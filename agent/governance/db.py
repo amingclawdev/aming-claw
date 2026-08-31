@@ -1491,7 +1491,78 @@ def _absolute_non_symlink_root(path: Path, *, create: bool) -> Path:
     return absolute
 
 
-def _dev_storage_root(*, create: bool = False) -> Path:
+def _validated_isolated_dev_receipt(
+    receipt_path: Path, root: Path, source_identity: Mapping[str, object],
+    stable_binding: Mapping[str, object],
+) -> Path:
+    archive = root / "archive" / "schema-admission"
+    path = receipt_path.expanduser().absolute()
+    details = path.lstat()
+    match = re.fullmatch(r"([0-9a-f]{64})\.json", path.name)
+    if (not stat.S_ISREG(details.st_mode) or details.st_nlink != 1 or path.is_symlink()
+            or path.resolve(strict=True) != path or path.parent.resolve(strict=True) != archive.resolve(strict=True)
+            or match is None):
+        raise ValueError("AC dev isolated receipt is not a canonical regular file")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != match.group(1):
+        raise ValueError("AC dev isolated receipt raw digest mismatch")
+    sidecar = archive / f"{match.group(1)}.sha256"
+    side = sidecar.lstat()
+    if (not stat.S_ISREG(side.st_mode) or side.st_nlink != 1 or sidecar.is_symlink()
+            or sidecar.read_text(encoding="utf-8") != f"sha256:{match.group(1)}  {path.name}\n"):
+        raise ValueError("AC dev isolated receipt sidecar mismatch")
+    receipt = json.loads(raw)
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    root_stat = root.stat(follow_symlinks=False)
+    db_stat = database.stat(follow_symlinks=False)
+    inventory = receipt.get("schema_inventory_after") if isinstance(receipt, Mapping) else None
+    plan_sha = "sha256:" + hashlib.sha256(
+        json.dumps(authority_projection_schema_plan(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    digest = hashlib.sha256()
+    descriptor = os.open(database, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    expected_source = dict(source_identity)
+    source = receipt.get("source_identity") if isinstance(receipt, Mapping) else None
+    cli_source = source.get("cli_source") if isinstance(source, Mapping) else None
+    if (
+        receipt.get("schema_version") != "ac_dev_offline_schema_admission.v3"
+        or receipt.get("stage") != "completed" or receipt.get("changed") is not False
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("previous_receipt_sha256") or ""))
+        or receipt.get("project_id") != AC_PROJECT_ID or receipt.get("port") != 40008
+        or receipt.get("root_identity") != {"path": str(root), "device": int(root_stat.st_dev), "inode": int(root_stat.st_ino)}
+        or receipt.get("database_identity") != {"path": str(database), "device": int(db_stat.st_dev), "inode": int(db_stat.st_ino)}
+        or receipt.get("database_sha256_after") != "sha256:" + digest.hexdigest()
+        or cli_source != expected_source or receipt.get("plan_sha256") != plan_sha
+        or not isinstance(inventory, Mapping)
+        or inventory.get("sha256") != AC_AUTHORITY_SCHEMA_INVENTORY_SHA256
+        or not isinstance(inventory.get("inventory"), list)
+        or len(inventory["inventory"]) != AC_AUTHORITY_SCHEMA_INVENTORY_COUNT
+        or "sha256:" + hashlib.sha256(json.dumps(
+            inventory["inventory"], separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")).hexdigest() != AC_AUTHORITY_SCHEMA_INVENTORY_SHA256
+    ):
+        raise ValueError("AC dev isolated receipt binding mismatch")
+    stable_database = Path(str(stable_binding["database_path"])).resolve(strict=True)
+    stable_stat = stable_database.stat(follow_symlinks=False)
+    stable_root = Path(str(stable_binding["shared_volume_path"])).resolve(strict=True)
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    canonical_dev_root = resolve_ac_dev_storage_root(stable_root)
+    source_root = Path(str(source_identity.get("root") or "")).resolve(strict=True)
+    if ((db_stat.st_dev, db_stat.st_ino) == (stable_stat.st_dev, stable_stat.st_ino)
+            or root in {stable_root, canonical_dev_root, source_root}
+            or root in stable_root.parents or stable_root in root.parents
+            or root in source_root.parents or source_root in root.parents):
+        raise ValueError("AC dev isolated root overlaps stable custody")
+    return root
+
+
+def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = None,
+                      source_identity: Mapping[str, object] | None = None) -> Path:
     """Resolve the only AC dev world; raw env values are assertions, not authority."""
     # Reject the missing required dev claim before contacting any authority or
     # resolving a potentially hostile sibling path.  This is zero-mutation.
@@ -1506,9 +1577,14 @@ def _dev_storage_root(*, create: bool = False) -> Path:
     stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
     if not stable_raw or _absolute_non_symlink_root(Path(stable_raw), create=False) != stable:
         raise RuntimeError("AC dev stable shared-volume claim mismatches verified authority")
+    supplied = Path(raw).expanduser().absolute()
+    if isolated_receipt is not None:
+        root = _absolute_non_symlink_root(supplied, create=False)
+        return _validated_isolated_dev_receipt(
+            isolated_receipt, root, source_identity or {}, binding,
+        )
     from agent.runtime_plane import resolve_ac_dev_storage_root
     expected = resolve_ac_dev_storage_root(stable)
-    supplied = Path(raw).expanduser().absolute()
     # Compare before any mkdir/open; a symlink/traversal is an invalid claim.
     if supplied.is_symlink():
         raise ValueError("AC dev storage root cannot be a symlink")
@@ -2482,6 +2558,7 @@ def bootstrap_dev_governance_store(
     expected_source_tip_sha256: str = "",
     expected_previous_process_identity: Mapping[str, object] | None = None,
     expected_database_identity: Mapping[str, object] | None = None,
+    linked_v3_receipt: Path | None = None,
 ) -> dict[str, object]:
     """Create or verify the source-only AC dev world without copying stable rows.
 
@@ -2503,7 +2580,10 @@ def bootstrap_dev_governance_store(
         shared = Path(shared_raw).expanduser().absolute()
         if root_input == shared or root_input in shared.parents or shared in root_input.parents:
             raise ValueError("AC dev storage root must be disjoint from shared storage")
-    root = _dev_storage_root(create=not root_existed)
+    root = _dev_storage_root(
+        create=not root_existed, isolated_receipt=linked_v3_receipt,
+        source_identity=source_identity,
+    )
     source = {
         "root": str(source_identity.get("root") or "").strip(),
         "branch": str(source_identity.get("branch") or "").strip(),

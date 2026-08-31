@@ -278,6 +278,7 @@ def _canonical_dev_database_binding(
     storage_root: str,
     *,
     source_identity: Mapping[str, Any],
+    linked_v3_receipt: Path | None = None,
 ) -> dict[str, Any]:
     """Bootstrap or verify one source-only, physically separate dev world."""
 
@@ -305,6 +306,7 @@ def _canonical_dev_database_binding(
                 "pid": os.getpid(),
                 "start_identity": f"pid:{os.getpid()}:cli-bootstrap",
             },
+            linked_v3_receipt=linked_v3_receipt,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2934,6 +2936,7 @@ def start(
         database_binding = _canonical_dev_database_binding(
             str(selected_dev_storage),
             source_identity=dev_identity,
+            linked_v3_receipt=linked_v3_receipt if durable_launch else None,
         )
         dev_storage_root = str(database_binding["dev_storage_root"])
         if durable_launch:

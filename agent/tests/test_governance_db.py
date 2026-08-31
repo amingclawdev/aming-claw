@@ -1799,3 +1799,39 @@ def test_ac_dev_schema_admission_rejects_shadow_and_altered_namespace_objects():
                 db.admit_missing_backlog_read_schema(conn)
         finally:
             conn.close()
+
+
+def test_isolated_root_direct_bootstrap_requires_central_valid_v3_receipt(tmp_path, monkeypatch):
+    from governance import db
+
+    stable = tmp_path / "stable"; stable.mkdir()
+    stable_database = stable / "governance.db"; stable_database.write_bytes(b"stable")
+    root = tmp_path / "isolated"; database = root / db.AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True); database.write_bytes(b"not-authorized")
+    archive = root / "archive" / "schema-admission"; archive.mkdir(parents=True)
+    raw = b'{"stage":"completed"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    receipt = archive / f"{digest}.json"; receipt.write_bytes(raw)
+    (archive / f"{digest}.sha256").write_text(
+        f"sha256:{digest}  {receipt.name}\n", encoding="utf-8",
+    )
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(root))
+    monkeypatch.setenv(db.AC_STABLE_SHARED_VOLUME_ENV, str(stable))
+    binding = {
+        "shared_volume_path": str(stable), "database_path": str(stable_database),
+        "stable_database_identity": {"device": stable_database.stat().st_dev,
+                                     "inode": stable_database.stat().st_ino},
+    }
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: binding)
+    monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _binding: None)
+    connects = []
+    monkeypatch.setattr(db.sqlite3, "connect", lambda *args, **kwargs: connects.append(args))
+    with pytest.raises(ValueError, match="isolated receipt binding mismatch"):
+        db.bootstrap_dev_governance_store(
+            root,
+            source_identity={"root": "/source", "branch": "codex/ac-dev", "commit": "a" * 40,
+                             "tree": "b" * 40, "source_sha256": "sha256:" + "c" * 64, "dirty": ""},
+            process_identity={"pid": 1, "start_identity": "start"},
+            linked_v3_receipt=receipt,
+        )
+    assert connects == []
