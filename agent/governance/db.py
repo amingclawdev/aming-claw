@@ -423,7 +423,7 @@ def classify_graph_activation_connection(
         expected_genesis_hash = _world_genesis_hash(genesis)
         database_identity = dict(genesis.get("database_identity") or {})
         storage_identity = dict(genesis.get("storage_root_identity") or {})
-        if not (
+        genesis_is_current_database = (
             meta.get("governance_world_id") == AC_DEV_WORLD_ID
             and genesis_hash == expected_genesis_hash
             and genesis.get("schema_version") == AC_WORLD_GENESIS_SCHEMA
@@ -436,8 +436,44 @@ def classify_graph_activation_connection(
             and storage_identity.get("path") == str(root)
             and storage_identity.get("device") == int(root_meta.st_dev)
             and storage_identity.get("inode") == int(root_meta.st_ino)
-        ):
-            return _unknown_graph_activation_connection("dev_genesis_identity_invalid")
+        )
+        cow_successor_verified = False
+        if not genesis_is_current_database:
+            # A validated v2 COW receipt is the sole authority for replacing
+            # genesis' immutable predecessor inode.  Its validator reconstructs
+            # and content-checks the complete receipt/history chain; no caller
+            # claim or mutable live row participates in this decision.
+            successor_receipt = validate_dev_cow_successor_receipt(root)
+            successor = dict(successor_receipt.get("successor") or {})
+            successor_identity = dict(successor.get("identity") or {})
+            predecessor = dict(
+                dict(successor_receipt.get("predecessor") or {}).get("backup") or {}
+            )
+            receipt_genesis = dict(successor_receipt.get("genesis") or {})
+            cow_successor_verified = (
+                meta.get("governance_world_id") == AC_DEV_WORLD_ID
+                and genesis_hash == expected_genesis_hash
+                and genesis.get("schema_version") == AC_WORLD_GENESIS_SCHEMA
+                and genesis.get("world_id") == AC_DEV_WORLD_ID
+                and genesis.get("project_id") == AC_PROJECT_ID
+                and genesis.get("source_only") is True
+                and genesis.get("rows_copied") == 0
+                and storage_identity.get("path") == str(root)
+                and storage_identity.get("device") == int(root_meta.st_dev)
+                and storage_identity.get("inode") == int(root_meta.st_ino)
+                and receipt_genesis.get("raw_json")
+                == str(meta.get("governance_world_genesis_json") or "")
+                and receipt_genesis.get("sha256") == genesis_hash
+                and predecessor.get("device") == database_identity.get("device")
+                and predecessor.get("inode") == database_identity.get("inode")
+                and successor_identity.get("path") == str(expected_database)
+                and successor_identity.get("device") == int(before.st_dev)
+                and successor_identity.get("inode") == int(before.st_ino)
+            )
+            if not cow_successor_verified:
+                return _unknown_graph_activation_connection(
+                    "dev_cow_successor_identity_invalid"
+                )
         _revalidate_stable_database_binding(binding)
         after = expected_database.stat(follow_symlinks=False)
         if (
@@ -449,7 +485,11 @@ def classify_graph_activation_connection(
             return _unknown_graph_activation_connection("dev_database_identity_changed")
         return {
             **graph_activation_policy("dev"),
-            "classification_reason": "verified_dev_root_receipt_genesis",
+            "classification_reason": (
+                "verified_dev_cow_successor_receipt_history"
+                if cow_successor_verified
+                else "verified_dev_root_receipt_genesis"
+            ),
         }
     except (json.JSONDecodeError, KeyError, OSError, RuntimeError, ValueError, sqlite3.Error):
         return _unknown_graph_activation_connection("dev_database_binding_unverified")
@@ -842,7 +882,10 @@ def admit_ac_dev_graph_materialization_schema(
     policy = classify_graph_activation_connection(conn)
     if (
         policy.get("runtime_plane") != DEV_RUNTIME_PLANE
-        or policy.get("classification_reason") != "verified_dev_root_receipt_genesis"
+        or policy.get("classification_reason") not in {
+            "verified_dev_root_receipt_genesis",
+            "verified_dev_cow_successor_receipt_history",
+        }
         or policy.get("active_graph_activation_allowed") is not False
     ):
         raise ValueError("AC dev graph materialization database identity is not admitted")

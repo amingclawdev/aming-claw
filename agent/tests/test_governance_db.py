@@ -1042,6 +1042,115 @@ def test_graph_activation_connection_classification_binds_opened_db_not_plane_en
     assert unknown_policy["active_graph_activation_allowed"] is False
 
 
+def _cow_graph_identity_fixture(tmp_path, monkeypatch):
+    from agent.governance import db
+    from agent import runtime_plane
+
+    stable = tmp_path / "stable"
+    stable.mkdir()
+    stable_db = stable / "stable.sqlite"
+    stable_db.touch()
+    root = tmp_path / "dev-root"
+    database = root / db.AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    root_meta = root.stat()
+    predecessor = {"device": 81, "inode": 82}
+    genesis = {
+        "schema_version": db.AC_WORLD_GENESIS_SCHEMA,
+        "world_id": db.AC_DEV_WORLD_ID,
+        "project_id": db.AC_PROJECT_ID,
+        "source_only": True,
+        "rows_copied": 0,
+        "database_identity": predecessor,
+        "storage_root_identity": {
+            "path": str(root), "device": root_meta.st_dev, "inode": root_meta.st_ino,
+        },
+    }
+    raw = json.dumps(genesis, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.executemany("INSERT INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", db.AC_DEV_WORLD_ID),
+        ("governance_world_genesis_json", raw),
+        ("governance_world_genesis_sha256", db._world_genesis_hash(genesis)),
+    ])
+    conn.commit()
+    identity = database.stat()
+    server_source = Path(db.__file__).with_name("server.py")
+    launch = {
+        "schema_version": db.AC_DEV_LAUNCH_RECEIPT_SCHEMA,
+        "world_id": db.AC_DEV_WORLD_ID, "project_id": db.AC_PROJECT_ID,
+        "runtime_plane": "dev", "port": 40008, "background": False,
+        "storage_root": str(root), "storage_device": root_meta.st_dev,
+        "storage_inode": root_meta.st_ino, "stable_shared_volume": str(stable),
+        "stable_shared_volume_device": stable.stat().st_dev,
+        "stable_shared_volume_inode": stable.stat().st_ino,
+        "stable_parent_device": stable.parent.stat().st_dev,
+        "stable_parent_inode": stable.parent.stat().st_ino,
+        "source_sha256": "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest(),
+    }
+    (root / db.AC_DEV_LAUNCH_RECEIPT_NAME).write_text(json.dumps(launch))
+    binding = {
+        "shared_volume_path": str(stable), "database_path": str(stable_db),
+        "stable_database_identity": {
+            "device": stable_db.stat().st_dev, "inode": stable_db.stat().st_ino,
+        },
+    }
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: binding)
+    monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _binding: None)
+    monkeypatch.setattr(runtime_plane, "resolve_ac_dev_storage_root", lambda _stable: root)
+    receipt = {
+        "genesis": {"raw_json": raw, "sha256": db._world_genesis_hash(genesis)},
+        "predecessor": {"backup": predecessor},
+        "successor": {"identity": {
+            "path": str(database), "device": identity.st_dev, "inode": identity.st_ino,
+        }},
+    }
+    return db, conn, receipt
+
+
+def test_graph_activation_classifies_exact_validated_cow_successor(tmp_path, monkeypatch):
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    try:
+        policy = db.classify_graph_activation_connection(conn)
+    finally:
+        conn.close()
+    assert policy["runtime_plane"] == "dev"
+    assert policy["active_graph_activation_allowed"] is False
+    assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
+
+
+@pytest.mark.parametrize("drift", ["inode", "history_gap"])
+def test_graph_materialization_rejects_unverified_cow_before_write(
+    tmp_path, monkeypatch, drift,
+):
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        db, "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db, "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    if drift == "inode":
+        receipt["successor"]["identity"]["inode"] += 1
+        monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    else:
+        def reject_history(_root):
+            raise ValueError("historical artifact chain mismatch")
+        monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", reject_history)
+    before_changes = conn.total_changes
+    before_inventory = db._graph_materialization_inventory(conn)
+    with pytest.raises(ValueError, match="identity is not admitted"):
+        db.admit_ac_dev_graph_materialization_schema(conn, project_id="aming-claw")
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    conn.close()
+
+
 @pytest.mark.parametrize("plane", ["stable", "generic"])
 @pytest.mark.parametrize("project_id", ["aming-claw", "aming_claw", "amingClaw"])
 def test_v27_central_resolver_rejects_ac_before_mkdir(

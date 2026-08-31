@@ -19326,6 +19326,38 @@ def test_dev_reconcile_handlers_admit_after_auth_before_graph_access(
     assert calls == ["auth", "admission"]
 
 
+def test_current_full_cow_identity_admission_failure_precedes_graph_access(
+    conn, monkeypatch, tmp_path,
+):
+    calls: list[str] = []
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(server, "dev_runtime_verify_only", lambda: True)
+    monkeypatch.setattr(
+        server, "_graph_governance_project_root", lambda _project_id, _body: tmp_path,
+    )
+    monkeypatch.setattr(
+        server, "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: calls.append("auth") or {},
+    )
+
+    def reject_identity(*_args, **_kwargs):
+        calls.append("identity-rejected")
+        raise ValueError("AC dev graph materialization database identity is not admitted")
+
+    monkeypatch.setattr(server, "admit_ac_dev_graph_materialization_schema", reject_identity)
+    monkeypatch.setattr(
+        server, "_git_head_commit", lambda *_args: calls.append("graph-access"),
+    )
+    with pytest.raises(ValueError, match="identity is not admitted"):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID}, "coordinator", method="POST",
+                body={"activate": False},
+            )
+        )
+    assert calls == ["auth", "identity-rejected"]
+
+
 def test_current_full_state_rejects_notes_only_and_premerge_provenance(conn):
     commit_sha = "c" * 40
     snapshot_id = "full-notes-only-current-full"
