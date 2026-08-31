@@ -2589,25 +2589,136 @@ def _durable_dev_launch(
     runtime = dev_storage / "runtime" / "durable-launch"
     runtime.mkdir(parents=True, exist_ok=True)
     lock = runtime / "launch.lock"
+    linked_digest, _linked = _validated_linked_v3_receipt(
+        linked_receipt, dev_storage=dev_storage, database=database,
+        database_identity=database_identity, source_identity=source_identity,
+        allow_postimage=True,
+    )
+    from agent.governance.db import validate_dev_preimage_only
+    preimage = validate_dev_preimage_only(
+        dev_storage, source_identity=source_identity,
+        linked_v3_receipt=linked_receipt,
+    )
+    source_root = Path(str(source_identity["root"])).resolve(strict=True)
+    server = source_root / "agent" / "governance" / "server.py"
+    server_sha = "sha256:" + hashlib.sha256(server.read_bytes()).hexdigest()
+
+    def current_database_sha256() -> str:
+        before = _admission_identity(database)
+        digest = _file_sha256(database)
+        if _admission_identity(database) != before:
+            raise click.ClickException("AC dev durable database identity changed during hash")
+        return digest
+
+    def validate_live_generation(
+        path: Path, value: Mapping[str, Any], digest: str,
+        process: Mapping[str, str], health: Mapping[str, Any],
+    ) -> None:
+        pid = int(value.get("pid") or 0)
+        pending_sha = str(value.get("pending_sha256") or "")
+        readiness_sha = str(value.get("readiness_sha256") or "")
+        if not (_exact_sha256(pending_sha) and _exact_sha256(readiness_sha)):
+            raise click.ClickException("AC dev durable live receipt chain mismatch")
+        pending_path = runtime / f"pending.{pending_sha[7:]}.json"
+        readiness_path = runtime / f"readiness.{readiness_sha[7:]}.json"
+        pending, pending_read_sha = _read_durable_content_receipt(pending_path, "pending")
+        readiness, readiness_read_sha = _read_durable_content_receipt(readiness_path, "readiness")
+        stopped = []
+        for stop_path in runtime.glob("stop.*.json"):
+            stop, _ = _read_durable_content_receipt(stop_path, "stop")
+            if stop.get("launch_sha256") == digest:
+                stopped.append(stop_path)
+        exited = []
+        for exit_path in runtime.glob("exit.*.json"):
+            exit_value, _ = _read_durable_content_receipt(exit_path, "exit")
+            if exit_value.get("launch_sha256") == digest:
+                exited.append(exit_path)
+        expected_policy = {"runtime_plane": "dev", "migration": "verify-only",
+                           "stable_deployment": "deny", "graph_activation": "deny",
+                           "background_workers": "deny"}
+        custody = dict(preimage.get("custody_projection") or {})
+        if (
+            value.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
+            or value.get("stage") != "completed" or value.get("pid") != pid
+            or value.get("process") != dict(process)
+            or value.get("argv") is None or value.get("cwd") != str(source_root)
+            or process.get("cwd") != str(source_root)
+            or value.get("source_root") != str(source_root)
+            or value.get("source_commit") != source_identity.get("commit")
+            or value.get("source_tree") != source_identity.get("tree")
+            or value.get("server_sha256") != server_sha
+            or value.get("dev_storage_root") != str(dev_storage)
+            or value.get("database_path") != str(database)
+            or dict(value.get("database_identity") or {}) != health.get("runtime_plane_identity", {}).get("database_identity")
+            or value.get("database_sha256_after") != current_database_sha256()
+            or value.get("project_id") != "aming-claw" or value.get("port") != AC_DEV_SERVICE_PORT
+            or value.get("policy") != expected_policy
+            or value.get("linked_v3_receipt_sha256") != linked_digest
+            or pending_read_sha != pending_sha or readiness_read_sha != readiness_sha
+            or pending.get("launch_id") != value.get("launch_id")
+            or pending.get("linked_v3_receipt_sha256") != linked_digest
+            or pending.get("database_sha256_before") != value.get("database_sha256_before")
+            or readiness.get("pending_sha256") != pending_sha
+            or readiness.get("launch_id") != value.get("launch_id")
+            or readiness.get("pid") != pid
+            or readiness.get("database_sha256_before") != value.get("database_sha256_before")
+            or readiness.get("database_sha256_after") != value.get("database_sha256_after")
+            or readiness.get("database_identity") != value.get("database_identity")
+            or readiness.get("custody_projection") != custody
+            or custody.get("pid") != pid or custody.get("launch_id") != value.get("launch_id")
+            or value.get("launch_id") not in str(process.get("argv") or "")
+            or stopped or exited
+            or not _dev_running_identity_matches(
+                health, source_identity, stable_anchor_commit=stable_anchor_commit,
+                dev_database_identity=dict(value.get("database_identity") or {}),
+            )
+        ):
+            raise click.ClickException("AC dev durable live completed receipt mismatch")
+
+    suspicious = list(runtime.glob(".launch*.json"))
+    if suspicious:
+        raise click.ClickException("AC dev durable hidden launch receipt state")
     existing_launches = []
     for path in runtime.glob("launch.*.json"):
         value, digest = _read_durable_content_receipt(path, "launch")
         existing_launches.append((path, value, digest))
+    live_generations = []
     for _path, value, digest in existing_launches:
         pid = int(value.get("pid") or 0)
         try:
             process = _posix_process_identity(pid)
         except click.ClickException:
             process = None
-        if process is not None and _durable_listener_pid(AC_DEV_SERVICE_PORT) == pid:
-            health = _probe_governance(AC_DEV_SERVICE_PORT, timeout=0.5)
-            if (value.get("source_commit") != source_identity.get("commit")
-                    or value.get("dev_storage_root") != str(dev_storage)
-                    or not health or health.get("pid") != pid):
-                raise click.ClickException("AC dev durable live prior generation identity mismatch")
-            click.echo(json.dumps({"status": "already_running", "pid": pid,
-                                   "receipt": str(_path), "receipt_sha256": digest}, sort_keys=True))
-            return
+        if process is not None:
+            live_generations.append((_path, value, digest, process))
+    if len(live_generations) > 1:
+        raise click.ClickException("AC dev durable multiple live generations")
+    if live_generations:
+        _path, value, digest, process = live_generations[0]
+        pid = int(value.get("pid") or 0)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            listener = _durable_listener_pid(AC_DEV_SERVICE_PORT)
+            if listener == pid:
+                health = _probe_governance(AC_DEV_SERVICE_PORT, timeout=0.5)
+                if not health or health.get("pid") != pid:
+                    raise click.ClickException("AC dev durable live health mismatch")
+                validate_live_generation(_path, value, digest, process, health)
+                click.echo(json.dumps({"status": "already_running", "pid": pid,
+                                       "receipt": str(_path), "receipt_sha256": digest}, sort_keys=True))
+                return
+            if listener:
+                raise click.ClickException("AC dev durable unknown listener owns port 40008")
+            try:
+                process = _posix_process_identity(pid)
+            except click.ClickException:
+                break
+            time.sleep(0.1)
+        else:
+            raise click.ClickException("AC dev durable live child remained unbound")
+    listener_before_recovery = _durable_listener_pid(AC_DEV_SERVICE_PORT)
+    if listener_before_recovery:
+        raise click.ClickException("AC dev durable unknown listener owns port 40008")
     if lock.is_symlink():
         raise click.ClickException("AC dev durable launch lock is not canonical")
     if lock.exists():
@@ -2628,14 +2739,25 @@ def _durable_dev_launch(
         if len(selected) != 1:
             raise click.ClickException("AC dev durable recovery pending generation mismatch")
         pending_path, pending_value, pending_digest = selected[0]
-        database_now = _admission_database_sha256(
-            database, expected_identity=_admission_identity(database),
-        )
+        # No recovery/seal is legal until the old child is OS-proven absent and
+        # the reserved listener is free.
+        pending_pid = 0
         readiness_matches = []
         for path in readiness_paths:
             value, digest = _read_durable_content_receipt(path, "readiness")
             if value.get("pending_sha256") == pending_digest:
                 readiness_matches.append((path, value, digest))
+                pending_pid = int(value.get("pid") or 0)
+        if pending_pid:
+            try:
+                _posix_process_identity(pending_pid)
+            except click.ClickException:
+                pass
+            else:
+                raise click.ClickException("AC dev durable recovery child is still live")
+        if _durable_listener_pid(AC_DEV_SERVICE_PORT):
+            raise click.ClickException("AC dev durable recovery requires free port 40008")
+        database_now = current_database_sha256()
         recovery_stage = ""
         recovery_readiness = ""
         if database_now == pending_value.get("database_sha256_before") and not readiness_matches:
@@ -2652,19 +2774,8 @@ def _durable_dev_launch(
         })
         lock.unlink()
         _fsync_parent(lock)
-    linked_digest, _linked = _validated_linked_v3_receipt(
-        linked_receipt, dev_storage=dev_storage, database=database,
-        database_identity=database_identity, source_identity=source_identity,
-        allow_postimage=True,
-    )
-    from agent.governance.db import validate_dev_preimage_only
-    preimage = validate_dev_preimage_only(
-        dev_storage, source_identity=source_identity,
-        linked_v3_receipt=linked_receipt,
-    )
-    source_root = Path(str(source_identity["root"])).resolve(strict=True)
-    server = source_root / "agent" / "governance" / "server.py"
-    server_sha = "sha256:" + hashlib.sha256(server.read_bytes()).hexdigest()
+    if _durable_listener_pid(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("AC dev durable launch requires free port 40008")
     launch_id = hashlib.sha256(
         f"{time.time_ns()}\0{os.getpid()}\0{source_identity['commit']}".encode()
     ).hexdigest()[:24]
@@ -3058,7 +3169,8 @@ def start(
         # running or foreign process must be rejected before bootstrap, source
         # CAS, activation validation, or any dedicated-root filesystem write.
         health = _probe_governance(port)
-        if health and health.get("status") == "ok" and health.get("service") == "governance":
+        if (not durable_launch and health and health.get("status") == "ok"
+                and health.get("service") == "governance"):
             runtime_identity = health.get("runtime_plane_identity")
             reported_database_identity = (
                 dict(runtime_identity.get("database_identity"))
@@ -3080,7 +3192,7 @@ def start(
             click.echo(f"Governance already running on port {port} (version {version}).")
             click.echo(f"Dashboard: {dashboard}")
             return
-        if _port_is_open(port):
+        if not durable_launch and _port_is_open(port):
             owner = _port_owner_hint(port)
             raise click.ClickException(
                 f"Port {port} is already in use{owner}, but /api/health is not Aming Claw governance. "
