@@ -224,6 +224,13 @@ def _dev_running_identity_matches(
     loaded_identity = health.get("loaded_runtime_identity")
     if not isinstance(identity, Mapping) or not isinstance(loaded_identity, Mapping):
         return False
+    runtime_source_sha256 = str(expected.get("source_sha256") or "")
+    try:
+        runtime_source = Path(str(expected.get("root") or "")) / "agent" / "governance" / "server.py"
+        if runtime_source.is_file():
+            runtime_source_sha256 = "sha256:" + hashlib.sha256(runtime_source.read_bytes()).hexdigest()
+    except OSError:
+        return False
     return bool(
         health.get("runtime_plane") == "dev"
         and health.get("port") == AC_DEV_SERVICE_PORT
@@ -268,9 +275,9 @@ def _dev_running_identity_matches(
         and loaded_identity.get("runtime_stale") is False
         and loaded_identity.get("runtime_stale_reasons") == []
         and loaded_identity.get("loaded_source_sha256")
-        == expected.get("source_sha256")
+        == runtime_source_sha256
         and loaded_identity.get("worktree_source_sha256")
-        == expected.get("source_sha256")
+        == runtime_source_sha256
     )
 
 
