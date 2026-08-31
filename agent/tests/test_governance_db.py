@@ -1716,6 +1716,22 @@ def test_ac_dev_offline_backlog_schema_admission_repairs_only_exact_missing_set(
         conn.close()
 
 
+def test_dev_schema_inventory_accepts_only_exact_backlog_overlay():
+    from governance import db
+
+    conn = sqlite3.connect(":memory:")
+    db._ensure_schema(conn)
+    try:
+        db.admit_missing_backlog_read_schema(conn)
+        db._verify_dev_world_schema_inventory(conn)
+        conn.execute("DROP TRIGGER trg_dashboard_backlog_cache_insert")
+        conn.execute("CREATE TRIGGER trg_dashboard_backlog_cache_insert AFTER INSERT ON backlog_bugs BEGIN SELECT 1; END")
+        with pytest.raises(ValueError, match="source schema inventory mismatch"):
+            db._verify_dev_world_schema_inventory(conn)
+    finally:
+        conn.close()
+
+
 def test_ac_dev_backlog_admission_binds_managed_and_protected_inventories():
     """Admission may add its five objects without reinterpreting other schema."""
     from governance import db

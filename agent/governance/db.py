@@ -2889,8 +2889,6 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         str(row[0])
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    unknown = sorted(actual - allowed)
-    missing = sorted(required - actual)
     actual_objects = {
         (str(row[0]), str(row[1]), str(row[2]))
         for row in conn.execute(
@@ -2898,10 +2896,34 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             "WHERE type IN ('table', 'index', 'trigger', 'view')"
         )
     }
+    managed_exact = (
+        backlog_read_schema_managed_inventory(conn)
+        == canonical_backlog_read_schema_managed_inventory()
+    )
+    managed_table = "dashboard_backlog_cache_generation"
+    managed_names = _backlog_read_managed_object_names()
+    managed_autoindex = "sqlite_autoindex_dashboard_backlog_cache_generation_1"
+    # This exception is deliberately all-or-nothing: the SQL-bearing five
+    # objects must equal the source plan before *only* their exact namespace
+    # can be removed from the baseline source-inventory comparison.
+    accepted_overlay = set()
+    if managed_exact:
+        accepted_overlay = {
+            (kind, name, table)
+            for kind, name, table in actual_objects
+            if name in managed_names
+            or (kind == "index" and name == managed_autoindex and table == managed_table)
+        }
+        if ("table", managed_table, managed_table) not in accepted_overlay or (
+                "index", managed_autoindex, managed_table) not in accepted_overlay:
+            accepted_overlay = set()
+            managed_exact = False
+    unknown = sorted((actual - allowed) - ({managed_table} if managed_exact else set()))
+    missing = sorted(required - actual)
     optional = allowed - required
     unknown_objects = sorted(
         item
-        for item in actual_objects - source_objects
+        for item in actual_objects - source_objects - accepted_overlay
         if not (item[0] in {"table", "index"} and item[2] in optional)
     )
     if unknown or missing or unknown_objects:
