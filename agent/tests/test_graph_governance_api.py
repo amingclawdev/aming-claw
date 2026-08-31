@@ -78,6 +78,47 @@ from agent.governance.contract_runtime_visualization import (
     build_contract_runtime_visualization,
 )
 from agent.governance.db import _ensure_schema
+
+
+def test_canonical_ref_adoption_intent_is_exactly_route_scoped():
+    """The new intent is data, but it cannot widen an issued observer route."""
+
+    commit = "a" * 40
+    intent = {
+        "schema_version": "canonical_ref_adoption_route_bound.v1",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
+        "action": "canonical_ref_adoption",
+        "contract_execution_id": "cex-adoption-r2",
+        "generation": "gen-r2",
+        "custody": "custody-r2",
+        "canonical_ref": "refs/heads/codex/ac-dev",
+        "expected_commit": commit,
+        "target_commit": "b" * 40,
+        "target_tree": "c" * 40,
+        "source_content_sha256": "sha256:" + "d" * 64,
+        "qa_content_sha256": "sha256:" + "e" * 64,
+        "issued_at": "2026-08-31T00:00:00Z",
+        "expires_at": "2026-08-31T01:00:00Z",
+        "replay_identity": "adoption-r2-once",
+    }
+    accepted = server._canonical_ref_adoption_issue_intent(
+        intent,
+        project_id="aming-claw",
+        backlog_id=intent["backlog_id"],
+        task_id="cex-adoption-r2",
+        allowed_actions=["canonical_ref_adoption"],
+    )
+    assert accepted and accepted["target_commit"] == "b" * 40
+    forged = dict(intent, backlog_id="other")
+    with pytest.raises(ValueError, match="native route scope"):
+        server._canonical_ref_adoption_issue_intent(
+            forged,
+            project_id="aming-claw",
+            backlog_id=intent["backlog_id"],
+            task_id="cex-adoption-r2",
+            allowed_actions=["canonical_ref_adoption"],
+        )
 from agent.governance.errors import (
     AuthError,
     GovernanceError,

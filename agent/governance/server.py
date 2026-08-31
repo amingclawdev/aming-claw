@@ -7704,6 +7704,49 @@ _OBSERVER_ROUTE_CONTEXT_GRAPH_FIRST_ENTRY_ACTIONS = {
     "mf_batch_parallel_enter",
 }
 
+_CANONICAL_REF_ADOPTION_ACTION = "canonical_ref_adoption"
+_CANONICAL_REF_ADOPTION_SCHEMA = "canonical_ref_adoption_route_bound.v1"
+
+
+def _canonical_ref_adoption_issue_intent(
+    value: Any, *, project_id: str, backlog_id: str, task_id: str, allowed_actions: Any
+) -> dict[str, str] | None:
+    """Validate the narrow, durable adoption payload before route issuance.
+
+    The payload is subsequently persisted inside the already-digest-bound route
+    lineage.  It is intentionally not a new authority table or a JB rule.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("canonical_ref_adoption must be an object")
+    required = (
+        "project_id", "backlog_id", "action", "contract_execution_id", "generation",
+        "custody", "canonical_ref", "expected_commit", "target_commit", "target_tree",
+        "source_content_sha256", "qa_content_sha256", "issued_at", "expires_at",
+        "replay_identity",
+    )
+    intent = {key: str(value.get(key) or "").strip() for key in required}
+    if any(not intent[key] for key in required):
+        raise ValueError("canonical_ref_adoption is incomplete")
+    if (
+        value.get("schema_version") != _CANONICAL_REF_ADOPTION_SCHEMA
+        or intent["project_id"] != project_id
+        or intent["backlog_id"] != backlog_id
+        or intent["contract_execution_id"] != task_id
+        or intent["action"] != _CANONICAL_REF_ADOPTION_ACTION
+        or intent["canonical_ref"] != "refs/heads/codex/ac-dev"
+        or _CANONICAL_REF_ADOPTION_ACTION not in set(allowed_actions or [])
+    ):
+        raise ValueError("canonical_ref_adoption does not match native route scope")
+    if any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", intent[key])
+           for key in ("expected_commit", "target_commit", "target_tree")):
+        raise ValueError("canonical_ref_adoption requires exact Git identities")
+    if any(not re.fullmatch(r"sha256:[0-9a-f]{64}", intent[key])
+           for key in ("source_content_sha256", "qa_content_sha256")):
+        raise ValueError("canonical_ref_adoption requires content-addressed source and QA evidence")
+    return {"schema_version": _CANONICAL_REF_ADOPTION_SCHEMA, **intent}
+
 
 def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
     if not isinstance(allowed_actions, list):
@@ -8685,6 +8728,25 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             source_gate="allowed_actions_type",
         )
     allowed_actions = _observer_route_context_issue_allowed_actions(allowed_actions)
+    try:
+        canonical_ref_adoption = _canonical_ref_adoption_issue_intent(
+            body.get("canonical_ref_adoption"),
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            allowed_actions=allowed_actions,
+        )
+    except ValueError as exc:
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error=str(exc),
+            field="canonical_ref_adoption",
+            expected="server-validated canonical_ref_adoption_route_bound.v1",
+            actual=_observer_route_context_issue_safe_actual(body.get("canonical_ref_adoption")),
+            source_gate="canonical_ref_adoption_scope",
+        )
     evidence_refs = body.get("evidence_refs")
     if evidence_refs is not None and not isinstance(evidence_refs, list):
         return _observer_route_context_issue_rejection(
@@ -8805,6 +8867,11 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 "owned_files",
                 [str(path).strip() for path in owned_scope if str(path or "").strip()],
             )
+            if canonical_ref_adoption is not None:
+                lineage = issued_token.setdefault("route_lineage", {})
+                if not isinstance(lineage, dict):
+                    raise ValueError("issued route lineage is invalid")
+                lineage["canonical_ref_adoption"] = dict(canonical_ref_adoption)
     except ValueError as exc:
         message = str(exc)
         value_field = (
@@ -8939,6 +9006,12 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             ),
         },
     }
+    if canonical_ref_adoption is not None:
+        response["canonical_ref_adoption_intent"] = {
+            "schema_version": _CANONICAL_REF_ADOPTION_SCHEMA,
+            "route_token_ref": issued["route_token_ref"],
+            "canonical_ref_adoption": dict(canonical_ref_adoption),
+        }
     for key, value in route_identity.items():
         response.setdefault(key, value)
     for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):

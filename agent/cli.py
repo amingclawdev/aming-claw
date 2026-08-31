@@ -27,6 +27,7 @@ import logging
 import json
 import hashlib
 import re
+import stat
 import time
 import webbrowser
 import socket
@@ -61,6 +62,8 @@ AC_DATABASE_STABLE_RELATIVE_PATH = (
     "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
 )
 AC_DEV_STORAGE_ROOT_ENV = "AMING_CLAW_DEV_STORAGE_ROOT"
+CANONICAL_REF_ADOPTION_ACTION = "canonical_ref_adoption"
+CANONICAL_REF_ADOPTION_SCHEMA = "canonical_ref_adoption_route_bound.v1"
 _GOVERNANCE_PROBE_HEALTH_BYTES = 64 * 1024
 _GOVERNANCE_PROBE_GRAPH_BYTES = 256 * 1024
 
@@ -619,11 +622,494 @@ def _run_dev_governance() -> None:
     governance_main()
 
 
+def _git_checked(root: Path, *args: str) -> str:
+    """Run a bounded Git read/write operation, returning stripped stdout."""
+
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise click.ClickException("canonical dev adoption Git invocation failed") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise click.ClickException(detail or "canonical dev adoption Git operation failed")
+    return result.stdout.strip()
+
+
+def _sha256_json(value: Mapping[str, Any]) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _worktree_adoption_snapshot(root: Path, ref: str) -> dict[str, str]:
+    """Produce a non-mutating, content-addressed Git state snapshot."""
+
+    status = _git_checked(root, "status", "--porcelain=v1", "-z")
+    head = _git_checked(root, "rev-parse", "HEAD").lower()
+    tree = _git_checked(root, "rev-parse", "HEAD^{tree}").lower()
+    index = _git_checked(root, "ls-files", "--stage", "-z")
+    ref_value = _git_checked(root, "rev-parse", "--verify", ref).lower()
+    return {
+        "head": head,
+        "tree": tree,
+        "ref": ref_value,
+        "ref_sha256": _sha256_json({"ref": ref, "value": ref_value}),
+        "index_sha256": "sha256:" + hashlib.sha256(index.encode("utf-8")).hexdigest(),
+        "worktree_sha256": "sha256:" + hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "worktree_clean": str(not status).lower(),
+    }
+
+
+def _adoption_worktrees(repo_root: Path, branch: str) -> list[Path]:
+    output = _git_checked(repo_root, "worktree", "list", "--porcelain")
+    roots: list[Path] = []
+    for block in output.split("\n\n"):
+        values = dict(
+            line.split(" ", 1) if " " in line else (line, "")
+            for line in block.splitlines()
+        )
+        if values.get("branch") == "refs/heads/" + branch and values.get("worktree"):
+            try:
+                roots.append(Path(values["worktree"]).resolve(strict=True))
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise click.ClickException("canonical dev adoption worktree identity is unavailable") from exc
+    return roots
+
+
+def _require_dead_dev_pid(pid_path: Path | None) -> None:
+    """Reject a live persisted dev PID; stale records are evidence, not holders."""
+
+    if pid_path is None or not pid_path.is_file():
+        return
+    try:
+        payload = json.loads(pid_path.read_text(encoding="utf-8"))
+        pid = int(payload.get("pid") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise click.ClickException("canonical dev adoption PID record is unreadable") from exc
+    if pid <= 0:
+        raise click.ClickException("canonical dev adoption PID record is invalid")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise click.ClickException("canonical dev adoption cannot verify dev PID ownership") from exc
+    raise click.ClickException("canonical dev adoption refuses a live dev runtime holder")
+
+
+def _validate_resume_receipt(
+    receipt_path: Path,
+    *,
+    expected_commit: str,
+    target_commit: str,
+    route_bound_intent: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException("canonical dev adoption resume receipt is unreadable") from exc
+    if not isinstance(receipt, dict):
+        raise click.ClickException("canonical dev adoption resume receipt is invalid")
+    receipt_hash = receipt.pop("receipt_sha256", "")
+    if receipt_hash != _sha256_json(receipt):
+        raise click.ClickException("canonical dev adoption resume receipt hash mismatch")
+    if not (
+        receipt.get("schema_version") == "ac_dev_canonical_ref_adoption.v2"
+        and receipt.get("expected_commit") == expected_commit
+        and receipt.get("target_commit") == target_commit
+        and receipt.get("stage") in {"detached", "cas", "attached"}
+        and isinstance(receipt.get("post"), Mapping)
+        and isinstance(receipt.get("stable"), Mapping)
+    ):
+        raise click.ClickException("canonical dev adoption resume receipt does not prove an exact stage")
+    if route_bound_intent is not None and receipt.get("route_bound_intent") != dict(route_bound_intent):
+        raise click.ClickException("canonical dev adoption resume receipt intent mismatch")
+    return {**receipt, "receipt_sha256": receipt_hash}
+
+
+def _read_regular_json(path: Path, *, label: str) -> dict[str, Any]:
+    """Read an operator-supplied evidence file without accepting links."""
+
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise OSError("not a regular file")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"canonical dev adoption {label} is unreadable") from exc
+    if not isinstance(value, dict):
+        raise click.ClickException(f"canonical dev adoption {label} is invalid")
+    return value
+
+
+def _route_bound_adoption_intent(
+    *, route_token_path: Path, route_intent_path: Path, dev_database: Path
+) -> dict[str, str]:
+    """Resolve an adoption intent only from a server-issued route-registry row.
+
+    The file presented by an operator is merely a locator.  Its fields are
+    compared byte-for-byte with the registry lineage after the full token has
+    passed the salted-digest verifier; it can therefore not become a
+    self-authored authorization manifest.
+    """
+
+    from agent.governance import observer_route_context as route_context
+
+    token = _read_regular_json(route_token_path, label="route token")
+    supplied = _read_regular_json(route_intent_path, label="route intent")
+    if supplied.get("schema_version") != CANONICAL_REF_ADOPTION_SCHEMA:
+        raise click.ClickException("canonical dev adoption intent schema is invalid")
+    route_token_ref = str(supplied.get("route_token_ref") or "").strip()
+    payload = supplied.get("canonical_ref_adoption")
+    if not route_token_ref or not isinstance(payload, Mapping):
+        raise click.ClickException("canonical dev adoption intent is incomplete")
+    try:
+        if not stat.S_ISREG(dev_database.lstat().st_mode):
+            raise OSError("not a regular database")
+        conn = sqlite3.connect(f"file:{dev_database}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except (OSError, sqlite3.Error) as exc:
+        raise click.ClickException("canonical dev adoption route registry is unavailable") from exc
+    try:
+        binding = route_context.verify_route_token_binding(
+            conn, project_id="aming-claw", token=token,
+            route_token_ref=route_token_ref,
+            backlog_id=str(payload.get("backlog_id") or ""),
+            task_id=str(payload.get("contract_execution_id") or ""),
+        )
+        if CANONICAL_REF_ADOPTION_ACTION not in set(binding.get("allowed_actions") or []):
+            raise click.ClickException("canonical dev adoption route action is not authorized")
+        row = conn.execute(
+            "SELECT route_lineage_json FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=? AND status='active'",
+            ("aming-claw", route_token_ref),
+        ).fetchone()
+    except route_context.RouteTokenRefError as exc:
+        raise click.ClickException("canonical dev adoption route binding rejected") from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException("canonical dev adoption route registry is unavailable") from exc
+    finally:
+        conn.close()
+    if row is None:
+        raise click.ClickException("canonical dev adoption route intent is not server-issued")
+    try:
+        lineage = json.loads(str(row["route_lineage_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException("canonical dev adoption route lineage is invalid") from exc
+    stored = lineage.get("canonical_ref_adoption") if isinstance(lineage, Mapping) else None
+    if not isinstance(stored, Mapping) or dict(stored) != dict(payload):
+        raise click.ClickException("canonical dev adoption rejects forged or self-authored intent")
+    required = (
+        "project_id", "backlog_id", "action", "contract_execution_id", "generation",
+        "custody", "canonical_ref", "expected_commit", "target_commit", "target_tree",
+        "source_content_sha256", "qa_content_sha256", "issued_at", "expires_at",
+        "replay_identity",
+    )
+    if any(not str(payload.get(key) or "").strip() for key in required):
+        raise click.ClickException("canonical dev adoption route intent is incomplete")
+    if (
+        payload.get("project_id") != "aming-claw"
+        or payload.get("action") != CANONICAL_REF_ADOPTION_ACTION
+        or payload.get("canonical_ref") != "refs/heads/codex/ac-dev"
+        or any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(payload.get(key) or ""))
+               for key in ("expected_commit", "target_commit", "target_tree"))
+        or any(not _exact_sha256(str(payload.get(key) or ""))
+               for key in ("source_content_sha256", "qa_content_sha256"))
+    ):
+        raise click.ClickException("canonical dev adoption route intent does not bind an exact target")
+    return {key: str(payload[key]) for key in required}
+
+
+def _require_regular_resume_receipt(
+    _ctx: click.Context, param: click.Parameter, value: Path | None
+) -> Path | None:
+    """Keep an explicitly supplied resume receipt a real, non-link file."""
+
+    if value is None:
+        return None
+    try:
+        mode = value.lstat().st_mode
+    except OSError as exc:
+        raise click.BadParameter("must be an existing regular receipt file", param=param) from exc
+    if not stat.S_ISREG(mode):
+        raise click.BadParameter("must be an existing regular receipt file", param=param)
+    return value
+
+
+def _stable_process_identity(pid: int) -> dict[str, str]:
+    """Read the stable process start/command/cwd tuple without mutating it."""
+
+    try:
+        process = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        cwd = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise click.ClickException("canonical dev adoption stable process identity is unavailable") from exc
+    line = process.stdout.strip()
+    cwd_line = next((entry[1:] for entry in cwd.stdout.splitlines() if entry.startswith("n")), "")
+    if process.returncode or not line or not cwd_line:
+        raise click.ClickException("canonical dev adoption stable process identity is unavailable")
+    # ps emits a fixed-width date followed by the command.  The exact string is
+    # retained in the receipt rather than inferred from a mutable process name.
+    return {"start": line[:24].strip(), "command": line[24:].strip(), "cwd": cwd_line}
+
+
+def _stable_adoption_identity(stable_root: Path) -> dict[str, Any]:
+    """Bind adoption to stable Git, loaded runtime, process, and DB identity."""
+
+    health = _probe_governance(AC_STABLE_SERVICE_PORT) or {}
+    identity = health.get("runtime_plane_identity")
+    loaded = health.get("loaded_runtime_identity")
+    stable = _worktree_adoption_snapshot(stable_root, "HEAD")
+    pid = health.get("pid")
+    if not (
+        health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and health.get("port") == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_plane") == "stable"
+        and health.get("runtime_loaded_version") == stable["head"]
+        and health.get("runtime_stale") is False
+        and type(pid) is int and pid > 0
+        and isinstance(identity, Mapping)
+        and identity.get("worktree_root") == str(stable_root)
+        and identity.get("branch") == AC_STABLE_BRANCH
+        and identity.get("commit") == stable["head"]
+        and identity.get("worktree_dirty") is False
+        and isinstance(identity.get("stable_database_identity"), Mapping)
+        and isinstance(loaded, Mapping)
+        and loaded.get("loaded_commit") == stable["head"]
+        and loaded.get("loaded_pid") == pid
+        and loaded.get("runtime_stale") is False
+        and loaded.get("loaded_source_sha256") == loaded.get("worktree_source_sha256")
+        and _exact_sha256(loaded.get("loaded_source_sha256"))
+    ):
+        raise click.ClickException("canonical dev adoption stable runtime identity mismatch")
+    process = _stable_process_identity(pid)
+    if not all(process.values()):
+        raise click.ClickException("canonical dev adoption stable process identity mismatch")
+    return {
+        "commit": stable["head"], "tree": stable["tree"], "port": AC_STABLE_SERVICE_PORT,
+        "pid": pid, "loaded_source_sha256": loaded["loaded_source_sha256"],
+        "process_start": process["start"], "process_command": process["command"],
+        "process_cwd": process["cwd"],
+        "database_identity": dict(identity["stable_database_identity"]),
+        "git": stable,
+    }
+
+
+def _adopt_canonical_dev_ref(
+    *,
+    candidate_worktree: Path,
+    canonical_worktree: Path,
+    expected_commit: str,
+    target_commit: str,
+    target_tree: str,
+    pid_path: Path | None = None,
+    resume_receipt: Mapping[str, Any] | None = None,
+    phase: str = "run",
+    stable_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Execute one interruption-safe detach/CAS/attach adoption stage."""
+
+    candidate = candidate_worktree.resolve(strict=True)
+    canonical = canonical_worktree.resolve(strict=True)
+    if candidate == canonical:
+        raise click.ClickException("candidate and canonical dev worktrees must differ")
+    candidate_snapshot = _worktree_adoption_snapshot(candidate, "HEAD")
+    if (
+        candidate_snapshot["head"] != target_commit
+        or candidate_snapshot["tree"] != target_tree
+        or candidate_snapshot["worktree_clean"] != "true"
+    ):
+        raise click.ClickException("canonical dev adoption candidate does not match exact target/tree/clean state")
+    if _git_checked(candidate, "branch", "--show-current") == AC_DEV_BRANCH:
+        raise click.ClickException("canonical dev adoption candidate must not already hold codex/ac-dev")
+    # ``git merge-base --is-ancestor`` communicates success solely by status;
+    # _git_checked turns its non-zero status into the required fail-closed error.
+    _git_checked(candidate, "merge-base", "--is-ancestor", expected_commit, target_commit)
+    dev_roots = _adoption_worktrees(candidate, AC_DEV_BRANCH)
+    allowed_dev_roots = (
+        ([canonical], []) if phase == "detach" else
+        ([],) if phase == "cas" else
+        ([], [canonical])
+    )
+    if dev_roots not in allowed_dev_roots:
+        raise click.ClickException("canonical dev adoption requires one exact codex/ac-dev worktree")
+    stable_roots = _adoption_worktrees(candidate, AC_STABLE_BRANCH)
+    if len(stable_roots) != 1 or stable_roots[0] in {candidate, canonical}:
+        raise click.ClickException("canonical dev adoption detects a stable worktree conflict")
+    stable_snapshot = _worktree_adoption_snapshot(stable_roots[0], "HEAD")
+    if stable_snapshot["worktree_clean"] != "true":
+        raise click.ClickException("canonical dev adoption refuses a dirty stable worktree")
+    current_stable = dict(stable_identity or _stable_adoption_identity(stable_roots[0]))
+    if not current_stable:
+        raise click.ClickException("canonical dev adoption stable identity is unavailable")
+    if resume_receipt is not None and resume_receipt.get("stable") != current_stable:
+        raise click.ClickException("canonical dev adoption stable identity changed during resume")
+    canonical_snapshot = _worktree_adoption_snapshot(canonical, "refs/heads/" + AC_DEV_BRANCH)
+    if _port_is_open(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("canonical dev adoption refuses an occupied dev service port")
+    _require_dead_dev_pid(pid_path)
+    branch = _git_checked(canonical, "branch", "--show-current")
+    if phase not in {"detach", "cas", "attach"}:
+        raise click.ClickException("canonical dev adoption phase must be detach, cas, or attach")
+    required_stages = {"detach": set(), "cas": {"detached", "cas"}, "attach": {"cas", "attached"}}[phase]
+    if required_stages:
+        if resume_receipt is None or resume_receipt.get("stage") not in required_stages:
+            raise click.ClickException("canonical dev adoption requires the prior exact stage receipt")
+    if phase == "detach":
+        if branch == "" and canonical_snapshot["head"] == expected_commit and canonical_snapshot["ref"] == expected_commit:
+            if resume_receipt is None or resume_receipt.get("stage") != "detached":
+                raise click.ClickException("canonical dev adoption detached state requires its exact receipt")
+            post = canonical_snapshot
+            status = "idempotent_detached"
+        elif (
+            branch == AC_DEV_BRANCH and canonical_snapshot["head"] == expected_commit
+            and canonical_snapshot["ref"] == expected_commit and canonical_snapshot["worktree_clean"] == "true"
+        ):
+            _git_checked(canonical, "checkout", "--detach", expected_commit)
+            post = _worktree_adoption_snapshot(canonical, "refs/heads/" + AC_DEV_BRANCH)
+            status = "detached"
+        else:
+            raise click.ClickException("canonical dev adoption detach precondition failed before Git effects")
+    elif phase == "cas":
+        if branch != "" or canonical_snapshot["head"] != expected_commit or canonical_snapshot["worktree_clean"] != "true":
+            raise click.ClickException("canonical dev adoption CAS requires clean detached expected worktree")
+        if canonical_snapshot["ref"] == target_commit:
+            post = canonical_snapshot
+            status = "idempotent_cas"
+        elif canonical_snapshot["ref"] == expected_commit:
+            _git_checked(canonical, "update-ref", "refs/heads/" + AC_DEV_BRANCH, target_commit, expected_commit)
+            post = _worktree_adoption_snapshot(canonical, "refs/heads/" + AC_DEV_BRANCH)
+            if post["ref"] != target_commit or post["head"] != expected_commit:
+                raise click.ClickException("canonical dev adoption CAS postcondition failed; stop for audit")
+            status = "cas"
+        else:
+            raise click.ClickException("canonical dev adoption CAS ref drift before Git effects")
+    else:
+        if branch == AC_DEV_BRANCH and canonical_snapshot["head"] == target_commit and canonical_snapshot["ref"] == target_commit:
+            post = canonical_snapshot
+            status = "idempotent_attached"
+        elif (
+            branch == "" and canonical_snapshot["head"] == expected_commit
+            and canonical_snapshot["ref"] == target_commit and canonical_snapshot["worktree_clean"] == "true"
+        ):
+            _git_checked(canonical, "checkout", AC_DEV_BRANCH)
+            post = _worktree_adoption_snapshot(canonical, "refs/heads/" + AC_DEV_BRANCH)
+            if post["head"] != target_commit or post["tree"] != target_tree or post["worktree_clean"] != "true":
+                raise click.ClickException("canonical dev adoption attach postcondition failed; stop for audit")
+            status = "attached"
+        else:
+            raise click.ClickException("canonical dev adoption attach precondition failed before Git effects")
+    receipt = {
+        "schema_version": "ac_dev_canonical_ref_adoption.v2",
+        "stage": {"detach": "detached", "cas": "cas", "attach": "attached"}[phase],
+        "status": status,
+        "expected_commit": expected_commit,
+        "target_commit": target_commit,
+        "target_tree": target_tree,
+        "candidate": candidate_snapshot,
+        "stable": current_stable,
+        "pre": canonical_snapshot,
+        "post": post,
+    }
+    return {**receipt, "receipt_sha256": _sha256_json(receipt)}
+
+
 @click.group()
 @click.version_option(package_name="aming-claw")
 def main():
     """aming-claw - governance-driven workflow platform."""
     pass
+
+
+@main.command("dev-adopt-canonical")
+@click.option(
+    "--candidate-worktree", required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Clean QA target worktree at the fixed adoption commit.",
+)
+@click.option(
+    "--canonical-worktree", required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="The sole clean worktree currently holding codex/ac-dev.",
+)
+@click.option(
+    "--dev-pid-file", required=True, type=click.Path(path_type=Path),
+    help="Persisted dev PID record; a live PID rejects adoption.",
+)
+@click.option(
+    "--route-token", required=True,
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True, path_type=Path),
+    help="Full server-issued route token; verified locally against the dev DB.",
+)
+@click.option(
+    "--route-intent", required=True,
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True, path_type=Path),
+    help="Server response intent locator, never a standalone authorization.",
+)
+@click.option(
+    "--dev-database", required=True,
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True, path_type=Path),
+    help="Canonical local AC-dev SQLite database containing the route registry.",
+)
+@click.option(
+    "--resume-receipt", default=None,
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True, path_type=Path),
+    callback=_require_regular_resume_receipt,
+    help="Prior content-addressed receipt, required only for an exact resume.",
+)
+@click.option(
+    "--phase", type=click.Choice(["detach", "cas", "attach"]), default="detach",
+    show_default=True, help="One interruption-safe adoption phase per invocation.",
+)
+def dev_adopt_canonical(
+    candidate_worktree: Path,
+    canonical_worktree: Path,
+    dev_pid_file: Path,
+    route_token: Path,
+    route_intent: Path,
+    dev_database: Path,
+    resume_receipt: Path | None,
+    phase: str,
+):
+    """Adopt one server-bound canonical dev ref in receipt-bound phases."""
+
+    intent = _route_bound_adoption_intent(
+        route_token_path=route_token,
+        route_intent_path=route_intent,
+        dev_database=dev_database,
+    )
+
+    prior = (
+        _validate_resume_receipt(
+            resume_receipt,
+            expected_commit=intent["expected_commit"],
+            target_commit=intent["target_commit"],
+            route_bound_intent=intent,
+        )
+        if resume_receipt else None
+    )
+
+    result = _adopt_canonical_dev_ref(
+        candidate_worktree=candidate_worktree,
+        canonical_worktree=canonical_worktree,
+        expected_commit=intent["expected_commit"],
+        target_commit=intent["target_commit"],
+        target_tree=intent["target_tree"],
+        pid_path=dev_pid_file,
+        resume_receipt=prior,
+        phase=phase,
+    )
+    result["route_bound_intent"] = intent
+    result["receipt_sha256"] = _sha256_json({key: value for key, value in result.items() if key != "receipt_sha256"})
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
 
 
 @main.command()
