@@ -2478,9 +2478,10 @@ def _validated_linked_v3_receipt(
         or database_identity.get("device") != canonical_database_identity["device"]
         or database_identity.get("inode") != canonical_database_identity["inode"]
         or receipt.get("plan_sha256") != plan_sha256
-        or (receipt.get("database_sha256_after") != _admission_database_sha256(
-            database, expected_identity=canonical_database_identity,
-        ) and not allow_postimage)
+        or (not allow_postimage and receipt.get("database_sha256_after")
+            != _admission_database_sha256(
+                database, expected_identity=canonical_database_identity,
+            ))
     ):
         raise click.ClickException("AC dev durable launch linked-v3 receipt mismatch")
     _validate_admission_receipt_chain(
