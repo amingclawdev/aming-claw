@@ -2405,6 +2405,8 @@ _AC_DEV_DURABLE_LAUNCH_VERSION = "ac_dev_durable_launch.v1"
 _AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION = (
     "ac_dev_canonical_legacy_postimage_adoption.v1"
 )
+_DURABLE_START_LEGACY_ADOPTION = "LEGACY_ADOPTION"
+_DURABLE_START_COMPLETED_BOOTSTRAP = "COMPLETED_BOOTSTRAP"
 
 
 def _immutable_sqlite_projection(path: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -3219,6 +3221,14 @@ def _completed_dashboard_bootstrap_binding(root: Path) -> dict[str, Any] | None:
             "bootstrap_pending_sha256": pending_sha}
 
 
+def _durable_start_phase(root: Path) -> tuple[str, dict[str, Any] | None]:
+    """Closed durable-start phase selection; artifacts may never fall back."""
+    archive = root / "archive" / "dashboard-backlog-bootstrap"
+    if archive.exists() or archive.is_symlink():
+        return _DURABLE_START_COMPLETED_BOOTSTRAP, _completed_dashboard_bootstrap_binding(root)
+    return _DURABLE_START_LEGACY_ADOPTION, None
+
+
 @main.command("dev-bootstrap-dashboard-backlog")
 @click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--project-id", required=True)
@@ -3317,8 +3327,10 @@ def _durable_listener_pid(port: int) -> int:
 def _validated_linked_v3_receipt(
     receipt_path: Path, *, dev_storage: Path, database: Path,
     database_identity: Mapping[str, object], source_identity: Mapping[str, object],
-    allow_postimage: bool = False,
+    allow_postimage: bool = False, durable_start_phase: str = _DURABLE_START_LEGACY_ADOPTION,
 ) -> tuple[str, dict[str, Any]]:
+    if durable_start_phase not in {_DURABLE_START_LEGACY_ADOPTION, _DURABLE_START_COMPLETED_BOOTSTRAP}:
+        raise click.ClickException("AC dev durable launch phase is invalid")
     archive = dev_storage / "archive" / "schema-admission"
     receipt, digest = _read_admission_receipt(receipt_path.absolute(), archive=archive)
     from agent.governance import db as _db
@@ -3329,11 +3341,18 @@ def _validated_linked_v3_receipt(
         receipt.get("source_identity")
     )
     historical_source = dict(receipt_source.get("cli_source") or {})
+    if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
+        # Bootstrap owns the current postimage; this re-authenticates only the
+        # sealed historical bridge and deliberately never asks legacy code to
+        # compare today's logical database with adoption-era bytes.
+        _historical_dashboard_bootstrap_adoption(dev_storage)
     if historical_source != dict(source_identity):
         adoptions = _canonical_adoption_receipts(dev_storage)
         runtime = dev_storage / "runtime" / "durable-launch"
         completed_generations = list(runtime.glob("launch.*.json")) if runtime.is_dir() else []
-        if completed_generations:
+        if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
+            _historical_dashboard_bootstrap_adoption(dev_storage)
+        elif completed_generations:
             # Adoption is an immutable ancestor authority.  Once child custody
             # has produced a completed generation the database is necessarily
             # a postimage, so reconstructing the legacy payload is both
@@ -3500,12 +3519,14 @@ def _durable_dev_launch(
     runtime = dev_storage / "runtime" / "durable-launch"
     runtime.mkdir(parents=True, exist_ok=True)
     lock = runtime / "launch.lock"
+    durable_phase, bootstrap_binding = _durable_start_phase(dev_storage)
+    if durable_phase == _DURABLE_START_COMPLETED_BOOTSTRAP and bootstrap_binding is None:
+        raise click.ClickException("dashboard backlog bootstrap durable phase is incomplete")
     linked_digest, _linked = _validated_linked_v3_receipt(
         linked_receipt, dev_storage=dev_storage, database=database,
         database_identity=database_identity, source_identity=source_identity,
-        allow_postimage=True,
+        allow_postimage=True, durable_start_phase=durable_phase,
     )
-    bootstrap_binding = _completed_dashboard_bootstrap_binding(dev_storage)
     if bootstrap_binding is None:
         from agent.governance.db import validate_dev_preimage_only
         preimage = validate_dev_preimage_only(
@@ -4014,10 +4035,11 @@ def _durable_dev_stop(dev_storage: Path) -> None:
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", linked_digest):
         raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
     linked_path = dev_storage / "archive" / "schema-admission" / f"{linked_digest[7:]}.json"
+    durable_phase, _bootstrap = _durable_start_phase(dev_storage)
     validated_digest, _ = _validated_linked_v3_receipt(
         linked_path, dev_storage=dev_storage, database=database,
         database_identity=database_identity, source_identity=current_source,
-        allow_postimage=True,
+        allow_postimage=True, durable_start_phase=durable_phase,
     )
     if validated_digest != linked_digest:
         raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
@@ -4210,12 +4232,13 @@ def start(
             isolated_database = selected_dev_storage / "governance" / "aming-claw" / "governance.db"
             if not isolated_database.is_file():
                 raise click.ClickException("AC dev durable launch requires its existing receipt-bound database")
+            durable_phase, _bootstrap = _durable_start_phase(selected_dev_storage)
             _validated_linked_v3_receipt(
                 linked_v3_receipt, dev_storage=selected_dev_storage,
                 database=isolated_database,
                 database_identity=_admission_identity(isolated_database),
                 source_identity=dev_identity,
-                allow_postimage=True,
+                allow_postimage=True, durable_start_phase=durable_phase,
             )
         # Listener ownership is the first dev-world admission decision.  A
         # running or foreign process must be rejected before bootstrap, source
