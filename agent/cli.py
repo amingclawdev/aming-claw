@@ -3052,6 +3052,7 @@ def start(
                 database=isolated_database,
                 database_identity=_admission_identity(isolated_database),
                 source_identity=dev_identity,
+                allow_postimage=True,
             )
         # Listener ownership is the first dev-world admission decision.  A
         # running or foreign process must be rejected before bootstrap, source
