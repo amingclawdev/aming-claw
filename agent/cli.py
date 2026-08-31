@@ -1343,6 +1343,43 @@ def _admission_identity(path: Path) -> dict[str, object]:
     }
 
 
+def _canonical_dev_database_identity_projection(database: Path) -> dict[str, object]:
+    """Derive the full v2 identity carried by durable launch receipts."""
+    from agent.governance import db as _db
+    physical = _admission_identity(database)
+    uri = "file:" + urllib.parse.quote(str(database.absolute())) + "?mode=ro&immutable=1"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=0)
+        meta = dict(connection.execute(
+            "SELECT key, value FROM schema_meta WHERE key IN "
+            "('governance_world_id', 'governance_world_genesis_sha256')"
+        ))
+    except sqlite3.Error as exc:
+        raise click.ClickException("AC dev durable database identity is unreadable") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    genesis = str(meta.get("governance_world_genesis_sha256") or "")
+    expected = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw",
+        "device": physical["device"], "inode": physical["inode"],
+        "relative_path_sha256": "sha256:" + hashlib.sha256(
+            _db.AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+        "genesis_sha256": genesis,
+    }
+    if meta.get("governance_world_id") != "ac-dev" or not _exact_sha256(genesis):
+        raise click.ClickException("AC dev durable database identity is invalid")
+    return expected
+
+
+def _matches_canonical_dev_database_identity(database: Path, claimed: object) -> bool:
+    """Require every full-v2 field, never compare it to a reduced identity."""
+    return isinstance(claimed, Mapping) and dict(claimed) == _canonical_dev_database_identity_projection(database)
+
+
 def _admission_regular_file(path: Path, *, archive: Path | None = None) -> None:
     try:
         details = path.lstat()
@@ -2728,7 +2765,9 @@ def _stopped_dashboard_bootstrap_ancestry(
                 or launch.get("dev_storage_root") != str(root)
                 or launch.get("database_path") != str(database)
                 or launch.get("database_sha256_after") != current_sha
-                or launch.get("database_identity") != _admission_identity(database)
+                or not _matches_canonical_dev_database_identity(
+                    database, launch.get("database_identity")
+                )
                 or launch.get("policy") != {"runtime_plane": "dev", "migration": "verify-only",
                     "stable_deployment": "deny", "graph_activation": "deny",
                     "background_workers": "deny"}):
@@ -2861,7 +2900,9 @@ def _offline_dashboard_backlog_bootstrap(
                 or prior.get("source_identity") != source_before
                 or prior.get("source_projection") != source_projection
                 or prior.get("target_database_sha256_after") != target_before["sha256"]
-                or recorded_ancestry.get("database_identity") != _admission_identity(target)):
+                or not _matches_canonical_dev_database_identity(
+                    target, recorded_ancestry.get("database_identity")
+                )):
             raise click.ClickException("dashboard backlog bootstrap replay drift")
         return {"status": "already_bootstrapped", "receipt": str(existing[0]),
                 "receipt_sha256": prior_sha, "row_count": source_projection["row_count"]}
