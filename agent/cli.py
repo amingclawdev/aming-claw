@@ -1313,6 +1313,7 @@ def status():
 
 
 _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION = "ac_dev_offline_schema_admission.v2"
+_AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION = "ac_dev_offline_schema_admission.v3"
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -1441,6 +1442,34 @@ def _admission_source_identity(source_tip_raw: str) -> dict[str, object]:
     }
 
 
+def _validated_historical_admission_source_identity(value: object) -> dict[str, object]:
+    """Validate a receipt's immutable source binding without rebinding its CLI."""
+    if not isinstance(value, dict) or not isinstance(value.get("db_source_tip"), dict):
+        raise click.ClickException(
+            "AC dev schema admission recertification historical source mismatch"
+        )
+    db_tip = value["db_source_tip"]
+    cli_source = value.get("cli_source")
+    db_tip_sha256 = "sha256:" + hashlib.sha256(_canonical_json_bytes(db_tip)).hexdigest()
+    cli_sha256 = (
+        "sha256:" + hashlib.sha256(_canonical_json_bytes(cli_source)).hexdigest()
+        if isinstance(cli_source, dict) else ""
+    )
+    if (
+        value.get("db_source_tip_sha256") != db_tip_sha256
+        or value.get("cli_source_sha256") != cli_sha256
+        or not isinstance(cli_source, dict)
+        or cli_source.get("branch") != AC_DEV_BRANCH
+        or cli_source.get("dirty") != ""
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(cli_source.get("commit") or ""))
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(cli_source.get("tree") or ""))
+    ):
+        raise click.ClickException(
+            "AC dev schema admission recertification historical source mismatch"
+        )
+    return dict(value)
+
+
 def _write_admission_receipt(archive: Path, payload: dict[str, Any]) -> tuple[Path, str]:
     """Persist a byte-addressed receipt without placing its own hash in it."""
     archive.mkdir(parents=True, exist_ok=True)
@@ -1480,7 +1509,10 @@ def _read_admission_receipt(path: Path, *, archive: Path) -> tuple[dict[str, Any
         value = json.loads(raw)
     except (ValueError, json.JSONDecodeError) as exc:
         raise click.ClickException("AC dev schema admission receipt is not JSON") from exc
-    if not isinstance(value, dict) or value.get("schema_version") != _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION:
+    if not isinstance(value, dict) or value.get("schema_version") not in {
+        _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
+        _AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION,
+    }:
         raise click.ClickException("AC dev schema admission receipt schema mismatch")
     return value, "sha256:" + digest
 
@@ -1503,8 +1535,15 @@ def _validate_admission_receipt_chain(
     current_digest = receipt_sha256
     descendant_before: dict[str, object] | None = None
     descendant_database_before = ""
+    descendant: dict[str, Any] | None = None
     while True:
-        if set(current) != required or current.get("schema_version") != _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION:
+        current_required = set(required)
+        if current.get("schema_version") == _AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION:
+            current_required.add("recertification")
+        if set(current) != current_required or current.get("schema_version") not in {
+            _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
+            _AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION,
+        }:
             raise click.ClickException("AC dev schema admission receipt fields mismatch")
         if (
             current.get("stage") not in {"completed", "rolled_back"}
@@ -1525,11 +1564,26 @@ def _validate_admission_receipt_chain(
         _admission_regular_file(backup_path, archive=archive)
         if _admission_identity(backup_path) != backup_identity or _file_sha256(backup_path) != backup["sha256"]:
             raise click.ClickException("AC dev schema admission receipt backup changed")
-        if descendant_before is not None and (
-            current.get("schema_inventory_after") != descendant_before
-            or current.get("database_sha256_after") != descendant_database_before
-        ):
-            raise click.ClickException("AC dev schema admission receipt chain is discontinuous")
+        if descendant_before is not None:
+            inventory_continuous = current.get("schema_inventory_after") == descendant_before
+            database_continuous = current.get("database_sha256_after") == descendant_database_before
+            recertification = dict(descendant.get("recertification") or {}) if descendant else {}
+            stale_bridge = (
+                inventory_continuous and not database_continuous and descendant is not None
+                and descendant.get("schema_version") == _AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION
+                and descendant.get("stage") == "completed" and descendant.get("changed") is False
+                and descendant.get("missing") == []
+                and descendant.get("schema_inventory_before") == descendant.get("schema_inventory_after")
+                and descendant.get("database_sha256_before") == descendant.get("database_sha256_after")
+                and recertification == {
+                    "mode": "existing_bytes_from_stale_completed_receipt",
+                    "historical_receipt_sha256": current_digest,
+                    "historical_database_sha256_after": current.get("database_sha256_after"),
+                    "current_database_sha256": descendant.get("database_sha256_after"),
+                }
+            )
+            if not (inventory_continuous and database_continuous) and not stale_bridge:
+                raise click.ClickException("AC dev schema admission receipt chain is discontinuous")
         previous = current.get("previous_receipt_sha256")
         if not isinstance(previous, str):
             raise click.ClickException("AC dev schema admission receipt predecessor mismatch")
@@ -1538,6 +1592,7 @@ def _validate_admission_receipt_chain(
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", previous) or previous == current_digest:
             raise click.ClickException("AC dev schema admission receipt predecessor mismatch")
         previous_path = archive / (previous.removeprefix("sha256:") + ".json")
+        descendant = current
         descendant_before = current["schema_inventory_before"]
         descendant_database_before = str(current["database_sha256_before"])
         current, current_digest = _read_admission_receipt(previous_path, archive=archive)
@@ -1545,7 +1600,8 @@ def _validate_admission_receipt_chain(
 
 def _offline_dev_schema_admission(
     storage_root: Path, *, project_id: str, port: int, resume_receipt: Path | None,
-    authority_projection: bool = False, recertify_existing_bytes: bool = False,
+    authority_projection: bool = False,
+    recertify_existing_bytes: Path | None = None,
     _after_checkpoint_for_test=None,
 ) -> dict[str, Any]:
     """One-shot, offline-only repair for the bounded dev backlog-read plan.
@@ -1599,18 +1655,66 @@ def _offline_dev_schema_admission(
         drift = _db.backlog_read_schema_drift
         plan_fn = _db.backlog_read_schema_plan
         inventory_fn = _db.backlog_read_schema_inventory
-    if recertify_existing_bytes and (not authority_projection or resume_receipt is not None):
+    if recertify_existing_bytes is not None and (not authority_projection or resume_receipt is not None):
         raise click.ClickException(
             "AC dev schema admission recertification requires authority schema and no resume receipt"
         )
-    if recertify_existing_bytes:
+    if recertify_existing_bytes is not None:
         root_identity = _admission_identity(root)
         database_identity = _admission_identity(database)
+        archive = root / "archive" / "schema-admission"
+        historical, historical_sha256 = _read_admission_receipt(
+            recertify_existing_bytes.absolute(), archive=archive,
+        )
+        plan_sha256 = "sha256:" + hashlib.sha256(
+            _canonical_json_bytes(plan_fn())
+        ).hexdigest()
+        expected_inventory = _db.authority_projection_schema_inventory()
+        historical_source = _validated_historical_admission_source_identity(
+            historical.get("source_identity")
+        )
+        historical_db_tip = historical_source["db_source_tip"]
+        expected_source = historical_source
+        if (
+            historical.get("schema_version") != _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION
+            or historical.get("stage") != "completed"
+            or historical.get("changed") is not True
+            or historical.get("project_id") != project_id
+            or historical.get("port") != port
+            or historical.get("root_identity") != root_identity
+            or historical.get("database_identity") != database_identity
+            or historical.get("source_identity") != expected_source
+            or historical.get("plan_sha256") != plan_sha256
+            or historical.get("schema_inventory_after") != expected_inventory
+            or len(list(expected_inventory.get("inventory") or [])) != 308
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(historical.get("database_sha256_after") or ""),
+            )
+        ):
+            raise click.ClickException(
+                "AC dev schema admission recertification historical receipt mismatch"
+            )
+        _validate_admission_receipt_chain(
+            historical, historical_sha256, archive=archive,
+            project_id=project_id, port=port, root_identity=root_identity,
+            database_identity=database_identity, source_identity=expected_source,
+            plan_sha256=plan_sha256,
+        )
+        artifacts_before = _admission_sqlite_artifact_identities(database)
+        if any(artifacts_before.get(suffix) is not None for suffix in ("-wal", "-shm", "-journal")):
+            raise click.ClickException(
+                "AC dev schema admission recertification requires durable sidecar-free bytes"
+            )
         durable_before = _admission_database_sha256(
             database, expected_identity=database_identity,
         )
+        if historical["database_sha256_after"] == durable_before:
+            raise click.ClickException(
+                "AC dev schema admission recertification requires a stale completed receipt"
+            )
         readonly = sqlite3.connect(
-            "file:" + urllib.parse.quote(str(database)) + "?mode=ro", uri=True,
+            "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1", uri=True,
             timeout=0, isolation_level=None,
         )
         try:
@@ -1633,12 +1737,17 @@ def _offline_dev_schema_admission(
             if state["missing"] or state["invalid"]:
                 raise click.ClickException("AC dev schema admission recertification requires complete exact schema")
             inventory = inventory_fn(readonly)
-            source_identity = _admission_source_identity(
-                str(meta["governance_world_source_tip_json"])
-            )
-            plan_sha256 = "sha256:" + hashlib.sha256(
-                _canonical_json_bytes(plan_fn())
-            ).hexdigest()
+            current_db_tip = json.loads(str(meta["governance_world_source_tip_json"]))
+            if (
+                current_db_tip != historical_db_tip
+                or "sha256:" + hashlib.sha256(
+                    _canonical_json_bytes(current_db_tip)
+                ).hexdigest() != historical_source["db_source_tip_sha256"]
+            ):
+                raise click.ClickException(
+                    "AC dev schema admission recertification current source-tip mismatch"
+                )
+            source_identity = historical_source
         finally:
             readonly.close()
         durable_after = _admission_database_sha256(
@@ -1646,8 +1755,14 @@ def _offline_dev_schema_admission(
         )
         if durable_after != durable_before:
             raise click.ClickException("AC dev schema admission recertification changed database bytes")
-        archive = root / "archive" / "schema-admission"
-        archive.mkdir(parents=True, exist_ok=True)
+        if inventory != expected_inventory or source_identity != expected_source:
+            raise click.ClickException(
+                "AC dev schema admission recertification current database binding mismatch"
+            )
+        if _admission_sqlite_artifact_identities(database) != artifacts_before:
+            raise click.ClickException(
+                "AC dev schema admission recertification changed SQLite artifacts"
+            )
         backup = archive / (durable_after.removeprefix("sha256:") + ".pre.sqlite")
         if backup.exists():
             _admission_regular_file(backup, archive=archive)
@@ -1656,7 +1771,7 @@ def _offline_dev_schema_admission(
         if _file_sha256(backup) != durable_after:
             raise click.ClickException("AC dev schema admission backup digest mismatch")
         payload = {
-            "schema_version": _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
+            "schema_version": _AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION,
             "stage": "completed", "project_id": project_id, "port": port,
             "root_identity": root_identity, "database_identity": database_identity,
             "source_identity": source_identity, "plan_sha256": plan_sha256,
@@ -1664,7 +1779,14 @@ def _offline_dev_schema_admission(
             "backup": {"identity": _admission_identity(backup), "sha256": durable_after},
             "database_sha256_before": durable_before,
             "database_sha256_after": durable_after,
-            "previous_receipt_sha256": "", "changed": False, "missing": [],
+            "previous_receipt_sha256": historical_sha256,
+            "changed": False, "missing": [],
+            "recertification": {
+                "mode": "existing_bytes_from_stale_completed_receipt",
+                "historical_receipt_sha256": historical_sha256,
+                "historical_database_sha256_after": historical["database_sha256_after"],
+                "current_database_sha256": durable_after,
+            },
         }
         receipt_path, receipt_digest = _write_admission_receipt(archive, payload)
         return {
@@ -1690,6 +1812,20 @@ def _offline_dev_schema_admission(
         previous_sha256 = ""
         if resume_receipt is not None:
             prior, previous_sha256 = _read_admission_receipt(resume_receipt.absolute(), archive=archive)
+            if prior.get("schema_version") == _AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION:
+                source_identity = _validated_historical_admission_source_identity(
+                    prior.get("source_identity")
+                )
+                try:
+                    current_tip = json.loads(str(meta["governance_world_source_tip_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise click.ClickException(
+                        "AC dev schema admission recertification current source-tip mismatch"
+                    ) from exc
+                if current_tip != source_identity["db_source_tip"]:
+                    raise click.ClickException(
+                        "AC dev schema admission recertification current source-tip mismatch"
+                    )
             _validate_admission_receipt_chain(
                 prior, previous_sha256, archive=archive, project_id=project_id,
                 port=port, root_identity=root_identity,
@@ -1827,8 +1963,12 @@ def dev_admit_schema(dev_storage_root: Path, project_id: str, port: int, resume_
 @click.option("--project-id", required=True)
 @click.option("--port", required=True, type=int)
 @click.option("--resume-receipt", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--recertify-existing-bytes", is_flag=True)
-def dev_admit_authority_schema(dev_storage_root: Path, project_id: str, port: int, resume_receipt: Path | None, recertify_existing_bytes: bool) -> None:
+@click.option(
+    "--recertify-existing-bytes", default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Historical immutable completed receipt whose stale DB hash is recertified.",
+)
+def dev_admit_authority_schema(dev_storage_root: Path, project_id: str, port: int, resume_receipt: Path | None, recertify_existing_bytes: Path | None) -> None:
     """Offline-only admission of the complete six-table AC authority plan."""
     try:
         click.echo(json.dumps(_offline_dev_schema_admission(

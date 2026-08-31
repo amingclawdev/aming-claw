@@ -3965,6 +3965,10 @@ def test_dev_admit_authority_schema_existing_byte_recertification_is_read_only_a
     import sqlite3
 
     monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: {
+        "root": "/source/ac-dev", "branch": "codex/ac-dev", "commit": "a" * 40,
+        "tree": "b" * 40, "source_sha256": "sha256:" + "c" * 64, "dirty": "",
+    })
     root = tmp_path / "external-authority-recertify"
     database = root / "governance" / "aming-claw" / "governance.db"
     database.parent.mkdir(parents=True)
@@ -3985,6 +3989,16 @@ def test_dev_admit_authority_schema_existing_byte_recertification_is_read_only_a
     assert admitted.exit_code == 0, admitted.output
     stale_receipt = Path(json.loads(admitted.output)["receipt_path"])
 
+    generic = CliRunner().invoke(main, command + ["--recertify-existing-bytes"])
+    assert generic.exit_code != 0 and "requires an argument" in generic.output
+    same_hash_bytes = database.read_bytes()
+    same_hash = CliRunner().invoke(
+        main, command + ["--recertify-existing-bytes", str(stale_receipt)]
+    )
+    assert same_hash.exit_code != 0
+    assert "requires a stale completed receipt" in same_hash.output
+    assert database.read_bytes() == same_hash_bytes
+
     changed = sqlite3.connect(database)
     changed.execute("PRAGMA user_version=313")
     changed.commit(); changed.close()
@@ -3993,8 +4007,26 @@ def test_dev_admit_authority_schema_existing_byte_recertification_is_read_only_a
     assert rejected.exit_code != 0
     assert "completed receipt does not match current database" in rejected.output
     assert database.read_bytes() == current_bytes
+    conflicting = CliRunner().invoke(main, command + [
+        "--resume-receipt", str(stale_receipt),
+        "--recertify-existing-bytes", str(stale_receipt),
+    ])
+    assert conflicting.exit_code != 0
+    assert "no resume receipt" in conflicting.output
+    assert database.read_bytes() == current_bytes
+    # The source-owned repair necessarily runs from a successor CLI commit;
+    # historical source identity remains immutable predecessor evidence.
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: {
+        "root": "/source/ac-dev", "branch": "codex/ac-dev", "commit": "d" * 40,
+        "tree": "e" * 40, "source_sha256": "sha256:" + "f" * 64, "dirty": "",
+    })
 
-    recertified = CliRunner().invoke(main, command + ["--recertify-existing-bytes"])
+    old_receipt_bytes = stale_receipt.read_bytes()
+    old_sidecar = stale_receipt.with_suffix(".sha256")
+    old_sidecar_bytes = old_sidecar.read_bytes()
+    recertified = CliRunner().invoke(
+        main, command + ["--recertify-existing-bytes", str(stale_receipt)]
+    )
     assert recertified.exit_code == 0, recertified.output
     output = json.loads(recertified.output)
     assert output["status"] == "recertified_existing_bytes"
@@ -4002,11 +4034,77 @@ def test_dev_admit_authority_schema_existing_byte_recertification_is_read_only_a
     assert database.read_bytes() == current_bytes
     receipt = Path(output["receipt_path"])
     payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["previous_receipt_sha256"] == "sha256:" + hashlib.sha256(old_receipt_bytes).hexdigest()
     assert payload["database_sha256_before"] == payload["database_sha256_after"]
     assert payload["database_sha256_after"] == "sha256:" + hashlib.sha256(current_bytes).hexdigest()
+    assert stale_receipt.read_bytes() == old_receipt_bytes
+    assert old_sidecar.read_bytes() == old_sidecar_bytes
     resumed = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
     assert resumed.exit_code == 0, resumed.output
     assert json.loads(resumed.output)["status"] == "already_admitted"
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["rolled_back", "root", "database", "source", "plan", "inventory_count"],
+)
+def test_dev_admit_authority_schema_recertification_rejects_foreign_predecessor_before_target_sqlite_open(tmp_path, monkeypatch, mismatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: {
+        "root": "/source/ac-dev", "branch": "codex/ac-dev", "commit": "a" * 40,
+        "tree": "b" * 40, "source_sha256": "sha256:" + "c" * 64, "dirty": "",
+    })
+    root = tmp_path / "external-authority-noncompleted"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database); conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ]); conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    command = ["dev-admit-authority-schema", "--dev-storage-root", str(root),
+               "--project-id", "aming-claw", "--port", "40008"]
+    admitted = CliRunner().invoke(main, command)
+    assert admitted.exit_code == 0, admitted.output
+    completed = Path(json.loads(admitted.output)["receipt_path"])
+    archive = completed.parent
+    payload = json.loads(completed.read_text(encoding="utf-8"))
+    if mismatch == "rolled_back":
+        payload["stage"] = "rolled_back"
+    elif mismatch == "root":
+        payload["root_identity"] = {**payload["root_identity"], "inode": -1}
+    elif mismatch == "database":
+        payload["database_identity"] = {**payload["database_identity"], "inode": -1}
+    elif mismatch == "source":
+        payload["source_identity"] = {**payload["source_identity"], "cli_source_sha256": "sha256:" + "0" * 64}
+    elif mismatch == "plan":
+        payload["plan_sha256"] = "sha256:" + "0" * 64
+    else:
+        payload["schema_inventory_after"] = {
+            **payload["schema_inventory_after"],
+            "inventory": payload["schema_inventory_after"]["inventory"][:-1],
+        }
+    forged, _digest = cli._write_admission_receipt(archive, payload)
+    opened = []
+    original_connect = cli.sqlite3.connect
+    def tracked_connect(target, *args, **kwargs):
+        opened.append(str(target))
+        return original_connect(target, *args, **kwargs)
+    monkeypatch.setattr(cli.sqlite3, "connect", tracked_connect)
+    before = database.read_bytes()
+    rejected = CliRunner().invoke(
+        main, command + ["--recertify-existing-bytes", str(forged)]
+    )
+    assert rejected.exit_code != 0
+    assert re.search(r"historical (receipt|source) mismatch", rejected.output)
+    assert database.read_bytes() == before
+    assert not any(str(database) in target for target in opened)
 
 
 @pytest.mark.parametrize("drift", ["wal_replacement", "database_replacement", "database_hash"])

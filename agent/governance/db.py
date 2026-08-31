@@ -2205,6 +2205,17 @@ def authority_projection_schema_plan() -> dict[str, object]:
     }
 
 
+def authority_projection_schema_inventory() -> dict[str, object]:
+    """Return the exact full source-owned inventory for receipt preflight."""
+    with closing(sqlite3.connect(":memory:")) as memory:
+        memory.row_factory = sqlite3.Row
+        _configure_connection(memory, busy_timeout=10000)
+        _ensure_schema(memory)
+        for statement in _authority_projection_schema_statements():
+            memory.execute(statement)
+        return backlog_read_schema_inventory(memory)
+
+
 def authority_projection_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
     """Fail closed unless this is exactly the six-object pristine absence."""
     base = _canonical_authority_projection_schema_inventory(include_plan=False)
