@@ -2730,11 +2730,13 @@ def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
         missing.append("generation_table")
     elif table[0] != "table" or _backlog_read_normalized_sql(table[3]) != _backlog_read_normalized_sql(BACKLOG_READ_SCHEMA_TABLE_SQL):
         invalid.append("generation_table")
+        invalid.append("inventory_altered:table:dashboard_backlog_cache_generation")
     index = actual.get("idx_backlog_bugs_dashboard_keyset")
     if index is None:
         missing.append("keyset_index")
     elif index[0] != "index" or index[2] != "backlog_bugs" or _backlog_read_normalized_sql(index[3]) != _backlog_read_normalized_sql(BACKLOG_READ_SCHEMA_INDEX_SQL):
         invalid.append("keyset_index")
+        invalid.append("inventory_altered:index:idx_backlog_bugs_dashboard_keyset")
     for event, sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.items():
         name = f"trg_dashboard_backlog_cache_{event.lower()}"
         trigger = actual.get(name)
@@ -2742,6 +2744,7 @@ def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
             missing.append(f"trigger_{event.lower()}")
         elif trigger[0] != "trigger" or trigger[2] != "backlog_bugs" or _backlog_read_normalized_sql(trigger[3]) != _backlog_read_normalized_sql(sql):
             invalid.append(f"trigger_{event.lower()}")
+            invalid.append("inventory_altered:trigger:" + name)
     if table is not None and "generation_table" not in invalid:
         seeds = conn.execute(
             "SELECT resource, generation, updated_at FROM dashboard_backlog_cache_generation "
@@ -2751,27 +2754,25 @@ def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
             missing.append("backlog_generation_seed")
         elif len(seeds) != 1 or str(seeds[0][0]) != BACKLOG_READ_SCHEMA_RESOURCE or int(seeds[0][1]) < 1 or not str(seeds[0][2]):
             invalid.append("backlog_generation_seed")
-    # The bounded plan is additive, but it is still part of one source-derived
-    # schema ABI.  Compare every user-visible table/index/trigger/view and its
-    # SQL definition, rather than inspecting only the five new names.
-    base_inventory = _canonical_backlog_read_schema_inventory(include_plan=False)
-    full_inventory = _canonical_backlog_read_schema_inventory(include_plan=True)
-    actual_inventory = _sqlite_master_inventory(conn)
-    base_map = {(kind, name, table): sql for kind, name, table, sql in base_inventory}
-    full_map = {(kind, name, table): sql for kind, name, table, sql in full_inventory}
-    actual_map = {(kind, name, table): sql for kind, name, table, sql in actual_inventory}
-    for key in sorted(set(actual_map) - set(full_map)):
-        invalid.append("inventory_extra:" + ":".join(key))
-    for key in sorted(set(base_map) - set(actual_map)):
-        invalid.append("inventory_missing:" + ":".join(key))
-    for key in sorted(set(actual_map) & set(full_map)):
-        if actual_map[key] != full_map[key]:
-            invalid.append("inventory_altered:" + ":".join(key))
-    present_plan = {
-        key for key in full_map if key not in base_map and key in actual_map
+    # This admission owns only the bounded backlog-read namespace.  Runtime,
+    # observer, worker, and contract objects are protected by the caller's
+    # complete inventory/projection binding; treating them as backlog drift
+    # would incorrectly force a pristine whole-world database.
+    managed_names = {
+        "dashboard_backlog_cache_generation", "idx_backlog_bugs_dashboard_keyset",
+        *(f"trg_dashboard_backlog_cache_{event.lower()}" for event in BACKLOG_READ_SCHEMA_TRIGGER_SQL),
     }
-    all_plan = {key for key in full_map if key not in base_map}
-    if present_plan and present_plan != all_plan:
+    base_names = {name for _kind, name, _table, _sql in _canonical_backlog_read_schema_inventory(include_plan=False)}
+    for kind, name, table_name, _sql in _sqlite_master_inventory(conn):
+        # Any collision/shadow object that claims the managed backlog naming
+        # domain remains fail-closed; unrelated objects do not.
+        if name in managed_names or name.startswith("sqlite_autoindex_dashboard_backlog_cache_generation_"):
+            continue
+        if name not in base_names and ("dashboard" in name.lower() or name.startswith("shadow_backlog")):
+            invalid.append("inventory_extra:" + ":".join((kind, name, table_name)))
+    # A partially materialized managed object set is never repairable: only
+    # the pristine absence of all five objects may be admitted.
+    if any(name in actual for name in managed_names) and missing:
         invalid.append("inventory_partial_plan")
     return {"missing": sorted(set(missing)), "invalid": sorted(set(invalid))}
 
