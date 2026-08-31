@@ -26,7 +26,7 @@ import shutil
 import tempfile
 from contextlib import closing
 from pathlib import Path
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -916,6 +916,123 @@ def _graph_materialization_canonical_inventory() -> list[tuple[str, str, str, st
         canonical.close()
 
 
+def _graph_schema_owner_inventory(
+    ensure_schema: Callable[[sqlite3.Connection], None],
+) -> list[tuple[str, str, str, str]]:
+    """Build one source owner's exact inventory in an isolated database."""
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        connection_ids = set(
+            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+        )
+        connection_ids.add(id(canonical))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        ensure_schema(canonical)
+        return [
+            row for row in _graph_materialization_inventory(canonical)
+            if row[1] != "sqlite_sequence"
+        ]
+    finally:
+        connection_ids = set(
+            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+        )
+        connection_ids.discard(id(canonical))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        canonical.close()
+
+
+def _graph_schema_owner_registry(
+) -> tuple[tuple[str, list[tuple[str, str, str, str]]], ...]:
+    """Return exact source-derived inventories for every admitted graph owner."""
+
+    from . import (
+        asset_impact,
+        asset_projection,
+        graph_correction_patches,
+        graph_events,
+        graph_snapshot_store,
+    )
+
+    return tuple(
+        (owner, _graph_schema_owner_inventory(ensure_schema))
+        for owner, ensure_schema in (
+            ("graph_snapshot_store", graph_snapshot_store.ensure_schema),
+            ("graph_events", graph_events.ensure_schema),
+            ("graph_correction_patches", graph_correction_patches.ensure_schema),
+            ("asset_projection", asset_projection.ensure_schema),
+            ("asset_impact", asset_impact.ensure_schema),
+        )
+    )
+
+
+_GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING = frozenset(
+    {"idx_pending_scope_branch", "idx_pending_scope_status"}
+)
+
+
+def classify_graph_materialization_preimage(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Classify graph schema ownership without DDL or data writes.
+
+    Each source owner may be wholly absent or SQL-exact.  The snapshot owner
+    additionally admits one bounded predecessor that differs only by the two
+    source-defined pending-scope indexes.  No prefix-wide allowlist is used.
+    """
+
+    actual = _graph_materialization_inventory(conn)
+    registry = _graph_schema_owner_registry()
+    known_names: set[str] = set()
+    known_tables: set[str] = set()
+    owner_states: dict[str, str] = {}
+    planned: list[tuple[str, str, str, str]] = []
+    for owner, canonical in registry:
+        owner_names = {row[1] for row in canonical}
+        owner_tables = {row[2] for row in canonical if row[0] == "table"}
+        known_names.update(owner_names)
+        known_tables.update(owner_tables)
+        managed = [
+            row for row in actual
+            if row[1] in owner_names or row[2] in owner_tables
+        ]
+        if not managed:
+            owner_states[owner] = "absent"
+            continue
+        if managed == canonical:
+            owner_states[owner] = "exact"
+            continue
+        if owner == "graph_snapshot_store":
+            missing = [row for row in canonical if row not in managed]
+            if (
+                {row[1] for row in missing}
+                == _GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING
+                and all(row[0] == "index" for row in missing)
+                and managed == [row for row in canonical if row not in missing]
+            ):
+                owner_states[owner] = "pending_scope_index_predecessor"
+                planned.extend(missing)
+                continue
+        raise ValueError(
+            f"AC dev graph materialization owner preimage is not absent or exact: {owner}"
+        )
+
+    unknown = [
+        row for row in actual
+        if (row[1].startswith("graph_") or row[2].startswith("graph_"))
+        and row[1] not in known_names
+        and row[2] not in known_tables
+    ]
+    if unknown:
+        raise ValueError("AC dev graph materialization preimage has unknown graph authority")
+    return {
+        "schema_version": "ac_dev_graph_materialization_preimage.v1",
+        "owner_states": owner_states,
+        "planned_ddl": [row[3] for row in planned],
+        "planned_objects": [row[1] for row in planned],
+    }
+
+
 def _graph_materialization_managed_inventory(
     inventory: Sequence[tuple[str, str, str, str]],
     canonical: Sequence[tuple[str, str, str, str]],
@@ -928,21 +1045,20 @@ def _graph_materialization_managed_inventory(
 def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
     """Verify the three source-owned rebuildable graph schemas without writes."""
 
-    canonical = _graph_materialization_canonical_inventory()
-    actual = _graph_materialization_inventory(conn)
-    managed = _graph_materialization_managed_inventory(actual, canonical)
-    extra_graph = [
-        row for row in actual
-        if row[1].startswith("graph_") and row[1] not in {item[1] for item in canonical}
-    ]
-    if managed != canonical or extra_graph:
+    try:
+        classification = classify_graph_materialization_preimage(conn)
+    except ValueError as exc:
         raise DevRuntimeSchemaVerificationError(
             "graph_materialization",
-            missing_tables=[
-                row[1] for row in canonical
-                if row[0] == "table" and row not in managed
-            ],
-        )
+        ) from exc
+    required = {
+        "graph_snapshot_store",
+        "graph_events",
+        "graph_correction_patches",
+    }
+    owner_states = classification["owner_states"]
+    if any(owner_states[owner] != "exact" for owner in required):
+        raise DevRuntimeSchemaVerificationError("graph_materialization")
 
 
 def admit_ac_dev_graph_materialization_schema(
@@ -978,20 +1094,10 @@ def admit_ac_dev_graph_materialization_schema(
         raise ValueError("AC dev graph materialization database identity is not admitted")
 
     canonical = _graph_materialization_canonical_inventory()
-    before_inventory = _graph_materialization_inventory(conn)
-    before_managed = _graph_materialization_managed_inventory(
-        before_inventory, canonical
-    )
-    canonical_names = {item[1] for item in canonical}
-    extra_graph_before = [
-        row for row in before_inventory
-        if row[1].startswith("graph_") and row[1] not in canonical_names
-    ]
-    # Admission initializes one absent rebuildable materialization or replays
-    # one exact current source inventory.  A partial, altered, extra, or legacy
-    # graph layout is not migrated and cannot be laundered by IF NOT EXISTS.
-    if extra_graph_before or (before_managed and before_managed != canonical):
-        raise ValueError("AC dev graph materialization preimage is not exact or empty")
+    # Admission initializes absent rebuildable owners, replays exact owners,
+    # or applies the one bounded snapshot predecessor.  Other partial,
+    # altered, extra, or legacy layouts cannot be laundered by IF NOT EXISTS.
+    classify_graph_materialization_preimage(conn)
     connection_ids = set(
         getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
     )
@@ -1007,16 +1113,17 @@ def admit_ac_dev_graph_materialization_schema(
             graph_snapshot_store.ensure_schema(conn)
             graph_events.ensure_schema(conn)
             graph_correction_patches.ensure_schema(conn)
-            actual = _graph_materialization_inventory(conn)
-            if _graph_materialization_managed_inventory(actual, canonical) != canonical:
+            postimage = classify_graph_materialization_preimage(conn)
+            required = {
+                "graph_snapshot_store",
+                "graph_events",
+                "graph_correction_patches",
+            }
+            if any(
+                postimage["owner_states"][owner] != "exact"
+                for owner in required
+            ):
                 raise ValueError("AC dev graph materialization schema postcondition failed")
-            extra_graph = [
-                row for row in actual
-                if row[1].startswith("graph_")
-                and row[1] not in canonical_names
-            ]
-            if extra_graph:
-                raise ValueError("AC dev graph materialization schema has extra authority")
             conn.commit()
     except BaseException:
         conn.rollback()

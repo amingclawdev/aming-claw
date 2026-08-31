@@ -144,6 +144,119 @@ def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(mo
         conn.close()
 
 
+def _install_graph_owner_for_preimage_test(db, conn, ensure_schema):
+    connection_ids = set(
+        getattr(db._GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+    )
+    connection_ids.add(id(conn))
+    db._GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+    try:
+        ensure_schema(conn)
+    finally:
+        connection_ids.discard(id(conn))
+        db._GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(
+            connection_ids
+        )
+
+
+def test_graph_materialization_preimage_classifier_accepts_only_exact_predecessor_without_write():
+    from agent.governance import (
+        asset_impact,
+        asset_projection,
+        db,
+        graph_snapshot_store,
+    )
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_graph_owner_for_preimage_test(db, conn, graph_snapshot_store.ensure_schema)
+    _install_graph_owner_for_preimage_test(db, conn, asset_projection.ensure_schema)
+    _install_graph_owner_for_preimage_test(db, conn, asset_impact.ensure_schema)
+    conn.execute("DROP INDEX idx_pending_scope_branch")
+    conn.execute("DROP INDEX idx_pending_scope_status")
+    before_inventory = db._graph_materialization_inventory(conn)
+    before_changes = conn.total_changes
+
+    result = db.classify_graph_materialization_preimage(conn)
+
+    assert result["owner_states"] == {
+        "graph_snapshot_store": "pending_scope_index_predecessor",
+        "graph_events": "absent",
+        "graph_correction_patches": "absent",
+        "asset_projection": "exact",
+        "asset_impact": "exact",
+    }
+    assert set(result["planned_objects"]) == {
+        "idx_pending_scope_branch",
+        "idx_pending_scope_status",
+    }
+    assert len(result["planned_ddl"]) == 2
+    assert all(sql.startswith("CREATE INDEX") for sql in result["planned_ddl"])
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
+
+    for sql in result["planned_ddl"]:
+        conn.execute(sql)
+    repaired = db.classify_graph_materialization_preimage(conn)
+    assert repaired["owner_states"]["graph_snapshot_store"] == "exact"
+    assert repaired["planned_objects"] == []
+    conn.close()
+
+
+@pytest.mark.parametrize("drift", ["one_more_missing", "altered", "unknown"])
+def test_graph_materialization_preimage_classifier_rejects_other_authority(drift):
+    from agent.governance import db, graph_snapshot_store
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_graph_owner_for_preimage_test(db, conn, graph_snapshot_store.ensure_schema)
+    conn.execute("DROP INDEX idx_pending_scope_branch")
+    conn.execute("DROP INDEX idx_pending_scope_status")
+    if drift == "one_more_missing":
+        conn.execute("DROP INDEX idx_graph_snapshots_status")
+    elif drift == "altered":
+        conn.execute("DROP INDEX idx_graph_snapshots_status")
+        conn.execute(
+            "CREATE INDEX idx_graph_snapshots_status "
+            "ON graph_snapshots(project_id, commit_sha)"
+        )
+    else:
+        conn.execute("CREATE TABLE graph_unknown_authority (id TEXT PRIMARY KEY)")
+    before_inventory = db._graph_materialization_inventory(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(ValueError, match="preimage"):
+        db.classify_graph_materialization_preimage(conn)
+
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    conn.close()
+
+
+@pytest.mark.parametrize("drift", ["partial", "altered"])
+def test_graph_materialization_preimage_classifier_rejects_sibling_drift(drift):
+    from agent.governance import asset_projection, db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_graph_owner_for_preimage_test(db, conn, asset_projection.ensure_schema)
+    conn.execute("DROP INDEX idx_graph_asset_projection_path")
+    if drift == "altered":
+        conn.execute(
+            "CREATE INDEX idx_graph_asset_projection_path "
+            "ON graph_asset_projection(project_id, snapshot_id)"
+        )
+    before_inventory = db._graph_materialization_inventory(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(ValueError, match="asset_projection"):
+        db.classify_graph_materialization_preimage(conn)
+
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    conn.close()
+
+
 def test_ac_dev_graph_materialization_admission_rolls_back_partial_schema(monkeypatch):
     from agent.governance import db, graph_correction_patches
 
