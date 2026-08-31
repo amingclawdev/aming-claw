@@ -4009,32 +4009,54 @@ def _durable_dev_launch(
 def _verified_durable_stopped_chain(dev_storage: Path) -> tuple[Path, str]:
     """Read-only proof for an already terminal durable generation."""
     runtime = dev_storage / "runtime" / "durable-launch"
-    groups = {prefix: sorted(runtime.glob(f"{prefix}.*.json"))
-              for prefix in ("launch", "pending", "readiness", "stop-challenge", "exit", "stop")}
-    if any(len(paths) != 1 for paths in groups.values()) or list(runtime.glob("abnormal.*.json")):
+    def read(prefix: str) -> dict[str, tuple[Path, dict[str, Any]]]:
+        return {digest: (path, value) for path in runtime.glob(f"{prefix}.*.json")
+                for value, digest in (_read_durable_content_receipt(path, prefix),)}
+    launches, pendings, readinesses = read("launch"), read("pending"), read("readiness")
+    challenges, exits, stops = read("stop-challenge"), read("exit"), read("stop")
+    if not launches or list(runtime.glob("abnormal.*.json")):
         raise click.ClickException("AC dev durable stopped chain is missing or ambiguous")
-    launch_path = groups["launch"][0]
-    launch, launch_sha = _read_durable_content_receipt(launch_path, "launch")
-    pending, pending_sha = _read_durable_content_receipt(groups["pending"][0], "pending")
-    readiness, readiness_sha = _read_durable_content_receipt(groups["readiness"][0], "readiness")
-    challenge, challenge_sha = _read_durable_content_receipt(groups["stop-challenge"][0], "stop-challenge")
-    exit_value, exit_sha = _read_durable_content_receipt(groups["exit"][0], "exit")
-    stop_path = groups["stop"][0]
-    stop, stop_sha = _read_durable_content_receipt(stop_path, "stop")
-    if (launch.get("stage") != "completed" or launch.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
-            or launch.get("pending_sha256") != pending_sha or launch.get("readiness_sha256") != readiness_sha
-            or pending.get("launch_id") != launch.get("launch_id")
-            or readiness.get("pending_sha256") != pending_sha
-            or challenge.get("launch_sha256") != launch_sha
-            or stop.get("launch_sha256") != launch_sha or stop.get("challenge_sha256") != challenge_sha
-            or stop.get("exit_sha256") != exit_sha or exit_value.get("launch_sha256") != launch_sha
-            or exit_value.get("challenge_sha256") != challenge_sha
-            or exit_value.get("binding") != challenge.get("binding")
-            or launch.get("dev_storage_root") != str(dev_storage)
-            or launch.get("port") != AC_DEV_SERVICE_PORT
-            or launch.get("database_sha256_after") != _file_sha256(
-                dev_storage / "governance" / "aming-claw" / "governance.db")):
-        raise click.ClickException("AC dev durable stopped chain binding mismatch")
+    terminals: dict[str, tuple[Path, str]] = {}
+    predecessors: dict[str, str] = {}
+    used: set[str] = set()
+    for launch_sha, (_launch_path, launch) in launches.items():
+        pending_sha, readiness_sha = launch.get("pending_sha256"), launch.get("readiness_sha256")
+        matching_challenges = [(sha, value) for sha, (_path, value) in challenges.items()
+                               if value.get("launch_sha256") == launch_sha]
+        matching_stops = [(sha, path, value) for sha, (path, value) in stops.items()
+                          if value.get("launch_sha256") == launch_sha]
+        if (not isinstance(pending_sha, str) or pending_sha not in pendings
+                or not isinstance(readiness_sha, str) or readiness_sha not in readinesses
+                or len(matching_challenges) != 1 or len(matching_stops) != 1):
+            raise click.ClickException("AC dev durable stopped chain is incomplete")
+        challenge_sha, challenge = matching_challenges[0]
+        stop_sha, stop_path, stop = matching_stops[0]
+        exit_sha = stop.get("exit_sha256")
+        if (exit_sha not in exits or stop.get("challenge_sha256") != challenge_sha
+                or exits[exit_sha][1].get("launch_sha256") != launch_sha
+                or exits[exit_sha][1].get("challenge_sha256") != challenge_sha
+                or launch.get("stage") != "completed"
+                or launch.get("dev_storage_root") != str(dev_storage)):
+            raise click.ClickException("AC dev durable stopped chain binding mismatch")
+        used.update({launch_sha, pending_sha, readiness_sha, challenge_sha, exit_sha, stop_sha})
+        binding = launch.get("dashboard_bootstrap")
+        if isinstance(binding, Mapping):
+            prior = str(binding.get("historical_launch_sha256") or "")
+            if prior not in launches or prior == launch_sha:
+                raise click.ClickException("AC dev durable stopped bootstrap predecessor mismatch")
+            predecessors[launch_sha] = prior
+        terminals[launch_sha] = (stop_path, stop_sha)
+    if any(predecessors.get(node) == node for node in predecessors):
+        raise click.ClickException("AC dev durable stopped chain cycle")
+    children = set(predecessors.values())
+    maximal = [node for node in terminals if node not in children]
+    if len(maximal) != 1 or len(used) != sum(len(group) for group in (launches, pendings, readinesses, challenges, exits, stops)):
+        raise click.ClickException("AC dev durable stopped chain is ambiguous")
+    launch_sha = maximal[0]
+    stop_path, stop_sha = terminals[launch_sha]
+    launch = launches[launch_sha][1]
+    if launch.get("database_sha256_after") != _file_sha256(dev_storage / "governance" / "aming-claw" / "governance.db"):
+        raise click.ClickException("AC dev durable stopped terminal DB mismatch")
     try:
         _posix_process_identity(int(launch.get("pid") or 0))
     except click.ClickException:
