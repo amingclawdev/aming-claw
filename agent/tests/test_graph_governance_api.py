@@ -44,6 +44,7 @@ from agent.governance import graph_events
 from agent.governance import graph_query_trace
 from agent.governance import observer_route_context
 from agent.governance import observer_session
+from agent.governance import role_service
 from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store as store
 from agent.governance import graph_query_trace
@@ -299,6 +300,30 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
         "WHERE route_token_ref=?",
         ("aming-claw", PID, "aming-claw", "rr-adoption-authority"),
     )
+    qa_scope = [
+        f"backlog:{backlog_id}", f"task:{execution_id}", f"commit:{'b' * 40}",
+        server._qa_scope_binding_ref(
+            project_id="aming-claw", backlog_id=backlog_id,
+            task_id=execution_id, commit_sha="b" * 40,
+        ),
+    ]
+    qa_session = role_service.register(
+        conn, principal_id="qa-adoption", project_id="aming-claw",
+        role="qa", scope=qa_scope,
+    )
+    qa_provenance = {
+        "schema_version": "qa_evidence_provenance.v1", "server_derived": True,
+        "authorization_source": "qa_session_token_ref", "evidence_owner_role": "qa",
+        "evidence_owner_actor": "qa-adoption", "evidence_owner_session": qa_session["session_id"],
+        "submitter_principal": "qa-adoption", "submitter_session": qa_session["session_id"],
+        "observer_impersonation": False, "parent_materialization_authorized": False,
+        "authenticated_qa_binding": {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "server_derived": True, "qa_principal": "qa-adoption",
+            "qa_session_id": qa_session["session_id"],
+            "independent_verification_session_matched": True,
+        },
+    }
     SQLiteContractExecutionStore(conn).create({
         "contract_execution_id": execution_id, "project_id": "aming-claw",
         "backlog_id": backlog_id, "contract_id": "adoption", "version": "1",
@@ -309,14 +334,22 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
             "target_commit": "b" * 40, "target_tree": "c" * 40,
             "source_content_sha256": "sha256:" + "d" * 64,
         },
+        # This is the ContractRuntime's server-authenticated projection, not a
+        # caller-inserted timeline row.  The issue handler rechecks the QA
+        # session and its exact persisted scope before it uses this fact.
+        "completed_lines": [{
+            "stage_id": "qa", "line_id": "qa_independent_verification",
+            "actor_role": "qa", "evidence_kind": "independent_verification",
+            "commit_sha": "b" * 40, "authoritative_pass_synthesized": False,
+            "authorization_source": "qa_session_token_ref",
+            "observer_impersonation": False,
+            "qa_evidence_provenance": qa_provenance,
+            "payload": {
+                "candidate_commit_sha": "b" * 40, "candidate_tree": "c" * 40,
+                "pass_synthesized": False,
+            },
+        }],
     })
-    task_timeline.ensure_schema(conn)
-    conn.execute(
-        "INSERT INTO task_timeline_events (project_id,backlog_id,task_id,event_type,actor,verification_json,created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        ("aming-claw", backlog_id, execution_id, "independent_verification", "qa-agent",
-         json.dumps({"qa_content_sha256": "sha256:" + "e" * 64}), "2026-08-31T00:00:00Z"),
-    )
     conn.commit(); conn.close()
     body = {
         "observer_session_id": session["observer_session_id"],
@@ -367,6 +400,56 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
             "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
             ("aming-claw",),
         ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_canonical_ref_adoption_rejects_before_dev_bootstrap_on_missing_qa_fact(
+    tmp_path, monkeypatch,
+):
+    """The dev shortcut cannot bypass the canonical QA authority gate."""
+    database = tmp_path / "canonical-adoption-dev-gate.db"
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    conn.close()
+
+    def connection_for_test(_project_id):
+        opened = sqlite3.connect(database)
+        opened.row_factory = sqlite3.Row
+        return opened
+
+    def dev_bootstrap_must_not_run(*_args, **_kwargs):
+        raise AssertionError("canonical authority rejection reached dev bootstrap")
+
+    monkeypatch.setattr(server, "get_connection", connection_for_test)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_handle_ac_dev_direct_route_context_issue",
+        dev_bootstrap_must_not_run,
+    )
+    request = _ctx(
+        {"project_id": "aming-claw"}, method="POST",
+        body={
+            "observer_session_id": "missing-observer",
+            "observer_route_token_ref": "missing-route",
+            "canonical_ref_adoption": {
+                "action": "canonical_ref_adoption",
+                "contract_execution_id": "missing-cex",
+            },
+        },
+    )
+    request.handler = SimpleNamespace(headers={"Authorization": "Bearer absent"})
+    status, rejected = server.handle_observer_route_context_issue(request)
+    assert status == 403
+    assert rejected["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='observer_route_token_refs'"
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

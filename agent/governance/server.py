@@ -7792,7 +7792,7 @@ def _canonical_ref_adoption_server_issue_body(
     This is intentionally a read-before-write gate: every failure happens
     before the ordinary issuer can mint or persist a route token.
     """
-    from . import observer_route_context, observer_session, task_timeline
+    from . import observer_route_context, observer_session
 
     forbidden = {
         "caller_role", "target_files", "owned_files", "allowed_actions",
@@ -7859,19 +7859,99 @@ def _canonical_ref_adoption_server_issue_body(
         required = ("generation", "custody", "canonical_ref", "expected_commit", "target_commit", "target_tree", "source_content_sha256")
         if any(not str(adoption.get(key) or "").strip() for key in required):
             raise ValueError("CEX adoption authority is incomplete")
-        events = task_timeline.list_events(conn, project_id, backlog_id=backlog_id, limit=200)
-        qa_hash = ""
-        for event in events:
-            if str(event.get("task_id") or "") != contract_execution_id:
+        # A timeline actor string is not QA authority.  The only acceptable
+        # fact is the already materialized ContractRuntime independent-QA
+        # projection, whose session/provenance was bound by the QA write
+        # boundary.  Re-derive every identity from that persisted projection;
+        # no client field (including headers) participates in this decision.
+        completed_lines = (
+            record.get("completed_lines")
+            if isinstance(record, Mapping)
+            and isinstance(record.get("completed_lines"), list)
+            else []
+        )
+        expected_commit = str(adoption.get("target_commit") or "").strip().lower()
+        expected_tree = str(adoption.get("target_tree") or "").strip().lower()
+        qa_line: Mapping[str, Any] | None = None
+        for candidate in reversed(completed_lines):
+            if not isinstance(candidate, Mapping):
                 continue
-            if "qa" not in str(event.get("actor") or "").lower():
+            payload = (
+                candidate.get("payload")
+                if isinstance(candidate.get("payload"), Mapping)
+                else {}
+            )
+            provenance = (
+                candidate.get("qa_evidence_provenance")
+                if isinstance(candidate.get("qa_evidence_provenance"), Mapping)
+                else {}
+            )
+            binding = (
+                provenance.get("authenticated_qa_binding")
+                if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+                else {}
+            )
+            candidate_commit = str(
+                payload.get("candidate_commit_sha")
+                or candidate.get("commit_sha") or ""
+            ).strip().lower()
+            candidate_tree = str(
+                payload.get("candidate_tree")
+                or payload.get("target_tree") or ""
+            ).strip().lower()
+            session_id = str(binding.get("qa_session_id") or "").strip()
+            principal_id = str(binding.get("qa_principal") or "").strip()
+            if not (
+                str(candidate.get("line_id") or "").strip()
+                == "qa_independent_verification"
+                and str(candidate.get("actor_role") or "").strip() == "qa"
+                and str(candidate.get("evidence_kind") or "").strip()
+                == "independent_verification"
+                and _contract_runtime_authenticated_qa_provenance(candidate)
+                and binding.get("independent_verification_session_matched") is True
+                and candidate_commit == expected_commit
+                and candidate_tree == expected_tree
+                and (
+                    candidate.get("authoritative_pass_synthesized") is False
+                    or payload.get("authoritative_pass_synthesized") is False
+                    or payload.get("pass_synthesized") is False
+                )
+                and session_id and principal_id
+            ):
                 continue
-            verification = event.get("verification") if isinstance(event.get("verification"), Mapping) else {}
-            candidate = str(verification.get("qa_content_sha256") or event.get("qa_content_sha256") or "").strip()
-            if re.fullmatch(r"sha256:[0-9a-f]{64}", candidate):
-                qa_hash = candidate; break
-        if not qa_hash:
-            raise ValueError("authenticated QA Fact is missing")
+            session_row = conn.execute(
+                "SELECT principal_id, project_id, role, scope_json, status "
+                "FROM sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if session_row is None or not (
+                str(session_row["principal_id"] or "").strip() == principal_id
+                and str(session_row["project_id"] or "").strip() == project_id
+                and str(session_row["role"] or "").strip() == "qa"
+                and str(session_row["status"] or "").strip() == "active"
+            ):
+                continue
+            try:
+                scope = json.loads(session_row["scope_json"] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            expected_scope = {
+                f"backlog:{backlog_id}", f"task:{contract_execution_id}",
+                f"commit:{expected_commit}",
+                _qa_scope_binding_ref(
+                    project_id=project_id, backlog_id=backlog_id,
+                    task_id=contract_execution_id, commit_sha=expected_commit,
+                ),
+            }
+            if not isinstance(scope, list) or not expected_scope.issubset(
+                {str(item or "").strip() for item in scope}
+            ):
+                continue
+            qa_line = candidate
+            break
+        if qa_line is None:
+            raise ValueError("authenticated independent QA Fact is missing")
+        qa_hash = stable_sha256(dict(qa_line))
         target_files = route.get("target_files") if isinstance(route.get("target_files"), list) else []
         if not target_files or _CANONICAL_REF_ADOPTION_ACTION not in set(route.get("allowed_actions") or []):
             raise ValueError("route lacks canonical adoption scope")
@@ -8743,13 +8823,6 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
 
-    if _runtime_plane() == "dev":
-        return _handle_ac_dev_direct_route_context_issue(
-            ctx,
-            project_id=project_id,
-            body=body,
-        )
-
     # Canonical-ref adoption is the one route kind whose authority may not be
     # self-declared in the request.  Convert its three references into the
     # normal issuer shape only after session/CEX/QA/route verification.
@@ -8765,6 +8838,16 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 expected="authenticated session + route + CEX + QA Fact references",
                 actual={"present": True}, source_gate="canonical_ref_adoption_authority",
             )
+
+    # Canonical adoption has already crossed its strict authority gate above.
+    # Keep the ordinary dev bootstrap behaviour for every other issue shape,
+    # but never permit that shortcut to preempt canonical QA validation.
+    if _runtime_plane() == "dev":
+        return _handle_ac_dev_direct_route_context_issue(
+            ctx,
+            project_id=project_id,
+            body=body,
+        )
 
     # Authorization: this endpoint mints a WRITE-authorizing route token, so the
     # caller must declare the observer role. The shared operator gate does not
