@@ -2783,10 +2783,20 @@ def _offline_dashboard_backlog_bootstrap(
     }
     receipts_dir = canonical / "archive" / "dashboard-backlog-bootstrap"
     existing = sorted(receipts_dir.glob("bootstrap.*.json")) if receipts_dir.is_dir() else []
+    pendings = sorted(receipts_dir.glob("bootstrap-pending.*.json")) if receipts_dir.is_dir() else []
     if existing:
         if len(existing) != 1:
             raise click.ClickException("dashboard backlog bootstrap receipt is ambiguous")
         prior, prior_sha = _read_durable_content_receipt(existing[0], "bootstrap")
+        prior_pending_sha = str(prior.get("pending_sha256") or "")
+        prior_pending_path = Path(str(prior.get("pending_receipt") or ""))
+        try:
+            pending_ok = (_exact_sha256(prior_pending_sha)
+                          and _read_durable_content_receipt(
+                              prior_pending_path, "bootstrap-pending",
+                          )[1] == prior_pending_sha)
+        except click.ClickException:
+            pending_ok = False
         recorded_ancestry = dict(prior.get("ancestry") or {})
         runtime = canonical / "runtime" / "durable-launch"
         immutable_chain = (
@@ -2806,34 +2816,121 @@ def _offline_dashboard_backlog_bootstrap(
             ) and all(_exact_sha256(str(digest or "")) for _path, _prefix, digest in immutable_chain)
         except click.ClickException:
             chain_ok = False
-        if (not chain_ok or prior.get("source_identity") != source_before
+        if (not pending_ok or not chain_ok or prior.get("source_identity") != source_before
                 or prior.get("source_projection") != source_projection
                 or prior.get("target_database_sha256_after") != target_before["sha256"]
                 or recorded_ancestry.get("database_identity") != _admission_identity(target)):
             raise click.ClickException("dashboard backlog bootstrap replay drift")
         return {"status": "already_bootstrapped", "receipt": str(existing[0]),
                 "receipt_sha256": prior_sha, "row_count": source_projection["row_count"]}
-    ancestry = _stopped_dashboard_bootstrap_ancestry(canonical)
+    if len(pendings) > 1:
+        raise click.ClickException("dashboard backlog bootstrap pending receipt is ambiguous")
+    pending: dict[str, Any] | None = None
+    pending_path: Path | None = None
+    pending_sha = ""
+    if pendings:
+        pending_path = pendings[0]
+        pending, pending_sha = _read_durable_content_receipt(
+            pending_path, "bootstrap-pending",
+        )
+        if (pending.get("schema_version") != "ac_dev_dashboard_backlog_bootstrap_pending.v1"
+                or pending.get("stage") != "pending"
+                or pending.get("source_identity") != source_before
+                or pending.get("source_projection") != source_projection
+                or pending.get("target_database_identity") != _admission_identity(target)):
+            raise click.ClickException("dashboard backlog bootstrap pending receipt mismatch")
+        pending_backup = dict(pending.get("backup") or {})
+        pending_backup_path = Path(str(pending_backup.get("path") or ""))
+        if (pending_backup_path.is_symlink() or not pending_backup_path.is_file()
+                or _admission_identity(pending_backup_path) != pending_backup.get("identity")
+                or _file_sha256(pending_backup_path) != pending_backup.get("sha256")):
+            raise click.ClickException("dashboard backlog bootstrap pending backup mismatch")
+    ancestry = dict(pending.get("ancestry") or {}) if pending else _stopped_dashboard_bootstrap_ancestry(canonical)
     connection = sqlite3.connect(str(target), timeout=5, isolation_level=None)
-    backup = receipts_dir / f"{target_before['sha256'][7:]}.pre.sqlite"
+    preimage_sha = str(pending.get("target_database_sha256_before") or "") if pending else target_before["sha256"]
+    backup = receipts_dir / f"{preimage_sha[7:]}.pre.sqlite"
     try:
         target_projection, target_rows = _dashboard_backlog_table_projection(connection)
-        if target_rows or target_projection["schema"] != source_projection["schema"]:
-            raise click.ClickException("dashboard backlog bootstrap target is not pristine")
-        target_inventory_before = _db.backlog_read_schema_inventory(connection)
+        observed_inventory = _db.backlog_read_schema_inventory(connection)
         protected_projection = _db._sqlite_logical_projection(
             connection,
             exclude_tables=frozenset({"backlog_bugs", "dashboard_backlog_cache_generation"}),
         )
+        if pending and target_before["sha256"] != preimage_sha:
+            expected = dict(pending.get("expected_postimage") or {})
+            if (target_projection != source_projection
+                    or observed_inventory != expected.get("target_inventory_after")
+                    or protected_projection != pending.get("protected_projection_before")):
+                raise click.ClickException("dashboard backlog bootstrap pending recovery HOLD")
+            target_after = target_before
+            payload = {
+                "schema_version": "ac_dev_dashboard_backlog_bootstrap.v1", "stage": "completed",
+                "project_id": project_id, "port": port, "pending_receipt": str(pending_path),
+                "pending_sha256": pending_sha, "source_identity": source_before,
+                "source_projection": source_projection,
+                "target_identity": {"before": pending["target_identity_before"], "after": target_after},
+                "target_database_sha256_before": preimage_sha,
+                "target_database_sha256_after": target_after["sha256"],
+                "target_inventory_before": pending["target_inventory_before"],
+                "target_inventory_after": observed_inventory,
+                "admission": pending["expected_admission"], "ancestry": ancestry,
+                "backup": pending["backup"], "row_count": source_projection["row_count"],
+                "status_counts": source_projection["status_counts"],
+                "recovery_mode": "finalized_exact_postimage",
+            }
+            connection.close(); connection = None
+            receipt, receipt_sha = _durable_content_receipt(receipts_dir, "bootstrap", payload)
+            return {"status": "finalized", "receipt": str(receipt),
+                    "receipt_sha256": receipt_sha, "row_count": source_projection["row_count"]}
+        if target_rows or target_projection["schema"] != source_projection["schema"]:
+            raise click.ClickException("dashboard backlog bootstrap target is not pristine")
+        target_inventory_before = observed_inventory
         drift = _db.backlog_read_schema_drift(connection)
         if drift["invalid"]:
             raise click.ClickException("dashboard backlog bootstrap target schema mismatch")
+        archive_root = receipts_dir.parent
+        if archive_root.is_symlink() or not archive_root.is_dir():
+            raise click.ClickException("dashboard backlog bootstrap archive is invalid")
         receipts_dir.mkdir(parents=True, exist_ok=True)
-        if backup.exists() or backup.is_symlink():
-            raise click.ClickException("dashboard backlog bootstrap backup collision")
-        shutil.copy2(target, backup)
+        if receipts_dir.is_symlink() or not receipts_dir.is_dir():
+            raise click.ClickException("dashboard backlog bootstrap receipt directory is invalid")
+        if not pending:
+            if backup.exists() or backup.is_symlink():
+                raise click.ClickException("dashboard backlog bootstrap backup collision")
+            shutil.copy2(target, backup)
         if _file_sha256(backup) != target_before["sha256"]:
             raise click.ClickException("dashboard backlog bootstrap backup mismatch")
+        if not pending:
+            canonical_after = _db._canonical_backlog_read_schema_inventory(include_plan=True)
+            encoded_after = json.dumps(
+                canonical_after, separators=(",", ":"), ensure_ascii=True,
+            ).encode("utf-8")
+            expected_inventory_after = {
+                "inventory": [list(item) for item in canonical_after],
+                "sha256": "sha256:" + hashlib.sha256(encoded_after).hexdigest(),
+            }
+            pending_payload = {
+                "schema_version": "ac_dev_dashboard_backlog_bootstrap_pending.v1",
+                "stage": "pending", "project_id": project_id, "port": port,
+                "source_identity": source_before, "source_projection": source_projection,
+                "target_database_identity": _admission_identity(target),
+                "target_identity_before": target_before,
+                "target_database_sha256_before": target_before["sha256"],
+                "target_inventory_before": target_inventory_before,
+                "protected_projection_before": protected_projection,
+                "backup": {"path": str(backup), "identity": _admission_identity(backup),
+                           "sha256": _file_sha256(backup)},
+                "ancestry": ancestry, "schema_plan": _db.backlog_read_schema_plan(),
+                "expected_admission": {"changed": bool(drift["missing"]),
+                                       "missing": drift["missing"]},
+                "expected_postimage": {"source_projection": source_projection,
+                                       "target_inventory_after": expected_inventory_after,
+                                       "recovery_modes": ["retry_exact_preimage", "finalize_exact_postimage"]},
+            }
+            pending_path, pending_sha = _durable_content_receipt(
+                receipts_dir, "bootstrap-pending", pending_payload,
+            )
+            pending = pending_payload
         connection.execute("BEGIN IMMEDIATE")
         admission = _db.admit_missing_backlog_read_schema(connection, commit=False)
         columns = list(source_projection["columns"])
@@ -2856,14 +2953,24 @@ def _offline_dashboard_backlog_bootstrap(
         if checkpoint != (0, 0, 0):
             raise click.ClickException("dashboard backlog bootstrap checkpoint failed")
     except BaseException:
-        connection.rollback()
+        if connection is not None:
+            connection.rollback()
         raise
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
     target_after = _bootstrap_regular_database(target, label="target")
+    inventory_connection = sqlite3.connect(
+        "file:" + urllib.parse.quote(str(target)) + "?mode=ro&immutable=1", uri=True,
+    )
+    try:
+        target_inventory_after = _db.backlog_read_schema_inventory(inventory_connection)
+    finally:
+        inventory_connection.close()
     payload = {
         "schema_version": "ac_dev_dashboard_backlog_bootstrap.v1", "stage": "completed",
-        "project_id": project_id, "port": port, "source_identity": source_before,
+        "project_id": project_id, "port": port, "pending_receipt": str(pending_path),
+        "pending_sha256": pending_sha, "source_identity": source_before,
         "source_projection": source_projection, "target_identity": {
             "before": target_before, "after": target_after,
         }, "target_database_sha256_before": target_before["sha256"],
@@ -2871,7 +2978,7 @@ def _offline_dashboard_backlog_bootstrap(
         "target_inventory_before": target_inventory_before,
         "target_inventory_after": target_inventory_after,
         "admission": admission, "ancestry": ancestry,
-        "backup": {"path": str(backup), "sha256": _file_sha256(backup)},
+        "backup": pending["backup"],
         "row_count": source_projection["row_count"],
         "status_counts": source_projection["status_counts"],
     }
