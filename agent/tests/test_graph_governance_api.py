@@ -16050,7 +16050,7 @@ def test_ac_dev_request_guard_blocks_source_process_and_unlisted_writes(
 
 
 def test_ac_dev_request_guard_allows_only_exact_route_bound_observer_registration(
-    monkeypatch,
+    conn, monkeypatch,
 ):
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     path = "/api/projects/aming-claw/observer-sessions/register"
@@ -16072,6 +16072,7 @@ def test_ac_dev_request_guard_allows_only_exact_route_bound_observer_registratio
         {**exact, "pid": 123},
         {key: value for key, value in exact.items() if key != "route_token_ref"},
     ):
+        before = conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0]
         with pytest.raises(ValidationError) as raised:
             server._guard_dev_runtime_request(
                 method="POST",
@@ -16080,6 +16081,7 @@ def test_ac_dev_request_guard_allows_only_exact_route_bound_observer_registratio
                 body=invalid,
             )
         assert raised.value.details["writes_performed"] is False
+        assert conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0] == before
 
 
 def test_ac_dev_observer_registration_handler_derives_authority_server_side(
@@ -16126,6 +16128,222 @@ def test_ac_dev_observer_registration_handler_derives_authority_server_side(
     ).fetchone()
     assert (stored["observer_kind"], stored["pid"], stored["cwd"]) == ("codex", 0, "")
     assert json.loads(stored["capabilities_json"]) == derived
+
+
+def _persist_dev_observer_registration_route(
+    conn,
+    *,
+    backlog_id="AC-REGISTER-PERSISTED",
+    task_id="observer-register-persisted",
+    cex_id="cex-direct-main-register-persisted",
+    allowed_actions=None,
+    now=None,
+):
+    actions = list(
+        allowed_actions
+        or ["observer_session_register", "graph_current_full_reconcile"]
+    )
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=actions,
+        evidence_refs=[cex_id],
+        ttl_hours=1,
+        now=now,
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id="aming-claw",
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    return {
+        "project_id": "aming-claw",
+        "route_token_ref": issued["route_token_ref"],
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "cex_id": cex_id,
+    }
+
+
+def test_dev_persisted_route_register_heartbeat_then_current_full_auth(
+    conn, monkeypatch
+):
+    body = _persist_dev_observer_registration_route(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(
+        server, "_route_registry_storage_project_id", lambda project_id: project_id
+    )
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/observer-sessions/register",
+        path_params={"project_id": "aming-claw"},
+        body=body,
+    )
+    status, registered = server.handle_observer_session_register(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert status == 201
+    session_id = registered["observer_session_id"]
+    heartbeat = server.handle_observer_session_heartbeat(
+        _ctx(
+            {"project_id": "aming-claw", "session_id": session_id},
+            method="POST",
+            body={"session_token": registered["session_token"]},
+        )
+    )
+    assert heartbeat["session"]["computed_status"] == "active"
+
+    downstream_calls = []
+
+    def stubbed_downstream_graph_admission(ctx):
+        auth = server._require_current_full_reconcile_auth(
+            ctx, conn, "graph-governance.reconcile.current-full"
+        )
+        downstream_calls.append(auth)
+        return {"admitted": True, "auth": auth}
+
+    current_full_body = {
+        "observer_session_id": session_id,
+        "route_token_ref": body["route_token_ref"],
+        "backlog_id": body["backlog_id"],
+        "task_id": body["task_id"],
+    }
+    downstream = stubbed_downstream_graph_admission(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=current_full_body)
+    )
+    assert downstream["admitted"] is True
+    assert downstream_calls[0]["role_source"] == "observer_session_route_token_ref"
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "missing", "wrong_backlog", "wrong_task", "wrong_cex", "wrong_action",
+        "expired", "revoked", "superseded",
+    ],
+)
+def test_dev_persisted_registration_route_rejections_are_pre_session_dml(
+    conn, monkeypatch, failure_mode
+):
+    now = None
+    allowed = None
+    if failure_mode == "expired":
+        now = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    if failure_mode == "wrong_action":
+        allowed = ["graph_query"]
+    body = _persist_dev_observer_registration_route(
+        conn,
+        backlog_id=f"AC-REGISTER-{failure_mode.upper()}",
+        task_id=f"observer-register-{failure_mode}",
+        cex_id=f"cex-direct-main-register-{failure_mode}",
+        allowed_actions=allowed,
+        now=now,
+    )
+    if failure_mode == "missing":
+        body["route_token_ref"] = "rtok-missing-registration"
+    elif failure_mode == "wrong_backlog":
+        body["backlog_id"] = "AC-REGISTER-WRONG-SCOPE"
+    elif failure_mode == "wrong_task":
+        body["task_id"] = "observer-register-wrong-scope"
+    elif failure_mode == "wrong_cex":
+        body["cex_id"] = "cex-direct-main-register-wrong"
+    elif failure_mode in {"revoked", "superseded"}:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (failure_mode, "aming-claw", body["route_token_ref"]),
+        )
+        conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    before = conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0]
+    status, result = server.handle_observer_session_register(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert status == 403
+    assert result["error"].startswith("route_token_ref_")
+    assert conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0] == before
+
+
+def test_dev_session_get_auth_and_current_full_route_auth_issue_zero_ddl(
+    conn, monkeypatch
+):
+    body = _persist_dev_observer_registration_route(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(
+        server, "_route_registry_storage_project_id", lambda project_id: project_id
+    )
+    status, registered = server.handle_observer_session_register(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert status == 201
+    denied_schema_actions = []
+
+    def authorizer(action, *args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_schema_actions.append(action)
+        return governance_db._dev_schema_authorizer(action, *args)
+
+    conn.set_authorizer(authorizer)
+    try:
+        fetched = observer_session.get_session(
+            conn,
+            project_id="aming-claw",
+            session_id=registered["observer_session_id"],
+        )
+        authenticated = observer_session.authenticate_session(
+            conn,
+            project_id="aming-claw",
+            session_id=registered["observer_session_id"],
+            session_token=registered["session_token"],
+            action=observer_session.ACTION_SESSION_HEARTBEAT,
+        )
+        route_auth = server._require_current_full_reconcile_auth(
+            _ctx(
+                {"project_id": "aming-claw"},
+                method="POST",
+                body={
+                    "observer_session_id": registered["observer_session_id"],
+                    "route_token_ref": body["route_token_ref"],
+                    "backlog_id": body["backlog_id"],
+                    "task_id": body["task_id"],
+                },
+            ),
+            conn,
+            "graph-governance.reconcile.current-full",
+        )
+    finally:
+        conn.set_authorizer(None)
+    assert fetched["computed_status"] == "active"
+    assert authenticated["computed_status"] == "active"
+    assert route_auth["role_source"] == "observer_session_route_token_ref"
+    assert denied_schema_actions == []
+
+
+def test_dev_registration_guard_rejects_foreign_project_before_database(
+    monkeypatch,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    with pytest.raises(ValidationError) as raised:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path="/api/projects/foreign/observer-sessions/register",
+            path_params={"project_id": "foreign"},
+            body={
+                "project_id": "foreign",
+                "route_token_ref": "rtok-foreign",
+                "backlog_id": "AC-FOREIGN",
+                "task_id": "foreign-register",
+                "cex_id": "cex-direct-main-foreign",
+            },
+        )
+    assert raised.value.details["zero_write_rejection"] is True
+    assert raised.value.details["writes_performed"] is False
 
 
 def test_observer_registration_route_requires_exact_action_scope_and_cex(
