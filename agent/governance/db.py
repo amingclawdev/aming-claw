@@ -3052,6 +3052,7 @@ def _cow_database_observation(
             "managed_inventory_drift": [], "protected_inventory": protected_inventory,
             "protected_projection": protected_projection,
             "backlog_projection_sha256": backlog_projection,
+            "governance_world_id": str(meta.get("governance_world_id") or ""),
             "genesis_json": str(meta.get("governance_world_genesis_json") or ""),
             "genesis_sha256": str(meta.get("governance_world_genesis_sha256") or "")}
 
@@ -3091,7 +3092,9 @@ def create_dev_cow_successor_receipt(
             or operator.get("target_sha256_before") != backup["sha256"]
             or operator.get("target_sha256_after") != successor["identity"]["sha256"]):
         raise ValueError("AC dev COW successor operator evidence mismatch")
-    if (backup_observation["genesis_json"] != successor["genesis_json"]
+    if (backup_observation["governance_world_id"] != AC_DEV_WORLD_ID
+            or successor["governance_world_id"] != AC_DEV_WORLD_ID
+            or backup_observation["genesis_json"] != successor["genesis_json"]
             or backup_observation["genesis_sha256"] != successor["genesis_sha256"]
             or backup_observation["protected_inventory"] != successor["protected_inventory"]
             or backup_observation["protected_projection"] != successor["protected_projection"]):
@@ -3100,7 +3103,18 @@ def create_dev_cow_successor_receipt(
         genesis = json.loads(str(successor["genesis_json"]))
     except ValueError as exc:
         raise ValueError("AC dev COW successor genesis is unreadable") from exc
+    canonical_genesis_raw = json.dumps(
+        dict(genesis), sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ) if isinstance(genesis, Mapping) else ""
+    rows_copied = genesis.get("rows_copied") if isinstance(genesis, Mapping) else None
     if (not isinstance(genesis, Mapping)
+            or genesis.get("schema_version") != AC_WORLD_GENESIS_SCHEMA
+            or genesis.get("world_id") != AC_DEV_WORLD_ID
+            or genesis.get("project_id") != AC_PROJECT_ID
+            or genesis.get("source_only") is not True
+            or not isinstance(rows_copied, int) or isinstance(rows_copied, bool)
+            or rows_copied != 0
+            or successor["genesis_json"] != canonical_genesis_raw
             or successor["genesis_sha256"] != _world_genesis_hash(genesis)
             or dict(genesis.get("database_identity") or {}).get("device") != backup["device"]
             or dict(genesis.get("database_identity") or {}).get("inode") != backup["inode"]):

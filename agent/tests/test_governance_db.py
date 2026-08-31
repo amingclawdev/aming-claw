@@ -1186,7 +1186,9 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
     for path in (database, backup, operator, linked):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"{}")
-    genesis = {"database_identity": {"device": 7, "inode": 11}}
+    genesis = {"schema_version": db.AC_WORLD_GENESIS_SCHEMA, "world_id": db.AC_DEV_WORLD_ID,
+               "project_id": db.AC_PROJECT_ID, "source_only": True, "rows_copied": 0,
+               "database_identity": {"device": 7, "inode": 11}}
     genesis_raw = json.dumps(genesis, sort_keys=True, separators=(",", ":"))
     genesis_sha = db._world_genesis_hash(genesis)
     successor_observation = {
@@ -1196,6 +1198,7 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
         "managed_inventory": {"sha256": "managed"}, "managed_inventory_drift": [],
         "protected_inventory": {"sha256": "protected"},
         "protected_projection": {"schema_meta": "sha256:meta"},
+        "governance_world_id": db.AC_DEV_WORLD_ID,
         "genesis_json": genesis_raw, "genesis_sha256": genesis_sha,
     }
     backup_observation = {**successor_observation,
@@ -1391,6 +1394,63 @@ def test_ac_dev_cow_successor_public_cli_wrong_real_schema_is_bounded(tmp_path, 
     assert "backlog table ABI mismatch" in result.output
     assert "Traceback" not in result.output
     assert not list((root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE).glob("successor.*.json"))
+
+
+def test_ac_dev_cow_successor_public_cli_rejects_self_consistent_foreign_world(
+    tmp_path, monkeypatch,
+):
+    pytest.importorskip("click")
+    from click.testing import CliRunner
+    from agent.cli import main
+    from agent.governance import db
+
+    root, database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch,
+    )
+    foreign = {"schema_version": db.AC_WORLD_GENESIS_SCHEMA, "world_id": "foreign-dev",
+               "project_id": "foreign-project", "source_only": True, "rows_copied": 0,
+               "database_identity": {"device": backup.stat().st_dev,
+                                     "inode": backup.stat().st_ino}}
+    foreign_raw = json.dumps(foreign, sort_keys=True, separators=(",", ":"))
+    foreign_sha = db._world_genesis_hash(foreign)
+    for path in (backup, database):
+        connection = sqlite3.connect(path)
+        connection.executemany(
+            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES (?,?)",
+            [("governance_world_id", "foreign-dev"),
+             ("governance_world_genesis_json", foreign_raw),
+             ("governance_world_genesis_sha256", foreign_sha)],
+        )
+        connection.commit(); connection.close()
+    operator_payload = json.loads(operator.read_text(encoding="utf-8"))
+    operator_payload["backup_sha256"] = db._durable_database_sha256(backup)
+    operator_payload["target_sha256_before"] = operator_payload["backup_sha256"]
+    operator_payload["target_sha256_after"] = db._durable_database_sha256(database)
+    operator_raw = json.dumps(operator_payload, sort_keys=True, separators=(",", ":")).encode()
+    operator.unlink()
+    operator = operator.parent / f"cow-import.{hashlib.sha256(operator_raw).hexdigest()}.json"
+    operator.write_bytes(operator_raw)
+    result = CliRunner().invoke(main, [
+        "dev-create-cow-successor-receipt", "--dev-storage-root", str(root),
+        "--operator-receipt", str(operator), "--predecessor-backup", str(backup),
+        "--linked-v3-receipt", str(linked)])
+    assert result.exit_code != 0
+    assert "protected preimage mismatch" in result.output
+    assert "Traceback" not in result.output
+    archive = root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE
+    assert not archive.exists()
+    crafted = {"schema_version": db.AC_DEV_COW_SUCCESSOR_SCHEMA, "stage": "completed",
+               "project_id": db.AC_PROJECT_ID, "port": 40008, "root": str(root),
+               "operator_evidence": {"path": str(operator)},
+               "predecessor": {"backup": {"path": str(backup)}},
+               "history": {"linked_v3": {"path": str(linked)}}}
+    crafted_raw = json.dumps(crafted, sort_keys=True, separators=(",", ":")).encode()
+    archive.mkdir(parents=True)
+    (archive / f"successor.{hashlib.sha256(crafted_raw).hexdigest()}.json").write_bytes(
+        crafted_raw
+    )
+    with pytest.raises(ValueError, match="protected preimage mismatch"):
+        db.validate_dev_cow_successor_receipt(root)
 def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process(tmp_path):
     from agent.governance import db
 
