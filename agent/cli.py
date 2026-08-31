@@ -3865,12 +3865,15 @@ def _durable_dev_launch(
     )
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     parent_sock.settimeout(15)
+    pending_identity = (dict(preimage["database_identity"])
+                        if durable_phase == _DURABLE_START_COMPLETED_BOOTSTRAP
+                        else {key: dict(preimage["database_identity"])[key] for key in ("device", "inode")})
     pending_payload = {
         "schema_version": "ac_dev_durable_pending.v1", "stage": "pending",
         "durable_start_phase": durable_phase,
         "launch_id": launch_id, "parent_pid": os.getpid(),
         "source_identity": dict(source_identity), "dev_storage_root": str(dev_storage),
-        "database_path": str(database), "database_identity": dict(preimage["database_identity"]),
+        "database_path": str(database), "database_identity": pending_identity,
         "database_sha256_before": preimage["database_sha256"],
         "linked_v3_receipt": str(linked_receipt.absolute()),
         "linked_v3_receipt_sha256": linked_digest,
@@ -4416,12 +4419,16 @@ def start(
             pending_database = dict(pending.get("database_identity") or {})
             canonical_database = dev_storage / "governance" / "aming-claw" / "governance.db"
             if phase == _DURABLE_START_LEGACY_ADOPTION:
+                actual_physical = _admission_identity(canonical_database)
                 if ("dashboard_bootstrap" in pending
-                        or pending_database != _canonical_dev_database_identity_projection(canonical_database)):
+                        or set(pending_database) != {"device", "inode"}
+                        or any(type(pending_database[key]) is not int for key in pending_database)
+                        or pending_database != {key: actual_physical[key] for key in ("device", "inode")}):
                     raise click.ClickException("AC dev durable child legacy database identity mismatch")
-            elif (pending_database.get("path") != str(canonical_database)
-                    or not isinstance(pending_database.get("device"), int)
-                    or not isinstance(pending_database.get("inode"), int)
+            elif (set(pending_database) != {"path", "device", "inode"}
+                    or pending_database.get("path") != str(canonical_database)
+                    or type(pending_database.get("device")) is not int
+                    or type(pending_database.get("inode")) is not int
                     or _admission_identity(canonical_database) != pending_database
                     or not isinstance(pending.get("dashboard_bootstrap"), Mapping)):
                 raise click.ClickException("AC dev durable child bootstrap database identity mismatch")
@@ -4479,7 +4486,7 @@ def start(
                         dev_storage, source_identity=dev_identity or {},
                         process_identity=custody,
                         linked_v3_receipt=durable_child_linked_v3_receipt,
-                        expected_database_identity=pending["database_identity"],
+                        expected_database_identity=_canonical_dev_database_identity_projection(canonical_database),
                         expected_pre_sha256=pending["database_sha256_before"],
                     )
                 else:
