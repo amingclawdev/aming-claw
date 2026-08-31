@@ -350,6 +350,7 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
             "qa_evidence_provenance": qa_provenance,
             "payload": {
                 "candidate_commit_sha": "b" * 40, "candidate_tree": "c" * 40,
+                "authoritative_pass_synthesized": False,
                 "pass_synthesized": False,
             },
         }],
@@ -510,13 +511,19 @@ def test_canonical_ref_adoption_qa_fact_flags_are_independent_fail_closed(
     cases = [
         ("line.authoritative_pass_synthesized", invalid_false),
         ("line.observer_impersonation", invalid_false),
-        ("payload.authoritative_pass_synthesized", (True, "false", 0, [], {})),
+        ("payload.authoritative_pass_synthesized", invalid_false),
         ("payload.pass_synthesized", invalid_false),
         ("provenance.server_derived", invalid_true),
         ("provenance.observer_impersonation", invalid_false),
         ("provenance.parent_materialization_authorized", invalid_false),
         ("binding.server_derived", invalid_true),
         ("binding.independent_verification_session_matched", invalid_true),
+        # Authority-looking spellings are not forward-compatible extension
+        # points.  They can otherwise conceal a misspelt required assertion.
+        ("extra.line.authoritative_pass_synthesised", (False,)),
+        ("extra.payload.pass_synthezised", (False,)),
+        ("extra.provenance.server_derive", (True,)),
+        ("extra.binding.independent_verification_session_match", (True,)),
         # A correct no-synthesis marker cannot compensate for other forged
         # provenance markers.
         ("combined", ((True, True, False),)),
@@ -611,6 +618,7 @@ def test_canonical_ref_adoption_qa_fact_flags_are_independent_fail_closed(
                 "observer_impersonation": False, "qa_evidence_provenance": provenance,
                 "payload": {
                     "candidate_commit_sha": "b" * 40, "candidate_tree": "c" * 40,
+                    "authoritative_pass_synthesized": False,
                     "pass_synthesized": False,
                 },
             }
@@ -618,6 +626,14 @@ def test_canonical_ref_adoption_qa_fact_flags_are_independent_fail_closed(
                 line["authoritative_pass_synthesized"] = value[0]
                 provenance["observer_impersonation"] = value[1]
                 line["payload"]["pass_synthesized"] = value[2]
+            elif field.startswith("extra."):
+                _, container_name, key = field.split(".")
+                {
+                    "line": line,
+                    "payload": line["payload"],
+                    "provenance": provenance,
+                    "binding": binding,
+                }[container_name][key] = value
             else:
                 set_field(line, field, value)
             SQLiteContractExecutionStore(conn).create({

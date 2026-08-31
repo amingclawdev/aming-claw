@@ -7707,6 +7707,77 @@ _OBSERVER_ROUTE_CONTEXT_GRAPH_FIRST_ENTRY_ACTIONS = {
 _CANONICAL_REF_ADOPTION_ACTION = "canonical_ref_adoption"
 _CANONICAL_REF_ADOPTION_SCHEMA = "canonical_ref_adoption_route_bound.v1"
 
+# These flags are an authority contract for the persisted QA Fact, rather than
+# optional diagnostics.  Keep the list source-owned and deliberately local to
+# canonical adoption: accepting a missing field (or an almost-identical field)
+# would silently turn an older/caller-shaped projection into authority.
+_CANONICAL_REF_ADOPTION_QA_AUTHORITY_FLAGS = {
+    "line": {
+        "authoritative_pass_synthesized": False,
+        "observer_impersonation": False,
+    },
+    "payload": {
+        "authoritative_pass_synthesized": False,
+        "pass_synthesized": False,
+    },
+    "provenance": {
+        "server_derived": True,
+        "observer_impersonation": False,
+        "parent_materialization_authorized": False,
+    },
+    "binding": {
+        "server_derived": True,
+        "independent_verification_session_matched": True,
+    },
+}
+
+
+def _canonical_ref_adoption_qa_authority_flags_are_exact(
+    *,
+    line: Any,
+    payload: Any,
+    provenance: Any,
+    binding: Any,
+) -> bool:
+    """Fail closed unless the whole persisted QA authority flag set is exact.
+
+    ContractRuntime stores JSON objects, so duplicate JSON keys cannot survive
+    into this projection as separate values.  Requiring ordinary ``dict``
+    containers and all named keys therefore gives one unambiguous value per
+    source-owned flag.  It also rejects Mapping-like caller inputs should this
+    helper ever be reached outside the durable projection reader.
+    """
+    containers = {
+        "line": line,
+        "payload": payload,
+        "provenance": provenance,
+        "binding": binding,
+    }
+    # A misspelt flag must not be interpreted as a harmless extension.  Limit
+    # this to authority-shaped spellings so unrelated evidence fields retain
+    # their existing forward-compatible schema behavior.
+    authority_fragments = (
+        "pass", "synthes", "impersonat", "server_deriv",
+        "materializ", "verification_session",
+    )
+    for container_name, expected in _CANONICAL_REF_ADOPTION_QA_AUTHORITY_FLAGS.items():
+        container = containers[container_name]
+        if type(container) is not dict:
+            return False
+        for key, expected_value in expected.items():
+            if key not in container or type(container[key]) is not bool:
+                return False
+            if container[key] is not expected_value:
+                return False
+        if any(
+            isinstance(key, str)
+            and any(fragment in key.lower() for fragment in authority_fragments)
+            and key not in expected
+            for key in container
+        ):
+            return False
+    return True
+
 
 def _canonical_ref_adoption_active_qa_fact(
     conn: sqlite3.Connection,
@@ -7769,6 +7840,13 @@ def _canonical_ref_adoption_active_qa_fact(
         qa_session_id = str(binding.get("qa_session_id") or "").strip()
         principal_id = str(binding.get("qa_principal") or "").strip()
         if not (
+            _canonical_ref_adoption_qa_authority_flags_are_exact(
+                line=candidate,
+                payload=payload,
+                provenance=provenance,
+                binding=binding,
+            )
+            and
             str(candidate.get("line_id") or "").strip()
             == "qa_independent_verification"
             and str(candidate.get("actor_role") or "").strip() == "qa"
@@ -7786,20 +7864,6 @@ def _canonical_ref_adoption_active_qa_fact(
             )
             and candidate_commit == expected_commit
             and candidate_tree == expected_tree
-            # These are separate no-synthesis assertions, not substitutes for
-            # one another.  A false value in one location must never mask a
-            # true, missing, or caller-shaped value in another.  ``is`` is
-            # intentional: 0, "false", and other falsey values are not an
-            # authority assertion.
-            and candidate.get("authoritative_pass_synthesized") is False
-            # Older projections do not materialize this duplicate payload
-            # field.  If a projection does include it, however, it must agree
-            # exactly; an explicit true or non-boolean is a forged claim.
-            and (
-                "authoritative_pass_synthesized" not in payload
-                or payload.get("authoritative_pass_synthesized") is False
-            )
-            and payload.get("pass_synthesized") is False
             and qa_session_id and principal_id
         ):
             continue
