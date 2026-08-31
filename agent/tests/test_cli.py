@@ -4473,6 +4473,33 @@ def test_posix_exclusive_durable_receipt_rejects_collision_and_symlink(tmp_path)
     with pytest.raises(cli.click.ClickException, match="canonical"):
         cli._posix_exclusive_json(link, {"stage": "pending"})
 
+    pending = tmp_path / "launch.pending.json"
+    completed = tmp_path / "launch.completed.json"
+    cli._posix_exclusive_json(pending, {"stage": "completed", "final": True})
+    inode = pending.stat().st_ino
+    cli._noreplace_promote(pending, completed)
+    assert not pending.exists()
+    assert completed.stat().st_ino == inode
+    assert json.loads(completed.read_text(encoding="utf-8")) == {"final": True, "stage": "completed"}
+
+
+def test_posix_durable_launch_lock_has_exactly_one_concurrent_winner(tmp_path):
+    import concurrent.futures
+    import agent.cli as cli
+
+    lock = tmp_path / "launch.lock"
+    def contender(number):
+        try:
+            cli._posix_exclusive_json(lock, {"winner": number})
+            return number
+        except cli.click.ClickException:
+            return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(contender, range(16)))
+    winners = [value for value in results if value is not None]
+    assert len(winners) == 1
+    assert json.loads(lock.read_text(encoding="utf-8")) == {"winner": winners[0]}
+
 
 def test_posix_detached_popen_uses_no_shell_new_session_and_devnull(tmp_path, monkeypatch):
     import agent.cli as cli
@@ -4493,7 +4520,36 @@ def test_posix_detached_popen_uses_no_shell_new_session_and_devnull(tmp_path, mo
     }
 
 
-def test_durable_stop_identity_drift_never_signals_other_pid(tmp_path, monkeypatch):
+def test_durable_exit_binding_discriminates_every_authorized_launch_field():
+    import copy
+    import agent.cli as cli
+
+    receipt = {
+        "launch_id": "launch", "pid": 123,
+        "process": {"start_identity": "sha256:" + "1" * 64},
+        "argv": ["python", "-m", "agent.cli"], "cwd": "/source",
+        "python": "/python", "source_commit": "a" * 40, "source_tree": "b" * 40,
+        "server_sha256": "sha256:" + "2" * 64, "source_root": "/source",
+        "database_path": "/dev/governance.db", "database_identity": {"device": 1, "inode": 2},
+        "dev_storage_root": "/dev", "project_id": "aming-claw", "port": 40008,
+        "policy": {"runtime_plane": "dev", "migration": "verify-only",
+                   "stable_deployment": "deny", "graph_activation": "deny",
+                   "background_workers": "deny"},
+    }
+    baseline = cli._durable_exit_binding(receipt, "sha256:" + "3" * 64)
+    assert baseline["completed_receipt_sha256"] == "sha256:" + "3" * 64
+    for field in ("launch_id", "pid", "argv", "cwd", "python", "source_commit", "source_tree",
+                  "server_sha256", "source_root", "database_path", "database_identity",
+                  "dev_storage_root", "project_id", "port", "policy"):
+        mutated = copy.deepcopy(receipt)
+        mutated[field] = ["mutated"] if field == "argv" else "mutated"
+        assert cli._durable_exit_binding(mutated, "sha256:" + "3" * 64) != baseline, field
+    mutated = copy.deepcopy(receipt); mutated["process"]["start_identity"] = "mutated"
+    assert cli._durable_exit_binding(mutated, "sha256:" + "3" * 64) != baseline
+
+
+@pytest.mark.parametrize("attack", ["identity_drift", "preforged_exit", "missing_exit_after_term"])
+def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
     import agent.cli as cli
 
     dev = tmp_path / "dev"; runtime = dev / "runtime" / "durable-launch"; runtime.mkdir(parents=True)
@@ -4511,19 +4567,38 @@ def test_durable_stop_identity_drift_never_signals_other_pid(tmp_path, monkeypat
         "process": {"start_identity": "sha256:" + "c" * 64, "argv": "expected", "cwd": str(source)},
         "argv": [sys.executable, "child"], "cwd": str(source), "exit_receipt": str(runtime / "exit-status.json"),
         "linked_v3_receipt_sha256": "sha256:" + "e" * 64,
+        "policy": {"runtime_plane": "dev", "migration": "verify-only",
+                   "stable_deployment": "deny", "graph_activation": "deny",
+                   "background_workers": "deny"},
     }
     (runtime / "launch.completed.json").write_text(json.dumps(receipt), encoding="utf-8")
     monkeypatch.setattr(cli, "_source_git_identity", lambda: {
         "root": str(source), "commit": "a" * 40, "tree": "b" * 40, "dirty": "",
     })
-    monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: {
-        "start_identity": "sha256:" + "d" * 64, "argv": "attacker", "cwd": str(source),
-    })
+    if attack in {"preforged_exit", "missing_exit_after_term"}:
+        (runtime / "exit-status.json").write_text("{}", encoding="utf-8")
+        if attack == "missing_exit_after_term":
+            (runtime / "exit-status.json").unlink()
+        monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: receipt["process"])
+        monkeypatch.setattr(cli, "_durable_listener_pid", lambda _port: receipt["pid"])
+        expected = "pre-existing exit receipt" if attack == "preforged_exit" else "exit receipt is missing"
+    else:
+        monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: {
+            "start_identity": "sha256:" + "d" * 64, "argv": "attacker", "cwd": str(source),
+        })
+        expected = "process identity mismatch"
     monkeypatch.setattr(cli, "_validated_linked_v3_receipt", lambda *_args, **_kwargs: (
         "sha256:" + "e" * 64, {},
     ))
     signals = []
-    monkeypatch.setattr(cli.os, "kill", lambda *args: signals.append(args))
-    with pytest.raises(cli.click.ClickException, match="process identity mismatch"):
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+        if attack == "missing_exit_after_term" and sig == 0:
+            raise ProcessLookupError
+    monkeypatch.setattr(cli.os, "kill", fake_kill)
+    with pytest.raises(cli.click.ClickException, match=expected):
         cli._durable_dev_stop(dev)
-    assert signals == []
+    if attack == "missing_exit_after_term":
+        assert signals == [(receipt["pid"], cli.signal.SIGTERM), (receipt["pid"], 0)]
+    else:
+        assert signals == []
