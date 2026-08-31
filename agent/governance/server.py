@@ -4019,7 +4019,12 @@ def _guard_dev_runtime_request(
             request_kind = _observer_route_context_issue_request_kind(body)
         except ValueError:
             request_kind = "canonical_rejection"
-        if request_kind == "direct_bootstrap":
+        if request_kind == "completed_source_free_system_operation":
+            _ac_dev_completed_source_free_route_issue_precheck_from_request(
+                project_id="aming-claw",
+                body=body,
+            )
+        elif request_kind == "direct_bootstrap":
             _ac_dev_direct_route_issue_precheck_from_request(
                 project_id="aming-claw",
                 body=body,
@@ -8245,6 +8250,15 @@ def _observer_route_context_issue_request_kind(
     silently discarded or routed as a different dev operation.
     """
 
+    if (
+        body.get("source_free_operation") is True
+        and body.get("target_files") == []
+        and body.get("owned_files") == []
+        and body.get("allowed_actions") == list(_OPERATOR_SOURCE_FREE_ACTIONS)
+        and isinstance(body.get("task_id"), str)
+        and body.get("task_id", "").startswith("onboard-service-")
+    ):
+        return "completed_source_free_system_operation"
     if "canonical_ref_adoption" not in body:
         return "direct_bootstrap"
     canonical_fields = {
@@ -9268,12 +9282,19 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     # Canonical adoption has already crossed its strict authority gate above.
     # Keep the ordinary dev bootstrap behaviour for every other issue shape,
     # but never permit that shortcut to preempt canonical QA validation.
-    if _runtime_plane() == "dev" and request_kind == "direct_bootstrap":
-        return _handle_ac_dev_direct_route_context_issue(
-            ctx,
-            project_id=project_id,
-            body=body,
-        )
+    if _runtime_plane() == "dev":
+        if request_kind == "completed_source_free_system_operation":
+            return _handle_ac_dev_completed_source_free_route_context_issue(
+                ctx,
+                project_id=project_id,
+                body=body,
+            )
+        if request_kind == "direct_bootstrap":
+            return _handle_ac_dev_direct_route_context_issue(
+                ctx,
+                project_id=project_id,
+                body=body,
+            )
 
     # Authorization: this endpoint mints a WRITE-authorizing route token, so the
     # caller must declare the observer role. The shared operator gate does not
@@ -149846,6 +149867,217 @@ def _ac_dev_direct_route_issue_precheck(
         "selected_revision": str(guide.get("contract_revision") or "").strip(),
         "zero_write_projection": True,
     }
+
+
+def _ac_dev_completed_source_free_route_issue_precheck(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebuild one completed-parent operation route without Direct authority."""
+
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    authority = _backlog_source_free_operation_authority(
+        conn, project_id=project_id, backlog_id=backlog_id
+    )
+    expected_task_id = _onboard_service_execution_id(project_id, backlog_id)
+    projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    resume = _onboard_runtime_resume_from_current_projection(projection)
+    action = _onboard_route_guide_completed_next_action(
+        role="observer",
+        work_type="system_operation",
+        runtime_resume=resume,
+        backlog_row_status="OPEN",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref="",
+        target_files=(),
+        source_free_operation_authority=authority,
+    )
+    expected_body = (
+        dict(action.get("copy_safe_body") or {})
+        if isinstance(action.get("copy_safe_body"), Mapping)
+        else {}
+    )
+    accepted = bool(
+        _runtime_plane() == "dev"
+        and project_id == "aming-claw"
+        and authority.get("accepted") is True
+        and _onboard_runtime_resume_is_complete(resume)
+        and task_id == expected_task_id
+        and str(resume.get("current_contract_execution_id") or "")
+        == expected_task_id
+        and str(resume.get("root_contract_execution_id") or "")
+        == expected_task_id
+        and action.get("id") == "completed_system_operation_route_issue"
+        and expected_body
+        and dict(body) == expected_body
+    )
+    if not accepted:
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_completed_source_free_route_not_guide_bound",
+            message=(
+                "completed source-free route issuance requires the exact current "
+                "guide copy-safe body and completed onboard-service parent"
+            ),
+            body=body,
+            expected_body=expected_body,
+            extra={"contract_runtime_mutated": False},
+        )
+    world = _operator_supervised_direct_main_dev_world_authority()
+    if not world or world.get("accepted") is not True:
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_completed_source_free_route_world_invalid",
+            message="completed source-free route requires the loaded AC dev world",
+            body=body,
+            expected_body=expected_body,
+        )
+    return {
+        "accepted": True,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "expected_body": expected_body,
+        "world_authority": dict(world),
+    }
+
+
+def _ac_dev_completed_source_free_route_issue_precheck_from_request(
+    *, project_id: str, body: Mapping[str, Any]
+) -> dict[str, Any]:
+    conn = get_connection(project_id)
+    try:
+        return _ac_dev_completed_source_free_route_issue_precheck(
+            conn, project_id=project_id, body=body
+        )
+    finally:
+        conn.close()
+
+
+def _handle_ac_dev_completed_source_free_route_context_issue(
+    ctx: RequestContext,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Atomically persist only the completed-parent operation route."""
+
+    from . import observer_route_context
+
+    conn = get_connection(project_id)
+    try:
+        _ac_dev_completed_source_free_route_issue_precheck(
+            conn, project_id=project_id, body=body
+        )
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                precheck = _ac_dev_completed_source_free_route_issue_precheck(
+                    conn, project_id=project_id, body=body
+                )
+                backlog_id = str(precheck["backlog_id"])
+                task_id = str(precheck["task_id"])
+                expected_body = dict(precheck["expected_body"])
+                storage_project_id = _route_registry_storage_project_id(project_id)
+                rows = conn.execute(
+                    "SELECT route_token_ref FROM observer_route_token_refs "
+                    "WHERE project_id=? AND backlog_id=? AND task_id=?",
+                    (storage_project_id, backlog_id, task_id),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise _ac_dev_direct_route_issue_rejection(
+                        code="ac_dev_completed_source_free_route_ambiguous",
+                        message="completed source-free operation route is not unique",
+                        body=body,
+                    )
+                if rows:
+                    route_token_ref = str(_row_get(rows[0], "route_token_ref", ""))
+                    token = observer_route_context.resolve_route_token_ref(
+                        conn,
+                        project_id=project_id,
+                        storage_project_id=storage_project_id,
+                        route_token_ref=route_token_ref,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                    )
+                    if (
+                        not isinstance(token, Mapping)
+                        or list(token.get("target_files") or []) != []
+                        or list(token.get("owned_files") or []) != []
+                        or list(token.get("allowed_actions") or [])
+                        != list(_OPERATOR_SOURCE_FREE_ACTIONS)
+                        or not set(expected_body.get("evidence_refs") or []).issubset(
+                            set(token.get("evidence_refs") or [])
+                        )
+                        or token.get("source_free_operation") is not True
+                    ):
+                        raise _ac_dev_direct_route_issue_rejection(
+                            code="ac_dev_completed_source_free_route_replay_mismatch",
+                            message="existing operation route does not match current guide",
+                            body=body,
+                            expected_body=expected_body,
+                        )
+                    issued = {
+                        "route_token": dict(token),
+                        "route_token_ref": route_token_ref,
+                        "merge_queue_id": observer_route_context.derive_merge_queue_id(token),
+                        "provider": {},
+                    }
+                    conn.rollback()
+                    response = _ac_dev_direct_route_issue_response(
+                        project_id=project_id,
+                        issued=issued,
+                        idempotent_replay=True,
+                        contract_execution_id=task_id,
+                    )
+                    response["atomic_route_and_contract_materialization"] = False
+                    response["contract_runtime_mutated"] = False
+                    return response
+                world = dict(precheck["world_authority"])
+                issued = observer_route_context.issue_observer_write_route_context(
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                    target_files=[],
+                    allowed_actions=list(_OPERATOR_SOURCE_FREE_ACTIONS),
+                    evidence_refs=list(expected_body.get("evidence_refs") or []),
+                    project_root=Path(str(world.get("target_project_root") or "")),
+                    source_free_operation=True,
+                )
+                token = dict(issued.get("route_token") or {})
+                token["owned_files"] = []
+                route_token_ref = str(issued.get("route_token_ref") or "").strip()
+                observer_route_context.persist_route_token_ref(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=storage_project_id,
+                    route_token_ref=route_token_ref,
+                    token=token,
+                )
+                if conn.in_transaction:
+                    conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        issued = {**dict(issued), "route_token": token}
+        response = _ac_dev_direct_route_issue_response(
+            project_id=project_id,
+            issued=issued,
+            idempotent_replay=False,
+            contract_execution_id=task_id,
+        )
+        response["atomic_route_and_contract_materialization"] = False
+        response["contract_runtime_mutated"] = False
+        return response
+    finally:
+        conn.close()
 
 
 def _ac_dev_direct_route_issue_precheck_from_request(

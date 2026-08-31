@@ -199262,6 +199262,128 @@ def test_ac_dev_source_free_projects_exact_real_r6_topology_to_empty_route(conn)
     assert result["next_legal_action"]["copy_safe_body"]["owned_files"] == []
 
 
+def test_ac_dev_completed_source_free_public_route_issue_persists_no_direct_cex(
+    conn, monkeypatch, tmp_path
+):
+    backlog_id = "AC-DEV-SOURCE-FREE-REAL-R6-PUBLIC-ISSUE"
+    _completed_source_free_system_operation_case(conn, backlog_id)
+    topology = (
+        "reuse_the_existing_unique_ac_observer."
+        "_source_free_system_operation_only;"
+        "_zero_implementation_workers;"
+        "_one_fresh_observer_route/session;"
+        "_exactly_one_full_reconcile."
+    )
+    _set_source_free_topology(conn, backlog_id, topology)
+    root = tmp_path / "completed-operation-world"
+    root.mkdir()
+    world = _fixed_ac_dev_direct_world(root, "a" * 40)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+            },
+        )
+    )
+    body = guide["next_legal_action"]["copy_safe_body"]
+    runtime_before = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0]
+    assert server._observer_route_context_issue_request_kind(body) == (
+        "completed_source_free_system_operation"
+    )
+    assert server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/observer/route-context/issue",
+        path_params={"project_id": "aming-claw"},
+        body=body,
+        query={},
+    ) is None
+
+    first = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    replay = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+
+    assert first["route_token"]["target_files"] == []
+    assert first["route_token"]["owned_files"] == []
+    assert first["route_token"]["allowed_actions"] == list(
+        server._OPERATOR_SOURCE_FREE_ACTIONS
+    )
+    assert first["contract_runtime_mutated"] is False
+    assert replay["route_token_ref"] == first["route_token_ref"]
+    assert replay["idempotent_replay"] is True
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0] == runtime_before
+
+
+@pytest.mark.parametrize("mutation", ["wrong_task", "mixed_action", "nonempty"])
+def test_ac_dev_completed_source_free_public_route_issue_rejects_tampering_zero_write(
+    conn, monkeypatch, tmp_path, mutation
+):
+    backlog_id = f"AC-DEV-SOURCE-FREE-PUBLIC-REJECT-{mutation}"
+    _completed_source_free_system_operation_case(conn, backlog_id)
+    topology = (
+        "reuse_the_existing_unique_ac_observer."
+        "_source_free_system_operation_only;"
+        "_zero_implementation_workers;"
+        "_one_fresh_observer_route/session;"
+        "_exactly_one_full_reconcile."
+    )
+    _set_source_free_topology(conn, backlog_id, topology)
+    root = tmp_path / f"operation-reject-{mutation}"
+    root.mkdir()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: _fixed_ac_dev_direct_world(root, "b" * 40),
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"}, method="POST",
+            body={"backlog_id": backlog_id, "role": "observer", "work_type": "system_operation"},
+        )
+    )
+    body = copy.deepcopy(guide["next_legal_action"]["copy_safe_body"])
+    if mutation == "wrong_task":
+        body["task_id"] = "onboard-service-wrong"
+    elif mutation == "mixed_action":
+        body["allowed_actions"].append("merge")
+    else:
+        body["target_files"] = ["agent/governance/server.py"]
+        body["owned_files"] = ["agent/governance/server.py"]
+    before_changes = conn.total_changes
+    before_routes = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0]
+
+    with pytest.raises(GovernanceError):
+        server.handle_observer_route_context_issue(
+            _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+        )
+
+    assert conn.total_changes == before_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0] == before_routes
+
+
 @pytest.mark.parametrize(
     "topology",
     [
