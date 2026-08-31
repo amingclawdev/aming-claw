@@ -2730,10 +2730,14 @@ def _bootstrap_regular_database(path: Path, *, label: str) -> dict[str, Any]:
     }
 
 
-def _stopped_dashboard_bootstrap_ancestry(
-    root: Path, *, expected_database_sha256: str | None = None,
-) -> dict[str, Any]:
-    """Prove the immutable adoption ancestor and exact latest stopped generation."""
+def _historical_dashboard_bootstrap_adoption(root: Path) -> tuple[dict[str, Any], str, Path]:
+    """Authenticate sealed historical adoption bytes without reading current DB logic.
+
+    This deliberately proves receipt content/address/path relationships only.
+    Callers select a separate current-database validator for first import versus
+    a postcommit/replay receipt; a historical adoption must never authorize the
+    current logical postimage by itself.
+    """
     from agent.governance import db as _db
     adoptions = _canonical_adoption_receipts(root)
     if len(adoptions) != 1:
@@ -2742,11 +2746,46 @@ def _stopped_dashboard_bootstrap_ancestry(
     linked = Path(str(adoption.get("linked_v3_receipt") or ""))
     source = _source_git_identity()
     try:
-        _db._validated_canonical_legacy_postimage_adoption(
-            root, linked, source, _db.verified_stable_database_binding(),
+        linked_value, linked_sha = _read_admission_receipt(
+            linked.absolute(), archive=root / "archive" / "schema-admission",
         )
     except (OSError, RuntimeError, ValueError) as exc:
-        raise click.ClickException("dashboard backlog bootstrap adoption mismatch") from exc
+        raise click.ClickException("dashboard backlog bootstrap historical linked receipt mismatch") from exc
+    database = root / "governance" / "aming-claw" / "governance.db"
+    root_stat = root.stat(follow_symlinks=False)
+    if (adoption.get("schema_version") != _AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION
+            or adoption.get("stage") != "completed"
+            or adoption.get("project_id") != "aming-claw" or adoption.get("port") != AC_DEV_SERVICE_PORT
+            or adoption.get("root_identity") != {"path": str(root), "device": int(root_stat.st_dev),
+                                                   "inode": int(root_stat.st_ino)}
+            or adoption.get("database_identity", {}).get("path") != str(database)
+            or adoption.get("linked_v3_receipt") != str(linked.absolute())
+            or adoption.get("linked_v3_receipt_sha256") != linked_sha
+            or adoption.get("candidate_source_identity") != source
+            or linked_value.get("database_sha256_after") != adoption.get("database_sha256_preimage")):
+        raise click.ClickException("dashboard backlog bootstrap historical adoption mismatch")
+    return adoption, adoption_sha, adoptions[0]
+
+
+def _stopped_dashboard_bootstrap_ancestry(
+    root: Path, *, expected_database_sha256: str | None = None, phase: str,
+) -> dict[str, Any]:
+    """Prove historical chain then apply the phase-specific current DB gate."""
+    from agent.governance import db as _db
+    adoption, adoption_sha, adoption_path = _historical_dashboard_bootstrap_adoption(root)
+    if phase not in {"first_import", "pending_finalize", "completed_replay"}:
+        raise click.ClickException("dashboard backlog bootstrap phase is invalid")
+    # Only first mutation is allowed through the legacy helper: it demands the
+    # stopped current preimage.  Postcommit finalize/replay instead bind current
+    # bytes through their own immutable bootstrap receipt below.
+    if phase == "first_import":
+        linked = Path(str(adoption.get("linked_v3_receipt") or ""))
+        try:
+            _db._validated_canonical_legacy_postimage_adoption(
+                root, linked, _source_git_identity(), _db.verified_stable_database_binding(),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise click.ClickException("dashboard backlog bootstrap preimage adoption mismatch") from exc
     runtime = root / "runtime" / "durable-launch"
     database = root / "governance" / "aming-claw" / "governance.db"
     database_before = _bootstrap_regular_database(database, label="target")
@@ -2807,7 +2846,7 @@ def _stopped_dashboard_bootstrap_ancestry(
     if database_after != database_before:
         raise click.ClickException("dashboard backlog bootstrap database drifted during ancestry read")
     ancestry = {
-        "adoption_receipt": str(adoptions[0]), "adoption_sha256": adoption_sha,
+        "adoption_receipt": str(adoption_path), "adoption_sha256": adoption_sha,
         "launch_sha256": launch_sha, "stop_sha256": stop_sha, "exit_sha256": exit_sha,
         "database_sha256": current_sha, "database_identity": launch.get("database_identity"),
     }
@@ -2875,6 +2914,7 @@ def _offline_dashboard_backlog_bootstrap(
             current_ancestry = _stopped_dashboard_bootstrap_ancestry(
                 canonical,
                 expected_database_sha256=str(recorded_ancestry.get("database_sha256") or ""),
+                phase="completed_replay",
             )
         except click.ClickException:
             current_ancestry = {}
@@ -2959,12 +2999,13 @@ def _offline_dashboard_backlog_bootstrap(
             if _stopped_dashboard_bootstrap_ancestry(
                 canonical,
                 expected_database_sha256=str(ancestry.get("database_sha256") or ""),
+                phase="pending_finalize",
             ) != ancestry:
                 raise click.ClickException("dashboard backlog bootstrap pending ancestry HOLD")
         except click.ClickException:
             raise
     else:
-        ancestry = _stopped_dashboard_bootstrap_ancestry(canonical)
+        ancestry = _stopped_dashboard_bootstrap_ancestry(canonical, phase="first_import")
     connection = sqlite3.connect(str(target), timeout=5, isolation_level=None)
     preimage_sha = str(pending.get("target_database_sha256_before") or "") if pending else target_before["sha256"]
     backup = receipts_dir / f"{preimage_sha[7:]}.pre.sqlite"
