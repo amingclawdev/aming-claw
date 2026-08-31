@@ -3615,7 +3615,9 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
         raise ValueError("AC dev COW successor reconstructed issuance payload mismatch")
     return receipt
 
-def _verify_current_dev_backlog_runtime_invariants(conn: sqlite3.Connection) -> None:
+def _verify_current_dev_backlog_runtime_invariants(
+    conn: sqlite3.Connection, *, expected_protected_inventory: Mapping[str, object]
+) -> None:
     """Validate mutable backlog state through schema/generation invariants."""
 
     if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
@@ -3630,13 +3632,10 @@ def _verify_current_dev_backlog_runtime_invariants(conn: sqlite3.Connection) -> 
         != canonical_backlog_read_schema_managed_inventory()
     ):
         raise ValueError("existing AC dev backlog managed inventory changed")
-    with closing(sqlite3.connect(":memory:")) as canonical:
-        canonical.row_factory = sqlite3.Row
-        _configure_connection(canonical, busy_timeout=10000)
-        _ensure_schema(canonical)
-        ensure_backlog_read_schema(canonical)
-        expected_protected = backlog_read_schema_protected_inventory(canonical)
-    if backlog_read_schema_protected_inventory(conn) != expected_protected:
+    if (
+        backlog_read_schema_protected_inventory(conn)
+        != dict(expected_protected_inventory)
+    ):
         raise ValueError("existing AC dev backlog protected inventory changed")
 
 
@@ -4053,7 +4052,14 @@ def bootstrap_dev_governance_store(
             _verify_existing_schema(conn)
             _verify_dev_world_schema_inventory(conn)
             if cow_successor_receipt is not None:
-                _verify_current_dev_backlog_runtime_invariants(conn)
+                _verify_current_dev_backlog_runtime_invariants(
+                    conn,
+                    expected_protected_inventory=dict(
+                        dict(cow_successor_receipt.get("successor") or {}).get(
+                            "protected_inventory"
+                        ) or {}
+                    ),
+                )
             meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
             try:
                 stored_genesis = json.loads(

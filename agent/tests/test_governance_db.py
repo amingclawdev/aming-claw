@@ -1396,10 +1396,14 @@ def test_ac_dev_cow_successor_replaces_only_genesis_physical_identity(tmp_path, 
     os.replace(replacement, database)
     with sqlite3.connect(database) as connection:
         db.ensure_backlog_read_schema(connection)
+        protected_inventory = db.backlog_read_schema_protected_inventory(connection)
     new = database.stat(follow_symlinks=False)
     receipt = {
         "predecessor": {"backup": {"device": old.st_dev, "inode": old.st_ino}},
-        "successor": {"identity": {"device": new.st_dev, "inode": new.st_ino}},
+        "successor": {
+            "identity": {"device": new.st_dev, "inode": new.st_ino},
+            "protected_inventory": protected_inventory,
+        },
     }
     monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
     replay = db.bootstrap_dev_governance_store(
@@ -1753,7 +1757,12 @@ def test_ac_dev_cow_successor_v2_restart_allows_legitimate_fresh_backlog_row(
     )
     connection.commit()
     connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    db._verify_current_dev_backlog_runtime_invariants(connection)
+    db._verify_current_dev_backlog_runtime_invariants(
+        connection,
+        expected_protected_inventory=json.loads(
+            Path(created["receipt"]).read_text(encoding="utf-8")
+        )["successor"]["protected_inventory"],
+    )
     connection.close()
     for suffix in ("-wal", "-shm"):
         path = Path(str(database) + suffix)
@@ -1910,7 +1919,10 @@ def test_current_dev_backlog_runtime_invariants_reject_schema_and_generation(
     db._configure_connection(connection, busy_timeout=1000)
     db._ensure_schema(connection)
     db.ensure_backlog_read_schema(connection)
-    db._verify_current_dev_backlog_runtime_invariants(connection)
+    protected = db.backlog_read_schema_protected_inventory(connection)
+    db._verify_current_dev_backlog_runtime_invariants(
+        connection, expected_protected_inventory=protected
+    )
     connection.execute(
         "UPDATE dashboard_backlog_cache_generation SET generation=0 "
         "WHERE resource=?",
@@ -1918,7 +1930,9 @@ def test_current_dev_backlog_runtime_invariants_reject_schema_and_generation(
     )
     connection.commit()
     with pytest.raises(ValueError, match="managed generation"):
-        db._verify_current_dev_backlog_runtime_invariants(connection)
+        db._verify_current_dev_backlog_runtime_invariants(
+            connection, expected_protected_inventory=protected
+        )
     connection.execute(
         "UPDATE dashboard_backlog_cache_generation SET generation=1 "
         "WHERE resource=?",
@@ -1927,8 +1941,51 @@ def test_current_dev_backlog_runtime_invariants_reject_schema_and_generation(
     connection.execute("DROP TRIGGER trg_dashboard_backlog_cache_update")
     connection.commit()
     with pytest.raises(ValueError, match="managed generation"):
-        db._verify_current_dev_backlog_runtime_invariants(connection)
+        db._verify_current_dev_backlog_runtime_invariants(
+            connection, expected_protected_inventory=protected
+        )
     connection.close()
+
+
+def test_current_dev_backlog_runtime_invariants_use_historical_phase_z_inventory(
+    tmp_path
+):
+    from agent.governance import db
+
+    database = tmp_path / "phase-z.sqlite"
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    db._configure_connection(connection, busy_timeout=1000)
+    db._ensure_schema(connection)
+    db.admit_missing_authority_projection_schema(connection)
+    db.ensure_backlog_read_schema(connection)
+    db._verify_dev_world_schema_inventory(connection)
+    historical = db.backlog_read_schema_protected_inventory(connection)
+    db._verify_current_dev_backlog_runtime_invariants(
+        connection, expected_protected_inventory=historical
+    )
+    authority_tables = [
+        row[1] for row in db.authority_projection_schema_inventory()["inventory"]
+        if row[0] == "table"
+    ]
+    assert len(authority_tables) >= 6
+    connection.close()
+
+    for index, statement in enumerate((
+        f'DROP TABLE "{authority_tables[0]}"',
+        f'ALTER TABLE "{authority_tables[1]}" ADD COLUMN qa_drift TEXT',
+        'CREATE TABLE qa_extra_protected_object(value TEXT)',
+    )):
+        candidate = tmp_path / f"phase-z-drift-{index}.sqlite"
+        shutil.copyfile(database, candidate)
+        drifted = sqlite3.connect(candidate)
+        drifted.execute(statement)
+        drifted.commit()
+        with pytest.raises(ValueError, match="protected inventory"):
+            db._verify_current_dev_backlog_runtime_invariants(
+                drifted, expected_protected_inventory=historical
+            )
+        drifted.close()
 
 
 def test_ac_dev_cow_successor_public_cli_wrong_real_schema_is_bounded(tmp_path, monkeypatch):
