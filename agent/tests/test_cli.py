@@ -29,6 +29,34 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_CLICK, reason="click not installed")
 
 
+def test_dev_create_cow_successor_receipt_delegates_to_db(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    root = tmp_path / "dev"
+    root.mkdir()
+    operator = tmp_path / "operator.json"
+    backup = tmp_path / "backup.sqlite"
+    linked = tmp_path / "linked.json"
+    for path in (operator, backup, linked):
+        path.write_text("{}", encoding="utf-8")
+    observed = {}
+
+    def create(storage_root, **kwargs):
+        observed.update({"storage_root": storage_root, **kwargs})
+        return {"status": "created", "receipt": "/receipt", "receipt_sha256": "sha256:" + "a" * 64}
+
+    monkeypatch.setattr(db, "create_dev_cow_successor_receipt", create)
+    result = CliRunner().invoke(main, [
+        "dev-create-cow-successor-receipt", "--dev-storage-root", str(root),
+        "--operator-receipt", str(operator), "--predecessor-backup", str(backup),
+        "--linked-v3-receipt", str(linked),
+    ])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["status"] == "created"
+    assert observed == {"storage_root": root, "operator_receipt": operator,
+                        "predecessor_backup": backup, "linked_v3_receipt": linked}
+
+
 class _GovernanceProbeResponse:
     def __init__(self, *, url, body, headers=None, status=200, expected_limit=None):
         self.url = url

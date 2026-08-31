@@ -52,6 +52,8 @@ AC_LEGACY_ARCHIVE_SIZE_BYTES = 178_625_794_048
 AC_DEV_CUTOVER_SCHEMA = "ac_dev_world_cutover.v1"
 AC_DEV_LAUNCH_RECEIPT_SCHEMA = "ac_dev_launch_receipt.v1"
 AC_DEV_LAUNCH_RECEIPT_NAME = "launch-receipt.json"
+AC_DEV_COW_SUCCESSOR_SCHEMA = "ac_dev_cow_database_successor.v1"
+AC_DEV_COW_SUCCESSOR_ARCHIVE = "archive/cow-database-successor"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
@@ -2951,6 +2953,237 @@ def _durable_database_sha256(database: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _cow_regular_identity(path: Path, *, nlink: int | None = None) -> dict[str, object]:
+    absolute = path.expanduser().absolute()
+    metadata = absolute.stat(follow_symlinks=False)
+    if (absolute.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+            or absolute.resolve(strict=True) != absolute
+            or (nlink is not None and int(metadata.st_nlink) != nlink)):
+        raise ValueError("AC dev COW successor artifact is not canonical")
+    return {"path": str(absolute), "device": int(metadata.st_dev),
+            "inode": int(metadata.st_ino), "size": int(metadata.st_size),
+            "nlink": int(metadata.st_nlink), "sha256": _durable_database_sha256(absolute)}
+
+
+def _cow_raw_receipt(path: Path, *, prefix: str = "") -> tuple[dict[str, object], str]:
+    absolute = path.expanduser().absolute()
+    metadata = absolute.stat(follow_symlinks=False)
+    if (absolute.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+            or int(metadata.st_nlink) != 1 or absolute.resolve(strict=True) != absolute):
+        raise ValueError("AC dev COW successor evidence is not canonical")
+    raw = absolute.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if prefix:
+        if (re.fullmatch(rf"{re.escape(prefix)}\.([0-9a-f]{{64}})\.json", absolute.name) is None
+                or absolute.name != f"{prefix}.{digest}.json"):
+            raise ValueError("AC dev COW successor receipt digest mismatch")
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError("AC dev COW successor evidence is unreadable") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("AC dev COW successor evidence is invalid")
+    return dict(value), "sha256:" + digest
+
+
+def _cow_database_observation(
+    database: Path, *, expected_rows: int = 3603, require_managed: bool = True,
+    nlink: int | None = 1,
+) -> dict[str, object]:
+    identity = _cow_regular_identity(database, nlink=nlink)
+    for suffix in ("-wal", "-shm", "-journal"):
+        if Path(str(database) + suffix).exists() or Path(str(database) + suffix).is_symlink():
+            raise ValueError("AC dev COW successor database has sidecars")
+    _assert_no_external_sqlite_holders(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise ValueError("AC dev COW successor quick-check failed")
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+        row_count = int(conn.execute(
+            "SELECT COUNT(*) FROM backlog_bugs WHERE project_id=?", (AC_PROJECT_ID,),
+        ).fetchone()[0])
+        status_counts = {
+            str(status): int(count) for status, count in conn.execute(
+                "SELECT status,COUNT(*) FROM backlog_bugs WHERE project_id=? "
+                "GROUP BY status ORDER BY status", (AC_PROJECT_ID,),
+            )
+        }
+        managed = backlog_read_schema_managed_inventory(conn)
+        canonical_managed = canonical_backlog_read_schema_managed_inventory()
+        drift = backlog_read_schema_drift(conn)
+        protected_inventory = backlog_read_schema_protected_inventory(conn)
+        protected_projection = _sqlite_logical_projection(
+            conn, exclude_tables=frozenset({"backlog_bugs", "dashboard_backlog_cache_generation"}),
+        )
+        backlog_projection = _sqlite_logical_projection(conn).get("backlog_bugs")
+    finally:
+        conn.close()
+    if (row_count != expected_rows
+            or (require_managed and managed != canonical_managed)
+            or (require_managed and drift.get("invalid"))):
+        raise ValueError("AC dev COW successor backlog projection is invalid")
+    return {"identity": identity, "quick_check": "ok", "row_count": row_count,
+            "status_counts": status_counts, "managed_inventory": managed,
+            "managed_inventory_drift": [], "protected_inventory": protected_inventory,
+            "protected_projection": protected_projection,
+            "backlog_projection_sha256": backlog_projection,
+            "genesis_json": str(meta.get("governance_world_genesis_json") or ""),
+            "genesis_sha256": str(meta.get("governance_world_genesis_sha256") or "")}
+
+
+def _cow_successor_archive(root: Path) -> Path:
+    return root / AC_DEV_COW_SUCCESSOR_ARCHIVE
+
+
+def create_dev_cow_successor_receipt(
+    storage_root: Path | str, *, operator_receipt: Path, predecessor_backup: Path,
+    linked_v3_receipt: Path,
+) -> dict[str, object]:
+    """Create the sole immutable authority for an operator-supervised DB COW."""
+    root = Path(storage_root).expanduser().absolute()
+    if root.is_symlink() or root.resolve(strict=True) != root:
+        raise ValueError("AC dev COW successor root is invalid")
+    listener = _default_cutover_listener_probe(40008)
+    if listener.get("listening") or int(listener.get("pid") or 0):
+        raise ValueError("AC dev COW successor requires stopped port 40008")
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    successor = _cow_database_observation(database)
+    backup_path = predecessor_backup.expanduser().absolute()
+    backup = _cow_regular_identity(backup_path)
+    if backup_path.parent != root / "archive" / "operator-exception-backups":
+        raise ValueError("AC dev COW successor backup is outside its archive")
+    backup_observation = _cow_database_observation(
+        backup_path, expected_rows=0, require_managed=False, nlink=None,
+    )
+    operator_path = operator_receipt.expanduser().absolute()
+    operator, operator_sha = _cow_raw_receipt(operator_path, prefix="cow-import")
+    if operator_path.parent != root / "archive" / "operator-exceptions":
+        raise ValueError("AC dev COW successor operator evidence is outside its archive")
+    if (operator.get("schema_version") != "ac_dev_operator_exception_cow_import.v1"
+            or operator.get("qa_pass") is not False or operator.get("release_authority") is not False
+            or operator.get("rows") != 3603 or not operator.get("decisions")
+            or operator.get("backup_sha256") != backup["sha256"]
+            or operator.get("target_sha256_before") != backup["sha256"]
+            or operator.get("target_sha256_after") != successor["identity"]["sha256"]):
+        raise ValueError("AC dev COW successor operator evidence mismatch")
+    if (backup_observation["genesis_json"] != successor["genesis_json"]
+            or backup_observation["genesis_sha256"] != successor["genesis_sha256"]
+            or backup_observation["protected_inventory"] != successor["protected_inventory"]
+            or backup_observation["protected_projection"] != successor["protected_projection"]):
+        raise ValueError("AC dev COW successor protected preimage mismatch")
+    try:
+        genesis = json.loads(str(successor["genesis_json"]))
+    except ValueError as exc:
+        raise ValueError("AC dev COW successor genesis is unreadable") from exc
+    if (not isinstance(genesis, Mapping)
+            or successor["genesis_sha256"] != _world_genesis_hash(genesis)
+            or dict(genesis.get("database_identity") or {}).get("device") != backup["device"]
+            or dict(genesis.get("database_identity") or {}).get("inode") != backup["inode"]):
+        raise ValueError("AC dev COW successor predecessor genesis mismatch")
+    linked_path = linked_v3_receipt.expanduser().absolute()
+    linked, linked_sha = _cow_raw_receipt(linked_path)
+    if linked_path.parent != root / "archive" / "schema-admission":
+        raise ValueError("AC dev COW successor linked receipt is outside its archive")
+    linked_hex = linked_sha.removeprefix("sha256:")
+    linked_sidecar = linked_path.with_suffix(".sha256")
+    if (linked_path.name != f"{linked_hex}.json" or linked_sidecar.is_symlink()
+            or not linked_sidecar.is_file()
+            or linked_sidecar.read_text(encoding="utf-8")
+            != f"sha256:{linked_hex}  {linked_path.name}\n"):
+        raise ValueError("AC dev COW successor linked receipt sidecar mismatch")
+    adoptions = sorted((root / "archive" / "canonical-legacy-postimage-adoption").glob("adoption.*.json"))
+    if len(adoptions) != 1:
+        raise ValueError("AC dev COW successor adoption evidence is missing or ambiguous")
+    adoption, adoption_sha = _cow_raw_receipt(adoptions[0], prefix="adoption")
+    if (adoption.get("schema_version") != "ac_dev_canonical_legacy_postimage_adoption.v1"
+            or adoption.get("stage") != "completed"
+            or adoption.get("project_id") != AC_PROJECT_ID or adoption.get("port") != 40008
+            or linked.get("schema_version") != "ac_dev_offline_schema_admission.v3"
+            or linked.get("stage") != "completed"
+            or adoption.get("linked_v3_receipt") != str(linked_path)
+            or adoption.get("linked_v3_receipt_sha256") != linked_sha
+            or linked.get("database_identity", {}).get("device") != backup["device"]
+            or linked.get("database_identity", {}).get("inode") != backup["inode"]):
+        raise ValueError("AC dev COW successor historical chain mismatch")
+    stable = verified_stable_database_binding()
+    _revalidate_stable_database_binding(stable)
+    stable_db = Path(str(stable["database_path"]))
+    stable_metadata = stable_db.stat(follow_symlinks=False)
+    stable_identity = dict(stable["stable_database_identity"])
+    if (stable_db.is_symlink() or not stat.S_ISREG(stable_metadata.st_mode)
+            or (stable_identity["device"], stable_identity["inode"]) == (
+                successor["identity"]["device"], successor["identity"]["inode"])):
+        raise ValueError("AC dev COW successor aliases stable database")
+    payload = {"schema_version": AC_DEV_COW_SUCCESSOR_SCHEMA, "stage": "completed",
+               "project_id": AC_PROJECT_ID, "port": 40008, "root": str(root),
+               "listener": {"host": "127.0.0.1", "port": 40008, "listening": False},
+               "genesis": {"raw_json": successor["genesis_json"],
+                           "sha256": successor["genesis_sha256"]},
+               "predecessor": {"backup": backup}, "successor": successor,
+               "operator_evidence": {"path": str(operator_path), "sha256": operator_sha,
+                                     "payload": operator},
+               "history": {"linked_v3": {"path": str(linked_path), "sha256": linked_sha},
+                           "adoption": {"path": str(adoptions[0]), "sha256": adoption_sha}},
+               "stable_binding": {"database": stable_identity,
+                                  "runtime_commit": stable.get("commit")}}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    archive = _cow_successor_archive(root)
+    archive.mkdir(parents=True, exist_ok=True)
+    if archive.is_symlink() or archive.resolve(strict=True) != archive:
+        raise ValueError("AC dev COW successor archive is invalid")
+    existing = sorted(archive.glob("successor.*.json"))
+    destination = archive / f"successor.{digest}.json"
+    if existing:
+        if existing != [destination] or destination.read_bytes() != raw:
+            raise ValueError("AC dev COW successor receipt is ambiguous")
+        return {"receipt": str(destination), "receipt_sha256": "sha256:" + digest,
+                "status": "already_created"}
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o444)
+    try:
+        os.write(descriptor, raw)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_fd = os.open(archive, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {"receipt": str(destination), "receipt_sha256": "sha256:" + digest,
+            "status": "created"}
+
+
+def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, object]:
+    """Cycle-free, source-owned revalidation of the unique COW successor."""
+    root = Path(storage_root).expanduser().absolute()
+    archive = _cow_successor_archive(root)
+    receipts = sorted(archive.glob("successor.*.json")) if archive.is_dir() else []
+    if len(receipts) != 1:
+        raise ValueError("AC dev COW successor receipt is missing or ambiguous")
+    receipt, digest = _cow_raw_receipt(receipts[0], prefix="successor")
+    if (receipt.get("schema_version") != AC_DEV_COW_SUCCESSOR_SCHEMA
+            or receipt.get("stage") != "completed" or receipt.get("project_id") != AC_PROJECT_ID
+            or receipt.get("port") != 40008 or receipt.get("root") != str(root)):
+        raise ValueError("AC dev COW successor receipt mismatch")
+    operator = dict(receipt.get("operator_evidence") or {})
+    predecessor = dict(receipt.get("predecessor") or {}).get("backup")
+    history = dict(receipt.get("history") or {})
+    linked = dict(history.get("linked_v3") or {})
+    # Re-run the creator's complete observation and require byte-identical payload.
+    expected = create_dev_cow_successor_receipt(
+        root, operator_receipt=Path(str(operator.get("path") or "")),
+        predecessor_backup=Path(str(dict(predecessor or {}).get("path") or "")),
+        linked_v3_receipt=Path(str(linked.get("path") or "")),
+    )
+    if expected["receipt_sha256"] != digest:
+        raise ValueError("AC dev COW successor receipt replay drift")
+    return receipt
+
+
 def validate_dev_preimage_only(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     linked_v3_receipt: Path,
@@ -3252,8 +3485,6 @@ def bootstrap_dev_governance_store(
         _sqlite_adoption_identity(database, required=True)
     for companion in companions:
         _sqlite_adoption_identity(companion, required=True)
-    lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
-    acquire_dev_runtime_writer_lease(root)
     genesis = {
         "schema_version": AC_WORLD_GENESIS_SCHEMA,
         "world_id": AC_DEV_WORLD_ID,
@@ -3271,6 +3502,33 @@ def bootstrap_dev_governance_store(
     source_upgraded = False
     if database.is_symlink():
         raise ValueError("AC dev governance database cannot be a symlink")
+    cow_successor_receipt: dict[str, object] | None = None
+    if not created:
+        # Resolve the exceptional physical successor before opening the writer;
+        # receipt validation includes the no-holder/no-sidecar admission gate.
+        probe = sqlite3.connect(
+            "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1",
+            uri=True,
+        )
+        try:
+            probe_meta = dict(probe.execute(
+                "SELECT key,value FROM schema_meta WHERE key='governance_world_genesis_json'"
+            ))
+        except sqlite3.Error as exc:
+            raise ValueError("existing AC dev world genesis is unreadable") from exc
+        finally:
+            probe.close()
+        try:
+            probe_genesis = json.loads(str(probe_meta.get("governance_world_genesis_json") or ""))
+        except ValueError:
+            probe_genesis = {}
+        probe_stored = dict(probe_genesis.get("database_identity") or {}) if isinstance(probe_genesis, Mapping) else {}
+        probe_stat = database.stat(follow_symlinks=False)
+        if (probe_stored.get("device"), probe_stored.get("inode")) != (
+                int(probe_stat.st_dev), int(probe_stat.st_ino)):
+            cow_successor_receipt = validate_dev_cow_successor_receipt(root)
+    lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
+    acquire_dev_runtime_writer_lease(root)
     conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(str(database), timeout=30)
@@ -3362,13 +3620,28 @@ def bootstrap_dev_governance_store(
             current_root = root.stat(follow_symlinks=False)
             current_database = database.stat(follow_symlinks=False)
             if (
-                stored_database.get("device") != int(current_database.st_dev)
-                or stored_database.get("inode") != int(current_database.st_ino)
+                (stored_database.get("device") != int(current_database.st_dev)
+                 or stored_database.get("inode") != int(current_database.st_ino))
                 or stored_root.get("path") != str(root)
                 or stored_root.get("device") != int(current_root.st_dev)
                 or stored_root.get("inode") != int(current_root.st_ino)
             ):
-                raise ValueError("existing AC dev world storage/database identity changed")
+                # A content-addressed COW successor is the only authority that
+                # may replace the physical genesis inode.  Genesis bytes and
+                # every logical/source-schema check below remain authoritative.
+                if (stored_root.get("path") != str(root)
+                        or stored_root.get("device") != int(current_root.st_dev)
+                        or stored_root.get("inode") != int(current_root.st_ino)):
+                    raise ValueError("existing AC dev world storage/database identity changed")
+                if cow_successor_receipt is None:
+                    raise ValueError("existing AC dev world COW successor receipt is missing")
+                predecessor = dict(dict(cow_successor_receipt.get("predecessor") or {}).get("backup") or {})
+                successor_identity = dict(dict(cow_successor_receipt.get("successor") or {}).get("identity") or {})
+                if (stored_database.get("device") != predecessor.get("device")
+                        or stored_database.get("inode") != predecessor.get("inode")
+                        or successor_identity.get("device") != int(current_database.st_dev)
+                        or successor_identity.get("inode") != int(current_database.st_ino)):
+                    raise ValueError("existing AC dev world COW successor identity mismatch")
             required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
             if stored_genesis.get("source_schema_sha256") != _source_schema_inventory_hash(
                 conn, required_tables

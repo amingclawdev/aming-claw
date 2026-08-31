@@ -3249,6 +3249,28 @@ def dev_bootstrap_dashboard_backlog(
     ), sort_keys=True))
 
 
+@main.command("dev-create-cow-successor-receipt")
+@click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--operator-receipt", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--predecessor-backup", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--linked-v3-receipt", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def dev_create_cow_successor_receipt(
+    dev_storage_root: Path, operator_receipt: Path, predecessor_backup: Path,
+    linked_v3_receipt: Path,
+) -> None:
+    """Seal one source-validated COW physical successor for the AC dev DB."""
+    from agent.governance import db as _db
+    try:
+        result = _db.create_dev_cow_successor_receipt(
+            dev_storage_root, operator_receipt=operator_receipt,
+            predecessor_backup=predecessor_backup,
+            linked_v3_receipt=linked_v3_receipt,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, sort_keys=True))
+
+
 def _posix_exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.parent.is_symlink() or path.is_symlink():

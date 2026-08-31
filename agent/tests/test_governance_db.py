@@ -1123,6 +1123,162 @@ def test_ac_dev_source_tip_cas_upgrade_is_descendant_and_genesis_immutable(tmp_p
         )
 
 
+def test_ac_dev_cow_successor_replaces_only_genesis_physical_identity(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    source_root, commit = _dev_source_repo(tmp_path)
+    storage_root, stable = _canonical_dev_world(tmp_path)
+    source = {"root": str(source_root.resolve()), "branch": "codex/ac-dev",
+              "commit": commit, "source_sha256": "sha256:" + "c" * 64}
+    first = db.bootstrap_dev_governance_store(
+        storage_root, source_identity=source,
+        process_identity={"pid": 101, "start_identity": "cow-before"},
+    )
+    _admit_existing_dev_world(storage_root, stable)
+    database = Path(first["database_path"])
+    with sqlite3.connect(database) as connection:
+        genesis_before = connection.execute(
+            "SELECT value FROM schema_meta WHERE key='governance_world_genesis_json'"
+        ).fetchone()[0]
+    db.release_dev_runtime_writer_lease(storage_root)
+    old = database.stat(follow_symlinks=False)
+    replacement = database.with_suffix(".cow")
+    replacement.write_bytes(database.read_bytes())
+    os.replace(replacement, database)
+    new = database.stat(follow_symlinks=False)
+    receipt = {
+        "predecessor": {"backup": {"device": old.st_dev, "inode": old.st_ino}},
+        "successor": {"identity": {"device": new.st_dev, "inode": new.st_ino}},
+    }
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    replay = db.bootstrap_dev_governance_store(
+        storage_root, source_identity=source,
+        process_identity={"pid": 202, "start_identity": "cow-after"},
+    )
+    assert replay["database_identity"]["inode"] == new.st_ino
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key='governance_world_genesis_json'"
+        ).fetchone()[0] == genesis_before
+
+    receipt["successor"]["identity"]["inode"] += 1
+    before = database.read_bytes()
+    with pytest.raises(ValueError, match="COW successor identity"):
+        db.bootstrap_dev_governance_store(
+            storage_root, source_identity=source,
+            process_identity={"pid": 303, "start_identity": "wrong-successor"},
+        )
+    assert database.read_bytes() == before
+
+
+def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    root = tmp_path / "dev"
+    database = root / db.AC_DATABASE_DEV_RELATIVE_PATH
+    backup = root / "archive" / "operator-exception-backups" / "old.sqlite"
+    operator_dir = root / "archive" / "operator-exceptions"
+    linked_dir = root / "archive" / "schema-admission"
+    operator = operator_dir / "placeholder"
+    linked = linked_dir / "placeholder"
+    adoption_dir = root / "archive" / "canonical-legacy-postimage-adoption"
+    for path in (database, backup, operator, linked):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"{}")
+    genesis = {"database_identity": {"device": 7, "inode": 11}}
+    genesis_raw = json.dumps(genesis, sort_keys=True, separators=(",", ":"))
+    genesis_sha = db._world_genesis_hash(genesis)
+    successor_observation = {
+        "identity": {"path": str(database), "device": 7, "inode": 22,
+                     "size": 2, "nlink": 1, "sha256": "sha256:" + "b" * 64},
+        "quick_check": "ok", "row_count": 3603, "status_counts": {"OPEN": 3603},
+        "managed_inventory": {"sha256": "managed"}, "managed_inventory_drift": [],
+        "protected_inventory": {"sha256": "protected"},
+        "protected_projection": {"schema_meta": "sha256:meta"},
+        "genesis_json": genesis_raw, "genesis_sha256": genesis_sha,
+    }
+    backup_observation = {**successor_observation,
+                          "identity": {"path": str(backup), "device": 7, "inode": 11,
+                                       "size": 2, "nlink": 1, "sha256": "sha256:" + "a" * 64},
+                          "row_count": 0}
+    operator_payload = {"schema_version": "ac_dev_operator_exception_cow_import.v1",
+                        "qa_pass": False, "release_authority": False, "rows": 3603,
+                        "decisions": ["decision"], "backup_sha256": "sha256:" + "a" * 64,
+                        "target_sha256_before": "sha256:" + "a" * 64,
+                        "target_sha256_after": "sha256:" + "b" * 64}
+    operator_raw = json.dumps(operator_payload, sort_keys=True, separators=(",", ":")).encode()
+    operator.unlink()
+    operator = operator_dir / f"cow-import.{hashlib.sha256(operator_raw).hexdigest()}.json"
+    operator.write_bytes(operator_raw)
+    linked_payload = {"schema_version": "ac_dev_offline_schema_admission.v3",
+                      "stage": "completed",
+                      "database_identity": {"device": 7, "inode": 11}}
+    linked_raw = json.dumps(linked_payload, sort_keys=True, separators=(",", ":")).encode()
+    linked.unlink()
+    linked = linked_dir / f"{hashlib.sha256(linked_raw).hexdigest()}.json"
+    linked.write_bytes(linked_raw)
+    linked_sha = "sha256:" + hashlib.sha256(linked.read_bytes()).hexdigest()
+    linked.with_suffix(".sha256").write_text(f"{linked_sha}  {linked.name}\n")
+    adoption_payload = {"schema_version": "ac_dev_canonical_legacy_postimage_adoption.v1",
+                        "stage": "completed", "project_id": "aming-claw", "port": 40008,
+                        "linked_v3_receipt": str(linked),
+                        "linked_v3_receipt_sha256": linked_sha}
+    adoption_raw = json.dumps(adoption_payload, sort_keys=True, separators=(",", ":")).encode()
+    adoption = adoption_dir / f"adoption.{hashlib.sha256(adoption_raw).hexdigest()}.json"
+    adoption_dir.mkdir(parents=True)
+    adoption.write_bytes(adoption_raw)
+
+    monkeypatch.setattr(db, "_cow_database_observation",
+                        lambda path, **_kwargs: successor_observation if path == database else backup_observation)
+    monkeypatch.setattr(db, "_cow_regular_identity",
+                        lambda path, **_kwargs: (
+                            {"path": str(backup), "device": 7, "inode": 11, "size": 2,
+                             "nlink": 1, "sha256": "sha256:" + "a" * 64}
+                            if path == backup else
+                            {"schema_version": "ac_stable_database_identity.v1", "device": 8,
+                             "inode": 33, "stable_relative_path_sha256": "sha256:" + "d" * 64}))
+    stable_db = tmp_path / "stable.db"
+    stable_db.write_bytes(b"stable")
+    stable_identity = {"schema_version": "ac_stable_database_identity.v1",
+                       "device": stable_db.stat().st_dev, "inode": stable_db.stat().st_ino,
+                       "stable_relative_path_sha256": "sha256:" + "d" * 64}
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: {
+        "database_path": str(stable_db), "stable_database_identity": stable_identity})
+    monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _binding: None)
+    monkeypatch.setattr(db, "_default_cutover_listener_probe",
+                        lambda port: {"port": port, "listening": False, "pid": 0})
+    first = db.create_dev_cow_successor_receipt(
+        root, operator_receipt=operator, predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    receipt = Path(first["receipt"])
+    raw = receipt.read_bytes()
+    assert receipt.name == f"successor.{hashlib.sha256(raw).hexdigest()}.json"
+    second = db.create_dev_cow_successor_receipt(
+        root, operator_receipt=operator, predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    assert second["status"] == "already_created"
+    assert receipt.read_bytes() == raw
+
+    ambiguous = receipt.with_name("successor." + "f" * 64 + ".json")
+    ambiguous.write_bytes(raw)
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        db.validate_dev_cow_successor_receipt(root)
+    ambiguous.unlink()
+    successor_observation["identity"]["sha256"] = "sha256:" + "e" * 64
+    with pytest.raises(ValueError, match="mismatch"):
+        db.validate_dev_cow_successor_receipt(root)
+    assert receipt.read_bytes() == raw
+
+
+def test_ac_dev_cow_successor_validator_rejects_missing(tmp_path):
+    from agent.governance import db
+
+    root = tmp_path / "dev"
+    root.mkdir()
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        db.validate_dev_cow_successor_receipt(root)
 def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process(tmp_path):
     from agent.governance import db
 
