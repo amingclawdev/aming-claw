@@ -146,7 +146,10 @@ def _route_bound_adoption_fixture(conn):
     )
     token = issued["route_token"]
     observer_route_context.persist_route_token_ref(
-        conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=token
+        conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=token,
+        # This fixture exercises lifecycle storage below the server authority
+        # boundary.  Handler tests provide the real final revalidator.
+        canonical_adoption_authority_revalidator=lambda _conn, _token: None,
     )
     return issued["route_token_ref"], token, intent
 
@@ -467,6 +470,90 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
     finally:
         conn.close()
 
+    # Exercise the actual handler-to-writer gap deterministically.  Each
+    # mutation is committed *after* the successful availability precheck but
+    # immediately before the real registry writer enters BEGIN IMMEDIATE.  A
+    # final authority check outside that writer transaction would mint a row;
+    # the writer-owned recheck must instead reject with no adoption registry
+    # write.  Restore each durable input before the next independently issued
+    # attempt.
+    real_persist = observer_route_context.persist_route_token_ref
+    writer_gap_mutations = (
+        (
+            "qa-revoked",
+            lambda changed: changed.execute(
+                "UPDATE sessions SET status='revoked' WHERE session_id=?",
+                (qa_session["session_id"],),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE sessions SET status='active' WHERE session_id=?",
+                (qa_session["session_id"],),
+            ),
+        ),
+        (
+            "qa-expired",
+            lambda changed: changed.execute(
+                "UPDATE sessions SET expires_at=? WHERE session_id=?",
+                ("2000-01-01T00:00:00Z", qa_session["session_id"]),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE sessions SET expires_at=? WHERE session_id=?",
+                (qa_session["expires_at"], qa_session["session_id"]),
+            ),
+        ),
+        (
+            "qa-scope-narrowed",
+            lambda changed: changed.execute(
+                "UPDATE sessions SET scope_json=? WHERE session_id=?",
+                (json.dumps([f"backlog:{backlog_id}"]), qa_session["session_id"]),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE sessions SET scope_json=? WHERE session_id=?",
+                (json.dumps(qa_scope), qa_session["session_id"]),
+            ),
+        ),
+        (
+            "source-route-superseded",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET status='superseded' "
+                "WHERE route_token_ref=?",
+                ("rr-adoption-authority",),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET status='active' "
+                "WHERE route_token_ref=?",
+                ("rr-adoption-authority",),
+            ),
+        ),
+    )
+    for name, mutate, restore in writer_gap_mutations:
+        def mutate_then_enter_writer(*args, _mutate=mutate, **kwargs):
+            changed = connection_for_test("aming-claw")
+            try:
+                _mutate(changed)
+                changed.commit()
+            finally:
+                changed.close()
+            return real_persist(*args, **kwargs)
+
+        monkeypatch.setattr(
+            observer_route_context, "persist_route_token_ref", mutate_then_enter_writer,
+        )
+        status, rejected_at_writer = issue_once()
+        assert status == 409, name
+        assert rejected_at_writer["writes_performed"] is False, name
+        conn = connection_for_test("aming-claw")
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+                ("aming-claw",),
+            ).fetchone()[0] == 1, name
+            restore(conn)
+            conn.commit()
+        finally:
+            conn.close()
+    monkeypatch.setattr(observer_route_context, "persist_route_token_ref", real_persist)
+
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [future.result() for future in (pool.submit(issue_once), pool.submit(issue_once))]
     successful = [item for item in results if isinstance(item, dict) and item.get("ok")]
@@ -773,7 +860,8 @@ def test_canonical_ref_adoption_reissue_stays_rejected_after_expiry(tmp_path):
         now=now - timedelta(seconds=1), canonical_ref_adoption=intent,
     )
     observer_route_context.persist_route_token_ref(
-        conn, project_id="aming-claw", route_token_ref=first["route_token_ref"], token=first["route_token"]
+        conn, project_id="aming-claw", route_token_ref=first["route_token_ref"], token=first["route_token"],
+        canonical_adoption_authority_revalidator=lambda _conn, _token: None,
     )
     conn.execute("UPDATE observer_route_token_refs SET status='expired'")
     conn.commit()
@@ -784,7 +872,8 @@ def test_canonical_ref_adoption_reissue_stays_rejected_after_expiry(tmp_path):
     )
     with pytest.raises(observer_route_context.RouteTokenRefError, match="already has"):
         observer_route_context.persist_route_token_ref(
-            conn, project_id="aming-claw", route_token_ref=second["route_token_ref"], token=second["route_token"]
+            conn, project_id="aming-claw", route_token_ref=second["route_token_ref"], token=second["route_token"],
+            canonical_adoption_authority_revalidator=lambda _conn, _token: None,
         )
     assert conn.execute("SELECT COUNT(*) FROM observer_route_token_refs").fetchone()[0] == 1
     conn.close()

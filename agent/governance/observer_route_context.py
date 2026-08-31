@@ -47,7 +47,7 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import Any
+from typing import Any, Callable
 
 # Import the gate's CANONICAL action normalizer so the mint-time sanitizer and
 # the downstream gate (``mf_subagent_contract.validate_route_token_mutation_gate``
@@ -2193,6 +2193,9 @@ def persist_route_token_ref(
     route_token_ref: str,
     token: Mapping[str, Any],
     commit: bool = True,
+    canonical_adoption_authority_revalidator: Callable[
+        [sqlite3.Connection, Mapping[str, Any]], None
+    ] | None = None,
 ) -> None:
     """Persist a minted token into the ref registry.
 
@@ -2201,7 +2204,10 @@ def persist_route_token_ref(
     compared; a mismatch raises ValueError (collision / tampering).  An identical
     re-issue is silently accepted (idempotent).
 
-    Thread-safe: holds ``_REF_REGISTRY_LOCK`` around the upsert.
+    Thread-safe: holds ``_REF_REGISTRY_LOCK`` around the upsert.  A canonical
+    adoption may additionally provide a server-owned revalidator.  It runs
+    after ``BEGIN IMMEDIATE`` and immediately before the registry mutation, so
+    a pre-issue read can never stand in for final authority at commit time.
     """
     project_id = _string(project_id)
     registry_project_id = _route_registry_storage_project_id(
@@ -2254,6 +2260,16 @@ def persist_route_token_ref(
             began = True
         try:
             if is_canonical_adoption:
+                if canonical_adoption_authority_revalidator is None:
+                    raise RouteTokenRefError(
+                        "canonical_ref_adoption requires final authority revalidation"
+                    )
+                # The callback is supplied only by the server issue boundary.
+                # It re-resolves mutable authority (sessions, route status and
+                # CEX/QA projection) using *this exact writer connection* and
+                # checks it against this exact token before any registry row is
+                # inserted or updated.
+                canonical_adoption_authority_revalidator(conn, token)
                 # This is the authority check.  It covers every durable route
                 # state (active, reserved, consumed/superseded, and expired),
                 # so an operation cannot obtain a second route through a race

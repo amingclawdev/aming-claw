@@ -8077,9 +8077,131 @@ def _canonical_ref_adoption_server_issue_body(
             "allowed_actions": [_CANONICAL_REF_ADOPTION_ACTION],
             "evidence_refs": list(route.get("evidence_refs") or []),
             "canonical_ref_adoption": derived_intent,
+            # This private value is created only after the first server-side
+            # authentication pass.  The handler removes it before ordinary
+            # issuance and uses it solely to repeat that authority proof in
+            # the registry writer transaction; it is never client input or a
+            # response field.
+            "__canonical_ref_adoption_final_authority__": {
+                "observer_session_id": session_id,
+                "observer_session_bearer": bearer,
+                "observer_route_token_ref": route_ref,
+                "contract_execution_id": contract_execution_id,
+            },
         }
     finally:
         conn.close()
+
+
+def _canonical_ref_adoption_revalidate_in_writer(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    authority: Mapping[str, Any],
+    token: Mapping[str, Any],
+) -> None:
+    """Repeat canonical-adoption authority under the registry write lock.
+
+    The earlier handler pass establishes availability and builds the token.  It
+    cannot authorize a later commit: a QA or observer session can be revoked,
+    narrowed or expired, and the source route can be superseded in between.
+    This function is invoked by ``persist_route_token_ref`` after its single
+    ``BEGIN IMMEDIATE`` and before its first registry mutation.  It therefore
+    uses one SQLite snapshot/lock for final authority and the digest-bound row.
+    """
+    from . import observer_route_context, observer_session
+
+    session_id = str(authority.get("observer_session_id") or "").strip()
+    bearer = str(authority.get("observer_session_bearer") or "").strip()
+    route_ref = str(authority.get("observer_route_token_ref") or "").strip()
+    contract_execution_id = str(authority.get("contract_execution_id") or "").strip()
+    if not session_id or not bearer or not route_ref or not contract_execution_id:
+        raise ValueError("canonical_ref_adoption final authority context is incomplete")
+    try:
+        observer_session.authenticate_session(
+            conn,
+            project_id=project_id,
+            session_id=session_id,
+            session_token=bearer,
+            action=_CANONICAL_REF_ADOPTION_ACTION,
+        )
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=route_ref,
+            task_id=contract_execution_id,
+        )
+    except (observer_session.ObserverSessionError,
+            observer_route_context.RouteTokenRefError) as exc:
+        raise ValueError(str(exc)) from exc
+    if not isinstance(route, Mapping):
+        raise ValueError("canonical_ref_adoption observer route authority is missing")
+
+    row = conn.execute(
+        "SELECT backlog_id, record_json FROM contract_runtime_executions "
+        "WHERE project_id=? AND contract_execution_id=?",
+        (project_id, contract_execution_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("contract runtime execution is missing")
+    backlog_id = str(row[0] or "").strip()
+    route_scope = route.get("scope") if isinstance(route.get("scope"), Mapping) else {}
+    if (
+        str(route.get("backlog_id") or route_scope.get("backlog_id") or "").strip()
+        != backlog_id
+        or str(route.get("task_id") or route_scope.get("task_id") or "").strip()
+        != contract_execution_id
+        or _CANONICAL_REF_ADOPTION_ACTION not in set(route.get("allowed_actions") or [])
+        or not isinstance(route.get("target_files"), list)
+        or not route.get("target_files")
+    ):
+        raise ValueError("canonical_ref_adoption observer route scope is no longer active")
+    try:
+        record = json.loads(str(row[1] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("contract runtime execution is invalid") from exc
+    adoption = record.get("canonical_ref_adoption") if isinstance(record, Mapping) else None
+    required = (
+        "generation", "custody", "canonical_ref", "expected_commit",
+        "target_commit", "target_tree", "source_content_sha256",
+    )
+    if not isinstance(adoption, Mapping) or any(
+        not str(adoption.get(key) or "").strip() for key in required
+    ):
+        raise ValueError("CEX adoption authority is incomplete")
+    expected_commit = str(adoption["target_commit"] or "").strip().lower()
+    expected_tree = str(adoption["target_tree"] or "").strip().lower()
+    completed_lines = record.get("completed_lines") if isinstance(record.get("completed_lines"), list) else []
+    qa_line = _canonical_ref_adoption_active_qa_fact(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        expected_commit=expected_commit,
+        expected_tree=expected_tree,
+        completed_lines=completed_lines,
+    )
+    if qa_line is None:
+        raise ValueError("authenticated independent QA Fact is missing")
+
+    lineage = token.get("route_lineage") if isinstance(token.get("route_lineage"), Mapping) else {}
+    bound = lineage.get("canonical_ref_adoption") if isinstance(lineage.get("canonical_ref_adoption"), Mapping) else {}
+    if not bound:
+        raise ValueError("canonical_ref_adoption token binding is missing")
+    # Bind every mutable CEX/QA identity that the token digest will cover.  The
+    # typed parser in the registry separately enforces canonical issue expiry.
+    expected = {
+        "schema_version": _CANONICAL_REF_ADOPTION_SCHEMA,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "action": _CANONICAL_REF_ADOPTION_ACTION,
+        "contract_execution_id": contract_execution_id,
+        **{key: str(adoption[key]).strip() for key in required},
+        "qa_content_sha256": stable_sha256(dict(qa_line)),
+    }
+    if any(str(bound.get(key) or "").strip() != value for key, value in expected.items()):
+        raise ValueError("canonical_ref_adoption token no longer matches final authority")
 
 
 def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
@@ -8925,6 +9047,7 @@ def handle_observer_route_context_issue(ctx: RequestContext):
 
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
+    canonical_final_authority: Mapping[str, Any] | None = None
 
     # Canonical-ref adoption is the one route kind whose authority may not be
     # self-declared in the request.  Convert its three references into the
@@ -8934,6 +9057,12 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             body = _canonical_ref_adoption_server_issue_body(
                 ctx, project_id=project_id, body=body,
             )
+            candidate_final_authority = body.pop(
+                "__canonical_ref_adoption_final_authority__", None
+            )
+            if not isinstance(candidate_final_authority, Mapping):
+                raise ValueError("canonical_ref_adoption final authority is missing")
+            canonical_final_authority = dict(candidate_final_authority)
         except (ValueError, PermissionError) as exc:
             return _observer_route_context_issue_rejection(
                 status=403, project_id=project_id, body=body,
@@ -9314,12 +9443,29 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     try:
         conn = get_connection(project_id)
         try:
+            final_revalidator = None
+            if canonical_ref_adoption is not None:
+                if canonical_final_authority is None:
+                    raise ValueError("canonical_ref_adoption final authority is missing")
+
+                def final_revalidator(
+                    writer_conn: sqlite3.Connection,
+                    writer_token: Mapping[str, Any],
+                ) -> None:
+                    _canonical_ref_adoption_revalidate_in_writer(
+                        writer_conn,
+                        project_id=project_id,
+                        authority=canonical_final_authority,
+                        token=writer_token,
+                    )
+
             observer_route_context.persist_route_token_ref(
                 conn,
                 project_id=project_id,
                 storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=issued["route_token_ref"],
                 token=issued["route_token"],
+                canonical_adoption_authority_revalidator=final_revalidator,
             )
         finally:
             conn.close()
