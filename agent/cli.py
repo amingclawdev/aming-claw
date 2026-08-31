@@ -2586,9 +2586,71 @@ def _durable_dev_launch(
     if os.name != "posix":
         raise click.ClickException("AC dev durable launch requires POSIX")
     runtime = dev_storage / "runtime" / "durable-launch"
+    runtime.mkdir(parents=True, exist_ok=True)
     lock = runtime / "launch.lock"
-    if lock.exists() or lock.is_symlink() or list(runtime.glob("launch.*.json")):
-        raise click.ClickException("AC dev durable launch has stale or active receipt state")
+    existing_launches = []
+    for path in runtime.glob("launch.*.json"):
+        value, digest = _read_durable_content_receipt(path, "launch")
+        existing_launches.append((path, value, digest))
+    for _path, value, digest in existing_launches:
+        pid = int(value.get("pid") or 0)
+        try:
+            process = _posix_process_identity(pid)
+        except click.ClickException:
+            process = None
+        if process is not None and _durable_listener_pid(AC_DEV_SERVICE_PORT) == pid:
+            health = _probe_governance(AC_DEV_SERVICE_PORT, timeout=0.5)
+            if (value.get("source_commit") != source_identity.get("commit")
+                    or value.get("dev_storage_root") != str(dev_storage)
+                    or not health or health.get("pid") != pid):
+                raise click.ClickException("AC dev durable live prior generation identity mismatch")
+            click.echo(json.dumps({"status": "already_running", "pid": pid,
+                                   "receipt": str(_path), "receipt_sha256": digest}, sort_keys=True))
+            return
+    if lock.is_symlink():
+        raise click.ClickException("AC dev durable launch lock is not canonical")
+    if lock.exists():
+        try:
+            lock_value = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise click.ClickException("AC dev durable recovery lock is unreadable") from exc
+        pending_paths = list(runtime.glob("pending.*.json"))
+        readiness_paths = list(runtime.glob("readiness.*.json"))
+        if not pending_paths:
+            raise click.ClickException("AC dev durable recovery pending receipt is missing")
+        pending_candidates = []
+        for path in pending_paths:
+            value, digest = _read_durable_content_receipt(path, "pending")
+            pending_candidates.append((path, value, digest))
+        selected = [item for item in pending_candidates
+                    if item[1].get("launch_id") == lock_value.get("launch_id")]
+        if len(selected) != 1:
+            raise click.ClickException("AC dev durable recovery pending generation mismatch")
+        pending_path, pending_value, pending_digest = selected[0]
+        database_now = _admission_database_sha256(
+            database, expected_identity=_admission_identity(database),
+        )
+        readiness_matches = []
+        for path in readiness_paths:
+            value, digest = _read_durable_content_receipt(path, "readiness")
+            if value.get("pending_sha256") == pending_digest:
+                readiness_matches.append((path, value, digest))
+        recovery_stage = ""
+        recovery_readiness = ""
+        if database_now == pending_value.get("database_sha256_before") and not readiness_matches:
+            recovery_stage = "preimage_retryable"
+        elif len(readiness_matches) == 1 and database_now == readiness_matches[0][1].get("database_sha256_after"):
+            recovery_stage = "postimage_child_absent"
+            recovery_readiness = readiness_matches[0][2]
+        else:
+            raise click.ClickException("AC dev durable recovery database projection mismatch")
+        _durable_content_receipt(runtime, "abnormal", {
+            "schema_version": "ac_dev_durable_abnormal_seal.v1", "stage": recovery_stage,
+            "pending_sha256": pending_digest, "readiness_sha256": recovery_readiness,
+            "database_sha256": database_now,
+        })
+        lock.unlink()
+        _fsync_parent(lock)
     linked_digest, _linked = _validated_linked_v3_receipt(
         linked_receipt, dev_storage=dev_storage, database=database,
         database_identity=database_identity, source_identity=source_identity,
@@ -2606,8 +2668,8 @@ def _durable_dev_launch(
         f"{time.time_ns()}\0{os.getpid()}\0{source_identity['commit']}".encode()
     ).hexdigest()[:24]
     log_path = runtime / f"governance-{launch_id}.log"
-    runtime.mkdir(parents=True, exist_ok=True)
-    _posix_exclusive_json(lock, {"schema_version": _AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "locked"})
+    _posix_exclusive_json(lock, {"schema_version": _AC_DEV_DURABLE_LAUNCH_VERSION,
+                                 "stage": "locked", "launch_id": launch_id})
     log_fd = os.open(
         log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600,
     )
@@ -2733,10 +2795,19 @@ def _durable_dev_launch(
 def _durable_dev_stop(dev_storage: Path) -> None:
     runtime = dev_storage / "runtime" / "durable-launch"
     launch_paths = list(runtime.glob("launch.*.json"))
-    if len(launch_paths) != 1:
+    live_launches = []
+    for path in launch_paths:
+        value, digest = _read_durable_content_receipt(path, "launch")
+        pid_value = int(value.get("pid") or 0)
+        if pid_value > 0 and _durable_listener_pid(AC_DEV_SERVICE_PORT) == pid_value:
+            live_launches.append((path, value, digest))
+    if len(launch_paths) == 1:
+        receipt_path = launch_paths[0]
+        receipt, launch_sha256 = _read_durable_content_receipt(receipt_path, "launch")
+    elif len(live_launches) == 1:
+        receipt_path, receipt, launch_sha256 = live_launches[0]
+    else:
         raise click.ClickException("AC dev durable stop requires completed launch receipt")
-    receipt_path = launch_paths[0]
-    receipt, launch_sha256 = _read_durable_content_receipt(receipt_path, "launch")
     pid = int(receipt.get("pid") or 0) if isinstance(receipt, dict) else 0
     if (
         not isinstance(receipt, dict) or receipt.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
@@ -2759,7 +2830,8 @@ def _durable_dev_stop(dev_storage: Path) -> None:
     if (
         receipt_root != dev_storage.resolve(strict=True)
         or not isinstance(receipt.get("database_identity"), dict)
-        or receipt["database_identity"] != database_identity
+        or receipt["database_identity"].get("device") != database_identity["device"]
+        or receipt["database_identity"].get("inode") != database_identity["inode"]
         or receipt.get("log_identity") != _admission_identity(log_path)
         or log_path.parent != runtime.resolve(strict=True)
         or current_source.get("root") != str(source_root)
@@ -2781,6 +2853,7 @@ def _durable_dev_stop(dev_storage: Path) -> None:
     validated_digest, _ = _validated_linked_v3_receipt(
         linked_path, dev_storage=dev_storage, database=database,
         database_identity=database_identity, source_identity=current_source,
+        allow_postimage=True,
     )
     if validated_digest != linked_digest:
         raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
@@ -2789,7 +2862,7 @@ def _durable_dev_stop(dev_storage: Path) -> None:
     if (
         process != receipt.get("process") or process["cwd"] != receipt.get("cwd")
         or not isinstance(receipt.get("argv"), list)
-        or shlex.split(process["argv"]) != receipt.get("argv")
+        or receipt.get("launch_id") not in process["argv"]
         or _durable_listener_pid(AC_DEV_SERVICE_PORT) != pid
         or not current_health or current_health.get("pid") != pid
     ):

@@ -3077,6 +3077,26 @@ def bootstrap_dev_governance_store(
                 source_tip_revision += 1
                 current_process_identity = dict(process)
                 source_upgraded = True
+            elif process != current_process_identity:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    locked_value = conn.execute(
+                        "SELECT value FROM schema_meta WHERE key = "
+                        "'governance_world_current_process_json'"
+                    ).fetchone()
+                    locked_process = json.loads(str(locked_value[0] or "{}")) if locked_value else {}
+                    if locked_process != current_process_identity:
+                        raise ValueError("AC dev current process custody changed while locked")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                        ("governance_world_current_process_json",
+                         json.dumps(process, sort_keys=True, separators=(",", ":"))),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                current_process_identity = dict(process)
     except Exception:
         if conn is not None:
             conn.close()
