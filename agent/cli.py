@@ -2522,6 +2522,20 @@ def _read_durable_content_receipt(path: Path, prefix: str) -> tuple[dict[str, An
     return payload, "sha256:" + digest
 
 
+def _validated_durable_runtime_dir(requested: Path, dev_storage: Path) -> Path:
+    requested_absolute = requested.absolute()
+    expected_absolute = (dev_storage / "runtime" / "durable-launch").absolute()
+    try:
+        resolved = requested_absolute.resolve(strict=True)
+        expected = expected_absolute.resolve(strict=True)
+    except OSError as exc:
+        raise click.ClickException("AC dev durable child runtime is unavailable") from exc
+    if (requested_absolute.is_symlink() or resolved != expected
+            or resolved.parent.is_symlink() or dev_storage.absolute().is_symlink()):
+        raise click.ClickException("AC dev durable child runtime is outside its bound dev root")
+    return resolved
+
+
 def _durable_exit_binding(receipt: Mapping[str, Any], receipt_sha256: str) -> dict[str, Any]:
     process = receipt["process"]
     return {
@@ -2581,9 +2595,8 @@ def _durable_dev_launch(
         sys.executable, "-m", "agent.cli", "start", "--runtime-plane", "dev",
         "--port", str(AC_DEV_SERVICE_PORT), "--dev-storage-root", str(dev_storage),
         "--stable-anchor-commit", stable_anchor_commit,
-        "--durable-child-exit-receipt", str(runtime),
+        "--durable-child-runtime-dir", str(runtime),
         "--durable-child-launch-id", launch_id,
-        "--durable-child-completed-receipt", str(runtime),
     ]
     try:
         child = _posix_detached_popen(argv, cwd=source_root, log_fd=log_fd)
@@ -2793,9 +2806,8 @@ def _durable_dev_stop(dev_storage: Path) -> None:
 @click.option("--durable-launch", is_flag=True, help="Launch the validated AC dev foreground server as a durable POSIX child.")
 @click.option("--durable-stop", is_flag=True, help="Stop only the exact receipt-bound durable AC dev child with bounded TERM.")
 @click.option("--linked-v3-receipt", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--durable-child-exit-receipt", default=None, type=click.Path(dir_okay=False, path_type=Path), hidden=True)
+@click.option("--durable-child-runtime-dir", default=None, type=click.Path(file_okay=False, dir_okay=True, path_type=Path), hidden=True)
 @click.option("--durable-child-launch-id", default="", hidden=True)
-@click.option("--durable-child-completed-receipt", default=None, type=click.Path(dir_okay=False, path_type=Path), hidden=True)
 def start(
     workspace,
     port,
@@ -2807,23 +2819,22 @@ def start(
     durable_launch,
     durable_stop,
     linked_v3_receipt,
-    durable_child_exit_receipt,
+    durable_child_runtime_dir,
     durable_child_launch_id,
-    durable_child_completed_receipt,
 ):
     """Start governance in the foreground without spawning plugin-owned workers."""
     from agent.runtime_plane import graph_activation_policy
 
-    if sum(bool(value) for value in (durable_launch, durable_stop, durable_child_exit_receipt)) > 1:
+    if sum(bool(value) for value in (durable_launch, durable_stop, durable_child_runtime_dir)) > 1:
         raise click.ClickException("AC dev durable lifecycle modes are mutually exclusive")
-    if (durable_launch or durable_stop or durable_child_exit_receipt) and runtime_plane != "dev":
+    if (durable_launch or durable_stop or durable_child_runtime_dir) and runtime_plane != "dev":
         raise click.ClickException("AC dev durable lifecycle is dev-only")
     if durable_launch and linked_v3_receipt is None:
         raise click.ClickException("AC dev durable launch requires --linked-v3-receipt")
     if not durable_launch and linked_v3_receipt is not None:
         raise click.ClickException("--linked-v3-receipt is valid only with --durable-launch")
-    child_binding_args = bool(durable_child_launch_id) and durable_child_completed_receipt is not None
-    if bool(durable_child_exit_receipt) != child_binding_args:
+    child_binding_args = bool(durable_child_launch_id) and durable_child_runtime_dir is not None
+    if bool(durable_child_runtime_dir) != child_binding_args:
         raise click.ClickException("AC dev durable child requires its complete launch binding")
 
     if runtime_plane == "dev" and graph_activation_policy("dev")[
@@ -3033,11 +3044,13 @@ def start(
     if runtime_plane == "dev":
         # Do not enter start_governance.py: its legacy host bootstrap performs
         # a chain-history backfill before the server can enforce the dev plane.
-        if durable_child_exit_receipt is None:
+        if durable_child_runtime_dir is None:
             _run_dev_governance()
         else:
-            durable_runtime = durable_child_exit_receipt.absolute()
-            completed_runtime = durable_child_completed_receipt.absolute()
+            durable_runtime = _validated_durable_runtime_dir(
+                durable_child_runtime_dir, dev_storage,
+            )
+            completed_runtime = durable_runtime
             previous_term = signal.getsignal(signal.SIGTERM)
             def _term_handler(_signum, _frame):
                 raise SystemExit(143)

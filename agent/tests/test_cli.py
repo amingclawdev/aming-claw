@@ -4559,6 +4559,21 @@ def test_durable_exit_binding_discriminates_every_authorized_launch_field():
     assert cli._durable_exit_binding(mutated, "sha256:" + "3" * 64) != baseline
 
 
+def test_durable_child_runtime_is_exactly_inside_bound_dev_root(tmp_path):
+    import agent.cli as cli
+
+    dev = tmp_path / "dev"
+    runtime = dev / "runtime" / "durable-launch"
+    runtime.mkdir(parents=True)
+    assert cli._validated_durable_runtime_dir(runtime, dev) == runtime.resolve()
+    external = tmp_path / "external"; external.mkdir()
+    with pytest.raises(cli.click.ClickException, match="outside its bound dev root"):
+        cli._validated_durable_runtime_dir(external, dev)
+    link = dev / "runtime-link"; link.symlink_to(runtime)
+    with pytest.raises(cli.click.ClickException, match="outside its bound dev root"):
+        cli._validated_durable_runtime_dir(link, dev)
+
+
 @pytest.mark.parametrize("attack", ["identity_drift", "preforged_exit", "missing_exit_after_term"])
 def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
     import agent.cli as cli
