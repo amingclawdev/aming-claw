@@ -3954,6 +3954,53 @@ def test_dev_admit_authority_schema_offline_receipt_and_resume(tmp_path, monkeyp
     assert json.loads(resumed.output)["status"] == "already_admitted"
 
 
+def test_dev_admit_authority_schema_rollback_receipt_resumes_without_drift(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-authority-rollback"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database); db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ]); conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    command = ["dev-admit-authority-schema", "--dev-storage-root", str(root),
+               "--project-id", "aming-claw", "--port", "40008"]
+    original = db.admit_missing_authority_projection_schema
+    def interrupted(connection):
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("CREATE TABLE authority_admission_interrupted (id TEXT)")
+        raise sqlite3.OperationalError("forced authority interruption")
+    monkeypatch.setattr(db, "admit_missing_authority_projection_schema", interrupted)
+    failed = CliRunner().invoke(main, command)
+    assert failed.exit_code != 0
+    match = re.search(r"receipt=([^ ]+) sha256=(sha256:[0-9a-f]{64})", failed.output)
+    assert match, failed.output
+    receipt = Path(match.group(1)); payload = json.loads(receipt.read_text())
+    assert payload["stage"] == "rolled_back"
+    assert payload["schema_inventory_before"] == payload["schema_inventory_after"]
+    conn = sqlite3.connect(database)
+    try:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name='authority_admission_interrupted'").fetchone() is None
+        assert dict(conn.execute("SELECT key,value FROM schema_meta"))["governance_world_source_tip_json"] == "{}"
+    finally:
+        conn.close()
+    monkeypatch.setattr(db, "admit_missing_authority_projection_schema", original)
+    resumed = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "admitted"
+    before = database.read_bytes()
+    receipt.write_text("{}", encoding="utf-8")
+    tampered = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
+    assert tampered.exit_code != 0 and database.read_bytes() == before
+
+
 def test_dev_admit_schema_rejects_tampered_or_foreign_resume_before_effect(tmp_path, monkeypatch):
     import agent.cli as cli
     from agent.governance import db

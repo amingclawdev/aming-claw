@@ -1550,10 +1550,15 @@ def _offline_dev_schema_admission(
         admit = _db.admit_missing_authority_projection_schema
         drift = _db.authority_projection_schema_drift
         plan_fn = _db.authority_projection_schema_plan
+        # Both receipts bind the complete sqlite_master inventory; retain a
+        # plan-specific selector so the authority path cannot accidentally
+        # depend on an unimported backlog-only symbol.
+        inventory_fn = _db.backlog_read_schema_inventory
     else:
         admit = _db.admit_missing_backlog_read_schema
         drift = _db.backlog_read_schema_drift
         plan_fn = _db.backlog_read_schema_plan
+        inventory_fn = _db.backlog_read_schema_inventory
     conn = sqlite3.connect(str(database), timeout=5)
     try:
         meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('governance_world_id','governance_world_genesis_json','governance_world_source_tip_json')"))
@@ -1568,7 +1573,7 @@ def _offline_dev_schema_admission(
         before = drift(conn)
         if before["invalid"]:
             raise click.ClickException("offline AC dev schema admission rejects unexpected schema drift")
-        inventory_before = backlog_read_schema_inventory(conn)
+        inventory_before = inventory_fn(conn)
         previous_sha256 = ""
         if resume_receipt is not None:
             prior, previous_sha256 = _read_admission_receipt(resume_receipt.absolute(), archive=archive)
@@ -1607,7 +1612,7 @@ def _offline_dev_schema_admission(
         except BaseException as exc:
             conn.rollback()
             after_meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key='governance_world_source_tip_json'"))
-            inventory_after = backlog_read_schema_inventory(conn)
+            inventory_after = inventory_fn(conn)
             rollback_payload = {
                 "schema_version": _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
                 "stage": "rolled_back", "project_id": project_id, "port": port,
@@ -1625,7 +1630,7 @@ def _offline_dev_schema_admission(
             raise click.ClickException(
                 f"AC dev schema admission rolled back; receipt={failed_path} sha256={failed_digest}"
             ) from exc
-        inventory_after = backlog_read_schema_inventory(conn)
+        inventory_after = inventory_fn(conn)
         post_meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key='governance_world_source_tip_json'"))
         if post_meta.get("governance_world_source_tip_json") != meta["governance_world_source_tip_json"]:
             raise click.ClickException("AC dev schema admission source-tip advanced unexpectedly")
