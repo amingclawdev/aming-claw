@@ -145215,40 +145215,29 @@ def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
 
 
 def _source_free_operation_topology_facts(value: object) -> dict[str, bool]:
-    """Decode the closed JB source-free topology vocabulary into typed facts."""
+    """Match only canonical persisted JB source-free topology spellings."""
 
-    clauses = tuple(
-        clause.strip().strip("_")
-        for clause in re.split(r"[.;]", str(value or "").strip())
-        if clause.strip().strip("_")
+    topology = str(value or "")
+    real_operation_shape = topology == (
+        "reuse_the_existing_unique_ac_observer."
+        "_source_free_system_operation_only;"
+        "_zero_implementation_workers;"
+        "_one_fresh_observer_route/session;"
+        "_exactly_one_full_reconcile."
     )
-    real_operation_shape = clauses == (
-        "reuse_the_existing_unique_ac_observer",
-        "source_free_system_operation_only",
-        "zero_implementation_workers",
-        "one_fresh_observer_route/session",
-        "exactly_one_full_reconcile",
-    )
-    explicit_legacy_shape = clauses == (
-        "existing_unique_ac_observer",
-        "source_mutation_forbidden",
-        "no_implementation_worker",
-        "source_free_operation_only",
-    )
-    revision_clause = clauses[1] if len(clauses) == 3 else ""
-    revision_parts = revision_clause.split("_because_r", 1)
-    revision_source_free = bool(
-        len(revision_parts) == 2
-        and revision_parts[0] == "no_implementation_worker"
-        and revision_parts[1].endswith("_is_source_free")
-        and revision_parts[1][: -len("_is_source_free")].isdigit()
+    explicit_legacy_shape = topology == (
+        "existing_unique_ac_observer;"
+        "_source_mutation_forbidden;"
+        "_no_implementation_worker;"
+        "_source_free_operation_only"
     )
     revision_legacy_shape = bool(
-        len(clauses) == 3
-        and clauses[0] == "existing_unique_ac_observer"
-        and revision_source_free
-        and clauses[2]
-        == "role_distinct_qa_only_if_a_new_mutation_is_introduced"
+        re.fullmatch(
+            r"existing_unique_ac_observer;"
+            r"_no_implementation_worker_because_r[0-9]+_is_source_free;"
+            r"_role_distinct_qa_only_if_a_new_mutation_is_introduced",
+            topology,
+        )
     )
     accepted = bool(
         real_operation_shape or explicit_legacy_shape or revision_legacy_shape
@@ -145258,12 +145247,8 @@ def _source_free_operation_topology_facts(value: object) -> dict[str, bool]:
         "unique_observer": accepted,
         "source_free_operation_only": accepted,
         "zero_implementation_workers": accepted,
-        "fresh_observer_route_session": (
-            real_operation_shape or explicit_legacy_shape or revision_legacy_shape
-        ),
-        "single_full_reconcile": (
-            real_operation_shape or explicit_legacy_shape or revision_legacy_shape
-        ),
+        "fresh_observer_route_session": accepted,
+        "single_full_reconcile": accepted,
     }
 
 

@@ -199267,6 +199267,41 @@ def test_ac_dev_source_free_projects_exact_real_r6_topology_to_empty_route(conn)
     [
         "",
         (
+            "reuse_the_existing_unique_ac_observer;"
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile;"
+        ),
+        (
+            "_reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer. "
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "Reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer:"
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
             "reuse_the_existing_unique_ac_observer."
             "_source_free_system_operation_only;"
             "_one_implementation_worker;"
@@ -199279,6 +199314,29 @@ def test_ac_dev_source_free_projects_exact_real_r6_topology_to_empty_route(conn)
             "_zero_implementation_workers;"
             "_one_fresh_observer_route/session;"
             "_two_full_reconciles."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_zero_implementation_workers;"
+            "_source_free_system_operation_only;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile;"
+            "_extra_fact."
         ),
     ],
 )
