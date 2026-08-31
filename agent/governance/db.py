@@ -1669,18 +1669,16 @@ def _verify_dev_source_upgrade(
         ).expanduser().resolve(strict=True)
     except OSError as exc:
         raise ValueError("AC dev source upgrade root mismatch") from exc
-    if candidate_root != previous_root:
-        raise ValueError("AC dev source upgrade root mismatch")
     if (
         str(previous.get("branch") or "") != "codex/ac-dev"
         or str(candidate.get("branch") or "") != "codex/ac-dev"
     ):
         raise ValueError("AC dev source upgrade branch mismatch")
 
-    def git(*args: str) -> str:
+    def git(root: Path, *args: str) -> str:
         result = subprocess.run(
             ["git", *args],
-            cwd=candidate_root,
+            cwd=root,
             capture_output=True,
             text=True,
             timeout=10,
@@ -1690,14 +1688,72 @@ def _verify_dev_source_upgrade(
             raise ValueError("AC dev source upgrade Git identity unavailable")
         return result.stdout.strip()
 
-    if Path(git("rev-parse", "--show-toplevel")).resolve(strict=True) != candidate_root:
+    if Path(git(candidate_root, "rev-parse", "--show-toplevel")).resolve(strict=True) != candidate_root:
         raise ValueError("AC dev source upgrade top-level mismatch")
-    if git("branch", "--show-current") != "codex/ac-dev":
+    if git(candidate_root, "branch", "--show-current") != "codex/ac-dev":
         raise ValueError("AC dev source upgrade checked-out branch mismatch")
-    if git("status", "--porcelain"):
+    if git(candidate_root, "status", "--porcelain"):
         raise ValueError("AC dev source upgrade requires a clean worktree")
-    if git("rev-parse", "HEAD").lower() != str(candidate.get("commit") or ""):
+    if git(candidate_root, "rev-parse", "HEAD").lower() != str(candidate.get("commit") or ""):
         raise ValueError("AC dev source upgrade HEAD mismatch")
+    if git(candidate_root, "rev-parse", "refs/heads/codex/ac-dev").lower() != str(candidate.get("commit") or ""):
+        raise ValueError("AC dev source upgrade canonical ref mismatch")
+
+    if candidate_root != previous_root:
+        # The only cross-root continuity accepted here is the exact physical
+        # state produced by the governed pointer-only handoff: the old checkout
+        # remains byte-for-byte at the stored commit but is detached, while the
+        # sole canonical branch checkout is the clean descendant candidate.
+        try:
+            dev_storage = Path(os.environ[AC_DEV_STORAGE_ROOT_ENV]).expanduser().resolve(strict=True)
+            binding = verified_stable_database_binding()
+            stable_storage = Path(str(binding.get("shared_volume_path") or "")).expanduser().resolve(strict=True)
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("AC dev source upgrade protected roots unavailable") from exc
+        for source_root in (previous_root, candidate_root):
+            if (
+                source_root == dev_storage or source_root in dev_storage.parents
+                or dev_storage in source_root.parents or source_root == stable_storage
+                or source_root in stable_storage.parents or stable_storage in source_root.parents
+            ):
+                raise ValueError("AC dev source upgrade source/storage roots overlap")
+        if Path(git(previous_root, "rev-parse", "--show-toplevel")).resolve(strict=True) != previous_root:
+            raise ValueError("AC dev source upgrade previous top-level mismatch")
+        previous_common = Path(git(previous_root, "rev-parse", "--git-common-dir"))
+        candidate_common = Path(git(candidate_root, "rev-parse", "--git-common-dir"))
+        if not previous_common.is_absolute():
+            previous_common = previous_root / previous_common
+        if not candidate_common.is_absolute():
+            candidate_common = candidate_root / candidate_common
+        if previous_common.resolve(strict=True) != candidate_common.resolve(strict=True):
+            raise ValueError("AC dev source upgrade Git common-dir mismatch")
+        worktrees = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=candidate_root,
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if worktrees.returncode != 0:
+            raise ValueError("AC dev source upgrade worktree registry unavailable")
+        registered = {
+            Path(line.removeprefix("worktree ")).resolve(strict=True)
+            for line in worktrees.stdout.splitlines() if line.startswith("worktree ")
+        }
+        if previous_root not in registered or candidate_root not in registered:
+            raise ValueError("AC dev source upgrade worktree is not registered")
+        previous_commit = str(previous.get("commit") or "").lower()
+        previous_symbolic = subprocess.run(
+            ["git", "symbolic-ref", "-q", "HEAD"], cwd=previous_root,
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if (
+            previous_symbolic.returncode == 0
+            or git(previous_root, "rev-parse", "HEAD").lower() != previous_commit
+            or git(previous_root, "status", "--porcelain")
+            or git(previous_root, "rev-parse", "HEAD^{tree}")
+            != git(previous_root, "rev-parse", f"{previous_commit}^{{tree}}")
+        ):
+            raise ValueError("AC dev source upgrade previous worktree is not exact detached state")
+        if str(candidate.get("commit") or "").lower() == previous_commit:
+            raise ValueError("AC dev source upgrade pointer-only candidate is not a strict descendant")
     ancestor = subprocess.run(
         [
             "git",

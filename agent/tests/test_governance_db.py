@@ -968,6 +968,65 @@ def _advance_dev_source(root: Path, value: str) -> str:
     ).stdout.strip()
 
 
+def _pointer_only_dev_worktrees(tmp_path: Path) -> tuple[Path, Path, str, str]:
+    """Materialize the exact OLD-detached/NEW-canonical handoff state."""
+    old, commit_a = _dev_source_repo(tmp_path)
+    builder = tmp_path / "builder"
+    subprocess.run(["git", "worktree", "add", "--detach", str(builder), commit_a], cwd=old, check=True, capture_output=True)
+    commit_b = _advance_dev_source(builder, "B")
+    subprocess.run(["git", "update-ref", "refs/heads/codex/ac-dev", commit_b, commit_a], cwd=old, check=True)
+    subprocess.run(["git", "update-ref", "--no-deref", "HEAD", commit_a, commit_b], cwd=old, check=True)
+    new = tmp_path / "successor"
+    subprocess.run(["git", "worktree", "add", str(new), "codex/ac-dev"], cwd=old, check=True, capture_output=True)
+    return old, new, commit_a, commit_b
+
+
+def test_ac_dev_pointer_only_physical_root_continuity_accepts_exact_registered_handoff(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    old, new, commit_a, commit_b = _pointer_only_dev_worktrees(tmp_path)
+    dev_storage = tmp_path / "dev-storage"; dev_storage.mkdir()
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_storage))
+    previous = {"root": str(old.resolve()), "branch": "codex/ac-dev", "commit": commit_a,
+                "source_sha256": "sha256:" + "a" * 64}
+    candidate = {**previous, "root": str(new.resolve()), "commit": commit_b,
+                 "source_sha256": "sha256:" + "b" * 64}
+    db._verify_dev_source_upgrade(previous, candidate)
+    assert subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=old).returncode != 0
+    assert subprocess.run(["git", "branch", "--show-current"], cwd=new, capture_output=True, text=True, check=True).stdout.strip() == "codex/ac-dev"
+
+
+@pytest.mark.parametrize("defect", ["old_attached", "old_dirty", "new_detached", "different_common_dir"])
+def test_ac_dev_pointer_only_physical_root_mismatch_matrix_rejects_without_effect(tmp_path, monkeypatch, defect):
+    from agent.governance import db
+
+    old, new, commit_a, commit_b = _pointer_only_dev_worktrees(tmp_path)
+    dev_storage = tmp_path / "dev-storage"; dev_storage.mkdir()
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_storage))
+    previous = {"root": str(old.resolve()), "branch": "codex/ac-dev", "commit": commit_a,
+                "source_sha256": "sha256:" + "a" * 64}
+    candidate = {**previous, "root": str(new.resolve()), "commit": commit_b,
+                 "source_sha256": "sha256:" + "b" * 64}
+    if defect == "old_attached":
+        subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/fixture-old"], cwd=old, check=True)
+        subprocess.run(["git", "update-ref", "refs/heads/fixture-old", commit_a], cwd=old, check=True)
+    elif defect == "old_dirty":
+        (old / "untracked.txt").write_text("foreign\n", encoding="utf-8")
+    elif defect == "new_detached":
+        subprocess.run(["git", "update-ref", "--no-deref", "HEAD", commit_b, commit_b], cwd=new, check=True)
+    else:
+        foreign_parent = tmp_path / "foreign"
+        foreign_parent.mkdir()
+        foreign, foreign_commit = _dev_source_repo(foreign_parent)
+        subprocess.run(["git", "branch", "-M", "codex/ac-dev"], cwd=foreign, check=True)
+        candidate["root"], candidate["commit"] = str(foreign.resolve()), foreign_commit
+    before = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=new, capture_output=True, text=True, check=True).stdout
+    with pytest.raises(ValueError):
+        db._verify_dev_source_upgrade(previous, candidate)
+    after = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=new, capture_output=True, text=True, check=True).stdout
+    assert after == before
+
+
 def _admit_existing_dev_world(storage_root: Path, stable: Path) -> None:
     """Give restart/adoption fixtures the same canonical receipt as CLI start."""
     from agent.governance import db

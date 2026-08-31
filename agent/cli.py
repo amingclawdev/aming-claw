@@ -1382,6 +1382,45 @@ def _admission_database_sha256(
         os.close(descriptor)
 
 
+def _admission_sqlite_artifact_identities(database: Path) -> dict[str, object | None]:
+    """Capture non-following SQLite identities without accepting replacement."""
+    identities: dict[str, object | None] = {}
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = Path(str(database) + suffix)
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            identities[suffix] = None
+            continue
+        if not stat.S_ISREG(details.st_mode) or path.is_symlink() or path.resolve(strict=True) != path.absolute():
+            raise click.ClickException("AC dev schema admission SQLite artifact identity is invalid")
+        identities[suffix] = {
+            "device": int(details.st_dev), "inode": int(details.st_ino),
+        }
+    return identities
+
+
+def _assert_admission_sqlite_artifacts(
+    database: Path, before: Mapping[str, object | None], *, after_close: bool = False,
+) -> None:
+    after = _admission_sqlite_artifact_identities(database)
+    if after.get("") != before.get("") or after.get("-journal") is not None:
+        raise click.ClickException("AC dev schema admission SQLite identity changed")
+    for suffix in ("-wal", "-shm"):
+        old, new = before.get(suffix), after.get(suffix)
+        if old == new or (after_close and old is not None and new is None):
+            continue
+        raise click.ClickException("AC dev schema admission SQLite sidecar identity changed")
+
+
+def _admission_file_state(path: Path) -> tuple[int, int, int, int, int]:
+    details = path.stat(follow_symlinks=False)
+    return (
+        int(details.st_dev), int(details.st_ino), int(details.st_size),
+        int(details.st_mtime_ns), int(details.st_ctime_ns),
+    )
+
+
 def _admission_source_identity(source_tip_raw: str) -> dict[str, object]:
     try:
         source_tip = json.loads(source_tip_raw)
@@ -1506,7 +1545,8 @@ def _validate_admission_receipt_chain(
 
 def _offline_dev_schema_admission(
     storage_root: Path, *, project_id: str, port: int, resume_receipt: Path | None,
-    authority_projection: bool = False,
+    authority_projection: bool = False, recertify_existing_bytes: bool = False,
+    _after_checkpoint_for_test=None,
 ) -> dict[str, Any]:
     """One-shot, offline-only repair for the bounded dev backlog-read plan.
 
@@ -1559,6 +1599,79 @@ def _offline_dev_schema_admission(
         drift = _db.backlog_read_schema_drift
         plan_fn = _db.backlog_read_schema_plan
         inventory_fn = _db.backlog_read_schema_inventory
+    if recertify_existing_bytes and (not authority_projection or resume_receipt is not None):
+        raise click.ClickException(
+            "AC dev schema admission recertification requires authority schema and no resume receipt"
+        )
+    if recertify_existing_bytes:
+        root_identity = _admission_identity(root)
+        database_identity = _admission_identity(database)
+        durable_before = _admission_database_sha256(
+            database, expected_identity=database_identity,
+        )
+        readonly = sqlite3.connect(
+            "file:" + urllib.parse.quote(str(database)) + "?mode=ro", uri=True,
+            timeout=0, isolation_level=None,
+        )
+        try:
+            readonly.execute("PRAGMA query_only=ON")
+            checks = [str(row[0]).lower() for row in readonly.execute("PRAGMA quick_check")]
+            if checks != ["ok"]:
+                raise click.ClickException("AC dev schema admission recertification quick_check failed")
+            meta = dict(readonly.execute(
+                "SELECT key, value FROM schema_meta WHERE key IN "
+                "('governance_world_id','governance_world_genesis_json',"
+                "'governance_world_source_tip_json')"
+            ))
+            if (
+                meta.get("governance_world_id") != "ac-dev"
+                or not meta.get("governance_world_genesis_json")
+                or not meta.get("governance_world_source_tip_json")
+            ):
+                raise click.ClickException("offline AC dev schema admission genesis/source-tip mismatch")
+            state = drift(readonly)
+            if state["missing"] or state["invalid"]:
+                raise click.ClickException("AC dev schema admission recertification requires complete exact schema")
+            inventory = inventory_fn(readonly)
+            source_identity = _admission_source_identity(
+                str(meta["governance_world_source_tip_json"])
+            )
+            plan_sha256 = "sha256:" + hashlib.sha256(
+                _canonical_json_bytes(plan_fn())
+            ).hexdigest()
+        finally:
+            readonly.close()
+        durable_after = _admission_database_sha256(
+            database, expected_identity=database_identity,
+        )
+        if durable_after != durable_before:
+            raise click.ClickException("AC dev schema admission recertification changed database bytes")
+        archive = root / "archive" / "schema-admission"
+        archive.mkdir(parents=True, exist_ok=True)
+        backup = archive / (durable_after.removeprefix("sha256:") + ".pre.sqlite")
+        if backup.exists():
+            _admission_regular_file(backup, archive=archive)
+        else:
+            shutil.copy2(database, backup)
+        if _file_sha256(backup) != durable_after:
+            raise click.ClickException("AC dev schema admission backup digest mismatch")
+        payload = {
+            "schema_version": _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
+            "stage": "completed", "project_id": project_id, "port": port,
+            "root_identity": root_identity, "database_identity": database_identity,
+            "source_identity": source_identity, "plan_sha256": plan_sha256,
+            "schema_inventory_before": inventory, "schema_inventory_after": inventory,
+            "backup": {"identity": _admission_identity(backup), "sha256": durable_after},
+            "database_sha256_before": durable_before,
+            "database_sha256_after": durable_after,
+            "previous_receipt_sha256": "", "changed": False, "missing": [],
+        }
+        receipt_path, receipt_digest = _write_admission_receipt(archive, payload)
+        return {
+            "status": "recertified_existing_bytes", "receipt_path": str(receipt_path),
+            "receipt_sha256": receipt_digest, "changed": False, "missing": [],
+            "post_sha256": durable_after,
+        }
     conn = sqlite3.connect(str(database), timeout=5)
     try:
         meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('governance_world_id','governance_world_genesis_json','governance_world_source_tip_json')"))
@@ -1620,12 +1733,17 @@ def _offline_dev_schema_admission(
                 "source_identity": source_identity, "plan_sha256": plan_sha256,
                 "schema_inventory_before": inventory_before, "schema_inventory_after": inventory_after,
                 "backup": {"identity": backup_identity, "sha256": pre_digest},
-                "database_sha256_before": pre_digest, "database_sha256_after": _admission_database_sha256(database, expected_identity=database_identity),
+                "database_sha256_before": pre_digest, "database_sha256_after": "",
                 "previous_receipt_sha256": previous_sha256, "changed": False,
                 "missing": before["missing"],
             }
             if inventory_after != inventory_before or after_meta.get("governance_world_source_tip_json") != meta["governance_world_source_tip_json"]:
                 raise click.ClickException("AC dev schema admission rollback proof failed") from exc
+            conn.close()
+            conn = None
+            rollback_payload["database_sha256_after"] = _admission_database_sha256(
+                database, expected_identity=database_identity,
+            )
             failed_path, failed_digest = _write_admission_receipt(archive, rollback_payload)
             raise click.ClickException(
                 f"AC dev schema admission rolled back; receipt={failed_path} sha256={failed_digest}"
@@ -1636,6 +1754,41 @@ def _offline_dev_schema_admission(
             raise click.ClickException("AC dev schema admission source-tip advanced unexpectedly")
         if drift(conn)["missing"] or inventory_after == inventory_before and before["missing"]:
             raise click.ClickException("AC dev schema admission postcondition failed")
+        sqlite_identities = _admission_sqlite_artifact_identities(database)
+        if authority_projection:
+            checkpoint = tuple(int(value) for value in conn.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone())
+            if checkpoint != (0, 0, 0):
+                raise click.ClickException("AC dev schema admission checkpoint did not truncate")
+        durable_state = _admission_file_state(database) if authority_projection else None
+        if _after_checkpoint_for_test is not None:
+            _after_checkpoint_for_test()
+        # Verify the committed projection and immutable source binding once
+        # more after checkpoint, then close the writer before hashing bytes.
+        inventory_after = inventory_fn(conn)
+        post_meta = dict(conn.execute(
+            "SELECT key, value FROM schema_meta WHERE key='governance_world_source_tip_json'"
+        ))
+        if (
+            drift(conn)["missing"] or drift(conn)["invalid"]
+            or post_meta.get("governance_world_source_tip_json")
+            != meta["governance_world_source_tip_json"]
+        ):
+            raise click.ClickException("AC dev schema admission durable postcondition failed")
+        _assert_admission_sqlite_artifacts(database, sqlite_identities)
+        if durable_state is not None and _admission_file_state(database) != durable_state:
+            raise click.ClickException("AC dev schema admission database drifted after checkpoint")
+        conn.close()
+        conn = None
+        _assert_admission_sqlite_artifacts(
+            database, sqlite_identities, after_close=True,
+        )
+        if durable_state is not None and _admission_file_state(database) != durable_state:
+            raise click.ClickException("AC dev schema admission database drifted while closing writer")
+        durable_post_digest = _admission_database_sha256(
+            database, expected_identity=database_identity,
+        )
         receipt_payload = {
             "schema_version": _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
             "stage": "completed", "project_id": project_id, "port": port,
@@ -1643,14 +1796,15 @@ def _offline_dev_schema_admission(
             "source_identity": source_identity, "plan_sha256": plan_sha256,
             "schema_inventory_before": inventory_before, "schema_inventory_after": inventory_after,
             "backup": {"identity": backup_identity, "sha256": pre_digest},
-            "database_sha256_before": pre_digest, "database_sha256_after": _admission_database_sha256(database, expected_identity=database_identity),
+            "database_sha256_before": pre_digest, "database_sha256_after": durable_post_digest,
             "previous_receipt_sha256": previous_sha256, "changed": bool(result["changed"]),
             "missing": result["missing"],
         }
         receipt_path, receipt_digest = _write_admission_receipt(archive, receipt_payload)
-        return {"status": "admitted", "receipt_path": str(receipt_path), "receipt_sha256": receipt_digest, "changed": result["changed"], "missing": result["missing"], "post_sha256": _admission_database_sha256(database, expected_identity=database_identity)}
+        return {"status": "admitted", "receipt_path": str(receipt_path), "receipt_sha256": receipt_digest, "changed": result["changed"], "missing": result["missing"], "post_sha256": durable_post_digest}
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @main.command("dev-admit-schema")
@@ -1673,12 +1827,14 @@ def dev_admit_schema(dev_storage_root: Path, project_id: str, port: int, resume_
 @click.option("--project-id", required=True)
 @click.option("--port", required=True, type=int)
 @click.option("--resume-receipt", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def dev_admit_authority_schema(dev_storage_root: Path, project_id: str, port: int, resume_receipt: Path | None) -> None:
+@click.option("--recertify-existing-bytes", is_flag=True)
+def dev_admit_authority_schema(dev_storage_root: Path, project_id: str, port: int, resume_receipt: Path | None, recertify_existing_bytes: bool) -> None:
     """Offline-only admission of the complete six-table AC authority plan."""
     try:
         click.echo(json.dumps(_offline_dev_schema_admission(
             dev_storage_root, project_id=project_id, port=port,
             resume_receipt=resume_receipt, authority_projection=True,
+            recertify_existing_bytes=recertify_existing_bytes,
         ), sort_keys=True))
     except click.ClickException:
         raise

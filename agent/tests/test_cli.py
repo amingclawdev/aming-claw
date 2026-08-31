@@ -3926,6 +3926,7 @@ def test_dev_admit_authority_schema_offline_receipt_and_resume(tmp_path, monkeyp
     database = root / "governance" / "aming-claw" / "governance.db"
     database.parent.mkdir(parents=True)
     conn = sqlite3.connect(database)
+    conn.execute("PRAGMA journal_mode=WAL")
     db._ensure_schema(conn)
     conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
         ("governance_world_id", "ac-dev"),
@@ -3944,6 +3945,10 @@ def test_dev_admit_authority_schema_offline_receipt_and_resume(tmp_path, monkeyp
     output = json.loads(first.output)
     receipt = Path(output["receipt_path"])
     assert output["status"] == "admitted" and receipt.is_file()
+    receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+    durable_hash = "sha256:" + hashlib.sha256(database.read_bytes()).hexdigest()
+    assert receipt_payload["changed"] is True
+    assert receipt_payload["database_sha256_after"] == durable_hash == output["post_sha256"]
     conn = sqlite3.connect(database)
     try:
         assert db.authority_projection_schema_drift(conn) == {"missing": [], "invalid": []}
@@ -3952,6 +3957,145 @@ def test_dev_admit_authority_schema_offline_receipt_and_resume(tmp_path, monkeyp
     resumed = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
     assert resumed.exit_code == 0, resumed.output
     assert json.loads(resumed.output)["status"] == "already_admitted"
+
+
+def test_dev_admit_authority_schema_existing_byte_recertification_is_read_only_and_stale_resume_fails(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-authority-recertify"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"),
+        ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ])
+    conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    command = ["dev-admit-authority-schema", "--dev-storage-root", str(root),
+               "--project-id", "aming-claw", "--port", "40008"]
+    admitted = CliRunner().invoke(main, command)
+    assert admitted.exit_code == 0, admitted.output
+    stale_receipt = Path(json.loads(admitted.output)["receipt_path"])
+
+    changed = sqlite3.connect(database)
+    changed.execute("PRAGMA user_version=313")
+    changed.commit(); changed.close()
+    current_bytes = database.read_bytes()
+    rejected = CliRunner().invoke(main, command + ["--resume-receipt", str(stale_receipt)])
+    assert rejected.exit_code != 0
+    assert "completed receipt does not match current database" in rejected.output
+    assert database.read_bytes() == current_bytes
+
+    recertified = CliRunner().invoke(main, command + ["--recertify-existing-bytes"])
+    assert recertified.exit_code == 0, recertified.output
+    output = json.loads(recertified.output)
+    assert output["status"] == "recertified_existing_bytes"
+    assert output["changed"] is False and output["missing"] == []
+    assert database.read_bytes() == current_bytes
+    receipt = Path(output["receipt_path"])
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["database_sha256_before"] == payload["database_sha256_after"]
+    assert payload["database_sha256_after"] == "sha256:" + hashlib.sha256(current_bytes).hexdigest()
+    resumed = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "already_admitted"
+
+
+@pytest.mark.parametrize("drift", ["wal_replacement", "database_replacement", "database_hash"])
+def test_dev_admit_authority_schema_rejects_real_post_checkpoint_identity_or_hash_drift(tmp_path, monkeypatch, drift):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / ("external-authority-" + drift)
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database); conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ]); conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+
+    def hostile_drift():
+        if drift == "wal_replacement":
+            wal = Path(str(database) + "-wal")
+            replacement = tmp_path / "replacement-wal"
+            replacement.write_bytes(wal.read_bytes())
+            os.replace(replacement, wal)
+        elif drift == "database_replacement":
+            replacement = tmp_path / "replacement-db"
+            replacement.write_bytes(database.read_bytes())
+            os.replace(replacement, database)
+        else:
+            with database.open("r+b") as handle:
+                handle.seek(68)
+                value = handle.read(1)
+                handle.seek(68)
+                handle.write(bytes([value[0] ^ 1]))
+
+    with pytest.raises(cli.click.ClickException, match="identity|sidecar|drifted"):
+        cli._offline_dev_schema_admission(
+            root, project_id="aming-claw", port=40008, resume_receipt=None,
+            authority_projection=True, _after_checkpoint_for_test=hostile_drift,
+        )
+    archive = root / "archive" / "schema-admission"
+    assert not list(archive.glob("*.json"))
+    if drift != "database_replacement":
+        check = sqlite3.connect(database)
+        try:
+            assert dict(check.execute("SELECT key,value FROM schema_meta"))["governance_world_source_tip_json"] == "{}"
+        finally:
+            check.close()
+
+
+def test_dev_admit_authority_schema_checkpoint_busy_emits_no_completed_receipt(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+    import types
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-authority-busy"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database); conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ]); conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    reader = sqlite3.connect(database)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    original_run = cli.subprocess.run
+    def no_external_holders(args, *positional, **kwargs):
+        if args and args[0] == "lsof":
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        return original_run(args, *positional, **kwargs)
+    monkeypatch.setattr(cli.subprocess, "run", no_external_holders)
+    try:
+        with pytest.raises(cli.click.ClickException, match="checkpoint did not truncate"):
+            cli._offline_dev_schema_admission(
+                root, project_id="aming-claw", port=40008,
+                resume_receipt=None, authority_projection=True,
+            )
+    finally:
+        reader.close()
+    assert not list((root / "archive" / "schema-admission").glob("*.json"))
 
 
 def test_dev_admit_authority_schema_rollback_receipt_resumes_without_drift(tmp_path, monkeypatch):
@@ -3963,7 +4107,7 @@ def test_dev_admit_authority_schema_rollback_receipt_resumes_without_drift(tmp_p
     root = tmp_path / "external-authority-rollback"
     database = root / "governance" / "aming-claw" / "governance.db"
     database.parent.mkdir(parents=True)
-    conn = sqlite3.connect(database); db._ensure_schema(conn)
+    conn = sqlite3.connect(database); conn.execute("PRAGMA journal_mode=WAL"); db._ensure_schema(conn)
     conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
         ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
         ("governance_world_source_tip_json", "{}"),
