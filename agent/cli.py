@@ -4006,6 +4006,46 @@ def _durable_dev_launch(
         raise
 
 
+def _verified_durable_stopped_chain(dev_storage: Path) -> tuple[Path, str]:
+    """Read-only proof for an already terminal durable generation."""
+    runtime = dev_storage / "runtime" / "durable-launch"
+    groups = {prefix: sorted(runtime.glob(f"{prefix}.*.json"))
+              for prefix in ("launch", "pending", "readiness", "stop-challenge", "exit", "stop")}
+    if any(len(paths) != 1 for paths in groups.values()) or list(runtime.glob("abnormal.*.json")):
+        raise click.ClickException("AC dev durable stopped chain is missing or ambiguous")
+    launch_path = groups["launch"][0]
+    launch, launch_sha = _read_durable_content_receipt(launch_path, "launch")
+    pending, pending_sha = _read_durable_content_receipt(groups["pending"][0], "pending")
+    readiness, readiness_sha = _read_durable_content_receipt(groups["readiness"][0], "readiness")
+    challenge, challenge_sha = _read_durable_content_receipt(groups["stop-challenge"][0], "stop-challenge")
+    exit_value, exit_sha = _read_durable_content_receipt(groups["exit"][0], "exit")
+    stop_path = groups["stop"][0]
+    stop, stop_sha = _read_durable_content_receipt(stop_path, "stop")
+    if (launch.get("stage") != "completed" or launch.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
+            or launch.get("pending_sha256") != pending_sha or launch.get("readiness_sha256") != readiness_sha
+            or pending.get("launch_id") != launch.get("launch_id")
+            or readiness.get("pending_sha256") != pending_sha
+            or challenge.get("launch_sha256") != launch_sha
+            or stop.get("launch_sha256") != launch_sha or stop.get("challenge_sha256") != challenge_sha
+            or stop.get("exit_sha256") != exit_sha or exit_value.get("launch_sha256") != launch_sha
+            or exit_value.get("challenge_sha256") != challenge_sha
+            or exit_value.get("binding") != challenge.get("binding")
+            or launch.get("dev_storage_root") != str(dev_storage)
+            or launch.get("port") != AC_DEV_SERVICE_PORT
+            or launch.get("database_sha256_after") != _file_sha256(
+                dev_storage / "governance" / "aming-claw" / "governance.db")):
+        raise click.ClickException("AC dev durable stopped chain binding mismatch")
+    try:
+        _posix_process_identity(int(launch.get("pid") or 0))
+    except click.ClickException:
+        pass
+    else:
+        raise click.ClickException("AC dev durable stopped chain PID is live")
+    if _durable_listener_pid(AC_DEV_SERVICE_PORT) or _port_is_open(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("AC dev durable stopped chain port is not free")
+    return stop_path, stop_sha
+
+
 def _durable_dev_stop(dev_storage: Path) -> None:
     runtime = dev_storage / "runtime" / "durable-launch"
     launch_paths = list(runtime.glob("launch.*.json"))
@@ -4015,6 +4055,11 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         pid_value = int(value.get("pid") or 0)
         if pid_value > 0 and _durable_listener_pid(AC_DEV_SERVICE_PORT) == pid_value:
             live_launches.append((path, value, digest))
+    if not live_launches and not _durable_listener_pid(AC_DEV_SERVICE_PORT):
+        stopped_path, stopped_sha = _verified_durable_stopped_chain(dev_storage)
+        click.echo(json.dumps({"status": "already_stopped", "receipt": str(stopped_path),
+                               "receipt_sha256": stopped_sha}, sort_keys=True))
+        return
     if len(launch_paths) == 1:
         receipt_path = launch_paths[0]
         receipt, launch_sha256 = _read_durable_content_receipt(receipt_path, "launch")
