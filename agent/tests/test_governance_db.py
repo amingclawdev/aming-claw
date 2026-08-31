@@ -1040,6 +1040,14 @@ def _admit_existing_dev_world(storage_root: Path, stable: Path) -> None:
     )
 
 
+def test_authority_projection_inventory_registry_matches_source_owned_schema():
+    from agent.governance import db
+
+    inventory = db.authority_projection_schema_inventory()
+    assert len(inventory["inventory"]) == db.AC_AUTHORITY_SCHEMA_INVENTORY_COUNT == 308
+    assert inventory["sha256"] == db.AC_AUTHORITY_SCHEMA_INVENTORY_SHA256
+
+
 def test_ac_dev_source_tip_cas_upgrade_is_descendant_and_genesis_immutable(tmp_path):
     from agent.governance import db
 

@@ -1470,6 +1470,29 @@ def _validated_historical_admission_source_identity(value: object) -> dict[str, 
     return dict(value)
 
 
+def _validated_authority_receipt_inventory(value: object, *, db_module) -> dict[str, object]:
+    """Validate the exact 308-object registry without opening SQLite."""
+    if not isinstance(value, dict) or set(value) != {"inventory", "sha256"}:
+        raise click.ClickException(
+            "AC dev schema admission recertification historical inventory mismatch"
+        )
+    inventory = value.get("inventory")
+    if not isinstance(inventory, list) or len(inventory) != db_module.AC_AUTHORITY_SCHEMA_INVENTORY_COUNT:
+        raise click.ClickException(
+            "AC dev schema admission recertification historical inventory mismatch"
+        )
+    encoded = json.dumps(inventory, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    if (
+        value.get("sha256") != digest
+        or digest != db_module.AC_AUTHORITY_SCHEMA_INVENTORY_SHA256
+    ):
+        raise click.ClickException(
+            "AC dev schema admission recertification historical inventory mismatch"
+        )
+    return dict(value)
+
+
 def _write_admission_receipt(archive: Path, payload: dict[str, Any]) -> tuple[Path, str]:
     """Persist a byte-addressed receipt without placing its own hash in it."""
     archive.mkdir(parents=True, exist_ok=True)
@@ -1669,7 +1692,6 @@ def _offline_dev_schema_admission(
         plan_sha256 = "sha256:" + hashlib.sha256(
             _canonical_json_bytes(plan_fn())
         ).hexdigest()
-        expected_inventory = _db.authority_projection_schema_inventory()
         historical_source = _validated_historical_admission_source_identity(
             historical.get("source_identity")
         )
@@ -1685,8 +1707,6 @@ def _offline_dev_schema_admission(
             or historical.get("database_identity") != database_identity
             or historical.get("source_identity") != expected_source
             or historical.get("plan_sha256") != plan_sha256
-            or historical.get("schema_inventory_after") != expected_inventory
-            or len(list(expected_inventory.get("inventory") or [])) != 308
             or not re.fullmatch(
                 r"sha256:[0-9a-f]{64}",
                 str(historical.get("database_sha256_after") or ""),
@@ -1695,6 +1715,9 @@ def _offline_dev_schema_admission(
             raise click.ClickException(
                 "AC dev schema admission recertification historical receipt mismatch"
             )
+        expected_inventory = _validated_authority_receipt_inventory(
+            historical.get("schema_inventory_after"), db_module=_db,
+        )
         _validate_admission_receipt_chain(
             historical, historical_sha256, archive=archive,
             project_id=project_id, port=port, root_identity=root_identity,

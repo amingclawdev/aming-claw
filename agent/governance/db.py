@@ -2166,6 +2166,10 @@ BACKLOG_READ_SCHEMA_OBJECTS = frozenset({
 # migration framework: all definitions are exported by their owning modules,
 # and an admission may only create a pristine absence of the complete set.
 AC_AUTHORITY_SCHEMA_PLAN_VERSION = "ac_dev_authority_projection_schema_plan.v1"
+AC_AUTHORITY_SCHEMA_INVENTORY_COUNT = 308
+AC_AUTHORITY_SCHEMA_INVENTORY_SHA256 = (
+    "sha256:76684bd3ece70dcae94e1b9678abf57ef74ca2d7dffdc4166414e5ca74cd7999"
+)
 AC_AUTHORITY_SCHEMA_TABLES = frozenset({
     "observer_route_token_refs",
     "contract_runtime_executions",

@@ -4045,7 +4045,11 @@ def test_dev_admit_authority_schema_existing_byte_recertification_is_read_only_a
 
 
 @pytest.mark.parametrize(
-    "mismatch", ["rolled_back", "root", "database", "source", "plan", "inventory_count"],
+    "mismatch", [
+        "rolled_back", "project", "port", "root", "database", "source", "plan",
+        "inventory_count", "inventory_hash", "backup", "chain", "content_hash",
+        "sidecar", "symlink", "wrong_path",
+    ],
 )
 def test_dev_admit_authority_schema_recertification_rejects_foreign_predecessor_before_target_sqlite_open(tmp_path, monkeypatch, mismatch):
     import agent.cli as cli
@@ -4075,8 +4079,13 @@ def test_dev_admit_authority_schema_recertification_rejects_foreign_predecessor_
     completed = Path(json.loads(admitted.output)["receipt_path"])
     archive = completed.parent
     payload = json.loads(completed.read_text(encoding="utf-8"))
+    forged = completed
     if mismatch == "rolled_back":
         payload["stage"] = "rolled_back"
+    elif mismatch == "project":
+        payload["project_id"] = "foreign"
+    elif mismatch == "port":
+        payload["port"] = 40009
     elif mismatch == "root":
         payload["root_identity"] = {**payload["root_identity"], "inode": -1}
     elif mismatch == "database":
@@ -4085,26 +4094,74 @@ def test_dev_admit_authority_schema_recertification_rejects_foreign_predecessor_
         payload["source_identity"] = {**payload["source_identity"], "cli_source_sha256": "sha256:" + "0" * 64}
     elif mismatch == "plan":
         payload["plan_sha256"] = "sha256:" + "0" * 64
-    else:
+    elif mismatch == "inventory_count":
         payload["schema_inventory_after"] = {
             **payload["schema_inventory_after"],
             "inventory": payload["schema_inventory_after"]["inventory"][:-1],
         }
-    forged, _digest = cli._write_admission_receipt(archive, payload)
+    elif mismatch == "inventory_hash":
+        payload["schema_inventory_after"] = {
+            **payload["schema_inventory_after"], "sha256": "sha256:" + "0" * 64,
+        }
+    elif mismatch == "backup":
+        payload["backup"] = {**payload["backup"], "sha256": "sha256:" + "0" * 64}
+    elif mismatch == "chain":
+        payload["previous_receipt_sha256"] = "sha256:" + "0" * 64
+    elif mismatch == "content_hash":
+        completed.write_bytes(completed.read_bytes() + b"\n")
+    elif mismatch == "sidecar":
+        completed.with_suffix(".sha256").write_text("foreign\n", encoding="utf-8")
+    elif mismatch == "symlink":
+        forged = archive / ("0" * 64 + ".json")
+        forged.symlink_to(completed)
+    elif mismatch == "wrong_path":
+        forged = tmp_path / completed.name
+        cli.shutil.copy2(completed, forged)
+    if mismatch not in {"content_hash", "sidecar", "symlink", "wrong_path"}:
+        forged, _digest = cli._write_admission_receipt(archive, payload)
     opened = []
+    writer_calls = []
     original_connect = cli.sqlite3.connect
     def tracked_connect(target, *args, **kwargs):
         opened.append(str(target))
         return original_connect(target, *args, **kwargs)
     monkeypatch.setattr(cli.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(cli, "_write_admission_receipt", lambda *_args, **_kwargs: writer_calls.append("receipt"))
+    monkeypatch.setattr(cli.shutil, "copy2", lambda *_args, **_kwargs: writer_calls.append("copy"))
+    monkeypatch.setattr(cli.os, "replace", lambda *_args, **_kwargs: writer_calls.append("replace"))
+    monkeypatch.setattr(cli.Path, "mkdir", lambda *_args, **_kwargs: writer_calls.append("mkdir"))
     before = database.read_bytes()
     rejected = CliRunner().invoke(
         main, command + ["--recertify-existing-bytes", str(forged)]
     )
     assert rejected.exit_code != 0
-    assert re.search(r"historical (receipt|source) mismatch", rejected.output)
     assert database.read_bytes() == before
-    assert not any(str(database) in target for target in opened)
+    assert opened == []
+    assert writer_calls == []
+
+
+@pytest.mark.parametrize("path_class", ["missing", "nonregular"])
+def test_dev_admit_authority_schema_recertification_path_rejection_has_zero_connect_or_writer(tmp_path, monkeypatch, path_class):
+    import agent.cli as cli
+
+    root = tmp_path / "root"; root.mkdir()
+    predecessor = tmp_path / "missing.json"
+    if path_class == "nonregular":
+        predecessor.mkdir()
+    connect_calls = []
+    writer_calls = []
+    monkeypatch.setattr(cli.sqlite3, "connect", lambda *_args, **_kwargs: connect_calls.append("connect"))
+    monkeypatch.setattr(cli, "_write_admission_receipt", lambda *_args, **_kwargs: writer_calls.append("receipt"))
+    monkeypatch.setattr(cli.shutil, "copy2", lambda *_args, **_kwargs: writer_calls.append("copy"))
+    monkeypatch.setattr(cli.os, "replace", lambda *_args, **_kwargs: writer_calls.append("replace"))
+    monkeypatch.setattr(cli.Path, "mkdir", lambda *_args, **_kwargs: writer_calls.append("mkdir"))
+    result = CliRunner().invoke(main, [
+        "dev-admit-authority-schema", "--dev-storage-root", str(root),
+        "--project-id", "aming-claw", "--port", "40008",
+        "--recertify-existing-bytes", str(predecessor),
+    ])
+    assert result.exit_code != 0
+    assert connect_calls == [] and writer_calls == []
 
 
 @pytest.mark.parametrize("drift", ["wal_replacement", "database_replacement", "database_hash"])
