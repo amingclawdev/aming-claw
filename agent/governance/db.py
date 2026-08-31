@@ -17,6 +17,8 @@ import re
 import fcntl
 import subprocess
 import errno
+import shutil
+import datetime
 import urllib.request
 import urllib.error
 from contextlib import closing
@@ -2062,6 +2064,152 @@ def _source_schema_inventory_hash(conn: sqlite3.Connection, required: set[str]) 
     return "sha256:" + hashlib.sha256(
         json.dumps([tuple(row) for row in rows], separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+# This is deliberately a small, separately-versioned schema capability.  It is
+# not a second general migration engine: the only admissible drift is a pristine
+# absence of these named objects in an otherwise verified AC dev world.
+BACKLOG_READ_SCHEMA_PLAN_VERSION = "ac_dev_backlog_read_schema_plan.v1"
+BACKLOG_READ_SCHEMA_RESOURCE = "backlog"
+BACKLOG_READ_SCHEMA_TABLE_DEFINITION = (
+    (("resource", "TEXT", 0, None, 1), "resource TEXT PRIMARY KEY"),
+    (("generation", "INTEGER", 1, "1", 0), "generation INTEGER NOT NULL DEFAULT 1"),
+    (("updated_at", "TEXT", 1, "''", 0), "updated_at TEXT NOT NULL DEFAULT ''"),
+)
+BACKLOG_READ_SCHEMA_TABLE_XINFO = tuple(
+    (*metadata, 0) for metadata, _sql in BACKLOG_READ_SCHEMA_TABLE_DEFINITION
+)
+BACKLOG_READ_SCHEMA_INDEX_SQL = (
+    "CREATE INDEX idx_backlog_bugs_dashboard_keyset "
+    "ON backlog_bugs(updated_at DESC, created_at DESC, bug_id DESC)"
+)
+BACKLOG_READ_SCHEMA_TABLE_SQL = (
+    "CREATE TABLE dashboard_backlog_cache_generation ("
+    + ", ".join(sql for _metadata, sql in BACKLOG_READ_SCHEMA_TABLE_DEFINITION)
+    + ")"
+)
+BACKLOG_READ_SCHEMA_SEED_SQL = (
+    "INSERT INTO dashboard_backlog_cache_generation "
+    "(resource, generation, updated_at) VALUES ('backlog', 1, CURRENT_TIMESTAMP)"
+)
+BACKLOG_READ_SCHEMA_TRIGGER_SQL: Mapping[str, str] = {
+    event: (
+        f"CREATE TRIGGER trg_dashboard_backlog_cache_{event.lower()} "
+        f"AFTER {event} ON backlog_bugs BEGIN "
+        "UPDATE dashboard_backlog_cache_generation "
+        "SET generation = generation + 1, updated_at = CURRENT_TIMESTAMP "
+        "WHERE resource = 'backlog'; END"
+    )
+    for event in ("INSERT", "UPDATE", "DELETE")
+}
+BACKLOG_READ_SCHEMA_OBJECTS = frozenset({
+    "dashboard_backlog_cache_generation",
+    "idx_backlog_bugs_dashboard_keyset",
+    *(f"trg_dashboard_backlog_cache_{event.lower()}" for event in BACKLOG_READ_SCHEMA_TRIGGER_SQL),
+})
+
+
+def backlog_read_schema_plan() -> dict[str, object]:
+    """Return the one canonical operator plan shared by stable/dev/CLI."""
+    return {
+        "schema_version": BACKLOG_READ_SCHEMA_PLAN_VERSION,
+        "table": "dashboard_backlog_cache_generation",
+        "index": "idx_backlog_bugs_dashboard_keyset",
+        "triggers": tuple(sorted(BACKLOG_READ_SCHEMA_TRIGGER_SQL)),
+        "allowed_objects": tuple(sorted(BACKLOG_READ_SCHEMA_OBJECTS)),
+    }
+
+
+def _backlog_read_normalized_sql(value: object) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().rstrip(";"))
+    return re.sub(r"\s*([(),;])\s*", r"\1", normalized.replace(" IF NOT EXISTS ", " "))
+
+
+def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Classify the bounded backlog-read plan without writing.
+
+    ``missing`` is the *only* class the offline admission may repair.  Any
+    definition mismatch, partial seed, or unexpected similarly-named object is
+    hostile drift and must remain a zero-write rejection.
+    """
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master "
+        "WHERE name IN (%s)" % ",".join("?" for _ in BACKLOG_READ_SCHEMA_OBJECTS),
+        tuple(sorted(BACKLOG_READ_SCHEMA_OBJECTS)),
+    ).fetchall()
+    actual = {str(row[1]): tuple(row) for row in rows}
+    missing: list[str] = []
+    invalid: list[str] = []
+    table = actual.get("dashboard_backlog_cache_generation")
+    if table is None:
+        missing.append("generation_table")
+    elif table[0] != "table" or _backlog_read_normalized_sql(table[3]) != _backlog_read_normalized_sql(BACKLOG_READ_SCHEMA_TABLE_SQL):
+        invalid.append("generation_table")
+    index = actual.get("idx_backlog_bugs_dashboard_keyset")
+    if index is None:
+        missing.append("keyset_index")
+    elif index[0] != "index" or index[2] != "backlog_bugs" or _backlog_read_normalized_sql(index[3]) != _backlog_read_normalized_sql(BACKLOG_READ_SCHEMA_INDEX_SQL):
+        invalid.append("keyset_index")
+    for event, sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.items():
+        name = f"trg_dashboard_backlog_cache_{event.lower()}"
+        trigger = actual.get(name)
+        if trigger is None:
+            missing.append(f"trigger_{event.lower()}")
+        elif trigger[0] != "trigger" or trigger[2] != "backlog_bugs" or _backlog_read_normalized_sql(trigger[3]) != _backlog_read_normalized_sql(sql):
+            invalid.append(f"trigger_{event.lower()}")
+    if table is not None and "generation_table" not in invalid:
+        seeds = conn.execute(
+            "SELECT resource, generation, updated_at FROM dashboard_backlog_cache_generation "
+            "WHERE resource=?", (BACKLOG_READ_SCHEMA_RESOURCE,)
+        ).fetchall()
+        if not seeds:
+            missing.append("backlog_generation_seed")
+        elif len(seeds) != 1 or str(seeds[0][0]) != BACKLOG_READ_SCHEMA_RESOURCE or int(seeds[0][1]) < 1 or not str(seeds[0][2]):
+            invalid.append("backlog_generation_seed")
+    return {"missing": sorted(missing), "invalid": sorted(invalid)}
+
+
+def ensure_backlog_read_schema(conn: sqlite3.Connection) -> None:
+    """Stable-only initializer for the bounded backlog-read plan."""
+    conn.execute(BACKLOG_READ_SCHEMA_TABLE_SQL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+    conn.execute(BACKLOG_READ_SCHEMA_INDEX_SQL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
+    conn.execute(BACKLOG_READ_SCHEMA_SEED_SQL.replace("INSERT INTO", "INSERT OR IGNORE INTO", 1))
+    for sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.values():
+        conn.execute(sql.replace("CREATE TRIGGER", "CREATE TRIGGER IF NOT EXISTS", 1))
+    conn.commit()
+
+
+def admit_missing_backlog_read_schema(conn: sqlite3.Connection) -> dict[str, object]:
+    """Apply exactly the known missing-object set in one caller-owned transaction."""
+    before = backlog_read_schema_drift(conn)
+    if before["invalid"]:
+        raise ValueError("AC dev schema admission rejects invalid backlog-read drift")
+    if not before["missing"]:
+        return {"changed": False, "missing": []}
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # The preflight allows only pristine absences; each statement is
+        # unconditional so a concurrent/create race becomes a rollback.
+        if "generation_table" in before["missing"]:
+            conn.execute(BACKLOG_READ_SCHEMA_TABLE_SQL)
+        if "keyset_index" in before["missing"]:
+            conn.execute(BACKLOG_READ_SCHEMA_INDEX_SQL)
+        if (
+            "generation_table" in before["missing"]
+            or "backlog_generation_seed" in before["missing"]
+        ):
+            conn.execute(BACKLOG_READ_SCHEMA_SEED_SQL)
+        for event, sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.items():
+            if f"trigger_{event.lower()}" in before["missing"]:
+                conn.execute(sql)
+        after = backlog_read_schema_drift(conn)
+        if after["missing"] or after["invalid"]:
+            raise ValueError("AC dev schema admission postcondition failed")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {"changed": True, "missing": before["missing"]}
 
 
 def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:

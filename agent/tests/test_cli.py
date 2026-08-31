@@ -3852,3 +3852,58 @@ def test_v27_dev_startup_does_not_use_cutover_marker_as_authority():
     assert "_require_dev_cutover_activation(" not in start_source
     assert "validate_dev_world_cutover_activation(" not in startup_source
     assert "AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH" not in start_source
+
+
+def test_dev_admit_schema_rejects_wrong_plane_before_database_write(tmp_path):
+    root = tmp_path / "external-dev-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    import sqlite3
+
+    conn = sqlite3.connect(database)
+    conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE backlog_bugs (bug_id TEXT, updated_at TEXT, created_at TEXT)")
+    conn.executemany(
+        "INSERT INTO schema_meta VALUES (?, ?)",
+        [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")],
+    )
+    conn.commit()
+    conn.close()
+    (root / "launch-receipt.json").write_text(
+        json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}),
+        encoding="utf-8",
+    )
+    before = database.read_bytes()
+    result = CliRunner().invoke(
+        main,
+        ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "wrong", "--port", "40008"],
+    )
+    assert result.exit_code != 0
+    assert database.read_bytes() == before
+
+
+def test_dev_admit_schema_repairs_exact_missing_set_offline(tmp_path, monkeypatch):
+    import agent.cli as cli
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-dev-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    import sqlite3
+
+    conn = sqlite3.connect(database)
+    conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE backlog_bugs (bug_id TEXT, updated_at TEXT, created_at TEXT)")
+    conn.executemany("INSERT INTO schema_meta VALUES (?, ?)", [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")])
+    conn.commit()
+    conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    result = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008"])
+    assert result.exit_code == 0, result.output
+    output = json.loads(result.output)
+    assert output["status"] == "admitted"
+    assert Path(output["receipt_path"]).is_file()
+    conn = sqlite3.connect(database)
+    try:
+        assert conn.execute("SELECT generation FROM dashboard_backlog_cache_generation WHERE resource='backlog'").fetchone()[0] >= 1
+    finally:
+        conn.close()

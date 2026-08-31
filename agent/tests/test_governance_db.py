@@ -1632,3 +1632,33 @@ def test_ac_dev_archive_cached_observation_is_not_activation_authority(tmp_path)
             content_digest=True,
             cached_identity={**actual, "inode": actual["inode"] + 1},
         )
+
+
+def test_ac_dev_offline_backlog_schema_admission_repairs_only_exact_missing_set():
+    from governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE backlog_bugs (bug_id TEXT, updated_at TEXT, created_at TEXT)")
+    try:
+        assert db.backlog_read_schema_drift(conn)["invalid"] == []
+        result = db.admit_missing_backlog_read_schema(conn)
+        assert result["changed"] is True
+        assert db.backlog_read_schema_drift(conn) == {"missing": [], "invalid": []}
+        assert db.admit_missing_backlog_read_schema(conn) == {"changed": False, "missing": []}
+    finally:
+        conn.close()
+
+
+def test_ac_dev_offline_backlog_schema_admission_rolls_back_unexpected_drift():
+    from governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE backlog_bugs (bug_id TEXT, updated_at TEXT, created_at TEXT)")
+    conn.execute("CREATE TABLE dashboard_backlog_cache_generation (resource TEXT)")
+    before = tuple(conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name"))
+    try:
+        with pytest.raises(ValueError, match="rejects invalid"):
+            db.admit_missing_backlog_read_schema(conn)
+        assert tuple(conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name")) == before
+    finally:
+        conn.close()

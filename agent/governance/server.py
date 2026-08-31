@@ -56,6 +56,14 @@ from .db import (
     validate_project_id_syntax,
     registered_public_safe_external_project,
     verify_existing_schema_capabilities,
+    ensure_backlog_read_schema as _db_ensure_backlog_read_schema,
+    BACKLOG_READ_SCHEMA_INDEX_SQL as _BACKLOG_READ_SCHEMA_INDEX_SQL,
+    BACKLOG_READ_SCHEMA_TABLE_DEFINITION as _BACKLOG_READ_SCHEMA_TABLE_DEFINITION,
+    BACKLOG_READ_SCHEMA_TABLE_XINFO as _BACKLOG_READ_SCHEMA_TABLE_XINFO,
+    BACKLOG_READ_SCHEMA_TABLE_SQL as _BACKLOG_READ_SCHEMA_TABLE_SQL,
+    BACKLOG_READ_SCHEMA_RESOURCE as _BACKLOG_READ_SCHEMA_RESOURCE,
+    BACKLOG_READ_SCHEMA_SEED_SQL as _BACKLOG_READ_SCHEMA_SEED_SQL,
+    BACKLOG_READ_SCHEMA_TRIGGER_SQL as _BACKLOG_READ_SCHEMA_TRIGGER_SQL,
     _dev_runtime_root,
 )
 from . import role_service
@@ -207891,18 +207899,6 @@ def _append_backlog_filters(sql: str, params: list[Any], ctx: RequestContext) ->
     return sql, params
 
 
-_BACKLOG_READ_SCHEMA_INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_backlog_bugs_dashboard_keyset
-    ON backlog_bugs(updated_at DESC, created_at DESC, bug_id DESC)
-"""
-_BACKLOG_READ_SCHEMA_TABLE_DEFINITION = (
-    (("resource", "TEXT", 0, None, 1), "resource TEXT PRIMARY KEY"),
-    (("generation", "INTEGER", 1, "1", 0), "generation INTEGER NOT NULL DEFAULT 1"),
-    (("updated_at", "TEXT", 1, "''", 0), "updated_at TEXT NOT NULL DEFAULT ''"),
-)
-_BACKLOG_READ_SCHEMA_TABLE_XINFO = tuple(
-    (*metadata, 0) for metadata, _sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION
-)
 # Exact direct-read subset bound from observer_session.SCHEMA_SQL's canonical
 # observer_command_queue definition. Recovery-only columns and indexes are not
 # part of the optimized backlog projection contract.
@@ -207917,32 +207913,6 @@ _BACKLOG_READ_OBSERVER_COMMAND_COLUMNS = {
     "created_at": ("TEXT", 1, None, 0),
     "result_json": ("TEXT", 1, "'{}'", 0),
 }
-_BACKLOG_READ_SCHEMA_TABLE_SQL = (
-    "CREATE TABLE IF NOT EXISTS dashboard_backlog_cache_generation (\n    "
-    + ",\n    ".join(sql for _metadata, sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION)
-    + "\n)"
-)
-_BACKLOG_READ_SCHEMA_RESOURCE = "backlog"
-_BACKLOG_READ_SCHEMA_SEED_SQL = f"""
-INSERT OR IGNORE INTO dashboard_backlog_cache_generation
-    (resource, generation, updated_at)
-VALUES ('{_BACKLOG_READ_SCHEMA_RESOURCE}', 1, CURRENT_TIMESTAMP)
-"""
-_BACKLOG_READ_SCHEMA_TRIGGER_SQL = {
-    event: f"""
-CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_{event.lower()}
-AFTER {event} ON backlog_bugs
-BEGIN
-    UPDATE dashboard_backlog_cache_generation
-       SET generation = generation + 1,
-           updated_at = CURRENT_TIMESTAMP
-     WHERE resource = '{_BACKLOG_READ_SCHEMA_RESOURCE}';
-END
-"""
-    for event in ("INSERT", "UPDATE", "DELETE")
-}
-
-
 def _backlog_read_schema_normalized_sql(value: Any) -> str:
     normalized = re.sub(
         r"\s+",
@@ -207955,19 +207925,7 @@ def _backlog_read_schema_normalized_sql(value: Any) -> str:
 
 def _ensure_backlog_read_schema(conn: sqlite3.Connection) -> None:
     """Stable-owned indexed keyset and mutation-generation initialization."""
-
-    conn.executescript(
-        ";\n".join(
-            (
-                _BACKLOG_READ_SCHEMA_INDEX_SQL,
-                _BACKLOG_READ_SCHEMA_TABLE_SQL,
-                _BACKLOG_READ_SCHEMA_SEED_SQL,
-                *_BACKLOG_READ_SCHEMA_TRIGGER_SQL.values(),
-            )
-        )
-        + ";"
-    )
-    conn.commit()
+    _db_ensure_backlog_read_schema(conn)
 
 
 def _ac_dev_backlog_read_schema_incompatible(

@@ -30,8 +30,11 @@ import re
 import time
 import webbrowser
 import socket
+import sqlite3
 import subprocess
 import tempfile
+import datetime
+import shutil
 import http.client
 import urllib.error
 import urllib.parse
@@ -733,6 +736,94 @@ def status():
     except Exception as exc:
         click.echo(f"Governance unreachable: {exc}", err=True)
         sys.exit(1)
+
+
+def _offline_dev_schema_admission(
+    storage_root: Path, *, project_id: str, port: int, resume_receipt: Path | None,
+) -> dict[str, Any]:
+    """One-shot, offline-only repair for the bounded dev backlog-read plan.
+
+    This command intentionally has no HTTP, graph, or service-manager path.
+    Its target is a stopped external AC dev world and it never opens the stable
+    database selected by the normal runtime.
+    """
+    if project_id != "aming-claw" or port != AC_DEV_SERVICE_PORT:
+        raise click.ClickException("offline AC dev schema admission requires exact project and port 40008")
+    root = storage_root.expanduser().absolute()
+    if root.is_symlink() or not root.is_dir() or "shared-volume" in root.parts:
+        raise click.ClickException("offline AC dev schema admission rejects non-external/stable root")
+    database = root / "governance" / "aming-claw" / "governance.db"
+    if database.is_symlink() or not database.is_file() or database.resolve(strict=True) != database:
+        raise click.ClickException("offline AC dev schema admission database identity is invalid")
+    if _port_is_open(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("offline AC dev schema admission requires stopped port 40008")
+    pid_file = root / "runtime" / "state" / "dev-governance" / "governance.pid"
+    if pid_file.is_file():
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, ValueError):
+            pass
+        else:
+            raise click.ClickException("offline AC dev schema admission requires no live dev PID")
+    holders = subprocess.run(["lsof", "-t", "--", str(database)], capture_output=True, text=True, check=False)
+    if holders.stdout.strip():
+        raise click.ClickException("offline AC dev schema admission requires no database holders")
+    launch = root / "launch-receipt.json"
+    try:
+        launch_data = json.loads(launch.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException("offline AC dev schema admission requires a readable launch receipt") from exc
+    if not isinstance(launch_data, dict) or launch_data.get("world_id") != "ac-dev" or launch_data.get("project_id") != project_id or launch_data.get("port") != port:
+        raise click.ClickException("offline AC dev schema admission launch receipt mismatch")
+    import sqlite3
+    from agent.governance.db import admit_missing_backlog_read_schema, backlog_read_schema_drift
+    conn = sqlite3.connect(str(database), timeout=5)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('governance_world_id','governance_world_genesis_json','governance_world_source_tip_json')"))
+        if meta.get("governance_world_id") != "ac-dev" or not meta.get("governance_world_genesis_json") or not meta.get("governance_world_source_tip_json"):
+            raise click.ClickException("offline AC dev schema admission genesis/source-tip mismatch")
+        before = backlog_read_schema_drift(conn)
+        if before["invalid"]:
+            raise click.ClickException("offline AC dev schema admission rejects unexpected schema drift")
+        archive = root / "archive" / "schema-admission"
+        archive.mkdir(parents=True, exist_ok=True)
+        pre_digest = _file_sha256(database)
+        receipt_payload = {"schema_version": "ac_dev_offline_schema_admission.v1", "project_id": project_id, "port": port, "database": str(database), "pre_sha256": pre_digest, "missing": before["missing"], "resumed_from": str(resume_receipt or "")}
+        receipt_digest = "sha256:" + hashlib.sha256(json.dumps(receipt_payload, sort_keys=True).encode()).hexdigest()
+        backup = archive / (receipt_digest.removeprefix("sha256:") + ".pre.sqlite")
+        if not backup.exists():
+            shutil.copy2(database, backup)
+        result = admit_missing_backlog_read_schema(conn)
+        post_digest = _file_sha256(database)
+        receipt_payload.update({"receipt_sha256": receipt_digest, "backup": str(backup), "post_sha256": post_digest, "changed": result["changed"], "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+        receipt_path = archive / (receipt_digest.removeprefix("sha256:") + ".json")
+        temporary = receipt_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(receipt_payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        os.replace(temporary, receipt_path)
+        return {"status": "admitted", "receipt_path": str(receipt_path), "receipt_sha256": receipt_digest, "changed": result["changed"], "missing": result["missing"], "post_sha256": post_digest}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@main.command("dev-admit-schema")
+@click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--project-id", required=True)
+@click.option("--port", required=True, type=int)
+@click.option("--resume-receipt", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def dev_admit_schema(dev_storage_root: Path, project_id: str, port: int, resume_receipt: Path | None) -> None:
+    """Admit only the known missing backlog-read objects into a stopped dev world."""
+    try:
+        click.echo(json.dumps(_offline_dev_schema_admission(dev_storage_root, project_id=project_id, port=port, resume_receipt=resume_receipt), sort_keys=True))
+    except click.ClickException:
+        raise
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _dashboard_url(governance_url: str) -> str:
