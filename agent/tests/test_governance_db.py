@@ -1178,7 +1178,7 @@ def test_verified_dev_adoption_recovers_real_committed_wal_without_source_advanc
     assert (storage_root / db.AC_DEV_LAUNCH_RECEIPT_NAME).read_bytes() == receipt_before
 
 
-@pytest.mark.parametrize("defect", ["busy", "corrupt", "symlink", "toc_tou"])
+@pytest.mark.parametrize("defect", ["busy", "corrupt", "symlink"])
 def test_verified_dev_adoption_failures_do_not_advance_source_or_receipt(
     tmp_path, monkeypatch, defect
 ):
@@ -1209,12 +1209,6 @@ def test_verified_dev_adoption_failures_do_not_advance_source_or_receipt(
         outside = tmp_path / "outside-wal"
         outside.write_bytes(b"outside")
         Path(str(database) + "-wal").symlink_to(outside)
-    else:
-        monkeypatch.setattr(
-            db, "_assert_sqlite_adoption_identity",
-            lambda *_args: (_ for _ in ()).throw(ValueError("identity changed")),
-        )
-
     with pytest.raises((RuntimeError, ValueError)):
         db.bootstrap_dev_governance_store(
             storage_root, source_identity=source,
@@ -1233,6 +1227,63 @@ def test_verified_dev_adoption_failures_do_not_advance_source_or_receipt(
         with sqlite3.connect(database) as connection:
             meta = dict(connection.execute("SELECT key, value FROM schema_meta"))
         assert meta["governance_world_source_tip_sha256"] == first["source_tip_sha256"]
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_verified_dev_adoption_rejects_real_atomic_sidecar_replacement(
+    tmp_path, suffix
+):
+    """A post-checkpoint `os.replace` cannot masquerade as SQLite recovery.
+
+    This is deliberately a real filesystem replacement, not a monkeypatch of
+    the final identity assertion.  The same test is RED on 707cd because its
+    final assertion only bound root/database identities.
+    """
+    from agent.governance import db
+
+    source_root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": commit, "source_sha256": "sha256:" + "c" * 64,
+    }
+    storage_root, stable = _canonical_dev_world(tmp_path)
+    first = db.bootstrap_dev_governance_store(
+        storage_root, source_identity=source,
+        process_identity={"pid": 555, "start_identity": "first"},
+    )
+    _admit_existing_dev_world(storage_root, stable)
+    database = Path(first["database_path"])
+    receipt_path = storage_root / db.AC_DEV_LAUNCH_RECEIPT_NAME
+    receipt_before = receipt_path.read_bytes()
+    code = (
+        "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+        "c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA wal_autocheckpoint=0'); "
+        "c.execute(\"INSERT OR REPLACE INTO schema_meta(key,value) VALUES('atomic_replace_probe','committed')\"); "
+        "c.commit(); os._exit(0)"
+    )
+    subprocess.run([sys.executable, "-c", code, str(database)], check=True)
+    companion = Path(str(database) + suffix)
+    assert companion.is_file() and not companion.is_symlink()
+    replacement = tmp_path / f"replacement{suffix}"
+    replacement.write_bytes(companion.read_bytes())
+    old_stat = companion.stat(follow_symlinks=False)
+
+    with pytest.raises(ValueError, match="companion identity changed"):
+        db._recover_verified_existing_dev_sqlite(
+            storage_root,
+            database,
+            _after_checkpoint_for_test=lambda: os.replace(replacement, companion),
+        )
+    assert companion.is_file()
+    new_stat = companion.stat(follow_symlinks=False)
+    assert (new_stat.st_dev, new_stat.st_ino) != (old_stat.st_dev, old_stat.st_ino)
+    assert receipt_path.read_bytes() == receipt_before
+    # Recovery fails before the bootstrap source-tip write, so no provenance
+    # can advance even though the filesystem attack raced after checkpoint.
+    companion.unlink()  # test-only hostile artifact cleanup
+    with sqlite3.connect(database) as connection:
+        meta = dict(connection.execute("SELECT key, value FROM schema_meta"))
+    assert meta["governance_world_source_tip_sha256"] == first["source_tip_sha256"]
 
 
 def test_ac_dev_cutover_preflight_activation_idempotency_and_rollback(tmp_path):

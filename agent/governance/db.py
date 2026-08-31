@@ -1864,9 +1864,16 @@ def _sqlite_adoption_snapshot(root: Path, database: Path) -> dict[str, object]:
 
 
 def _assert_sqlite_adoption_identity(
-    before: Mapping[str, object], root: Path, database: Path
+    before: Mapping[str, object], root: Path, database: Path,
+    *, checkpoint_result: tuple[int, int, int],
 ) -> None:
-    """Reject root/database substitution; WAL/SHM may change only by SQLite."""
+    """Reject every substitution after a bounded SQLite checkpoint.
+
+    A successful ``TRUNCATE`` is allowed to remove an existing WAL/SHM file on
+    close.  It is never allowed to make a different inode look legitimate:
+    accepting a replacement would turn a narrow SQLite recovery into an
+    attacker-controlled adoption path.
+    """
 
     after = _sqlite_adoption_snapshot(root, database)
     if after["root"] != before.get("root") or after["database"] != before.get("database"):
@@ -1876,6 +1883,23 @@ def _assert_sqlite_adoption_identity(
     # concurrent/foreign writer signal and must fail closed.
     if after["companions"].get("-journal") is not None:
         raise ValueError("AC dev SQLite adoption found rollback journal")
+    if checkpoint_result != (0, 0, 0):
+        raise RuntimeError("AC dev SQLite adoption checkpoint did not truncate")
+    before_companions = dict(before.get("companions") or {})
+    after_companions = dict(after.get("companions") or {})
+    for suffix in ("-wal", "-shm"):
+        previous = before_companions.get(suffix)
+        current = after_companions.get(suffix)
+        if previous == current:
+            continue
+        # SQLite may remove its own sidecar after a completed truncate.  A
+        # changed-but-present file is an atomic replacement/recreation and is
+        # deliberately not accepted without a stronger directory-fd protocol.
+        if previous is not None and current is None:
+            continue
+        raise ValueError(
+            "AC dev SQLite adoption companion identity changed during recovery"
+        )
 
 
 def _assert_no_external_sqlite_holders(database: Path) -> None:
@@ -1947,7 +1971,12 @@ def _validate_existing_adoption_receipt(root: Path) -> None:
         raise ValueError("existing AC dev launch receipt source hash is invalid")
 
 
-def _recover_verified_existing_dev_sqlite(root: Path, database: Path) -> None:
+def _recover_verified_existing_dev_sqlite(
+    root: Path,
+    database: Path,
+    *,
+    _after_checkpoint_for_test=None,
+) -> None:
     """Bounded source-owned recovery for a stopped, verified dev world.
 
     No unlink is performed.  SQLite owns any WAL/SHM changes through a fully
@@ -1981,15 +2010,21 @@ def _recover_verified_existing_dev_sqlite(root: Path, database: Path) -> None:
             rows = [str(row[0]).lower() for row in conn.execute(f"PRAGMA {pragma}")]
             if rows != ["ok"]:
                 raise ValueError(f"AC dev SQLite adoption {pragma} failed")
-        result = tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
-        if len(result) != 3 or int(result[0]) != 0 or int(result[1]) != int(result[2]):
+        result = tuple(int(value) for value in conn.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone())
+        if result != (0, 0, 0):
             raise RuntimeError("AC dev SQLite adoption checkpoint is incomplete")
     except sqlite3.DatabaseError as exc:
         raise ValueError("AC dev SQLite adoption recovery failed") from exc
     finally:
         if conn is not None:
             conn.close()
-    _assert_sqlite_adoption_identity(before, root, database)
+    if _after_checkpoint_for_test is not None:
+        _after_checkpoint_for_test()
+    _assert_sqlite_adoption_identity(
+        before, root, database, checkpoint_result=result
+    )
     binding = verified_stable_database_binding()
     _revalidate_stable_database_binding(binding)
 
