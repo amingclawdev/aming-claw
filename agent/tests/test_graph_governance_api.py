@@ -123,14 +123,6 @@ def test_canonical_ref_adoption_intent_is_exactly_route_scoped():
 
 def _route_bound_adoption_fixture(conn):
     now = datetime.now(timezone.utc)
-    issued = observer_route_context.issue_observer_write_route_context(
-        project_id="aming-claw",
-        backlog_id="AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
-        task_id="cex-adoption-r2",
-        target_files=["agent/cli.py"],
-        allowed_actions=["canonical_ref_adoption"],
-        ttl_hours=1,
-    )
     intent = {
         "schema_version": "canonical_ref_adoption_route_bound.v1",
         "project_id": "aming-claw", "backlog_id": "AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
@@ -142,8 +134,16 @@ def _route_bound_adoption_fixture(conn):
         "expires_at": (now + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "replay_identity": "adoption-r2-once",
     }
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw",
+        backlog_id="AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
+        task_id="cex-adoption-r2",
+        target_files=["agent/cli.py"],
+        allowed_actions=["canonical_ref_adoption"],
+        ttl_hours=1,
+        canonical_ref_adoption=intent,
+    )
     token = issued["route_token"]
-    token.setdefault("route_lineage", {})["canonical_ref_adoption"] = intent
     observer_route_context.persist_route_token_ref(
         conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=token
     )
@@ -261,6 +261,151 @@ def test_canonical_ref_adoption_issuance_rejects_boundary_expiry_and_reissue(tmp
         observer_route_context.canonical_ref_adoption_issuance_available(
             conn, project_id="aming-claw", intent=intent,
         )
+    conn.close()
+
+
+def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, monkeypatch):
+    """Only one complete server issue can claim a typed adoption operation."""
+    database = tmp_path / "canonical-adoption-issue.db"
+    setup = sqlite3.connect(database)
+    setup.row_factory = sqlite3.Row
+    _ensure_schema(setup)
+    setup.commit()
+    setup.close()
+
+    def connection_for_test(_project_id):
+        conn = sqlite3.connect(database, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(server, "get_connection", connection_for_test)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    body = {
+        "caller_role": "observer",
+        "backlog_id": "ADOPTION-ATOMIC-ISSUE",
+        "task_id": "cex-adoption-atomic-issue",
+        "target_files": ["agent/cli.py"],
+        "allowed_actions": ["canonical_ref_adoption"],
+        "canonical_ref_adoption": {
+            "schema_version": "canonical_ref_adoption_route_bound.v1",
+            "project_id": "aming-claw",
+            "backlog_id": "ADOPTION-ATOMIC-ISSUE",
+            "action": "canonical_ref_adoption",
+            "contract_execution_id": "cex-adoption-atomic-issue",
+            "generation": "gen-atomic", "custody": "custody-atomic",
+            "canonical_ref": "refs/heads/codex/ac-dev",
+            "expected_commit": "a" * 40, "target_commit": "b" * 40,
+            "target_tree": "c" * 40,
+            "source_content_sha256": "sha256:" + "d" * 64,
+            "qa_content_sha256": "sha256:" + "e" * 64,
+            # Deliberately caller-controlled nonsense: the issuer replaces it.
+            "issued_at": "2020-01-01T00:00:00Z",
+            "expires_at": "2020-01-01T01:00:00Z",
+            "replay_identity": "caller-must-not-control-this",
+        },
+    }
+
+    def issue_once():
+        return server.handle_observer_route_context_issue(
+            _ctx({"project_id": "aming-claw"}, method="POST", body=copy.deepcopy(body))
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result() for future in (pool.submit(issue_once), pool.submit(issue_once))]
+    successful = [item for item in results if isinstance(item, dict) and item.get("ok")]
+    rejected = [item for item in results if isinstance(item, tuple) and item[0] == 409]
+    assert len(successful) == 1
+    assert len(rejected) == 1
+
+    issued = successful[0]
+    token = issued["route_token"]
+    typed = token["route_lineage"]["canonical_ref_adoption"]
+    assert typed["issued_at"] == token["issued_at"]
+    assert typed["expires_at"] == token["expires_at"]
+    assert typed["replay_identity"] != body["canonical_ref_adoption"]["replay_identity"]
+    conn = connection_for_test("aming-claw")
+    try:
+        stored = conn.execute(
+            "SELECT route_lineage_json FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            ("aming-claw", issued["route_token_ref"]),
+        ).fetchone()
+        stored_lineage = json.loads(stored["route_lineage_json"])
+        assert stored_lineage["canonical_ref_adoption"] == typed
+        # A process can die after durable issue but before the CLI reserve;
+        # issuance itself never synthesizes a reservation state.
+        assert "canonical_ref_adoption_state" not in stored_lineage
+        assert observer_route_context.verify_route_token_binding(
+            conn,
+            project_id="aming-claw",
+            route_token_ref=issued["route_token_ref"],
+            token=token,
+        )["route_token_ref"] == issued["route_token_ref"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+            ("aming-claw",),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_canonical_ref_adoption_reissue_stays_rejected_after_expiry(tmp_path):
+    """Expiry changes route availability, never operation replay custody."""
+    conn = sqlite3.connect(tmp_path / "expired-adoption.db")
+    conn.row_factory = sqlite3.Row
+    now = datetime.now(timezone.utc)
+    intent = {
+        "schema_version": "canonical_ref_adoption_route_bound.v1",
+        "project_id": "aming-claw", "backlog_id": "expired-adoption",
+        "action": "canonical_ref_adoption", "contract_execution_id": "cex-expired",
+        "generation": "gen-expired", "custody": "custody-expired",
+        "canonical_ref": "refs/heads/codex/ac-dev",
+        "expected_commit": "a" * 40, "target_commit": "b" * 40,
+        "target_tree": "c" * 40,
+        "source_content_sha256": "sha256:" + "d" * 64,
+        "qa_content_sha256": "sha256:" + "e" * 64,
+        "issued_at": (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "replay_identity": "replay-expired",
+    }
+    first = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw", backlog_id="expired-adoption", task_id="cex-expired",
+        target_files=["agent/cli.py"], allowed_actions=["canonical_ref_adoption"],
+        now=now - timedelta(seconds=1), canonical_ref_adoption=intent,
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id="aming-claw", route_token_ref=first["route_token_ref"], token=first["route_token"]
+    )
+    conn.execute("UPDATE observer_route_token_refs SET status='expired'")
+    conn.commit()
+    second = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw", backlog_id="expired-adoption", task_id="cex-expired",
+        target_files=["agent/cli.py"], allowed_actions=["canonical_ref_adoption"],
+        now=now, canonical_ref_adoption=intent,
+    )
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="already has"):
+        observer_route_context.persist_route_token_ref(
+            conn, project_id="aming-claw", route_token_ref=second["route_token_ref"], token=second["route_token"]
+        )
+    assert conn.execute("SELECT COUNT(*) FROM observer_route_token_refs").fetchone()[0] == 1
+    conn.close()
+
+
+def test_generic_route_issue_remains_idempotent_without_adoption(tmp_path):
+    """The atomic adoption claim does not change ordinary registry behavior."""
+    conn = sqlite3.connect(tmp_path / "ordinary-route.db")
+    conn.row_factory = sqlite3.Row
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw", backlog_id="ordinary", task_id="ordinary-task",
+        target_files=["agent/cli.py"], allowed_actions=["task_timeline_append"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=issued["route_token"]
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=issued["route_token"]
+    )
+    assert conn.execute("SELECT COUNT(*) FROM observer_route_token_refs").fetchone()[0] == 1
     conn.close()
 from agent.governance.errors import (
     AuthError,

@@ -7748,6 +7748,40 @@ def _canonical_ref_adoption_issue_intent(
     return {"schema_version": _CANONICAL_REF_ADOPTION_SCHEMA, **intent}
 
 
+def _canonical_ref_adoption_bind_issued_intent(
+    intent: Mapping[str, str], *, issued_at: datetime, expires_at: datetime
+) -> dict[str, str]:
+    """Bind an adoption intent to the server's exact route issue window.
+
+    Request payload timestamps and replay labels are evidence inputs, never a
+    caller-controlled authority.  The route issuer fixes both timestamps and
+    derives the replay identity from the immutable operation binding before
+    the token body is digested and persisted.
+    """
+    bound = dict(intent)
+    bound["issued_at"] = issued_at.astimezone(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    bound["expires_at"] = expires_at.astimezone(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    replay_binding = {
+        key: bound[key]
+        for key in (
+            "schema_version", "project_id", "backlog_id", "action",
+            "contract_execution_id", "generation", "custody", "canonical_ref",
+            "expected_commit", "target_commit", "target_tree",
+            "source_content_sha256", "qa_content_sha256",
+        )
+    }
+    bound["replay_identity"] = "cra-" + hashlib.sha256(
+        json.dumps(replay_binding, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return bound
+
+
 def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
     if not isinstance(allowed_actions, list):
         return allowed_actions
@@ -8747,32 +8781,8 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             actual=_observer_route_context_issue_safe_actual(body.get("canonical_ref_adoption")),
             source_gate="canonical_ref_adoption_scope",
         )
-    if canonical_ref_adoption is not None:
-        # The server is the time authority for issuance.  A route intent cannot
-        # be pre-dated, post-dated, or replayed merely by resubmitting its JSON.
-        try:
-            from . import observer_route_context
-            conn = get_connection(project_id)
-            try:
-                observer_route_context.canonical_ref_adoption_issuance_available(
-                    conn,
-                    project_id=project_id,
-                    intent=canonical_ref_adoption,
-                    now=datetime.now(timezone.utc),
-                )
-            finally:
-                conn.close()
-        except observer_route_context.RouteTokenRefError as exc:
-            return _observer_route_context_issue_rejection(
-                status=409,
-                project_id=project_id,
-                body=body,
-                error=str(exc),
-                field="canonical_ref_adoption",
-                expected="unexpired, unique server-issued canonical_ref_adoption lifecycle",
-                actual=_observer_route_context_issue_safe_actual(body.get("canonical_ref_adoption")),
-                source_gate="canonical_ref_adoption_lifecycle",
-            )
+    # A pre-issue lookup is diagnostic only.  The complete typed token claims
+    # its replay identity in the registry's single BEGIN IMMEDIATE transaction.
     evidence_refs = body.get("evidence_refs")
     if evidence_refs is not None and not isinstance(evidence_refs, list):
         return _observer_route_context_issue_rejection(
@@ -8865,6 +8875,14 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             correction_overrides={"ttl_hours": 24},
         )
 
+    issue_now = datetime.now(timezone.utc).replace(microsecond=0)
+    if canonical_ref_adoption is not None:
+        canonical_ref_adoption = _canonical_ref_adoption_bind_issued_intent(
+            canonical_ref_adoption,
+            issued_at=issue_now,
+            expires_at=issue_now + timedelta(hours=ttl_hours),
+        )
+
     try:
         from . import observer_route_context
 
@@ -8881,9 +8899,11 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             target_files=target_files,
             allowed_actions=allowed_actions,
             ttl_hours=ttl_hours,
+            now=issue_now,
             evidence_refs=evidence_refs,
             project_root=project_root,
             parent_route_identity=parent_route_identity,
+            canonical_ref_adoption=canonical_ref_adoption,
             **parent_identity_args,
         )
         issued_token = issued.get("route_token")
@@ -8893,11 +8913,6 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 "owned_files",
                 [str(path).strip() for path in owned_scope if str(path or "").strip()],
             )
-            if canonical_ref_adoption is not None:
-                lineage = issued_token.setdefault("route_lineage", {})
-                if not isinstance(lineage, dict):
-                    raise ValueError("issued route lineage is invalid")
-                lineage["canonical_ref_adoption"] = dict(canonical_ref_adoption)
     except ValueError as exc:
         message = str(exc)
         value_field = (
@@ -8990,6 +9005,22 @@ def handle_observer_route_context_issue(ctx: RequestContext):
         finally:
             conn.close()
     except Exception as exc:  # pragma: no cover - defensive
+        if canonical_ref_adoption is not None:
+            # Unlike ordinary advisory ref registration, this registry write is
+            # the adoption route's unique issuance claim.  Returning a token
+            # after it loses that claim would create an unverifiable route.
+            return _observer_route_context_issue_rejection(
+                status=409,
+                project_id=project_id,
+                body=body,
+                error=f"canonical_ref_adoption route persistence failed: {exc}",
+                field="canonical_ref_adoption",
+                expected="one durable server-issued canonical_ref_adoption lifecycle",
+                actual=_observer_route_context_issue_safe_actual(
+                    body.get("canonical_ref_adoption")
+                ),
+                source_gate="canonical_ref_adoption_atomic_persist",
+            )
         ref_persist_warning = f"route_token_ref persist failed (ref-resolution disabled): {exc}"
 
     route_token = issued["route_token"]
