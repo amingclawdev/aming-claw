@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 import subprocess
+import shutil
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -4611,6 +4613,41 @@ def test_durable_child_runtime_is_exactly_inside_bound_dev_root(tmp_path):
     link = dev / "runtime-link"; link.symlink_to(runtime)
     with pytest.raises(cli.click.ClickException, match="outside its bound dev root"):
         cli._validated_durable_runtime_dir(link, dev)
+
+
+def test_canonical_legacy_postimage_projection_excludes_only_schema_meta(tmp_path):
+    import agent.cli as cli
+
+    before = tmp_path / "before.db"
+    connection = sqlite3.connect(before)
+    connection.executescript(
+        "CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT);"
+        "CREATE TABLE evidence(id TEXT PRIMARY KEY,payload TEXT);"
+        "INSERT INTO evidence VALUES('one','immutable');"
+        "INSERT INTO schema_meta VALUES('schema_version','47');"
+    )
+    connection.commit(); connection.close()
+    after = tmp_path / "after.db"; shutil.copy2(before, after)
+    connection = sqlite3.connect(after)
+    for key, value in {
+        "governance_world_current_process_json": '{"pid":1}',
+        "governance_world_source_tip_json": '{"commit":"a"}',
+        "governance_world_source_tip_revision": "3",
+        "governance_world_source_tip_sha256": "sha256:" + "a" * 64,
+    }.items():
+        connection.execute("INSERT INTO schema_meta VALUES(?,?)", (key, value))
+    connection.commit(); connection.close()
+    before_projection, before_meta = cli._immutable_sqlite_projection(before)
+    after_projection, after_meta = cli._immutable_sqlite_projection(after)
+    assert before_projection == after_projection
+    assert set(after_meta) - set(before_meta) == {
+        "governance_world_current_process_json", "governance_world_source_tip_json",
+        "governance_world_source_tip_revision", "governance_world_source_tip_sha256",
+    }
+    connection = sqlite3.connect(after)
+    connection.execute("UPDATE evidence SET payload='drift'"); connection.commit(); connection.close()
+    drifted_projection, _ = cli._immutable_sqlite_projection(after)
+    assert drifted_projection != before_projection
 
 
 @pytest.mark.parametrize("attack", ["identity_drift", "preforged_exit", "missing_exit_after_term"])

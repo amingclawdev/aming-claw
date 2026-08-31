@@ -1835,3 +1835,66 @@ def test_isolated_root_direct_bootstrap_requires_central_valid_v3_receipt(tmp_pa
             linked_v3_receipt=receipt,
         )
     assert connects == []
+
+
+@pytest.mark.parametrize("mutation", [
+    "none", "candidate", "database_sha", "linked", "sidecar", "stable_overlap",
+])
+def test_canonical_legacy_postimage_adoption_is_exact_zero_connect_ingress(
+    tmp_path, monkeypatch, mutation,
+):
+    from governance import db
+    import agent.runtime_plane as runtime_plane
+
+    stable = tmp_path / "stable"; stable.mkdir()
+    stable_database = stable / "stable.db"; stable_database.write_bytes(b"stable")
+    root = tmp_path / "canonical"; database = root / db.AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True); database.write_bytes(b"postimage")
+    archive = root / "archive" / "schema-admission"; archive.mkdir(parents=True)
+    historical = {"root": "/old", "branch": "codex/ac-dev", "commit": "a" * 40,
+                  "tree": "b" * 40, "source_sha256": "sha256:" + "c" * 64, "dirty": ""}
+    linked_value = {"source_identity": {"cli_source": historical},
+                    "database_sha256_after": "sha256:" + "d" * 64}
+    linked_raw = json.dumps(linked_value, sort_keys=True).encode()
+    linked = archive / (hashlib.sha256(linked_raw).hexdigest() + ".json"); linked.write_bytes(linked_raw)
+    source = {**historical, "commit": "e" * 40, "tree": "f" * 40,
+              "source_sha256": "sha256:" + "1" * 64}
+    adoption = {
+        "schema_version": "ac_dev_canonical_legacy_postimage_adoption.v1", "stage": "completed",
+        "project_id": "aming-claw", "port": 40008,
+        "root_identity": {"path": str(root), "device": root.stat().st_dev, "inode": root.stat().st_ino},
+        "database_identity": {"path": str(database), "device": database.stat().st_dev,
+                              "inode": database.stat().st_ino},
+        "database_sha256_preimage": linked_value["database_sha256_after"],
+        "database_sha256_postimage": "sha256:" + hashlib.sha256(database.read_bytes()).hexdigest(),
+        "linked_v3_receipt": str(linked),
+        "linked_v3_receipt_sha256": "sha256:" + hashlib.sha256(linked_raw).hexdigest(),
+        "receipt_source_identity": historical, "candidate_source_identity": source,
+    }
+    if mutation == "candidate": adoption["candidate_source_identity"] = historical
+    elif mutation == "database_sha": adoption["database_sha256_postimage"] = "sha256:" + "0" * 64
+    elif mutation == "linked": adoption["linked_v3_receipt_sha256"] = "sha256:" + "0" * 64
+    elif mutation == "sidecar": Path(str(database) + "-wal").write_bytes(b"")
+    elif mutation == "stable_overlap":
+        stable_database.unlink(); stable_database.hardlink_to(database)
+    adoption_dir = root / "archive" / "canonical-legacy-postimage-adoption"; adoption_dir.mkdir()
+    raw = json.dumps(adoption, sort_keys=True, separators=(",", ":")).encode()
+    receipt = adoption_dir / f"adoption.{hashlib.sha256(raw).hexdigest()}.json"; receipt.write_bytes(raw)
+    binding = {"shared_volume_path": str(stable), "database_path": str(stable_database)}
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(root))
+    monkeypatch.setenv(db.AC_STABLE_SHARED_VOLUME_ENV, str(stable))
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: binding)
+    monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _binding: None)
+    monkeypatch.setattr(runtime_plane, "resolve_ac_dev_storage_root", lambda _stable: root)
+    connects = []
+    monkeypatch.setattr(db.sqlite3, "connect", lambda *args, **kwargs: connects.append(args))
+    if mutation == "none":
+        assert db._dev_storage_root(
+            create=False, isolated_receipt=linked, source_identity=source, allow_postimage=True,
+        ) == root
+    else:
+        with pytest.raises(ValueError):
+            db._dev_storage_root(
+                create=False, isolated_receipt=linked, source_identity=source, allow_postimage=True,
+            )
+    assert connects == []

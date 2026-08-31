@@ -1586,6 +1586,135 @@ def _validated_isolated_dev_receipt(
     return root
 
 
+def _validated_canonical_legacy_postimage_adoption(
+    root: Path, receipt_path: Path, source_identity: Mapping[str, object],
+    stable_binding: Mapping[str, object],
+) -> Path:
+    """Accept only the immutable audited bridge from the canonical legacy world."""
+    directory = root / "archive" / "canonical-legacy-postimage-adoption"
+    receipts = sorted(directory.glob("adoption.*.json")) if directory.is_dir() else []
+    if len(receipts) != 1:
+        raise ValueError("AC dev canonical adoption receipt is missing or ambiguous")
+    path = receipts[0]
+    match = re.fullmatch(r"adoption\.([0-9a-f]{64})\.json", path.name)
+    raw = path.read_bytes()
+    try:
+        adoption = json.loads(raw)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("AC dev canonical adoption receipt is unreadable") from exc
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    root_stat = root.stat(follow_symlinks=False)
+    db_stat = database.stat(follow_symlinks=False)
+    digest = hashlib.sha256()
+    descriptor = os.open(database, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    current_sha256 = "sha256:" + digest.hexdigest()
+    linked = receipt_path.expanduser().absolute()
+    linked_raw = linked.read_bytes()
+    linked_digest = "sha256:" + hashlib.sha256(linked_raw).hexdigest()
+    candidate = dict(adoption.get("candidate_source_identity") or {}) if isinstance(adoption, Mapping) else {}
+    stable_database = Path(str(stable_binding["database_path"])).resolve(strict=True)
+    stable_stat = stable_database.stat(follow_symlinks=False)
+    if (
+        path.is_symlink() or not path.is_file() or match is None
+        or hashlib.sha256(raw).hexdigest() != match.group(1)
+        or adoption.get("schema_version") != "ac_dev_canonical_legacy_postimage_adoption.v1"
+        or adoption.get("stage") != "completed"
+        or adoption.get("project_id") != AC_PROJECT_ID or adoption.get("port") != 40008
+        or adoption.get("root_identity") != {
+            "path": str(root), "device": int(root_stat.st_dev), "inode": int(root_stat.st_ino),
+        }
+        or adoption.get("database_identity") != {
+            "path": str(database), "device": int(db_stat.st_dev), "inode": int(db_stat.st_ino),
+        }
+        or adoption.get("linked_v3_receipt") != str(linked)
+        or adoption.get("linked_v3_receipt_sha256") != linked_digest
+        or candidate != dict(source_identity)
+        or (db_stat.st_dev, db_stat.st_ino) == (stable_stat.st_dev, stable_stat.st_ino)
+    ):
+        raise ValueError("AC dev canonical adoption receipt mismatch")
+    historical = dict(adoption.get("receipt_source_identity") or {})
+    try:
+        linked_value = json.loads(linked_raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("AC dev canonical adoption linked receipt is unreadable") from exc
+    linked_source = linked_value.get("source_identity") if isinstance(linked_value, Mapping) else None
+    if (not isinstance(linked_source, Mapping)
+            or dict(linked_source.get("cli_source") or {}) != historical
+            or linked_value.get("database_sha256_after") != adoption.get("database_sha256_preimage")):
+        raise ValueError("AC dev canonical adoption predecessor mismatch")
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(database) + suffix)
+        if companion.exists() or companion.is_symlink():
+            raise ValueError("AC dev canonical adoption sidecar drift")
+    if adoption.get("database_sha256_postimage") != current_sha256:
+        # Once the adoption receipt has authorized the legacy postimage, the
+        # ordinary child custody transaction may advance only the same four
+        # schema_meta custody fields.  Re-prove every other logical byte.
+        if (not isinstance(adoption.get("non_schema_meta_projection"), Mapping)
+                or not isinstance(adoption.get("schema_meta_postimage"), Mapping)):
+            raise ValueError("AC dev canonical adoption post-custody authority is incomplete")
+        uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("AC dev canonical adoption post-custody quick-check failed")
+            tables = [row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ) if row[0] != "schema_meta" and not row[0].startswith("sqlite_")]
+            projection = {}
+            for table in tables:
+                columns = [row[1] for row in connection.execute(
+                    f'PRAGMA table_info("{table}")'
+                )]
+                quoted = ",".join(f'"{column}"' for column in columns)
+                rows = connection.execute(
+                    f'SELECT {quoted} FROM "{table}" ORDER BY {quoted}'
+                ).fetchall()
+                projection[table] = "sha256:" + hashlib.sha256(json.dumps(
+                    [list(row) for row in rows], sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")).hexdigest()
+            meta = {str(key): str(value) for key, value in connection.execute(
+                "SELECT key,value FROM schema_meta ORDER BY key"
+            )}
+        finally:
+            connection.close()
+        if projection != adoption.get("non_schema_meta_projection"):
+            raise ValueError("AC dev canonical adoption post-custody projection mismatch")
+        baseline_meta = dict(adoption.get("schema_meta_postimage") or {})
+        custody_fields = {
+            "governance_world_current_process_json", "governance_world_source_tip_json",
+            "governance_world_source_tip_revision", "governance_world_source_tip_sha256",
+        }
+        if ({key: value for key, value in meta.items() if key not in custody_fields}
+                != {key: value for key, value in baseline_meta.items() if key not in custody_fields}):
+            raise ValueError("AC dev canonical adoption post-custody metadata mismatch")
+        try:
+            tip = json.loads(meta["governance_world_source_tip_json"])
+            process = json.loads(meta["governance_world_current_process_json"])
+            revision = int(meta["governance_world_source_tip_revision"])
+            baseline_revision = int(baseline_meta["governance_world_source_tip_revision"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("AC dev canonical adoption post-custody metadata is invalid") from exc
+        expected_tip = {key: source_identity.get(key) for key in (
+            "root", "branch", "commit", "source_sha256",
+        )}
+        if (tip != expected_tip or meta.get("governance_world_source_tip_sha256")
+                != _world_source_tip_hash(expected_tip)
+                or revision < baseline_revision + 1
+                or not isinstance(process, Mapping)
+                or process.get("source_root") != source_identity.get("root")
+                or process.get("source_commit") != source_identity.get("commit")
+                or process.get("project_id") != AC_PROJECT_ID or process.get("port") != 40008):
+            raise ValueError("AC dev canonical adoption post-custody binding mismatch")
+    return root
+
+
 def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = None,
                       source_identity: Mapping[str, object] | None = None,
                       allow_postimage: bool = False) -> Path:
@@ -1606,6 +1735,15 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
     supplied = Path(raw).expanduser().absolute()
     if isolated_receipt is not None:
         root = _absolute_non_symlink_root(supplied, create=False)
+        from agent.runtime_plane import resolve_ac_dev_storage_root
+        try:
+            canonical_root = resolve_ac_dev_storage_root(stable)
+        except (OSError, RuntimeError, ValueError):
+            canonical_root = None
+        if canonical_root is not None and root == canonical_root:
+            return _validated_canonical_legacy_postimage_adoption(
+                root, isolated_receipt, source_identity or {}, binding,
+            )
         return _validated_isolated_dev_receipt(
             isolated_receipt, root, source_identity or {}, binding,
             allow_postimage=allow_postimage,

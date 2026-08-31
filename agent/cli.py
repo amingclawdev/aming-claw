@@ -2365,6 +2365,266 @@ def _launcher_html(governance_url: str) -> str:
 
 
 _AC_DEV_DURABLE_LAUNCH_VERSION = "ac_dev_durable_launch.v1"
+_AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION = (
+    "ac_dev_canonical_legacy_postimage_adoption.v1"
+)
+
+
+def _immutable_sqlite_projection(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Return source-independent logical hashes without ever opening a writer."""
+    uri = "file:" + urllib.parse.quote(str(path)) + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise click.ClickException("AC dev canonical adoption quick-check failed")
+        tables = [row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ) if row[0] != "schema_meta" and not row[0].startswith("sqlite_")]
+        projection: dict[str, str] = {}
+        for table in tables:
+            columns = [row[1] for row in connection.execute(
+                f'PRAGMA table_info("{table}")'
+            )]
+            quoted = ",".join(f'"{column}"' for column in columns)
+            rows = connection.execute(
+                f'SELECT {quoted} FROM "{table}" ORDER BY {quoted}'
+            ).fetchall()
+            projection[table] = "sha256:" + hashlib.sha256(
+                _canonical_json_bytes([list(row) for row in rows])
+            ).hexdigest()
+        meta = dict(connection.execute("SELECT key,value FROM schema_meta ORDER BY key"))
+        return projection, {str(key): str(value) for key, value in meta.items()}
+    finally:
+        connection.close()
+
+
+def _canonical_adoption_receipts(root: Path) -> list[Path]:
+    directory = root / "archive" / "canonical-legacy-postimage-adoption"
+    return sorted(directory.glob("adoption.*.json")) if directory.is_dir() else []
+
+
+def _read_canonical_adoption_receipt(path: Path) -> tuple[dict[str, Any], str]:
+    return _read_durable_content_receipt(path, "adoption")
+
+
+def _canonical_legacy_postimage_adoption(
+    dev_storage: Path, *, linked_v3_receipt: Path,
+    source_identity: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
+    """Seal the one audited canonical foreground postimage without DB writes."""
+    from agent.governance import db as _db
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+
+    source = dict(source_identity or _dev_source_identity_precheck())
+    if (source.get("branch") != AC_DEV_BRANCH
+            or source.get("root") != str(Path(__file__).resolve().parents[1])
+            or source.get("dirty")):
+        raise click.ClickException("AC dev canonical adoption candidate source mismatch")
+    stable = _db.verified_stable_database_binding()
+    stable_root = Path(str(stable["shared_volume_path"])).resolve(strict=True)
+    root = dev_storage.expanduser().absolute()
+    if root.is_symlink() or root.resolve(strict=True) != root or root != resolve_ac_dev_storage_root(stable_root):
+        raise click.ClickException("AC dev canonical adoption requires the canonical dev root")
+    database = root / _db.AC_DATABASE_DEV_RELATIVE_PATH
+    identity = _admission_identity(database)
+    stable_db = Path(str(stable["database_path"])).resolve(strict=True)
+    stable_identity = _admission_identity(stable_db)
+    if (identity["device"], identity["inode"]) == (stable_identity["device"], stable_identity["inode"]):
+        raise click.ClickException("AC dev canonical adoption overlaps stable database")
+    for suffix in ("-wal", "-shm", "-journal"):
+        if Path(str(database) + suffix).exists() or Path(str(database) + suffix).is_symlink():
+            raise click.ClickException("AC dev canonical adoption requires sidecar-free bytes")
+    if _port_is_open(AC_DEV_SERVICE_PORT) or _durable_listener_pid(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("AC dev canonical adoption requires a free port 40008")
+    holder = subprocess.run(
+        ["lsof", "-t", str(database)], capture_output=True, text=True, check=False, timeout=3,
+    ).stdout.strip()
+    if holder:
+        raise click.ClickException("AC dev canonical adoption rejects database holders")
+
+    archive = root / "archive" / "schema-admission"
+    linked, linked_digest = _read_admission_receipt(linked_v3_receipt.absolute(), archive=archive)
+    linked_source = _validated_historical_admission_source_identity(linked.get("source_identity"))
+    plan_sha = "sha256:" + hashlib.sha256(
+        _canonical_json_bytes(_db.authority_projection_schema_plan())
+    ).hexdigest()
+    root_identity = _admission_identity(root)
+    if (linked.get("schema_version") != _AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION
+            or linked.get("stage") != "completed" or linked.get("changed") is not False
+            or linked.get("project_id") != "aming-claw" or linked.get("port") != 40008
+            or linked.get("root_identity") != root_identity
+            or linked.get("database_identity") != identity or linked.get("plan_sha256") != plan_sha):
+        raise click.ClickException("AC dev canonical adoption linked-v3 binding mismatch")
+    _validated_authority_receipt_inventory(linked.get("schema_inventory_after"), db_module=_db)
+    _validate_admission_receipt_chain(
+        linked, linked_digest, archive=archive, project_id="aming-claw", port=40008,
+        root_identity=root_identity, database_identity=identity,
+        source_identity=linked_source, plan_sha256=plan_sha,
+    )
+    backup = Path(str(dict(linked.get("backup") or {}).get("identity", {}).get("path") or ""))
+    if not backup.is_file() or backup.is_symlink() or _file_sha256(backup) != linked.get("database_sha256_after"):
+        raise click.ClickException("AC dev canonical adoption preimage backup mismatch")
+    if (_admission_identity(backup).get("device") != dict(linked.get("backup") or {}).get("identity", {}).get("device")
+            or _admission_identity(backup).get("inode") != dict(linked.get("backup") or {}).get("identity", {}).get("inode")):
+        raise click.ClickException("AC dev canonical adoption preimage identity mismatch")
+    historical_sha = str(linked.get("previous_receipt_sha256") or "")
+    quarantine_root = root / "quarantine" / "schema-admission-sidecars" / str(
+        linked.get("database_sha256_after") or ""
+    ).removeprefix("sha256:")
+    manifests = sorted(quarantine_root.glob("manifest.*.json"))
+    completed_manifests = [item for item in manifests if item.name != "manifest.pending.json"]
+    if len(completed_manifests) != 1:
+        raise click.ClickException("AC dev canonical adoption quarantine manifest is missing")
+    quarantine_manifest = completed_manifests[0]
+    manifest_match = re.fullmatch(r"manifest\.([0-9a-f]{64})\.json", quarantine_manifest.name)
+    manifest_raw = quarantine_manifest.read_bytes()
+    try:
+        manifest = json.loads(manifest_raw)
+    except (OSError, ValueError, TypeError) as exc:
+        raise click.ClickException("AC dev canonical adoption quarantine manifest is invalid") from exc
+    sidecars = list(manifest.get("sidecars") or []) if isinstance(manifest, Mapping) else []
+    kinds = {str(item.get("kind") or "") for item in sidecars if isinstance(item, Mapping)}
+    historical_readback = dict(dict(manifest.get("readback") or {}).get("historical_receipt") or {})
+    for item in sidecars:
+        target = Path(str(item.get("target") or ""))
+        target_identity = _admission_identity(target)
+        target_stat = target.stat(follow_symlinks=False)
+        source_claim = dict(item.get("source") or {})
+        if (target.is_symlink() or not target.is_file()
+                or target_identity.get("device") != source_claim.get("st_dev")
+                or target_identity.get("inode") != source_claim.get("st_ino")
+                or int(target_stat.st_size) != source_claim.get("size")
+                or _file_sha256(target).removeprefix("sha256:") != source_claim.get("sha256")):
+            raise click.ClickException("AC dev canonical adoption quarantine target mismatch")
+    if (manifest_match is None
+            or hashlib.sha256(manifest_raw).hexdigest() != manifest_match.group(1)
+            or manifest.get("schema_version") != "aming-claw.schema-admission-sidecar-quarantine.v1"
+            or manifest.get("stage") != "completed" or kinds != {"wal", "shm"}
+            or dict(manifest.get("database") or {}).get("sha256")
+                != str(linked.get("database_sha256_after") or "").removeprefix("sha256:")
+            or historical_readback.get("sha256") != historical_sha.removeprefix("sha256:")):
+        raise click.ClickException("AC dev canonical adoption quarantine chain mismatch")
+
+    before_projection, before_meta = _immutable_sqlite_projection(backup)
+    after_projection, after_meta = _immutable_sqlite_projection(database)
+    if before_projection != after_projection:
+        raise click.ClickException("AC dev canonical adoption rejects non-custody database drift")
+    changed = {key: {"before": before_meta.get(key), "after": after_meta.get(key)}
+               for key in sorted(set(before_meta) | set(after_meta))
+               if before_meta.get(key) != after_meta.get(key)}
+    exact_fields = {
+        "governance_world_current_process_json", "governance_world_source_tip_json",
+        "governance_world_source_tip_revision", "governance_world_source_tip_sha256",
+    }
+    if set(changed) != exact_fields:
+        raise click.ClickException("AC dev canonical adoption custody delta mismatch")
+    try:
+        old_tip = json.loads(before_meta["governance_world_source_tip_json"])
+        new_tip = json.loads(after_meta["governance_world_source_tip_json"])
+        old_process = json.loads(after_meta["governance_world_current_process_json"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise click.ClickException("AC dev canonical adoption custody metadata is invalid") from exc
+    receipt_cli = dict(linked_source.get("cli_source") or {})
+    receipt_db_tip = dict(linked_source.get("db_source_tip") or {})
+    if old_tip != receipt_db_tip:
+        raise click.ClickException("AC dev canonical adoption admitted preimage source-tip mismatch")
+    legacy_source = dict(new_tip)
+    legacy_pid = int(old_process.get("pid") or 0)
+    stable_health = dict(stable.get("health") or {})
+    stable_pid = int(stable_health.get("pid") or 0)
+    stable_runtime = dict(stable_health.get("runtime_plane_identity") or {})
+    if (stable_pid <= 0 or stable_pid == legacy_pid
+            or stable_runtime.get("world_id") != "ac-stable"
+            or stable_runtime.get("worktree_root") in {str(root), str(source.get("root") or "")}):
+        raise click.ClickException("AC dev canonical adoption stable custody overlaps legacy world")
+    try:
+        if legacy_pid > 0:
+            os.kill(legacy_pid, 0)
+            raise click.ClickException("AC dev canonical adoption legacy PID remains live")
+    except ProcessLookupError:
+        pass
+    old_commit = str(legacy_source.get("commit") or "")
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", old_commit, str(source.get("commit") or "")],
+        cwd=source["root"], check=False, capture_output=True,
+    )
+    if ancestry.returncode != 0:
+        raise click.ClickException("AC dev canonical adoption source lineage mismatch")
+    old_cli = subprocess.run(
+        ["git", "show", f"{old_commit}:agent/cli.py"], cwd=source["root"],
+        check=False, capture_output=True,
+    )
+    if (old_cli.returncode != 0 or "sha256:" + hashlib.sha256(old_cli.stdout).hexdigest()
+            != legacy_source.get("source_sha256")
+            or _file_sha256(Path(source["root"]) / "agent" / "cli.py") != source.get("source_sha256")):
+        raise click.ClickException("AC dev canonical adoption source hash mismatch")
+    current_sha = _admission_database_sha256(database, expected_identity=identity)
+    pidfile = root / "runtime" / "state" / "dev-governance" / "governance.pid"
+    pidfile_binding: dict[str, Any] = {"path": str(pidfile), "exists": pidfile.exists()}
+    if pidfile.exists():
+        if pidfile.is_symlink() or not pidfile.is_file():
+            raise click.ClickException("AC dev canonical adoption stale pidfile is invalid")
+        pidfile_binding.update(_admission_identity(pidfile))
+        pidfile_binding["sha256"] = _file_sha256(pidfile)
+        try:
+            stale_record = json.loads(pidfile.read_text(encoding="utf-8"))
+            stale_pid = int(stale_record.get("pid") or 0)
+        except (OSError, TypeError, ValueError) as exc:
+            raise click.ClickException("AC dev canonical adoption stale pidfile is unreadable") from exc
+        pidfile_binding["record"] = stale_record
+        try:
+            if stale_pid > 0:
+                os.kill(stale_pid, 0)
+                raise click.ClickException("AC dev canonical adoption stale pidfile PID remains live")
+        except ProcessLookupError:
+            pass
+    payload = {
+        "schema_version": _AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION,
+        "stage": "completed", "project_id": "aming-claw", "port": 40008,
+        "root_identity": root_identity, "database_identity": identity,
+        "database_sha256_preimage": linked.get("database_sha256_after"),
+        "database_sha256_postimage": current_sha,
+        "linked_v3_receipt": str(linked_v3_receipt.absolute()),
+        "linked_v3_receipt_sha256": linked_digest,
+        "receipt_source_identity": receipt_cli,
+        "preimage_source_tip_identity": receipt_db_tip,
+        "legacy_source_identity": legacy_source, "candidate_source_identity": source,
+        "custody_delta": changed, "non_schema_meta_projection": after_projection,
+        "schema_meta_postimage": after_meta,
+        "legacy_process_identity": old_process, "stale_pidfile_identity": pidfile_binding,
+        "quarantine_manifest": {"path": str(quarantine_manifest),
+                                "sha256": "sha256:" + manifest_match.group(1)},
+        "readbacks": {"port_free": True, "database_holders": [], "sidecars_absent": True,
+                      "stable_database_identity": stable_identity,
+                      "stable_pid": stable_pid,
+                      "stable_runtime_commit": stable_runtime.get("commit"),
+                      "stable_worktree_root": stable_runtime.get("worktree_root")},
+    }
+    destination_dir = root / "archive" / "canonical-legacy-postimage-adoption"
+    existing = _canonical_adoption_receipts(root)
+    if existing:
+        if len(existing) != 1:
+            raise click.ClickException("AC dev canonical adoption has ambiguous prior receipts")
+        prior, prior_sha = _read_canonical_adoption_receipt(existing[0])
+        if prior != payload:
+            raise click.ClickException("AC dev canonical adoption replay drift")
+        return {"status": "already_adopted", "receipt_path": str(existing[0]), "receipt_sha256": prior_sha}
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    receipt_path, receipt_sha = _durable_content_receipt(destination_dir, "adoption", payload)
+    return {"status": "adopted", "receipt_path": str(receipt_path), "receipt_sha256": receipt_sha}
+
+
+@main.command("dev-adopt-canonical-legacy-postimage")
+@click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--project-id", required=True)
+@click.option("--port", required=True, type=int)
+@click.option("--linked-v3-receipt", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def dev_adopt_canonical_legacy_postimage(dev_storage_root: Path, project_id: str, port: int, linked_v3_receipt: Path) -> None:
+    if project_id != "aming-claw" or port != 40008:
+        raise click.ClickException("AC dev canonical adoption requires aming-claw on port 40008")
+    click.echo(json.dumps(_canonical_legacy_postimage_adoption(
+        dev_storage_root, linked_v3_receipt=linked_v3_receipt,
+    ), sort_keys=True))
 
 
 def _posix_exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -2462,8 +2722,24 @@ def _validated_linked_v3_receipt(
     receipt_source = _validated_historical_admission_source_identity(
         receipt.get("source_identity")
     )
-    if receipt_source.get("cli_source") != dict(source_identity):
-        raise click.ClickException("AC dev durable launch linked-v3 source mismatch")
+    historical_source = dict(receipt_source.get("cli_source") or {})
+    if historical_source != dict(source_identity):
+        _canonical_legacy_postimage_adoption(
+            dev_storage, linked_v3_receipt=receipt_path,
+            source_identity=source_identity,
+        )
+        adoptions = _canonical_adoption_receipts(dev_storage)
+        if len(adoptions) != 1:
+            raise click.ClickException("AC dev durable launch linked-v3 source mismatch")
+        adoption, _adoption_digest = _read_canonical_adoption_receipt(adoptions[0])
+        if (adoption.get("schema_version")
+                != _AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION
+                or adoption.get("stage") != "completed"
+                or adoption.get("receipt_source_identity") != historical_source
+                or adoption.get("candidate_source_identity") != dict(source_identity)
+                or adoption.get("linked_v3_receipt") != str(receipt_path.absolute())
+                or adoption.get("linked_v3_receipt_sha256") != digest):
+            raise click.ClickException("AC dev durable launch canonical adoption mismatch")
     _validated_authority_receipt_inventory(
         receipt.get("schema_inventory_after"), db_module=_db,
     )
