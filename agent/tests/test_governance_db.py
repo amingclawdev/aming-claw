@@ -1112,6 +1112,8 @@ def _cow_graph_identity_fixture(tmp_path, monkeypatch):
 def test_graph_activation_classifies_exact_validated_cow_successor(tmp_path, monkeypatch):
     db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    monkeypatch.setattr(db, "_verify_dev_world_schema_inventory", lambda _conn: None)
+    monkeypatch.setattr(db, "_verify_current_cow_successor_source", lambda *_args, **_kwargs: None)
     try:
         policy = db.classify_graph_activation_connection(conn)
     finally:
@@ -1121,7 +1123,7 @@ def test_graph_activation_classifies_exact_validated_cow_successor(tmp_path, mon
     assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
 
 
-@pytest.mark.parametrize("drift", ["inode", "history_gap"])
+@pytest.mark.parametrize("drift", ["inode", "history_gap", "source_descendant"])
 def test_graph_materialization_rejects_unverified_cow_before_write(
     tmp_path, monkeypatch, drift,
 ):
@@ -1135,13 +1137,20 @@ def test_graph_materialization_rejects_unverified_cow_before_write(
         db, "canonical_ac_database_identity",
         lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
     )
+    monkeypatch.setattr(db, "_verify_dev_world_schema_inventory", lambda _conn: None)
+    monkeypatch.setattr(db, "_verify_current_cow_successor_source", lambda *_args, **_kwargs: None)
     if drift == "inode":
         receipt["successor"]["identity"]["inode"] += 1
         monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
-    else:
+    elif drift == "history_gap":
         def reject_history(_root):
             raise ValueError("historical artifact chain mismatch")
         monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", reject_history)
+    else:
+        monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+        def reject_source(*_args, **_kwargs):
+            raise ValueError("current source descendant authority mismatch")
+        monkeypatch.setattr(db, "_verify_current_cow_successor_source", reject_source)
     before_changes = conn.total_changes
     before_inventory = db._graph_materialization_inventory(conn)
     with pytest.raises(ValueError, match="identity is not admitted"):
@@ -1702,6 +1711,114 @@ def test_ac_dev_cow_successor_validator_rejects_missing(tmp_path):
     root.mkdir()
     with pytest.raises(ValueError, match="missing or ambiguous"):
         db.validate_dev_cow_successor_receipt(root)
+
+
+def test_cow_receipt_reconstruction_keeps_issuance_schema_after_source_expands(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, _database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch
+    )
+    created = db.create_dev_cow_successor_receipt(
+        root, operator_receipt=operator, predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    _write_historical_v1_from_v2(created["receipt"])
+    immutable = json.loads(Path(created["receipt"]).read_text())
+    original_contract = db._source_schema_table_contract
+    required, allowed, objects = original_contract()
+    monkeypatch.setattr(
+        db, "_source_schema_table_contract",
+        lambda: (
+            required | {"parallel_branch_runtime_future"},
+            allowed | {"parallel_branch_runtime_future"},
+            objects | {(
+                "table", "parallel_branch_runtime_future",
+                "parallel_branch_runtime_future",
+            )},
+        ),
+    )
+    reconstructed = db._reconstruct_dev_cow_successor_payload(root, immutable)
+    assert reconstructed == immutable
+    assert db.validate_dev_cow_successor_receipt(root) == immutable
+
+
+@pytest.mark.parametrize("drift", [None, "dirty", "non_descendant", "launch_hash"])
+def test_current_cow_source_requires_clean_strict_same_root_descendant(
+    tmp_path, monkeypatch, drift,
+):
+    from agent.governance import db
+
+    source_root, anchor_commit = _dev_source_repo(tmp_path)
+    subprocess.run(["git", "branch", "-M", "codex/ac-dev"], cwd=source_root, check=True)
+    current_commit = _advance_dev_source(source_root, "descendant-one")
+    current_commit = _advance_dev_source(source_root, "descendant-two")
+    source_sha = "sha256:" + "7" * 64
+    anchor = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": anchor_commit, "source_sha256": "sha256:" + "6" * 64,
+    }
+    current = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": current_commit, "source_sha256": source_sha,
+    }
+    storage = tmp_path / "dev-storage"
+    adoption_dir = storage / "archive" / "canonical-legacy-postimage-adoption"
+    adoption_dir.mkdir(parents=True)
+    adoption_payload = {"candidate_source_identity": anchor}
+    adoption_raw = json.dumps(
+        adoption_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    adoption = adoption_dir / (
+        f"adoption.{hashlib.sha256(adoption_raw).hexdigest()}.json"
+    )
+    adoption.write_bytes(adoption_raw)
+    adoption_sha = "sha256:" + hashlib.sha256(adoption_raw).hexdigest()
+    receipt = {"history": {"adoption": {
+        "path": str(adoption), "sha256": adoption_sha,
+    }}}
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+    if drift == "non_descendant":
+        unrelated = subprocess.run(
+            ["git", "commit-tree", "HEAD^{tree}", "-m", "unrelated"],
+            cwd=source_root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        anchor["commit"] = unrelated
+        adoption_payload["candidate_source_identity"] = anchor
+        adoption_raw = json.dumps(
+            adoption_payload, sort_keys=True, separators=(",", ":")
+        ).encode()
+        adoption.unlink()
+        adoption = adoption_dir / (
+            f"adoption.{hashlib.sha256(adoption_raw).hexdigest()}.json"
+        )
+        adoption.write_bytes(adoption_raw)
+        receipt["history"]["adoption"] = {
+            "path": str(adoption),
+            "sha256": "sha256:" + hashlib.sha256(adoption_raw).hexdigest(),
+        }
+    conn.executemany("INSERT INTO schema_meta VALUES (?,?)", [
+        ("governance_world_source_tip_json", json.dumps(current)),
+        ("governance_world_source_tip_sha256", db._world_source_tip_hash(current)),
+        ("governance_world_source_tip_revision", "3"),
+    ])
+    conn.commit()
+    if drift == "dirty":
+        (source_root / "untracked-drift.txt").write_text("dirty\n")
+    launch_sha = "sha256:" + "8" * 64 if drift == "launch_hash" else source_sha
+    if drift is None:
+        db._verify_current_cow_successor_source(
+            conn, storage, receipt, launch_source_sha256=launch_sha,
+        )
+    else:
+        with pytest.raises(ValueError):
+            db._verify_current_cow_successor_source(
+                conn, storage, receipt, launch_source_sha256=launch_sha,
+            )
+    conn.close()
 
 
 def _real_cow_successor_cli_fixture(tmp_path, monkeypatch):

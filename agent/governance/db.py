@@ -334,6 +334,44 @@ def _unknown_graph_activation_connection(reason: str) -> dict[str, object]:
     return {**graph_activation_policy("unknown"), "classification_reason": reason}
 
 
+def _verify_current_cow_successor_source(
+    conn: sqlite3.Connection, root: Path, successor_receipt: Mapping[str, object],
+    *, launch_source_sha256: str,
+) -> None:
+    """Bind immutable adoption history to the clean current canonical descendant."""
+
+    adoption_ref = dict(
+        dict(successor_receipt.get("history") or {}).get("adoption") or {}
+    )
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    anchor = dict(adoption.get("candidate_source_identity") or {})
+    meta = dict(conn.execute(
+        "SELECT key,value FROM schema_meta WHERE key IN "
+        "('governance_world_source_tip_json','governance_world_source_tip_sha256',"
+        "'governance_world_source_tip_revision')"
+    ))
+    try:
+        current = json.loads(str(meta.get("governance_world_source_tip_json") or ""))
+        revision = int(meta.get("governance_world_source_tip_revision") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AC dev COW current source tip is invalid") from exc
+    if (
+        adoption_path.parent
+        != root / "archive" / "canonical-legacy-postimage-adoption"
+        or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
+        or not isinstance(current, Mapping)
+        or revision < 2
+        or meta.get("governance_world_source_tip_sha256")
+        != _world_source_tip_hash(current)
+        or str(current.get("source_sha256") or "") != launch_source_sha256
+        or str(anchor.get("root") or "") != str(current.get("root") or "")
+        or str(anchor.get("commit") or "") == str(current.get("commit") or "")
+    ):
+        raise ValueError("AC dev COW current source descendant authority mismatch")
+    _verify_dev_source_upgrade(anchor, current)
+
+
 def classify_graph_activation_connection(
     conn: sqlite3.Connection,
 ) -> dict[str, object]:
@@ -474,6 +512,15 @@ def classify_graph_activation_connection(
                 return _unknown_graph_activation_connection(
                     "dev_cow_successor_identity_invalid"
                 )
+            if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                return _unknown_graph_activation_connection(
+                    "dev_cow_successor_current_database_invalid"
+                )
+            _verify_dev_world_schema_inventory(conn)
+            _verify_current_cow_successor_source(
+                conn, root, successor_receipt,
+                launch_source_sha256=str(receipt.get("source_sha256") or ""),
+            )
         _revalidate_stable_database_binding(binding)
         after = expected_database.stat(follow_symlinks=False)
         if (
@@ -3212,6 +3259,7 @@ def _cow_raw_receipt(path: Path, *, prefix: str = "") -> tuple[dict[str, object]
 def _cow_database_observation(
     database: Path, *, expected_rows: int = 3603, require_managed: bool = True,
     nlink: int | None = 1,
+    historical_source_schema: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     identity = _cow_regular_identity(database, nlink=nlink)
     for suffix in ("-wal", "-shm", "-journal"):
@@ -3240,14 +3288,53 @@ def _cow_database_observation(
             )]
             if require_managed:
                 ensure_backlog_read_schema(canonical)
-            expected_required, _expected_allowed, _expected_objects = _source_schema_table_contract()
-            expected_placeholders = ",".join("?" for _ in expected_required)
-            expected_source_inventory = [tuple(row) for row in canonical.execute(
-                "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
-                f"WHERE tbl_name IN ({expected_placeholders}) ORDER BY type,name,tbl_name",
-                tuple(sorted(expected_required)),
-            )]
-            expected_source_sha = _source_schema_inventory_hash(canonical, expected_required)
+            if historical_source_schema is None:
+                expected_required, _expected_allowed, _expected_objects = (
+                    _source_schema_table_contract()
+                )
+                expected_placeholders = ",".join("?" for _ in expected_required)
+                expected_source_inventory = [tuple(row) for row in canonical.execute(
+                    "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+                    f"WHERE tbl_name IN ({expected_placeholders}) ORDER BY type,name,tbl_name",
+                    tuple(sorted(expected_required)),
+                )]
+                expected_source_sha = _source_schema_inventory_hash(
+                    canonical, expected_required
+                )
+            else:
+                historical_required = historical_source_schema.get("required_tables")
+                historical_inventory = historical_source_schema.get("inventory")
+                expected_source_sha = str(
+                    historical_source_schema.get("sha256") or ""
+                )
+                if (
+                    not isinstance(historical_required, list)
+                    or not historical_required
+                    or historical_required != sorted(set(historical_required))
+                    or not all(isinstance(name, str) and name for name in historical_required)
+                    or not isinstance(historical_inventory, list)
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_source_sha)
+                ):
+                    raise ValueError("AC dev COW historical source schema authority is invalid")
+                expected_required = set(historical_required)
+                try:
+                    expected_source_inventory = [
+                        tuple(str(value) for value in row)
+                        for row in historical_inventory
+                    ]
+                except TypeError as exc:
+                    raise ValueError(
+                        "AC dev COW historical source schema inventory is invalid"
+                    ) from exc
+                if (
+                    any(len(row) != 4 for row in expected_source_inventory)
+                    or expected_source_inventory != sorted(expected_source_inventory)
+                    or any(row[2] not in expected_required for row in expected_source_inventory)
+                    or "sha256:" + hashlib.sha256(json.dumps(
+                        expected_source_inventory, separators=(",", ":")
+                    ).encode("utf-8")).hexdigest() != expected_source_sha
+                ):
+                    raise ValueError("AC dev COW historical source schema inventory is invalid")
         actual_sql_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='backlog_bugs'"
         ).fetchone()
@@ -3274,7 +3361,7 @@ def _cow_database_observation(
             conn, exclude_tables=frozenset({"backlog_bugs", "dashboard_backlog_cache_generation"}),
         )
         backlog_projection = _sqlite_logical_projection(conn).get("backlog_bugs")
-        required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
+        required_tables = set(expected_required)
         placeholders = ",".join("?" for _ in required_tables)
         source_inventory = [tuple(row) for row in conn.execute(
             "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
@@ -3286,7 +3373,8 @@ def _cow_database_observation(
             "inventory": [list(row) for row in source_inventory],
             "sha256": _source_schema_inventory_hash(conn, required_tables),
         }
-        _verify_dev_world_schema_inventory(conn)
+        if historical_source_schema is None:
+            _verify_dev_world_schema_inventory(conn)
     finally:
         conn.close()
     if (row_count != expected_rows
@@ -3591,7 +3679,12 @@ def _reconstruct_dev_cow_successor_payload(
                 raise ValueError("AC dev COW successor reconstruction checkpoint failed")
         finally:
             conn.close()
-        reconstructed = _cow_database_observation(temporary)
+        reconstructed = _cow_database_observation(
+            temporary,
+            historical_source_schema=dict(
+                dict(receipt.get("successor") or {}).get("source_schema") or {}
+            ),
+        )
     finally:
         for suffix in ("", "-wal", "-shm", "-journal"):
             try:
