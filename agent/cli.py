@@ -3867,6 +3867,7 @@ def _durable_dev_launch(
     parent_sock.settimeout(15)
     pending_payload = {
         "schema_version": "ac_dev_durable_pending.v1", "stage": "pending",
+        "durable_start_phase": durable_phase,
         "launch_id": launch_id, "parent_pid": os.getpid(),
         "source_identity": dict(source_identity), "dev_storage_root": str(dev_storage),
         "database_path": str(database), "database_identity": dict(preimage["database_identity"]),
@@ -4419,13 +4420,49 @@ def start(
             }
             from agent.governance.db import commit_dev_child_custody
             try:
-                committed = commit_dev_child_custody(
-                    dev_storage, source_identity=dev_identity or {},
-                    process_identity=custody,
-                    linked_v3_receipt=durable_child_linked_v3_receipt,
-                    expected_database_identity=pending["database_identity"],
-                    expected_pre_sha256=pending["database_sha256_before"],
-                )
+                if pending.get("durable_start_phase") == _DURABLE_START_COMPLETED_BOOTSTRAP:
+                    from agent.governance import db as _db
+                    if not isinstance(pending.get("dashboard_bootstrap"), Mapping):
+                        raise click.ClickException("AC dev durable bootstrap child context is missing")
+                    database = dev_storage / "governance" / "aming-claw" / "governance.db"
+                    snapshot = sqlite3.connect(
+                        "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1", uri=True,
+                    )
+                    try:
+                        meta = {str(k): str(v) for k, v in snapshot.execute(
+                            "SELECT key,value FROM schema_meta ORDER BY key")}
+                        managed = _db.backlog_read_schema_managed_inventory(snapshot)
+                        protected = _db.backlog_read_schema_protected_inventory(snapshot)
+                        projection = _db._sqlite_logical_projection(
+                            snapshot, exclude_tables=frozenset({"schema_meta"}))
+                    finally:
+                        snapshot.close()
+                    source_tip = {key: (dev_identity or {}).get(key) for key in
+                                  ("root", "branch", "commit", "source_sha256")}
+                    updates = {
+                        "governance_world_source_tip_json": json.dumps(source_tip, sort_keys=True, separators=(",", ":")),
+                        "governance_world_source_tip_sha256": _db._world_source_tip_hash(source_tip),
+                        "governance_world_source_tip_revision": str(int(meta["governance_world_source_tip_revision"]) + 1),
+                        "governance_world_current_process_json": json.dumps(custody, sort_keys=True, separators=(",", ":")),
+                    }
+                    committed = _db.commit_completed_bootstrap_child_custody(
+                        dev_storage, expected_database_identity=pending["database_identity"],
+                        expected_pre_sha256=pending["database_sha256_before"],
+                        expected_schema_meta=meta, custody_updates=updates,
+                        expected_managed_inventory=managed, expected_protected_inventory=protected,
+                        expected_protected_projection=projection,
+                    )
+                    committed["custody_projection"] = custody
+                elif pending.get("durable_start_phase") == _DURABLE_START_LEGACY_ADOPTION:
+                    committed = commit_dev_child_custody(
+                        dev_storage, source_identity=dev_identity or {},
+                        process_identity=custody,
+                        linked_v3_receipt=durable_child_linked_v3_receipt,
+                        expected_database_identity=pending["database_identity"],
+                        expected_pre_sha256=pending["database_sha256_before"],
+                    )
+                else:
+                    raise click.ClickException("AC dev durable child phase is invalid")
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 raise click.ClickException(str(exc)) from exc
             readiness, readiness_sha256 = _durable_content_receipt(

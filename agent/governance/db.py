@@ -3022,6 +3022,89 @@ def commit_dev_child_custody(
     }
 
 
+_COMPLETED_BOOTSTRAP_CUSTODY_KEYS = (
+    "governance_world_source_tip_json", "governance_world_source_tip_sha256",
+    "governance_world_source_tip_revision", "governance_world_current_process_json",
+)
+
+
+def commit_completed_bootstrap_child_custody(
+    storage_root: Path | str, *, expected_database_identity: Mapping[str, object],
+    expected_pre_sha256: str, expected_schema_meta: Mapping[str, object],
+    custody_updates: Mapping[str, object], expected_managed_inventory: Mapping[str, object],
+    expected_protected_inventory: Mapping[str, object],
+    expected_protected_projection: Mapping[str, object],
+) -> dict[str, object]:
+    """CAS exactly four custody cells on a verified dashboard-bootstrap postimage.
+
+    This intentionally has no legacy receipt/adoption fallback.  The caller
+    supplies immutable receipt-derived expectations; every other schema/meta
+    value is held byte-for-byte stable across the single transaction.
+    """
+    root = Path(storage_root).expanduser().absolute()
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    if (set(custody_updates) != set(_COMPLETED_BOOTSTRAP_CUSTODY_KEYS)
+            or not all(isinstance(value, str) for value in custody_updates.values())
+            or not isinstance(expected_schema_meta, Mapping)):
+        raise ValueError("AC dev completed bootstrap custody context is invalid")
+    physical_stat = database.stat(follow_symlinks=False)
+    physical = {"device": int(physical_stat.st_dev), "inode": int(physical_stat.st_ino)}
+    if dict(expected_database_identity) != physical:
+        raise ValueError("AC dev completed bootstrap custody identity mismatch")
+    pre_sha = _durable_database_sha256(database)
+    if pre_sha != expected_pre_sha256:
+        raise ValueError("AC dev completed bootstrap custody preimage mismatch")
+    conn = sqlite3.connect(str(database), timeout=30, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        before_meta = {str(key): str(value) for key, value in conn.execute(
+            "SELECT key,value FROM schema_meta ORDER BY key"
+        )}
+        if before_meta != {str(key): str(value) for key, value in expected_schema_meta.items()}:
+            raise ValueError("AC dev completed bootstrap custody metadata drift")
+        if (backlog_read_schema_managed_inventory(conn) != dict(expected_managed_inventory)
+                or backlog_read_schema_protected_inventory(conn) != dict(expected_protected_inventory)
+                or _sqlite_logical_projection(
+                    conn, exclude_tables=frozenset({"schema_meta"})
+                ) != dict(expected_protected_projection)):
+            raise ValueError("AC dev completed bootstrap custody schema drift")
+        for key in _COMPLETED_BOOTSTRAP_CUSTODY_KEYS:
+            conn.execute("UPDATE schema_meta SET value=? WHERE key=?", (custody_updates[key], key))
+            if conn.execute("SELECT changes()").fetchone() != (1,):
+                raise ValueError("AC dev completed bootstrap custody key is missing")
+        after_meta = {str(key): str(value) for key, value in conn.execute(
+            "SELECT key,value FROM schema_meta ORDER BY key"
+        )}
+        changed = {key for key in after_meta if before_meta.get(key) != after_meta.get(key)}
+        if changed != set(_COMPLETED_BOOTSTRAP_CUSTODY_KEYS):
+            raise ValueError("AC dev completed bootstrap custody wrote outside its authority")
+        if (backlog_read_schema_managed_inventory(conn) != dict(expected_managed_inventory)
+                or backlog_read_schema_protected_inventory(conn) != dict(expected_protected_inventory)
+                or _sqlite_logical_projection(
+                    conn, exclude_tables=frozenset({"schema_meta"})
+                ) != dict(expected_protected_projection)):
+            raise ValueError("AC dev completed bootstrap custody postcondition failed")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    checkpoint = sqlite3.connect(str(database), timeout=30)
+    try:
+        if tuple(checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()) != (0, 0, 0):
+            raise RuntimeError("AC dev completed bootstrap custody checkpoint failed")
+    finally:
+        checkpoint.close()
+    post_stat = database.stat(follow_symlinks=False)
+    post_identity = {"device": int(post_stat.st_dev), "inode": int(post_stat.st_ino)}
+    return {"database_identity": post_identity, "database_sha256_before": pre_sha,
+            "database_sha256_after": _durable_database_sha256(database),
+            "schema_meta_before": before_meta, "schema_meta_after": after_meta,
+            "custody_delta": {key: {"before": before_meta[key], "after": after_meta[key]}
+                              for key in _COMPLETED_BOOTSTRAP_CUSTODY_KEYS}}
+
+
 def bootstrap_dev_governance_store(
     storage_root: Path | str,
     *,
