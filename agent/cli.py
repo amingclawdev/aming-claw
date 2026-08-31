@@ -33,8 +33,8 @@ import socket
 import sqlite3
 import subprocess
 import tempfile
-import datetime
 import shutil
+import stat
 import http.client
 import urllib.error
 import urllib.parse
@@ -738,6 +738,160 @@ def status():
         sys.exit(1)
 
 
+_AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION = "ac_dev_offline_schema_admission.v2"
+
+
+def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _admission_identity(path: Path) -> dict[str, object]:
+    resolved = path.resolve(strict=True)
+    details = resolved.stat()
+    return {
+        "path": str(resolved),
+        "device": int(details.st_dev),
+        "inode": int(details.st_ino),
+    }
+
+
+def _admission_regular_file(path: Path, *, archive: Path | None = None) -> None:
+    try:
+        details = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise click.ClickException("AC dev schema admission receipt/file is unreadable") from exc
+    if not stat.S_ISREG(details.st_mode) or path.is_symlink() or resolved != path.absolute():
+        raise click.ClickException("AC dev schema admission requires a regular nonlink file")
+    if archive is not None:
+        try:
+            resolved.relative_to(archive.resolve(strict=True))
+        except ValueError as exc:
+            raise click.ClickException("AC dev schema admission receipt is outside its canonical archive") from exc
+
+
+def _admission_source_identity(source_tip_raw: str) -> dict[str, object]:
+    try:
+        source_tip = json.loads(source_tip_raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException("offline AC dev schema admission source-tip is invalid") from exc
+    if not isinstance(source_tip, dict):
+        raise click.ClickException("offline AC dev schema admission source-tip is invalid")
+    cli_source = _source_git_identity()
+    return {
+        "db_source_tip": source_tip,
+        "db_source_tip_sha256": "sha256:" + hashlib.sha256(
+            _canonical_json_bytes(source_tip)
+        ).hexdigest(),
+        "cli_source": cli_source,
+        "cli_source_sha256": "sha256:" + hashlib.sha256(
+            _canonical_json_bytes(cli_source)
+        ).hexdigest(),
+    }
+
+
+def _write_admission_receipt(archive: Path, payload: dict[str, Any]) -> tuple[Path, str]:
+    """Persist a byte-addressed receipt without placing its own hash in it."""
+    archive.mkdir(parents=True, exist_ok=True)
+    payload_bytes = _canonical_json_bytes(payload)
+    digest = hashlib.sha256(payload_bytes).hexdigest()
+    receipt_path = archive / f"{digest}.json"
+    sidecar = archive / f"{digest}.sha256"
+    if receipt_path.exists() or sidecar.exists():
+        _admission_regular_file(receipt_path, archive=archive)
+        _admission_regular_file(sidecar, archive=archive)
+        if receipt_path.read_bytes() != payload_bytes or sidecar.read_text(encoding="utf-8") != f"sha256:{digest}  {receipt_path.name}\n":
+            raise click.ClickException("AC dev schema admission receipt address collision")
+        return receipt_path, "sha256:" + digest
+    temporary = archive / f".{digest}.tmp"
+    temporary.write_bytes(payload_bytes)
+    os.replace(temporary, receipt_path)
+    temporary_sidecar = archive / f".{digest}.sha256.tmp"
+    temporary_sidecar.write_text(f"sha256:{digest}  {receipt_path.name}\n", encoding="utf-8")
+    os.replace(temporary_sidecar, sidecar)
+    return receipt_path, "sha256:" + digest
+
+
+def _read_admission_receipt(path: Path, *, archive: Path) -> tuple[dict[str, Any], str]:
+    _admission_regular_file(path, archive=archive)
+    match = re.fullmatch(r"([0-9a-f]{64})\.json", path.name)
+    if match is None:
+        raise click.ClickException("AC dev schema admission receipt has a noncanonical name")
+    digest = match.group(1)
+    sidecar = archive / f"{digest}.sha256"
+    _admission_regular_file(sidecar, archive=archive)
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise click.ClickException("AC dev schema admission receipt content digest mismatch")
+    if sidecar.read_text(encoding="utf-8") != f"sha256:{digest}  {path.name}\n":
+        raise click.ClickException("AC dev schema admission receipt sidecar mismatch")
+    try:
+        value = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException("AC dev schema admission receipt is not JSON") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION:
+        raise click.ClickException("AC dev schema admission receipt schema mismatch")
+    return value, "sha256:" + digest
+
+
+def _validate_admission_receipt_chain(
+    receipt: dict[str, Any], receipt_sha256: str, *, archive: Path,
+    project_id: str, port: int, root_identity: dict[str, object],
+    database_identity: dict[str, object], source_identity: dict[str, object],
+    plan_sha256: str,
+) -> None:
+    """Validate every byte-addressed predecessor before any DDL is possible."""
+    required = {
+        "schema_version", "stage", "project_id", "port", "root_identity",
+        "database_identity", "source_identity", "plan_sha256",
+        "schema_inventory_before", "schema_inventory_after", "backup",
+        "database_sha256_before", "database_sha256_after",
+        "previous_receipt_sha256", "changed", "missing",
+    }
+    current = receipt
+    current_digest = receipt_sha256
+    descendant_before: dict[str, object] | None = None
+    descendant_database_before = ""
+    while True:
+        if set(current) != required or current.get("schema_version") != _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION:
+            raise click.ClickException("AC dev schema admission receipt fields mismatch")
+        if (
+            current.get("stage") not in {"completed", "rolled_back"}
+            or current.get("project_id") != project_id or current.get("port") != port
+            or current.get("root_identity") != root_identity
+            or current.get("database_identity") != database_identity
+            or current.get("source_identity") != source_identity
+            or current.get("plan_sha256") != plan_sha256
+        ):
+            raise click.ClickException("AC dev schema admission receipt binding mismatch")
+        backup = current.get("backup")
+        if not isinstance(backup, dict) or set(backup) != {"identity", "sha256"}:
+            raise click.ClickException("AC dev schema admission receipt backup binding mismatch")
+        backup_identity = backup.get("identity")
+        if not isinstance(backup_identity, dict) or not isinstance(backup.get("sha256"), str):
+            raise click.ClickException("AC dev schema admission receipt backup binding mismatch")
+        backup_path = Path(str(backup_identity.get("path") or ""))
+        _admission_regular_file(backup_path, archive=archive)
+        if _admission_identity(backup_path) != backup_identity or _file_sha256(backup_path) != backup["sha256"]:
+            raise click.ClickException("AC dev schema admission receipt backup changed")
+        if descendant_before is not None and (
+            current.get("schema_inventory_after") != descendant_before
+            or current.get("database_sha256_after") != descendant_database_before
+        ):
+            raise click.ClickException("AC dev schema admission receipt chain is discontinuous")
+        previous = current.get("previous_receipt_sha256")
+        if not isinstance(previous, str):
+            raise click.ClickException("AC dev schema admission receipt predecessor mismatch")
+        if not previous:
+            return
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", previous) or previous == current_digest:
+            raise click.ClickException("AC dev schema admission receipt predecessor mismatch")
+        previous_path = archive / (previous.removeprefix("sha256:") + ".json")
+        descendant_before = current["schema_inventory_before"]
+        descendant_database_before = str(current["database_sha256_before"])
+        current, current_digest = _read_admission_receipt(previous_path, archive=archive)
+
+
 def _offline_dev_schema_admission(
     storage_root: Path, *, project_id: str, port: int, resume_receipt: Path | None,
 ) -> dict[str, Any]:
@@ -778,35 +932,95 @@ def _offline_dev_schema_admission(
         raise click.ClickException("offline AC dev schema admission requires a readable launch receipt") from exc
     if not isinstance(launch_data, dict) or launch_data.get("world_id") != "ac-dev" or launch_data.get("project_id") != project_id or launch_data.get("port") != port:
         raise click.ClickException("offline AC dev schema admission launch receipt mismatch")
-    import sqlite3
-    from agent.governance.db import admit_missing_backlog_read_schema, backlog_read_schema_drift
+    from agent.governance.db import (
+        admit_missing_backlog_read_schema,
+        backlog_read_schema_drift,
+        backlog_read_schema_inventory,
+        backlog_read_schema_plan,
+    )
     conn = sqlite3.connect(str(database), timeout=5)
     try:
         meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('governance_world_id','governance_world_genesis_json','governance_world_source_tip_json')"))
         if meta.get("governance_world_id") != "ac-dev" or not meta.get("governance_world_genesis_json") or not meta.get("governance_world_source_tip_json"):
             raise click.ClickException("offline AC dev schema admission genesis/source-tip mismatch")
+        root_identity = _admission_identity(root)
+        database_identity = _admission_identity(database)
+        source_identity = _admission_source_identity(str(meta["governance_world_source_tip_json"]))
+        plan = backlog_read_schema_plan()
+        plan_sha256 = "sha256:" + hashlib.sha256(_canonical_json_bytes(plan)).hexdigest()
+        archive = root / "archive" / "schema-admission"
         before = backlog_read_schema_drift(conn)
         if before["invalid"]:
             raise click.ClickException("offline AC dev schema admission rejects unexpected schema drift")
-        archive = root / "archive" / "schema-admission"
-        archive.mkdir(parents=True, exist_ok=True)
+        inventory_before = backlog_read_schema_inventory(conn)
+        previous_sha256 = ""
+        if resume_receipt is not None:
+            prior, previous_sha256 = _read_admission_receipt(resume_receipt.absolute(), archive=archive)
+            _validate_admission_receipt_chain(
+                prior, previous_sha256, archive=archive, project_id=project_id,
+                port=port, root_identity=root_identity,
+                database_identity=database_identity, source_identity=source_identity,
+                plan_sha256=plan_sha256,
+            )
+            if prior["stage"] == "completed":
+                if (prior["schema_inventory_after"] != inventory_before or before["missing"]
+                    or prior["database_sha256_after"] != _file_sha256(database)):
+                    raise click.ClickException("AC dev schema admission completed receipt does not match current database")
+                return {"status": "already_admitted", "receipt_path": str(resume_receipt), "receipt_sha256": previous_sha256, "changed": False, "missing": []}
+            if prior["stage"] != "rolled_back" or prior["schema_inventory_after"] != inventory_before:
+                raise click.ClickException("AC dev schema admission rollback receipt does not match current database")
         pre_digest = _file_sha256(database)
-        receipt_payload = {"schema_version": "ac_dev_offline_schema_admission.v1", "project_id": project_id, "port": port, "database": str(database), "pre_sha256": pre_digest, "missing": before["missing"], "resumed_from": str(resume_receipt or "")}
-        receipt_digest = "sha256:" + hashlib.sha256(json.dumps(receipt_payload, sort_keys=True).encode()).hexdigest()
-        backup = archive / (receipt_digest.removeprefix("sha256:") + ".pre.sqlite")
-        if not backup.exists():
+        archive.mkdir(parents=True, exist_ok=True)
+        backup = archive / (pre_digest.removeprefix("sha256:") + ".pre.sqlite")
+        if backup.exists():
+            _admission_regular_file(backup, archive=archive)
+        else:
             shutil.copy2(database, backup)
-        result = admit_missing_backlog_read_schema(conn)
-        post_digest = _file_sha256(database)
-        receipt_payload.update({"receipt_sha256": receipt_digest, "backup": str(backup), "post_sha256": post_digest, "changed": result["changed"], "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
-        receipt_path = archive / (receipt_digest.removeprefix("sha256:") + ".json")
-        temporary = receipt_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(receipt_payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-        os.replace(temporary, receipt_path)
-        return {"status": "admitted", "receipt_path": str(receipt_path), "receipt_sha256": receipt_digest, "changed": result["changed"], "missing": result["missing"], "post_sha256": post_digest}
-    except Exception:
-        conn.rollback()
-        raise
+        if _file_sha256(backup) != pre_digest:
+            raise click.ClickException("AC dev schema admission backup digest mismatch")
+        backup_identity = _admission_identity(backup)
+        try:
+            result = admit_missing_backlog_read_schema(conn)
+        except BaseException as exc:
+            conn.rollback()
+            after_meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key='governance_world_source_tip_json'"))
+            inventory_after = backlog_read_schema_inventory(conn)
+            rollback_payload = {
+                "schema_version": _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
+                "stage": "rolled_back", "project_id": project_id, "port": port,
+                "root_identity": root_identity, "database_identity": database_identity,
+                "source_identity": source_identity, "plan_sha256": plan_sha256,
+                "schema_inventory_before": inventory_before, "schema_inventory_after": inventory_after,
+                "backup": {"identity": backup_identity, "sha256": pre_digest},
+                "database_sha256_before": pre_digest, "database_sha256_after": _file_sha256(database),
+                "previous_receipt_sha256": previous_sha256, "changed": False,
+                "missing": before["missing"],
+            }
+            if inventory_after != inventory_before or after_meta.get("governance_world_source_tip_json") != meta["governance_world_source_tip_json"]:
+                raise click.ClickException("AC dev schema admission rollback proof failed") from exc
+            failed_path, failed_digest = _write_admission_receipt(archive, rollback_payload)
+            raise click.ClickException(
+                f"AC dev schema admission rolled back; receipt={failed_path} sha256={failed_digest}"
+            ) from exc
+        inventory_after = backlog_read_schema_inventory(conn)
+        post_meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key='governance_world_source_tip_json'"))
+        if post_meta.get("governance_world_source_tip_json") != meta["governance_world_source_tip_json"]:
+            raise click.ClickException("AC dev schema admission source-tip advanced unexpectedly")
+        if backlog_read_schema_drift(conn)["missing"] or inventory_after == inventory_before and before["missing"]:
+            raise click.ClickException("AC dev schema admission postcondition failed")
+        receipt_payload = {
+            "schema_version": _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
+            "stage": "completed", "project_id": project_id, "port": port,
+            "root_identity": root_identity, "database_identity": database_identity,
+            "source_identity": source_identity, "plan_sha256": plan_sha256,
+            "schema_inventory_before": inventory_before, "schema_inventory_after": inventory_after,
+            "backup": {"identity": backup_identity, "sha256": pre_digest},
+            "database_sha256_before": pre_digest, "database_sha256_after": _file_sha256(database),
+            "previous_receipt_sha256": previous_sha256, "changed": bool(result["changed"]),
+            "missing": result["missing"],
+        }
+        receipt_path, receipt_digest = _write_admission_receipt(archive, receipt_payload)
+        return {"status": "admitted", "receipt_path": str(receipt_path), "receipt_sha256": receipt_digest, "changed": result["changed"], "missing": result["missing"], "post_sha256": _file_sha256(database)}
     finally:
         conn.close()
 

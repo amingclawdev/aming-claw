@@ -3,6 +3,7 @@
 import os
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import types
@@ -3884,6 +3885,7 @@ def test_dev_admit_schema_rejects_wrong_plane_before_database_write(tmp_path):
 
 def test_dev_admit_schema_repairs_exact_missing_set_offline(tmp_path, monkeypatch):
     import agent.cli as cli
+    from agent.governance import db
     monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
     root = tmp_path / "external-dev-world"
     database = root / "governance" / "aming-claw" / "governance.db"
@@ -3891,9 +3893,8 @@ def test_dev_admit_schema_repairs_exact_missing_set_offline(tmp_path, monkeypatc
     import sqlite3
 
     conn = sqlite3.connect(database)
-    conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute("CREATE TABLE backlog_bugs (bug_id TEXT, updated_at TEXT, created_at TEXT)")
-    conn.executemany("INSERT INTO schema_meta VALUES (?, ?)", [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")])
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")])
     conn.commit()
     conn.close()
     (root / "launch-receipt.json").write_text(json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
@@ -3902,8 +3903,84 @@ def test_dev_admit_schema_repairs_exact_missing_set_offline(tmp_path, monkeypatc
     output = json.loads(result.output)
     assert output["status"] == "admitted"
     assert Path(output["receipt_path"]).is_file()
+    receipt_path = Path(output["receipt_path"])
+    assert output["receipt_sha256"] == "sha256:" + hashlib.sha256(receipt_path.read_bytes()).hexdigest()
     conn = sqlite3.connect(database)
     try:
         assert conn.execute("SELECT generation FROM dashboard_backlog_cache_generation WHERE resource='backlog'").fetchone()[0] >= 1
     finally:
         conn.close()
+    resumed = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(receipt_path)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "already_admitted"
+
+
+def test_dev_admit_schema_rejects_tampered_or_foreign_resume_before_effect(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-dev-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")])
+    conn.commit()
+    conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    first = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008"])
+    assert first.exit_code == 0, first.output
+    receipt = Path(json.loads(first.output)["receipt_path"])
+    before = database.read_bytes()
+    receipt.write_text("{}", encoding="utf-8")
+    tampered = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(receipt)])
+    assert tampered.exit_code != 0
+    assert "digest mismatch" in tampered.output
+    assert database.read_bytes() == before
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text("{}", encoding="utf-8")
+    result = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(foreign)])
+    assert result.exit_code != 0
+    assert database.read_bytes() == before
+
+
+def test_dev_admit_schema_forced_ddl_error_emits_rollback_receipt_and_resumes(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-dev-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")])
+    conn.commit()
+    conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+
+    def forced_ddl_error(connection):
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("CREATE TABLE interrupted_schema_admission (id TEXT)")
+        raise sqlite3.OperationalError("forced DDL interruption")
+
+    original_admission = db.admit_missing_backlog_read_schema
+    monkeypatch.setattr(db, "admit_missing_backlog_read_schema", forced_ddl_error)
+    failed = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008"])
+    assert failed.exit_code != 0
+    match = re.search(r"receipt=([^ ]+) sha256=(sha256:[0-9a-f]{64})", failed.output)
+    assert match, failed.output
+    rollback_receipt = Path(match.group(1))
+    payload = json.loads(rollback_receipt.read_text(encoding="utf-8"))
+    assert payload["stage"] == "rolled_back"
+    assert payload["schema_inventory_before"] == payload["schema_inventory_after"]
+    check = sqlite3.connect(database)
+    try:
+        assert check.execute("SELECT name FROM sqlite_master WHERE name='interrupted_schema_admission'").fetchone() is None
+    finally:
+        check.close()
+    monkeypatch.setattr(db, "admit_missing_backlog_read_schema", original_admission)
+    resumed = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(rollback_receipt)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "admitted"

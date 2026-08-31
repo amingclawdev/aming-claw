@@ -17,8 +17,6 @@ import re
 import fcntl
 import subprocess
 import errno
-import shutil
-import datetime
 import urllib.request
 import urllib.error
 from contextlib import closing
@@ -2125,6 +2123,53 @@ def _backlog_read_normalized_sql(value: object) -> str:
     return re.sub(r"\s*([(),;])\s*", r"\1", normalized.replace(" IF NOT EXISTS ", " "))
 
 
+def _sqlite_master_inventory(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
+    """Return the complete managed SQLite namespace, including SQL bodies.
+
+    Names alone are not a schema authority: a shadow trigger or a table with an
+    altered definition can change the meaning of the same read path.  SQLite's
+    internal autoindexes do not have sqlite_master SQL rows and are deliberately
+    outside this source-derived inventory.
+    """
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master "
+        "WHERE type IN ('table', 'index', 'trigger', 'view') "
+        "ORDER BY type, name, tbl_name"
+    ).fetchall()
+    return tuple(
+        (str(kind), str(name), str(table), _backlog_read_normalized_sql(sql))
+        for kind, name, table, sql in rows
+    )
+
+
+def _canonical_backlog_read_schema_inventory(*, include_plan: bool) -> tuple[tuple[str, str, str, str], ...]:
+    """Materialize the source ABI in memory; never infer it from the target."""
+    with closing(sqlite3.connect(":memory:")) as memory:
+        memory.row_factory = sqlite3.Row
+        _configure_connection(memory, busy_timeout=10000)
+        _ensure_schema(memory)
+        if include_plan:
+            memory.execute(BACKLOG_READ_SCHEMA_TABLE_SQL)
+            memory.execute(BACKLOG_READ_SCHEMA_INDEX_SQL)
+            memory.execute(BACKLOG_READ_SCHEMA_SEED_SQL)
+            for sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.values():
+                memory.execute(sql)
+        return _sqlite_master_inventory(memory)
+
+
+def backlog_read_schema_inventory(conn: sqlite3.Connection) -> dict[str, object]:
+    """Return a content-addressed complete inventory for receipt binding."""
+    inventory = _sqlite_master_inventory(conn)
+    encoded = json.dumps(inventory, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return {
+        # Receipts are JSON, so keep the public value JSON-native as well;
+        # otherwise a parsed receipt (lists) cannot equal a fresh observation
+        # (tuples) despite identical canonical bytes.
+        "inventory": [list(item) for item in inventory],
+        "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
     """Classify the bounded backlog-read plan without writing.
 
@@ -2166,7 +2211,29 @@ def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
             missing.append("backlog_generation_seed")
         elif len(seeds) != 1 or str(seeds[0][0]) != BACKLOG_READ_SCHEMA_RESOURCE or int(seeds[0][1]) < 1 or not str(seeds[0][2]):
             invalid.append("backlog_generation_seed")
-    return {"missing": sorted(missing), "invalid": sorted(invalid)}
+    # The bounded plan is additive, but it is still part of one source-derived
+    # schema ABI.  Compare every user-visible table/index/trigger/view and its
+    # SQL definition, rather than inspecting only the five new names.
+    base_inventory = _canonical_backlog_read_schema_inventory(include_plan=False)
+    full_inventory = _canonical_backlog_read_schema_inventory(include_plan=True)
+    actual_inventory = _sqlite_master_inventory(conn)
+    base_map = {(kind, name, table): sql for kind, name, table, sql in base_inventory}
+    full_map = {(kind, name, table): sql for kind, name, table, sql in full_inventory}
+    actual_map = {(kind, name, table): sql for kind, name, table, sql in actual_inventory}
+    for key in sorted(set(actual_map) - set(full_map)):
+        invalid.append("inventory_extra:" + ":".join(key))
+    for key in sorted(set(base_map) - set(actual_map)):
+        invalid.append("inventory_missing:" + ":".join(key))
+    for key in sorted(set(actual_map) & set(full_map)):
+        if actual_map[key] != full_map[key]:
+            invalid.append("inventory_altered:" + ":".join(key))
+    present_plan = {
+        key for key in full_map if key not in base_map and key in actual_map
+    }
+    all_plan = {key for key in full_map if key not in base_map}
+    if present_plan and present_plan != all_plan:
+        invalid.append("inventory_partial_plan")
+    return {"missing": sorted(set(missing)), "invalid": sorted(set(invalid))}
 
 
 def ensure_backlog_read_schema(conn: sqlite3.Connection) -> None:

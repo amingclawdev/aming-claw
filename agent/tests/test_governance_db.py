@@ -1638,7 +1638,7 @@ def test_ac_dev_offline_backlog_schema_admission_repairs_only_exact_missing_set(
     from governance import db
 
     conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE backlog_bugs (bug_id TEXT, updated_at TEXT, created_at TEXT)")
+    db._ensure_schema(conn)
     try:
         assert db.backlog_read_schema_drift(conn)["invalid"] == []
         result = db.admit_missing_backlog_read_schema(conn)
@@ -1653,7 +1653,7 @@ def test_ac_dev_offline_backlog_schema_admission_rolls_back_unexpected_drift():
     from governance import db
 
     conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE backlog_bugs (bug_id TEXT, updated_at TEXT, created_at TEXT)")
+    db._ensure_schema(conn)
     conn.execute("CREATE TABLE dashboard_backlog_cache_generation (resource TEXT)")
     before = tuple(conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name"))
     try:
@@ -1662,3 +1662,25 @@ def test_ac_dev_offline_backlog_schema_admission_rolls_back_unexpected_drift():
         assert tuple(conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name")) == before
     finally:
         conn.close()
+
+
+def test_ac_dev_schema_admission_rejects_shadow_and_altered_namespace_objects():
+    from governance import db
+
+    for sql, expected in (
+        ("CREATE TABLE shadow_backlog_table (id TEXT)", "inventory_extra"),
+        ("CREATE INDEX shadow_backlog_index ON backlog_bugs(bug_id)", "inventory_extra"),
+        ("CREATE TRIGGER shadow_backlog AFTER INSERT ON backlog_bugs BEGIN SELECT 1; END", "inventory_extra"),
+        ("CREATE VIEW shadow_backlog_view AS SELECT bug_id FROM backlog_bugs", "inventory_extra"),
+        ("CREATE INDEX idx_backlog_bugs_dashboard_keyset ON backlog_bugs(bug_id)", "inventory_altered"),
+    ):
+        conn = sqlite3.connect(":memory:")
+        db._ensure_schema(conn)
+        conn.execute(sql)
+        try:
+            drift = db.backlog_read_schema_drift(conn)
+            assert any(expected in item for item in drift["invalid"])
+            with pytest.raises(ValueError, match="rejects invalid"):
+                db.admit_missing_backlog_read_schema(conn)
+        finally:
+            conn.close()
