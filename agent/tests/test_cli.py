@@ -99,10 +99,12 @@ def test_linked_v3_validator_uses_cow_preimage_for_replaced_inode(tmp_path, monk
                         lambda *_args, **_kwargs: (receipt, "sha256:" + "1" * 64))
     monkeypatch.setattr(cli, "_validated_historical_admission_source_identity",
                         lambda value: value)
-    monkeypatch.setattr(
-        cli, "_completed_durable_generation_ref", lambda **_kwargs: None,
-    )
     calls = []
+    pristine = []
+    monkeypatch.setattr(
+        cli, "_require_first_cow_runtime_pristine",
+        lambda value: pristine.append(value),
+    )
     monkeypatch.setattr(db, "validate_dev_cow_successor_preimage",
                         lambda *args, **kwargs: calls.append((args, kwargs)))
     monkeypatch.setattr(db, "verified_stable_database_binding", lambda: {"stable": True})
@@ -112,37 +114,28 @@ def test_linked_v3_validator_uses_cow_preimage_for_replaced_inode(tmp_path, monk
     )
     assert digest == "sha256:" + "1" * 64
     assert returned is receipt
+    assert pristine == [root]
     assert len(calls) == 1
-    assert calls[0][1]["completed_generation_ref"] is None
+    assert "completed_generation_ref" not in calls[0][1]
 
 
-def test_completed_durable_generation_ref_delegates_to_central_db_validator(
-    tmp_path, monkeypatch,
-):
+@pytest.mark.parametrize("artifact", ("file", "symlink", "directory"))
+def test_first_cow_runtime_rejects_every_existing_artifact(tmp_path, artifact):
     import agent.cli as cli
-    from agent.governance import db
 
-    dev = tmp_path / "dev"
-    linked = tmp_path / "linked.json"
-    linked.write_text("{}", encoding="utf-8")
-    source = {"commit": "a" * 40}
-    ref = {
-        "schema_version": db._DEV_DURABLE_COMPLETED_REF_SCHEMA,
-        "launch_sha256": "sha256:" + "b" * 64,
-    }
-    observed = []
-    monkeypatch.setattr(
-        db, "select_dev_completed_generation_ref",
-        lambda *args, **kwargs: observed.append((args, kwargs)) or ref,
-    )
-
-    assert cli._completed_durable_generation_ref(
-        dev_storage=dev, source_identity=source, linked_v3_receipt=linked,
-    ) == ref
-    assert observed == [(
-        (dev,), {"source_identity": source, "linked_v3_receipt": linked},
-    )]
-    assert not hasattr(cli, "_completed_durable_generation_database_anchor")
+    dev = tmp_path / "dev"; runtime = dev / "runtime" / "durable-launch"
+    runtime.mkdir(parents=True)
+    target = runtime / "current"
+    if artifact == "file":
+        target.write_text("forged", encoding="utf-8")
+    elif artifact == "directory":
+        target.mkdir()
+    else:
+        foreign = tmp_path / "foreign"; foreign.write_text("forged", encoding="utf-8")
+        target.symlink_to(foreign)
+    with pytest.raises(cli.click.ClickException, match="must be pristine"):
+        cli._require_first_cow_runtime_pristine(dev)
+    assert not hasattr(cli, "_completed_durable_generation_ref")
 
 
 @pytest.mark.parametrize(

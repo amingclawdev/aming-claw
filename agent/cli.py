@@ -3352,19 +3352,19 @@ def _durable_listener_pid(port: int) -> int:
     return next(iter(pids)) if len(pids) == 1 else 0
 
 
-def _completed_durable_generation_ref(
-    *, dev_storage: Path, source_identity: Mapping[str, object],
-    linked_v3_receipt: Path,
-) -> dict[str, str] | None:
-    """Delegate completed-generation authority reconstruction to the DB layer."""
-    from agent.governance import db as _db
+def _require_first_cow_runtime_pristine(dev_storage: Path) -> None:
+    """Admit only an untouched first-start runtime; archives are out of scope."""
+    runtime = (dev_storage / "runtime" / "durable-launch").absolute()
+    if not runtime.exists():
+        return
     try:
-        return _db.select_dev_completed_generation_ref(
-            dev_storage, source_identity=source_identity,
-            linked_v3_receipt=linked_v3_receipt,
-        )
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        metadata = runtime.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise click.ClickException("AC dev first-start runtime is invalid") from exc
+    if (runtime.is_symlink() or not stat.S_ISDIR(metadata.st_mode)
+            or runtime.resolve(strict=True) != runtime
+            or runtime.parent.is_symlink() or any(runtime.iterdir())):
+        raise click.ClickException("AC dev first-start runtime must be pristine")
 
 
 def _validated_linked_v3_receipt(
@@ -3388,24 +3388,11 @@ def _validated_linked_v3_receipt(
     linked_database_identity = dict(receipt.get("database_identity") or {})
     if (linked_database_identity.get("device"), linked_database_identity.get("inode")) != (
             canonical_database_identity.get("device"), canonical_database_identity.get("inode")):
-        if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
-            bootstrap_binding = _completed_dashboard_bootstrap_binding(dev_storage)
-            if bootstrap_binding is None:
-                raise click.ClickException(
-                    "dashboard backlog bootstrap durable phase is incomplete"
-                )
-            _db.validate_dev_cow_successor_receipt(dev_storage)
-            return digest, receipt
-        else:
-            completed_generation_ref = _completed_durable_generation_ref(
-                dev_storage=dev_storage, source_identity=source_identity,
-                linked_v3_receipt=receipt_path,
-            )
+        _require_first_cow_runtime_pristine(dev_storage)
         _db.validate_dev_cow_successor_preimage(
             dev_storage, linked_v3_receipt=receipt_path,
             source_identity=source_identity,
             stable_binding=_db.verified_stable_database_binding(),
-            completed_generation_ref=completed_generation_ref,
         )
         return digest, receipt
     if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
@@ -3416,17 +3403,9 @@ def _validated_linked_v3_receipt(
     if historical_source != dict(source_identity):
         adoptions = _canonical_adoption_receipts(dev_storage)
         runtime = dev_storage / "runtime" / "durable-launch"
-        completed_generations = list(runtime.glob("launch.*.json")) if runtime.is_dir() else []
         if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
             _historical_dashboard_bootstrap_adoption(dev_storage)
-        elif completed_generations:
-            # Adoption is an immutable ancestor authority.  Once child custody
-            # has produced a completed generation the database is necessarily
-            # a postimage, so reconstructing the legacy payload is both
-            # impossible and the wrong state transition.  The DB validator
-            # proves the one immutable ancestor and its bounded custody delta;
-            # the durable generation validators below prove the exact current
-            # postimage and process/listener chain.
+        elif adoptions:
             if len(adoptions) != 1:
                 raise click.ClickException(
                     "AC dev durable launch canonical adoption is missing or ambiguous"
@@ -3583,7 +3562,6 @@ def _durable_dev_launch(
     if os.name != "posix":
         raise click.ClickException("AC dev durable launch requires POSIX")
     runtime = dev_storage / "runtime" / "durable-launch"
-    runtime.mkdir(parents=True, exist_ok=True)
     lock = runtime / "launch.lock"
     durable_phase, bootstrap_binding = _durable_start_phase(dev_storage)
     if durable_phase == _DURABLE_START_COMPLETED_BOOTSTRAP and bootstrap_binding is None:
@@ -3593,18 +3571,12 @@ def _durable_dev_launch(
         database_identity=database_identity, source_identity=source_identity,
         allow_postimage=True, durable_start_phase=durable_phase,
     )
-    completed_generation_ref = None
-    if bootstrap_binding is None:
-        completed_generation_ref = _completed_durable_generation_ref(
-            dev_storage=dev_storage, source_identity=source_identity,
-            linked_v3_receipt=linked_receipt,
-        )
+    runtime.mkdir(parents=True, exist_ok=True)
     if bootstrap_binding is None:
         from agent.governance.db import validate_dev_preimage_only
         preimage = validate_dev_preimage_only(
             dev_storage, source_identity=source_identity,
             linked_v3_receipt=linked_receipt,
-            completed_generation_ref=completed_generation_ref,
         )
     else:
         preimage = bootstrap_binding
@@ -3944,7 +3916,6 @@ def _durable_dev_launch(
         "database_sha256_before": preimage["database_sha256"],
         "linked_v3_receipt": str(linked_receipt.absolute()),
         "linked_v3_receipt_sha256": linked_digest,
-        "completed_generation_ref": completed_generation_ref,
     }
     if bootstrap_binding is not None:
         pending_payload["dashboard_bootstrap"] = {
@@ -4364,7 +4335,6 @@ def start(
     health = None
     database_binding = None
     dev_identity = None
-    completed_generation_ref = None
     if runtime_plane == "dev":
         if port != AC_DEV_SERVICE_PORT:
             raise click.ClickException(
@@ -4415,12 +4385,6 @@ def start(
                 source_identity=dev_identity,
                 allow_postimage=True, durable_start_phase=durable_phase,
             )
-            if durable_phase == _DURABLE_START_LEGACY_ADOPTION:
-                completed_generation_ref = _completed_durable_generation_ref(
-                    dev_storage=selected_dev_storage,
-                    source_identity=dev_identity,
-                    linked_v3_receipt=linked_v3_receipt,
-                )
         # Listener ownership is the first dev-world admission decision.  A
         # running or foreign process must be rejected before bootstrap, source
         # CAS, activation validation, or any dedicated-root filesystem write.
@@ -4468,18 +4432,9 @@ def start(
                 if bootstrap_preimage:
                     preimage_binding = bootstrap_preimage
                 else:
-                    if durable_child_runtime_dir is not None:
-                        completed_generation_ref = (
-                            _completed_durable_generation_ref(
-                                dev_storage=selected_dev_storage,
-                                source_identity=dev_identity,
-                                linked_v3_receipt=lifecycle_receipt,
-                            )
-                        )
                     preimage_binding = validate_dev_preimage_only(
                         selected_dev_storage, source_identity=dev_identity,
                         linked_v3_receipt=lifecycle_receipt,
-                        completed_generation_ref=completed_generation_ref,
                     )
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 raise click.ClickException(str(exc)) from exc
@@ -4576,9 +4531,7 @@ def start(
             )
             if (pending.get("launch_id") != durable_child_launch_id
                     or pending.get("dev_storage_root") != str(dev_storage)
-                    or pending.get("source_identity") != dict(dev_identity or {})
-                    or pending.get("completed_generation_ref")
-                    != completed_generation_ref):
+                    or pending.get("source_identity") != dict(dev_identity or {})):
                 raise click.ClickException("AC dev durable child pending binding mismatch")
             phase = pending.get("durable_start_phase")
             bootstrap_fields = {"dashboard_bootstrap"}
@@ -4621,48 +4574,15 @@ def start(
             }
             from agent.governance.db import commit_dev_child_custody
             try:
-                if phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
-                    from agent.governance import db as _db
-                    if not isinstance(pending.get("dashboard_bootstrap"), Mapping):
-                        raise click.ClickException("AC dev durable bootstrap child context is missing")
-                    database = dev_storage / "governance" / "aming-claw" / "governance.db"
-                    snapshot = sqlite3.connect(
-                        "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1", uri=True,
-                    )
-                    try:
-                        meta = {str(k): str(v) for k, v in snapshot.execute(
-                            "SELECT key,value FROM schema_meta ORDER BY key")}
-                        managed = _db.backlog_read_schema_managed_inventory(snapshot)
-                        protected = _db.backlog_read_schema_protected_inventory(snapshot)
-                        projection = _db._sqlite_logical_projection(
-                            snapshot, exclude_tables=frozenset({"schema_meta"}))
-                    finally:
-                        snapshot.close()
-                    source_tip = {key: (dev_identity or {}).get(key) for key in
-                                  ("root", "branch", "commit", "source_sha256")}
-                    updates = {
-                        "governance_world_source_tip_json": json.dumps(source_tip, sort_keys=True, separators=(",", ":")),
-                        "governance_world_source_tip_sha256": _db._world_source_tip_hash(source_tip),
-                        "governance_world_source_tip_revision": str(int(meta["governance_world_source_tip_revision"]) + 1),
-                        "governance_world_current_process_json": json.dumps(custody, sort_keys=True, separators=(",", ":")),
-                    }
-                    committed = _db.commit_completed_bootstrap_child_custody(
-                        dev_storage, expected_database_identity=pending["database_identity"],
-                        expected_pre_sha256=pending["database_sha256_before"],
-                        expected_schema_meta=meta, custody_updates=updates,
-                        expected_managed_inventory=managed, expected_protected_inventory=protected,
-                        expected_protected_projection=projection,
-                    )
-                    committed["custody_projection"] = custody
-                    committed["database_identity"] = _canonical_dev_database_identity_projection(database)
-                elif phase == _DURABLE_START_LEGACY_ADOPTION:
+                if phase == _DURABLE_START_LEGACY_ADOPTION:
                     committed = commit_dev_child_custody(
                         dev_storage, source_identity=dev_identity or {},
                         process_identity=custody,
                         linked_v3_receipt=durable_child_linked_v3_receipt,
-                        expected_database_identity=pending_database,
-                        expected_pre_sha256=pending["database_sha256_before"],
-                        completed_generation_ref=completed_generation_ref,
+                    )
+                elif phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
+                    raise click.ClickException(
+                        "AC dev completed generation cannot authorize a new start"
                     )
                 else:
                     raise click.ClickException("AC dev durable child phase is invalid")

@@ -61,6 +61,43 @@ AC_DEV_COW_SUCCESSOR_PREFIX = "successor-v2"
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
+_DEV_FIRST_START_CONTEXT_TOKEN = object()
+
+
+class _DevFirstStartContext:
+    """One-process proof that the issuance preimage made its sole transition."""
+
+    __slots__ = (
+        "pid", "process_start_identity", "source_root", "source_commit",
+        "source_tree", "cli_sha256", "server_sha256", "storage_root",
+        "storage_device", "storage_inode", "database_path", "database_device",
+        "database_inode", "database_sha256", "logical_sha256", "_sealed",
+    )
+
+    def __init__(self, token: object, **values: object) -> None:
+        if token is not _DEV_FIRST_START_CONTEXT_TOKEN:
+            raise TypeError("AC dev first-start context is module-private")
+        for name in self.__slots__[:-1]:
+            object.__setattr__(self, name, values[name])
+        object.__setattr__(self, "_sealed", token)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise TypeError("AC dev first-start context is immutable")
+
+    def __copy__(self) -> object:
+        raise TypeError("AC dev first-start context cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> object:
+        raise TypeError("AC dev first-start context cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("AC dev first-start context cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("AC dev first-start context cannot be serialized")
+
+
+_DEV_FIRST_START_CONTEXT: _DevFirstStartContext | None = None
 
 
 def _sqlite_quote_identifier(identifier: str) -> str:
@@ -2188,8 +2225,7 @@ def _validated_canonical_legacy_postimage_adoption(
 
 def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = None,
                       source_identity: Mapping[str, object] | None = None,
-                      allow_postimage: bool = False,
-                      completed_generation_ref: Mapping[str, object] | None = None) -> Path:
+                      allow_postimage: bool = False) -> Path:
     """Resolve the only AC dev world; raw env values are assertions, not authority."""
     # Reject the missing required dev claim before contacting any authority or
     # resolving a potentially hostile sibling path.  This is zero-mutation.
@@ -2225,10 +2261,11 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
                 return _validated_canonical_legacy_postimage_adoption(
                     root, isolated_receipt, source_identity or {}, binding,
                 )
+            if _validate_dev_first_start_context(root):
+                return root
             validate_dev_cow_successor_preimage(
                 root, linked_v3_receipt=isolated_receipt,
                 source_identity=source_identity or {}, stable_binding=binding,
-                completed_generation_ref=completed_generation_ref,
             )
             return root
         return _validated_isolated_dev_receipt(
@@ -2242,41 +2279,24 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
         raise ValueError("AC dev storage root cannot be a symlink")
     if supplied != expected:
         root = _absolute_non_symlink_root(supplied, create=False)
-        runtime = root / "runtime" / "durable-launch"
-        launches = []
-        for candidate in runtime.glob("launch.*.json"):
-            try:
-                value = json.loads(candidate.read_bytes())
-            except (OSError, ValueError, TypeError):
-                continue
-            if isinstance(value, Mapping) and value.get("pid") == os.getpid():
-                launches.append(candidate)
-        if len(launches) != 1:
+        if not _validate_dev_first_start_context(root):
             raise ValueError("AC dev storage root must equal canonical resolver output")
-        launch = launches[0]
-        match = re.fullmatch(r"launch\.([0-9a-f]{64})\.json", launch.name)
-        raw = launch.read_bytes()
-        try:
-            durable = json.loads(raw)
-        except (OSError, ValueError, TypeError) as exc:
-            raise ValueError("AC dev isolated durable root receipt is unreadable") from exc
-        database = root / AC_DATABASE_DEV_RELATIVE_PATH
-        physical = database.stat(follow_symlinks=False)
-        if (launch.is_symlink() or match is None
-                or hashlib.sha256(raw).hexdigest() != match.group(1)
-                or not isinstance(durable, Mapping)
-                or durable.get("schema_version") != "ac_dev_durable_launch.v1"
-                or durable.get("stage") != "completed"
-                or durable.get("pid") != os.getpid()
-                or durable.get("dev_storage_root") != str(root)
-                or durable.get("database_path") != str(database)
-                or durable.get("project_id") != AC_PROJECT_ID
-                or durable.get("port") != 40008
-                or dict(durable.get("database_identity") or {}).get("device") != int(physical.st_dev)
-                or dict(durable.get("database_identity") or {}).get("inode") != int(physical.st_ino)):
-            raise ValueError("AC dev isolated durable root receipt mismatch")
         return root
-    return _absolute_non_symlink_root(expected, create=create)
+    root = _absolute_non_symlink_root(expected, create=create)
+    archive = _cow_successor_archive(root)
+    if archive.is_dir():
+        receipts = list(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"))
+        if receipts:
+            receipt = validate_dev_cow_successor_receipt(root)
+            successor = dict(receipt.get("successor") or {})
+            identity = dict(successor.get("identity") or {})
+            database = root / AC_DATABASE_DEV_RELATIVE_PATH
+            physical = database.stat(follow_symlinks=False)
+            if (identity.get("device"), identity.get("inode")) == (
+                int(physical.st_dev), int(physical.st_ino),
+            ) and not _validate_dev_first_start_context(root):
+                raise ValueError("AC dev COW postimage requires live first-start custody")
+    return root
 
 
 def dev_launch_receipt_path(storage_root: Path | str) -> Path:
@@ -2335,14 +2355,12 @@ def write_dev_launch_receipt(
 def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str) -> dict[str, object]:
     """Fail closed before a dev server opens SQLite or takes the writer lease."""
     supplied = Path(storage_root).expanduser().absolute()
-    try:
-        root = _dev_storage_root(create=False)
-        if list((root / "runtime" / "durable-launch").glob("launch.*.json")):
-            raise ValueError("isolated durable receipt selected")
-    except ValueError:
-        # An isolated durable child is released only by the immutable
-        # completed receipt written after its unbound custody transaction.
-        root = _absolute_non_symlink_root(supplied, create=False)
+    root = _dev_storage_root(create=False)
+    if supplied != root:
+        raise ValueError("AC dev launch receipt storage root mismatch")
+    if _validate_dev_first_start_context(root):
+        # The completed receipt proves only process/listener release.  Root and
+        # database custody have already been re-proved by the live context.
         runtime = root / "runtime" / "durable-launch"
         candidates = []
         for item in runtime.glob("launch.*.json"):
@@ -2381,8 +2399,6 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
                     "background_workers": "deny"}):
             raise ValueError("AC dev isolated durable launch receipt mismatch")
         return dict(durable)
-    if supplied != root:
-        raise ValueError("AC dev launch receipt storage root mismatch")
     path = root / AC_DEV_LAUNCH_RECEIPT_NAME
     if not path.is_file() or path.is_symlink() or path.resolve(strict=True) != path:
         raise ValueError("AC dev launch receipt is missing or invalid")
@@ -2472,12 +2488,6 @@ _DEV_DURABLE_POLICY = {
     "stable_deployment": "deny", "graph_activation": "deny",
     "background_workers": "deny",
 }
-_DEV_DURABLE_COMPLETED_REF_SCHEMA = "ac_dev_durable_completed_generation_ref.v1"
-_DEV_DURABLE_LAUNCH_SCHEMA = "ac_dev_durable_launch.v1"
-_DEV_DURABLE_PENDING_SCHEMA = "ac_dev_durable_pending.v1"
-_DEV_DURABLE_READINESS_SCHEMA = "ac_dev_durable_readiness.v1"
-_DEV_DURABLE_LEGACY_PHASE = "LEGACY_ADOPTION"
-_DEV_DURABLE_BOOTSTRAP_PHASE = "COMPLETED_BOOTSTRAP"
 
 
 def _git_read_exact(root: Path, *args: str) -> bytes:
@@ -2724,6 +2734,17 @@ def _writer_process_start_identity() -> str:
     ).hexdigest()
 
 
+def _current_custody_start_identity() -> str:
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True,
+        text=True, timeout=2, check=False,
+    )
+    started = result.stdout.strip() if result.returncode == 0 else ""
+    if not started:
+        raise RuntimeError("AC dev custody process start identity is unavailable")
+    return "sha256:" + hashlib.sha256(started.encode("utf-8")).hexdigest()
+
+
 def acquire_dev_runtime_writer_lease(storage_root: Path | str) -> dict[str, object]:
     """Hold the dedicated dev database's OS writer fence for this process."""
 
@@ -2768,16 +2789,19 @@ def acquire_dev_runtime_writer_lease(storage_root: Path | str) -> dict[str, obje
 def release_dev_runtime_writer_lease(storage_root: Path | str) -> None:
     """Release this process's dedicated dev writer fence during shutdown."""
 
+    global _DEV_FIRST_START_CONTEXT
     root = Path(storage_root).expanduser().absolute()
     key = str((root / AC_DATABASE_DEV_RELATIVE_PATH).absolute())
     with _DEV_DATABASE_WRITER_LEASES_LOCK:
         receipt = _DEV_DATABASE_WRITER_LEASES.pop(key, None)
-        if not receipt:
-            return
-        handle = receipt.get("handle")
-        if handle is not None and not getattr(handle, "closed", True):
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
+        if receipt:
+            handle = receipt.get("handle")
+            if handle is not None and not getattr(handle, "closed", True):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                handle.close()
+        context = _DEV_FIRST_START_CONTEXT
+        if context is not None and context.storage_root == str(root):
+            _DEV_FIRST_START_CONTEXT = None
 
 
 def _bind_dev_writer_lease_database_identity(database: Path) -> None:
@@ -3264,6 +3288,25 @@ def backlog_read_schema_inventory(conn: sqlite3.Connection) -> dict[str, object]
     }
 
 
+def _authority_projection_inventory_in_managed_world(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Project the 308 source-owned objects out of the separate backlog overlay."""
+    managed = _backlog_read_managed_object_names() | frozenset({
+        "sqlite_autoindex_dashboard_backlog_cache_generation_1",
+    })
+    inventory = tuple(
+        row for row in _sqlite_master_inventory(conn) if row[1] not in managed
+    )
+    encoded = json.dumps(
+        inventory, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    return {
+        "inventory": [list(item) for item in inventory],
+        "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def _backlog_read_managed_object_names() -> frozenset[str]:
     """The only sqlite_master names an offline backlog admission may create."""
     return frozenset({
@@ -3560,6 +3603,123 @@ def _durable_database_sha256(database: Path) -> str:
     if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
         raise ValueError("AC dev durable database changed during hashing")
     return "sha256:" + digest.hexdigest()
+
+
+def _database_logical_sha256(database: Path) -> str:
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        projection = _sqlite_logical_projection(connection)
+    finally:
+        connection.close()
+    return "sha256:" + hashlib.sha256(json.dumps(
+        projection, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")).hexdigest()
+
+
+def _current_first_start_source(source_root: Path) -> dict[str, str]:
+    root = source_root.expanduser().resolve(strict=True)
+    branch = _git_read_exact(root, "branch", "--show-current").decode().strip()
+    commit = _git_read_exact(root, "rev-parse", "HEAD").decode().strip().lower()
+    tree = _git_read_exact(root, "rev-parse", "HEAD^{tree}").decode().strip().lower()
+    dirty = _git_read_exact(root, "status", "--porcelain").decode()
+    cli_path = root / "agent" / "cli.py"
+    server_path = root / "agent" / "governance" / "server.py"
+    if (branch != "codex/ac-dev" or dirty or cli_path.is_symlink()
+            or server_path.is_symlink() or not cli_path.is_file()
+            or not server_path.is_file()):
+        raise ValueError("AC dev first-start source binding is invalid")
+    return {
+        "root": str(root), "branch": branch, "commit": commit, "tree": tree,
+        "cli_sha256": "sha256:" + hashlib.sha256(cli_path.read_bytes()).hexdigest(),
+        "server_sha256": "sha256:" + hashlib.sha256(server_path.read_bytes()).hexdigest(),
+    }
+
+
+def _install_dev_first_start_context(
+    root: Path, *, source_identity: Mapping[str, object], database_sha256: str,
+    logical_sha256: str,
+) -> None:
+    """Install the sole non-persistent post-transition authority."""
+    global _DEV_FIRST_START_CONTEXT
+    resolved_root = root.expanduser().resolve(strict=True)
+    claimed_source_root = Path(str(source_identity.get("root") or "")).resolve(
+        strict=True
+    )
+    loaded_source_root = Path(__file__).resolve(strict=True).parents[2]
+    if claimed_source_root != loaded_source_root:
+        raise ValueError("AC dev first-start loaded source root mismatch")
+    source = _current_first_start_source(claimed_source_root)
+    expected_source = {
+        "root": source["root"], "branch": source["branch"],
+        "commit": source["commit"], "tree": source["tree"],
+        "source_sha256": source["cli_sha256"], "dirty": "",
+    }
+    if dict(source_identity) != expected_source:
+        raise ValueError("AC dev first-start source identity mismatch")
+    database = resolved_root / AC_DATABASE_DEV_RELATIVE_PATH
+    root_stat = resolved_root.stat(follow_symlinks=False)
+    database_stat = database.stat(follow_symlinks=False)
+    if (_durable_database_sha256(database) != database_sha256
+            or _database_logical_sha256(database) != logical_sha256):
+        raise ValueError("AC dev first-start postimage changed before context install")
+    _bind_dev_writer_lease_database_identity(database)
+    _DEV_FIRST_START_CONTEXT = _DevFirstStartContext(
+        _DEV_FIRST_START_CONTEXT_TOKEN,
+        pid=os.getpid(), process_start_identity=_writer_process_start_identity(),
+        source_root=source["root"], source_commit=source["commit"],
+        source_tree=source["tree"], cli_sha256=source["cli_sha256"],
+        server_sha256=source["server_sha256"], storage_root=str(resolved_root),
+        storage_device=int(root_stat.st_dev), storage_inode=int(root_stat.st_ino),
+        database_path=str(database), database_device=int(database_stat.st_dev),
+        database_inode=int(database_stat.st_ino), database_sha256=database_sha256,
+        logical_sha256=logical_sha256,
+    )
+
+
+def _validate_dev_first_start_context(root: Path) -> bool:
+    context = _DEV_FIRST_START_CONTEXT
+    if context is None:
+        return False
+    if (type(context) is not _DevFirstStartContext
+            or context._sealed is not _DEV_FIRST_START_CONTEXT_TOKEN):
+        raise ValueError("AC dev first-start context is forged")
+    resolved_root = root.expanduser().resolve(strict=True)
+    database = resolved_root / AC_DATABASE_DEV_RELATIVE_PATH
+    root_stat = resolved_root.stat(follow_symlinks=False)
+    database_stat = database.stat(follow_symlinks=False)
+    source = _current_first_start_source(Path(context.source_root))
+    if Path(__file__).resolve(strict=True).parents[2] != Path(context.source_root):
+        raise ValueError("AC dev first-start loaded source root changed")
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = _DEV_DATABASE_WRITER_LEASES.get(str(database))
+        lease_valid = bool(lease) and (
+            int(lease.get("owner_pid") or 0) == os.getpid()
+            and lease.get("owner_start_identity") == _writer_process_start_identity()
+            and (lease.get("database_device"), lease.get("database_inode"))
+            == (int(database_stat.st_dev), int(database_stat.st_ino))
+            and not getattr(lease.get("handle"), "closed", True)
+        )
+    if (
+        context.pid != os.getpid()
+        or context.process_start_identity != _writer_process_start_identity()
+        or context.source_root != source["root"]
+        or context.source_commit != source["commit"]
+        or context.source_tree != source["tree"]
+        or context.cli_sha256 != source["cli_sha256"]
+        or context.server_sha256 != source["server_sha256"]
+        or context.storage_root != str(resolved_root)
+        or (context.storage_device, context.storage_inode)
+        != (int(root_stat.st_dev), int(root_stat.st_ino))
+        or context.database_path != str(database)
+        or (context.database_device, context.database_inode)
+        != (int(database_stat.st_dev), int(database_stat.st_ino))
+        or context.database_sha256 != _durable_database_sha256(database)
+        or context.logical_sha256 != _database_logical_sha256(database)
+        or not lease_valid
+    ):
+        raise ValueError("AC dev first-start context binding changed")
+    return True
 
 
 def _cow_regular_identity(path: Path, *, nlink: int | None = None) -> dict[str, object]:
@@ -4098,479 +4258,9 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
     return receipt
 
 
-_DEV_DURABLE_SOURCE_KEYS = frozenset({
-    "root", "branch", "commit", "tree", "source_sha256", "dirty",
-})
-_DEV_DURABLE_PENDING_KEYS = frozenset({
-    "schema_version", "stage", "durable_start_phase", "launch_id",
-    "parent_pid", "source_identity", "dev_storage_root", "database_path",
-    "database_identity", "database_sha256_before", "linked_v3_receipt",
-    "linked_v3_receipt_sha256", "completed_generation_ref",
-})
-_DEV_DURABLE_READINESS_KEYS = frozenset({
-    "schema_version", "stage", "launch_id", "pid", "pending_sha256",
-    "database_sha256_before", "database_sha256_after", "database_identity",
-    "custody_projection", "durable_start_phase", "custody_delta",
-})
-_DEV_DURABLE_LAUNCH_KEYS = frozenset({
-    "schema_version", "stage", "launch_id", "pid", "process", "argv",
-    "cwd", "python", "source_commit", "source_tree", "server_sha256",
-    "source_root", "database_path", "database_identity", "dev_storage_root",
-    "project_id", "port", "linked_v3_receipt_sha256", "log_path",
-    "log_identity", "policy", "pending_sha256", "readiness_sha256",
-    "database_sha256_before", "database_sha256_after",
-})
-_DEV_DURABLE_DASHBOARD_KEYS = frozenset({
-    "bootstrap_receipt", "bootstrap_receipt_sha256", "bootstrap_pending",
-    "bootstrap_pending_sha256", "historical_launch_sha256",
-    "historical_stop_sha256", "historical_exit_sha256",
-    "historical_launch_id",
-})
-
-
-def _exact_dev_durable_sha256(value: object) -> bool:
-    return bool(re.fullmatch(r"sha256:[0-9a-f]{64}", str(value or "")))
-
-
-def _canonical_dev_durable_runtime(root: Path, *, required: bool) -> Path | None:
-    runtime = (root / "runtime" / "durable-launch").absolute()
-    if not runtime.exists():
-        if required:
-            raise ValueError("AC dev durable completed generation runtime is missing")
-        return None
-    try:
-        details = runtime.stat(follow_symlinks=False)
-        resolved = runtime.resolve(strict=True)
-    except OSError as exc:
-        raise ValueError("AC dev durable completed generation runtime is invalid") from exc
-    if (
-        runtime.is_symlink()
-        or not stat.S_ISDIR(details.st_mode)
-        or resolved != runtime
-        or runtime.parent.is_symlink()
-    ):
-        raise ValueError("AC dev durable completed generation runtime is invalid")
-    return runtime
-
-
-def _read_dev_durable_chain_receipt(
-    runtime: Path, prefix: str, receipt_sha256: str,
-) -> tuple[dict[str, object], Path]:
-    """Read one canonical content-addressed receipt without following links."""
-    if not _exact_dev_durable_sha256(receipt_sha256):
-        raise ValueError(f"AC dev durable {prefix} receipt reference is invalid")
-    digest = receipt_sha256[7:]
-    path = runtime / f"{prefix}.{digest}.json"
-    try:
-        before = path.stat(follow_symlinks=False)
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-        )
-    except OSError as exc:
-        raise ValueError(f"AC dev durable {prefix} receipt is missing") from exc
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            path.is_symlink()
-            or not stat.S_ISREG(before.st_mode)
-            or not stat.S_ISREG(opened.st_mode)
-            or before.st_nlink != 1
-            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
-            or path.parent.resolve(strict=True) != runtime
-        ):
-            raise ValueError(f"AC dev durable {prefix} receipt is not canonical")
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            chunk = os.read(descriptor, 65536)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > 1_048_576:
-                raise ValueError(f"AC dev durable {prefix} receipt is oversized")
-            chunks.append(chunk)
-    finally:
-        os.close(descriptor)
-    raw = b"".join(chunks)
-    if hashlib.sha256(raw).hexdigest() != digest:
-        raise ValueError(f"AC dev durable {prefix} receipt digest mismatch")
-    try:
-        payload = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"AC dev durable {prefix} receipt is malformed") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"AC dev durable {prefix} receipt is malformed")
-    return payload, path
-
-
-def _dev_durable_ref(launch_sha256: str) -> dict[str, str]:
-    return {
-        "schema_version": _DEV_DURABLE_COMPLETED_REF_SCHEMA,
-        "launch_sha256": launch_sha256,
-    }
-
-
-def _validate_dev_durable_ref(value: object) -> dict[str, str]:
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != {"schema_version", "launch_sha256"}
-        or value.get("schema_version") != _DEV_DURABLE_COMPLETED_REF_SCHEMA
-        or not _exact_dev_durable_sha256(value.get("launch_sha256"))
-    ):
-        raise ValueError("AC dev durable completed generation ref is invalid")
-    return _dev_durable_ref(str(value["launch_sha256"]))
-
-
-def _validate_dev_durable_source(
-    value: object, *, candidate_source: Mapping[str, object],
-) -> tuple[dict[str, object], str]:
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != _DEV_DURABLE_SOURCE_KEYS
-        or value.get("branch") != "codex/ac-dev"
-        or value.get("dirty") != ""
-        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(value.get("commit") or ""))
-        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(value.get("tree") or ""))
-        or not _exact_dev_durable_sha256(value.get("source_sha256"))
-    ):
-        raise ValueError("AC dev durable completed generation source is invalid")
-    source = dict(value)
-    tip = {key: source[key] for key in _DEV_SOURCE_TIP_KEYS}
-    _validate_dev_source_tip_custody(
-        tip, stored_sha256=_world_source_tip_hash(tip), candidate=candidate_source,
-    )
-    source_root = Path(str(source["root"])).expanduser().resolve(strict=True)
-    tree = _git_read_exact(
-        source_root, "rev-parse", f"{source['commit']}^{{tree}}",
-    ).decode().strip()
-    source_bytes = _git_read_exact(
-        source_root, "show", f"{source['commit']}:agent/cli.py",
-    )
-    server_bytes = _git_read_exact(
-        source_root, "show", f"{source['commit']}:agent/governance/server.py",
-    )
-    if (
-        tree != source["tree"]
-        or "sha256:" + hashlib.sha256(source_bytes).hexdigest()
-        != source["source_sha256"]
-    ):
-        raise ValueError("AC dev durable completed generation source producer mismatch")
-    return source, "sha256:" + hashlib.sha256(server_bytes).hexdigest()
-
-
-def _validate_dev_durable_dashboard(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _DEV_DURABLE_DASHBOARD_KEYS:
-        raise ValueError("AC dev durable dashboard bootstrap binding is invalid")
-    result = dict(value)
-    for key in (
-        "bootstrap_receipt_sha256", "bootstrap_pending_sha256",
-        "historical_launch_sha256", "historical_stop_sha256",
-        "historical_exit_sha256",
-    ):
-        if not _exact_dev_durable_sha256(result.get(key)):
-            raise ValueError("AC dev durable dashboard bootstrap binding is invalid")
-    if not all(
-        isinstance(result.get(key), str) and result.get(key)
-        for key in ("bootstrap_receipt", "bootstrap_pending", "historical_launch_id")
-    ):
-        raise ValueError("AC dev durable dashboard bootstrap binding is invalid")
-    return result
-
-
-def _validate_dev_durable_launch_argv(
-    value: object, *, python: str, root: Path, runtime: Path,
-    launch_id: str, pending_path: Path, linked_path: Path,
-) -> list[str]:
-    if not isinstance(value, list) or not all(
-        isinstance(item, str) and item for item in value
-    ):
-        raise ValueError("AC dev durable completed generation argv is invalid")
-    argv = list(value)
-    if (
-        len(argv) != 22
-        or argv[1:10] != [
-            "-m", "agent.cli", "start", "--runtime-plane", "dev", "--port",
-            "40008", "--dev-storage-root", str(root),
-        ]
-        or argv[10] != "--stable-anchor-commit"
-        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", argv[11])
-        or argv[12:17] != [
-            "--durable-child-runtime-dir", str(runtime),
-            "--durable-child-launch-id", launch_id,
-            "--durable-child-control-fd",
-        ]
-        or not argv[17].isdigit()
-        or argv[18:] != [
-            "--durable-child-pending-receipt", str(pending_path),
-            "--durable-child-linked-v3-receipt", str(linked_path),
-        ]
-    ):
-        raise ValueError("AC dev durable completed generation argv is invalid")
-    try:
-        if Path(argv[0]).resolve(strict=True) != Path(python).resolve(strict=True):
-            raise ValueError("AC dev durable completed generation python mismatch")
-    except OSError as exc:
-        raise ValueError("AC dev durable completed generation python mismatch") from exc
-    return argv
-
-
-def _validate_dev_durable_completed_chain(
-    root: Path, *, completed_generation_ref: Mapping[str, object],
-    source_identity: Mapping[str, object], linked_v3_receipt: Path,
-    visited: frozenset[str] = frozenset(),
-) -> dict[str, object]:
-    """Reconstruct one official launch/readiness/pending chain from canonical bytes."""
-    runtime = _canonical_dev_durable_runtime(root, required=True)
-    assert runtime is not None
-    ref = _validate_dev_durable_ref(completed_generation_ref)
-    launch_sha256 = ref["launch_sha256"]
-    if launch_sha256 in visited:
-        raise ValueError("AC dev durable completed generation chain is cyclic")
-    launch, _launch_path = _read_dev_durable_chain_receipt(
-        runtime, "launch", launch_sha256,
-    )
-    if set(launch) not in {
-        _DEV_DURABLE_LAUNCH_KEYS,
-        _DEV_DURABLE_LAUNCH_KEYS | {"dashboard_bootstrap"},
-    }:
-        raise ValueError("AC dev durable completed launch shape is invalid")
-    pending_sha256 = str(launch.get("pending_sha256") or "")
-    readiness_sha256 = str(launch.get("readiness_sha256") or "")
-    pending, pending_path = _read_dev_durable_chain_receipt(
-        runtime, "pending", pending_sha256,
-    )
-    readiness, _readiness_path = _read_dev_durable_chain_receipt(
-        runtime, "readiness", readiness_sha256,
-    )
-    if set(pending) not in {
-        _DEV_DURABLE_PENDING_KEYS,
-        _DEV_DURABLE_PENDING_KEYS | {"dashboard_bootstrap"},
-    }:
-        raise ValueError("AC dev durable completed pending shape is invalid")
-    if set(readiness) != _DEV_DURABLE_READINESS_KEYS:
-        raise ValueError("AC dev durable completed readiness shape is invalid")
-    phase = pending.get("durable_start_phase")
-    dashboard = pending.get("dashboard_bootstrap")
-    if phase == _DEV_DURABLE_LEGACY_PHASE:
-        if dashboard is not None or "dashboard_bootstrap" in launch:
-            raise ValueError("AC dev durable legacy generation has bootstrap state")
-    elif phase == _DEV_DURABLE_BOOTSTRAP_PHASE:
-        dashboard = _validate_dev_durable_dashboard(dashboard)
-        if launch.get("dashboard_bootstrap") != dashboard:
-            raise ValueError("AC dev durable dashboard bootstrap chain mismatch")
-    else:
-        raise ValueError("AC dev durable completed generation phase is invalid")
-    source, server_sha256 = _validate_dev_durable_source(
-        pending.get("source_identity"), candidate_source=source_identity,
-    )
-    database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
-    linked_path = linked_v3_receipt.expanduser().absolute()
-    linked_sha256 = "sha256:" + hashlib.sha256(linked_path.read_bytes()).hexdigest()
-    database_stat = database.stat(follow_symlinks=False)
-    expected_database_identity = {
-        "device": int(database_stat.st_dev), "inode": int(database_stat.st_ino),
-    }
-    if phase == _DEV_DURABLE_BOOTSTRAP_PHASE:
-        expected_database_identity = {"path": str(database), **expected_database_identity}
-    launch_id = str(launch.get("launch_id") or "")
-    pid = launch.get("pid")
-    process = launch.get("process")
-    custody = readiness.get("custody_projection")
-    policy = dict(_DEV_DURABLE_POLICY)
-    if (
-        launch.get("schema_version") != _DEV_DURABLE_LAUNCH_SCHEMA
-        or launch.get("stage") != "completed"
-        or pending.get("schema_version") != _DEV_DURABLE_PENDING_SCHEMA
-        or pending.get("stage") != "pending"
-        or readiness.get("schema_version") != _DEV_DURABLE_READINESS_SCHEMA
-        or readiness.get("stage") != "ready_unbound"
-        or not re.fullmatch(r"[0-9a-f]{24}", launch_id)
-        or type(pid) is not int or pid <= 0
-        or type(pending.get("parent_pid")) is not int
-        or int(pending["parent_pid"]) <= 0
-        or pending.get("launch_id") != launch_id
-        or readiness.get("launch_id") != launch_id
-        or readiness.get("pid") != pid
-        or readiness.get("pending_sha256") != pending_sha256
-        or pending.get("dev_storage_root") != str(root)
-        or launch.get("dev_storage_root") != str(root)
-        or pending.get("database_path") != str(database)
-        or launch.get("database_path") != str(database)
-        or pending.get("database_identity") != expected_database_identity
-        or readiness.get("database_identity") != expected_database_identity
-        or launch.get("database_identity") != expected_database_identity
-        or pending.get("linked_v3_receipt") != str(linked_path)
-        or pending.get("linked_v3_receipt_sha256") != linked_sha256
-        or launch.get("linked_v3_receipt_sha256") != linked_sha256
-        or launch.get("project_id") != AC_PROJECT_ID
-        or launch.get("port") != 40008
-        or launch.get("policy") != policy
-        or launch.get("source_root") != source["root"]
-        or launch.get("source_commit") != source["commit"]
-        or launch.get("source_tree") != source["tree"]
-        or launch.get("server_sha256") != server_sha256
-        or launch.get("cwd") != source["root"]
-        or readiness.get("durable_start_phase") != phase
-        or not _exact_dev_durable_sha256(pending.get("database_sha256_before"))
-        or pending.get("database_sha256_before")
-        != readiness.get("database_sha256_before")
-        or readiness.get("database_sha256_before")
-        != launch.get("database_sha256_before")
-        or not _exact_dev_durable_sha256(readiness.get("database_sha256_after"))
-        or readiness.get("database_sha256_after")
-        != launch.get("database_sha256_after")
-    ):
-        raise ValueError("AC dev durable completed generation binding mismatch")
-    if phase == _DEV_DURABLE_LEGACY_PHASE:
-        if readiness.get("custody_delta") is not None:
-            raise ValueError("AC dev durable legacy custody delta is invalid")
-    else:
-        delta = readiness.get("custody_delta")
-        if not isinstance(delta, Mapping) or set(delta) != set(
-            _COMPLETED_BOOTSTRAP_CUSTODY_KEYS
-        ):
-            raise ValueError("AC dev durable bootstrap custody delta is invalid")
-    if not isinstance(custody, Mapping):
-        raise ValueError("AC dev durable completed custody is invalid")
-    _validate_dev_current_process_custody(
-        custody, root=root, candidate_source=source_identity,
-    )
-    if (
-        custody.get("pid") != pid
-        or custody.get("launch_id") != launch_id
-        or custody.get("source_root") != source["root"]
-        or custody.get("source_commit") != source["commit"]
-        or custody.get("source_tree") != source["tree"]
-        or custody.get("dev_storage_root") != str(root)
-        or custody.get("project_id") != AC_PROJECT_ID
-        or custody.get("port") != 40008
-        or custody.get("policy") != policy
-    ):
-        raise ValueError("AC dev durable completed custody binding mismatch")
-    if (
-        not isinstance(process, Mapping)
-        or set(process) != {"start_identity", "argv", "cwd"}
-        or process.get("start_identity") != custody.get("start_identity")
-        or process.get("cwd") != source["root"]
-        or not isinstance(process.get("argv"), str)
-        or launch_id not in str(process.get("argv"))
-        or "agent.cli" not in str(process.get("argv"))
-    ):
-        raise ValueError("AC dev durable completed process binding mismatch")
-    _validate_dev_durable_launch_argv(
-        launch.get("argv"), python=str(launch.get("python") or ""),
-        root=root, runtime=runtime, launch_id=launch_id,
-        pending_path=pending_path, linked_path=linked_path,
-    )
-    log_path = runtime / f"governance-{launch_id}.log"
-    try:
-        log_stat = log_path.stat(follow_symlinks=False)
-    except OSError as exc:
-        raise ValueError("AC dev durable completed log is missing") from exc
-    if (
-        log_path.is_symlink()
-        or not stat.S_ISREG(log_stat.st_mode)
-        or launch.get("log_path") != str(log_path)
-        or launch.get("log_identity") != {
-            "path": str(log_path), "device": int(log_stat.st_dev),
-            "inode": int(log_stat.st_ino),
-        }
-    ):
-        raise ValueError("AC dev durable completed log binding mismatch")
-    predecessor_ref = pending.get("completed_generation_ref")
-    if predecessor_ref is not None:
-        predecessor = _validate_dev_durable_completed_chain(
-            root, completed_generation_ref=_validate_dev_durable_ref(predecessor_ref),
-            source_identity=source_identity, linked_v3_receipt=linked_path,
-            visited=visited | {launch_sha256},
-        )
-        if predecessor["database_sha256"] != pending["database_sha256_before"]:
-            raise ValueError("AC dev durable completed generation predecessor mismatch")
-    elif phase == _DEV_DURABLE_LEGACY_PHASE:
-        issuance = validate_dev_cow_successor_receipt(root)
-        issuance_sha256 = str(
-            dict(dict(issuance.get("successor") or {}).get("identity") or {}).get(
-                "sha256"
-            )
-            or ""
-        )
-        if (
-            not _exact_dev_durable_sha256(issuance_sha256)
-            or pending["database_sha256_before"] != issuance_sha256
-        ):
-            raise ValueError(
-                "AC dev durable completed generation lacks issuance authority"
-            )
-    else:
-        raise ValueError(
-            "AC dev durable completed bootstrap generation lacks external authority"
-        )
-    return {
-        "ref": ref,
-        "database_sha256": str(launch["database_sha256_after"]),
-        "custody_projection": dict(custody),
-        "launch": launch,
-    }
-
-
-def select_dev_completed_generation_ref(
-    storage_root: Path | str, *, source_identity: Mapping[str, object],
-    linked_v3_receipt: Path,
-) -> dict[str, str] | None:
-    """Select the unique official completed chain owning today's database bytes."""
-    root = Path(storage_root).expanduser().absolute()
-    runtime = _canonical_dev_durable_runtime(root, required=False)
-    if runtime is None:
-        return None
-    launch_paths = sorted(runtime.glob("launch.*.json"))
-    if not launch_paths:
-        if list(runtime.glob("pending.*.json")) or list(runtime.glob("readiness.*.json")):
-            raise ValueError("AC dev durable completed generation chain is incomplete")
-        return None
-    database_sha256 = _durable_database_sha256(
-        root / AC_DATABASE_DEV_RELATIVE_PATH
-    )
-    matches: list[dict[str, str]] = []
-    for path in launch_paths:
-        match = re.fullmatch(r"launch\.([0-9a-f]{64})\.json", path.name)
-        if match is None:
-            raise ValueError("AC dev durable completed launch filename is invalid")
-        ref = _dev_durable_ref("sha256:" + match.group(1))
-        chain = _validate_dev_durable_completed_chain(
-            root, completed_generation_ref=ref, source_identity=source_identity,
-            linked_v3_receipt=linked_v3_receipt,
-        )
-        if chain["database_sha256"] == database_sha256:
-            matches.append(ref)
-    if len(matches) != 1:
-        raise ValueError(
-            "AC dev durable completed generation postimage is missing or ambiguous"
-        )
-    return matches[0]
-
-
-def _resolve_dev_completed_generation_ref(
-    root: Path, *, completed_generation_ref: object,
-    source_identity: Mapping[str, object], linked_v3_receipt: Path,
-) -> dict[str, object]:
-    ref = _validate_dev_durable_ref(completed_generation_ref)
-    selected = select_dev_completed_generation_ref(
-        root, source_identity=source_identity,
-        linked_v3_receipt=linked_v3_receipt,
-    )
-    if selected != ref:
-        raise ValueError("AC dev durable completed generation ref is not current")
-    return _validate_dev_durable_completed_chain(
-        root, completed_generation_ref=ref, source_identity=source_identity,
-        linked_v3_receipt=linked_v3_receipt,
-    )
-
-
 def validate_dev_cow_successor_preimage(
     storage_root: Path | str, *, linked_v3_receipt: Path,
     source_identity: Mapping[str, object], stable_binding: Mapping[str, object],
-    completed_generation_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate the exact live post-COW inode against immutable v2 authority."""
     root = Path(storage_root).expanduser().absolute()
@@ -4606,6 +4296,11 @@ def validate_dev_cow_successor_preimage(
     try:
         _verify_existing_schema(conn)
         _verify_dev_world_schema_inventory(conn)
+        actual_inventory = _authority_projection_inventory_in_managed_world(conn)
+        canonical_inventory = authority_projection_schema_inventory()
+        if (len(actual_inventory["inventory"]) != 308
+                or actual_inventory != canonical_inventory):
+            raise ValueError("AC dev COW successor exact schema inventory mismatch")
         _verify_current_dev_backlog_runtime_invariants(
             conn,
             expected_protected_inventory=dict(successor.get("protected_inventory") or {}),
@@ -4624,15 +4319,7 @@ def validate_dev_cow_successor_preimage(
         r"sha256:[0-9a-f]{64}", issuance_schema_meta_sha256
     ):
         raise ValueError("AC dev COW successor issuance schema_meta authority is invalid")
-    completed_generation = None
-    if completed_generation_ref is not None:
-        completed_generation = _resolve_dev_completed_generation_ref(
-            root, completed_generation_ref=completed_generation_ref,
-            source_identity=source_identity, linked_v3_receipt=linked_path,
-        )
-        if current.get("sha256") != completed_generation["database_sha256"]:
-            raise ValueError("AC dev COW completed generation database anchor mismatch")
-    elif current_schema_meta_sha256 != issuance_schema_meta_sha256:
+    if current_schema_meta_sha256 != issuance_schema_meta_sha256:
         raise ValueError("AC dev COW successor issuance schema_meta mismatch")
     if (meta.get("governance_world_genesis_json") != successor.get("genesis_json")
             or meta.get("governance_world_genesis_sha256") != successor.get("genesis_sha256")
@@ -4659,11 +4346,6 @@ def validate_dev_cow_successor_preimage(
         process, root=root, candidate_source=source_identity,
         historical_process=historical_process,
     )
-    if (
-        completed_generation is not None
-        and dict(process) != completed_generation["custody_projection"]
-    ):
-        raise ValueError("AC dev COW completed generation custody mismatch")
     _validate_dev_source_tip_custody(
         tip, stored_sha256=str(meta.get("governance_world_source_tip_sha256") or ""),
         candidate=source_identity,
@@ -4698,7 +4380,6 @@ def _verify_current_dev_backlog_runtime_invariants(
 def validate_dev_preimage_only(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     linked_v3_receipt: Path,
-    completed_generation_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate an admitted preimage or exact source-owned custody postimage.
 
@@ -4708,7 +4389,6 @@ def validate_dev_preimage_only(
     root = _dev_storage_root(
         create=False, isolated_receipt=linked_v3_receipt,
         source_identity=source_identity, allow_postimage=True,
-        completed_generation_ref=completed_generation_ref,
     )
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
     physical = database.stat(follow_symlinks=False)
@@ -4745,18 +4425,12 @@ def validate_dev_preimage_only(
 def commit_dev_child_custody(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     process_identity: Mapping[str, object], linked_v3_receipt: Path,
-    expected_database_identity: Mapping[str, object], expected_pre_sha256: str,
-    completed_generation_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Child-owned, CAS-bound custody commit used before any listener bind."""
     pre = validate_dev_preimage_only(
         storage_root, source_identity=source_identity,
         linked_v3_receipt=linked_v3_receipt,
-        completed_generation_ref=completed_generation_ref,
     )
-    if (pre["database_identity"] != dict(expected_database_identity)
-            or pre["database_sha256"] != expected_pre_sha256):
-        raise ValueError("AC dev durable child preimage CAS mismatch")
     # The child has not bound and this is the sole explicitly authorized
     # bootstrap transaction.  Source-contract construction must not inherit
     # the later live server's verify-only capability mode (which would reject
@@ -4766,7 +4440,6 @@ def commit_dev_child_custody(
         receipt = bootstrap_dev_governance_store(
             storage_root, source_identity=source_identity,
             process_identity=process_identity, linked_v3_receipt=linked_v3_receipt,
-            completed_generation_ref=completed_generation_ref,
         )
     finally:
         if previous_plane is not None:
@@ -4781,11 +4454,7 @@ def commit_dev_child_custody(
     finally:
         checkpoint.close()
     physical = database.stat(follow_symlinks=False)
-    if (
-        physical.st_nlink != 1
-        or {"device": int(physical.st_dev), "inode": int(physical.st_ino)}
-        != dict(expected_database_identity)
-    ):
+    if physical.st_nlink != 1:
         raise ValueError("AC dev durable child postimage identity mismatch")
     post_sha256 = _durable_database_sha256(database)
     uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
@@ -4829,8 +4498,13 @@ def commit_dev_child_custody(
         ),
         candidate=source_identity,
     )
+    logical_sha256 = _database_logical_sha256(database)
+    _install_dev_first_start_context(
+        root, source_identity=source_identity, database_sha256=post_sha256,
+        logical_sha256=logical_sha256,
+    )
     return {
-        **receipt, "database_sha256_before": expected_pre_sha256,
+        **receipt, "database_sha256_before": pre["database_sha256"],
         "database_sha256_after": post_sha256,
         "custody_projection": dict(post_process),
         "database_identity": {
@@ -4839,127 +4513,189 @@ def commit_dev_child_custody(
     }
 
 
-_COMPLETED_BOOTSTRAP_CUSTODY_KEYS = (
+_FIRST_COW_CUSTODY_KEYS = (
     "governance_world_source_tip_json", "governance_world_source_tip_sha256",
     "governance_world_source_tip_revision", "governance_world_current_process_json",
 )
 
 
-def commit_completed_bootstrap_child_custody(
-    storage_root: Path | str, *, expected_database_identity: Mapping[str, object],
-    expected_pre_sha256: str, expected_schema_meta: Mapping[str, object],
-    custody_updates: Mapping[str, object], expected_managed_inventory: Mapping[str, object],
-    expected_protected_inventory: Mapping[str, object],
-    expected_protected_projection: Mapping[str, object],
+def _commit_first_cow_child_custody(
+    conn: sqlite3.Connection, *, root: Path, linked_v3_receipt: Path,
+    source_identity: Mapping[str, object], process_identity: Mapping[str, object],
 ) -> dict[str, object]:
-    """CAS exactly four custody cells on a verified dashboard-bootstrap postimage.
-
-    This intentionally has no legacy receipt/adoption fallback.  The caller
-    supplies immutable receipt-derived expectations; every other schema/meta
-    value is held byte-for-byte stable across the single transaction.
-    """
-    root = Path(storage_root).expanduser().absolute()
-    if root.is_symlink() or root.resolve(strict=True) != root:
-        raise ValueError("AC dev completed bootstrap custody root is invalid")
+    """Perform the one issuance-authorized custody transition atomically."""
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
-    if (database.is_symlink() or not database.is_file()
-            or database.resolve(strict=True) != database):
-        raise ValueError("AC dev completed bootstrap custody database path is invalid")
-    if (set(custody_updates) != set(_COMPLETED_BOOTSTRAP_CUSTODY_KEYS)
-            or not all(isinstance(value, str) for value in custody_updates.values())
-            or not isinstance(expected_schema_meta, Mapping)):
-        raise ValueError("AC dev completed bootstrap custody context is invalid")
-    if (not isinstance(expected_database_identity.get("path"), str)
-            or expected_database_identity.get("path") != str(database)
-            or not isinstance(expected_database_identity.get("device"), int)
-            or not isinstance(expected_database_identity.get("inode"), int)):
-        raise ValueError("AC dev completed bootstrap custody receipt identity is invalid")
-    physical_stat = database.stat(follow_symlinks=False)
-    if physical_stat.st_nlink != 1:
-        raise ValueError("AC dev completed bootstrap custody database link count is invalid")
-    physical = {"device": int(physical_stat.st_dev), "inode": int(physical_stat.st_ino)}
-    claimed_physical = {"device": expected_database_identity["device"],
-                        "inode": expected_database_identity["inode"]}
-    if claimed_physical != physical:
-        raise ValueError("AC dev completed bootstrap custody identity mismatch")
-    pre_sha = _durable_database_sha256(database)
-    if pre_sha != expected_pre_sha256:
-        raise ValueError("AC dev completed bootstrap custody preimage mismatch")
-    lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
-    acquire_dev_runtime_writer_lease(root)
-    conn = sqlite3.connect(str(database), timeout=30, isolation_level=None)
+    stable = verified_stable_database_binding()
+    linked_v3_receipt = linked_v3_receipt.expanduser().absolute()
+    pre_receipt = validate_dev_cow_successor_preimage(
+        root, linked_v3_receipt=linked_v3_receipt,
+        source_identity=source_identity, stable_binding=stable,
+    )
+    pre_identity = _cow_regular_identity(database)
+    linked_sha256 = "sha256:" + hashlib.sha256(
+        linked_v3_receipt.read_bytes()
+    ).hexdigest()
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        # SQLite creates its own WAL/SHM or rollback journal at BEGIN IMMEDIATE.
+        # The sidecar-free admission immediately above precedes the lock; once
+        # locked, re-prove every immutable/physical binding and reject every
+        # sidecar except this connection's regular transient journal.
+        receipt = validate_dev_cow_successor_receipt(root)
+        successor = dict(receipt.get("successor") or {})
+        identity = dict(successor.get("identity") or {})
+        current = _cow_regular_identity(database)
+        history = dict(receipt.get("history") or {})
+        stable_identity = dict(stable.get("stable_database_identity") or {})
+        issuance_stable = dict(
+            dict(receipt.get("stable_binding") or {}).get("database") or {}
+        )
+        transaction_sidecars: dict[str, tuple[int, int]] = {}
+        sidecars_valid = True
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(str(database) + suffix)
+            if not sidecar.exists():
+                continue
+            details = sidecar.stat(follow_symlinks=False)
+            if sidecar.is_symlink() or not stat.S_ISREG(details.st_mode):
+                sidecars_valid = False
+                continue
+            transaction_sidecars[suffix] = (int(details.st_dev), int(details.st_ino))
+        locked_reasons = []
+        if receipt != pre_receipt:
+            locked_reasons.append("receipt")
+        if current != pre_identity:
+            locked_reasons.append("database")
+        if (identity.get("path") != str(database)
+                or identity.get("device") != current["device"]
+                or identity.get("inode") != current["inode"]):
+            locked_reasons.append("identity")
+        if dict(history.get("linked_v3") or {}) != {
+                    "path": str(linked_v3_receipt), "sha256": linked_sha256,
+                }:
+            locked_reasons.append("linked")
+        if issuance_stable != stable_identity:
+            locked_reasons.append("stable")
+        if not sidecars_valid:
+            locked_reasons.append("sidecar")
+        if locked_reasons:
+            raise ValueError(
+                "AC dev first-start locked physical binding changed: "
+                + ",".join(locked_reasons)
+            )
+        _assert_no_external_sqlite_holders(database)
         before_meta = {str(key): str(value) for key, value in conn.execute(
             "SELECT key,value FROM schema_meta ORDER BY key"
         )}
-        if before_meta != {str(key): str(value) for key, value in expected_schema_meta.items()}:
-            raise ValueError("AC dev completed bootstrap custody metadata drift")
-        if (backlog_read_schema_managed_inventory(conn) != dict(expected_managed_inventory)
-                or backlog_read_schema_protected_inventory(conn) != dict(expected_protected_inventory)
-                or _sqlite_logical_projection(
-                    conn, exclude_tables=frozenset({"schema_meta"})
-                ) != dict(expected_protected_projection)):
-            raise ValueError("AC dev completed bootstrap custody schema drift")
-        for key in _COMPLETED_BOOTSTRAP_CUSTODY_KEYS:
-            conn.execute("UPDATE schema_meta SET value=? WHERE key=?", (custody_updates[key], key))
-            if conn.execute("SELECT changes()").fetchone() != (1,):
-                raise ValueError("AC dev completed bootstrap custody key is missing")
+        before_projection = _sqlite_logical_projection(conn)
+        issuance_schema_meta = str(
+            dict(successor.get("protected_projection") or {}).get("schema_meta") or ""
+        )
+        inventory = _authority_projection_inventory_in_managed_world(conn)
+        if (len(inventory["inventory"]) != 308
+                or inventory != authority_projection_schema_inventory()
+                or before_projection.get("schema_meta") != issuance_schema_meta
+                or backlog_read_schema_managed_inventory(conn)
+                != dict(successor.get("managed_inventory") or {})
+                or backlog_read_schema_protected_inventory(conn)
+                != dict(successor.get("protected_inventory") or {})):
+            raise ValueError("AC dev first-start issuance projection mismatch")
+        try:
+            previous_tip = json.loads(before_meta["governance_world_source_tip_json"])
+            previous_process = json.loads(
+                before_meta["governance_world_current_process_json"]
+            )
+            previous_revision = int(
+                before_meta["governance_world_source_tip_revision"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("AC dev first-start custody preimage is malformed") from exc
+        if not isinstance(previous_tip, Mapping) or not isinstance(previous_process, Mapping):
+            raise ValueError("AC dev first-start custody preimage is malformed")
+        _validate_dev_source_tip_custody(
+            previous_tip,
+            stored_sha256=before_meta["governance_world_source_tip_sha256"],
+            candidate=source_identity,
+        )
+        _validate_dev_current_process_custody(
+            process_identity, root=root, candidate_source=source_identity,
+        )
+        if (process_identity.get("pid") != os.getpid()
+                or process_identity.get("start_identity")
+                != _current_custody_start_identity()):
+            raise ValueError("AC dev first-start custody is not the current process")
+        source_tip = {key: source_identity.get(key) for key in _DEV_SOURCE_TIP_KEYS}
+        source_changed = dict(previous_tip) != source_tip
+        updates = {
+            "governance_world_source_tip_json": json.dumps(
+                source_tip, sort_keys=True, separators=(",", ":")
+            ),
+            "governance_world_source_tip_sha256": _world_source_tip_hash(source_tip),
+            "governance_world_source_tip_revision": str(
+                previous_revision + (1 if source_changed else 0)
+            ),
+            "governance_world_current_process_json": json.dumps(
+                dict(process_identity), sort_keys=True, separators=(",", ":")
+            ),
+        }
+        if dict(process_identity) == dict(previous_process):
+            raise ValueError("AC dev first-start process custody did not advance")
+        for key in _FIRST_COW_CUSTODY_KEYS:
+            cursor = conn.execute(
+                "UPDATE schema_meta SET value=? WHERE key=? AND value=?",
+                (updates[key], key, before_meta.get(key)),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("AC dev first-start custody CAS changed")
         after_meta = {str(key): str(value) for key, value in conn.execute(
             "SELECT key,value FROM schema_meta ORDER BY key"
         )}
-        changed = {key for key in after_meta if before_meta.get(key) != after_meta.get(key)}
-        if (not changed or not changed <= set(_COMPLETED_BOOTSTRAP_CUSTODY_KEYS)
+        changed = {key for key in before_meta if before_meta[key] != after_meta.get(key)}
+        noncustody_before = {
+            key: value for key, value in before_meta.items()
+            if key not in _FIRST_COW_CUSTODY_KEYS
+        }
+        noncustody_after = {
+            key: value for key, value in after_meta.items()
+            if key not in _FIRST_COW_CUSTODY_KEYS
+        }
+        after_projection = _sqlite_logical_projection(conn)
+        sidecars_after = {}
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(str(database) + suffix)
+            if sidecar.exists():
+                details = sidecar.stat(follow_symlinks=False)
+                sidecars_after[suffix] = (int(details.st_dev), int(details.st_ino))
+        if (not changed
                 or "governance_world_current_process_json" not in changed
-                or "governance_world_source_tip_revision" not in changed
-                or any(after_meta.get(key) != custody_updates[key]
-                       for key in _COMPLETED_BOOTSTRAP_CUSTODY_KEYS)):
-            raise ValueError("AC dev completed bootstrap custody wrote outside its authority")
-        try:
-            tip = json.loads(after_meta["governance_world_source_tip_json"])
-            revision_before = int(before_meta["governance_world_source_tip_revision"])
-            revision_after = int(after_meta["governance_world_source_tip_revision"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("AC dev completed bootstrap custody source tip is malformed") from exc
-        if (not isinstance(tip, Mapping)
-                or revision_after != revision_before + 1
-                or after_meta["governance_world_source_tip_sha256"]
-                != _world_source_tip_hash(dict(tip))):
-            raise ValueError("AC dev completed bootstrap custody source tip mismatch")
-        if (backlog_read_schema_managed_inventory(conn) != dict(expected_managed_inventory)
-                or backlog_read_schema_protected_inventory(conn) != dict(expected_protected_inventory)
-                or _sqlite_logical_projection(
-                    conn, exclude_tables=frozenset({"schema_meta"})
-                ) != dict(expected_protected_projection)):
-            raise ValueError("AC dev completed bootstrap custody postcondition failed")
+                or not changed <= set(_FIRST_COW_CUSTODY_KEYS)
+                or noncustody_after != noncustody_before
+                or any(after_meta.get(key) != updates[key]
+                       for key in _FIRST_COW_CUSTODY_KEYS)
+                or {key: value for key, value in after_projection.items()
+                    if key != "schema_meta"}
+                != {key: value for key, value in before_projection.items()
+                    if key != "schema_meta"}
+                or sidecars_after != transaction_sidecars
+                or _authority_projection_inventory_in_managed_world(conn) != inventory):
+            raise ValueError("AC dev first-start custody postcondition failed")
+        logical_sha256 = "sha256:" + hashlib.sha256(json.dumps(
+            after_projection, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")).hexdigest()
         conn.commit()
     except Exception:
         conn.rollback()
-        if lease_created:
-            release_dev_runtime_writer_lease(root)
         raise
-    finally:
-        conn.close()
-    checkpoint = sqlite3.connect(str(database), timeout=30)
-    try:
-        if tuple(checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()) != (0, 0, 0):
-            raise RuntimeError("AC dev completed bootstrap custody checkpoint failed")
-    finally:
-        checkpoint.close()
-    try:
-        _bind_dev_writer_lease_database_identity(database)
-    except Exception:
-        if lease_created:
-            release_dev_runtime_writer_lease(root)
-        raise
-    post_stat = database.stat(follow_symlinks=False)
-    post_identity = {"device": int(post_stat.st_dev), "inode": int(post_stat.st_ino)}
-    return {"database_identity": post_identity, "database_sha256_before": pre_sha,
-            "database_sha256_after": _durable_database_sha256(database),
-            "schema_meta_before": before_meta, "schema_meta_after": after_meta,
-            "custody_delta": {key: {"before": before_meta[key], "after": after_meta[key]}
-                              for key in _COMPLETED_BOOTSTRAP_CUSTODY_KEYS},
-            "changed_custody_keys": sorted(changed)}
+    return {
+        "receipt": receipt, "schema_meta_before": before_meta,
+        "schema_meta_after": after_meta, "logical_sha256": logical_sha256,
+        "changed_custody_keys": sorted(changed),
+        "custody_delta": {
+            key: {"before": before_meta[key], "after": after_meta[key]}
+            for key in changed
+        },
+    }
 
 
 def bootstrap_dev_governance_store(
@@ -4971,7 +4707,6 @@ def bootstrap_dev_governance_store(
     expected_previous_process_identity: Mapping[str, object] | None = None,
     expected_database_identity: Mapping[str, object] | None = None,
     linked_v3_receipt: Path | None = None,
-    completed_generation_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Create or verify the source-only AC dev world without copying stable rows.
 
@@ -4996,7 +4731,6 @@ def bootstrap_dev_governance_store(
     root = _dev_storage_root(
         create=not root_existed, isolated_receipt=linked_v3_receipt,
         source_identity=source_identity, allow_postimage=True,
-        completed_generation_ref=completed_generation_ref,
     )
     source = {
         "root": str(source_identity.get("root") or "").strip(),
@@ -5097,6 +4831,65 @@ def bootstrap_dev_governance_store(
     try:
         conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row
+        if cow_successor_receipt is not None and linked_v3_receipt is not None:
+            pre_sha256 = _durable_database_sha256(database)
+            transition = _commit_first_cow_child_custody(
+                conn, root=root, linked_v3_receipt=linked_v3_receipt,
+                source_identity=source_identity, process_identity=process,
+            )
+            conn.close()
+            conn = None
+            checkpoint = sqlite3.connect(str(database), timeout=30)
+            try:
+                if tuple(checkpoint.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()) != (0, 0, 0):
+                    raise RuntimeError("AC dev first-start checkpoint failed")
+            finally:
+                checkpoint.close()
+            _bind_dev_writer_lease_database_identity(database)
+            post_sha256 = _durable_database_sha256(database)
+            logical_sha256 = _database_logical_sha256(database)
+            if logical_sha256 != transition["logical_sha256"]:
+                raise ValueError("AC dev first-start logical postimage changed")
+            _install_dev_first_start_context(
+                root, source_identity=source_identity, database_sha256=post_sha256,
+                logical_sha256=logical_sha256,
+            )
+            meta = dict(transition["schema_meta_after"])
+            genesis = json.loads(meta["governance_world_genesis_json"])
+            current_process_identity = json.loads(
+                meta["governance_world_current_process_json"]
+            )
+            source_tip_identity = json.loads(
+                meta["governance_world_source_tip_json"]
+            )
+            source_tip_sha256 = meta["governance_world_source_tip_sha256"]
+            source_tip_revision = int(meta["governance_world_source_tip_revision"])
+            genesis_sha256 = meta["governance_world_genesis_sha256"]
+            metadata = database.stat(follow_symlinks=False)
+            identity = {
+                "schema_version": "ac_governance_database_identity.v2",
+                "world_id": AC_DEV_WORLD_ID, "project_id": AC_PROJECT_ID,
+                "device": int(metadata.st_dev), "inode": int(metadata.st_ino),
+                "relative_path_sha256": "sha256:" + hashlib.sha256(
+                    AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")
+                ).hexdigest(), "genesis_sha256": genesis_sha256,
+            }
+            return {
+                **dict(genesis), "genesis_sha256": genesis_sha256,
+                "database_path": str(database), "database_identity": identity,
+                "created": False, "restart_safe": False,
+                "legacy_rows_imported": False,
+                "current_process_identity": current_process_identity,
+                "source_tip_identity": source_tip_identity,
+                "source_tip_sha256": source_tip_sha256,
+                "source_tip_revision": source_tip_revision,
+                "source_upgraded": bool(transition["changed_custody_keys"]),
+                "database_sha256_before": pre_sha256,
+                "database_sha256_after": post_sha256,
+                "custody_delta": transition["custody_delta"],
+            }
         admitted_preimage = False
         if not created and linked_v3_receipt is not None:
             existing_meta = dict(conn.execute(
