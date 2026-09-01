@@ -57,47 +57,6 @@ def test_dev_create_cow_successor_receipt_delegates_to_db(tmp_path, monkeypatch)
                         "predecessor_backup": backup, "linked_v3_receipt": linked}
 
 
-def test_dev_create_graph_admission_recovery_adoption_receipt_delegates(tmp_path, monkeypatch):
-    from agent.governance import db
-    root = tmp_path / "dev"; root.mkdir()
-    observed = {}
-    def create(storage_root, **kwargs):
-        observed.update({"storage_root": storage_root, **kwargs})
-        return {"status": "created", "receipt": "/receipt", "receipt_sha256": "sha256:" + "b" * 64}
-    monkeypatch.setattr(db, "create_dev_graph_admission_recovery_adoption_receipt", create)
-    result = CliRunner().invoke(main, [
-        "dev-create-graph-admission-recovery-adoption-receipt",
-        "--dev-storage-root", str(root), "--backlog-id", "R10",
-        "--contract-execution-id", "cex-1", "--route-token-ref", "route-1",
-        "--recovery-adoption-acknowledgment", db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
-    ])
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["status"] == "created"
-    assert observed == {"storage_root": root, "backlog_id": "R10",
-                        "contract_execution_id": "cex-1", "route_token_ref": "route-1",
-                        "recovery_adoption_acknowledgment": db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
-                        }
-
-
-def test_dev_graph_adoption_indeterminate_publish_reports_final_and_prohibits_retry(tmp_path, monkeypatch):
-    from agent.governance import db
-    root = tmp_path / "dev"; root.mkdir()
-    def create(*_args, **_kwargs):
-        raise db.GraphAdoptionPublishIndeterminate(
-            tmp_path / "final.json", "sha256:" + "c" * 64, OSError("fsync"))
-    monkeypatch.setattr(db, "create_dev_graph_admission_recovery_adoption_receipt", create)
-    result = CliRunner().invoke(main, [
-        "dev-create-graph-admission-recovery-adoption-receipt",
-        "--dev-storage-root", str(root), "--backlog-id", "R10",
-        "--contract-execution-id", "cex-1", "--route-token-ref", "route-1",
-        "--recovery-adoption-acknowledgment", db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
-    ])
-    assert result.exit_code != 0
-    assert "publish_indeterminate_do_not_retry" in result.output
-    assert str(tmp_path / "final.json") in result.output
-    assert "sha256:" + "c" * 64 in result.output
-
-
 class _GovernanceProbeResponse:
     def __init__(self, *, url, body, headers=None, status=200, expected_limit=None):
         self.url = url

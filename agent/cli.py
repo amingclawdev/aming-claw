@@ -3271,37 +3271,6 @@ def dev_create_cow_successor_receipt(
     click.echo(json.dumps(result, sort_keys=True))
 
 
-@main.command("dev-create-graph-admission-recovery-adoption-receipt")
-@click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--backlog-id", required=True)
-@click.option("--contract-execution-id", required=True)
-@click.option("--route-token-ref", required=True)
-@click.option("--recovery-adoption-acknowledgment", required=True)
-def dev_create_graph_admission_recovery_adoption_receipt(
-    dev_storage_root: Path, backlog_id: str, contract_execution_id: str,
-    route_token_ref: str,
-    recovery_adoption_acknowledgment: str,
-) -> None:
-    """Seal a non-retroactive recovery adoption of one exact graph DDL delta."""
-    from agent.governance import db as _db
-    try:
-        result = _db.create_dev_graph_admission_recovery_adoption_receipt(
-            dev_storage_root, backlog_id=backlog_id,
-            contract_execution_id=contract_execution_id,
-            route_token_ref=route_token_ref,
-            recovery_adoption_acknowledgment=recovery_adoption_acknowledgment,
-        )
-    except _db.GraphAdoptionPublishIndeterminate as exc:
-        raise click.ClickException(json.dumps({
-            "status": "publish_indeterminate_do_not_retry",
-            "final_path": exc.final_path,
-            "receipt_sha256": exc.raw_sha256,
-        }, sort_keys=True)) from exc
-    except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(json.dumps(result, sort_keys=True))
-
-
 def _posix_exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.parent.is_symlink() or path.is_symlink():
