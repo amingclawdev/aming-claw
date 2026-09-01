@@ -146558,6 +146558,116 @@ def _operator_supervised_direct_main_dev_selector_authority(
     return {**core, "authority_hash": stable_sha256(core)}
 
 
+def _operator_supervised_direct_main_persisted_world_ownership(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Resolve world from the selected physical backlog/CR chain, never claims."""
+
+    backlog_rows = conn.execute(
+        "SELECT bug_id FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchall()
+    try:
+        execution_rows = conn.execute(
+            """SELECT project_id, backlog_id, contract_id,
+                      contract_execution_id, record_json
+               FROM contract_runtime_executions
+               WHERE project_id = ? AND backlog_id = ?
+                 AND contract_id = ?""",
+            (project_id, backlog_id, "operator_supervised_direct_main"),
+        ).fetchall()
+    except sqlite3.Error:
+        execution_rows = []
+
+    valid_records: list[tuple[str, Mapping[str, Any]]] = []
+    for row in execution_rows:
+        try:
+            record = json.loads(str(row["record_json"] or "{}"))
+        except (TypeError, ValueError):
+            continue
+        execution_id = str(row["contract_execution_id"] or "").strip()
+        if not isinstance(record, Mapping) or not execution_id:
+            continue
+        if not (
+            str(row["project_id"] or "") == project_id
+            and str(row["backlog_id"] or "") == backlog_id
+            and str(row["contract_id"] or "")
+            == "operator_supervised_direct_main"
+            and str(record.get("project_id") or "") == project_id
+            and str(record.get("backlog_id") or "") == backlog_id
+            and str(record.get("contract_id") or "")
+            == "operator_supervised_direct_main"
+            and str(record.get("contract_execution_id") or "").strip()
+            == execution_id
+        ):
+            continue
+        valid_records.append((execution_id, record))
+
+    violations: list[str] = []
+    if not backlog_id or len(backlog_rows) != 1:
+        violations.append("backlog_identity_not_unique")
+    if len(execution_rows) != 1:
+        violations.append("contract_execution_identity_not_unique")
+    if len(valid_records) != 1:
+        violations.append("contract_execution_binding_invalid")
+
+    world = ""
+    execution_id = ""
+    if not violations:
+        execution_id, record = valid_records[0]
+        metadata = (
+            record.get("metadata")
+            if isinstance(record.get("metadata"), Mapping)
+            else {}
+        )
+        binding = (
+            metadata.get("operator_supervised_direct_main_runtime_binding")
+            if isinstance(
+                metadata.get("operator_supervised_direct_main_runtime_binding"),
+                Mapping,
+            )
+            else {}
+        )
+        has_persisted_world = "runtime_world_authority" in binding
+        persisted_world = (
+            binding.get("runtime_world_authority")
+            if isinstance(binding.get("runtime_world_authority"), Mapping)
+            else {}
+        )
+        if not has_persisted_world:
+            world = "stable"
+        elif (
+            persisted_world.get("accepted") is True
+            and persisted_world.get("server_derived") is True
+            and persisted_world.get("caller_claims_trusted") is False
+            and str(persisted_world.get("runtime_plane") or "") == "dev"
+            and int(persisted_world.get("runtime_port") or 0)
+            == AC_DEV_SERVICE_PORT
+            and str(persisted_world.get("world_id") or "") == "ac-dev"
+            and bool(str(persisted_world.get("namespace_hash") or ""))
+        ):
+            world = "dev"
+        else:
+            violations.append("runtime_world_authority_mixed_or_invalid")
+
+    core = {
+        "schema_version": "operator_supervised_direct_main.persisted_world_ownership.v1",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "world": world,
+        "contract_execution_id": execution_id,
+        "complete": bool(world) and not violations,
+        "violations": violations,
+        "zero_write_projection": True,
+    }
+    return {**core, "authority_hash": stable_sha256(core)}
+
+
 def _operator_supervised_direct_main_request_claim_values(
     request_body: Mapping[str, Any] | None,
     field: str,
@@ -146870,60 +146980,75 @@ def _require_onboard_dev_selector_endpoint(
     role: str,
     work_type: str,
 ) -> dict[str, Any]:
-    """Reject every exact dev authority selector before Onboard dispatch."""
+    """Resolve persisted world first, then validate its endpoint/selectors."""
 
     authority = _operator_supervised_direct_main_dev_selector_authority(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
     )
-    if _runtime_plane() == "dev":
-        has_explicit_selector = any(
-            str(value or "").strip()
-            for field in _onboard_runtime_selector_keys()
-            for value in _operator_supervised_direct_main_request_claim_values(
-                request_body,
-                field,
-            )
+    ownership = _operator_supervised_direct_main_persisted_world_ownership(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    has_explicit_selector = any(
+        str(value or "").strip()
+        for field in _onboard_runtime_selector_keys()
+        for value in _operator_supervised_direct_main_request_claim_values(
+            request_body,
+            field,
         )
-        if not has_explicit_selector:
+    )
+    if ownership["world"] == "stable":
+        if _runtime_plane() == "stable":
             return authority
+        raise GovernanceError(
+            "ac_onboard_stable_world_wrong_endpoint",
+            "stable-owned runtime chain requires the canonical 40000 endpoint",
+            409,
+            {
+                "runtime_plane": _runtime_plane(),
+                "required_endpoint": "http://127.0.0.1:40000",
+                "world_ownership_hash": ownership["authority_hash"],
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "public_safe": True,
+                "secret_safe": True,
+            },
+        )
+    if ownership["world"] == "dev" and _runtime_plane() == "dev":
         world_authority = (
             _operator_supervised_direct_main_dev_world_authority()
         )
-        execution_id = ""
-        task_claimed = any(
-            str(value or "").strip()
-            for field in ("task_id", "contract_execution_id")
-            for value in _operator_supervised_direct_main_request_claim_values(
-                request_body,
-                field,
-            )
+        records = _operator_supervised_direct_main_strict_records(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
         )
-        if task_claimed and backlog_id:
-            records = _operator_supervised_direct_main_strict_records(
-                conn,
-                project_id=project_id,
-                backlog_id=backlog_id,
+        if len(records) != 1 or not (
+            _operator_supervised_direct_main_record_matches_dev_world(
+                records[0], world_authority
             )
-            if len(records) == 1:
-                execution_id = str(
-                    records[0].get("contract_execution_id") or ""
-                ).strip()
-            elif not records:
-                definition = (
-                    _operator_supervised_direct_main_fresh_definition()
-                )
-                revision = str(definition.get("revision") or "").strip()
-                if revision:
-                    execution_id = (
-                        _operator_supervised_direct_main_execution_id(
-                            project_id,
-                            backlog_id,
-                            revision=revision,
-                            world_authority=world_authority,
-                        )
-                    )
+        ):
+            raise GovernanceError(
+                "ac_onboard_dev_world_binding_mismatch",
+                "persisted dev chain does not match the loaded 40008 world",
+                409,
+                {
+                    "runtime_plane": _runtime_plane(),
+                    "world_ownership_hash": ownership["authority_hash"],
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "public_safe": True,
+                    "secret_safe": True,
+                },
+            )
+        if not has_explicit_selector:
+            return authority
+        execution_id = str(
+            ownership.get("contract_execution_id") or ""
+        ).strip()
         mismatches = _operator_supervised_direct_main_request_mismatches(
             request_body,
             execution_id=execution_id,
@@ -146939,11 +147064,23 @@ def _require_onboard_dev_selector_endpoint(
                 selector_authority=authority,
             )
         return authority
-    if not _operator_supervised_direct_main_request_uses_dev_selector(
-        request_body,
-        selector_authority=authority,
-    ):
+    if not ownership.get("complete") and not has_explicit_selector:
         return authority
+    if not ownership.get("complete"):
+        raise GovernanceError(
+            "ac_onboard_runtime_world_ownership_unresolved",
+            "Onboard requires one complete persisted backlog/runtime world chain",
+            409,
+            {
+                "runtime_plane": _runtime_plane(),
+                "world_ownership_hash": ownership["authority_hash"],
+                "violations": list(ownership.get("violations") or ()),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "public_safe": True,
+                "secret_safe": True,
+            },
+        )
     raise GovernanceError(
         "ac_onboard_dev_selector_wrong_endpoint",
         "dev runtime selectors require the isolated 40008 Onboard endpoint",

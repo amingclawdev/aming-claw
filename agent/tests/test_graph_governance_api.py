@@ -199935,6 +199935,265 @@ def test_onboard_dev_selector_authority_is_server_derived_from_physical_namespac
     assert conn.total_changes == before
 
 
+def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
+    conn,
+    monkeypatch,
+):
+    backlog_id = (
+        "DG-NEURIPS-2026-CORRIDOR-DETERMINISTIC-COMPILATION-"
+        "R6-20260831"
+    )
+    execution_id = "cex-direct-main-2bf87f05dcbcbd35114a"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    SQLiteContractExecutionStore(conn)
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "execution_state_revision": 1,
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+            }
+        },
+    }
+    conn.execute(
+        """INSERT INTO contract_runtime_executions (
+               contract_execution_id, project_id, backlog_id, contract_id,
+               version, revision, execution_state_revision, record_json,
+               created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            execution_id,
+            PID,
+            backlog_id,
+            "operator_supervised_direct_main",
+            "v1",
+            "rev3",
+            1,
+            json.dumps(record),
+            "2026-08-31T00:00:00Z",
+            "2026-08-31T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    authority = {
+        "schema_version": "operator_supervised_direct_main.dev_selector_authority.v1",
+        "server_derived": True,
+        "dev_branch": server.AC_DEV_BRANCH,
+        "dev_refs": [server.AC_DEV_BRANCH, f"refs/heads/{server.AC_DEV_BRANCH}"],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": "",
+        "dev_head_commit": "8" * 40,
+        "dev_contract_execution_ids": ["cex-unrelated-dev"],
+        "authority_hash": "sha256:" + "9" * 64,
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    selected = server._require_onboard_dev_selector_endpoint(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        request_body={
+            "target_ref": f"refs/heads/{server.AC_DEV_BRANCH}",
+            "target_head_commit": authority["dev_head_commit"],
+        },
+        role="observer",
+        work_type="capability_query",
+    )
+    server._require_onboard_route_guide_backlog_exists(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="observer",
+        work_type="capability_query",
+    )
+
+    assert selected == authority
+    ownership = server._operator_supervised_direct_main_persisted_world_ownership(
+        conn, project_id=PID, backlog_id=backlog_id
+    )
+    assert ownership["world"] == "stable"
+    assert ownership["contract_execution_id"] == execution_id
+    assert ownership["complete"] is True
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["missing", "multiple", "cross_binding", "mixed_world"],
+)
+def test_onboard_persisted_world_ownership_fails_closed_zero_write(
+    conn,
+    monkeypatch,
+    case,
+):
+    backlog_id = f"AC-WORLD-OWNERSHIP-{case.upper()}"
+    if case != "missing":
+        _insert_simple_mf_close_backlog(conn, backlog_id)
+        SQLiteContractExecutionStore(conn)
+        count = 2 if case == "multiple" else 1
+        for index in range(count):
+            execution_id = f"cex-world-{case}-{index}"
+            record_backlog_id = (
+                "AC-FOREIGN-BACKLOG" if case == "cross_binding" else backlog_id
+            )
+            binding: dict[str, Any] = {"strict_runtime_binding_required": True}
+            if case == "mixed_world":
+                binding["runtime_world_authority"] = {
+                    "accepted": True,
+                    "server_derived": True,
+                    "caller_claims_trusted": False,
+                    "runtime_plane": "stable",
+                    "runtime_port": server.AC_STABLE_SERVICE_PORT,
+                    "world_id": "ac-dev",
+                    "namespace_hash": "sha256:" + "a" * 64,
+                }
+            record = {
+                "project_id": PID,
+                "backlog_id": record_backlog_id,
+                "contract_execution_id": execution_id,
+                "contract_id": "operator_supervised_direct_main",
+                "version": "v1",
+                "revision": "rev3",
+                "execution_state_revision": 1,
+                "metadata": {
+                    "operator_supervised_direct_main_runtime_binding": binding
+                },
+            }
+            conn.execute(
+                """INSERT INTO contract_runtime_executions (
+                       contract_execution_id, project_id, backlog_id, contract_id,
+                       version, revision, execution_state_revision, record_json,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    execution_id, PID, backlog_id,
+                    "operator_supervised_direct_main", "v1", "rev3", 1,
+                    json.dumps(record), "2026-08-31T00:00:00Z",
+                    "2026-08-31T00:00:00Z",
+                ),
+            )
+    conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._require_onboard_dev_selector_endpoint(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            request_body={"target_ref": server.AC_DEV_BRANCH},
+            role="qa",
+            work_type="qa_verification",
+        )
+
+    assert rejected.value.code == "ac_onboard_runtime_world_ownership_unresolved"
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+def test_fresh_dev_owned_chain_validates_source_only_after_world_selection(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-FRESH-DEV-WORLD-OWNERSHIP"
+    execution_id = "cex-fresh-dev-world-ownership"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    SQLiteContractExecutionStore(conn)
+    world = {
+        "schema_version": "operator_supervised_direct_main.dev_runtime_world.v1",
+        "accepted": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "runtime_plane": "dev",
+        "runtime_port": server.AC_DEV_SERVICE_PORT,
+        "bind_host": server.AC_DEV_BIND_HOST,
+        "runtime_stale": False,
+        "violations": [],
+        "world_id": "ac-dev",
+        "namespace_hash": "sha256:" + "a" * 64,
+        "target_ref": f"refs/heads/{server.AC_DEV_BRANCH}",
+        "branch": server.AC_DEV_BRANCH,
+        "target_head_commit": "b" * 40,
+        "loaded_runtime_commit": "b" * 40,
+        "target_project_root": "/tmp/ac-dev",
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "execution_state_revision": 1,
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "runtime_world_authority": world,
+            }
+        },
+    }
+    conn.execute(
+        """INSERT INTO contract_runtime_executions (
+               contract_execution_id, project_id, backlog_id, contract_id,
+               version, revision, execution_state_revision, record_json,
+               created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            execution_id, PID, backlog_id, "operator_supervised_direct_main",
+            "v1", "rev3", 1, json.dumps(record),
+            "2026-08-31T00:00:00Z", "2026-08-31T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    selector = {
+        "dev_refs": [server.AC_DEV_BRANCH, f"refs/heads/{server.AC_DEV_BRANCH}"],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": "",
+        "dev_head_commit": world["target_head_commit"],
+        "dev_contract_execution_ids": [execution_id],
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(selector),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    before = conn.total_changes
+
+    assert server._require_onboard_dev_selector_endpoint(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        request_body={
+            "target_ref": world["target_ref"],
+            "target_head_commit": world["target_head_commit"],
+            "task_id": execution_id,
+        },
+        role="worker",
+        work_type="operator_supervised_direct_main",
+    ) == selector
+    assert conn.total_changes == before
+
+
 @pytest.mark.parametrize("runtime_plane", ["stable", "generic"])
 @pytest.mark.parametrize(
     "selector_alias",
@@ -200015,6 +200274,16 @@ def test_every_dev_authority_alias_requires_40008_on_stable_and_generic(
         "_operator_supervised_direct_main_dev_selector_authority",
         lambda *_args, **_kwargs: copy.deepcopy(authority),
     )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_persisted_world_ownership",
+        lambda *_args, **_kwargs: {
+            "world": "dev",
+            "complete": True,
+            "contract_execution_id": dev_execution_id,
+            "authority_hash": "sha256:" + "d" * 64,
+        },
+    )
     before = conn.total_changes
 
     with pytest.raises(GovernanceError) as rejected:
@@ -200081,6 +200350,16 @@ def test_onboard_ingress_rejects_dev_selector_before_role_or_work_type_dispatch(
         "_operator_supervised_direct_main_dev_selector_authority",
         lambda *_args, **_kwargs: copy.deepcopy(authority),
     )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_persisted_world_ownership",
+        lambda *_args, **_kwargs: {
+            "world": "dev",
+            "complete": True,
+            "contract_execution_id": "",
+            "authority_hash": "sha256:" + "d" * 64,
+        },
+    )
     body = {
         "backlog_id": authority["backlog_id"],
         "target_head_commit": authority["dev_head_commit"],
@@ -200129,6 +200408,16 @@ def test_onboard_get_query_dev_selector_is_rejected_at_plane_ingress(
         server,
         "_operator_supervised_direct_main_dev_selector_authority",
         lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_persisted_world_ownership",
+        lambda *_args, **_kwargs: {
+            "world": "dev",
+            "complete": True,
+            "contract_execution_id": "",
+            "authority_hash": "sha256:" + "d" * 64,
+        },
     )
     before_rows = tuple(conn.iterdump())
     with pytest.raises(GovernanceError) as rejected:
@@ -200228,6 +200517,16 @@ def test_onboard_ingress_evaluates_every_body_and_repeated_query_selector_claim(
         server,
         "_operator_supervised_direct_main_dev_selector_authority",
         lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_persisted_world_ownership",
+        lambda *_args, **_kwargs: {
+            "world": "dev",
+            "complete": True,
+            "contract_execution_id": dev_execution_id,
+            "authority_hash": "sha256:" + "d" * 64,
+        },
     )
     before = conn.total_changes
     before_rows = tuple(conn.iterdump())
