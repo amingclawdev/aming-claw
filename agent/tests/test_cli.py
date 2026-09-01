@@ -4548,6 +4548,103 @@ def test_pre_readiness_consumer_binds_paths_inodes_port_and_ancestry():
         assert required in source
 
 
+def _historical_durable_source_fixture(cli, tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    (root / "agent" / "governance").mkdir(parents=True)
+    cli_path = root / "agent" / "cli.py"
+    server_path = root / "agent" / "governance" / "server.py"
+    cli_path.write_text("historical cli\n", encoding="utf-8")
+    server_path.write_text("historical server\n", encoding="utf-8")
+
+    def git(*args):
+        result = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-b", cli.AC_DEV_BRANCH)
+    git("config", "user.email", "tests@example.invalid")
+    git("config", "user.name", "AC Tests")
+    git("add", ".")
+    git("commit", "-m", "historical")
+    historical_commit = git("rev-parse", "HEAD")
+    historical_tree = git("rev-parse", "HEAD^{tree}")
+    historical_cli_sha = "sha256:" + hashlib.sha256(cli_path.read_bytes()).hexdigest()
+    historical_server_sha = "sha256:" + hashlib.sha256(server_path.read_bytes()).hexdigest()
+    cli_path.write_text("historical cli\ncurrent descendant\n", encoding="utf-8")
+    git("add", "agent/cli.py")
+    git("commit", "-m", "current")
+    current_commit = git("rev-parse", "HEAD")
+    current = {
+        "root": str(root), "branch": cli.AC_DEV_BRANCH,
+        "commit": current_commit, "tree": git("rev-parse", "HEAD^{tree}"),
+        "source_sha256": "sha256:" + hashlib.sha256(cli_path.read_bytes()).hexdigest(),
+        "dirty": "",
+    }
+    completed = {
+        "source_root": str(root), "source_commit": historical_commit,
+        "source_tree": historical_tree, "server_sha256": historical_server_sha,
+    }
+    pending = {"source_identity": {
+        "root": str(root), "branch": cli.AC_DEV_BRANCH,
+        "commit": historical_commit, "tree": historical_tree,
+        "source_sha256": historical_cli_sha, "dirty": "",
+    }}
+    sibling = git("commit-tree", historical_tree, "-m", "non-descendant")
+    monkeypatch.setattr(cli, "__file__", str(cli_path))
+    return current, completed, pending, sibling
+
+
+def test_historical_durable_source_accepts_receipt_bound_ancestor(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+
+    current, completed, pending, _sibling = _historical_durable_source_fixture(
+        cli, tmp_path, monkeypatch,
+    )
+    assert cli._historical_durable_source_chain_is_valid(
+        current=current, completed=completed, pending=pending,
+    )
+
+
+@pytest.mark.parametrize(
+    "drift", [
+        "missing_object", "tree", "server", "pending_tuple", "pending_cli",
+        "non_descendant", "current_dirty", "current_branch", "current_head",
+    ],
+)
+def test_historical_durable_source_rejects_each_core_invariant(
+    tmp_path, monkeypatch, drift,
+):
+    import agent.cli as cli
+
+    current, completed, pending, sibling = _historical_durable_source_fixture(
+        cli, tmp_path, monkeypatch,
+    )
+    if drift == "missing_object":
+        completed["source_commit"] = pending["source_identity"]["commit"] = "0" * 40
+    elif drift == "tree":
+        completed["source_tree"] = pending["source_identity"]["tree"] = "0" * 40
+    elif drift == "server":
+        completed["server_sha256"] = "sha256:" + "0" * 64
+    elif drift == "pending_tuple":
+        pending["source_identity"]["root"] = str(tmp_path / "foreign")
+    elif drift == "pending_cli":
+        pending["source_identity"]["source_sha256"] = "sha256:" + "0" * 64
+    elif drift == "non_descendant":
+        completed["source_commit"] = pending["source_identity"]["commit"] = sibling
+    elif drift == "current_dirty":
+        current["dirty"] = "agent/cli.py"
+    elif drift == "current_branch":
+        current["branch"] = "codex/foreign"
+    elif drift == "current_head":
+        current["commit"] = pending["source_identity"]["commit"]
+    assert not cli._historical_durable_source_chain_is_valid(
+        current=current, completed=completed, pending=pending,
+    )
+
+
 def test_dev_admit_schema_rejects_wrong_plane_before_database_write(tmp_path):
     root = tmp_path / "external-dev-world"
     database = root / "governance" / "aming-claw" / "governance.db"

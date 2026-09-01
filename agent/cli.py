@@ -4199,6 +4199,79 @@ def dev_prepare_durable_custody_rebaseline(
         expected_device=expected_database_device, expected_inode=expected_database_inode)
     click.echo(json.dumps(result, sort_keys=True))
 
+
+def _historical_durable_source_chain_is_valid(
+    *, current: Mapping[str, object], completed: Mapping[str, object],
+    pending: Mapping[str, object],
+) -> bool:
+    """Verify immutable launch source bytes against their historical Git commit."""
+
+    try:
+        root = Path(str(current.get("root") or "")).resolve(strict=True)
+        historical_commit = str(completed.get("source_commit") or "").lower()
+        historical_tree = str(completed.get("source_tree") or "").lower()
+        current_commit = str(current.get("commit") or "").lower()
+        current_tree = str(current.get("tree") or "").lower()
+        identities = (historical_commit, historical_tree, current_commit, current_tree)
+        if not all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", item) for item in identities):
+            return False
+        current_cli_sha = "sha256:" + hashlib.sha256(
+            (root / "agent" / "cli.py").read_bytes()
+        ).hexdigest()
+        if (
+            root != Path(__file__).resolve().parents[1]
+            or current.get("root") != str(root)
+            or current.get("branch") != AC_DEV_BRANCH
+            or current.get("dirty") != ""
+            or current.get("source_sha256") != current_cli_sha
+            or _git_checked(root, "rev-parse", "--show-toplevel") != str(root)
+            or _git_checked(root, "branch", "--show-current") != AC_DEV_BRANCH
+            or _git_checked(root, "status", "--porcelain") != ""
+            or _git_checked(root, "rev-parse", "HEAD").lower() != current_commit
+            or _git_checked(root, "rev-parse", "HEAD^{tree}").lower() != current_tree
+            or _git_checked(root, "rev-parse", "--verify",
+                            f"refs/heads/{AC_DEV_BRANCH}").lower() != current_commit
+            or completed.get("source_root") != str(root)
+            or _git_checked(root, "rev-parse", "--verify",
+                            f"{historical_commit}^{{commit}}").lower() != historical_commit
+            or _git_checked(root, "rev-parse",
+                            f"{historical_commit}^{{tree}}").lower() != historical_tree
+        ):
+            return False
+
+        def historical_blob(path: str) -> bytes:
+            result = subprocess.run(
+                ["git", "show", f"{historical_commit}:{path}"], cwd=root,
+                capture_output=True, timeout=15, check=False,
+            )
+            if result.returncode:
+                raise click.ClickException("historical durable source blob is unavailable")
+            return result.stdout
+
+        historical_cli_sha = "sha256:" + hashlib.sha256(
+            historical_blob("agent/cli.py")
+        ).hexdigest()
+        historical_server_sha = "sha256:" + hashlib.sha256(
+            historical_blob("agent/governance/server.py")
+        ).hexdigest()
+        expected_pending_source = {
+            "root": str(root), "branch": AC_DEV_BRANCH,
+            "commit": historical_commit, "tree": historical_tree,
+            "source_sha256": historical_cli_sha, "dirty": "",
+        }
+        if (
+            pending.get("source_identity") != expected_pending_source
+            or completed.get("server_sha256") != historical_server_sha
+        ):
+            return False
+        _git_checked(
+            root, "merge-base", "--is-ancestor", historical_commit, current_commit,
+        )
+        return True
+    except (OSError, RuntimeError, ValueError, click.ClickException):
+        return False
+
+
 def _durable_dev_launch(
     *, dev_storage: Path, database: Path, database_identity: Mapping[str, object],
     source_identity: Mapping[str, object], stable_anchor_commit: str,
@@ -4332,10 +4405,9 @@ def _durable_dev_launch(
         return bool(
             value.get("schema_version") == _AC_DEV_DURABLE_LAUNCH_VERSION
             and value.get("stage") == "completed"
-            and value.get("source_root") == str(source_root)
-            and value.get("source_commit") == source_identity.get("commit")
-            and value.get("source_tree") == source_identity.get("tree")
-            and value.get("server_sha256") == server_sha
+            and _historical_durable_source_chain_is_valid(
+                current=source_identity, completed=value, pending=pending,
+            )
             and value.get("dev_storage_root") == str(dev_storage)
             and value.get("database_path") == str(database)
             and isinstance(value.get("database_identity"), dict)
