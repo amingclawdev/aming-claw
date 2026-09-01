@@ -199938,7 +199938,9 @@ def test_onboard_dev_selector_authority_is_server_derived_from_physical_namespac
 def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     conn,
     monkeypatch,
+    tmp_path,
 ):
+    project_id = "drift-gym"
     backlog_id = (
         "DG-NEURIPS-2026-CORRIDOR-DETERMINISTIC-COMPILATION-"
         "R6-20260831"
@@ -199946,8 +199948,56 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     execution_id = "cex-direct-main-2bf87f05dcbcbd35114a"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     SQLiteContractExecutionStore(conn)
+    root = "/srv/drift-gym"
+    commit = "7" * 40
+    world_ref = {
+        "schema_version": "operator_supervised_direct_main.pre_mutation_world_ref.v1",
+        "accepted": True,
+        "status": "accepted",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "target_project_root": root,
+        "worktree_path": root,
+        "base_commit": commit,
+        "target_head_commit": commit,
+        "repository_root_exact": True,
+        "resolution_error": "",
+        "zero_write_on_failure": True,
+    }
+    world_ref["authority_hash"] = server.stable_sha256(world_ref)
+    binding = {
+        "schema_version": "operator_supervised_direct_main.runtime_binding.v1",
+        "strict_runtime_binding_required": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "route_identity": {
+            "route_id": "route-dg-r6-stable",
+            "route_context_hash": "sha256:" + "1" * 64,
+            "prompt_contract_id": "prompt-dg-r6-stable",
+            "prompt_contract_hash": "sha256:" + "2" * 64,
+            "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+            "route_token_ref": "rtok-dg-r6-stable",
+        },
+        "owned_files": ["paper/dg-r6.tex"],
+        "target_files": ["paper/dg-r6.tex"],
+        "target_project_root": root,
+        "worktree_path": root,
+        "base_commit": commit,
+        "target_head_commit": commit,
+        "pre_mutation_world_ref": world_ref,
+        "runtime_world_authority": {},
+        "stable_visible_chain_projection_written": True,
+        "same_execution_retry_allowed": False,
+        "same_generation_retry_allowed": False,
+        "post_hoc_pass_backfill_allowed": False,
+    }
+    binding["binding_hash"] = server.stable_sha256(binding)
     record = {
-        "project_id": PID,
+        "project_id": project_id,
         "backlog_id": backlog_id,
         "contract_execution_id": execution_id,
         "contract_id": "operator_supervised_direct_main",
@@ -199955,9 +200005,7 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
         "revision": "rev3",
         "execution_state_revision": 1,
         "metadata": {
-            "operator_supervised_direct_main_runtime_binding": {
-                "strict_runtime_binding_required": True,
-            }
+            "operator_supervised_direct_main_runtime_binding": binding,
         },
     }
     conn.execute(
@@ -199968,7 +200016,7 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             execution_id,
-            PID,
+            project_id,
             backlog_id,
             "operator_supervised_direct_main",
             "v1",
@@ -199992,6 +200040,34 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
         "authority_hash": "sha256:" + "9" * 64,
     }
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    database_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": 11,
+        "inode": 12,
+        "stable_relative_path_sha256": "sha256:" + "6" * 64,
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_plane_identity",
+        lambda: {
+            "status": "ready",
+            "plane": "stable",
+            "port": server.AC_STABLE_SERVICE_PORT,
+            "world_id": "ac-stable",
+            "stable_database_identity": database_identity,
+        },
+    )
+    database = (
+        tmp_path / "shared-volume" / "codex-tasks" / "state"
+        / "governance" / project_id / "governance.db"
+    )
+    database.parent.mkdir(parents=True)
+    database.touch()
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_connection_database_path",
+        lambda _conn: database.resolve(),
+    )
     monkeypatch.setattr(
         server,
         "_operator_supervised_direct_main_dev_selector_authority",
@@ -200002,7 +200078,7 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
 
     selected = server._require_onboard_dev_selector_endpoint(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         request_body={
             "target_ref": f"refs/heads/{server.AC_DEV_BRANCH}",
@@ -200013,7 +200089,7 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     )
     server._require_onboard_route_guide_backlog_exists(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         role="observer",
         work_type="capability_query",
@@ -200021,13 +200097,122 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
 
     assert selected == authority
     ownership = server._operator_supervised_direct_main_persisted_world_ownership(
-        conn, project_id=PID, backlog_id=backlog_id
+        conn, project_id=project_id, backlog_id=backlog_id
     )
     assert ownership["world"] == "stable"
     assert ownership["contract_execution_id"] == execution_id
     assert ownership["complete"] is True
     assert conn.total_changes == before
     assert tuple(conn.iterdump()) == before_rows
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["wrong_database", "cross_project", "missing_stable_ref", "dev_plane"],
+)
+def test_legacy_empty_world_requires_exact_stable_physical_binding(
+    conn,
+    monkeypatch,
+    tmp_path,
+    case,
+):
+    project_id = "drift-gym"
+    backlog_id = f"DG-LEGACY-EMPTY-{case.upper()}"
+    execution_id = f"cex-legacy-empty-{case}"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    root = "/srv/drift-gym"
+    commit = "7" * 40
+    world_ref = {
+        "schema_version": "operator_supervised_direct_main.pre_mutation_world_ref.v1",
+        "accepted": True,
+        "status": "accepted",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "target_project_root": root,
+        "worktree_path": root,
+        "base_commit": commit,
+        "target_head_commit": commit,
+        "repository_root_exact": True,
+    }
+    world_ref["authority_hash"] = server.stable_sha256(world_ref)
+    binding = {
+        "schema_version": "operator_supervised_direct_main.runtime_binding.v1",
+        "strict_runtime_binding_required": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "stable_visible_chain_projection_written": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "route_identity": {
+            "route_id": "route-legacy-empty",
+            "route_context_hash": "sha256:" + "1" * 64,
+            "prompt_contract_id": "prompt-legacy-empty",
+            "prompt_contract_hash": "sha256:" + "2" * 64,
+            "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+            "route_token_ref": "rtok-legacy-empty",
+        },
+        "target_project_root": root,
+        "worktree_path": root,
+        "base_commit": commit,
+        "target_head_commit": commit,
+        "pre_mutation_world_ref": world_ref,
+        "runtime_world_authority": {},
+    }
+    if case == "cross_project":
+        binding["project_id"] = "foreign-project"
+    elif case == "missing_stable_ref":
+        binding["pre_mutation_world_ref"] = {}
+    binding["binding_hash"] = server.stable_sha256(binding)
+    database = (
+        tmp_path / "shared-volume" / "codex-tasks" / "state"
+        / "governance" / project_id / "governance.db"
+    )
+    database.parent.mkdir(parents=True)
+    database.touch()
+    actual_database = (
+        tmp_path / "foreign" / "governance.db"
+        if case == "wrong_database"
+        else database
+    )
+    if case == "wrong_database":
+        actual_database.parent.mkdir()
+        actual_database.touch()
+    monkeypatch.setenv(
+        "AMING_CLAW_RUNTIME_PLANE", "dev" if case == "dev_plane" else "stable"
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_plane_identity",
+        lambda: {
+            "status": "ready",
+            "plane": "stable",
+            "port": server.AC_STABLE_SERVICE_PORT,
+            "world_id": "ac-stable",
+            "stable_database_identity": {
+                "schema_version": "ac_stable_database_identity.v1",
+                "device": 11,
+                "inode": 12,
+                "stable_relative_path_sha256": "sha256:" + "6" * 64,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_connection_database_path",
+        lambda _conn: actual_database.resolve(),
+    )
+    before = tuple(conn.iterdump())
+
+    assert server._operator_supervised_direct_main_legacy_empty_stable_world_valid(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        execution_id=execution_id,
+        binding=binding,
+    ) is False
+    assert tuple(conn.iterdump()) == before
 
 
 @pytest.mark.parametrize(

@@ -146639,6 +146639,16 @@ def _operator_supervised_direct_main_persisted_world_ownership(
         )
         if not has_persisted_world:
             world = "stable"
+        elif not persisted_world and (
+            _operator_supervised_direct_main_legacy_empty_stable_world_valid(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                execution_id=execution_id,
+                binding=binding,
+            )
+        ):
+            world = "stable"
         elif (
             persisted_world.get("accepted") is True
             and persisted_world.get("server_derived") is True
@@ -146666,6 +146676,129 @@ def _operator_supervised_direct_main_persisted_world_ownership(
         "zero_write_projection": True,
     }
     return {**core, "authority_hash": stable_sha256(core)}
+
+
+def _operator_supervised_direct_main_connection_database_path(conn) -> Path:
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        return Path()
+    paths = [
+        str(row[2] or "").strip()
+        for row in rows
+        if str(row[1] or "").strip() == "main"
+    ]
+    if len(paths) != 1 or not paths[0]:
+        return Path()
+    try:
+        return Path(paths[0]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return Path()
+
+
+def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    execution_id: str,
+    binding: Mapping[str, Any],
+) -> bool:
+    """Accept legacy ``runtime_world_authority: {}`` only with exact stable proof."""
+
+    if _runtime_plane() != "stable":
+        return False
+    identity = _runtime_plane_identity()
+    database_identity = (
+        identity.get("stable_database_identity")
+        if isinstance(identity.get("stable_database_identity"), Mapping)
+        else {}
+    )
+    if not (
+        identity.get("status") == "ready"
+        and identity.get("plane") == "stable"
+        and int(identity.get("port") or 0) == AC_STABLE_SERVICE_PORT
+        and identity.get("world_id") == "ac-stable"
+        and _ac_stable_database_identity_valid(database_identity)
+    ):
+        return False
+    actual_database = _operator_supervised_direct_main_connection_database_path(
+        conn
+    )
+    stable_suffix = (
+        "shared-volume",
+        "codex-tasks",
+        "state",
+        "governance",
+        project_id,
+        "governance.db",
+    )
+    if not (
+        actual_database
+        and tuple(actual_database.parts[-len(stable_suffix):]) == stable_suffix
+    ):
+        return False
+
+    backlog_row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    status = str(backlog_row["status"] or "").strip().upper() if backlog_row else ""
+    if not status or status in {"FIXED", "CLOSED", "CANCELLED", "CANCELED"}:
+        return False
+
+    world_ref = (
+        binding.get("pre_mutation_world_ref")
+        if isinstance(binding.get("pre_mutation_world_ref"), Mapping)
+        else {}
+    )
+    world_hash = str(world_ref.get("authority_hash") or "").strip()
+    unsigned_world = {
+        key: value for key, value in world_ref.items() if key != "authority_hash"
+    }
+    route = (
+        binding.get("route_identity")
+        if isinstance(binding.get("route_identity"), Mapping)
+        else {}
+    )
+    binding_hash = str(binding.get("binding_hash") or "").strip()
+    unsigned_binding = {
+        key: value for key, value in binding.items() if key != "binding_hash"
+    }
+    root = str(binding.get("target_project_root") or "").strip()
+    base = str(binding.get("base_commit") or "").strip().lower()
+    head = str(binding.get("target_head_commit") or "").strip().lower()
+    return bool(
+        binding.get("schema_version")
+        == "operator_supervised_direct_main.runtime_binding.v1"
+        and binding.get("strict_runtime_binding_required") is True
+        and binding.get("server_derived") is True
+        and binding.get("caller_claims_trusted") is False
+        and binding.get("stable_visible_chain_projection_written") is True
+        and str(binding.get("project_id") or "") == project_id
+        and str(binding.get("backlog_id") or "") == backlog_id
+        and str(binding.get("contract_execution_id") or "") == execution_id
+        and root
+        and str(binding.get("worktree_path") or "").strip() == root
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base)
+        and head == base
+        and world_ref.get("schema_version")
+        == "operator_supervised_direct_main.pre_mutation_world_ref.v1"
+        and world_ref.get("accepted") is True
+        and world_ref.get("status") == "accepted"
+        and world_ref.get("server_derived") is True
+        and world_ref.get("caller_claims_trusted") is False
+        and world_ref.get("repository_root_exact") is True
+        and str(world_ref.get("project_id") or "") == project_id
+        and str(world_ref.get("target_project_root") or "") == root
+        and str(world_ref.get("worktree_path") or "") == root
+        and str(world_ref.get("base_commit") or "").lower() == base
+        and str(world_ref.get("target_head_commit") or "").lower() == head
+        and world_hash == stable_sha256(unsigned_world)
+        and _observer_root_route_identity_complete(route)
+        and str(route.get("route_token_ref") or "").strip()
+        and binding_hash == stable_sha256(unsigned_binding)
+    )
 
 
 def _operator_supervised_direct_main_request_claim_values(
