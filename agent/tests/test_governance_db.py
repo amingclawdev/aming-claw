@@ -1987,6 +1987,38 @@ def test_ac_dev_cow_successor_validator_rejects_missing(tmp_path):
         db.validate_dev_cow_successor_receipt(root)
 
 
+def test_canonical_preimage_selects_cow_bridge_only_for_replaced_inode(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+    import agent.runtime_plane as runtime_plane
+
+    stable = tmp_path / "stable"; stable.mkdir()
+    root = tmp_path / "dev"; root.mkdir()
+    database = root / db.AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True); database.write_bytes(b"successor")
+    linked = root / "linked.json"
+    linked.write_text(json.dumps({"database_identity": {
+        "device": database.stat().st_dev, "inode": database.stat().st_ino + 1,
+    }}))
+    binding = {"shared_volume_path": str(stable)}
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(root))
+    monkeypatch.setenv(db.AC_STABLE_SHARED_VOLUME_ENV, str(stable))
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: binding)
+    monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _value: None)
+    monkeypatch.setattr(runtime_plane, "resolve_ac_dev_storage_root", lambda _stable: root)
+    calls = []
+    monkeypatch.setattr(db, "validate_dev_cow_successor_preimage",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(db, "_validated_canonical_legacy_postimage_adoption",
+                        lambda *_args, **_kwargs: pytest.fail("legacy path must remain disjoint"))
+    assert db._dev_storage_root(
+        isolated_receipt=linked, source_identity={"commit": "a" * 40},
+        allow_postimage=True,
+    ) == root
+    assert len(calls) == 1
+
+
 def test_cow_receipt_reconstruction_keeps_issuance_schema_after_source_expands(
     tmp_path, monkeypatch,
 ):

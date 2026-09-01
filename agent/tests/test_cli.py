@@ -83,6 +83,35 @@ class _GovernanceProbeResponse:
         return self.body[:limit]
 
 
+def test_linked_v3_validator_uses_cow_preimage_for_replaced_inode(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"; database = root / "governance.db"
+    database.parent.mkdir(); database.write_bytes(b"successor")
+    linked = root / "linked.json"; linked.write_bytes(b"linked")
+    current = cli._admission_identity(database)
+    receipt = {
+        "database_identity": {**current, "inode": current["inode"] + 1},
+        "source_identity": {"cli_source": {"commit": "a" * 40}},
+    }
+    monkeypatch.setattr(cli, "_read_admission_receipt",
+                        lambda *_args, **_kwargs: (receipt, "sha256:" + "1" * 64))
+    monkeypatch.setattr(cli, "_validated_historical_admission_source_identity",
+                        lambda value: value)
+    calls = []
+    monkeypatch.setattr(db, "validate_dev_cow_successor_preimage",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: {"stable": True})
+    digest, returned = cli._validated_linked_v3_receipt(
+        linked, dev_storage=root, database=database,
+        database_identity=current, source_identity={"commit": "b" * 40},
+    )
+    assert digest == "sha256:" + "1" * 64
+    assert returned is receipt
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "mode",
     [

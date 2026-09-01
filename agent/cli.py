@@ -3369,6 +3369,16 @@ def _validated_linked_v3_receipt(
         receipt.get("source_identity")
     )
     historical_source = dict(receipt_source.get("cli_source") or {})
+    canonical_database_identity = _admission_identity(database)
+    linked_database_identity = dict(receipt.get("database_identity") or {})
+    if (linked_database_identity.get("device"), linked_database_identity.get("inode")) != (
+            canonical_database_identity.get("device"), canonical_database_identity.get("inode")):
+        _db.validate_dev_cow_successor_preimage(
+            dev_storage, linked_v3_receipt=receipt_path,
+            source_identity=source_identity,
+            stable_binding=_db.verified_stable_database_binding(),
+        )
+        return digest, receipt
     if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
         # Bootstrap owns the current postimage; this re-authenticates only the
         # sealed historical bridge and deliberately never asks legacy code to
@@ -3426,7 +3436,6 @@ def _validated_linked_v3_receipt(
         receipt.get("schema_inventory_after"), db_module=_db,
     )
     root_identity = _admission_identity(dev_storage)
-    canonical_database_identity = _admission_identity(database)
     if (
         receipt.get("schema_version") != _AC_DEV_SCHEMA_RECERTIFICATION_RECEIPT_VERSION
         or receipt.get("stage") != "completed" or receipt.get("changed") is not False

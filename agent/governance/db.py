@@ -2213,9 +2213,23 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
         except (OSError, RuntimeError, ValueError):
             canonical_root = None
         if canonical_root is not None and root == canonical_root:
-            return _validated_canonical_legacy_postimage_adoption(
-                root, isolated_receipt, source_identity or {}, binding,
+            linked = json.loads(isolated_receipt.expanduser().absolute().read_bytes())
+            linked_identity = dict(linked.get("database_identity") or {}) if isinstance(
+                linked, Mapping
+            ) else {}
+            database = root / AC_DATABASE_DEV_RELATIVE_PATH
+            current = database.stat(follow_symlinks=False)
+            linked_physical = (linked_identity.get("device"), linked_identity.get("inode"))
+            if (not all(isinstance(value, int) for value in linked_physical)
+                    or linked_physical == (int(current.st_dev), int(current.st_ino))):
+                return _validated_canonical_legacy_postimage_adoption(
+                    root, isolated_receipt, source_identity or {}, binding,
+                )
+            validate_dev_cow_successor_preimage(
+                root, linked_v3_receipt=isolated_receipt,
+                source_identity=source_identity or {}, stable_binding=binding,
             )
+            return root
         return _validated_isolated_dev_receipt(
             isolated_receipt, root, source_identity or {}, binding,
             allow_postimage=allow_postimage,
@@ -3967,6 +3981,69 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
     if receipt_canonical != expected_canonical:
         raise ValueError("AC dev COW successor reconstructed issuance payload mismatch")
     return receipt
+
+
+def validate_dev_cow_successor_preimage(
+    storage_root: Path | str, *, linked_v3_receipt: Path,
+    source_identity: Mapping[str, object], stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the exact live post-COW inode against immutable v2 authority."""
+    root = Path(storage_root).expanduser().absolute()
+    receipt = validate_dev_cow_successor_receipt(root)
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    linked_path = linked_v3_receipt.expanduser().absolute()
+    linked_sha = "sha256:" + hashlib.sha256(linked_path.read_bytes()).hexdigest()
+    history = dict(receipt.get("history") or {})
+    successor = dict(receipt.get("successor") or {})
+    expected_identity = dict(successor.get("identity") or {})
+    current = _cow_regular_identity(database)
+    stable_identity = dict(stable_binding.get("stable_database_identity") or {})
+    issuance_stable = dict(dict(receipt.get("stable_binding") or {}).get("database") or {})
+    if (
+        dict(history.get("linked_v3") or {})
+        != {"path": str(linked_path), "sha256": linked_sha}
+        or expected_identity.get("path") != str(database)
+        or expected_identity.get("device") != current["device"]
+        or expected_identity.get("inode") != current["inode"]
+        or expected_identity.get("nlink") != current["nlink"]
+        or issuance_stable != stable_identity
+        or (current["device"], current["inode"])
+        == (stable_identity.get("device"), stable_identity.get("inode"))
+    ):
+        raise ValueError("AC dev COW successor current binding mismatch")
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(database) + suffix)
+        if companion.exists() or companion.is_symlink():
+            raise ValueError("AC dev COW successor requires sidecar-free bytes")
+    _assert_no_external_sqlite_holders(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(conn)
+        _verify_dev_world_schema_inventory(conn)
+        _verify_current_dev_backlog_runtime_invariants(
+            conn,
+            expected_protected_inventory=dict(successor.get("protected_inventory") or {}),
+        )
+        meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
+    finally:
+        conn.close()
+    if (meta.get("governance_world_genesis_json") != successor.get("genesis_json")
+            or meta.get("governance_world_genesis_sha256") != successor.get("genesis_sha256")
+            or meta.get("governance_world_id") != AC_DEV_WORLD_ID):
+        raise ValueError("AC dev COW successor genesis mismatch")
+    try:
+        tip = json.loads(str(meta.get("governance_world_source_tip_json") or ""))
+        process = json.loads(str(meta.get("governance_world_current_process_json") or ""))
+        revision = int(meta.get("governance_world_source_tip_revision") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AC dev COW successor custody metadata is invalid") from exc
+    if (not isinstance(tip, Mapping) or not isinstance(process, Mapping) or revision < 1
+            or meta.get("governance_world_source_tip_sha256") != _world_source_tip_hash(tip)):
+        raise ValueError("AC dev COW successor custody binding mismatch")
+    _verify_dev_source_upgrade(dict(tip), dict(source_identity))
+    return receipt
+
 
 def _verify_current_dev_backlog_runtime_invariants(
     conn: sqlite3.Connection, *, expected_protected_inventory: Mapping[str, object]
