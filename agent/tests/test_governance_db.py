@@ -1798,6 +1798,16 @@ def test_ac_dev_cow_successor_replaces_only_genesis_physical_identity(tmp_path, 
         },
     }
     monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    # This unit isolates the downstream genesis/physical-identity rule from
+    # the completed-generation ingress preflight, which is covered with real
+    # content-addressed receipt chains below.
+    monkeypatch.setattr(
+        db, "_validate_dev_cow_completed_basic_restart",
+        lambda *_args, **_kwargs: {
+            "database_sha256": db._durable_database_sha256(database),
+            "logical_sha256": db._database_logical_sha256(database),
+        },
+    )
     replay = db.bootstrap_dev_governance_store(
         storage_root, source_identity=source,
         process_identity={"pid": 202, "start_identity": "cow-after"},
@@ -2865,6 +2875,150 @@ def test_cow_completed_generation_uses_current_projection_not_issuance_digest(
     ) == receipt
 
 
+def _completed_cow_basic_restart_fixture(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    root, database, _linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    candidate = _advance_cow_to_completed_generation(database, root, source)
+    _phase_z_bind_first_start_runtime(tmp_path, monkeypatch, root)
+    original_kill = os.kill
+
+    def stopped_process(pid, signal_number):
+        if pid == 42 and signal_number == 0:
+            raise ProcessLookupError(pid)
+        return original_kill(pid, signal_number)
+
+    monkeypatch.setattr(db.os, "kill", stopped_process)
+    stable = Path(db.verified_stable_database_binding()["shared_volume_path"])
+    launch_path = root / db.AC_DEV_LAUNCH_RECEIPT_NAME
+    db.write_dev_launch_receipt(
+        root, stable_shared_volume=stable,
+        source_sha256="sha256:" + "0" * 64, port=40008,
+    )
+    return root, database, candidate, stable, launch_path
+
+
+def test_completed_cow_basic_restart_preserves_database_and_refreshes_only_basic_receipt(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, candidate, stable, launch_path = (
+        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+    )
+    database_before = database.read_bytes()
+    logical_before = db._database_logical_sha256(database)
+    launch_before = launch_path.read_bytes()
+    archive_before = {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted((root / "archive").rglob("*"))
+        if path.is_file()
+    }
+    process = {"pid": os.getpid(), "start_identity": f"pid:{os.getpid()}:cli-bootstrap"}
+
+    binding = db.bootstrap_dev_governance_store(
+        root, source_identity=candidate, process_identity=process,
+    )
+
+    assert binding["restart_safe"] is True
+    assert binding["source_upgraded"] is False
+    assert binding["current_process_identity"] != process
+    assert database.read_bytes() == database_before
+    assert db._database_logical_sha256(database) == logical_before
+    assert launch_path.read_bytes() == launch_before
+    assert {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted((root / "archive").rglob("*"))
+        if path.is_file()
+    } == archive_before
+
+    server_sha256 = "sha256:" + hashlib.sha256(
+        (Path(candidate["root"]) / "agent" / "governance" / "server.py").read_bytes()
+    ).hexdigest()
+    refreshed = db.write_dev_launch_receipt(
+        root, stable_shared_volume=stable,
+        source_sha256=server_sha256, port=40008,
+    )
+    assert refreshed["source_sha256"] == server_sha256
+    assert launch_path.read_bytes() != launch_before
+    assert database.read_bytes() == database_before
+    assert db._dev_storage_root(create=False) == root
+    db.release_dev_runtime_writer_lease(root)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("receipt_missing", "successor", "custody", "world", "schema", "source", "listener"),
+)
+def test_completed_cow_basic_restart_rejects_invalid_evidence_without_new_mutation(
+    tmp_path, monkeypatch, defect,
+):
+    from agent.governance import db
+
+    root, database, candidate, _stable, launch_path = (
+        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+    )
+    if defect == "receipt_missing":
+        launch_path.unlink()
+    elif defect == "successor":
+        archive = root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE
+        (archive / f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{'f' * 64}.json").write_text(
+            "{}", encoding="utf-8",
+        )
+    elif defect in {"custody", "world", "schema"}:
+        connection = sqlite3.connect(database)
+        if defect == "custody":
+            connection.execute(
+                "UPDATE schema_meta SET value='{}' "
+                "WHERE key='governance_world_current_process_json'"
+            )
+        elif defect == "world":
+            connection.execute(
+                "UPDATE schema_meta SET value='foreign' "
+                "WHERE key='governance_world_id'"
+            )
+        else:
+            connection.execute("DROP TABLE parallel_branch_runtime_contexts")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+    elif defect == "source":
+        (Path(candidate["root"]) / "untracked-drift.txt").write_text(
+            "dirty\n", encoding="utf-8",
+        )
+    else:
+        monkeypatch.setattr(
+            db, "_default_cutover_listener_probe",
+            lambda port: {"port": port, "listening": True, "pid": 99},
+        )
+
+    database_before = database.read_bytes()
+    receipt_before = launch_path.read_bytes() if launch_path.exists() else None
+    archive_before = {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted((root / "archive").rglob("*"))
+        if path.is_file()
+    }
+    with pytest.raises((OSError, RuntimeError, TypeError, ValueError)):
+        db.bootstrap_dev_governance_store(
+            root, source_identity=candidate,
+            process_identity={
+                "pid": os.getpid(),
+                "start_identity": f"pid:{os.getpid()}:cli-bootstrap",
+            },
+        )
+    assert database.read_bytes() == database_before
+    assert (launch_path.read_bytes() if launch_path.exists() else None) == receipt_before
+    assert {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted((root / "archive").rglob("*"))
+        if path.is_file()
+    } == archive_before
+    assert str(database.absolute()) not in db._DEV_DATABASE_WRITER_LEASES
+
+
 def test_cow_completed_axis_accepts_current_bootstrap_pid_and_new_candidate_bytes(
     tmp_path, monkeypatch,
 ):
@@ -3174,7 +3328,7 @@ def test_public_linked_v3_prevalidator_admits_real_completed_cow_projection(
     historical = []
     monkeypatch.setattr(
         cli, "_historical_dashboard_bootstrap_adoption",
-        lambda value: historical.append(value),
+        lambda value, **_kwargs: historical.append(value),
     )
     monkeypatch.setattr(
         cli, "_validated_historical_admission_source_identity",

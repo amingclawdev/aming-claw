@@ -2370,7 +2370,21 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
             if (identity.get("device"), identity.get("inode")) == (
                 int(physical.st_dev), int(physical.st_ino),
             ) and not _validate_dev_first_start_context(root):
-                raise ValueError("AC dev COW postimage requires live first-start custody")
+                # A completed COW generation is also a valid stopped-world
+                # preimage for the ordinary foreground launcher.  Its runtime
+                # authority is deliberately composed from the existing basic
+                # launch receipt and writer lease rather than the durable
+                # first-start context.  Before those live bindings exist,
+                # re-prove the complete persisted generation and stopped state
+                # without changing SQLite or any receipt.
+                if _validate_dev_basic_runtime_custody(
+                    root, stable_binding=binding,
+                ):
+                    return root
+                _validate_dev_cow_completed_basic_restart(
+                    root, source_identity=source_identity or {},
+                    stable_binding=binding,
+                )
     return root
 
 
@@ -2474,6 +2488,18 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
                     "background_workers": "deny"}):
             raise ValueError("AC dev isolated durable launch receipt mismatch")
         return dict(durable)
+
+    return _validate_dev_basic_launch_receipt(
+        root, source_sha256=source_sha256,
+        stable_binding=verified_stable_database_binding(),
+    )
+
+
+def _validate_dev_basic_launch_receipt(
+    root: Path, *, source_sha256: str,
+    stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the canonical non-durable receipt without resolving root again."""
     path = root / AC_DEV_LAUNCH_RECEIPT_NAME
     if not path.is_file() or path.is_symlink() or path.resolve(strict=True) != path:
         raise ValueError("AC dev launch receipt is missing or invalid")
@@ -2488,9 +2514,10 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
         "storage_inode": int(root_stat.st_ino), "source_sha256": source_sha256}
     if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in required.items()):
         raise ValueError("AC dev launch receipt mismatch")
-    binding = verified_stable_database_binding()
-    _revalidate_stable_database_binding(binding)
-    stable = _absolute_non_symlink_root(Path(str(binding.get("shared_volume_path") or "")), create=False)
+    _revalidate_stable_database_binding(stable_binding)
+    stable = _absolute_non_symlink_root(
+        Path(str(stable_binding.get("shared_volume_path") or "")), create=False,
+    )
     if receipt.get("stable_shared_volume") != str(stable):
         raise ValueError("AC dev launch receipt stable volume claim mismatch")
     stable_stat = stable.stat(follow_symlinks=False)
@@ -4919,6 +4946,114 @@ def validate_dev_cow_completed_generation_projection(
     return receipt
 
 
+def _validate_dev_cow_completed_basic_restart(
+    storage_root: Path | str, *, source_identity: Mapping[str, object],
+    stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Admit one stopped completed COW world to the ordinary launcher.
+
+    This is a read-only preflight.  The persisted source tip and process are
+    historical custody provenance; the ordinary runtime later derives current
+    authority from clean Git, the refreshed basic launch receipt, and its
+    writer lease.  A first-issuance generation still requires the dedicated
+    first-start custody transition and is never admitted here.
+    """
+
+    root = Path(storage_root).expanduser().absolute()
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    database_before = _durable_database_sha256(database)
+    logical_before = _database_logical_sha256(database)
+    receipt = validate_dev_cow_successor_receipt(root)
+    linked_ref = dict(dict(receipt.get("history") or {}).get("linked_v3") or {})
+    linked_path = Path(str(linked_ref.get("path") or "")).expanduser().absolute()
+    if not linked_path.is_file() or linked_path.is_symlink():
+        raise ValueError("AC dev COW completed basic restart linked receipt is missing")
+    linked_sha256 = "sha256:" + hashlib.sha256(linked_path.read_bytes()).hexdigest()
+    if linked_ref != {"path": str(linked_path), "sha256": linked_sha256}:
+        raise ValueError("AC dev COW completed basic restart linked receipt mismatch")
+    phase = _select_dev_cow_generation_phase(
+        root, linked_v3_receipt=linked_path, source_identity=source_identity,
+        stable_binding=stable_binding,
+    )
+    if phase is not _DevCowGenerationPhase.COMPLETED_GENERATION:
+        raise ValueError("AC dev COW postimage requires live first-start custody")
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(conn)
+        _verify_dev_world_schema_inventory(conn)
+        axis = _validated_dev_cow_completed_generation_axis(
+            conn, root=root, receipt=receipt, linked_v3_receipt=linked_path,
+            source_identity=source_identity, stable_binding=stable_binding,
+        )
+    finally:
+        conn.close()
+    listener = _default_cutover_listener_probe(40008)
+    if (
+        listener.get("port") != 40008
+        or listener.get("listening") is not False
+        or int(listener.get("pid") or 0) != 0
+    ):
+        raise ValueError("AC dev COW completed basic restart requires a stopped listener")
+    process = dict(axis.get("process") or {})
+    if set(process) == _DURABLE_PROCESS_IDENTITY_KEYS:
+        try:
+            os.kill(int(process.get("pid") or 0), 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "AC dev COW completed basic restart process state is unavailable"
+            ) from exc
+        else:
+            raise ValueError("AC dev COW completed basic restart process is still live")
+    _validate_existing_adoption_receipt(root)
+    if (
+        _durable_database_sha256(database) != database_before
+        or _database_logical_sha256(database) != logical_before
+    ):
+        raise ValueError("AC dev COW completed basic restart preflight changed the database")
+    return {
+        "receipt": receipt,
+        "linked_v3_receipt": linked_path,
+        "database_sha256": database_before,
+        "logical_sha256": logical_before,
+        "historical_process": process,
+    }
+
+
+def _validate_dev_basic_runtime_custody(
+    storage_root: Path | str, *, stable_binding: Mapping[str, object],
+) -> bool:
+    """Compose existing receipt and lease authority for a live basic runtime."""
+
+    root = Path(storage_root).expanduser().absolute()
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    try:
+        metadata = database.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = _DEV_DATABASE_WRITER_LEASES.get(str(database.absolute()))
+        if lease is None:
+            return False
+        if (
+            getattr(lease.get("handle"), "closed", True)
+            or int(lease.get("owner_pid") or 0) != os.getpid()
+            or lease.get("owner_start_identity") != _writer_process_start_identity()
+            or (lease.get("database_device"), lease.get("database_inode"))
+            != (int(metadata.st_dev), int(metadata.st_ino))
+        ):
+            raise ValueError("AC dev basic runtime writer custody mismatch")
+    loaded_root = Path(__file__).resolve(strict=True).parents[2]
+    source = _current_first_start_source(loaded_root)
+    _validate_dev_basic_launch_receipt(
+        root, source_sha256=source["server_sha256"],
+        stable_binding=stable_binding,
+    )
+    return True
+
+
 def _verify_current_dev_backlog_runtime_invariants(
     conn: sqlite3.Connection, *, expected_protected_inventory: Mapping[str, object]
 ) -> None:
@@ -5367,6 +5502,7 @@ def bootstrap_dev_governance_store(
         raise ValueError("AC dev governance database cannot be a symlink")
     cow_successor_receipt: dict[str, object] | None = None
     cow_phase: _DevCowGenerationPhase | None = None
+    basic_cow_restart: dict[str, object] | None = None
     if not created:
         # Resolve the exceptional physical successor before opening the writer;
         # receipt validation includes the no-holder/no-sidecar admission gate.
@@ -5403,6 +5539,12 @@ def bootstrap_dev_governance_store(
                         source_identity=source_identity,
                         stable_binding=verified_stable_database_binding(),
                     )
+            else:
+                basic_cow_restart = _validate_dev_cow_completed_basic_restart(
+                    root, source_identity=source_identity,
+                    stable_binding=verified_stable_database_binding(),
+                )
+                cow_phase = _DevCowGenerationPhase.COMPLETED_GENERATION
     lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
     acquire_dev_runtime_writer_lease(root)
     conn: sqlite3.Connection | None = None
@@ -5658,8 +5800,25 @@ def bootstrap_dev_governance_store(
             # exact clean source lineage are now all verified before SQLite
             # may touch WAL.  The same check is intentional on a no-op restart.
             _verify_dev_source_upgrade(source_tip_identity, source)
-            _recover_verified_existing_dev_sqlite(root, database)
-            if source != source_tip_identity:
+            if basic_cow_restart is None:
+                _recover_verified_existing_dev_sqlite(root, database)
+            if basic_cow_restart is not None:
+                # The ordinary foreground service does not become a new
+                # persisted custody generation.  Keep source-tip/process
+                # provenance and every database byte unchanged; current
+                # authority is the clean source, basic receipt, and live lease.
+                conn.close()
+                conn = None
+                if (
+                    _durable_database_sha256(database)
+                    != basic_cow_restart["database_sha256"]
+                    or _database_logical_sha256(database)
+                    != basic_cow_restart["logical_sha256"]
+                ):
+                    raise ValueError(
+                        "AC dev COW completed basic restart changed the database"
+                    )
+            elif source != source_tip_identity:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     locked_meta = dict(
