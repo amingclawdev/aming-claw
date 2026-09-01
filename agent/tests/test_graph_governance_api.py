@@ -199948,6 +199948,16 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     execution_id = "cex-direct-main-2bf87f05dcbcbd35114a"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     SQLiteContractExecutionStore(conn)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
+        (
+            json.dumps(["paper/dg-r6.tex"]),
+            json.dumps(["tests/test_dg_r6.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    row_files = sorted(server._backlog_declared_direct_file_scope(conn, backlog_id))
     root = "/srv/drift-gym"
     commit = "7" * 40
     world_ref = {
@@ -199977,13 +199987,13 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
         "route_identity": {
             "route_id": "route-dg-r6-stable",
             "route_context_hash": "sha256:" + "1" * 64,
-            "prompt_contract_id": "prompt-dg-r6-stable",
+            "prompt_contract_id": "rprompt-dg-r6-stable",
             "prompt_contract_hash": "sha256:" + "2" * 64,
             "visible_injection_manifest_hash": "sha256:" + "3" * 64,
             "route_token_ref": "rtok-dg-r6-stable",
         },
-        "owned_files": ["paper/dg-r6.tex"],
-        "target_files": ["paper/dg-r6.tex"],
+        "owned_files": row_files,
+        "target_files": row_files,
         "target_project_root": root,
         "worktree_path": root,
         "base_commit": commit,
@@ -200063,11 +200073,37 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     )
     database.parent.mkdir(parents=True)
     database.touch()
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path / "shared-volume"))
     monkeypatch.setattr(
         server,
         "_operator_supervised_direct_main_connection_database_path",
         lambda _conn: database.resolve(),
     )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=project_id,
+        route_token_ref=binding["route_identity"]["route_token_ref"],
+        token={
+            **binding["route_identity"],
+            "caller_role": "observer",
+            "allowed_actions": list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+            "target_files": row_files,
+            "owned_files": row_files,
+            "scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": execution_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{execution_id}",
+            ],
+        },
+    )
+    conn.commit()
     monkeypatch.setattr(
         server,
         "_operator_supervised_direct_main_dev_selector_authority",
@@ -200123,6 +200159,18 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     wrong_type = copy.deepcopy(binding)
     wrong_type["owned_files"] = "paper/dg-r6.tex"
     attacks.append(wrong_type)
+    for invalid_digest in (
+        "not-a-hash",
+        "sha256:" + "A" * 64,
+        "sha256:" + "4" * 63,
+        "sha512:" + "4" * 64,
+        None,
+    ):
+        invalid_route_digest = copy.deepcopy(binding)
+        invalid_route_digest["route_identity"]["route_context_hash"] = (
+            invalid_digest
+        )
+        attacks.append(invalid_route_digest)
     for attack in attacks:
         unsigned_attack = dict(attack)
         unsigned_attack.pop("binding_hash")
@@ -200186,7 +200234,7 @@ def test_legacy_empty_world_requires_exact_stable_physical_binding(
         "route_identity": {
             "route_id": "route-legacy-empty",
             "route_context_hash": "sha256:" + "1" * 64,
-            "prompt_contract_id": "prompt-legacy-empty",
+            "prompt_contract_id": "rprompt-legacy-empty",
             "prompt_contract_hash": "sha256:" + "2" * 64,
             "visible_injection_manifest_hash": "sha256:" + "3" * 64,
             "route_token_ref": "rtok-legacy-empty",
@@ -200209,17 +200257,18 @@ def test_legacy_empty_world_requires_exact_stable_physical_binding(
     )
     database.parent.mkdir(parents=True)
     database.touch()
-    actual_database = (
-        tmp_path / "foreign" / "governance.db"
-        if case == "wrong_database"
-        else database
-    )
+    actual_database = database
     if case == "wrong_database":
-        actual_database.parent.mkdir()
+        actual_database = (
+            tmp_path / "copied" / "shared-volume" / "codex-tasks" / "state"
+            / "governance" / project_id / "governance.db"
+        )
+        actual_database.parent.mkdir(parents=True)
         actual_database.touch()
     monkeypatch.setenv(
         "AMING_CLAW_RUNTIME_PLANE", "dev" if case == "dev_plane" else "stable"
     )
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path / "shared-volume"))
     monkeypatch.setattr(
         server,
         "_runtime_plane_identity",

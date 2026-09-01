@@ -37,6 +37,7 @@ from .errors import GovernanceError, PermissionDeniedError, ValidationError
 from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
 import logging
 import sqlite3
+import stat
 import time
 
 log = logging.getLogger(__name__)
@@ -146837,20 +146838,49 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
         and _ac_stable_database_identity_valid(database_identity)
     ):
         return False
+    try:
+        canonical_project_id = validate_project_id_syntax(
+            project_id, require_exact=True
+        )
+        shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
+        if not shared_raw:
+            return False
+        shared_input = Path(shared_raw).expanduser().absolute()
+        shared_root = shared_input.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not (
+        canonical_project_id == project_id
+        and shared_input == shared_root
+        and not shared_input.is_symlink()
+        and shared_root.is_dir()
+    ):
+        return False
+    expected_database = (
+        shared_root / "codex-tasks" / "state" / "governance"
+        / canonical_project_id / "governance.db"
+    ).absolute()
+    try:
+        expected_metadata = expected_database.stat(follow_symlinks=False)
+        expected_realpath = expected_database.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
     actual_database = _operator_supervised_direct_main_connection_database_path(
         conn
     )
-    stable_suffix = (
-        "shared-volume",
-        "codex-tasks",
-        "state",
-        "governance",
-        project_id,
-        "governance.db",
-    )
+    try:
+        actual_metadata = actual_database.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
     if not (
         actual_database
-        and tuple(actual_database.parts[-len(stable_suffix):]) == stable_suffix
+        and expected_realpath == expected_database
+        and actual_database == expected_realpath
+        and not expected_database.is_symlink()
+        and stat.S_ISREG(expected_metadata.st_mode)
+        and stat.S_ISREG(actual_metadata.st_mode)
+        and int(actual_metadata.st_dev) == int(expected_metadata.st_dev)
+        and int(actual_metadata.st_ino) == int(expected_metadata.st_ino)
     ):
         return False
 
@@ -146883,7 +146913,12 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
     root = str(binding.get("target_project_root") or "").strip()
     base = str(binding.get("base_commit") or "").strip().lower()
     head = str(binding.get("target_head_commit") or "").strip().lower()
-    return bool(
+    digest_fields = (
+        "route_context_hash",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    )
+    static_valid = bool(
         _operator_supervised_direct_main_legacy_empty_closed_shapes_valid(
             binding, world_ref, route
         )
@@ -146914,8 +146949,33 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
         and str(world_ref.get("target_head_commit") or "").lower() == head
         and world_hash == stable_sha256(unsigned_world)
         and _observer_root_route_identity_complete(route)
-        and str(route.get("route_token_ref") or "").strip()
+        and str(route.get("route_id") or "").startswith("route-")
+        and str(route.get("prompt_contract_id") or "").startswith("rprompt-")
+        and str(route.get("route_token_ref") or "").startswith("rtok-")
+        and all(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", str(route.get(field) or ""))
+            for field in digest_fields
+        )
         and binding_hash == stable_sha256(unsigned_binding)
+    )
+    if not static_valid:
+        return False
+    route_registry = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        ("observer_route_token_refs",),
+    ).fetchone()
+    if route_registry is None:
+        return False
+    route_authority = _operator_supervised_direct_main_route_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=str(route.get("route_token_ref") or ""),
+    )
+    return bool(
+        route_authority.get("accepted") is True
+        and dict(route_authority.get("route_identity") or {}) == dict(route)
     )
 
 
