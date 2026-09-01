@@ -9,6 +9,7 @@ import hashlib
 import subprocess
 import shutil
 import socket
+import errno
 from pathlib import Path
 from unittest import mock
 
@@ -2022,6 +2023,16 @@ def test_graph_admission_recovery_adoption_public_create_restart_restart_is_clos
     assert payload["non_retroactive"] is True
     assert payload["claims_r10_reconcile_success"] is payload["claims_r10_zero_write"] is False
     assert payload["startup_authority"]["kind"] == "explicit_one_time_operator_supervised_recovery_adoption"
+    assert payload["policy_ast_sha256"] == db._graph_adoption_policy_ast_sha256()
+    assert payload["startup_authority_sha256"] == db._graph_adoption_startup_authority_hash(
+        payload["startup_authority"]
+    )
+    assert payload["issuance_evidence_sha256"] == db._canonical_json_hash(
+        payload["issuance_evidence"]
+    )
+    assert payload["issuance_evidence_manifest"] == db._closed_value_manifest(
+        payload["issuance_evidence"]
+    )
     assert payload["issuance_evidence"]["typed_lineage"]["identifiers"] == identifiers
     assert db.create_dev_graph_admission_recovery_adoption_receipt(
         root, **identifiers,
@@ -2079,6 +2090,124 @@ def test_graph_adoption_exclusive_publish_collision_leaves_no_temporary_residue(
         db._rename_noreplace(source, destination)
     assert source.read_bytes() == b"candidate"
     assert destination.read_bytes() == b"winner"
+
+
+def test_graph_adoption_write_all_retries_eintr_and_short_writes(monkeypatch):
+    from agent.governance import db
+    written = bytearray(); calls = 0
+    def short_write(_descriptor, chunk):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise InterruptedError()
+        count = min(2, len(chunk))
+        written.extend(bytes(chunk[:count]))
+        return count
+    monkeypatch.setattr(db.os, "write", short_write)
+    db._write_all(9, b"abcdef")
+    assert bytes(written) == b"abcdef"
+    assert calls == 4
+
+
+def test_graph_adoption_post_promote_fsync_is_truthful_and_preserves_final(tmp_path, monkeypatch):
+    from agent.governance import db
+    root = tmp_path / "dev"; root.mkdir()
+    identifiers = {"backlog_id": "R10", "contract_execution_id": "cex", "route_token_ref": "route"}
+    observation = {
+        "cow_v2": {}, "protected_preimage": {"inventory": []}, "protected_preimage_count": 308,
+        "admitted_delta": {"added": [], "removed": [], "sha256": "d"},
+        "protected_postimage": {"inventory": []}, "protected_postimage_count": 326,
+        "database": {"path": "db", "device": 1, "inode": 2},
+        "typed_lineage": {}, "source": {}, "registry": {"sha256": "sha256:" + "b" * 64},
+        "graph_zero_state": {"table_counts": {}}, "stable": {},
+    }
+    monkeypatch.setattr(db, "_default_cutover_listener_probe", lambda _port: {"listening": False, "pid": 0})
+    monkeypatch.setattr(db, "_graph_adoption_observation", lambda *_args, **_kwargs: observation)
+    real_fsync = db.os.fsync; calls = 0
+    def fail_directory_fsync(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(errno.EIO, "directory fsync failed")
+        return real_fsync(descriptor)
+    monkeypatch.setattr(db.os, "fsync", fail_directory_fsync)
+    with pytest.raises(db.GraphAdoptionPublishIndeterminate) as captured:
+        db.create_dev_graph_admission_recovery_adoption_receipt(
+            root, **identifiers,
+            recovery_adoption_acknowledgment=db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT)
+    final = Path(captured.value.final_path)
+    assert final.is_file()
+    assert captured.value.raw_sha256 == "sha256:" + hashlib.sha256(final.read_bytes()).hexdigest()
+    assert not list(final.parent.glob("*.tmp"))
+
+
+def test_graph_adoption_policy_ast_digest_is_closed_and_local(tmp_path):
+    from agent.governance import db
+    source = Path(str(db.__spec__.origin)).read_text()
+    baseline_path = tmp_path / "db.py"; baseline_path.write_text(source)
+    baseline = db._graph_adoption_policy_ast_sha256(baseline_path)
+    selected = tmp_path / "selected.py"
+    selected.write_text(source.replace(
+        'raise OSError(errno.EIO, "short write made no progress")',
+        'raise OSError(errno.ENOSPC, "short write made no progress")', 1))
+    assert db._graph_adoption_policy_ast_sha256(selected) != baseline
+    unrelated = tmp_path / "unrelated.py"
+    unrelated.write_text(source.replace(
+        'def _stable_health_request()', 'def _stable_health_request_unrelated()', 1))
+    assert db._graph_adoption_policy_ast_sha256(unrelated) == baseline
+    manifest = tmp_path / "manifest.py"
+    manifest.write_text(source.replace(
+        '"create": ["create_dev_graph_admission_recovery_adoption_receipt"]',
+        '"create": ["create_dev_graph_admission_recovery_adoption_receipt", "_canonical_json_hash"]', 1))
+    assert db._graph_adoption_policy_ast_sha256(manifest) != baseline
+
+
+def _write_graph_adoption_anchor(db, source_root: Path, **changes):
+    directory = source_root / db.AC_DEV_GRAPH_ADOPTION_ANCHOR_DIRECTORY
+    directory.mkdir(parents=True)
+    payload = {
+        "schema_version": db.AC_DEV_GRAPH_ADOPTION_ANCHOR_SCHEMA,
+        "runtime_receipt_raw_sha256": "sha256:" + "1" * 64,
+        "startup_authority_sha256": "sha256:" + "2" * 64,
+        "policy_ast_sha256": db._graph_adoption_policy_ast_sha256(),
+        "project": db.AC_PROJECT_ID, "port": 40008,
+    }
+    payload.update(changes)
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    path = directory / f"{db.AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json"
+    path.write_bytes(raw)
+    return path, payload
+
+
+def test_graph_adoption_source_authority_loader_closed_fixture(tmp_path):
+    from agent.governance import db
+    path, payload = _write_graph_adoption_anchor(db, tmp_path)
+    assert db._load_graph_adoption_source_authority(tmp_path) == payload
+    duplicate = path.with_name(f"{db.AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX}.{'f' * 64}.json")
+    duplicate.write_bytes(path.read_bytes())
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        db._load_graph_adoption_source_authority(tmp_path)
+
+
+@pytest.mark.parametrize("fault", ["filename", "canonical", "schema", "hash", "symlink"])
+def test_graph_adoption_source_authority_loader_rejects_tamper(tmp_path, fault):
+    from agent.governance import db
+    path, payload = _write_graph_adoption_anchor(db, tmp_path)
+    if fault == "filename":
+        path.rename(path.with_name(f"{db.AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX}.{'e' * 64}.json"))
+    elif fault == "canonical":
+        raw = json.dumps(payload, indent=2).encode(); path.unlink()
+        path = path.with_name(f"{db.AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json")
+        path.write_bytes(raw)
+    elif fault in {"schema", "hash"}:
+        payload["extra" if fault == "schema" else "policy_ast_sha256"] = True if fault == "schema" else "sha256:" + "9" * 64
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(); path.unlink()
+        path = path.with_name(f"{db.AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json")
+        path.write_bytes(raw)
+    else:
+        target = tmp_path / "target"; target.write_bytes(path.read_bytes()); path.unlink(); path.symlink_to(target)
+    with pytest.raises((OSError, ValueError)):
+        db._load_graph_adoption_source_authority(tmp_path)
 
 
 def _graph_adoption_lineage_connection():

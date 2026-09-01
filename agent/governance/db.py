@@ -25,6 +25,7 @@ import urllib.parse
 import shutil
 import tempfile
 import ctypes
+import ast
 from contextlib import closing
 from pathlib import Path
 from collections.abc import Callable, Mapping, Sequence
@@ -62,6 +63,23 @@ AC_DEV_GRAPH_ADOPTION_SCHEMA = "ac_dev_graph_admission_recovery_adoption.v2"
 AC_DEV_GRAPH_ADOPTION_ARCHIVE = "archive/graph-admission-recovery-adoption"
 AC_DEV_GRAPH_ADOPTION_PREFIX = "recovery-adoption"
 AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT = "I AUTHORIZE CURRENT GRAPH POSTIMAGE RECOVERY ADOPTION"
+AC_DEV_GRAPH_ADOPTION_ANCHOR_SCHEMA = "ac_dev_graph_admission_recovery_authority.v1"
+AC_DEV_GRAPH_ADOPTION_ANCHOR_DIRECTORY = "agent/governance/receipt_authorities"
+AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX = "ac_dev_graph_admission_recovery"
+
+# This is deliberately a closed, source-bound dependency graph.  Adding a new
+# policy helper requires changing this manifest, which itself changes the
+# digest.  Functions outside this graph do not invalidate an issued authority.
+_GRAPH_ADOPTION_POLICY_SELECTORS = {
+    "create": ["create_dev_graph_admission_recovery_adoption_receipt"],
+    "validate": ["validate_dev_graph_admission_recovery_adoption_receipt"],
+    "observe": ["_graph_adoption_observation", "_graph_adoption_typed_lineage", "_graph_adoption_zero_state", "_graph_adoption_source_binding", "_closed_value_manifest"],
+    "startup": ["_load_graph_adoption_source_authority", "_graph_adoption_source_root", "_graph_adoption_startup_authority_hash", "_verify_current_dev_backlog_runtime_invariants"],
+    "inventory": ["backlog_read_schema_protected_inventory", "_canonical_json_hash", "_closed_json_object"],
+    "registry": ["_graph_adoption_registry_binding", "_graph_schema_owner_registry", "_graph_schema_owner_inventory", "classify_graph_materialization_preimage"],
+    "persistence": ["_rename_noreplace", "_write_all"],
+    "constants": ["AC_PROJECT_ID", "AC_DATABASE_DEV_RELATIVE_PATH", "AC_DEV_COW_SUCCESSOR_PREFIX", "AC_DEV_GRAPH_ADOPTION_SCHEMA", "AC_DEV_GRAPH_ADOPTION_ARCHIVE", "AC_DEV_GRAPH_ADOPTION_PREFIX", "AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT", "AC_DEV_GRAPH_ADOPTION_ANCHOR_SCHEMA", "AC_DEV_GRAPH_ADOPTION_ANCHOR_DIRECTORY", "AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX"],
+}
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
@@ -3979,6 +3997,152 @@ def _canonical_json_hash(value: object) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
+def _closed_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def _closed_value_manifest(value: object) -> dict[str, object]:
+    """Recursively bind shape, types, ordering and content of issuance evidence."""
+    if isinstance(value, Mapping):
+        keys = sorted(value)
+        return {"type": "object", "keys": keys,
+                "children": {key: _closed_value_manifest(value[key]) for key in keys},
+                "sha256": _canonical_json_hash(dict(value))}
+    if isinstance(value, list):
+        return {"type": "array", "length": len(value),
+                "children": [_closed_value_manifest(item) for item in value],
+                "sha256": _canonical_json_hash(value)}
+    scalar_type = ("null" if value is None else "boolean" if isinstance(value, bool)
+                   else "integer" if isinstance(value, int) else "number" if isinstance(value, float)
+                   else "string" if isinstance(value, str) else "invalid")
+    if scalar_type == "invalid":
+        raise TypeError("unsupported graph adoption evidence type")
+    return {"type": scalar_type, "sha256": _canonical_json_hash(value)}
+
+
+class GraphAdoptionPublishIndeterminate(OSError):
+    """The final receipt exists, but directory durability could not be proven."""
+    def __init__(self, path: Path, raw_sha256: str, cause: BaseException):
+        super().__init__(errno.EIO, "receipt promoted; parent fsync outcome is indeterminate", str(path))
+        self.final_path = str(path)
+        self.raw_sha256 = raw_sha256
+        self.__cause__ = cause
+
+
+def _graph_adoption_policy_ast_sha256(source_path: Path | None = None) -> str:
+    """Hash the canonical AST of the closed adoption-policy dependency graph."""
+    path = source_path or Path(str(__spec__.origin))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    selector_nodes = [node for node in tree.body
+                      if ((node.__class__.__name__ == "Assign"
+                           and any(target.__class__.__name__ == "Name"
+                                   and target.id == "_GRAPH_ADOPTION_POLICY_SELECTORS"
+                                   for target in node.targets))
+                          or (node.__class__.__name__ == "AnnAssign"
+                              and node.target.__class__.__name__ == "Name"
+                              and node.target.id == "_GRAPH_ADOPTION_POLICY_SELECTORS"))]
+    if len(selector_nodes) != 1:
+        raise ValueError("graph adoption policy selector manifest is missing or ambiguous")
+    selectors = ast.literal_eval(selector_nodes[0].value)
+    if not isinstance(selectors, dict) or not selectors:
+        raise ValueError("graph adoption policy selector manifest is invalid")
+    constant_names = set(selectors.get("constants") or [])
+    wanted = {name for category, names in selectors.items() if category != "constants" for name in names}
+    selected: dict[str, str] = {}
+    for node in tree.body:
+        if node.__class__.__name__ in {"FunctionDef", "AsyncFunctionDef"} and node.name in wanted:
+            if node.name in selected:
+                raise ValueError("duplicate graph adoption policy function")
+            selected[node.name] = ast.dump(node, annotate_fields=True, include_attributes=False)
+    if set(selected) != wanted:
+        raise ValueError("graph adoption policy selector is incomplete")
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        if node.__class__.__name__ != "Assign":
+            continue
+        names = [target.id for target in node.targets if target.__class__.__name__ == "Name"]
+        for name in names:
+            if name in constant_names:
+                constants[name] = ast.dump(node.value, annotate_fields=True, include_attributes=False)
+    if set(constants) != constant_names:
+        raise ValueError("graph adoption policy constant selector is incomplete")
+    payload = {"schema_version": "ac_dev_graph_adoption_policy_ast.v1",
+               "selectors": selectors,
+               "functions": selected, "constants": constants}
+    return _canonical_json_hash(payload)
+
+
+def _write_all(descriptor: int, raw: bytes) -> None:
+    """Write every byte, retrying EINTR and rejecting a zero-length write."""
+    view = memoryview(raw)
+    offset = 0
+    while offset < len(view):
+        try:
+            written = os.write(descriptor, view[offset:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError(errno.EIO, "short write made no progress")
+        offset += written
+
+
+def _graph_adoption_source_root() -> Path:
+    return Path(str(__spec__.origin)).resolve().parents[2]
+
+
+def _load_graph_adoption_source_authority(source_root: Path | None = None) -> dict[str, object]:
+    root = (source_root or _graph_adoption_source_root()).absolute()
+    directory = root / AC_DEV_GRAPH_ADOPTION_ANCHOR_DIRECTORY
+    if not directory.is_dir() or directory.is_symlink() or directory.resolve(strict=True) != directory:
+        raise ValueError("AC dev graph adoption source authority directory is invalid")
+    anchors = sorted(directory.glob(f"{AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX}.*.json"))
+    if len(anchors) != 1:
+        raise ValueError("AC dev graph adoption source authority is missing or ambiguous")
+    path = anchors[0]
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        meta = os.fstat(descriptor)
+        if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
+            raise ValueError("AC dev graph adoption source authority identity is invalid")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    digest = hashlib.sha256(raw).hexdigest()
+    if path.name != f"{AC_DEV_GRAPH_ADOPTION_ANCHOR_PREFIX}.{digest}.json":
+        raise ValueError("AC dev graph adoption source authority filename mismatch")
+    try:
+        anchor = json.loads(raw, object_pairs_hook=_closed_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("AC dev graph adoption source authority is invalid") from exc
+    if raw != json.dumps(anchor, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode():
+        raise ValueError("AC dev graph adoption source authority is not canonical JSON")
+    if set(anchor) != {"schema_version", "runtime_receipt_raw_sha256", "startup_authority_sha256",
+                       "policy_ast_sha256", "project", "port"}:
+        raise ValueError("AC dev graph adoption source authority schema is not closed")
+    hashes = [anchor.get(key) for key in ("runtime_receipt_raw_sha256", "startup_authority_sha256", "policy_ast_sha256")]
+    if (anchor.get("schema_version") != AC_DEV_GRAPH_ADOPTION_ANCHOR_SCHEMA
+            or anchor.get("project") != AC_PROJECT_ID or anchor.get("port") != 40008
+            or any(not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value)) for value in hashes)
+            or anchor.get("policy_ast_sha256") != _graph_adoption_policy_ast_sha256()):
+        raise ValueError("AC dev graph adoption source authority contract mismatch")
+    return anchor
+
+
+def _graph_adoption_startup_authority_hash(authority: Mapping[str, object]) -> str:
+    return _canonical_json_hash(dict(authority))
+
+
 def _graph_adoption_registry_binding() -> dict[str, object]:
     owners = []
     for owner, rows in _graph_schema_owner_registry():
@@ -4230,13 +4394,19 @@ def create_dev_graph_admission_recovery_adoption_receipt(
         "protected_postimage": observation["protected_postimage"],
         "protected_postimage_count": observation["protected_postimage_count"],
         "adoption_policy": {"registry_sha256": observation["registry"]["sha256"],
-                            "policy_schema": "exact_source_owned_graph_registry.v1"},
+                            "policy_schema": "exact_source_owned_graph_registry.v1",
+                            "policy_ast_sha256": _graph_adoption_policy_ast_sha256()},
     }
     issuance_evidence = dict(observation)
+    issuance_manifest = _closed_value_manifest(issuance_evidence)
     payload = {"schema_version": AC_DEV_GRAPH_ADOPTION_SCHEMA, "stage": "recovery_adoption",
                "qa_pass": False, "pass_claim": False, "non_retroactive": True,
                "claims_r10_reconcile_success": False, "claims_r10_zero_write": False,
                "startup_authority": startup_authority,
+               "startup_authority_sha256": _graph_adoption_startup_authority_hash(startup_authority),
+               "policy_ast_sha256": _graph_adoption_policy_ast_sha256(),
+               "issuance_evidence_sha256": _canonical_json_hash(issuance_evidence),
+               "issuance_evidence_manifest": issuance_manifest,
                "issuance_evidence": issuance_evidence,
                "project_id": AC_PROJECT_ID, "port": 40008, "root": str(root)}
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
@@ -4248,7 +4418,14 @@ def create_dev_graph_admission_recovery_adoption_receipt(
     destination = archive / f"{AC_DEV_GRAPH_ADOPTION_PREFIX}.{digest}.json"
     existing = sorted(archive.glob(f"{AC_DEV_GRAPH_ADOPTION_PREFIX}.*.json"))
     if existing:
-        if existing == [destination] and destination.read_bytes() == raw:
+        if existing == [destination]:
+            existing_meta = destination.stat(follow_symlinks=False)
+            exact = (not destination.is_symlink() and stat.S_ISREG(existing_meta.st_mode)
+                     and existing_meta.st_nlink == 1 and destination.read_bytes() == raw
+                     and hashlib.sha256(destination.read_bytes()).hexdigest() == digest)
+        else:
+            exact = False
+        if exact:
             return {"status": "already_created", "receipt": str(destination),
                     "receipt_sha256": "sha256:" + digest}
         raise ValueError("AC dev graph recovery adoption receipt is ambiguous")
@@ -4256,13 +4433,18 @@ def create_dev_graph_admission_recovery_adoption_receipt(
     descriptor = None
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o444)
-        os.write(descriptor, raw); os.fsync(descriptor); os.close(descriptor); descriptor = None
+        _write_all(descriptor, raw); os.fsync(descriptor); os.close(descriptor); descriptor = None
         _rename_noreplace(temporary, destination)
-        directory_fd = os.open(archive, os.O_RDONLY)
-        try: os.fsync(directory_fd)
-        finally: os.close(directory_fd)
+        try:
+            directory_fd = os.open(archive, os.O_RDONLY)
+            try: os.fsync(directory_fd)
+            finally: os.close(directory_fd)
+        except BaseException as exc:
+            raise GraphAdoptionPublishIndeterminate(destination, "sha256:" + digest, exc) from exc
     except BaseException:
         if descriptor is not None: os.close(descriptor)
+        # After a successful promotion the final is authoritative and must be
+        # preserved; only a still-private temporary may be cleaned up.
         try: temporary.unlink()
         except FileNotFoundError: pass
         raise
@@ -4310,7 +4492,8 @@ def validate_dev_graph_admission_recovery_adoption_receipt(
         raise ValueError("AC dev graph recovery adoption receipt is not canonical JSON")
     fixed = {"schema_version", "stage", "qa_pass", "pass_claim", "non_retroactive",
              "claims_r10_reconcile_success", "claims_r10_zero_write", "startup_authority",
-             "issuance_evidence",
+             "startup_authority_sha256", "policy_ast_sha256", "issuance_evidence_sha256",
+             "issuance_evidence_manifest", "issuance_evidence",
              "project_id", "port", "root"}
     if set(receipt) != fixed or any((
         receipt.get("schema_version") != AC_DEV_GRAPH_ADOPTION_SCHEMA,
@@ -4322,6 +4505,11 @@ def validate_dev_graph_admission_recovery_adoption_receipt(
         raise ValueError("AC dev graph recovery adoption receipt contract mismatch")
     authority = dict(receipt.get("startup_authority") or {})
     issuance = dict(receipt.get("issuance_evidence") or {})
+    if (receipt.get("startup_authority_sha256") != _graph_adoption_startup_authority_hash(authority)
+            or receipt.get("issuance_evidence_sha256") != _canonical_json_hash(issuance)
+            or receipt.get("issuance_evidence_manifest") != _closed_value_manifest(issuance)
+            or receipt.get("policy_ast_sha256") != _graph_adoption_policy_ast_sha256()):
+        raise ValueError("AC dev graph recovery adoption evidence hash mismatch")
     issuance_keys = {"cow_v2", "protected_preimage", "protected_preimage_count",
                      "admitted_delta", "protected_postimage", "protected_postimage_count",
                      "database", "typed_lineage", "source", "registry",
@@ -4372,10 +4560,16 @@ def validate_dev_graph_admission_recovery_adoption_receipt(
         "database_identity": {"path": str(database), "device": int(meta.st_dev), "inode": int(meta.st_ino)},
         "protected_postimage": inventory, "protected_postimage_count": len(inventory.get("inventory", [])),
         "adoption_policy": {"registry_sha256": registry["sha256"],
-                            "policy_schema": "exact_source_owned_graph_registry.v1"},
+                            "policy_schema": "exact_source_owned_graph_registry.v1",
+                            "policy_ast_sha256": _graph_adoption_policy_ast_sha256()},
     }
     if authority != expected or expected["protected_postimage_count"] != 326:
         raise ValueError("AC dev graph recovery adoption current startup authority mismatch")
+    anchor = _load_graph_adoption_source_authority()
+    if (anchor.get("runtime_receipt_raw_sha256") != "sha256:" + digest
+            or anchor.get("startup_authority_sha256") != receipt.get("startup_authority_sha256")
+            or anchor.get("policy_ast_sha256") != receipt.get("policy_ast_sha256")):
+        raise ValueError("AC dev graph recovery adoption source authority mismatch")
     return receipt
 
 def _verify_current_dev_backlog_runtime_invariants(
