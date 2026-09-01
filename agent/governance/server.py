@@ -146617,14 +146617,20 @@ def _operator_supervised_direct_main_persisted_world_ownership(
     violations: list[str] = []
     if not backlog_id or len(backlog_rows) != 1:
         violations.append("backlog_identity_not_unique")
-    if len(execution_rows) != 1:
+    if len(execution_rows) > 1:
         violations.append("contract_execution_identity_not_unique")
-    if len(valid_records) != 1:
+    if execution_rows and len(valid_records) != 1:
         violations.append("contract_execution_binding_invalid")
 
     world = ""
     execution_id = ""
-    if not violations:
+    if not violations and not execution_rows:
+        # A unique backlog with no Direct ContractExecution is the normal
+        # pre-route state for a fresh generation.  There is no persisted
+        # runtime world to recover yet; Onboard may mint the deterministic
+        # execution only after independently rejecting any exact dev selector.
+        world = "unbound"
+    elif not violations:
         execution_id, record = valid_records[0]
         metadata = (
             record.get("metadata")
@@ -146678,8 +146684,17 @@ def _operator_supervised_direct_main_persisted_world_ownership(
         "project_id": project_id,
         "backlog_id": backlog_id,
         "world": world,
+        "contract_execution_state": (
+            "fresh_unbound"
+            if world == "unbound"
+            else "persisted"
+            if world in {"stable", "dev"}
+            else "invalid"
+        ),
+        "contract_execution_count": len(execution_rows),
         "contract_execution_id": execution_id,
-        "complete": bool(world) and not violations,
+        "complete": world in {"stable", "dev"} and not violations,
+        "fresh_start_allowed": world == "unbound" and not violations,
         "violations": violations,
         "zero_write_projection": True,
     }
@@ -147128,7 +147143,6 @@ def _operator_supervised_direct_main_request_mismatches(
 
     body = request_body if isinstance(request_body, Mapping) else {}
     plane = _runtime_plane()
-    identity = _runtime_plane_identity()
     if world_authority:
         expected_root = str(world_authority.get("target_project_root") or "")
         expected_head = str(world_authority.get("target_head_commit") or "")
@@ -147137,22 +147151,18 @@ def _operator_supervised_direct_main_request_mismatches(
         expected_port = int(
             world_authority.get("runtime_port") or AC_DEV_SERVICE_PORT
         )
-    elif plane == "stable":
-        expected_root = str(identity.get("worktree_root") or "")
-        loaded = governance_loaded_runtime_identity(get_server_version())
-        expected_head = str(
-            loaded.get("loaded_commit") or identity.get("commit") or ""
-        ).strip().lower()
-        expected_branch = str(identity.get("branch") or AC_STABLE_BRANCH)
-        expected_ref = f"refs/heads/{expected_branch}"
-        expected_port = AC_STABLE_SERVICE_PORT
     else:
         expected_root = ""
         expected_head = ""
         expected_branch = ""
         expected_ref = ""
         expected_port = 0
-    enforce_loaded_authority = bool(world_authority) or plane == "stable"
+    # Stable Onboard governs external repositories.  Their project root,
+    # branch, and commit are target-project selectors, not claims about the
+    # governance server's own loaded checkout.  Only a persisted dev-world
+    # ContractExecution binds those values to the runtime world; exact dev
+    # selectors are rejected independently below from server-derived authority.
+    enforce_loaded_authority = bool(world_authority)
     mismatches: list[dict[str, str]] = []
     if plane != "dev" and _operator_supervised_direct_main_request_uses_dev_selector(
         body,
@@ -147419,9 +147429,23 @@ def _require_onboard_dev_selector_endpoint(
                 selector_authority=authority,
             )
         return authority
+    if ownership["world"] == "unbound":
+        if _runtime_plane() == "dev" or not (
+            _operator_supervised_direct_main_request_uses_dev_selector(
+                request_body,
+                selector_authority=authority,
+            )
+        ):
+            return authority
+        # A fresh stable generation has no CEX world to inherit.  Exact dev
+        # selectors still belong on 40008, while ordinary external-project
+        # roots/heads/refs remain valid target selectors on stable.
     if not ownership.get("complete") and not has_explicit_selector:
+        # Selector-free reads retain the existing ContractRuntime/path-specific
+        # validation behavior.  As soon as a caller supplies world-like claims,
+        # only a fresh-unbound row or complete persisted ownership may proceed.
         return authority
-    if not ownership.get("complete"):
+    if ownership["world"] != "unbound" and not ownership.get("complete"):
         raise GovernanceError(
             "ac_onboard_runtime_world_ownership_unresolved",
             "Onboard requires one complete persisted backlog/runtime world chain",
@@ -149108,6 +149132,15 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         if current_record
         else {}
     )
+    storage_row = conn.execute(
+        "SELECT mf_type FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    work_type_storage_projection = _onboard_work_type_storage_projection(
+        requested_work_type="operator_supervised_direct_main",
+        selected_work_type="operator_supervised_direct_main",
+        storage_mf_type=str(_row_get(storage_row, "mf_type", "")),
+    )
 
     return {
         "schema_version": (
@@ -149119,6 +149152,8 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "backlog_id": backlog_id,
         "selected_role": "observer",
         "selected_work_type": "operator_supervised_direct_main",
+        "selected_contract": "operator_supervised_direct_main",
+        "work_type_storage_projection": work_type_storage_projection,
         "selected_backlog_source": "backlog_row",
         "contract_execution_id": execution_id,
         "contract_id": "operator_supervised_direct_main",
@@ -160825,8 +160860,9 @@ def _onboard_work_type_storage_projection(
         "storage_label_is_contract_selection": False,
         "selected_contract_changed_by_storage_label": False,
         "chain_rescue_semantics": (
-            "MVP internal storage label; it does not replace or revise the "
-            "observer-selected mf_batch_parallel contract"
+            "MVP internal storage label; it is not selection authority and "
+            f"does not replace or revise the explicitly selected {canonical_contract} "
+            "contract"
             if internal_storage_label
             else "not_applicable"
         ),

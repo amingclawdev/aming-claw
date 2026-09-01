@@ -199716,7 +199716,7 @@ def test_ac_dev_schema_failure_is_public_typed_zero_write_http(monkeypatch):
     assert captured["body"]["details"]["public_safe"] is True
 
 
-def test_stable_direct_guide_rejects_all_dev_authority_aliases_zero_write(
+def test_stable_direct_guide_rejects_dev_authority_without_rebinding_external_target(
     conn,
     monkeypatch,
     tmp_path,
@@ -199823,8 +199823,8 @@ def test_stable_direct_guide_rejects_all_dev_authority_aliases_zero_write(
     fields = {
         item["field"] for item in rejected.value.details["identity_mismatches"]
     }
+    assert {"runtime_plane", "task_id", "contract_execution_id"} <= fields
     assert {
-        "runtime_plane",
         "target_project_root",
         "target_head_commit",
         "head_commit",
@@ -199832,13 +199832,7 @@ def test_stable_direct_guide_rejects_all_dev_authority_aliases_zero_write(
         "requested_commit",
         "commit_sha",
         "base_commit",
-        "target_ref",
-        "branch",
-        "branch_ref",
-        "requested_branch_ref",
-        "task_id",
-        "contract_execution_id",
-    } <= fields
+    }.isdisjoint(fields)
     assert rejected.value.details["writes_performed"] is False
     assert conn.total_changes == before
 
@@ -199870,6 +199864,277 @@ def test_generic_direct_claims_preserve_generic_authority_but_reject_dev_selecto
             "actual": "generic",
         }
     ]
+
+
+def test_fresh_stable_external_direct_selectors_issue_deterministic_route(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "DP-V2-DIRECT-PENDING-COUNT-R2-20260901"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    SQLiteContractExecutionStore(conn)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
+        (
+            json.dumps(["daily_planner/planner.py"]),
+            json.dumps(["tests/test_planner.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    external_root = tmp_path / "daily-planner"
+    external_root.mkdir()
+    dev_root = tmp_path / ".worktrees" / "ac-dev"
+    dev_root.mkdir(parents=True)
+    external_head = "4" * 40
+    dev_head = "8" * 40
+    authority = {
+        "schema_version": (
+            "operator_supervised_direct_main.dev_selector_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "dev_branch": server.AC_DEV_BRANCH,
+        "dev_refs": [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": str(dev_root.resolve()),
+        "dev_head_commit": dev_head,
+        "dev_contract_execution_ids": [],
+        "zero_write_projection": True,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    body = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+        "project_root": str(external_root),
+        "target_project_root": str(external_root),
+        "target_ref": "refs/heads/main",
+        "target_head_commit": external_head,
+        "graph_snapshot_id": "full-daily-planner-external",
+        "response_view": "compact",
+    }
+    before = conn.total_changes
+    before_execution_count = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE project_id=? AND backlog_id=?",
+        (PID, backlog_id),
+    ).fetchone()[0]
+    before_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id=?",
+        (backlog_id,),
+    ).fetchone()[0]
+
+    first = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    replay = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    expected_execution_id = (
+        server._operator_supervised_direct_main_execution_id(
+            PID,
+            backlog_id,
+            revision=first["contract_revision"],
+        )
+    )
+    assert first["contract_execution_id"] == expected_execution_id
+    assert replay["contract_execution_id"] == expected_execution_id
+    assert first["selected_work_type"] == (
+        "operator_supervised_direct_main"
+    )
+    assert first["selected_contract"] == "operator_supervised_direct_main"
+    assert first["next_legal_action"]["id"] == (
+        "operator_supervised_direct_main_route_issue"
+    )
+    assert first["next_legal_action"]["action_input_ready"] is True
+    projection = first["work_type_storage_projection"]
+    assert projection["requested_work_type"] == (
+        "operator_supervised_direct_main"
+    )
+    assert projection["selected_work_type"] == (
+        "operator_supervised_direct_main"
+    )
+    assert projection["selected_contract"] == (
+        "operator_supervised_direct_main"
+    )
+    assert projection["storage_mf_type"] == "chain_rescue"
+    assert projection["storage_label_is_contract_selection"] is False
+    assert "operator_supervised_direct_main" in projection[
+        "chain_rescue_semantics"
+    ]
+    assert "mf_batch_parallel" not in projection["chain_rescue_semantics"]
+    assert conn.total_changes == before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE project_id=? AND backlog_id=?",
+        (PID, backlog_id),
+    ).fetchone()[0] == before_execution_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id=?",
+        (backlog_id,),
+    ).fetchone()[0] == before_timeline_count
+
+
+def test_fresh_unbound_direct_world_rejects_exact_dev_selector_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "DP-V2-DIRECT-FRESH-UNBOUND-DEV-SELECTOR"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    dev_root = tmp_path / ".worktrees" / "ac-dev"
+    dev_root.mkdir(parents=True)
+    dev_head = "9" * 40
+    authority = {
+        "schema_version": (
+            "operator_supervised_direct_main.dev_selector_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "dev_branch": server.AC_DEV_BRANCH,
+        "dev_refs": [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": str(dev_root.resolve()),
+        "dev_head_commit": dev_head,
+        "dev_contract_execution_ids": [],
+        "zero_write_projection": True,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    ownership = (
+        server._operator_supervised_direct_main_persisted_world_ownership(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+        )
+    )
+    assert ownership["world"] == "unbound"
+    assert ownership["contract_execution_state"] == "fresh_unbound"
+    assert ownership["contract_execution_count"] == 0
+    assert ownership["complete"] is False
+    assert ownership["fresh_start_allowed"] is True
+    assert ownership["violations"] == []
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._require_onboard_dev_selector_endpoint(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            request_body={
+                "target_project_root": str(dev_root),
+                "target_head_commit": dev_head,
+            },
+            role="observer",
+            work_type="operator_supervised_direct_main",
+        )
+
+    assert rejected.value.code == "ac_onboard_dev_selector_wrong_endpoint"
+    assert rejected.value.details["required_endpoint"] == (
+        "http://127.0.0.1:40008"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+def test_fresh_direct_multiple_contract_executions_remain_fail_closed(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "DP-V2-DIRECT-MULTIPLE-CEX-CORRUPTION"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    SQLiteContractExecutionStore(conn)
+    for index in range(2):
+        execution_id = f"cex-direct-main-corrupt-{index}"
+        record = {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "contract_id": "operator_supervised_direct_main",
+            "version": "v1",
+            "revision": "rev3",
+            "execution_state_revision": 1,
+            "metadata": {
+                "operator_supervised_direct_main_runtime_binding": {
+                    "strict_runtime_binding_required": True,
+                }
+            },
+        }
+        conn.execute(
+            """INSERT INTO contract_runtime_executions (
+                   contract_execution_id, project_id, backlog_id, contract_id,
+                   version, revision, execution_state_revision, record_json,
+                   created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                execution_id,
+                PID,
+                backlog_id,
+                "operator_supervised_direct_main",
+                "v1",
+                "rev3",
+                1,
+                json.dumps(record),
+                "2026-09-01T00:00:00Z",
+                "2026-09-01T00:00:00Z",
+            ),
+        )
+    conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    ownership = (
+        server._operator_supervised_direct_main_persisted_world_ownership(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+        )
+    )
+    assert ownership["world"] == ""
+    assert ownership["contract_execution_state"] == "invalid"
+    assert ownership["contract_execution_count"] == 2
+    assert ownership["complete"] is False
+    assert ownership["fresh_start_allowed"] is False
+    assert "contract_execution_identity_not_unique" in ownership["violations"]
+    with pytest.raises(GovernanceError) as rejected:
+        server._require_onboard_dev_selector_endpoint(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            request_body={"target_ref": "refs/heads/main"},
+            role="observer",
+            work_type="operator_supervised_direct_main",
+        )
+    assert rejected.value.code == (
+        "ac_onboard_runtime_world_ownership_unresolved"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
 
 
 def test_onboard_dev_selector_authority_is_server_derived_from_physical_namespace(
