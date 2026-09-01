@@ -2900,6 +2900,216 @@ def _completed_cow_basic_restart_fixture(tmp_path, monkeypatch):
     return root, database, candidate, stable, launch_path
 
 
+def _defer_completed_source_and_open_clean_successor(
+    tmp_path, historical_source,
+):
+    """Move current authority without requiring the old worktree to stay frozen."""
+
+    old = Path(historical_source["root"])
+    historical_commit = str(historical_source["commit"])
+    builder = tmp_path / "completed-source-builder"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(builder), historical_commit],
+        cwd=old, check=True, capture_output=True,
+    )
+    current_commit = _advance_dev_source(builder, "completed-current-descendant")
+    subprocess.run(
+        ["git", "update-ref", "refs/heads/codex/ac-dev", current_commit,
+         historical_commit], cwd=old, check=True,
+    )
+    subprocess.run(
+        ["git", "update-ref", "--no-deref", "HEAD", historical_commit,
+         current_commit], cwd=old, check=True,
+    )
+    subprocess.run(
+        ["git", "branch", "codex/deferred-completed", historical_commit],
+        cwd=old, check=True,
+    )
+    subprocess.run(
+        ["git", "symbolic-ref", "HEAD", "refs/heads/codex/deferred-completed"],
+        cwd=old, check=True,
+    )
+    successor = tmp_path / "completed-source-successor"
+    subprocess.run(
+        ["git", "worktree", "add", str(successor), "codex/ac-dev"],
+        cwd=old, check=True, capture_output=True,
+    )
+    # This is the retained operator draft from the retired checkout.  It is
+    # intentionally not cleaned, reset, or made part of current authority.
+    with (old / "agent" / "cli.py").open("a", encoding="utf-8") as handle:
+        handle.write("# retained deferred operator draft\n")
+    return {
+        **historical_source,
+        "root": str(successor.resolve()),
+        "commit": current_commit,
+        "tree": subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=successor, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip(),
+        "source_sha256": "sha256:" + hashlib.sha256(
+            (successor / "agent" / "cli.py").read_bytes()
+        ).hexdigest(),
+        "dirty": "",
+    }
+
+
+def test_completed_cow_restart_accepts_content_addressed_tip_and_inert_sidecars(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    historical = _advance_cow_to_completed_generation(database, root, source)
+    current = _defer_completed_source_and_open_clean_successor(tmp_path, historical)
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(root))
+    wal = Path(str(database) + "-wal")
+    shm = Path(str(database) + "-shm")
+    wal.write_bytes(b"")
+    shm.write_bytes(b"\0" * 32768)
+    before = {
+        "database": database.read_bytes(), "wal": wal.read_bytes(),
+        "shm": shm.read_bytes(),
+    }
+
+    assert db.validate_dev_cow_completed_generation_projection(
+        root, linked_v3_receipt=linked, source_identity=current,
+        stable_binding=db.verified_stable_database_binding(),
+    ) == receipt
+
+    assert database.read_bytes() == before["database"]
+    assert wal.read_bytes() == before["wal"]
+    assert shm.read_bytes() == before["shm"]
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=historical["root"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == "M agent/cli.py"
+
+
+@pytest.mark.parametrize("defect", ("nonempty_wal", "bad_shm", "listener", "holder"))
+def test_completed_cow_restart_rejects_unsafe_sidecar_or_live_owner_zero_write(
+    tmp_path, monkeypatch, defect,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    current = _advance_cow_to_completed_generation(database, root, source)
+    wal = Path(str(database) + "-wal")
+    shm = Path(str(database) + "-shm")
+    wal.write_bytes(b"foreign-frame" if defect == "nonempty_wal" else b"")
+    shm.write_bytes(b"tampered" if defect == "bad_shm" else b"\0" * 32768)
+    if defect == "listener":
+        monkeypatch.setattr(
+            db, "_default_cutover_listener_probe",
+            lambda port: {"port": port, "listening": True, "pid": 77},
+        )
+    elif defect == "holder":
+        monkeypatch.setattr(
+            db, "_assert_no_external_sqlite_holders",
+            lambda _path: (_ for _ in ()).throw(RuntimeError("live holder")),
+        )
+    before = database.read_bytes(), wal.read_bytes(), shm.read_bytes()
+
+    with pytest.raises((RuntimeError, ValueError)):
+        db.validate_dev_cow_completed_generation_projection(
+            root, linked_v3_receipt=linked, source_identity=current,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+
+    assert (database.read_bytes(), wal.read_bytes(), shm.read_bytes()) == before
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("unknown_tip", "tip_hash", "forged_root", "nonancestor", "cross_repo"),
+)
+def test_completed_cow_historical_source_authority_rejects_forgery_zero_write(
+    tmp_path, monkeypatch, defect,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    historical = _advance_cow_to_completed_generation(database, root, source)
+    current = _defer_completed_source_and_open_clean_successor(tmp_path, historical)
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(root))
+    if defect in {"unknown_tip", "tip_hash", "forged_root"}:
+        connection = sqlite3.connect(database)
+        tip = json.loads(connection.execute(
+            "SELECT value FROM schema_meta "
+            "WHERE key='governance_world_source_tip_json'"
+        ).fetchone()[0])
+        if defect == "unknown_tip":
+            tip["commit"] = "f" * 40
+        elif defect == "tip_hash":
+            tip["source_sha256"] = "sha256:" + "f" * 64
+        else:
+            forged = tmp_path / "forged-provenance-root"
+            forged.mkdir()
+            tip["root"] = str(forged.resolve())
+        encoded = json.dumps(tip, sort_keys=True, separators=(",", ":"))
+        connection.executemany(
+            "UPDATE schema_meta SET value=? WHERE key=?",
+            (
+                (encoded, "governance_world_source_tip_json"),
+                (db._world_source_tip_hash(tip),
+                 "governance_world_source_tip_sha256"),
+            ),
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+    elif defect == "nonancestor":
+        successor = Path(current["root"])
+        orphan = subprocess.run(
+            ["git", "commit-tree", current["tree"], "-m", "unrelated current"],
+            cwd=successor, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", "refs/heads/codex/ac-dev", orphan,
+             current["commit"]], cwd=successor, check=True,
+        )
+        current = {**current, "commit": orphan}
+    else:
+        foreign = tmp_path / "foreign-source-repository"
+        subprocess.run(
+            ["git", "clone", "--no-local", str(historical["root"]), str(foreign)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-B", "codex/ac-dev", "origin/codex/ac-dev"],
+            cwd=foreign, check=True, capture_output=True,
+        )
+        current = {
+            **current,
+            "root": str(foreign.resolve()),
+            "commit": subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=foreign, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip(),
+            "tree": subprocess.run(
+                ["git", "rev-parse", "HEAD^{tree}"], cwd=foreign, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip(),
+            "source_sha256": "sha256:" + hashlib.sha256(
+                (foreign / "agent" / "cli.py").read_bytes()
+            ).hexdigest(),
+        }
+    before = database.read_bytes()
+
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        db.validate_dev_cow_completed_generation_projection(
+            root, linked_v3_receipt=linked, source_identity=current,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+
+    assert database.read_bytes() == before
+
+
 def test_completed_cow_basic_restart_preserves_database_and_refreshes_only_basic_receipt(
     tmp_path, monkeypatch,
 ):

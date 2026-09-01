@@ -2683,7 +2683,7 @@ def _git_read_exact(root: Path, *args: str) -> bytes:
 
 def _validate_dev_source_tip_custody(
     tip: Mapping[str, object], *, stored_sha256: str,
-    candidate: Mapping[str, object],
+    candidate: Mapping[str, object], historical_worktree_advisory: bool = False,
 ) -> None:
     """Bind a closed historical tip to its producer and a clean descendant."""
     candidate_tip = {key: candidate.get(key) for key in _DEV_SOURCE_TIP_KEYS}
@@ -2704,15 +2704,31 @@ def _validate_dev_source_tip_custody(
             or candidate_cli.is_symlink() or not stat.S_ISREG(candidate_stat.st_mode)
             or candidate_cli.resolve(strict=True) != candidate_cli):
         raise ValueError("AC dev source tip custody identity mismatch")
+    # A completed generation stores the producer checkout path as provenance,
+    # not as a perpetual lease on that worktree's HEAD or index.  Read the
+    # content-addressed historical object from the current clean checkout's
+    # shared repository.  `_verify_dev_source_upgrade` still proves that both
+    # registered worktrees share the same Git object store before this can be
+    # admitted.
+    historical_object_root = candidate_root if historical_worktree_advisory else tip_root
     historical_bytes = _git_read_exact(
-        tip_root, "show", f"{tip['commit']}:agent/cli.py",
+        historical_object_root, "show", f"{tip['commit']}:agent/cli.py",
     )
+    if historical_worktree_advisory:
+        for path in ("agent/governance/server.py", "agent/governance/db.py"):
+            if not _git_read_exact(
+                historical_object_root, "show", f"{tip['commit']}:{path}",
+            ):
+                raise ValueError("AC dev source tip producer object is incomplete")
     historical_sha = "sha256:" + hashlib.sha256(historical_bytes).hexdigest()
     candidate_sha = "sha256:" + hashlib.sha256(candidate_cli.read_bytes()).hexdigest()
     if (tip.get("source_sha256") != historical_sha
             or candidate_tip.get("source_sha256") != candidate_sha):
         raise ValueError("AC dev source tip producer hash mismatch")
-    _verify_dev_source_upgrade(tip, candidate_tip)
+    _verify_dev_source_upgrade(
+        tip, candidate_tip,
+        historical_worktree_advisory=historical_worktree_advisory,
+    )
 
 
 def _validate_dev_current_process_custody(
@@ -2720,6 +2736,7 @@ def _validate_dev_current_process_custody(
     candidate_source: Mapping[str, object],
     historical_process: Mapping[str, object] | None = None,
     completed_dead_pre_normalization: bool = False,
+    historical_source_tip: Mapping[str, object] | None = None,
 ) -> None:
     """Validate the sole two admitted process-custody projections."""
     value = dict(process)
@@ -2739,12 +2756,16 @@ def _validate_dev_current_process_custody(
         cwd = Path(str(value.get("cwd") or "")).resolve(strict=True)
         dev_root = Path(str(value.get("dev_storage_root") or "")).resolve(strict=True)
         candidate_root = Path(str(candidate_source.get("root") or "")).resolve(strict=True)
+        custody_source_root = (
+            Path(str(historical_source_tip.get("root") or "")).resolve(strict=True)
+            if historical_source_tip is not None else candidate_root
+        )
     except OSError as exc:
         raise ValueError("AC dev durable process custody root mismatch") from exc
     commit = str(value.get("source_commit") or "").lower()
     launch_id = str(value.get("launch_id") or "")
     argv_canonical = _dev_durable_process_argv_is_canonical(
-        argv, root=root.resolve(strict=True), source_root=candidate_root,
+        argv, root=root.resolve(strict=True), source_root=custody_source_root,
         launch_id=launch_id,
     )
     if completed_dead_pre_normalization and not argv_canonical:
@@ -2770,18 +2791,24 @@ def _validate_dev_current_process_custody(
             process_is_dead
             and no_dev_listener
             and _dev_durable_completed_pre_normalization_argv_is_canonical(
-                argv, root=root.resolve(strict=True), source_root=candidate_root,
+                argv, root=root.resolve(strict=True), source_root=custody_source_root,
                 launch_id=launch_id,
             )
         )
+    historical_commit = str(
+        historical_source_tip.get("commit") if historical_source_tip is not None else ""
+    ).lower()
+    expected_commit = historical_commit
     if (type(pid) is not int or pid <= 0
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("start_identity") or ""))
-            or source_root != candidate_root or cwd != candidate_root or dev_root != root.resolve(strict=True)
+            or source_root != custody_source_root or cwd != custody_source_root
+            or dev_root != root.resolve(strict=True)
             or value.get("project_id") != AC_PROJECT_ID or value.get("port") != 40008
             or value.get("policy") != _DEV_DURABLE_POLICY
             or not re.fullmatch(r"[0-9a-f]{24}", launch_id)
             or not argv_canonical
-            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)):
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
+            or (expected_commit and commit != expected_commit)):
         raise ValueError("AC dev durable process custody binding mismatch")
     tree = _git_read_exact(candidate_root, "rev-parse", f"{commit}^{{tree}}").decode().strip()
     if value.get("source_tree") != tree:
@@ -2797,6 +2824,7 @@ def _validate_dev_current_process_custody(
 def _verify_dev_source_upgrade(
     previous: Mapping[str, object],
     candidate: Mapping[str, object],
+    *, historical_worktree_advisory: bool = False,
 ) -> None:
     """Verify one clean exact-branch Git descendant without changing source."""
 
@@ -2840,10 +2868,12 @@ def _verify_dev_source_upgrade(
         raise ValueError("AC dev source upgrade canonical ref mismatch")
 
     if candidate_root != previous_root:
-        # The only cross-root continuity accepted here is the exact physical
-        # state produced by the governed pointer-only handoff: the old checkout
-        # remains byte-for-byte at the stored commit but is detached, while the
-        # sole canonical branch checkout is the clean descendant candidate.
+        # A live pointer-only handoff still requires an exact detached old
+        # checkout.  A stopped completed generation is different: its stored
+        # path is historical provenance, so that registered worktree may have
+        # moved to a deferred branch or acquired an operator draft.  In both
+        # cases continuity comes from one shared Git object store, an exact
+        # clean canonical candidate, and content-addressed ancestry.
         try:
             dev_storage = Path(os.environ[AC_DEV_STORAGE_ROOT_ENV]).expanduser().resolve(strict=True)
             binding = verified_stable_database_binding()
@@ -2880,18 +2910,19 @@ def _verify_dev_source_upgrade(
         if previous_root not in registered or candidate_root not in registered:
             raise ValueError("AC dev source upgrade worktree is not registered")
         previous_commit = str(previous.get("commit") or "").lower()
-        previous_symbolic = subprocess.run(
-            ["git", "symbolic-ref", "-q", "HEAD"], cwd=previous_root,
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-        if (
-            previous_symbolic.returncode == 0
-            or git(previous_root, "rev-parse", "HEAD").lower() != previous_commit
-            or git(previous_root, "status", "--porcelain")
-            or git(previous_root, "rev-parse", "HEAD^{tree}")
-            != git(previous_root, "rev-parse", f"{previous_commit}^{{tree}}")
-        ):
-            raise ValueError("AC dev source upgrade previous worktree is not exact detached state")
+        if not historical_worktree_advisory:
+            previous_symbolic = subprocess.run(
+                ["git", "symbolic-ref", "-q", "HEAD"], cwd=previous_root,
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if (
+                previous_symbolic.returncode == 0
+                or git(previous_root, "rev-parse", "HEAD").lower() != previous_commit
+                or git(previous_root, "status", "--porcelain")
+                or git(previous_root, "rev-parse", "HEAD^{tree}")
+                != git(previous_root, "rev-parse", f"{previous_commit}^{{tree}}")
+            ):
+                raise ValueError("AC dev source upgrade previous worktree is not exact detached state")
         if str(candidate.get("commit") or "").lower() == previous_commit:
             raise ValueError("AC dev source upgrade pointer-only candidate is not a strict descendant")
     ancestor = subprocess.run(
@@ -4770,6 +4801,7 @@ class _DevCowGenerationPhase(Enum):
 def _validate_dev_cow_completed_process_axis(
     process: Mapping[str, object], *, root: Path,
     source_identity: Mapping[str, object],
+    historical_source_tip: Mapping[str, object] | None = None,
 ) -> None:
     """Validate current custody without rebinding it to adoption-era PID."""
     value = dict(process)
@@ -4782,7 +4814,51 @@ def _validate_dev_cow_completed_process_axis(
     _validate_dev_current_process_custody(
         value, root=root, candidate_source=source_identity,
         completed_dead_pre_normalization=True,
+        historical_source_tip=historical_source_tip,
     )
+
+
+def _validate_dev_cow_stopped_sidecar_residue(database: Path) -> None:
+    """Accept only SQLite's inert stopped residue without changing its bytes."""
+
+    listener = _default_cutover_listener_probe(40008)
+    if (
+        listener.get("port") != 40008
+        or listener.get("listening") is not False
+        or int(listener.get("pid") or 0) != 0
+    ):
+        raise ValueError("AC dev COW completed generation has a live listener")
+    _assert_no_external_sqlite_holders(database)
+    journal = Path(str(database) + "-journal")
+    if journal.exists() or journal.is_symlink():
+        raise ValueError("AC dev COW completed generation has rollback journal residue")
+    wal = Path(str(database) + "-wal")
+    shm = Path(str(database) + "-shm")
+
+    def regular_single_link(path: Path) -> os.stat_result | None:
+        try:
+            details = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(details.st_mode)
+            or int(details.st_nlink) != 1
+            or path.resolve(strict=True) != path.absolute()
+        ):
+            raise ValueError("AC dev COW completed generation sidecar is not canonical")
+        return details
+
+    wal_stat = regular_single_link(wal)
+    shm_stat = regular_single_link(shm)
+    if wal_stat is not None and int(wal_stat.st_size) != 0:
+        raise ValueError("AC dev COW completed generation WAL is not empty")
+    if shm_stat is not None:
+        # SQLite's WAL-index mapping is allocated in one 32 KiB region.  With
+        # no live holder it is non-authoritative residue only when paired with
+        # the empty WAL that made it; arbitrary or linked bytes remain closed.
+        if wal_stat is None or int(shm_stat.st_size) != 32768:
+            raise ValueError("AC dev COW completed generation SHM residue is invalid")
 
 
 def _validated_dev_cow_completed_generation_axis(
@@ -4811,11 +4887,7 @@ def _validated_dev_cow_completed_generation_axis(
         revision = int(meta["governance_world_source_tip_revision"])
     except (KeyError, sqlite3.Error, TypeError, ValueError) as exc:
         raise ValueError("AC dev COW completed generation custody metadata is invalid") from exc
-    for suffix in ("-wal", "-shm", "-journal"):
-        companion = Path(str(database) + suffix)
-        if companion.exists() or companion.is_symlink():
-            raise ValueError("AC dev COW completed generation requires sidecar-free bytes")
-    _assert_no_external_sqlite_holders(database)
+    _validate_dev_cow_stopped_sidecar_residue(database)
     if not _quick_check_returns_literal_ok(conn):
         raise ValueError("AC dev COW completed generation quick-check failed")
     inventory = _authority_projection_inventory_in_managed_world(conn)
@@ -4860,20 +4932,22 @@ def _validated_dev_cow_completed_generation_axis(
     if (str(anchor.get("root") or "") != str(tip.get("root") or "")
             or str(anchor.get("commit") or "") == str(tip.get("commit") or "")):
         raise ValueError("AC dev COW completed generation historical tip is not closed")
+    candidate_root = Path(str(source_identity.get("root") or ""))
     anchor_ancestry = subprocess.run(
         ["git", "merge-base", "--is-ancestor", str(anchor.get("commit") or ""),
          str(tip.get("commit") or "")],
-        cwd=Path(str(tip.get("root") or "")), capture_output=True,
+        cwd=candidate_root, capture_output=True,
         timeout=10, check=False,
     )
     if anchor_ancestry.returncode != 0:
         raise ValueError("AC dev COW completed generation historical tip is not an ancestor")
     _validate_dev_source_tip_custody(
         tip, stored_sha256=meta["governance_world_source_tip_sha256"],
-        candidate=source_identity,
+        candidate=source_identity, historical_worktree_advisory=True,
     )
     _validate_dev_cow_completed_process_axis(
         process, root=root, source_identity=source_identity,
+        historical_source_tip=tip,
     )
     return {"receipt": dict(receipt), "meta": meta, "tip": dict(tip),
             "process": dict(process), "revision": revision}
