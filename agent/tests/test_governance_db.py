@@ -1803,10 +1803,7 @@ def test_ac_dev_cow_successor_replaces_only_genesis_physical_identity(tmp_path, 
     # content-addressed receipt chains below.
     monkeypatch.setattr(
         db, "_validate_dev_cow_completed_basic_restart",
-        lambda *_args, **_kwargs: {
-            "database_sha256": db._durable_database_sha256(database),
-            "logical_sha256": db._database_logical_sha256(database),
-        },
+        lambda *_args, **_kwargs: None,
     )
     replay = db.bootstrap_dev_governance_store(
         storage_root, source_identity=source,
@@ -3355,6 +3352,10 @@ def test_completed_cow_basic_restart_returns_before_normal_sqlite_connect(
     current = _defer_completed_source_and_open_clean_successor(
         tmp_path, historical,
     )
+    monkeypatch.setattr(
+        db, "__file__",
+        str(Path(current["root"]) / "agent" / "governance" / "db.py"),
+    )
     wal = Path(str(database) + "-wal")
     shm = Path(str(database) + "-shm")
     wal.write_bytes(b"")
@@ -3470,6 +3471,79 @@ def test_completed_cow_basic_restart_early_return_failure_releases_new_lease(
     assert str(database.absolute()) not in db._DEV_DATABASE_WRITER_LEASES
     assert db._dev_cow_basic_restart_artifact_snapshot(database) == before
     assert launch_path.read_bytes() == launch_before
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ("source", "linked_receipt", "basic_receipt", "lease_owner"),
+)
+def test_completed_cow_basic_restart_lease_window_cas_rejects_exact_drift(
+    tmp_path, monkeypatch, attack,
+):
+    from agent.governance import db
+
+    root, database, candidate, _stable, launch_path = (
+        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+    )
+    before_artifacts = db._dev_cow_basic_restart_artifact_snapshot(database)
+    basic_before = launch_path.read_bytes()
+    classified = []
+    original_classifier = db._validate_dev_cow_completed_basic_restart
+    original_acquire = db.acquire_dev_runtime_writer_lease
+    attacked_path = None
+    attacked_bytes = None
+
+    def capture_classifier(*args, **kwargs):
+        result = original_classifier(*args, **kwargs)
+        classified.append(result)
+        return result
+
+    def acquire_then_attack(storage_root):
+        nonlocal attacked_path, attacked_bytes
+        lease = original_acquire(storage_root)
+        assert classified
+        evidence = classified[-1]
+        if attack == "source":
+            attacked_path = Path(candidate["root"]) / "lease-window-drift.txt"
+            attacked_bytes = b"drift\n"
+            attacked_path.write_bytes(attacked_bytes)
+        elif attack == "linked_receipt":
+            attacked_path = Path(evidence["linked_v3_receipt"])
+            attacked_bytes = attacked_path.read_bytes() + b" "
+            attacked_path.write_bytes(attacked_bytes)
+        elif attack == "basic_receipt":
+            attacked_path = launch_path
+            attacked_bytes = basic_before + b" "
+            attacked_path.write_bytes(attacked_bytes)
+        else:
+            with db._DEV_DATABASE_WRITER_LEASES_LOCK:
+                db._DEV_DATABASE_WRITER_LEASES[
+                    str(database.absolute())
+                ]["owner_pid"] = os.getpid() + 1
+        return lease
+
+    monkeypatch.setattr(
+        db, "_validate_dev_cow_completed_basic_restart", capture_classifier,
+    )
+    monkeypatch.setattr(
+        db, "acquire_dev_runtime_writer_lease", acquire_then_attack,
+    )
+
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        db.bootstrap_dev_governance_store(
+            root, source_identity=candidate,
+            process_identity={
+                "pid": os.getpid(),
+                "start_identity": f"pid:{os.getpid()}:cli-bootstrap",
+            },
+        )
+
+    assert db._dev_cow_basic_restart_artifact_snapshot(database) == before_artifacts
+    assert str(database.absolute()) not in db._DEV_DATABASE_WRITER_LEASES
+    if attacked_path is not None:
+        assert attacked_path.read_bytes() == attacked_bytes
+    if attack != "basic_receipt":
+        assert launch_path.read_bytes() == basic_before
 
 
 @pytest.mark.parametrize(

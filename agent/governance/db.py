@@ -5219,6 +5219,78 @@ def _dev_cow_basic_restart_artifact_snapshot(
     return snapshot
 
 
+def _dev_cow_basic_restart_source_snapshot(
+    source_identity: Mapping[str, object],
+) -> dict[str, object]:
+    """Capture the exact clean candidate source used by this loaded DB code."""
+
+    root = Path(str(source_identity.get("root") or "")).expanduser().resolve(
+        strict=True
+    )
+    source = _current_first_start_source(root)
+    canonical_ref = _git_read_exact(
+        root, "rev-parse", "refs/heads/codex/ac-dev"
+    ).decode().strip().lower()
+    expected = {
+        "root": source["root"],
+        "branch": source["branch"],
+        "commit": source["commit"],
+        "tree": source["tree"],
+        "source_sha256": source["cli_sha256"],
+        "dirty": "",
+    }
+    if dict(source_identity) != expected or canonical_ref != source["commit"]:
+        raise ValueError("AC dev COW completed basic restart source identity mismatch")
+    paths = {
+        "cli": root / "agent" / "cli.py",
+        "server": root / "agent" / "governance" / "server.py",
+        "database_runtime": root / "agent" / "governance" / "db.py",
+    }
+    if Path(__file__).resolve(strict=True) != paths["database_runtime"]:
+        raise ValueError("AC dev COW completed basic restart loaded source mismatch")
+    files = {
+        name: _cow_regular_identity(path, nlink=1)
+        for name, path in paths.items()
+    }
+    if (
+        dict(files["cli"])["sha256"] != source["cli_sha256"]
+        or dict(files["server"])["sha256"] != source["server_sha256"]
+    ):
+        raise ValueError("AC dev COW completed basic restart source content mismatch")
+    return {
+        "root": source["root"],
+        "branch": source["branch"],
+        "canonical_ref": canonical_ref,
+        "commit": source["commit"],
+        "tree": source["tree"],
+        "dirty": "",
+        "files": files,
+    }
+
+
+def _validate_dev_cow_basic_restart_writer_lease(
+    database: Path,
+) -> None:
+    """Re-prove the newly acquired in-memory writer lease before return."""
+
+    metadata = database.stat(follow_symlinks=False)
+    key = str(database.absolute())
+    owner_start_identity = _writer_process_start_identity()
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = _DEV_DATABASE_WRITER_LEASES.get(key)
+        if (
+            lease is None
+            or int(lease.get("owner_pid") or 0) != os.getpid()
+            or lease.get("owner_start_identity") != owner_start_identity
+            or getattr(lease.get("handle"), "closed", True)
+            or (lease.get("database_device"), lease.get("database_inode"))
+            != (int(metadata.st_dev), int(metadata.st_ino))
+        ):
+            raise ValueError(
+                "AC dev COW completed basic restart writer lease changed under lease"
+            )
+
+
 def _validate_dev_cow_completed_basic_restart(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     stable_binding: Mapping[str, object],
@@ -5289,9 +5361,17 @@ def _validate_dev_cow_completed_basic_restart(
     artifacts = _dev_cow_basic_restart_artifact_snapshot(database)
     if str(dict(artifacts.get("database") or {}).get("sha256") or "") != database_before:
         raise ValueError("AC dev COW completed basic restart database snapshot changed")
+    source_snapshot = _dev_cow_basic_restart_source_snapshot(source_identity)
+    linked_snapshot = _cow_regular_identity(linked_path, nlink=1)
+    basic_receipt_snapshot = _cow_regular_identity(
+        root / AC_DEV_LAUNCH_RECEIPT_NAME, nlink=1,
+    )
     return {
         "receipt": receipt,
         "linked_v3_receipt": linked_path,
+        "linked_v3_receipt_snapshot": linked_snapshot,
+        "basic_launch_receipt_snapshot": basic_receipt_snapshot,
+        "source_snapshot": source_snapshot,
         "database_sha256": database_before,
         "logical_sha256": logical_before,
         "historical_process": process,
@@ -5848,6 +5928,32 @@ def bootstrap_dev_governance_store(
                 raise ValueError(
                     "AC dev COW completed basic restart artifacts changed under lease"
                 )
+            if (
+                _dev_cow_basic_restart_source_snapshot(source_identity)
+                != basic_cow_restart.get("source_snapshot")
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart source changed under lease"
+                )
+            linked_receipt = Path(
+                str(basic_cow_restart.get("linked_v3_receipt") or "")
+            ).expanduser().absolute()
+            if (
+                _cow_regular_identity(linked_receipt, nlink=1)
+                != basic_cow_restart.get("linked_v3_receipt_snapshot")
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart linked receipt changed under lease"
+                )
+            if (
+                _cow_regular_identity(
+                    root / AC_DEV_LAUNCH_RECEIPT_NAME, nlink=1,
+                )
+                != basic_cow_restart.get("basic_launch_receipt_snapshot")
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart basic receipt changed under lease"
+                )
             axis = dict(basic_cow_restart.get("axis") or {})
             meta = dict(axis.get("meta") or {})
             try:
@@ -5902,7 +6008,7 @@ def bootstrap_dev_governance_store(
                     != current_process_identity
                 ):
                     raise ValueError("AC dev source upgrade process identity mismatch")
-            return {
+            result = {
                 **dict(genesis),
                 "genesis_sha256": genesis_sha256,
                 "database_path": str(database),
@@ -5916,6 +6022,8 @@ def bootstrap_dev_governance_store(
                 "source_tip_revision": source_tip_revision,
                 "source_upgraded": False,
             }
+            _validate_dev_cow_basic_restart_writer_lease(database)
+            return result
         conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row
         if (cow_successor_receipt is not None
