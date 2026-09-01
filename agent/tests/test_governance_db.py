@@ -2640,6 +2640,54 @@ def test_cow_completed_generation_uses_current_projection_not_issuance_digest(
     ) == receipt
 
 
+def test_cow_completed_axis_accepts_current_bootstrap_pid_and_new_candidate_bytes(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    stored_source = _advance_cow_to_completed_generation(database, root, source)
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "UPDATE schema_meta SET value=? WHERE key=?",
+        (json.dumps({"pid": 999, "start_identity": "pid:999:cli-bootstrap"}),
+         "governance_world_current_process_json"),
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    source_root = Path(stored_source["root"])
+    cli_source = source_root / "agent" / "cli.py"
+    cli_source.write_text(
+        cli_source.read_text(encoding="utf-8") + "# candidate descendant\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "agent/cli.py"], cwd=source_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "candidate descendant"], cwd=source_root,
+        check=True, capture_output=True,
+    )
+    candidate = {
+        **stored_source,
+        "commit": subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip(),
+        "tree": subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=source_root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip(),
+        "source_sha256": "sha256:" + hashlib.sha256(cli_source.read_bytes()).hexdigest(),
+    }
+    assert candidate["source_sha256"] != stored_source["source_sha256"]
+    assert db.validate_dev_cow_completed_generation_projection(
+        root, linked_v3_receipt=linked, source_identity=candidate,
+        stable_binding=db.verified_stable_database_binding(),
+    ) == receipt
+
+
 def test_cow_generation_phase_selector_is_closed_for_first_and_completed(
     tmp_path, monkeypatch,
 ):
@@ -2673,7 +2721,7 @@ def test_cow_generation_phase_selector_rejects_ambiguous_and_neither(
     stable = db.verified_stable_database_binding()
     before = db._durable_database_sha256(database)
     monkeypatch.setattr(
-        db, "_cow_completed_generation_phase_prerequisites", lambda *_a, **_k: True,
+        db, "_validated_dev_cow_completed_generation_axis", lambda *_a, **_k: {},
     )
     with pytest.raises(ValueError, match="ambiguous"):
         db._select_dev_cow_generation_phase(
@@ -2682,7 +2730,8 @@ def test_cow_generation_phase_selector_rejects_ambiguous_and_neither(
         )
     assert db._durable_database_sha256(database) == before
     monkeypatch.setattr(
-        db, "_cow_completed_generation_phase_prerequisites", lambda *_a, **_k: False,
+        db, "_validated_dev_cow_completed_generation_axis",
+        lambda *_a, **_k: (_ for _ in ()).throw(ValueError("not completed")),
     )
     connection = sqlite3.connect(database)
     connection.execute(
