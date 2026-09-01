@@ -4213,6 +4213,90 @@ def test_durable_recovery_requires_old_child_absent_and_port_free_before_spawn()
     assert "_durable_exit_binding(value, digest)" in launch_source
 
 
+def test_exact_custody_rebaseline_ignores_draft_then_prepares_and_consumes(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"; runtime = root / "runtime" / "durable-launch"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True); runtime.mkdir(parents=True)
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT);"
+        "CREATE TABLE evidence(id TEXT PRIMARY KEY,payload TEXT);"
+        "INSERT INTO evidence VALUES('one','unchanged');")
+    connection.commit(); connection.close()
+    launch_id = "a" * 24
+    source = {"root": str(tmp_path / "source"), "branch": cli.AC_DEV_BRANCH,
+              "commit": "b" * 40, "tree": "c" * 40,
+              "source_sha256": "sha256:" + "d" * 64, "dirty": ""}
+    Path(source["root"]).mkdir()
+    linked = root / "archive" / "schema-admission" / "linked.json"
+    linked.parent.mkdir(parents=True); linked.write_text("{}", encoding="utf-8")
+    lock = runtime / "launch.lock"
+    lock_value = {"schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION,
+                  "stage": "locked", "launch_id": launch_id}
+    cli._posix_exclusive_json(lock, lock_value)
+    pending_value = {
+        "schema_version": "ac_dev_durable_pending.v1", "stage": "pending",
+        "launch_id": launch_id, "source_identity": source,
+        "dev_storage_root": str(root), "database_path": str(database),
+        "linked_v3_receipt": str(linked),
+    }
+    pending, pending_sha = cli._durable_content_receipt(runtime, "pending", pending_value)
+    cli._posix_exclusive_json(runtime / f"launch-{launch_id}.failed.json", {
+        "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "failed",
+        "launch_id": launch_id, "pid": 987654,
+    })
+    cli._durable_content_receipt(runtime, "abnormal", {
+        "schema_version": "ac_dev_durable_abnormal_seal.v1",
+        "stage": "preimage_retryable", "pending_sha256": "sha256:" + "e" * 64,
+        "readiness_sha256": "", "database_sha256": "sha256:" + "f" * 64,
+    })
+    drafts = root / "archive" / "preimplementation-drafts" / "draft"
+    cli._durable_content_receipt(drafts, "durable-custody-rebaseline", {"draft": True})
+    stable_identity = {"device": 9, "inode": 10}
+    stable_health = {"pid": 111, "runtime_loaded_version": "1" * 40,
+                     "runtime_stale": False, "runtime_plane": "stable", "port": 40000}
+    monkeypatch.setattr(cli, "_dev_source_identity_precheck", lambda: source)
+    monkeypatch.setattr(cli, "_validated_linked_v3_receipt", lambda *_a, **_k: (
+        "sha256:" + "1" * 64, {}))
+    monkeypatch.setattr(cli, "_probe_governance", lambda _port: stable_health)
+    monkeypatch.setattr(cli, "_durable_listener_pid", lambda _port: 0)
+    monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: (_ for _ in ()).throw(
+        cli.click.ClickException("absent")))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_a, **_k: types.SimpleNamespace(
+        returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(db, "_assert_no_external_sqlite_holders", lambda _path: None)
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda **_k: {
+        "stable_head": stable_health["runtime_loaded_version"],
+        "stable_database_identity": stable_identity,
+    })
+    stat_before = database.stat(); digest_before = cli._file_sha256(database)
+    with pytest.raises(cli.click.ClickException, match="missing or ambiguous"):
+        cli._consume_exact_custody_rebaseline(
+            dev_storage=root, database=database, source_identity=source,
+            lock=lock, lock_value=lock_value, pending_path=pending,
+            pending_value=pending_value, pending_digest=pending_sha)
+    prepared = cli._prepare_exact_custody_rebaseline(
+        root, expected_sha256=digest_before, expected_device=stat_before.st_dev,
+        expected_inode=stat_before.st_ino)
+    replay = cli._prepare_exact_custody_rebaseline(
+        root, expected_sha256=digest_before, expected_device=stat_before.st_dev,
+        expected_inode=stat_before.st_ino)
+    assert prepared["status"] == "prepared" and replay["status"] == "already_prepared"
+    assert prepared["receipt_sha256"] == cli._consume_exact_custody_rebaseline(
+        dev_storage=root, database=database, source_identity=source,
+        lock=lock, lock_value=lock_value, pending_path=pending,
+        pending_value=pending_value, pending_digest=pending_sha)
+    assert cli._file_sha256(database) == digest_before
+    assert (database.stat().st_dev, database.stat().st_ino) == (
+        stat_before.st_dev, stat_before.st_ino)
+    assert Path(prepared["backup"]).stat().st_mode & 0o777 == 0o400
+
+
 def test_dev_admit_schema_rejects_wrong_plane_before_database_write(tmp_path):
     root = tmp_path / "external-dev-world"
     database = root / "governance" / "aming-claw" / "governance.db"

@@ -3614,6 +3614,295 @@ def _posix_detached_popen(
     )
 
 
+_CUSTODY_REBASELINE_AUTHORITY = {
+    "intent_id": "intent-ac-dev-custody-rebaseline-exception-r1-20260901", "intent_version": 2,
+    "event_id": "oide-f23968926ffdd46d5f17", "event_hash": "sha256:7834747cab764ba7068f49ba436d0d59ee454c2126c297a95eac3cba8eb8a08c",
+    "route_id": "route-20260901-c24afad341", "route_context_hash": "sha256:1a1966b412f5526f3289d51729e91c22f4fcfc3cd91eafd91c10746c50d57769",
+    "parent_route_id": "route-20260901-9218f59731", "parent_route_context_hash": "sha256:04ad4c6d798378127fd6fa0cb46a42dc54a438c7289ac23574293fa9b7cf827e",
+    "parent_prompt_contract_ref": "rprompt-6c2d4f2ef18828eb", "parent_visible_manifest_hash": "sha256:a2c4321f05488f84b71710dc91b873c61103e88729ddc9ed856a7117278659e6",
+}
+
+def _prepare_exact_custody_rebaseline(
+    dev_storage: Path, *, expected_sha256: str, expected_device: int, expected_inode: int,
+) -> dict[str, Any]:
+    """Prepare the sole JB-authorized current-state backup and receipt."""
+    from agent.governance import db as _db
+    root = dev_storage.expanduser().absolute()
+    database = root / "governance" / "aming-claw" / "governance.db"
+    source = _dev_source_identity_precheck()
+    if root.is_symlink() or root.resolve(strict=True) != root:
+        raise click.ClickException("AC dev custody rebaseline root is not canonical")
+
+    def snapshot(path: Path) -> dict[str, Any]:
+        absolute = path.absolute(); metadata = absolute.stat(follow_symlinks=False)
+        if (absolute.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+                or absolute.resolve(strict=True) != absolute or metadata.st_nlink != 1):
+            raise click.ClickException("AC dev custody rebaseline database is not canonical")
+        if any(Path(str(absolute) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+            raise click.ClickException("AC dev custody rebaseline database has sidecars")
+        _db._assert_no_external_sqlite_holders(absolute)
+        uri = "file:" + urllib.parse.quote(str(absolute)) + "?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            quick = [str(row[0]).lower() for row in connection.execute("PRAGMA quick_check")]
+            integrity = [str(row[0]).lower() for row in connection.execute("PRAGMA integrity_check")]
+            inventory = _db._sqlite_master_inventory(connection)
+            tables = [str(row[0]) for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+            counts = {}
+            for table in tables:
+                quoted = '"' + table.replace('"', '""') + '"'
+                counts[table] = int(connection.execute(
+                    f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
+            logical = _db._sqlite_logical_projection(connection)
+        finally:
+            connection.close()
+        if quick != ["ok"] or integrity != ["ok"]:
+            raise click.ClickException("AC dev custody rebaseline integrity failed")
+        return {**_admission_identity(absolute), "size": metadata.st_size,
+                "nlink": metadata.st_nlink, "sha256": _file_sha256(absolute),
+                "quick_check": "ok", "integrity_check": "ok",
+                "sqlite_master_count": len(inventory),
+                "sqlite_master_sha256": "sha256:" + hashlib.sha256(
+                    _canonical_json_bytes(inventory)).hexdigest(),
+                "table_row_counts": counts, "table_logical_digests": logical}
+
+    current = snapshot(database)
+    if (current["sha256"], current["device"], current["inode"]) != (
+            expected_sha256, expected_device, expected_inode):
+        raise click.ClickException("AC dev custody rebaseline expected database mismatch")
+    runtime = root / "runtime" / "durable-launch"; lock = runtime / "launch.lock"
+    try:
+        lock_raw = lock.read_bytes(); lock_value = json.loads(lock_raw)
+    except (OSError, ValueError, TypeError) as exc:
+        raise click.ClickException("AC dev custody rebaseline lock is unreadable") from exc
+    launch_id = str(lock_value.get("launch_id") or "")
+    if (lock_value.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
+            or lock_value.get("stage") != "locked" or not re.fullmatch(r"[0-9a-f]{24}", launch_id)):
+        raise click.ClickException("AC dev custody rebaseline lock is malformed")
+    pending_matches = []
+    for path in runtime.glob("pending.*.json"):
+        value, digest = _read_durable_content_receipt(path, "pending")
+        if value.get("launch_id") == launch_id:
+            pending_matches.append((path, value, digest))
+    if len(pending_matches) != 1:
+        raise click.ClickException("AC dev custody rebaseline pending generation mismatch")
+    pending_path, pending, pending_sha = pending_matches[0]
+    if (pending.get("schema_version") != "ac_dev_durable_pending.v1" or pending.get("stage") != "pending"
+            or pending.get("dev_storage_root") != str(root) or pending.get("database_path") != str(database)):
+        raise click.ClickException("AC dev custody rebaseline pending receipt mismatch")
+    if any(_read_durable_content_receipt(path, "readiness")[0].get("pending_sha256") == pending_sha
+           for path in runtime.glob("readiness.*.json")):
+        raise click.ClickException("AC dev custody rebaseline is not pre-readiness")
+    failed_path = runtime / f"launch-{launch_id}.failed.json"
+    try:
+        failed_raw = failed_path.read_bytes(); failed = json.loads(failed_raw)
+    except (OSError, ValueError, TypeError) as exc:
+        raise click.ClickException("AC dev custody rebaseline failed receipt is unreadable") from exc
+    failed_pid = int(failed.get("pid") or 0)
+    if (failed.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
+            or failed.get("stage") != "failed" or failed.get("launch_id") != launch_id
+            or failed_pid <= 0):
+        raise click.ClickException("AC dev custody rebaseline failed receipt mismatch")
+    try:
+        _posix_process_identity(failed_pid)
+    except click.ClickException:
+        pass
+    else:
+        raise click.ClickException("AC dev custody rebaseline failed child is live")
+    if _durable_listener_pid(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("AC dev custody rebaseline requires free port 40008")
+    linked = Path(str(pending.get("linked_v3_receipt") or "")).absolute()
+    linked_sha, _ = _validated_linked_v3_receipt(
+        linked, dev_storage=root, database=database,
+        database_identity=_admission_identity(database), source_identity=source,
+        allow_postimage=True,
+    )
+    pending_source = dict(pending.get("source_identity") or {})
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", str(pending_source.get("commit") or ""),
+         str(source.get("commit") or "")], cwd=Path(str(source["root"])),
+        capture_output=True, text=True, timeout=10, check=False)
+    if ancestry.returncode != 0:
+        raise click.ClickException("AC dev custody rebaseline source ancestry mismatch")
+    stable_health = _probe_governance(AC_STABLE_SERVICE_PORT); stable_commit = str(
+        stable_health.get("runtime_loaded_version") or "")
+    stable = _db.verified_stable_database_binding(stable_anchor_commit=stable_commit)
+    if (int(stable_health.get("pid") or 0) <= 0 or stable_health.get("runtime_stale") is not False
+            or stable_health.get("runtime_plane") != "stable"
+            or stable.get("stable_head") != stable_commit):
+        raise click.ClickException("AC dev custody rebaseline stable binding mismatch")
+    stable_identity = dict(stable.get("stable_database_identity") or {})
+    if (current["device"], current["inode"]) == (
+            stable_identity.get("device"), stable_identity.get("inode")):
+        raise click.ClickException("AC dev custody rebaseline overlaps stable database")
+    abnormal = []
+    for path in sorted(runtime.glob("abnormal.*.json")):
+        value, digest = _read_durable_content_receipt(path, "abnormal")
+        abnormal.append({"path": str(path), "sha256": digest, "payload": value})
+    chain = {
+        "lock": {"path": str(lock), "sha256": "sha256:" + hashlib.sha256(lock_raw).hexdigest(),
+                 "payload": lock_value},
+        "pending": {"path": str(pending_path), "sha256": pending_sha, "payload": pending},
+        "failed_launch": {"path": str(failed_path),
+                          "sha256": "sha256:" + hashlib.sha256(failed_raw).hexdigest(),
+                          "payload": failed},
+        "prior_abnormals": abnormal, "failed_pid_absent": True, "listener_40008": None,
+    }
+    backup_dir = root / "archive" / "operator-exception-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / ("governance.rebaseline." + current["sha256"][7:] + ".sqlite")
+    if not backup_path.exists():
+        temporary = backup_dir / ("." + backup_path.name + f".{secrets.token_hex(16)}.pending")
+        with database.open("rb") as source_file, temporary.open("xb") as target_file:
+            shutil.copyfileobj(source_file, target_file, 1024 * 1024)
+            target_file.flush(); os.fsync(target_file.fileno())
+        os.chmod(temporary, 0o400); _noreplace_promote(temporary, backup_path)
+    backup = snapshot(backup_path)
+    comparable = ("size", "nlink", "sha256", "quick_check", "integrity_check",
+                  "sqlite_master_count", "sqlite_master_sha256", "table_row_counts",
+                  "table_logical_digests")
+    if any(backup[key] != current[key] for key in comparable):
+        raise click.ClickException("AC dev custody rebaseline backup mismatch")
+    if snapshot(database) != current:
+        raise click.ClickException("AC dev custody rebaseline database changed during backup")
+    backup["restore"] = {"operation": "stopped_world_atomic_restore_from_exact_backup",
+                         "target_path": str(database), "expected_target_device": current["device"],
+                         "expected_target_inode": current["inode"]}
+    payload = {
+        "schema_version": "ac_dev_durable_custody_rebaseline.v1", "stage": "accepted_baseline",
+        "classification": "unproven_pre_readiness_delta_accepted_by_operator",
+        "historical_equivalence_claim": False, "qa_pass": False,
+        "release_authority": False, "pass_implied": False,
+        "project_id": "aming-claw", "port": AC_DEV_SERVICE_PORT,
+        "authority": dict(_CUSTODY_REBASELINE_AUTHORITY),
+        "producer": {"command": "dev-prepare-durable-custody-rebaseline",
+                     "source_commit": source["commit"], "source_tree": source["tree"],
+                     "source_sha256": source["source_sha256"]},
+        "database": current, "backup": backup, "failed_generation": chain,
+        "source_identity": source, "completed_generation_axis": True,
+        "linked_v3_receipt": str(linked), "linked_v3_receipt_sha256": linked_sha,
+        "pending_source_is_ancestor": True,
+        "stable": {"pid": int(stable_health["pid"]), "commit": stable_commit,
+                   "database_identity": stable_identity},
+    }
+    archive = root / "archive" / "operator-exceptions"; archive.mkdir(parents=True, exist_ok=True)
+    existing = sorted(archive.glob("durable-custody-rebaseline.*.json"))
+    raw = _canonical_json_bytes(payload); expected_digest = hashlib.sha256(raw).hexdigest()
+    expected_path = archive / f"durable-custody-rebaseline.{expected_digest}.json"
+    if existing:
+        if existing != [expected_path] or expected_path.read_bytes() != raw:
+            raise click.ClickException("AC dev custody rebaseline receipt is ambiguous")
+        status = "already_prepared"
+    else:
+        created, digest = _durable_content_receipt(archive, "durable-custody-rebaseline", payload)
+        if created != expected_path or digest != "sha256:" + expected_digest:
+            raise click.ClickException("AC dev custody rebaseline receipt readback mismatch")
+        os.chmod(created, 0o400); _fsync_parent(created); status = "prepared"
+    return {"status": status, "receipt": str(expected_path), "receipt_sha256": "sha256:" + expected_digest,
+            "backup": str(backup_path), "backup_sha256": backup["sha256"], "database_sha256": current["sha256"]}
+
+def _consume_exact_custody_rebaseline(
+    *, dev_storage: Path, database: Path, source_identity: Mapping[str, object],
+    lock: Path, lock_value: Mapping[str, Any], pending_path: Path, pending_value: Mapping[str, Any],
+    pending_digest: str,
+) -> str:
+    """Validate and consume only the checked-in command's exact receipt."""
+    from agent.governance import db as _db
+    archive = dev_storage / "archive" / "operator-exceptions"
+    paths = sorted(archive.glob("durable-custody-rebaseline.*.json"))
+    if len(paths) != 1:
+        raise click.ClickException("AC dev custody rebaseline receipt is missing or ambiguous")
+    receipt, digest = _read_durable_content_receipt(paths[0], "durable-custody-rebaseline")
+    receipt_stat = paths[0].stat(follow_symlinks=False); current_stat = database.stat(follow_symlinks=False)
+    current = dict(receipt.get("database") or {}); backup = dict(receipt.get("backup") or {})
+    backup_path = Path(str(backup.get("path") or "")).absolute()
+    failed = dict(receipt.get("failed_generation") or {}); launch_id = str(lock_value.get("launch_id") or "")
+    failed_path = dev_storage / "runtime" / "durable-launch" / f"launch-{launch_id}.failed.json"
+    try:
+        lock_raw = lock.read_bytes(); failed_raw = failed_path.read_bytes(); failed_value = json.loads(failed_raw)
+    except (OSError, ValueError, TypeError) as exc:
+        raise click.ClickException("AC dev custody rebaseline chain is unreadable") from exc
+    abnormal = []
+    for path in sorted((dev_storage / "runtime" / "durable-launch").glob("abnormal.*.json")):
+        value, value_digest = _read_durable_content_receipt(path, "abnormal")
+        abnormal.append({"path": str(path), "sha256": value_digest, "payload": value})
+    pending_source = dict(pending_value.get("source_identity") or {})
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", str(pending_source.get("commit") or ""),
+         str(source_identity.get("commit") or "")], cwd=Path(str(source_identity["root"])),
+        capture_output=True, text=True, timeout=10, check=False)
+    stable_health = _probe_governance(AC_STABLE_SERVICE_PORT)
+    stable = _db.verified_stable_database_binding(
+        stable_anchor_commit=str(stable_health.get("runtime_loaded_version") or ""))
+    failed_pid = int(failed_value.get("pid") or 0)
+    try:
+        _posix_process_identity(failed_pid)
+    except click.ClickException:
+        dead = True
+    else:
+        dead = False
+    expected_chain = {
+        "lock": {"path": str(lock), "sha256": "sha256:" + hashlib.sha256(lock_raw).hexdigest(),
+                 "payload": dict(lock_value)},
+        "pending": {"path": str(pending_path), "sha256": pending_digest,
+                    "payload": dict(pending_value)},
+        "failed_launch": {"path": str(failed_path),
+                          "sha256": "sha256:" + hashlib.sha256(failed_raw).hexdigest(),
+                          "payload": failed_value},
+        "prior_abnormals": abnormal, "failed_pid_absent": True, "listener_40008": None,
+    }
+    producer = {"command": "dev-prepare-durable-custody-rebaseline",
+                "source_commit": source_identity.get("commit"),
+                "source_tree": source_identity.get("tree"),
+                "source_sha256": source_identity.get("source_sha256")}
+    expected_stable = {"pid": int(stable_health.get("pid") or 0),
+                       "commit": stable.get("stable_head"),
+                       "database_identity": stable.get("stable_database_identity")}
+    if (receipt.get("schema_version") != "ac_dev_durable_custody_rebaseline.v1"
+            or receipt.get("stage") != "accepted_baseline"
+            or receipt.get("classification") != "unproven_pre_readiness_delta_accepted_by_operator"
+            or any(receipt.get(key) is not False for key in (
+                "historical_equivalence_claim", "qa_pass", "release_authority", "pass_implied"))
+            or receipt.get("project_id") != "aming-claw" or receipt.get("port") != AC_DEV_SERVICE_PORT
+            or receipt.get("authority") != _CUSTODY_REBASELINE_AUTHORITY
+            or receipt.get("producer") != producer or receipt.get("source_identity") != dict(source_identity)
+            or receipt.get("completed_generation_axis") is not True
+            or receipt.get("pending_source_is_ancestor") is not True or ancestry.returncode != 0
+            or receipt.get("failed_generation") != expected_chain or not dead
+            or _durable_listener_pid(AC_DEV_SERVICE_PORT) or receipt.get("stable") != expected_stable
+            or int(stable_health.get("pid") or 0) <= 0 or stable_health.get("runtime_stale") is not False
+            or receipt_stat.st_nlink != 1 or receipt_stat.st_mode & 0o077
+            or current.get("path") != str(database) or current.get("device") != current_stat.st_dev
+            or current.get("inode") != current_stat.st_ino or current.get("size") != current_stat.st_size
+            or current.get("nlink") != current_stat.st_nlink or current.get("sha256") != _file_sha256(database)
+            or backup_path.parent != dev_storage / "archive" / "operator-exception-backups"
+            or backup_path.is_symlink() or not backup_path.is_file()
+            or backup.get("sha256") != current.get("sha256")
+            or backup.get("sha256") != _file_sha256(backup_path)
+            or backup.get("size") != current.get("size") or backup.get("nlink") != 1):
+        raise click.ClickException("AC dev custody rebaseline receipt mismatch")
+    return digest
+
+@main.command("dev-prepare-durable-custody-rebaseline", hidden=True)
+@click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--expected-database-sha256", required=True)
+@click.option("--expected-database-device", required=True, type=int)
+@click.option("--expected-database-inode", required=True, type=int)
+@click.option("--authority-event-id", required=True)
+@click.option("--authority-route-id", required=True)
+def dev_prepare_durable_custody_rebaseline(
+    dev_storage_root: Path, expected_database_sha256: str, expected_database_device: int,
+    expected_database_inode: int, authority_event_id: str, authority_route_id: str) -> None:
+    """Prepare one exact operator exception; never changes governance DB bytes."""
+    if (authority_event_id != _CUSTODY_REBASELINE_AUTHORITY["event_id"]
+            or authority_route_id != _CUSTODY_REBASELINE_AUTHORITY["route_id"]):
+        raise click.ClickException("AC dev custody rebaseline authority mismatch")
+    result = _prepare_exact_custody_rebaseline(
+        dev_storage_root, expected_sha256=expected_database_sha256,
+        expected_device=expected_database_device, expected_inode=expected_database_inode)
+    click.echo(json.dumps(result, sort_keys=True))
+
 def _durable_dev_launch(
     *, dev_storage: Path, database: Path, database_identity: Mapping[str, object],
     source_identity: Mapping[str, object], stable_anchor_commit: str,
@@ -3943,12 +4232,19 @@ def _durable_dev_launch(
             recovery_stage = "postimage_child_absent"
             recovery_readiness = readiness_matches[0][2]
         else:
-            raise click.ClickException("AC dev durable recovery database projection mismatch")
-        _durable_content_receipt(runtime, "abnormal", {
+            recovery_rebaseline = _consume_exact_custody_rebaseline(
+                dev_storage=dev_storage, database=database, source_identity=source_identity,
+                lock=lock, lock_value=lock_value, pending_path=pending_path,
+                pending_value=pending_value, pending_digest=pending_digest)
+            recovery_stage = "pre_readiness_custody_only_postimage_operator_rebaseline"
+        recovery_payload = {
             "schema_version": "ac_dev_durable_abnormal_seal.v1", "stage": recovery_stage,
             "pending_sha256": pending_digest, "readiness_sha256": recovery_readiness,
             "database_sha256": database_now,
-        })
+        }
+        if recovery_stage == "pre_readiness_custody_only_postimage_operator_rebaseline":
+            recovery_payload["rebaseline_sha256"] = recovery_rebaseline
+        _durable_content_receipt(runtime, "abnormal", recovery_payload)
         lock.unlink()
         _fsync_parent(lock)
     if _durable_listener_pid(AC_DEV_SERVICE_PORT):
