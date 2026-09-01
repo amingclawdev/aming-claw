@@ -99,6 +99,9 @@ def test_linked_v3_validator_uses_cow_preimage_for_replaced_inode(tmp_path, monk
                         lambda *_args, **_kwargs: (receipt, "sha256:" + "1" * 64))
     monkeypatch.setattr(cli, "_validated_historical_admission_source_identity",
                         lambda value: value)
+    monkeypatch.setattr(
+        cli, "_completed_durable_generation_ref", lambda **_kwargs: None,
+    )
     calls = []
     monkeypatch.setattr(db, "validate_dev_cow_successor_preimage",
                         lambda *args, **kwargs: calls.append((args, kwargs)))
@@ -110,95 +113,36 @@ def test_linked_v3_validator_uses_cow_preimage_for_replaced_inode(tmp_path, monk
     assert digest == "sha256:" + "1" * 64
     assert returned is receipt
     assert len(calls) == 1
-    assert calls[0][1]["expected_completed_generation_database_sha256"] == ""
+    assert calls[0][1]["completed_generation_ref"] is None
 
 
-def test_completed_durable_generation_anchors_exact_current_database(
-    tmp_path,
+def test_completed_durable_generation_ref_delegates_to_central_db_validator(
+    tmp_path, monkeypatch,
 ):
     import agent.cli as cli
+    from agent.governance import db
 
     dev = tmp_path / "dev"
-    runtime = dev / "runtime" / "durable-launch"
-    runtime.mkdir(parents=True)
-    database = dev / "governance" / "aming-claw" / "governance.db"
-    database.parent.mkdir(parents=True)
-    database.write_bytes(b"completed-generation-postimage")
-    source_root = tmp_path / "source"
-    server = source_root / "agent" / "governance" / "server.py"
-    server.parent.mkdir(parents=True)
-    server.write_text("server\n", encoding="utf-8")
-    source = {
-        "root": str(source_root.resolve()),
-        "branch": "codex/ac-dev",
-        "commit": "a" * 40,
-        "tree": "b" * 40,
-        "source_sha256": "sha256:" + "c" * 64,
+    linked = tmp_path / "linked.json"
+    linked.write_text("{}", encoding="utf-8")
+    source = {"commit": "a" * 40}
+    ref = {
+        "schema_version": db._DEV_DURABLE_COMPLETED_REF_SCHEMA,
+        "launch_sha256": "sha256:" + "b" * 64,
     }
-    linked_sha256 = "sha256:" + "d" * 64
-    launch_id = "phase-z-generation"
-    database_sha256 = cli._file_sha256(database)
-    database_identity = cli._admission_identity(database)
-    pending, pending_sha256 = cli._durable_content_receipt(
-        runtime, "pending", {
-            "launch_id": launch_id,
-            "source_identity": source,
-            "linked_v3_receipt_sha256": linked_sha256,
-            "database_sha256_before": "sha256:" + "e" * 64,
-        },
+    observed = []
+    monkeypatch.setattr(
+        db, "select_dev_completed_generation_ref",
+        lambda *args, **kwargs: observed.append((args, kwargs)) or ref,
     )
-    readiness, readiness_sha256 = cli._durable_content_receipt(
-        runtime, "readiness", {
-            "pending_sha256": pending_sha256,
-            "launch_id": launch_id,
-            "pid": 31337,
-            "database_sha256_before": "sha256:" + "e" * 64,
-            "database_sha256_after": database_sha256,
-            "database_identity": database_identity,
-        },
-    )
-    policy = {
-        "runtime_plane": "dev", "migration": "verify-only",
-        "stable_deployment": "deny", "graph_activation": "deny",
-        "background_workers": "deny",
-    }
-    launch, launch_sha256 = cli._durable_content_receipt(
-        runtime, "launch", {
-            "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION,
-            "stage": "completed",
-            "launch_id": launch_id,
-            "pid": 31337,
-            "source_root": str(source_root.resolve()),
-            "source_commit": source["commit"],
-            "source_tree": source["tree"],
-            "server_sha256": "sha256:" + hashlib.sha256(
-                server.read_bytes()
-            ).hexdigest(),
-            "dev_storage_root": str(dev),
-            "database_path": str(database),
-            "database_identity": database_identity,
-            "project_id": "aming-claw",
-            "port": cli.AC_DEV_SERVICE_PORT,
-            "policy": policy,
-            "linked_v3_receipt_sha256": linked_sha256,
-            "pending_sha256": pending_sha256,
-            "readiness_sha256": readiness_sha256,
-            "database_sha256_before": "sha256:" + "e" * 64,
-            "database_sha256_after": database_sha256,
-        },
-    )
-    assert pending.is_file() and readiness.is_file() and launch.is_file()
-    assert launch_sha256.startswith("sha256:")
-    assert cli._completed_durable_generation_database_anchor(
-        dev_storage=dev, database=database, source_identity=source,
-        linked_v3_receipt_sha256=linked_sha256,
-    ) == database_sha256
-    database.write_bytes(b"unanchored-post-generation-drift")
-    with pytest.raises(cli.click.ClickException, match="postimage"):
-        cli._completed_durable_generation_database_anchor(
-            dev_storage=dev, database=database, source_identity=source,
-            linked_v3_receipt_sha256=linked_sha256,
-        )
+
+    assert cli._completed_durable_generation_ref(
+        dev_storage=dev, source_identity=source, linked_v3_receipt=linked,
+    ) == ref
+    assert observed == [(
+        (dev,), {"source_identity": source, "linked_v3_receipt": linked},
+    )]
+    assert not hasattr(cli, "_completed_durable_generation_database_anchor")
 
 
 @pytest.mark.parametrize(

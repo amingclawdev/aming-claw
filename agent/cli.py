@@ -3352,88 +3352,19 @@ def _durable_listener_pid(port: int) -> int:
     return next(iter(pids)) if len(pids) == 1 else 0
 
 
-def _completed_durable_generation_database_anchor(
-    *, dev_storage: Path, database: Path,
-    source_identity: Mapping[str, object], linked_v3_receipt_sha256: str,
-) -> str:
-    """Return the one content-addressed generation that owns current bytes."""
-    runtime = dev_storage / "runtime" / "durable-launch"
-    launch_paths = sorted(runtime.glob("launch.*.json")) if runtime.is_dir() else []
-    if not launch_paths:
-        return ""
-    current_identity = _admission_identity(database)
-    current_sha256 = _file_sha256(database)
-    source_root = Path(str(source_identity.get("root") or "")).resolve(strict=True)
-    server_sha256 = "sha256:" + hashlib.sha256(
-        (source_root / "agent" / "governance" / "server.py").read_bytes()
-    ).hexdigest()
-    expected_policy = {
-        "runtime_plane": "dev", "migration": "verify-only",
-        "stable_deployment": "deny", "graph_activation": "deny",
-        "background_workers": "deny",
-    }
-    matches = []
-    for launch_path in launch_paths:
-        launch, launch_sha256 = _read_durable_content_receipt(
-            launch_path, "launch"
+def _completed_durable_generation_ref(
+    *, dev_storage: Path, source_identity: Mapping[str, object],
+    linked_v3_receipt: Path,
+) -> dict[str, str] | None:
+    """Delegate completed-generation authority reconstruction to the DB layer."""
+    from agent.governance import db as _db
+    try:
+        return _db.select_dev_completed_generation_ref(
+            dev_storage, source_identity=source_identity,
+            linked_v3_receipt=linked_v3_receipt,
         )
-        pending_sha256 = str(launch.get("pending_sha256") or "")
-        readiness_sha256 = str(launch.get("readiness_sha256") or "")
-        if not (_exact_sha256(pending_sha256) and _exact_sha256(readiness_sha256)):
-            raise click.ClickException(
-                "AC dev durable completed generation is unclassifiable"
-            )
-        pending, pending_read_sha256 = _read_durable_content_receipt(
-            runtime / f"pending.{pending_sha256[7:]}.json", "pending"
-        )
-        readiness, readiness_read_sha256 = _read_durable_content_receipt(
-            runtime / f"readiness.{readiness_sha256[7:]}.json", "readiness"
-        )
-        launch_identity = dict(launch.get("database_identity") or {})
-        if (
-            launch.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
-            or launch.get("stage") != "completed"
-            or launch.get("source_root") != str(source_root)
-            or launch.get("source_commit") != source_identity.get("commit")
-            or launch.get("source_tree") != source_identity.get("tree")
-            or launch.get("server_sha256") != server_sha256
-            or launch.get("dev_storage_root") != str(dev_storage)
-            or launch.get("database_path") != str(database)
-            or launch_identity.get("device") != current_identity["device"]
-            or launch_identity.get("inode") != current_identity["inode"]
-            or launch.get("project_id") != "aming-claw"
-            or launch.get("port") != AC_DEV_SERVICE_PORT
-            or launch.get("policy") != expected_policy
-            or launch.get("linked_v3_receipt_sha256")
-            != linked_v3_receipt_sha256
-            or pending_read_sha256 != pending_sha256
-            or readiness_read_sha256 != readiness_sha256
-            or pending.get("launch_id") != launch.get("launch_id")
-            or pending.get("source_identity") != dict(source_identity)
-            or pending.get("linked_v3_receipt_sha256")
-            != linked_v3_receipt_sha256
-            or pending.get("database_sha256_before")
-            != launch.get("database_sha256_before")
-            or readiness.get("pending_sha256") != pending_sha256
-            or readiness.get("launch_id") != launch.get("launch_id")
-            or readiness.get("pid") != launch.get("pid")
-            or readiness.get("database_sha256_before")
-            != launch.get("database_sha256_before")
-            or readiness.get("database_sha256_after")
-            != launch.get("database_sha256_after")
-            or readiness.get("database_identity") != launch_identity
-            or not _exact_sha256(str(launch.get("database_sha256_after") or ""))
-        ):
-            raise click.ClickException(
-                "AC dev durable completed generation is unclassifiable"
-            )
-        if launch.get("database_sha256_after") == current_sha256:
-            matches.append((launch_sha256, current_sha256))
-    if len(matches) != 1:
-        raise click.ClickException(
-            "AC dev durable completed generation postimage is missing or ambiguous"
-        )
-    return matches[0][1]
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _validated_linked_v3_receipt(
@@ -3463,24 +3394,18 @@ def _validated_linked_v3_receipt(
                 raise click.ClickException(
                     "dashboard backlog bootstrap durable phase is incomplete"
                 )
-            completed_generation_sha256 = str(
-                bootstrap_binding.get("database_sha256") or ""
-            )
+            _db.validate_dev_cow_successor_receipt(dev_storage)
+            return digest, receipt
         else:
-            completed_generation_sha256 = (
-                _completed_durable_generation_database_anchor(
-                    dev_storage=dev_storage, database=database,
-                    source_identity=source_identity,
-                    linked_v3_receipt_sha256=digest,
-                )
+            completed_generation_ref = _completed_durable_generation_ref(
+                dev_storage=dev_storage, source_identity=source_identity,
+                linked_v3_receipt=receipt_path,
             )
         _db.validate_dev_cow_successor_preimage(
             dev_storage, linked_v3_receipt=receipt_path,
             source_identity=source_identity,
             stable_binding=_db.verified_stable_database_binding(),
-            expected_completed_generation_database_sha256=(
-                completed_generation_sha256
-            ),
+            completed_generation_ref=completed_generation_ref,
         )
         return digest, receipt
     if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
@@ -3668,23 +3593,18 @@ def _durable_dev_launch(
         database_identity=database_identity, source_identity=source_identity,
         allow_postimage=True, durable_start_phase=durable_phase,
     )
-    completed_generation_database_sha256 = ""
+    completed_generation_ref = None
     if bootstrap_binding is None:
-        completed_generation_database_sha256 = (
-            _completed_durable_generation_database_anchor(
-                dev_storage=dev_storage, database=database,
-                source_identity=source_identity,
-                linked_v3_receipt_sha256=linked_digest,
-            )
+        completed_generation_ref = _completed_durable_generation_ref(
+            dev_storage=dev_storage, source_identity=source_identity,
+            linked_v3_receipt=linked_receipt,
         )
     if bootstrap_binding is None:
         from agent.governance.db import validate_dev_preimage_only
         preimage = validate_dev_preimage_only(
             dev_storage, source_identity=source_identity,
             linked_v3_receipt=linked_receipt,
-            expected_completed_generation_database_sha256=(
-                completed_generation_database_sha256
-            ),
+            completed_generation_ref=completed_generation_ref,
         )
     else:
         preimage = bootstrap_binding
@@ -4024,9 +3944,7 @@ def _durable_dev_launch(
         "database_sha256_before": preimage["database_sha256"],
         "linked_v3_receipt": str(linked_receipt.absolute()),
         "linked_v3_receipt_sha256": linked_digest,
-        "completed_generation_database_sha256": (
-            completed_generation_database_sha256
-        ),
+        "completed_generation_ref": completed_generation_ref,
     }
     if bootstrap_binding is not None:
         pending_payload["dashboard_bootstrap"] = {
@@ -4446,7 +4364,7 @@ def start(
     health = None
     database_binding = None
     dev_identity = None
-    completed_generation_database_sha256 = ""
+    completed_generation_ref = None
     if runtime_plane == "dev":
         if port != AC_DEV_SERVICE_PORT:
             raise click.ClickException(
@@ -4490,7 +4408,7 @@ def start(
             if not isolated_database.is_file():
                 raise click.ClickException("AC dev durable launch requires its existing receipt-bound database")
             durable_phase, _bootstrap = _durable_start_phase(selected_dev_storage)
-            linked_digest, _linked = _validated_linked_v3_receipt(
+            _linked_digest, _linked = _validated_linked_v3_receipt(
                 linked_v3_receipt, dev_storage=selected_dev_storage,
                 database=isolated_database,
                 database_identity=_admission_identity(isolated_database),
@@ -4498,13 +4416,10 @@ def start(
                 allow_postimage=True, durable_start_phase=durable_phase,
             )
             if durable_phase == _DURABLE_START_LEGACY_ADOPTION:
-                completed_generation_database_sha256 = (
-                    _completed_durable_generation_database_anchor(
-                        dev_storage=selected_dev_storage,
-                        database=isolated_database,
-                        source_identity=dev_identity,
-                        linked_v3_receipt_sha256=linked_digest,
-                    )
+                completed_generation_ref = _completed_durable_generation_ref(
+                    dev_storage=selected_dev_storage,
+                    source_identity=dev_identity,
+                    linked_v3_receipt=linked_v3_receipt,
                 )
         # Listener ownership is the first dev-world admission decision.  A
         # running or foreign process must be rejected before bootstrap, source
@@ -4554,26 +4469,17 @@ def start(
                     preimage_binding = bootstrap_preimage
                 else:
                     if durable_child_runtime_dir is not None:
-                        lifecycle_digest = "sha256:" + hashlib.sha256(
-                            lifecycle_receipt.read_bytes()
-                        ).hexdigest()
-                        completed_generation_database_sha256 = (
-                            _completed_durable_generation_database_anchor(
+                        completed_generation_ref = (
+                            _completed_durable_generation_ref(
                                 dev_storage=selected_dev_storage,
-                                database=(
-                                    selected_dev_storage
-                                    / "governance" / "aming-claw" / "governance.db"
-                                ),
                                 source_identity=dev_identity,
-                                linked_v3_receipt_sha256=lifecycle_digest,
+                                linked_v3_receipt=lifecycle_receipt,
                             )
                         )
                     preimage_binding = validate_dev_preimage_only(
                         selected_dev_storage, source_identity=dev_identity,
                         linked_v3_receipt=lifecycle_receipt,
-                        expected_completed_generation_database_sha256=(
-                            completed_generation_database_sha256
-                        ),
+                        completed_generation_ref=completed_generation_ref,
                     )
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 raise click.ClickException(str(exc)) from exc
@@ -4671,9 +4577,8 @@ def start(
             if (pending.get("launch_id") != durable_child_launch_id
                     or pending.get("dev_storage_root") != str(dev_storage)
                     or pending.get("source_identity") != dict(dev_identity or {})
-                    or str(pending.get(
-                        "completed_generation_database_sha256"
-                    ) or "") != completed_generation_database_sha256):
+                    or pending.get("completed_generation_ref")
+                    != completed_generation_ref):
                 raise click.ClickException("AC dev durable child pending binding mismatch")
             phase = pending.get("durable_start_phase")
             bootstrap_fields = {"dashboard_bootstrap"}
@@ -4757,9 +4662,7 @@ def start(
                         linked_v3_receipt=durable_child_linked_v3_receipt,
                         expected_database_identity=pending_database,
                         expected_pre_sha256=pending["database_sha256_before"],
-                        expected_completed_generation_database_sha256=(
-                            completed_generation_database_sha256
-                        ),
+                        completed_generation_ref=completed_generation_ref,
                     )
                 else:
                     raise click.ClickException("AC dev durable child phase is invalid")

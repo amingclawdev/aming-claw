@@ -2189,7 +2189,7 @@ def _validated_canonical_legacy_postimage_adoption(
 def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = None,
                       source_identity: Mapping[str, object] | None = None,
                       allow_postimage: bool = False,
-                      expected_completed_generation_database_sha256: str = "") -> Path:
+                      completed_generation_ref: Mapping[str, object] | None = None) -> Path:
     """Resolve the only AC dev world; raw env values are assertions, not authority."""
     # Reject the missing required dev claim before contacting any authority or
     # resolving a potentially hostile sibling path.  This is zero-mutation.
@@ -2228,9 +2228,7 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
             validate_dev_cow_successor_preimage(
                 root, linked_v3_receipt=isolated_receipt,
                 source_identity=source_identity or {}, stable_binding=binding,
-                expected_completed_generation_database_sha256=(
-                    expected_completed_generation_database_sha256
-                ),
+                completed_generation_ref=completed_generation_ref,
             )
             return root
         return _validated_isolated_dev_receipt(
@@ -2474,6 +2472,12 @@ _DEV_DURABLE_POLICY = {
     "stable_deployment": "deny", "graph_activation": "deny",
     "background_workers": "deny",
 }
+_DEV_DURABLE_COMPLETED_REF_SCHEMA = "ac_dev_durable_completed_generation_ref.v1"
+_DEV_DURABLE_LAUNCH_SCHEMA = "ac_dev_durable_launch.v1"
+_DEV_DURABLE_PENDING_SCHEMA = "ac_dev_durable_pending.v1"
+_DEV_DURABLE_READINESS_SCHEMA = "ac_dev_durable_readiness.v1"
+_DEV_DURABLE_LEGACY_PHASE = "LEGACY_ADOPTION"
+_DEV_DURABLE_BOOTSTRAP_PHASE = "COMPLETED_BOOTSTRAP"
 
 
 def _git_read_exact(root: Path, *args: str) -> bytes:
@@ -2554,7 +2558,7 @@ def _validate_dev_current_process_custody(
             or source_root != candidate_root or cwd != candidate_root or dev_root != root.resolve(strict=True)
             or value.get("project_id") != AC_PROJECT_ID or value.get("port") != 40008
             or value.get("policy") != _DEV_DURABLE_POLICY
-            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("launch_id") or ""))
+            or not re.fullmatch(r"[0-9a-f]{24}", str(value.get("launch_id") or ""))
             or value["launch_id"] not in command
             or "agent.cli" not in command or " start " not in f" {command} "
             or "--durable-child-launch-id" not in command
@@ -4094,10 +4098,479 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
     return receipt
 
 
+_DEV_DURABLE_SOURCE_KEYS = frozenset({
+    "root", "branch", "commit", "tree", "source_sha256", "dirty",
+})
+_DEV_DURABLE_PENDING_KEYS = frozenset({
+    "schema_version", "stage", "durable_start_phase", "launch_id",
+    "parent_pid", "source_identity", "dev_storage_root", "database_path",
+    "database_identity", "database_sha256_before", "linked_v3_receipt",
+    "linked_v3_receipt_sha256", "completed_generation_ref",
+})
+_DEV_DURABLE_READINESS_KEYS = frozenset({
+    "schema_version", "stage", "launch_id", "pid", "pending_sha256",
+    "database_sha256_before", "database_sha256_after", "database_identity",
+    "custody_projection", "durable_start_phase", "custody_delta",
+})
+_DEV_DURABLE_LAUNCH_KEYS = frozenset({
+    "schema_version", "stage", "launch_id", "pid", "process", "argv",
+    "cwd", "python", "source_commit", "source_tree", "server_sha256",
+    "source_root", "database_path", "database_identity", "dev_storage_root",
+    "project_id", "port", "linked_v3_receipt_sha256", "log_path",
+    "log_identity", "policy", "pending_sha256", "readiness_sha256",
+    "database_sha256_before", "database_sha256_after",
+})
+_DEV_DURABLE_DASHBOARD_KEYS = frozenset({
+    "bootstrap_receipt", "bootstrap_receipt_sha256", "bootstrap_pending",
+    "bootstrap_pending_sha256", "historical_launch_sha256",
+    "historical_stop_sha256", "historical_exit_sha256",
+    "historical_launch_id",
+})
+
+
+def _exact_dev_durable_sha256(value: object) -> bool:
+    return bool(re.fullmatch(r"sha256:[0-9a-f]{64}", str(value or "")))
+
+
+def _canonical_dev_durable_runtime(root: Path, *, required: bool) -> Path | None:
+    runtime = (root / "runtime" / "durable-launch").absolute()
+    if not runtime.exists():
+        if required:
+            raise ValueError("AC dev durable completed generation runtime is missing")
+        return None
+    try:
+        details = runtime.stat(follow_symlinks=False)
+        resolved = runtime.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("AC dev durable completed generation runtime is invalid") from exc
+    if (
+        runtime.is_symlink()
+        or not stat.S_ISDIR(details.st_mode)
+        or resolved != runtime
+        or runtime.parent.is_symlink()
+    ):
+        raise ValueError("AC dev durable completed generation runtime is invalid")
+    return runtime
+
+
+def _read_dev_durable_chain_receipt(
+    runtime: Path, prefix: str, receipt_sha256: str,
+) -> tuple[dict[str, object], Path]:
+    """Read one canonical content-addressed receipt without following links."""
+    if not _exact_dev_durable_sha256(receipt_sha256):
+        raise ValueError(f"AC dev durable {prefix} receipt reference is invalid")
+    digest = receipt_sha256[7:]
+    path = runtime / f"{prefix}.{digest}.json"
+    try:
+        before = path.stat(follow_symlinks=False)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise ValueError(f"AC dev durable {prefix} receipt is missing") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or before.st_nlink != 1
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or path.parent.resolve(strict=True) != runtime
+        ):
+            raise ValueError(f"AC dev durable {prefix} receipt is not canonical")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 1_048_576:
+                raise ValueError(f"AC dev durable {prefix} receipt is oversized")
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError(f"AC dev durable {prefix} receipt digest mismatch")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"AC dev durable {prefix} receipt is malformed") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"AC dev durable {prefix} receipt is malformed")
+    return payload, path
+
+
+def _dev_durable_ref(launch_sha256: str) -> dict[str, str]:
+    return {
+        "schema_version": _DEV_DURABLE_COMPLETED_REF_SCHEMA,
+        "launch_sha256": launch_sha256,
+    }
+
+
+def _validate_dev_durable_ref(value: object) -> dict[str, str]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"schema_version", "launch_sha256"}
+        or value.get("schema_version") != _DEV_DURABLE_COMPLETED_REF_SCHEMA
+        or not _exact_dev_durable_sha256(value.get("launch_sha256"))
+    ):
+        raise ValueError("AC dev durable completed generation ref is invalid")
+    return _dev_durable_ref(str(value["launch_sha256"]))
+
+
+def _validate_dev_durable_source(
+    value: object, *, candidate_source: Mapping[str, object],
+) -> tuple[dict[str, object], str]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _DEV_DURABLE_SOURCE_KEYS
+        or value.get("branch") != "codex/ac-dev"
+        or value.get("dirty") != ""
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(value.get("commit") or ""))
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(value.get("tree") or ""))
+        or not _exact_dev_durable_sha256(value.get("source_sha256"))
+    ):
+        raise ValueError("AC dev durable completed generation source is invalid")
+    source = dict(value)
+    tip = {key: source[key] for key in _DEV_SOURCE_TIP_KEYS}
+    _validate_dev_source_tip_custody(
+        tip, stored_sha256=_world_source_tip_hash(tip), candidate=candidate_source,
+    )
+    source_root = Path(str(source["root"])).expanduser().resolve(strict=True)
+    tree = _git_read_exact(
+        source_root, "rev-parse", f"{source['commit']}^{{tree}}",
+    ).decode().strip()
+    source_bytes = _git_read_exact(
+        source_root, "show", f"{source['commit']}:agent/cli.py",
+    )
+    server_bytes = _git_read_exact(
+        source_root, "show", f"{source['commit']}:agent/governance/server.py",
+    )
+    if (
+        tree != source["tree"]
+        or "sha256:" + hashlib.sha256(source_bytes).hexdigest()
+        != source["source_sha256"]
+    ):
+        raise ValueError("AC dev durable completed generation source producer mismatch")
+    return source, "sha256:" + hashlib.sha256(server_bytes).hexdigest()
+
+
+def _validate_dev_durable_dashboard(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _DEV_DURABLE_DASHBOARD_KEYS:
+        raise ValueError("AC dev durable dashboard bootstrap binding is invalid")
+    result = dict(value)
+    for key in (
+        "bootstrap_receipt_sha256", "bootstrap_pending_sha256",
+        "historical_launch_sha256", "historical_stop_sha256",
+        "historical_exit_sha256",
+    ):
+        if not _exact_dev_durable_sha256(result.get(key)):
+            raise ValueError("AC dev durable dashboard bootstrap binding is invalid")
+    if not all(
+        isinstance(result.get(key), str) and result.get(key)
+        for key in ("bootstrap_receipt", "bootstrap_pending", "historical_launch_id")
+    ):
+        raise ValueError("AC dev durable dashboard bootstrap binding is invalid")
+    return result
+
+
+def _validate_dev_durable_launch_argv(
+    value: object, *, python: str, root: Path, runtime: Path,
+    launch_id: str, pending_path: Path, linked_path: Path,
+) -> list[str]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ValueError("AC dev durable completed generation argv is invalid")
+    argv = list(value)
+    if (
+        len(argv) != 22
+        or argv[1:10] != [
+            "-m", "agent.cli", "start", "--runtime-plane", "dev", "--port",
+            "40008", "--dev-storage-root", str(root),
+        ]
+        or argv[10] != "--stable-anchor-commit"
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", argv[11])
+        or argv[12:17] != [
+            "--durable-child-runtime-dir", str(runtime),
+            "--durable-child-launch-id", launch_id,
+            "--durable-child-control-fd",
+        ]
+        or not argv[17].isdigit()
+        or argv[18:] != [
+            "--durable-child-pending-receipt", str(pending_path),
+            "--durable-child-linked-v3-receipt", str(linked_path),
+        ]
+    ):
+        raise ValueError("AC dev durable completed generation argv is invalid")
+    try:
+        if Path(argv[0]).resolve(strict=True) != Path(python).resolve(strict=True):
+            raise ValueError("AC dev durable completed generation python mismatch")
+    except OSError as exc:
+        raise ValueError("AC dev durable completed generation python mismatch") from exc
+    return argv
+
+
+def _validate_dev_durable_completed_chain(
+    root: Path, *, completed_generation_ref: Mapping[str, object],
+    source_identity: Mapping[str, object], linked_v3_receipt: Path,
+    visited: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """Reconstruct one official launch/readiness/pending chain from canonical bytes."""
+    runtime = _canonical_dev_durable_runtime(root, required=True)
+    assert runtime is not None
+    ref = _validate_dev_durable_ref(completed_generation_ref)
+    launch_sha256 = ref["launch_sha256"]
+    if launch_sha256 in visited:
+        raise ValueError("AC dev durable completed generation chain is cyclic")
+    launch, _launch_path = _read_dev_durable_chain_receipt(
+        runtime, "launch", launch_sha256,
+    )
+    if set(launch) not in {
+        _DEV_DURABLE_LAUNCH_KEYS,
+        _DEV_DURABLE_LAUNCH_KEYS | {"dashboard_bootstrap"},
+    }:
+        raise ValueError("AC dev durable completed launch shape is invalid")
+    pending_sha256 = str(launch.get("pending_sha256") or "")
+    readiness_sha256 = str(launch.get("readiness_sha256") or "")
+    pending, pending_path = _read_dev_durable_chain_receipt(
+        runtime, "pending", pending_sha256,
+    )
+    readiness, _readiness_path = _read_dev_durable_chain_receipt(
+        runtime, "readiness", readiness_sha256,
+    )
+    if set(pending) not in {
+        _DEV_DURABLE_PENDING_KEYS,
+        _DEV_DURABLE_PENDING_KEYS | {"dashboard_bootstrap"},
+    }:
+        raise ValueError("AC dev durable completed pending shape is invalid")
+    if set(readiness) != _DEV_DURABLE_READINESS_KEYS:
+        raise ValueError("AC dev durable completed readiness shape is invalid")
+    phase = pending.get("durable_start_phase")
+    dashboard = pending.get("dashboard_bootstrap")
+    if phase == _DEV_DURABLE_LEGACY_PHASE:
+        if dashboard is not None or "dashboard_bootstrap" in launch:
+            raise ValueError("AC dev durable legacy generation has bootstrap state")
+    elif phase == _DEV_DURABLE_BOOTSTRAP_PHASE:
+        dashboard = _validate_dev_durable_dashboard(dashboard)
+        if launch.get("dashboard_bootstrap") != dashboard:
+            raise ValueError("AC dev durable dashboard bootstrap chain mismatch")
+    else:
+        raise ValueError("AC dev durable completed generation phase is invalid")
+    source, server_sha256 = _validate_dev_durable_source(
+        pending.get("source_identity"), candidate_source=source_identity,
+    )
+    database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+    linked_path = linked_v3_receipt.expanduser().absolute()
+    linked_sha256 = "sha256:" + hashlib.sha256(linked_path.read_bytes()).hexdigest()
+    database_stat = database.stat(follow_symlinks=False)
+    expected_database_identity = {
+        "device": int(database_stat.st_dev), "inode": int(database_stat.st_ino),
+    }
+    if phase == _DEV_DURABLE_BOOTSTRAP_PHASE:
+        expected_database_identity = {"path": str(database), **expected_database_identity}
+    launch_id = str(launch.get("launch_id") or "")
+    pid = launch.get("pid")
+    process = launch.get("process")
+    custody = readiness.get("custody_projection")
+    policy = dict(_DEV_DURABLE_POLICY)
+    if (
+        launch.get("schema_version") != _DEV_DURABLE_LAUNCH_SCHEMA
+        or launch.get("stage") != "completed"
+        or pending.get("schema_version") != _DEV_DURABLE_PENDING_SCHEMA
+        or pending.get("stage") != "pending"
+        or readiness.get("schema_version") != _DEV_DURABLE_READINESS_SCHEMA
+        or readiness.get("stage") != "ready_unbound"
+        or not re.fullmatch(r"[0-9a-f]{24}", launch_id)
+        or type(pid) is not int or pid <= 0
+        or type(pending.get("parent_pid")) is not int
+        or int(pending["parent_pid"]) <= 0
+        or pending.get("launch_id") != launch_id
+        or readiness.get("launch_id") != launch_id
+        or readiness.get("pid") != pid
+        or readiness.get("pending_sha256") != pending_sha256
+        or pending.get("dev_storage_root") != str(root)
+        or launch.get("dev_storage_root") != str(root)
+        or pending.get("database_path") != str(database)
+        or launch.get("database_path") != str(database)
+        or pending.get("database_identity") != expected_database_identity
+        or readiness.get("database_identity") != expected_database_identity
+        or launch.get("database_identity") != expected_database_identity
+        or pending.get("linked_v3_receipt") != str(linked_path)
+        or pending.get("linked_v3_receipt_sha256") != linked_sha256
+        or launch.get("linked_v3_receipt_sha256") != linked_sha256
+        or launch.get("project_id") != AC_PROJECT_ID
+        or launch.get("port") != 40008
+        or launch.get("policy") != policy
+        or launch.get("source_root") != source["root"]
+        or launch.get("source_commit") != source["commit"]
+        or launch.get("source_tree") != source["tree"]
+        or launch.get("server_sha256") != server_sha256
+        or launch.get("cwd") != source["root"]
+        or readiness.get("durable_start_phase") != phase
+        or not _exact_dev_durable_sha256(pending.get("database_sha256_before"))
+        or pending.get("database_sha256_before")
+        != readiness.get("database_sha256_before")
+        or readiness.get("database_sha256_before")
+        != launch.get("database_sha256_before")
+        or not _exact_dev_durable_sha256(readiness.get("database_sha256_after"))
+        or readiness.get("database_sha256_after")
+        != launch.get("database_sha256_after")
+    ):
+        raise ValueError("AC dev durable completed generation binding mismatch")
+    if phase == _DEV_DURABLE_LEGACY_PHASE:
+        if readiness.get("custody_delta") is not None:
+            raise ValueError("AC dev durable legacy custody delta is invalid")
+    else:
+        delta = readiness.get("custody_delta")
+        if not isinstance(delta, Mapping) or set(delta) != set(
+            _COMPLETED_BOOTSTRAP_CUSTODY_KEYS
+        ):
+            raise ValueError("AC dev durable bootstrap custody delta is invalid")
+    if not isinstance(custody, Mapping):
+        raise ValueError("AC dev durable completed custody is invalid")
+    _validate_dev_current_process_custody(
+        custody, root=root, candidate_source=source_identity,
+    )
+    if (
+        custody.get("pid") != pid
+        or custody.get("launch_id") != launch_id
+        or custody.get("source_root") != source["root"]
+        or custody.get("source_commit") != source["commit"]
+        or custody.get("source_tree") != source["tree"]
+        or custody.get("dev_storage_root") != str(root)
+        or custody.get("project_id") != AC_PROJECT_ID
+        or custody.get("port") != 40008
+        or custody.get("policy") != policy
+    ):
+        raise ValueError("AC dev durable completed custody binding mismatch")
+    if (
+        not isinstance(process, Mapping)
+        or set(process) != {"start_identity", "argv", "cwd"}
+        or process.get("start_identity") != custody.get("start_identity")
+        or process.get("cwd") != source["root"]
+        or not isinstance(process.get("argv"), str)
+        or launch_id not in str(process.get("argv"))
+        or "agent.cli" not in str(process.get("argv"))
+    ):
+        raise ValueError("AC dev durable completed process binding mismatch")
+    _validate_dev_durable_launch_argv(
+        launch.get("argv"), python=str(launch.get("python") or ""),
+        root=root, runtime=runtime, launch_id=launch_id,
+        pending_path=pending_path, linked_path=linked_path,
+    )
+    log_path = runtime / f"governance-{launch_id}.log"
+    try:
+        log_stat = log_path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("AC dev durable completed log is missing") from exc
+    if (
+        log_path.is_symlink()
+        or not stat.S_ISREG(log_stat.st_mode)
+        or launch.get("log_path") != str(log_path)
+        or launch.get("log_identity") != {
+            "path": str(log_path), "device": int(log_stat.st_dev),
+            "inode": int(log_stat.st_ino),
+        }
+    ):
+        raise ValueError("AC dev durable completed log binding mismatch")
+    predecessor_ref = pending.get("completed_generation_ref")
+    if predecessor_ref is not None:
+        predecessor = _validate_dev_durable_completed_chain(
+            root, completed_generation_ref=_validate_dev_durable_ref(predecessor_ref),
+            source_identity=source_identity, linked_v3_receipt=linked_path,
+            visited=visited | {launch_sha256},
+        )
+        if predecessor["database_sha256"] != pending["database_sha256_before"]:
+            raise ValueError("AC dev durable completed generation predecessor mismatch")
+    elif phase == _DEV_DURABLE_LEGACY_PHASE:
+        issuance = validate_dev_cow_successor_receipt(root)
+        issuance_sha256 = str(
+            dict(dict(issuance.get("successor") or {}).get("identity") or {}).get(
+                "sha256"
+            )
+            or ""
+        )
+        if (
+            not _exact_dev_durable_sha256(issuance_sha256)
+            or pending["database_sha256_before"] != issuance_sha256
+        ):
+            raise ValueError(
+                "AC dev durable completed generation lacks issuance authority"
+            )
+    else:
+        raise ValueError(
+            "AC dev durable completed bootstrap generation lacks external authority"
+        )
+    return {
+        "ref": ref,
+        "database_sha256": str(launch["database_sha256_after"]),
+        "custody_projection": dict(custody),
+        "launch": launch,
+    }
+
+
+def select_dev_completed_generation_ref(
+    storage_root: Path | str, *, source_identity: Mapping[str, object],
+    linked_v3_receipt: Path,
+) -> dict[str, str] | None:
+    """Select the unique official completed chain owning today's database bytes."""
+    root = Path(storage_root).expanduser().absolute()
+    runtime = _canonical_dev_durable_runtime(root, required=False)
+    if runtime is None:
+        return None
+    launch_paths = sorted(runtime.glob("launch.*.json"))
+    if not launch_paths:
+        if list(runtime.glob("pending.*.json")) or list(runtime.glob("readiness.*.json")):
+            raise ValueError("AC dev durable completed generation chain is incomplete")
+        return None
+    database_sha256 = _durable_database_sha256(
+        root / AC_DATABASE_DEV_RELATIVE_PATH
+    )
+    matches: list[dict[str, str]] = []
+    for path in launch_paths:
+        match = re.fullmatch(r"launch\.([0-9a-f]{64})\.json", path.name)
+        if match is None:
+            raise ValueError("AC dev durable completed launch filename is invalid")
+        ref = _dev_durable_ref("sha256:" + match.group(1))
+        chain = _validate_dev_durable_completed_chain(
+            root, completed_generation_ref=ref, source_identity=source_identity,
+            linked_v3_receipt=linked_v3_receipt,
+        )
+        if chain["database_sha256"] == database_sha256:
+            matches.append(ref)
+    if len(matches) != 1:
+        raise ValueError(
+            "AC dev durable completed generation postimage is missing or ambiguous"
+        )
+    return matches[0]
+
+
+def _resolve_dev_completed_generation_ref(
+    root: Path, *, completed_generation_ref: object,
+    source_identity: Mapping[str, object], linked_v3_receipt: Path,
+) -> dict[str, object]:
+    ref = _validate_dev_durable_ref(completed_generation_ref)
+    selected = select_dev_completed_generation_ref(
+        root, source_identity=source_identity,
+        linked_v3_receipt=linked_v3_receipt,
+    )
+    if selected != ref:
+        raise ValueError("AC dev durable completed generation ref is not current")
+    return _validate_dev_durable_completed_chain(
+        root, completed_generation_ref=ref, source_identity=source_identity,
+        linked_v3_receipt=linked_v3_receipt,
+    )
+
+
 def validate_dev_cow_successor_preimage(
     storage_root: Path | str, *, linked_v3_receipt: Path,
     source_identity: Mapping[str, object], stable_binding: Mapping[str, object],
-    expected_completed_generation_database_sha256: str = "",
+    completed_generation_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate the exact live post-COW inode against immutable v2 authority."""
     root = Path(storage_root).expanduser().absolute()
@@ -4151,15 +4624,13 @@ def validate_dev_cow_successor_preimage(
         r"sha256:[0-9a-f]{64}", issuance_schema_meta_sha256
     ):
         raise ValueError("AC dev COW successor issuance schema_meta authority is invalid")
-    if expected_completed_generation_database_sha256:
-        if (
-            not re.fullmatch(
-                r"sha256:[0-9a-f]{64}",
-                expected_completed_generation_database_sha256,
-            )
-            or current.get("sha256")
-            != expected_completed_generation_database_sha256
-        ):
+    completed_generation = None
+    if completed_generation_ref is not None:
+        completed_generation = _resolve_dev_completed_generation_ref(
+            root, completed_generation_ref=completed_generation_ref,
+            source_identity=source_identity, linked_v3_receipt=linked_path,
+        )
+        if current.get("sha256") != completed_generation["database_sha256"]:
             raise ValueError("AC dev COW completed generation database anchor mismatch")
     elif current_schema_meta_sha256 != issuance_schema_meta_sha256:
         raise ValueError("AC dev COW successor issuance schema_meta mismatch")
@@ -4188,6 +4659,11 @@ def validate_dev_cow_successor_preimage(
         process, root=root, candidate_source=source_identity,
         historical_process=historical_process,
     )
+    if (
+        completed_generation is not None
+        and dict(process) != completed_generation["custody_projection"]
+    ):
+        raise ValueError("AC dev COW completed generation custody mismatch")
     _validate_dev_source_tip_custody(
         tip, stored_sha256=str(meta.get("governance_world_source_tip_sha256") or ""),
         candidate=source_identity,
@@ -4222,7 +4698,7 @@ def _verify_current_dev_backlog_runtime_invariants(
 def validate_dev_preimage_only(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     linked_v3_receipt: Path,
-    expected_completed_generation_database_sha256: str = "",
+    completed_generation_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate an admitted preimage or exact source-owned custody postimage.
 
@@ -4232,9 +4708,7 @@ def validate_dev_preimage_only(
     root = _dev_storage_root(
         create=False, isolated_receipt=linked_v3_receipt,
         source_identity=source_identity, allow_postimage=True,
-        expected_completed_generation_database_sha256=(
-            expected_completed_generation_database_sha256
-        ),
+        completed_generation_ref=completed_generation_ref,
     )
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
     physical = database.stat(follow_symlinks=False)
@@ -4272,15 +4746,13 @@ def commit_dev_child_custody(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     process_identity: Mapping[str, object], linked_v3_receipt: Path,
     expected_database_identity: Mapping[str, object], expected_pre_sha256: str,
-    expected_completed_generation_database_sha256: str = "",
+    completed_generation_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Child-owned, CAS-bound custody commit used before any listener bind."""
     pre = validate_dev_preimage_only(
         storage_root, source_identity=source_identity,
         linked_v3_receipt=linked_v3_receipt,
-        expected_completed_generation_database_sha256=(
-            expected_completed_generation_database_sha256
-        ),
+        completed_generation_ref=completed_generation_ref,
     )
     if (pre["database_identity"] != dict(expected_database_identity)
             or pre["database_sha256"] != expected_pre_sha256):
@@ -4294,9 +4766,7 @@ def commit_dev_child_custody(
         receipt = bootstrap_dev_governance_store(
             storage_root, source_identity=source_identity,
             process_identity=process_identity, linked_v3_receipt=linked_v3_receipt,
-            expected_completed_generation_database_sha256=(
-                expected_completed_generation_database_sha256
-            ),
+            completed_generation_ref=completed_generation_ref,
         )
     finally:
         if previous_plane is not None:
@@ -4501,7 +4971,7 @@ def bootstrap_dev_governance_store(
     expected_previous_process_identity: Mapping[str, object] | None = None,
     expected_database_identity: Mapping[str, object] | None = None,
     linked_v3_receipt: Path | None = None,
-    expected_completed_generation_database_sha256: str = "",
+    completed_generation_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Create or verify the source-only AC dev world without copying stable rows.
 
@@ -4526,9 +4996,7 @@ def bootstrap_dev_governance_store(
     root = _dev_storage_root(
         create=not root_existed, isolated_receipt=linked_v3_receipt,
         source_identity=source_identity, allow_postimage=True,
-        expected_completed_generation_database_sha256=(
-            expected_completed_generation_database_sha256
-        ),
+        completed_generation_ref=completed_generation_ref,
     )
     source = {
         "root": str(source_identity.get("root") or "").strip(),
