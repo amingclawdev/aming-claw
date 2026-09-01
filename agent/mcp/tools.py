@@ -27,6 +27,7 @@ from .host_envelope_continuity import ManagedHostEnvelopeContinuity
 from .schema_contract import (
     MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION,
     MCP_TOOL_SCHEMA_VERSION,
+    mcp_tool_schema_fingerprint,
     mcp_tool_schema_compatibility,
     register_loaded_tool_schema,
 )
@@ -9541,12 +9542,20 @@ class ToolDispatcher:
                 or governance.get("mcp_tool_schema_min_client_version")
                 or MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION
             ).strip()
+            loaded_schema_fingerprint = mcp_tool_schema_fingerprint(TOOLS)
+            server_schema_fingerprint = str(
+                server_schema.get("server_tool_schema_fingerprint")
+                or governance.get("mcp_tool_schema_fingerprint")
+                or ""
+            ).strip()
             schema_status = mcp_tool_schema_compatibility(
                 loaded_schema_version=MCP_TOOL_SCHEMA_VERSION,
                 server_schema_version=(
                     server_schema_version or MCP_TOOL_SCHEMA_VERSION
                 ),
                 minimum_client_schema_version=minimum_client_schema_version,
+                loaded_schema_fingerprint=loaded_schema_fingerprint,
+                server_schema_fingerprint=server_schema_fingerprint,
             )
             schema_status["server_version_observable"] = bool(
                 server_schema_version

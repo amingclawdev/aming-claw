@@ -1977,6 +1977,7 @@ class _RuntimeGovRecorder(_Recorder):
                 "version": "abc1234",
                 "mcp_tool_schema_version": MCP_TOOL_SCHEMA_VERSION,
                 "mcp_tool_schema_min_client_version": MCP_TOOL_SCHEMA_VERSION,
+                "mcp_tool_schema_fingerprint": mcp_tool_schema_fingerprint(TOOLS),
             }
         if path == "/api/version-check/aming-claw":
             return {
@@ -7189,6 +7190,12 @@ def test_mcp_runtime_status_aggregates_governance_and_manager():
     assert status["governance_runtime"]["runtime_match"] is True
     assert status["mcp_tool_schema"]["status"] == "current"
     assert status["mcp_tool_schema"]["client_schema_fresh"] is True
+    assert status["mcp_tool_schema"]["loaded_client_tool_schema_fingerprint"] == (
+        mcp_tool_schema_fingerprint(TOOLS)
+    )
+    assert status["mcp_tool_schema"]["server_tool_schema_fingerprint"] == (
+        mcp_tool_schema_fingerprint(TOOLS)
+    )
     assert status["mcp_tool_schema"]["loaded_client_tool_schema_version"] == (
         MCP_TOOL_SCHEMA_VERSION
     )
@@ -7226,6 +7233,33 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
     assert "restart_or_refresh_mcp_session" in status["recommended_actions"]
 
 
+@pytest.mark.parametrize("server_fingerprint", ["", "sha256:" + "0" * 64])
+def test_mcp_runtime_status_same_version_unregistered_or_mismatched_fingerprint_is_stale(
+    server_fingerprint,
+):
+    class FingerprintDriftGovernance(_RuntimeGovRecorder):
+        def api(self, method: str, path: str, data: dict | None = None) -> dict:
+            result = super().api(method, path, data)
+            if path == "/api/health":
+                result = dict(result)
+                result["mcp_tool_schema_fingerprint"] = server_fingerprint
+            return result
+
+    status = _dispatcher(FingerprintDriftGovernance(), _Recorder()).dispatch(
+        "runtime_status",
+        {"project_id": "aming-claw"},
+    )
+
+    schema = status["mcp_tool_schema"]
+    assert schema["status"] == "stale_client"
+    assert schema["client_schema_fresh"] is False
+    assert schema["client_schema_fingerprint_fresh"] is False
+    assert schema["loaded_client_tool_schema_fingerprint"] == (
+        mcp_tool_schema_fingerprint(TOOLS)
+    )
+    assert schema["server_tool_schema_fingerprint"] == server_fingerprint
+
+
 def test_current_mcp_schema_bump_marks_pre_current_full_view_client_stale():
     assert MCP_TOOL_SCHEMA_VERSION == "2026-09-01.1"
     reconcile_properties = _tool_properties("graph_current_full_reconcile")
@@ -7248,14 +7282,29 @@ def test_current_mcp_schema_bump_marks_pre_current_full_view_client_stale():
     assert compatibility["stale_client_possible"] is True
 
 
-def test_mcp_schema_same_version_old_registration_fingerprint_is_not_current():
+@pytest.mark.parametrize(
+    ("loaded_fingerprint", "server_fingerprint"),
+    [
+        ("sha256:" + "0" * 64, "current"),
+        ("", "current"),
+        ("current", ""),
+    ],
+)
+def test_mcp_schema_same_version_old_or_absent_fingerprint_is_not_current(
+    loaded_fingerprint,
+    server_fingerprint,
+):
     current = mcp_tool_schema_fingerprint(TOOLS)
     compatibility = mcp_tool_schema_compatibility(
         loaded_schema_version=MCP_TOOL_SCHEMA_VERSION,
         server_schema_version=MCP_TOOL_SCHEMA_VERSION,
         minimum_client_schema_version=MCP_TOOL_SCHEMA_VERSION,
-        loaded_schema_fingerprint="sha256:" + "0" * 64,
-        server_schema_fingerprint=current,
+        loaded_schema_fingerprint=(
+            current if loaded_fingerprint == "current" else loaded_fingerprint
+        ),
+        server_schema_fingerprint=(
+            current if server_fingerprint == "current" else server_fingerprint
+        ),
     )
 
     assert compatibility["client_schema_fresh"] is False

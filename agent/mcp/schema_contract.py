@@ -102,16 +102,12 @@ def mcp_tool_schema_compatibility(
     loaded_fingerprint = str(loaded_schema_fingerprint or "").strip()
     server_fingerprint = str(server_schema_fingerprint or "").strip()
     version_fresh = loaded == server if loaded else None
-    fingerprint_fresh = (
-        loaded_fingerprint == server_fingerprint
-        if loaded_fingerprint and server_fingerprint
-        else None
+    fingerprint_fresh = bool(
+        loaded_fingerprint
+        and server_fingerprint
+        and loaded_fingerprint == server_fingerprint
     )
-    fresh = (
-        version_fresh and fingerprint_fresh
-        if fingerprint_fresh is not None
-        else version_fresh
-    )
+    fresh = bool(version_fresh and fingerprint_fresh)
     return {
         "schema_version": "mcp_tool_schema_compatibility.v1",
         "loaded_client_tool_schema_version": loaded,
