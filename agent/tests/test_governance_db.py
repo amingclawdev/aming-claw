@@ -2380,6 +2380,264 @@ def _write_historical_v1_from_v2(receipt_path):
     return path
 
 
+def _phase_z_cow_prestart_fixture(tmp_path, monkeypatch):
+    """Build one real COW successor whose issuance meta is externally sealed."""
+    from agent.governance import db
+
+    git_fixture = tmp_path / "git-source"
+    git_fixture.mkdir()
+    source_root, source_commit = _dev_source_repo(git_fixture)
+    source = {
+        "root": str(source_root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": source_commit,
+        "source_sha256": "sha256:" + hashlib.sha256(
+            (source_root / "agent" / "cli.py").read_bytes()
+        ).hexdigest(),
+    }
+    process = {"pid": 41, "start_identity": "pid:41:cli-bootstrap"}
+    root, database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch, candidate_source_identity=source,
+    )
+    meta = (
+        ("governance_world_source_tip_json", json.dumps(source)),
+        ("governance_world_source_tip_sha256", db._world_source_tip_hash(source)),
+        ("governance_world_source_tip_revision", "2"),
+        ("governance_world_current_process_json", json.dumps(process)),
+    )
+    for candidate in (backup, database):
+        connection = sqlite3.connect(candidate)
+        connection.executemany(
+            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES (?,?)", meta,
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+    adoption = next(
+        (root / "archive" / "canonical-legacy-postimage-adoption").glob(
+            "adoption.*.json"
+        )
+    )
+    adoption_payload = json.loads(adoption.read_text(encoding="utf-8"))
+    adoption_payload["legacy_process_identity"] = process
+    adoption_raw = json.dumps(
+        adoption_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    adoption.unlink()
+    adoption = adoption.parent / (
+        f"adoption.{hashlib.sha256(adoption_raw).hexdigest()}.json"
+    )
+    adoption.write_bytes(adoption_raw)
+    operator_payload = json.loads(operator.read_text(encoding="utf-8"))
+    operator_payload.update(
+        backup_sha256=db._durable_database_sha256(backup),
+        target_sha256_before=db._durable_database_sha256(backup),
+        target_sha256_after=db._durable_database_sha256(database),
+    )
+    operator_raw = json.dumps(
+        operator_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    operator.unlink()
+    operator = operator.parent / (
+        f"cow-import.{hashlib.sha256(operator_raw).hexdigest()}.json"
+    )
+    operator.write_bytes(operator_raw)
+    created = db.create_dev_cow_successor_receipt(
+        root, operator_receipt=operator, predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    _write_historical_v1_from_v2(created["receipt"])
+    receipt = json.loads(Path(created["receipt"]).read_text(encoding="utf-8"))
+    return root, database, linked, source, process, receipt
+
+
+def _phase_z_durable_process(root, source, *, pid):
+    launch_id = str(pid)[-1] * 64
+    source_tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=source["root"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return {
+        "pid": pid,
+        "start_identity": "sha256:" + str(pid + 1)[-1] * 64,
+        "argv": [
+            sys.executable, "-m", "agent.cli", "start",
+            "--durable-child-launch-id", launch_id,
+        ],
+        "cwd": source["root"],
+        "source_root": source["root"],
+        "source_commit": source["commit"],
+        "source_tree": source_tree,
+        "dev_storage_root": str(root),
+        "project_id": "aming-claw",
+        "port": 40008,
+        "policy": {
+            "runtime_plane": "dev", "migration": "verify-only",
+            "stable_deployment": "deny", "graph_activation": "deny",
+            "background_workers": "deny",
+        },
+        "launch_id": launch_id,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation", ("process", "tip", "managed", "protected", "other_meta")
+)
+def test_cow_prestart_requires_exact_issuance_schema_meta_projection(
+    tmp_path, monkeypatch, mutation,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    assert db.validate_dev_cow_successor_preimage(
+        root, linked_v3_receipt=linked, source_identity=source,
+        stable_binding=db.verified_stable_database_binding(),
+    ) == receipt
+    candidate_source = source
+    connection = sqlite3.connect(database)
+    if mutation == "process":
+        connection.execute(
+            "UPDATE schema_meta SET value=? WHERE key=?",
+            (json.dumps(_phase_z_durable_process(root, source, pid=42)),
+             "governance_world_current_process_json"),
+        )
+    elif mutation == "tip":
+        next_commit = _advance_dev_source(Path(source["root"]), "phase-z-next")
+        candidate_source = {**source, "commit": next_commit}
+        connection.executemany(
+            "UPDATE schema_meta SET value=? WHERE key=?",
+            (
+                (json.dumps(candidate_source), "governance_world_source_tip_json"),
+                (db._world_source_tip_hash(candidate_source),
+                 "governance_world_source_tip_sha256"),
+                ("3", "governance_world_source_tip_revision"),
+            ),
+        )
+    elif mutation == "managed":
+        connection.execute("DROP TRIGGER trg_dashboard_backlog_cache_update")
+    elif mutation == "protected":
+        connection.execute("CREATE TABLE phase_z_protected_drift(value TEXT)")
+    else:
+        connection.execute(
+            "INSERT INTO schema_meta(key,value) VALUES (?,?)",
+            ("phase_z_unanchored_meta", "self-consistent-but-unsealed"),
+        )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+
+    expected = (
+        "issuance schema_meta"
+        if mutation in {"process", "tip", "other_meta"}
+        else "inventory|schema"
+    )
+    with pytest.raises(ValueError, match=expected):
+        db.validate_dev_cow_successor_preimage(
+            root, linked_v3_receipt=linked, source_identity=candidate_source,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+
+
+def test_cow_completed_generation_anchor_replaces_issuance_meta_after_transition(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, process, receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    transitioned = _phase_z_durable_process(root, source, pid=42)
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "UPDATE schema_meta SET value=? WHERE key=?",
+        (json.dumps(transitioned), "governance_world_current_process_json"),
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    postimage = db._durable_database_sha256(database)
+
+    with pytest.raises(ValueError, match="issuance schema_meta"):
+        db.validate_dev_cow_successor_preimage(
+            root, linked_v3_receipt=linked, source_identity=source,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+    assert db.validate_dev_cow_successor_preimage(
+        root, linked_v3_receipt=linked, source_identity=source,
+        stable_binding=db.verified_stable_database_binding(),
+        expected_completed_generation_database_sha256=postimage,
+    ) == receipt
+    with pytest.raises(ValueError, match="completed generation"):
+        db.validate_dev_cow_successor_preimage(
+            root, linked_v3_receipt=linked, source_identity=source,
+            stable_binding=db.verified_stable_database_binding(),
+            expected_completed_generation_database_sha256="sha256:" + "0" * 64,
+        )
+
+
+def test_cow_first_then_second_child_custody_uses_completed_generation_anchor(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+    import agent.runtime_plane as runtime_plane
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    stable_binding = db.verified_stable_database_binding()
+    stable_volume = tmp_path / "stable-volume"
+    stable_volume.mkdir()
+    stable_binding = {**stable_binding, "shared_volume_path": str(stable_volume)}
+    monkeypatch.setattr(
+        db, "verified_stable_database_binding", lambda **_kwargs: stable_binding,
+    )
+    monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _value: None)
+    monkeypatch.setattr(
+        runtime_plane, "resolve_ac_dev_storage_root", lambda _stable: root,
+    )
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(root))
+    monkeypatch.setenv(db.AC_STABLE_SHARED_VOLUME_ENV, str(stable_volume))
+    physical = database.stat(follow_symlinks=False)
+    expected_identity = {
+        "device": int(physical.st_dev), "inode": int(physical.st_ino),
+    }
+    issuance_sha256 = db._durable_database_sha256(database)
+    first_process = _phase_z_durable_process(root, source, pid=42)
+    try:
+        first = db.commit_dev_child_custody(
+            root, source_identity=source, process_identity=first_process,
+            linked_v3_receipt=linked,
+            expected_database_identity=expected_identity,
+            expected_pre_sha256=issuance_sha256,
+        )
+    finally:
+        db.release_dev_runtime_writer_lease(root)
+    assert first["custody_projection"] == first_process
+    with pytest.raises(ValueError, match="issuance schema_meta"):
+        db.validate_dev_preimage_only(
+            root, source_identity=source, linked_v3_receipt=linked,
+        )
+
+    second_process = _phase_z_durable_process(root, source, pid=43)
+    try:
+        second = db.commit_dev_child_custody(
+            root, source_identity=source, process_identity=second_process,
+            linked_v3_receipt=linked,
+            expected_database_identity=expected_identity,
+            expected_pre_sha256=first["database_sha256_after"],
+            expected_completed_generation_database_sha256=(
+                first["database_sha256_after"]
+            ),
+        )
+    finally:
+        db.release_dev_runtime_writer_lease(root)
+    assert second["database_sha256_before"] == first["database_sha256_after"]
+    assert second["custody_projection"] == second_process
+    assert second["database_sha256_after"] != first["database_sha256_after"]
+
+
 def test_ac_dev_cow_successor_public_cli_real_sqlite_create_and_replay(tmp_path, monkeypatch):
     pytest.importorskip("click")
     from click.testing import CliRunner

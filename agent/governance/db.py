@@ -2188,7 +2188,8 @@ def _validated_canonical_legacy_postimage_adoption(
 
 def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = None,
                       source_identity: Mapping[str, object] | None = None,
-                      allow_postimage: bool = False) -> Path:
+                      allow_postimage: bool = False,
+                      expected_completed_generation_database_sha256: str = "") -> Path:
     """Resolve the only AC dev world; raw env values are assertions, not authority."""
     # Reject the missing required dev claim before contacting any authority or
     # resolving a potentially hostile sibling path.  This is zero-mutation.
@@ -2227,6 +2228,9 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
             validate_dev_cow_successor_preimage(
                 root, linked_v3_receipt=isolated_receipt,
                 source_identity=source_identity or {}, stable_binding=binding,
+                expected_completed_generation_database_sha256=(
+                    expected_completed_generation_database_sha256
+                ),
             )
             return root
         return _validated_isolated_dev_receipt(
@@ -4093,6 +4097,7 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
 def validate_dev_cow_successor_preimage(
     storage_root: Path | str, *, linked_v3_receipt: Path,
     source_identity: Mapping[str, object], stable_binding: Mapping[str, object],
+    expected_completed_generation_database_sha256: str = "",
 ) -> dict[str, object]:
     """Validate the exact live post-COW inode against immutable v2 authority."""
     root = Path(storage_root).expanduser().absolute()
@@ -4133,8 +4138,31 @@ def validate_dev_cow_successor_preimage(
             expected_protected_inventory=dict(successor.get("protected_inventory") or {}),
         )
         meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
+        current_schema_meta_sha256 = _sqlite_logical_projection(conn).get(
+            "schema_meta"
+        )
     finally:
         conn.close()
+    issuance_schema_meta_sha256 = str(
+        dict(successor.get("protected_projection") or {}).get("schema_meta")
+        or ""
+    )
+    if not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", issuance_schema_meta_sha256
+    ):
+        raise ValueError("AC dev COW successor issuance schema_meta authority is invalid")
+    if expected_completed_generation_database_sha256:
+        if (
+            not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                expected_completed_generation_database_sha256,
+            )
+            or current.get("sha256")
+            != expected_completed_generation_database_sha256
+        ):
+            raise ValueError("AC dev COW completed generation database anchor mismatch")
+    elif current_schema_meta_sha256 != issuance_schema_meta_sha256:
+        raise ValueError("AC dev COW successor issuance schema_meta mismatch")
     if (meta.get("governance_world_genesis_json") != successor.get("genesis_json")
             or meta.get("governance_world_genesis_sha256") != successor.get("genesis_sha256")
             or meta.get("governance_world_id") != AC_DEV_WORLD_ID):
@@ -4194,6 +4222,7 @@ def _verify_current_dev_backlog_runtime_invariants(
 def validate_dev_preimage_only(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     linked_v3_receipt: Path,
+    expected_completed_generation_database_sha256: str = "",
 ) -> dict[str, object]:
     """Validate an admitted preimage or exact source-owned custody postimage.
 
@@ -4203,6 +4232,9 @@ def validate_dev_preimage_only(
     root = _dev_storage_root(
         create=False, isolated_receipt=linked_v3_receipt,
         source_identity=source_identity, allow_postimage=True,
+        expected_completed_generation_database_sha256=(
+            expected_completed_generation_database_sha256
+        ),
     )
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
     physical = database.stat(follow_symlinks=False)
@@ -4240,11 +4272,15 @@ def commit_dev_child_custody(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     process_identity: Mapping[str, object], linked_v3_receipt: Path,
     expected_database_identity: Mapping[str, object], expected_pre_sha256: str,
+    expected_completed_generation_database_sha256: str = "",
 ) -> dict[str, object]:
     """Child-owned, CAS-bound custody commit used before any listener bind."""
     pre = validate_dev_preimage_only(
         storage_root, source_identity=source_identity,
         linked_v3_receipt=linked_v3_receipt,
+        expected_completed_generation_database_sha256=(
+            expected_completed_generation_database_sha256
+        ),
     )
     if (pre["database_identity"] != dict(expected_database_identity)
             or pre["database_sha256"] != expected_pre_sha256):
@@ -4258,6 +4294,9 @@ def commit_dev_child_custody(
         receipt = bootstrap_dev_governance_store(
             storage_root, source_identity=source_identity,
             process_identity=process_identity, linked_v3_receipt=linked_v3_receipt,
+            expected_completed_generation_database_sha256=(
+                expected_completed_generation_database_sha256
+            ),
         )
     finally:
         if previous_plane is not None:
@@ -4271,16 +4310,62 @@ def commit_dev_child_custody(
             raise RuntimeError("AC dev durable child checkpoint did not truncate")
     finally:
         checkpoint.close()
-    post = validate_dev_preimage_only(
-        storage_root, source_identity=source_identity,
-        linked_v3_receipt=linked_v3_receipt,
-    )
-    if dict(post["custody_projection"]) != dict(process_identity):
+    physical = database.stat(follow_symlinks=False)
+    if (
+        physical.st_nlink != 1
+        or {"device": int(physical.st_dev), "inode": int(physical.st_ino)}
+        != dict(expected_database_identity)
+    ):
+        raise ValueError("AC dev durable child postimage identity mismatch")
+    post_sha256 = _durable_database_sha256(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    post_conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(post_conn)
+        previous_plane = os.environ.pop(RUNTIME_PLANE_ENV, None)
+        try:
+            _verify_dev_world_schema_inventory(post_conn)
+        finally:
+            if previous_plane is not None:
+                os.environ[RUNTIME_PLANE_ENV] = previous_plane
+        post_meta = dict(post_conn.execute(
+            "SELECT key,value FROM schema_meta"
+        ))
+    finally:
+        post_conn.close()
+    try:
+        post_process = json.loads(str(
+            post_meta.get("governance_world_current_process_json") or ""
+        ))
+        post_tip = json.loads(str(
+            post_meta.get("governance_world_source_tip_json") or ""
+        ))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AC dev durable child custody projection is unreadable") from exc
+    if (
+        not isinstance(post_process, Mapping)
+        or not isinstance(post_tip, Mapping)
+        or dict(post_process) != dict(process_identity)
+    ):
         raise ValueError("AC dev durable child custody projection mismatch")
+    root = Path(storage_root).expanduser().absolute()
+    _validate_dev_current_process_custody(
+        post_process, root=root, candidate_source=source_identity,
+    )
+    _validate_dev_source_tip_custody(
+        post_tip,
+        stored_sha256=str(
+            post_meta.get("governance_world_source_tip_sha256") or ""
+        ),
+        candidate=source_identity,
+    )
     return {
         **receipt, "database_sha256_before": expected_pre_sha256,
-        "database_sha256_after": post["database_sha256"],
-        "custody_projection": post["custody_projection"],
+        "database_sha256_after": post_sha256,
+        "custody_projection": dict(post_process),
+        "database_identity": {
+            "device": int(physical.st_dev), "inode": int(physical.st_ino),
+        },
     }
 
 
@@ -4416,6 +4501,7 @@ def bootstrap_dev_governance_store(
     expected_previous_process_identity: Mapping[str, object] | None = None,
     expected_database_identity: Mapping[str, object] | None = None,
     linked_v3_receipt: Path | None = None,
+    expected_completed_generation_database_sha256: str = "",
 ) -> dict[str, object]:
     """Create or verify the source-only AC dev world without copying stable rows.
 
@@ -4440,6 +4526,9 @@ def bootstrap_dev_governance_store(
     root = _dev_storage_root(
         create=not root_existed, isolated_receipt=linked_v3_receipt,
         source_identity=source_identity, allow_postimage=True,
+        expected_completed_generation_database_sha256=(
+            expected_completed_generation_database_sha256
+        ),
     )
     source = {
         "root": str(source_identity.get("root") or "").strip(),
