@@ -4297,6 +4297,204 @@ def test_exact_custody_rebaseline_ignores_draft_then_prepares_and_consumes(
     assert Path(prepared["backup"]).stat().st_mode & 0o777 == 0o400
 
 
+def _pre_readiness_projection_fixture(cli, tmp_path):
+    from agent.governance import db
+
+    source = {
+        "root": str(tmp_path / "source"), "branch": cli.AC_DEV_BRANCH,
+        "commit": "c" * 40, "tree": "d" * 40,
+        "source_sha256": "sha256:" + "e" * 64, "dirty": "",
+    }
+    prior_tip = {
+        "root": source["root"], "branch": cli.AC_DEV_BRANCH,
+        "commit": "a" * 40, "source_sha256": "sha256:" + "b" * 64,
+    }
+    after_tip = {key: source[key] for key in db._DEV_SOURCE_TIP_KEYS}
+    policy = dict(db._DEV_DURABLE_POLICY)
+    prior_process = {
+        "argv": ["prior"], "cwd": source["root"], "source_root": source["root"],
+        "source_commit": prior_tip["commit"], "source_tree": "1" * 40,
+        "dev_storage_root": str(tmp_path / "dev"), "project_id": "aming-claw",
+        "port": 40008, "policy": policy, "launch_id": "1" * 24,
+        "pid": 111, "start_identity": "sha256:" + "2" * 64,
+    }
+    after_process = {
+        "argv": ["current"], "cwd": source["root"], "source_root": source["root"],
+        "source_commit": source["commit"], "source_tree": source["tree"],
+        "dev_storage_root": str(tmp_path / "dev"), "project_id": "aming-claw",
+        "port": 40008, "policy": policy,
+        "launch_id": cli._PRE_READINESS_CUSTODY_POSTIMAGE["launch_id"],
+        "pid": 222, "start_identity": "sha256:" + "3" * 64,
+    }
+    unchanged = {"schema_version": "47", "governance_world_id": "ac-dev"}
+    before_meta = {
+        **unchanged,
+        "governance_world_current_process_json": json.dumps(
+            prior_process, sort_keys=True, separators=(",", ":")
+        ),
+        "governance_world_source_tip_json": json.dumps(
+            prior_tip, sort_keys=True, separators=(",", ":")
+        ),
+        "governance_world_source_tip_revision": "22",
+        "governance_world_source_tip_sha256": db._world_source_tip_hash(prior_tip),
+    }
+    after_meta = {
+        **unchanged,
+        "governance_world_current_process_json": json.dumps(
+            after_process, sort_keys=True, separators=(",", ":")
+        ),
+        "governance_world_source_tip_json": json.dumps(
+            after_tip, sort_keys=True, separators=(",", ":")
+        ),
+        "governance_world_source_tip_revision": "23",
+        "governance_world_source_tip_sha256": db._world_source_tip_hash(after_tip),
+    }
+    counts = {f"table_{number}": number for number in range(84)}
+    logical = {"schema_meta": "sha256:" + "4" * 64,
+               "evidence": "sha256:" + "5" * 64}
+    common = {
+        "quick_check": "ok", "integrity_check": "ok",
+        "sqlite_master_count": 314,
+        "sqlite_master_sha256": cli._PRE_READINESS_CUSTODY_POSTIMAGE[
+            "sqlite_master_sha256"
+        ],
+        "table_row_counts": counts, "table_logical_digests": logical,
+    }
+    baseline = {**common, "schema_meta": before_meta}
+    current = {**common, "schema_meta": after_meta,
+               "table_row_counts": dict(counts),
+               "table_logical_digests": {**logical, "schema_meta": "sha256:" + "6" * 64}}
+    pending = {"source_identity": source}
+    failed = {"pid": 222}
+    return baseline, current, pending, failed, source
+
+
+def test_pre_readiness_custody_delta_accepts_only_four_key_transition(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    baseline, current, pending, failed, source = _pre_readiness_projection_fixture(
+        cli, tmp_path
+    )
+    monkeypatch.setattr(db, "_validate_dev_source_tip_custody", lambda *_a, **_k: None)
+    monkeypatch.setattr(db, "_validate_dev_current_process_custody", lambda *_a, **_k: None)
+    result = cli._validate_pre_readiness_custody_delta(
+        baseline=baseline, current=current, pending=pending, failed=failed,
+        source_identity=source, dev_storage=tmp_path / "dev",
+    )
+    assert result["baseline_revision"] == 22
+    assert result["postimage_revision"] == 23
+    assert set(result["custody_delta"]) == set(db._FIRST_COW_CUSTODY_KEYS)
+
+
+@pytest.mark.parametrize(
+    "drift", [
+        "extra_meta", "table_count", "row_count", "logical", "pid", "port",
+        "policy", "revision", "source_hash", "ancestry",
+    ],
+)
+def test_pre_readiness_custody_delta_rejects_one_drift_per_invariant(
+    tmp_path, monkeypatch, drift,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    baseline, current, pending, failed, source = _pre_readiness_projection_fixture(
+        cli, tmp_path
+    )
+    monkeypatch.setattr(db, "_validate_dev_source_tip_custody", lambda *_a, **_k: None)
+    monkeypatch.setattr(db, "_validate_dev_current_process_custody", lambda *_a, **_k: None)
+    if drift == "extra_meta":
+        current["schema_meta"]["unexpected"] = "drift"
+    elif drift == "table_count":
+        current["table_row_counts"].pop("table_83")
+    elif drift == "row_count":
+        current["table_row_counts"]["table_0"] = 999
+    elif drift == "logical":
+        current["table_logical_digests"]["evidence"] = "sha256:" + "7" * 64
+    else:
+        process = json.loads(current["schema_meta"]["governance_world_current_process_json"])
+        if drift == "pid":
+            process["pid"] = 333
+        elif drift == "port":
+            process["port"] = 40000
+        elif drift == "policy":
+            process["policy"]["migration"] = "write"
+        elif drift == "revision":
+            current["schema_meta"]["governance_world_source_tip_revision"] = "24"
+        elif drift == "source_hash":
+            current["schema_meta"]["governance_world_source_tip_sha256"] = "sha256:" + "8" * 64
+        elif drift == "ancestry":
+            monkeypatch.setattr(
+                db, "_validate_dev_source_tip_custody",
+                lambda *_a, **_k: (_ for _ in ()).throw(ValueError("ancestry drift")),
+            )
+        current["schema_meta"]["governance_world_current_process_json"] = json.dumps(
+            process, sort_keys=True, separators=(",", ":")
+        )
+    with pytest.raises(cli.click.ClickException):
+        cli._validate_pre_readiness_custody_delta(
+            baseline=baseline, current=current, pending=pending, failed=failed,
+            source_identity=source, dev_storage=tmp_path / "dev",
+        )
+
+
+def test_durable_readiness_timeout_is_named_bounded_and_shared():
+    import inspect
+    import agent.cli as cli
+
+    launch = inspect.getsource(cli._durable_dev_launch)
+    start = inspect.getsource(cli.start.callback)
+    assert cli._AC_DEV_DURABLE_READINESS_TIMEOUT_SEC == 45.0
+    assert "parent_sock.settimeout(_AC_DEV_DURABLE_READINESS_TIMEOUT_SEC)" in launch
+    assert "time.monotonic() + _AC_DEV_DURABLE_READINESS_TIMEOUT_SEC" in launch
+    assert "control.settimeout(_AC_DEV_DURABLE_READINESS_TIMEOUT_SEC)" in start
+
+
+def test_readiness_timeout_terms_exact_child_and_seals_recoverable_failure(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+
+    class Child:
+        pid = 424242
+        def poll(self):
+            return None
+
+    signals = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    launch_id = "a" * 24
+    failure = cli._record_failed_durable_launch(
+        child=Child(), runtime=tmp_path, launch_id=launch_id,
+        error=cli.socket.timeout("readiness"),
+    )
+    payload = json.loads(failure.read_text(encoding="utf-8"))
+    assert signals == [(Child.pid, cli.signal.SIGTERM)]
+    assert payload == {
+        "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION,
+        "stage": "failed", "launch_id": launch_id, "pid": Child.pid,
+        "failure_class": "readiness_timeout", "recoverable": True,
+        "term_signal_sent": True, "kill_signal_sent": False,
+    }
+
+
+def test_pre_readiness_consumer_binds_paths_inodes_port_and_ancestry():
+    import inspect
+    import agent.cli as cli
+
+    source = inspect.getsource(cli._consume_pre_readiness_custody_only_postimage)
+    for required in (
+        "receipt_database.get(\"device\")", "receipt_database.get(\"inode\")",
+        "baseline_path.parent", "pending_value.get(\"database_identity\")",
+        "_durable_listener_pid(AC_DEV_SERVICE_PORT)",
+        '"git", "merge-base", "--is-ancestor"',
+        "_pre_readiness_sqlite_snapshot(database)",
+    ):
+        assert required in source
+
+
 def test_dev_admit_schema_rejects_wrong_plane_before_database_write(tmp_path):
     root = tmp_path / "external-dev-world"
     database = root / "governance" / "aming-claw" / "governance.db"

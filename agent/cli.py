@@ -2407,6 +2407,17 @@ _AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION = (
 )
 _DURABLE_START_LEGACY_ADOPTION = "LEGACY_ADOPTION"
 _DURABLE_START_COMPLETED_BOOTSTRAP = "COMPLETED_BOOTSTRAP"
+_AC_DEV_DURABLE_READINESS_TIMEOUT_SEC = 45.0
+
+_PRE_READINESS_CUSTODY_POSTIMAGE = {
+    "launch_id": "9396d45740fe066aebf0aa70",
+    "pending_sha256": "sha256:0c81f9b19bec0f336fc5127686a7a9f87bdd0b8a95cc17381e280f47a80bdecb",
+    "failed_sha256": "sha256:bccb8f161aa80b14d793aa1bf0df6ffe2f8e413109a13b456a728e7741716013",
+    "database_sha256": "sha256:875296929b53ad9d881e86749ed38adcd3d8749bb820922d965afe7da2b33d2f",
+    "rebaseline_sha256": "sha256:f6c7452d50521141f987d5438e9987b7c438cd2d8e43bc3be5cc2330ceadff5a",
+    "backup_sha256": "sha256:fc2132137905cc9360d10fbae651b60d97e79a640ac2f3f45c635b6e13df66d0",
+    "sqlite_master_count": 314, "sqlite_master_sha256": "sha256:0c515fef10e491d8d2aea99aba163a1a3c806d7add4f52604a45b474343158fa",
+    "table_count": 84}
 
 
 def _immutable_sqlite_projection(path: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -3884,6 +3895,288 @@ def _consume_exact_custody_rebaseline(
         raise click.ClickException("AC dev custody rebaseline receipt mismatch")
     return digest
 
+
+def _pre_readiness_sqlite_snapshot(path: Path) -> dict[str, Any]:
+    from agent.governance import db as _db
+    absolute = path.expanduser().absolute()
+    try:
+        details = absolute.stat(follow_symlinks=False)
+        resolved = absolute.resolve(strict=True)
+    except OSError as exc:
+        raise click.ClickException("AC dev pre-readiness custody database is unavailable") from exc
+    if (absolute.is_symlink() or not stat.S_ISREG(details.st_mode)
+            or resolved != absolute or details.st_nlink != 1):
+        raise click.ClickException("AC dev pre-readiness custody database is not canonical")
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(str(absolute) + suffix)
+        if sidecar.exists() or sidecar.is_symlink():
+            raise click.ClickException("AC dev pre-readiness custody database has sidecars")
+    _db._assert_no_external_sqlite_holders(absolute)
+    uri = "file:" + urllib.parse.quote(str(absolute)) + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True, timeout=0)
+    try:
+        quick = [str(row[0]).lower() for row in connection.execute("PRAGMA quick_check")]
+        integrity = [str(row[0]).lower() for row in connection.execute("PRAGMA integrity_check")]
+        inventory = _db._sqlite_master_inventory(connection)
+        tables = [str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        counts: dict[str, int] = {}
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            counts[table] = int(connection.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
+        logical = _db._sqlite_logical_projection(connection)
+        meta = {str(key): str(value) for key, value in connection.execute(
+            "SELECT key,value FROM schema_meta ORDER BY key")}
+    finally:
+        connection.close()
+    if quick != ["ok"] or integrity != ["ok"]:
+        raise click.ClickException("AC dev pre-readiness custody database integrity failed")
+    return {**_admission_identity(absolute), "size": int(details.st_size),
+        "nlink": int(details.st_nlink), "sha256": _file_sha256(absolute),
+        "quick_check": "ok", "integrity_check": "ok",
+        "sqlite_master_count": len(inventory),
+        "sqlite_master_sha256": "sha256:" + hashlib.sha256(
+            _canonical_json_bytes(inventory)).hexdigest(),
+        "table_row_counts": counts, "table_logical_digests": logical,
+        "schema_meta": meta}
+
+
+def _validate_pre_readiness_custody_delta(
+    *, baseline: Mapping[str, Any], current: Mapping[str, Any],
+    pending: Mapping[str, Any], failed: Mapping[str, Any],
+    source_identity: Mapping[str, object], dev_storage: Path,
+) -> dict[str, Any]:
+    from agent.governance import db as _db
+    incident = _PRE_READINESS_CUSTODY_POSTIMAGE
+    exact_custody_keys = {"governance_world_current_process_json", "governance_world_source_tip_json",
+        "governance_world_source_tip_revision", "governance_world_source_tip_sha256"}
+    for snapshot in (baseline, current):
+        if (snapshot.get("quick_check") != "ok"
+                or snapshot.get("integrity_check") != "ok"
+                or snapshot.get("sqlite_master_count")
+                    != incident["sqlite_master_count"]
+                or snapshot.get("sqlite_master_sha256")
+                    != incident["sqlite_master_sha256"]
+                or len(dict(snapshot.get("table_row_counts") or {}))
+                    != incident["table_count"]):
+            raise click.ClickException("AC dev pre-readiness custody inventory mismatch")
+    if (baseline.get("table_row_counts") != current.get("table_row_counts")
+            or {key: value for key, value in dict(
+                baseline.get("table_logical_digests") or {}
+            ).items() if key != "schema_meta"}
+            != {key: value for key, value in dict(
+                current.get("table_logical_digests") or {}
+            ).items() if key != "schema_meta"}):
+        raise click.ClickException("AC dev pre-readiness custody logical projection drifted")
+    before_meta = dict(baseline.get("schema_meta") or {})
+    after_meta = dict(current.get("schema_meta") or {})
+    delta = {
+        key: {"before": before_meta.get(key), "after": after_meta.get(key)}
+        for key in sorted(set(before_meta) | set(after_meta))
+        if before_meta.get(key) != after_meta.get(key)
+    }
+    if set(delta) != exact_custody_keys:
+        raise click.ClickException("AC dev pre-readiness custody metadata delta mismatch")
+    try:
+        before_tip = json.loads(before_meta["governance_world_source_tip_json"])
+        after_tip = json.loads(after_meta["governance_world_source_tip_json"])
+        before_process = json.loads(before_meta["governance_world_current_process_json"])
+        after_process = json.loads(after_meta["governance_world_current_process_json"])
+        before_revision = int(before_meta["governance_world_source_tip_revision"])
+        after_revision = int(after_meta["governance_world_source_tip_revision"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise click.ClickException("AC dev pre-readiness custody metadata is malformed") from exc
+    pending_source = dict(pending.get("source_identity") or {})
+    expected_tip = {key: pending_source.get(key) for key in _db._DEV_SOURCE_TIP_KEYS}
+    if (not isinstance(before_tip, Mapping)
+            or not isinstance(after_tip, Mapping)
+            or not isinstance(before_process, Mapping)
+            or not isinstance(after_process, Mapping)
+            or dict(after_tip) != expected_tip
+            or after_meta.get("governance_world_source_tip_sha256")
+                != _db._world_source_tip_hash(after_tip)
+            or before_meta.get("governance_world_source_tip_sha256")
+                != _db._world_source_tip_hash(before_tip)
+            or after_revision != before_revision + 1
+            or after_process.get("launch_id") != incident["launch_id"]
+            or after_process.get("pid") != failed.get("pid")
+            or after_process.get("source_commit") != pending_source.get("commit")
+            or after_process.get("source_tree") != pending_source.get("tree")
+            or after_process.get("source_root") != pending_source.get("root")
+            or after_process.get("cwd") != pending_source.get("root")
+            or after_process.get("dev_storage_root") != str(dev_storage)
+            or after_process.get("project_id") != "aming-claw"
+            or after_process.get("port") != AC_DEV_SERVICE_PORT
+            or after_process.get("policy") != _db._DEV_DURABLE_POLICY):
+        raise click.ClickException("AC dev pre-readiness custody structural binding mismatch")
+    try:
+        _db._validate_dev_source_tip_custody(before_tip,
+            stored_sha256=before_meta["governance_world_source_tip_sha256"],
+            candidate=source_identity)
+        _db._validate_dev_source_tip_custody(after_tip,
+            stored_sha256=after_meta["governance_world_source_tip_sha256"],
+            candidate=source_identity)
+        _db._validate_dev_current_process_custody(
+            before_process, root=dev_storage, candidate_source=source_identity,
+            completed_dead_pre_normalization=True,
+        )
+        _db._validate_dev_current_process_custody(
+            after_process, root=dev_storage, candidate_source=source_identity,
+            completed_dead_pre_normalization=True,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return {"custody_delta": delta,
+        "custody_delta_sha256": "sha256:" + hashlib.sha256(
+            _canonical_json_bytes(delta)).hexdigest(),
+        "baseline_revision": before_revision, "postimage_revision": after_revision}
+
+
+def _consume_pre_readiness_custody_only_postimage(
+    *, dev_storage: Path, database: Path,
+    source_identity: Mapping[str, object], lock: Path,
+    lock_value: Mapping[str, Any], pending_path: Path,
+    pending_value: Mapping[str, Any], pending_digest: str,
+) -> dict[str, Any]:
+    from agent.governance import db as _db
+    incident = _PRE_READINESS_CUSTODY_POSTIMAGE
+    root = dev_storage.expanduser().absolute()
+    if (root.is_symlink() or root.resolve(strict=True) != root
+            or database.absolute() != root / _db.AC_DATABASE_DEV_RELATIVE_PATH):
+        raise click.ClickException("AC dev pre-readiness custody root/path mismatch")
+    receipt_path = root / "archive" / "operator-exceptions" / ("durable-custody-rebaseline."
+        + str(incident["rebaseline_sha256"])[7:] + ".json")
+    receipt, receipt_sha = _read_durable_content_receipt(
+        receipt_path, "durable-custody-rebaseline"
+    )
+    receipt_stat = receipt_path.stat(follow_symlinks=False)
+    backup = dict(receipt.get("backup") or {})
+    baseline_path = Path(str(backup.get("path") or "")).absolute()
+    baseline = _pre_readiness_sqlite_snapshot(baseline_path)
+    current = _pre_readiness_sqlite_snapshot(database)
+    receipt_database = dict(receipt.get("database") or {})
+    comparable = {"size", "nlink", "sha256", "quick_check", "integrity_check",
+        "sqlite_master_count", "sqlite_master_sha256", "table_row_counts",
+        "table_logical_digests"}
+    receipt_source = dict(receipt.get("source_identity") or {})
+    producer = dict(receipt.get("producer") or {})
+    failed_path = root / "runtime" / "durable-launch" / (
+        "launch-" + str(incident["launch_id"]) + ".failed.json")
+    try:
+        lock_raw = lock.read_bytes()
+        failed_raw = failed_path.read_bytes()
+        failed = json.loads(failed_raw)
+    except (OSError, TypeError, ValueError) as exc:
+        raise click.ClickException("AC dev pre-readiness custody chain is unreadable") from exc
+    current_identity = _admission_identity(database); pending_source = dict(
+        pending_value.get("source_identity") or {})
+    linked = Path(str(pending_value.get("linked_v3_receipt") or "")).absolute()
+    linked_sha = "sha256:" + hashlib.sha256(linked.read_bytes()).hexdigest()
+    if (receipt_sha != incident["rebaseline_sha256"]
+            or receipt_stat.st_nlink != 1 or receipt_stat.st_mode & 0o077
+            or receipt.get("schema_version")
+                != "ac_dev_durable_custody_rebaseline.v1"
+            or receipt.get("stage") != "accepted_baseline"
+            or receipt.get("classification")
+                != "unproven_pre_readiness_delta_accepted_by_operator"
+            or any(receipt.get(key) is not False for key in ("historical_equivalence_claim",
+                "qa_pass", "release_authority", "pass_implied"))
+            or receipt.get("authority") != _CUSTODY_REBASELINE_AUTHORITY
+            or receipt.get("completed_generation_axis") is not True
+            or receipt.get("pending_source_is_ancestor") is not True
+            or receipt_source != pending_source
+            or producer != {"command": "dev-prepare-durable-custody-rebaseline",
+                "source_commit": receipt_source.get("commit"),
+                "source_tree": receipt_source.get("tree"),
+                "source_sha256": receipt_source.get("source_sha256")}
+            or receipt.get("linked_v3_receipt") != str(linked)
+            or receipt.get("linked_v3_receipt_sha256") != linked_sha
+            or baseline_path.parent
+                != root / "archive" / "operator-exception-backups"
+            or baseline.get("sha256") != incident["backup_sha256"]
+            or current.get("sha256") != incident["database_sha256"]
+            or receipt_database.get("path") != str(database)
+            or receipt_database.get("device") != current_identity["device"]
+            or receipt_database.get("inode") != current_identity["inode"]
+            or any(receipt_database.get(key) != baseline.get(key)
+                   for key in comparable)
+            or any(backup.get(key) != baseline.get(key)
+                   for key in comparable | {"path", "device", "inode"})
+            or lock_value != {"schema_version": _AC_DEV_DURABLE_LAUNCH_VERSION,
+                "stage": "locked", "launch_id": incident["launch_id"]}
+            or pending_digest != incident["pending_sha256"]
+            or pending_path != root / "runtime" / "durable-launch" / ("pending."
+                + str(incident["pending_sha256"])[7:] + ".json")
+            or pending_value.get("schema_version")
+                != "ac_dev_durable_pending.v1"
+            or pending_value.get("stage") != "pending"
+            or pending_value.get("durable_start_phase")
+                != _DURABLE_START_LEGACY_ADOPTION
+            or pending_value.get("launch_id") != incident["launch_id"]
+            or pending_value.get("dev_storage_root") != str(root)
+            or pending_value.get("database_path") != str(database)
+            or pending_value.get("database_identity") != {
+                "device": current_identity["device"], "inode": current_identity["inode"]}
+            or pending_value.get("database_sha256_before")
+                != incident["backup_sha256"]
+            or pending_value.get("linked_v3_receipt_sha256") != linked_sha
+            or "sha256:" + hashlib.sha256(failed_raw).hexdigest()
+                != incident["failed_sha256"]
+            or failed != {"schema_version": _AC_DEV_DURABLE_LAUNCH_VERSION,
+                "stage": "failed", "launch_id": incident["launch_id"],
+                "pid": failed.get("pid")}
+            or type(failed.get("pid")) is not int
+            or int(failed["pid"]) <= 0):
+        raise click.ClickException("AC dev pre-readiness custody evidence mismatch")
+    try:
+        _posix_process_identity(int(failed["pid"]))
+    except click.ClickException:
+        pass
+    else:
+        raise click.ClickException("AC dev pre-readiness custody failed child is live")
+    if _durable_listener_pid(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("AC dev pre-readiness custody requires free port 40008")
+    ancestry = subprocess.run(["git", "merge-base", "--is-ancestor",
+         str(receipt_source.get("commit") or ""),
+         str(source_identity.get("commit") or "")],
+        cwd=Path(str(source_identity.get("root") or "")),
+        capture_output=True, text=True, timeout=10, check=False)
+    if ancestry.returncode != 0:
+        raise click.ClickException("AC dev pre-readiness custody source ancestry mismatch")
+    delta = _validate_pre_readiness_custody_delta(
+        baseline=baseline, current=current, pending=pending_value,
+        failed=failed, source_identity=source_identity, dev_storage=root,
+    )
+    return {"classification": "pre_readiness_custody_only_postimage",
+        "rebaseline_receipt": str(receipt_path), "rebaseline_sha256": receipt_sha,
+        "backup": str(baseline_path), "backup_sha256": baseline["sha256"],
+        "supersedes": {
+            "lock_sha256": "sha256:" + hashlib.sha256(lock_raw).hexdigest(),
+            "pending_sha256": pending_digest, "failed_path": str(failed_path),
+            "failed_sha256": incident["failed_sha256"],
+            "failed_pid": failed["pid"]}, **delta}
+
+
+def _record_failed_durable_launch(
+    *, child: subprocess.Popen, runtime: Path, launch_id: str,
+    error: BaseException,
+) -> Path:
+    term_signal_sent = False
+    if child.poll() is None:
+        os.kill(child.pid, signal.SIGTERM)
+        term_signal_sent = True
+    failure = runtime / f"launch-{launch_id}.failed.json"
+    if not failure.exists():
+        failure_class = ("readiness_timeout" if isinstance(
+            error, (TimeoutError, socket.timeout)) else "startup_error")
+        _posix_exclusive_json(failure, {
+            "schema_version": _AC_DEV_DURABLE_LAUNCH_VERSION,
+            "stage": "failed", "launch_id": launch_id, "pid": child.pid,
+            "failure_class": failure_class,
+            "recoverable": True, "term_signal_sent": term_signal_sent,
+            "kill_signal_sent": False})
+    return failure
+
 @main.command("dev-prepare-durable-custody-rebaseline", hidden=True)
 @click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--expected-database-sha256", required=True)
@@ -4232,18 +4525,18 @@ def _durable_dev_launch(
             recovery_stage = "postimage_child_absent"
             recovery_readiness = readiness_matches[0][2]
         else:
-            recovery_rebaseline = _consume_exact_custody_rebaseline(
+            recovery_evidence = _consume_pre_readiness_custody_only_postimage(
                 dev_storage=dev_storage, database=database, source_identity=source_identity,
                 lock=lock, lock_value=lock_value, pending_path=pending_path,
                 pending_value=pending_value, pending_digest=pending_digest)
-            recovery_stage = "pre_readiness_custody_only_postimage_operator_rebaseline"
+            recovery_stage = "pre_readiness_custody_only_postimage"
         recovery_payload = {
             "schema_version": "ac_dev_durable_abnormal_seal.v1", "stage": recovery_stage,
             "pending_sha256": pending_digest, "readiness_sha256": recovery_readiness,
             "database_sha256": database_now,
         }
-        if recovery_stage == "pre_readiness_custody_only_postimage_operator_rebaseline":
-            recovery_payload["rebaseline_sha256"] = recovery_rebaseline
+        if recovery_stage == "pre_readiness_custody_only_postimage":
+            recovery_payload["recovery_evidence"] = recovery_evidence
         _durable_content_receipt(runtime, "abnormal", recovery_payload)
         lock.unlink()
         _fsync_parent(lock)
@@ -4259,7 +4552,7 @@ def _durable_dev_launch(
         log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600,
     )
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-    parent_sock.settimeout(15)
+    parent_sock.settimeout(_AC_DEV_DURABLE_READINESS_TIMEOUT_SEC)
     pending_identity = (dict(preimage["database_identity"])
                         if durable_phase == _DURABLE_START_COMPLETED_BOOTSTRAP
                         else {key: dict(preimage["database_identity"])[key] for key in ("device", "inode")})
@@ -4365,7 +4658,7 @@ def _durable_dev_launch(
             "completed_path": str(active), "completed_sha256": active_sha256,
         }) + b"\n")
         parent_sock.close()
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + _AC_DEV_DURABLE_READINESS_TIMEOUT_SEC
         health = None
         while time.monotonic() < deadline and child.poll() is None:
             health = _probe_governance(AC_DEV_SERVICE_PORT, timeout=0.5)
@@ -4388,16 +4681,11 @@ def _durable_dev_launch(
         _fsync_parent(lock)
         click.echo(json.dumps({"status": "started", "pid": child.pid, "receipt": str(active),
                                "receipt_sha256": active_sha256}, sort_keys=True))
-    except BaseException:
+    except BaseException as exc:
         parent_sock.close()
-        if child.poll() is None:
-            os.kill(child.pid, signal.SIGTERM)
-        failure = runtime / f"launch-{launch_id}.failed.json"
-        if not failure.exists():
-            _posix_exclusive_json(failure, {
-                "schema_version": _AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "failed",
-                "launch_id": launch_id, "pid": child.pid,
-            })
+        _record_failed_durable_launch(
+            child=child, runtime=runtime, launch_id=launch_id, error=exc,
+        )
         raise
 
 
@@ -4915,7 +5203,7 @@ def start(
                     or not isinstance(pending.get("dashboard_bootstrap"), Mapping)):
                 raise click.ClickException("AC dev durable child bootstrap database identity mismatch")
             control = socket.socket(fileno=durable_child_control_fd)
-            control.settimeout(15)
+            control.settimeout(_AC_DEV_DURABLE_READINESS_TIMEOUT_SEC)
             child_process = _posix_process_identity(os.getpid())
             try:
                 python_executable = Path(sys.executable).resolve(strict=True)
