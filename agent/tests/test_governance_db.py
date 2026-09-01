@@ -1324,6 +1324,41 @@ def test_graph_activation_denies_cow_with_dirty_or_mismatched_source(
     assert policy["active_graph_activation_allowed"] is False
 
 
+def test_graph_activation_denies_cross_project_cow_before_source_or_custody(
+    tmp_path, monkeypatch,
+):
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    foreign = json.loads(receipt["genesis"]["raw_json"])
+    foreign["project_id"] = "foreign-project"
+    receipt["genesis"] = {
+        "raw_json": json.dumps(
+            foreign, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ),
+        "sha256": db._world_genesis_hash(foreign),
+    }
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    monkeypatch.setattr(
+        db, "_verify_current_cow_successor_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-project world reached source authority")
+        ),
+    )
+    monkeypatch.setattr(
+        db, "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-project world reached runtime custody")
+        ),
+    )
+
+    try:
+        policy = db.classify_graph_activation_connection(conn)
+    finally:
+        conn.close()
+
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["active_graph_activation_allowed"] is False
+
+
 def test_graph_materialization_verification_exposes_public_component_diagnostics():
     from agent.governance import db, graph_snapshot_store
 
@@ -2217,26 +2252,66 @@ def test_cow_bootstrap_process_custody_accepts_exact_historical_observation(tmp_
     )
 
 
-@pytest.mark.parametrize("drift", [None, "dirty", "non_descendant", "cli_hash"])
-def test_current_cow_source_requires_clean_strict_same_root_descendant(
-    tmp_path, monkeypatch, drift,
-):
+def _current_cow_historical_tip_fixture(tmp_path, monkeypatch):
     from agent.governance import db
 
-    source_root, anchor_commit = _dev_source_repo(tmp_path)
-    subprocess.run(["git", "branch", "-M", "codex/ac-dev"], cwd=source_root, check=True)
-    current_commit = _advance_dev_source(source_root, "descendant-one")
-    current_commit = _advance_dev_source(source_root, "descendant-two")
-    cli_source = source_root / "agent" / "cli.py"
-    source_sha = "sha256:" + hashlib.sha256(cli_source.read_bytes()).hexdigest()
+    source_repository = tmp_path / "source-repository"
+    source_repository.mkdir()
+    source_root, _anchor_commit = _dev_source_repo(source_repository)
+    server_source = source_root / "agent" / "governance" / "server.py"
+    database_source = source_root / "agent" / "governance" / "db.py"
+    server_source.parent.mkdir(parents=True)
+    server_source.write_text("# canonical server source\n", encoding="utf-8")
+    database_source.write_text("# canonical database source\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py", "agent/governance/db.py"],
+        cwd=source_root, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "--amend", "--no-edit"], cwd=source_root,
+        check=True, capture_output=True,
+    )
+    anchor_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    cli_sha = "sha256:" + hashlib.sha256(
+        (source_root / "agent" / "cli.py").read_bytes()
+    ).hexdigest()
     anchor = {
         "root": str(source_root.resolve()), "branch": "codex/ac-dev",
-        "commit": anchor_commit, "source_sha256": "sha256:" + "6" * 64,
+        "commit": anchor_commit, "source_sha256": cli_sha,
     }
-    current = {
+    historical_commit = _advance_dev_source(source_root, "completed-source-tip")
+    historical = {
         "root": str(source_root.resolve()), "branch": "codex/ac-dev",
-        "commit": current_commit, "source_sha256": source_sha,
+        "commit": historical_commit, "source_sha256": cli_sha,
     }
+    current = _defer_completed_source_and_open_clean_successor(
+        tmp_path, {**historical, "tree": "", "dirty": ""},
+    )
+    monkeypatch.setattr(
+        db, "__file__", str(Path(current["root"]) / "agent" / "governance" / "db.py")
+    )
+
+    def loaded_runtime_identity(current_commit):
+        loaded_root = Path(db.__file__).resolve(strict=True).parents[2]
+        server_path = loaded_root / "agent" / "governance" / "server.py"
+        server_sha = "sha256:" + hashlib.sha256(server_path.read_bytes()).hexdigest()
+        return {
+            "loaded_pid": os.getpid(),
+            "loaded_commit": current_commit,
+            "worktree_head_version": current_commit,
+            "loaded_source_path": str(server_path),
+            "loaded_source_sha256": server_sha,
+            "worktree_source_sha256": server_sha,
+            "runtime_stale": False,
+            "runtime_stale_reasons": [],
+        }
+
+    monkeypatch.setattr(
+        db, "_current_dev_loaded_runtime_identity", loaded_runtime_identity,
+    )
     storage = tmp_path / "dev-storage"
     adoption_dir = storage / "archive" / "canonical-legacy-postimage-adoption"
     adoption_dir.mkdir(parents=True)
@@ -2254,49 +2329,154 @@ def test_current_cow_source_requires_clean_strict_same_root_descendant(
     }}}
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
-    if drift == "non_descendant":
-        unrelated = subprocess.run(
-            ["git", "commit-tree", "HEAD^{tree}", "-m", "unrelated"],
-            cwd=source_root, capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        anchor["commit"] = unrelated
-        adoption_payload["candidate_source_identity"] = anchor
-        adoption_raw = json.dumps(
-            adoption_payload, sort_keys=True, separators=(",", ":")
-        ).encode()
-        adoption.unlink()
-        adoption = adoption_dir / (
-            f"adoption.{hashlib.sha256(adoption_raw).hexdigest()}.json"
-        )
-        adoption.write_bytes(adoption_raw)
-        receipt["history"]["adoption"] = {
-            "path": str(adoption),
-            "sha256": "sha256:" + hashlib.sha256(adoption_raw).hexdigest(),
-        }
     conn.executemany("INSERT INTO schema_meta VALUES (?,?)", [
-        ("governance_world_source_tip_json", json.dumps(current)),
-        ("governance_world_source_tip_sha256", db._world_source_tip_hash(current)),
+        ("governance_world_source_tip_json", json.dumps(historical)),
+        ("governance_world_source_tip_sha256", db._world_source_tip_hash(historical)),
         ("governance_world_source_tip_revision", "3"),
     ])
     conn.commit()
+    stable = tmp_path / "stable-volume"
+    stable.mkdir()
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(storage))
+    monkeypatch.setattr(
+        db, "verified_stable_database_binding",
+        lambda: {"shared_volume_path": str(stable)},
+    )
+    return db, conn, storage, receipt, historical, current
+
+
+def test_current_dev_loaded_runtime_identity_requires_preloaded_server_without_import(
+    monkeypatch,
+):
+    from agent.governance import db
+
+    monkeypatch.delitem(sys.modules, "agent.governance.server", raising=False)
+
+    with pytest.raises(ValueError, match="loaded runtime identity is unavailable"):
+        db._current_dev_loaded_runtime_identity("a" * 40)
+
+    assert "agent.governance.server" not in sys.modules
+
+
+def test_current_cow_source_accepts_clean_canonical_descendant_of_historical_tip(
+    tmp_path, monkeypatch,
+):
+    db, conn, storage, receipt, historical, current = (
+        _current_cow_historical_tip_fixture(tmp_path, monkeypatch)
+    )
+    before = conn.iterdump()
+    before = tuple(before)
+    old_root = Path(historical["root"])
+    assert subprocess.run(
+        ["git", "branch", "--show-current"], cwd=old_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == "codex/deferred-completed"
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=old_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == "M agent/cli.py"
+
+    db._verify_current_cow_successor_source(conn, storage, receipt)
+
+    assert tuple(conn.iterdump()) == before
+    assert json.loads(conn.execute(
+        "SELECT value FROM schema_meta "
+        "WHERE key='governance_world_source_tip_json'"
+    ).fetchone()[0]) == historical
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=current["root"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == current["commit"]
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "dirty", "non_descendant", "current_source_hash", "historical_source_hash",
+        "stable_branch", "foreign_object_store", "loaded_path", "loaded_runtime",
+    ),
+)
+def test_current_cow_source_rejects_untrusted_live_descendant_zero_write(
+    tmp_path, monkeypatch, drift,
+):
+    db, conn, storage, receipt, historical, current = (
+        _current_cow_historical_tip_fixture(tmp_path, monkeypatch)
+    )
+    current_root = Path(current["root"])
     if drift == "dirty":
-        (source_root / "untracked-drift.txt").write_text("dirty\n")
-    if drift == "cli_hash":
-        current["source_sha256"] = "sha256:" + "7" * 64
+        (current_root / "untracked-drift.txt").write_text("dirty\n")
+    elif drift == "non_descendant":
+        unrelated = subprocess.run(
+            ["git", "commit-tree", "HEAD^{tree}", "-m", "unrelated"],
+            cwd=current_root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", "refs/heads/codex/ac-dev", unrelated,
+             current["commit"]], cwd=current_root, check=True,
+        )
+    elif drift == "current_source_hash":
+        original = db._current_first_start_source
+
+        def mismatched_current(root):
+            return {**original(root), "cli_sha256": "sha256:" + "7" * 64}
+
+        monkeypatch.setattr(db, "_current_first_start_source", mismatched_current)
+    elif drift == "historical_source_hash":
+        historical["source_sha256"] = "sha256:" + "8" * 64
         conn.execute(
             "UPDATE schema_meta SET value=? WHERE key='governance_world_source_tip_json'",
-            (json.dumps(current),),
+            (json.dumps(historical),),
         )
         conn.execute(
             "UPDATE schema_meta SET value=? WHERE key='governance_world_source_tip_sha256'",
-            (db._world_source_tip_hash(current),),
+            (db._world_source_tip_hash(historical),),
         )
         conn.commit()
-    if drift is None:
-        db._verify_current_cow_successor_source(conn, storage, receipt)
+    elif drift == "stable_branch":
+        subprocess.run(
+            ["git", "branch", "-m", "codex/stable"], cwd=current_root,
+            check=True, capture_output=True,
+        )
+    elif drift == "foreign_object_store":
+        foreign = tmp_path / "foreign-source"
+        subprocess.run(
+            ["git", "clone", "--no-local", str(current_root), str(foreign)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-B", "codex/ac-dev", current["commit"]],
+            cwd=foreign, check=True, capture_output=True,
+        )
+        monkeypatch.setattr(
+            db, "__file__", str(foreign / "agent" / "governance" / "db.py")
+        )
+    elif drift == "loaded_path":
+        monkeypatch.setattr(
+            db, "__file__", str(current_root / "agent" / "governance" / "server.py")
+        )
     else:
-        with pytest.raises(ValueError):
-            db._verify_current_cow_successor_source(conn, storage, receipt)
+        monkeypatch.setattr(
+            db, "_current_dev_loaded_runtime_identity",
+            lambda commit: {
+                "loaded_pid": os.getpid(),
+                "loaded_commit": historical["commit"],
+                "worktree_head_version": commit,
+                "loaded_source_path": str(
+                    current_root / "agent" / "governance" / "server.py"
+                ),
+                "loaded_source_sha256": "sha256:" + "9" * 64,
+                "worktree_source_sha256": "sha256:" + "9" * 64,
+                "runtime_stale": True,
+                "runtime_stale_reasons": ["worktree_head_moved"],
+            },
+        )
+    before = tuple(conn.iterdump())
+
+    with pytest.raises(ValueError):
+        db._verify_current_cow_successor_source(conn, storage, receipt)
+
+    assert tuple(conn.iterdump()) == before
     conn.close()
 
 

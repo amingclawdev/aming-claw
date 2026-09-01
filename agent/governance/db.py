@@ -372,45 +372,131 @@ def _unknown_graph_activation_connection(reason: str) -> dict[str, object]:
     return {**graph_activation_policy("unknown"), "classification_reason": reason}
 
 
+def _current_dev_loaded_runtime_identity(
+    current_commit: str,
+) -> dict[str, object]:
+    """Reuse the server's frozen-at-import identity for the running process."""
+
+    server = sys.modules.get("agent.governance.server")
+    identity = getattr(server, "governance_loaded_runtime_identity", None)
+    if server is None or not callable(identity):
+        raise ValueError("AC dev loaded runtime identity is unavailable")
+    return dict(identity(current_commit))
+
+
+def _validate_dev_cow_historical_source_provenance(
+    *, root: Path, receipt: Mapping[str, object],
+    historical_tip: Mapping[str, object], stored_tip_sha256: str,
+    current_source: Mapping[str, object], strict_current_descendant: bool,
+) -> None:
+    """Validate one immutable adoption -> historical tip -> current chain."""
+
+    adoption_ref = dict(dict(receipt.get("history") or {}).get("adoption") or {})
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    anchor = dict(adoption.get("candidate_source_identity") or {})
+    if (
+        adoption_path.parent
+        != root / "archive" / "canonical-legacy-postimage-adoption"
+        or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
+        or stored_tip_sha256 != _world_source_tip_hash(historical_tip)
+        or str(anchor.get("root") or "")
+        != str(historical_tip.get("root") or "")
+        or str(anchor.get("commit") or "")
+        == str(historical_tip.get("commit") or "")
+        or (
+            strict_current_descendant
+            and str(historical_tip.get("commit") or "")
+            == str(current_source.get("commit") or "")
+        )
+    ):
+        raise ValueError("AC dev COW historical source provenance mismatch")
+    _validate_dev_source_tip_custody(
+        historical_tip,
+        stored_sha256=stored_tip_sha256,
+        candidate=current_source,
+        historical_worktree_advisory=True,
+    )
+    candidate_root = Path(str(current_source.get("root") or ""))
+    anchor_ancestry = subprocess.run(
+        [
+            "git", "merge-base", "--is-ancestor",
+            str(anchor.get("commit") or ""),
+            str(historical_tip.get("commit") or ""),
+        ],
+        cwd=candidate_root,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if anchor_ancestry.returncode != 0:
+        raise ValueError("AC dev COW adoption source is not an ancestor")
+
+
 def _verify_current_cow_successor_source(
     conn: sqlite3.Connection, root: Path, successor_receipt: Mapping[str, object],
 ) -> None:
     """Bind immutable adoption history to the clean current canonical descendant."""
 
-    adoption_ref = dict(
-        dict(successor_receipt.get("history") or {}).get("adoption") or {}
-    )
-    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
-    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
-    anchor = dict(adoption.get("candidate_source_identity") or {})
     meta = dict(conn.execute(
         "SELECT key,value FROM schema_meta WHERE key IN "
         "('governance_world_source_tip_json','governance_world_source_tip_sha256',"
         "'governance_world_source_tip_revision')"
     ))
     try:
-        current = json.loads(str(meta.get("governance_world_source_tip_json") or ""))
+        historical = json.loads(
+            str(meta.get("governance_world_source_tip_json") or "")
+        )
         revision = int(meta.get("governance_world_source_tip_revision") or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("AC dev COW current source tip is invalid") from exc
-    if not isinstance(current, Mapping):
+    if not isinstance(historical, Mapping):
         raise ValueError("AC dev COW current source tip is invalid")
+    try:
+        loaded_database_source = Path(__file__).resolve(strict=True)
+        loaded_root = loaded_database_source.parents[2]
+        current_source = _current_first_start_source(loaded_root)
+    except (IndexError, OSError, ValueError) as exc:
+        raise ValueError("AC dev COW current source checkout is invalid") from exc
+    if loaded_database_source != loaded_root / "agent" / "governance" / "db.py":
+        raise ValueError("AC dev COW loaded source path is not canonical")
+    current = {
+        "root": current_source["root"],
+        "branch": current_source["branch"],
+        "commit": current_source["commit"],
+        "source_sha256": current_source["cli_sha256"],
+    }
+    loaded_runtime = _current_dev_loaded_runtime_identity(current["commit"])
+    current_server_source = loaded_root / "agent" / "governance" / "server.py"
     if (
-        adoption_path.parent
-        != root / "archive" / "canonical-legacy-postimage-adoption"
-        or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
-        or revision < 2
-        or meta.get("governance_world_source_tip_sha256")
-        != _world_source_tip_hash(current)
-        or str(anchor.get("root") or "") != str(current.get("root") or "")
-        or str(anchor.get("commit") or "") == str(current.get("commit") or "")
+        loaded_runtime.get("loaded_pid") != os.getpid()
+        or str(loaded_runtime.get("loaded_commit") or "").lower()
+        != current["commit"]
+        or str(loaded_runtime.get("worktree_head_version") or "").lower()
+        != current["commit"]
+        or loaded_runtime.get("loaded_source_path") != str(current_server_source)
+        or loaded_runtime.get("loaded_source_sha256")
+        != current_source["server_sha256"]
+        or loaded_runtime.get("worktree_source_sha256")
+        != current_source["server_sha256"]
+        or loaded_runtime.get("runtime_stale") is not False
+        or loaded_runtime.get("runtime_stale_reasons") != []
+    ):
+        raise ValueError("AC dev COW loaded/current runtime source mismatch")
+    if (
+        revision < 2
     ):
         raise ValueError("AC dev COW current source descendant authority mismatch")
-    _validate_dev_source_tip_custody(
-        current, stored_sha256=str(meta.get("governance_world_source_tip_sha256") or ""),
-        candidate=current,
+    _validate_dev_cow_historical_source_provenance(
+        root=root,
+        receipt=successor_receipt,
+        historical_tip=historical,
+        stored_tip_sha256=str(
+            meta.get("governance_world_source_tip_sha256") or ""
+        ),
+        current_source=current,
+        strict_current_descendant=True,
     )
-    _verify_dev_source_upgrade(anchor, current)
 
 
 def _quick_check_returns_literal_ok(conn: sqlite3.Connection) -> bool:
@@ -5143,8 +5229,6 @@ def _validated_dev_cow_completed_generation_axis(
         or meta.get("governance_world_id") != AC_DEV_WORLD_ID
         or revision < 2 or not isinstance(tip, Mapping)
         or not isinstance(process, Mapping)
-        or meta.get("governance_world_source_tip_sha256")
-        != _world_source_tip_hash(tip)
         or len(inventory["inventory"]) != 308
         or inventory != authority_projection_schema_inventory()
         or backlog_read_schema_managed_inventory(conn)
@@ -5153,27 +5237,13 @@ def _validated_dev_cow_completed_generation_axis(
         != dict(successor.get("protected_inventory") or {})
     ):
         raise ValueError("AC dev COW completed generation projection mismatch")
-    adoption_ref = dict(history.get("adoption") or {})
-    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
-    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
-    if adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}:
-        raise ValueError("AC dev COW completed generation custody history mismatch")
-    anchor = dict(adoption.get("candidate_source_identity") or {})
-    if (str(anchor.get("root") or "") != str(tip.get("root") or "")
-            or str(anchor.get("commit") or "") == str(tip.get("commit") or "")):
-        raise ValueError("AC dev COW completed generation historical tip is not closed")
-    candidate_root = Path(str(source_identity.get("root") or ""))
-    anchor_ancestry = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", str(anchor.get("commit") or ""),
-         str(tip.get("commit") or "")],
-        cwd=candidate_root, capture_output=True,
-        timeout=10, check=False,
-    )
-    if anchor_ancestry.returncode != 0:
-        raise ValueError("AC dev COW completed generation historical tip is not an ancestor")
-    _validate_dev_source_tip_custody(
-        tip, stored_sha256=meta["governance_world_source_tip_sha256"],
-        candidate=source_identity, historical_worktree_advisory=True,
+    _validate_dev_cow_historical_source_provenance(
+        root=root,
+        receipt=receipt,
+        historical_tip=tip,
+        stored_tip_sha256=meta["governance_world_source_tip_sha256"],
+        current_source=source_identity,
+        strict_current_descendant=False,
     )
     _validate_dev_cow_completed_process_axis(
         process, root=root, source_identity=source_identity,
