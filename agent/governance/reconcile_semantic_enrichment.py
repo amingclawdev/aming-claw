@@ -133,6 +133,14 @@ CREATE INDEX IF NOT EXISTS idx_graph_semantic_jobs_status
 
 
 def _ensure_semantic_state_schema(conn: sqlite3.Connection) -> None:
+    from . import db
+
+    if db.dev_runtime_verify_only():
+        if db.graph_materialization_admission_active(conn):
+            db.execute_graph_schema_sql(conn, SEMANTIC_STATE_SCHEMA_SQL)
+            return
+        db.verify_semantic_state_schema(conn)
+        return
     conn.executescript(SEMANTIC_STATE_SCHEMA_SQL)
     _ensure_semantic_timeline_columns(conn)
     _ensure_semantic_jobs_claim_columns(conn)

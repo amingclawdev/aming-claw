@@ -1090,6 +1090,22 @@ def _graph_schema_owner_registry(
     )
 
 
+def _semantic_state_schema_inventory() -> list[tuple[str, str, str, str]]:
+    """Build the distinct post-structural semantic inventory from source SQL."""
+
+    from .reconcile_semantic_enrichment import SEMANTIC_STATE_SCHEMA_SQL
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        execute_graph_schema_sql(canonical, SEMANTIC_STATE_SCHEMA_SQL)
+        return [
+            row for row in _graph_materialization_inventory(canonical)
+            if row[1] != "sqlite_sequence"
+        ]
+    finally:
+        canonical.close()
+
+
 _GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING = frozenset(
     {"idx_pending_scope_branch", "idx_pending_scope_status"}
 )
@@ -1107,6 +1123,9 @@ def classify_graph_materialization_preimage(
 
     actual = _graph_materialization_inventory(conn)
     registry = _graph_schema_owner_registry()
+    semantic = _semantic_state_schema_inventory()
+    semantic_names = {row[1] for row in semantic}
+    semantic_tables = {row[2] for row in semantic if row[0] == "table"}
     known_names: set[str] = set()
     known_tables: set[str] = set()
     owner_states: dict[str, str] = {}
@@ -1146,6 +1165,8 @@ def classify_graph_materialization_preimage(
         if (row[1].startswith("graph_") or row[2].startswith("graph_"))
         and row[1] not in known_names
         and row[2] not in known_tables
+        and row[1] not in semantic_names
+        and row[2] not in semantic_tables
     ]
     if unknown:
         raise ValueError("AC dev graph materialization preimage has unknown graph authority")
@@ -1164,6 +1185,74 @@ def _graph_materialization_managed_inventory(
     names = {row[1] for row in canonical}
     tables = {row[2] for row in canonical if row[0] == "table"}
     return [row for row in inventory if row[1] in names or row[2] in tables]
+
+
+def classify_semantic_state_schema(conn: sqlite3.Connection) -> dict[str, object]:
+    """Classify the source-owned post-structural semantic schema read-only."""
+
+    canonical = _semantic_state_schema_inventory()
+    actual = _graph_materialization_inventory(conn)
+    managed = _graph_materialization_managed_inventory(
+        actual, canonical,
+    )
+    canonical_names = {row[1] for row in canonical}
+    canonical_tables = {row[2] for row in canonical if row[0] == "table"}
+    structural = _graph_materialization_canonical_inventory()
+    structural_names = {row[1] for row in structural}
+    structural_tables = {row[2] for row in structural if row[0] == "table"}
+    unknown = [
+        row for row in actual
+        if (row[1].startswith("graph_semantic_")
+            or row[2].startswith("graph_semantic_"))
+        and row[1] not in canonical_names
+        and row[2] not in canonical_tables
+        and row[1] not in structural_names
+        and row[2] not in structural_tables
+    ]
+    if unknown:
+        raise ValueError("AC dev semantic state schema has unknown authority")
+    if not managed:
+        state = "absent"
+    elif managed == canonical:
+        state = "exact"
+    else:
+        raise ValueError("AC dev semantic state schema is not absent or exact")
+    return {
+        "schema_version": "ac_dev_semantic_state_schema_preimage.v1",
+        "owner_state": state,
+        "planned_objects": [row[1] for row in canonical] if state == "absent" else [],
+    }
+
+
+def verify_semantic_state_schema(conn: sqlite3.Connection) -> None:
+    """Require the exact semantic state owner without issuing DDL."""
+
+    try:
+        classification = classify_semantic_state_schema(conn)
+    except ValueError as exc:
+        raise DevRuntimeSchemaVerificationError(
+            "semantic_state",
+            component_diagnostics={
+                "semantic_state": {
+                    "status": "preimage_incompatible",
+                    "public_safe": True,
+                }
+            },
+        ) from exc
+    if classification["owner_state"] != "exact":
+        raise DevRuntimeSchemaVerificationError(
+            "semantic_state",
+            owner_states={"semantic_state": str(classification["owner_state"])},
+            planned_objects=list(classification["planned_objects"]),
+            component_diagnostics={
+                "semantic_state": {
+                    "status": "incompatible",
+                    "owner_state": str(classification["owner_state"]),
+                    "planned_objects": list(classification["planned_objects"]),
+                    "public_safe": True,
+                }
+            },
+        )
 
 
 def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
@@ -1242,6 +1331,7 @@ def admit_ac_dev_graph_materialization_schema(
     # or applies the one bounded snapshot predecessor.  Other partial,
     # altered, extra, or legacy layouts cannot be laundered by IF NOT EXISTS.
     classify_graph_materialization_preimage(conn)
+    classify_semantic_state_schema(conn)
     connection_ids = set(
         getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
     )
@@ -1263,6 +1353,15 @@ def admit_ac_dev_graph_materialization_schema(
                 for owner in required
             ):
                 raise ValueError("AC dev graph materialization schema postcondition failed")
+            semantic_preimage = classify_semantic_state_schema(conn)
+            if semantic_preimage["owner_state"] == "absent":
+                from .reconcile_semantic_enrichment import (
+                    _ensure_semantic_state_schema,
+                )
+
+                _ensure_semantic_state_schema(conn)
+            if classify_semantic_state_schema(conn)["owner_state"] != "exact":
+                raise ValueError("AC dev semantic state schema postcondition failed")
             conn.commit()
     except BaseException:
         conn.rollback()
@@ -3746,7 +3845,7 @@ def backlog_read_schema_protected_inventory(conn: sqlite3.Connection) -> dict[st
 def _completed_generation_schema_projections(
     conn: sqlite3.Connection,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Project an exact graph overlay out of completed-generation bindings."""
+    """Project exact structural and semantic overlays out of generation bindings."""
 
     authority = _authority_projection_inventory_in_managed_world(conn)
     protected = backlog_read_schema_protected_inventory(conn)
@@ -3765,19 +3864,35 @@ def _completed_generation_schema_projections(
         or set(owner_states) != required_owners
     ):
         raise ValueError("AC dev graph materialization owner registry mismatch")
-    if any(owner_states[owner] != "exact" for owner in required_owners):
+    semantic = classify_semantic_state_schema(conn)
+    graph_exact = all(
+        owner_states[owner] == "exact" for owner in required_owners
+    )
+    semantic_exact = semantic["owner_state"] == "exact"
+    if semantic_exact and not graph_exact:
+        raise ValueError(
+            "AC dev completed generation semantic schema requires exact graph owners"
+        )
+    if not graph_exact:
         return authority, protected
 
-    canonical_graph_rows = {
-        (kind, name, table, _backlog_read_normalized_sql(sql))
-        for _owner, _ensure_schema, inventory in registry
-        for kind, name, table, sql in inventory
-    }
+    overlay_rows: set[tuple[str, str, str, str]] = set()
+    if graph_exact:
+        overlay_rows.update(
+            (kind, name, table, _backlog_read_normalized_sql(sql))
+            for _owner, _ensure_schema, inventory in registry
+            for kind, name, table, sql in inventory
+        )
+    if semantic_exact:
+        overlay_rows.update(
+            (kind, name, table, _backlog_read_normalized_sql(sql))
+            for kind, name, table, sql in _semantic_state_schema_inventory()
+        )
     canonical_authority_rows = {
         tuple(str(value) for value in row)
         for row in authority_projection_schema_inventory()["inventory"]
     }
-    additive_rows = canonical_graph_rows - canonical_authority_rows
+    additive_rows = overlay_rows - canonical_authority_rows
     authority_rows = tuple(
         tuple(str(value) for value in row) for row in authority["inventory"]
     )
@@ -3945,6 +4060,9 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     managed_autoindex = "sqlite_autoindex_dashboard_backlog_cache_generation_1"
     graph_classification = classify_graph_materialization_preimage(conn)
     graph_registry = _graph_schema_owner_registry()
+    semantic_classification = classify_semantic_state_schema(conn)
+    semantic_inventory = _semantic_state_schema_inventory()
+    semantic_exact = semantic_classification["owner_state"] == "exact"
     graph_owner_states = graph_classification.get("owner_states")
     owner_state_values = (
         [
@@ -3958,6 +4076,11 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         owner_state_values
         and all(state == "exact" for state in owner_state_values)
     )
+    if semantic_exact and not graph_overlay_exact:
+        raise ValueError(
+            "AC dev source schema inventory mismatch: "
+            "semantic state requires all graph owners SQL-exact"
+        )
     graph_known_names = {
         row[1]
         for _owner, _ensure_schema, canonical in graph_registry
@@ -3997,6 +4120,15 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         name for kind, name, _table, _sql in graph_exact_inventory
         if kind == "table"
     }
+    semantic_exact_objects = {
+        (kind, name, table)
+        for kind, name, table, _sql in semantic_inventory
+        if semantic_exact
+    }
+    semantic_exact_tables = {
+        name for kind, name, _table, _sql in semantic_inventory
+        if semantic_exact and kind == "table"
+    }
     # This exception is deliberately all-or-nothing: the SQL-bearing five
     # objects must equal the source plan before *only* their exact namespace
     # can be removed from the baseline source-inventory comparison.
@@ -4015,6 +4147,7 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     unknown = sorted(
         (actual - allowed)
         - graph_exact_tables
+        - semantic_exact_tables
         - ({managed_table} if managed_exact else set())
     )
     missing = sorted(required - actual)
@@ -4026,6 +4159,7 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             - source_objects
             - accepted_overlay
             - graph_exact_objects
+            - semantic_exact_objects
         )
         if not (item[0] in {"table", "index"} and item[2] in optional)
     )

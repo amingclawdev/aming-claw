@@ -19,6 +19,116 @@ def conn(tmp_path):
     c.close()
 
 
+def test_batch_schema_is_already_base_owned_and_source_exact():
+    from agent.governance import db
+
+    source = db._migration_capable_source_schema_memory()
+    canonical = sqlite3.connect(":memory:")
+    try:
+        canonical.executescript(bm.BATCH_MEMORY_SCHEMA_SQL)
+        source_rows = tuple(
+            row for row in db._sqlite_master_inventory(source)
+            if row[1] == "reconcile_batch_memory"
+            or row[2] == "reconcile_batch_memory"
+        )
+        canonical_rows = tuple(
+            row for row in db._sqlite_master_inventory(canonical)
+            if row[1] == "reconcile_batch_memory"
+            or row[2] == "reconcile_batch_memory"
+        )
+    finally:
+        source.close()
+        canonical.close()
+
+    assert source_rows == canonical_rows
+    assert len(source_rows) == 4
+    authority = {
+        tuple(row) for row in db.authority_projection_schema_inventory()["inventory"]
+    }
+    assert set(source_rows).issubset(authority)
+
+
+def test_batch_schema_dev_exact_is_no_ddl_no_commit_and_allows_dml(monkeypatch):
+    from agent.governance import db
+
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    connection.commit()
+    statements = []
+    connection.set_trace_callback(statements.append)
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    connection.execute("BEGIN")
+
+    bm.ensure_schema(connection)
+    connection.execute(
+        "INSERT INTO reconcile_batch_memory "
+        "(project_id,batch_id,created_at,updated_at) VALUES('p','b','now','now')"
+    )
+
+    assert connection.in_transaction is True
+    assert not any(
+        statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "COMMIT"))
+        for statement in statements
+    )
+    assert connection.execute(
+        "SELECT COUNT(*) FROM reconcile_batch_memory"
+    ).fetchone()[0] == 1
+    connection.rollback()
+    connection.close()
+
+
+@pytest.mark.parametrize("state", ["missing", "altered"])
+def test_batch_schema_dev_missing_or_altered_is_typed_zero_write(
+    monkeypatch, state,
+):
+    from agent.governance import db
+
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    if state == "altered":
+        _ensure_schema(connection)
+        connection.execute("DROP INDEX idx_reconcile_batch_memory_status")
+        connection.execute(
+            "CREATE INDEX idx_reconcile_batch_memory_status "
+            "ON reconcile_batch_memory(project_id, session_id)"
+        )
+        connection.commit()
+    before = db._sqlite_master_inventory(connection)
+    changes = connection.total_changes
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    with pytest.raises(db.DevRuntimeSchemaVerificationError):
+        bm.ensure_schema(connection)
+
+    assert connection.total_changes == changes
+    assert db._sqlite_master_inventory(connection) == before
+    connection.close()
+
+
+def test_batch_schema_stable_preserves_legacy_executescript_and_commit(monkeypatch):
+    from agent.governance import db
+
+    calls = []
+
+    class StableConnection:
+        row_factory = None
+
+        def executescript(self, sql):
+            calls.append(("script", sql))
+
+        def commit(self):
+            calls.append(("commit", None))
+
+    monkeypatch.setattr(db, "dev_runtime_verify_only", lambda: False)
+    connection = StableConnection()
+
+    bm.ensure_schema(connection)
+
+    assert connection.row_factory is sqlite3.Row
+    assert calls == [("script", bm.BATCH_MEMORY_SCHEMA_SQL), ("commit", None)]
+
+
 def test_create_or_get_batch_initializes_memory(conn):
     batch = bm.create_or_get_batch(
         conn,

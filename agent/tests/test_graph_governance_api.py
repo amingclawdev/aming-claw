@@ -208102,13 +208102,13 @@ def test_dev_direct_onboard_preserves_later_contract_runtime_action(
     ]["line_id"]
 
 
-def test_dev_graph_bootstrap_new_head_identity_leaves_b977_failure_immutable(
+def test_dev_graph_bootstrap_new_head_identity_leaves_a348_failure_immutable(
     conn,
     monkeypatch,
     tmp_path,
 ):
-    old_commit = "b977cae94bf454d0ca4d809374dc546040c59ac4"
-    new_commit = "c05da96f88f107298453fae815215d1768e095c1"
+    old_commit = "a3484681de9e823e98b160d7ed67928d32dbb524"
+    new_commit = "d47c71c07d843eac18d5aebfbe9b98dcdf0b8c81"
     old_run_id = "current-full-" + old_commit[:7]
     old_snapshot_id = server._current_full_deterministic_snapshot_id(old_commit)
     claim = store.acquire_current_full_build_claim(
@@ -208117,10 +208117,10 @@ def test_dev_graph_bootstrap_new_head_identity_leaves_b977_failure_immutable(
         run_id=old_run_id,
         snapshot_id=old_snapshot_id,
         commit_sha=old_commit,
-        manager_epoch="old-b977-generation",
+        manager_epoch="old-a348-generation",
         manager_pid=4242,
         manager_started_at="2026-09-01T00:00:00Z",
-        manager_start_identity="old-b977-manager",
+        manager_start_identity="old-a348-manager",
         metric_evidence={"idempotency_scope": {}},
         created_at="2026-09-01T00:00:00Z",
     )
@@ -208132,7 +208132,7 @@ def test_dev_graph_bootstrap_new_head_identity_leaves_b977_failure_immutable(
         snapshot_id=old_snapshot_id,
         commit_sha=old_commit,
         terminal_status="failed",
-        manager_start_identity="old-b977-manager",
+        manager_start_identity="old-a348-manager",
         metric_evidence={
             "phase": "candidate_materialization_failed",
             "idempotency_scope": {},

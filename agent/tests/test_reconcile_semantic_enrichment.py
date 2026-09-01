@@ -13,6 +13,7 @@ from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
 from agent.governance.reconcile_semantic_enrichment import (
     NODE_SEMANTIC_SELF_CHECK_RULES,
+    SEMANTIC_STATE_SCHEMA_SQL,
     _aggregate_chunked_semantic_response,
     _batch_key,
     _carry_forward_semantic_graph_state,
@@ -32,6 +33,84 @@ from agent.governance.db import _ensure_schema
 
 
 PID = "semantic-enrichment-test"
+
+
+def test_semantic_schema_dev_exact_is_no_ddl_and_allows_dml(monkeypatch):
+    from agent.governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db.execute_graph_schema_sql(conn, SEMANTIC_STATE_SCHEMA_SQL)
+    conn.commit()
+    statements = []
+    conn.set_trace_callback(statements.append)
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    conn.execute("BEGIN")
+
+    _ensure_semantic_state_schema(conn)
+    conn.execute(
+        "INSERT INTO graph_semantic_nodes(project_id,snapshot_id,node_id) "
+        "VALUES('p','s','n')"
+    )
+
+    assert conn.in_transaction is True
+    assert not any(
+        statement.lstrip().upper().startswith(("CREATE ", "ALTER "))
+        for statement in statements
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_semantic_nodes"
+    ).fetchone()[0] == 1
+    conn.rollback()
+    conn.close()
+
+
+def test_semantic_schema_dev_missing_is_typed_and_zero_write(monkeypatch):
+    from agent.governance import db
+
+    conn = sqlite3.connect(":memory:")
+    before = db._graph_materialization_inventory(conn)
+    changes = conn.total_changes
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    with pytest.raises(db.DevRuntimeSchemaVerificationError):
+        _ensure_semantic_state_schema(conn)
+
+    assert conn.total_changes == changes
+    assert db._graph_materialization_inventory(conn) == before
+    conn.close()
+
+
+def test_semantic_schema_stable_preserves_legacy_script_and_alter_flow(monkeypatch):
+    from agent.governance import db
+    from agent.governance import reconcile_semantic_enrichment as semantic
+
+    calls = []
+
+    class StableConnection:
+        def executescript(self, sql):
+            calls.append(("script", sql))
+
+    monkeypatch.setattr(db, "dev_runtime_verify_only", lambda: False)
+    monkeypatch.setattr(
+        semantic,
+        "_ensure_semantic_timeline_columns",
+        lambda conn: calls.append(("timeline", conn)),
+    )
+    monkeypatch.setattr(
+        semantic,
+        "_ensure_semantic_jobs_claim_columns",
+        lambda conn: calls.append(("claims", conn)),
+    )
+    connection = StableConnection()
+
+    semantic._ensure_semantic_state_schema(connection)
+
+    assert calls == [
+        ("script", semantic.SEMANTIC_STATE_SCHEMA_SQL),
+        ("timeline", connection),
+        ("claims", connection),
+    ]
 
 
 def test_semantic_batch_key_prefers_hierarchy_parent_for_feature_groups():

@@ -152,8 +152,12 @@ def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(mo
             "asset_impact",
         ]
         assert set(owner_states.values()) == {"exact"}
-        assert [row for row in inventory if row[1] != "sqlite_sequence"] == (
-            db._graph_materialization_canonical_inventory()
+        canonical_graph = db._graph_materialization_canonical_inventory()
+        assert db._graph_materialization_managed_inventory(
+            inventory, canonical_graph,
+        ) == canonical_graph
+        assert db.classify_semantic_state_schema(conn)["owner_state"] == (
+            "exact"
         )
         changes = conn.total_changes
         for ensure_schema in (
@@ -169,6 +173,87 @@ def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(mo
         assert first == second
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "state", ["absent", "exact", "partial", "altered", "extra"],
+)
+def test_semantic_state_schema_classifier_and_typed_verifier_are_zero_write(state):
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    if state != "absent":
+        db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+        if state == "partial":
+            conn.execute("DROP INDEX idx_graph_semantic_nodes_status")
+        elif state == "altered":
+            conn.execute("DROP INDEX idx_graph_semantic_nodes_status")
+            conn.execute(
+                "CREATE INDEX idx_graph_semantic_nodes_status "
+                "ON graph_semantic_nodes(project_id, status)"
+            )
+        elif state == "extra":
+            conn.execute(
+                "CREATE TABLE graph_semantic_unknown_owner(value TEXT)"
+            )
+        conn.commit()
+    before = db._graph_materialization_inventory(conn)
+    changes = conn.total_changes
+
+    if state in {"absent", "exact"}:
+        classification = db.classify_semantic_state_schema(conn)
+        assert classification["owner_state"] == state
+        if state == "exact":
+            assert len([row for row in before if row[0] == "table"]) == 3
+            assert len([row for row in before if row[0] == "index"]) == 6
+            db.verify_semantic_state_schema(conn)
+        else:
+            with pytest.raises(db.DevRuntimeSchemaVerificationError):
+                db.verify_semantic_state_schema(conn)
+    else:
+        with pytest.raises(db.DevRuntimeSchemaVerificationError):
+            db.verify_semantic_state_schema(conn)
+
+    assert conn.total_changes == changes
+    assert db._graph_materialization_inventory(conn) == before
+    conn.close()
+
+
+def test_dev_world_rejects_semantic_exact_without_exact_graph_zero_write():
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    conn = db._migration_capable_source_schema_memory()
+    db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+    conn.commit()
+    before = db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+
+    with pytest.raises(ValueError, match="semantic state requires all graph owners"):
+        db._verify_dev_world_schema_inventory(conn)
+
+    assert conn.total_changes == changes
+    assert db._sqlite_master_inventory(conn) == before
+    conn.close()
+
+
+def test_completed_projection_rejects_semantic_exact_without_exact_graph_zero_write():
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    conn = db._migration_capable_source_schema_memory()
+    for statement in db._authority_projection_schema_statements():
+        conn.execute(statement)
+    db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+    conn.commit()
+    before = db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+
+    with pytest.raises(ValueError, match="semantic schema requires exact graph owners"):
+        db._completed_generation_schema_projections(conn)
+
+    assert conn.total_changes == changes
+    assert db._sqlite_master_inventory(conn) == before
+    conn.close()
 
 
 def _install_graph_owner_for_preimage_test(db, conn, ensure_schema):
@@ -522,6 +607,103 @@ def test_ac_dev_graph_materialization_admission_rolls_back_partial_schema(monkey
     assert conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'graph_%'"
     ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_ac_dev_graph_materialization_admission_rolls_back_semantic_schema(monkeypatch):
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_root_receipt_genesis",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    original = semantic._ensure_semantic_state_schema
+
+    def fail_after_semantic_schema(candidate):
+        original(candidate)
+        raise RuntimeError("semantic admission sentinel")
+
+    monkeypatch.setattr(
+        semantic, "_ensure_semantic_state_schema", fail_after_semantic_schema,
+    )
+    with pytest.raises(RuntimeError, match="semantic admission sentinel"):
+        db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw",
+        )
+
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    conn.close()
+
+
+def test_ac_dev_graph_admission_reclassifies_semantic_race_inside_transaction(
+    monkeypatch,
+):
+    from agent.governance import db
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_root_receipt_genesis",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    original = db.classify_semantic_state_schema
+    calls = 0
+
+    def inject_partial_on_transactional_recheck(candidate):
+        nonlocal calls
+        calls += 1
+        if candidate is conn and calls == 2:
+            candidate.execute(
+                "CREATE TABLE graph_semantic_nodes(project_id TEXT)"
+            )
+        return original(candidate)
+
+    monkeypatch.setattr(
+        db,
+        "classify_semantic_state_schema",
+        inject_partial_on_transactional_recheck,
+    )
+    with pytest.raises(ValueError, match="semantic state schema"):
+        db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw",
+        )
+
+    assert calls == 2
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
     conn.close()
 
 
@@ -4190,10 +4372,11 @@ def test_cow_generation_phase_selector_is_closed_for_first_and_completed(
     ) is db._DevCowGenerationPhase.COMPLETED_GENERATION
 
 
+@pytest.mark.parametrize("semantic_overlay", [False, True])
 def test_cow_completed_generation_accepts_exact_graph_overlay_read_only(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, semantic_overlay,
 ):
-    from agent.governance import db
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
 
     root, database, linked, source, _process, receipt = (
         _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
@@ -4203,6 +4386,10 @@ def test_cow_completed_generation_accepts_exact_graph_overlay_read_only(
     )
     connection = sqlite3.connect(database)
     _install_all_graph_owners_for_inventory_test(db, connection)
+    if semantic_overlay:
+        db.execute_graph_schema_sql(
+            connection, semantic.SEMANTIC_STATE_SCHEMA_SQL,
+        )
     connection.commit()
     connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     changes_before = connection.total_changes
@@ -4211,6 +4398,9 @@ def test_cow_completed_generation_accepts_exact_graph_overlay_read_only(
     assert authority == db.authority_projection_schema_inventory()
     assert len(authority["inventory"]) == db.AC_AUTHORITY_SCHEMA_INVENTORY_COUNT
     assert protected == receipt["successor"]["protected_inventory"]
+    assert db.classify_semantic_state_schema(connection)["owner_state"] == (
+        "exact" if semantic_overlay else "absent"
+    )
     canonical_graph_rows = {
         (kind, name, table, db._backlog_read_normalized_sql(sql))
         for _owner, _ensure_schema, inventory in db._graph_schema_owner_registry()
@@ -5956,14 +6146,15 @@ def test_source_reference_builder_restores_runtime_plane_after_failure(monkeypat
     assert os.environ[db.RUNTIME_PLANE_ENV] == db.DEV_RUNTIME_PLANE
 
 
-def test_dev_schema_inventory_subtracts_only_five_sql_exact_graph_owners_zero_write():
-    from governance import db
+def test_dev_schema_inventory_subtracts_exact_graph_and_semantic_owners_zero_write():
+    from governance import db, reconcile_semantic_enrichment as semantic
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     db._ensure_schema(conn)
     db.admit_missing_backlog_read_schema(conn)
     _install_all_graph_owners_for_inventory_test(db, conn)
+    db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
     conn.commit()
     registry_names = {
         row[1]
