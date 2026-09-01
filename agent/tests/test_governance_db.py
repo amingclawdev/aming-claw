@@ -2384,6 +2384,102 @@ def _write_historical_v1_from_v2(receipt_path):
     return path
 
 
+def _dev_issuance_anchor_receipt_fixture(tmp_path: Path):
+    from agent.governance import db
+
+    root = (tmp_path / "dev-issuance").resolve()
+    adoption_dir = root / "archive" / "canonical-legacy-postimage-adoption"
+    linked_dir = root / "archive" / "schema-admission"
+    successor_dir = root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE
+    for directory in (adoption_dir, linked_dir, successor_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    def write(directory: Path, payload, *, prefix: str = "") -> Path:
+        raw = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+        digest = hashlib.sha256(raw).hexdigest()
+        path = directory / (f"{prefix}.{digest}.json" if prefix else f"{digest}.json")
+        path.write_bytes(raw)
+        return path
+
+    historical_source = {
+        "root": "/source/ac-dev", "branch": "codex/ac-dev",
+        "commit": "1" * 40, "tree": "2" * 40,
+        "source_sha256": "sha256:" + "3" * 64, "dirty": "",
+    }
+    linked = write(linked_dir, {
+        "schema_version": "ac_dev_offline_schema_admission.v3",
+        "stage": "completed", "project_id": "aming-claw", "port": 40008,
+        "root_identity": {"path": str(root), "device": 1, "inode": 2},
+        "source_identity": {"cli_source": historical_source},
+    })
+    linked_digest = hashlib.sha256(linked.read_bytes()).hexdigest()
+    linked.with_suffix(".sha256").write_text(
+        f"sha256:{linked_digest}  {linked.name}\n", encoding="utf-8"
+    )
+    issuance = "8" * 40
+    adoption = write(adoption_dir, {
+        "schema_version": "ac_dev_canonical_legacy_postimage_adoption.v1",
+        "stage": "completed", "project_id": "aming-claw", "port": 40008,
+        "root_identity": {"path": str(root), "device": 1, "inode": 2},
+        "receipt_source_identity": historical_source,
+        "linked_v3_receipt": str(linked),
+        "linked_v3_receipt_sha256": "sha256:" + linked_digest,
+        "readbacks": {"stable_runtime_commit": issuance},
+    }, prefix="adoption")
+    adoption_sha = "sha256:" + hashlib.sha256(adoption.read_bytes()).hexdigest()
+    successor = write(successor_dir, {
+        "schema_version": db.AC_DEV_COW_SUCCESSOR_SCHEMA,
+        "stage": "completed", "project_id": "aming-claw", "port": 40008,
+        "root": str(root),
+        "history": {
+            "adoption": {"path": str(adoption), "sha256": adoption_sha},
+            "linked_v3": {
+                "path": str(linked), "sha256": "sha256:" + linked_digest,
+            },
+        },
+        "stable_binding": {"database": {}, "runtime_commit": None},
+    }, prefix=db.AC_DEV_COW_SUCCESSOR_PREFIX)
+    return root, successor, adoption, linked, issuance
+
+
+def test_dev_issuance_ancestry_anchor_is_exact_receipt_chain_projection(tmp_path):
+    from agent.governance import db
+
+    root, _successor, _adoption, _linked, issuance = (
+        _dev_issuance_anchor_receipt_fixture(tmp_path)
+    )
+
+    assert db.dev_issuance_ancestry_anchor_commit(root) == issuance
+
+
+@pytest.mark.parametrize("tamper", ["successor_anchor", "linked_sidecar", "adoption_duplicate"])
+def test_dev_issuance_ancestry_anchor_fails_closed_on_chain_drift(tmp_path, tamper):
+    from agent.governance import db
+
+    root, successor, adoption, linked, _issuance = (
+        _dev_issuance_anchor_receipt_fixture(tmp_path)
+    )
+    if tamper == "successor_anchor":
+        payload = json.loads(successor.read_text(encoding="utf-8"))
+        payload["stable_binding"]["runtime_commit"] = "f" * 40
+        successor.unlink()
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        successor.with_name(
+            f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json"
+        ).write_bytes(raw)
+    elif tamper == "linked_sidecar":
+        linked.with_suffix(".sha256").write_text("sha256:" + "0" * 64 + "\n")
+    else:
+        adoption.with_name("adoption." + "0" * 64 + ".json").write_text(
+            "{}", encoding="utf-8"
+        )
+
+    with pytest.raises(ValueError, match="AC dev issuance"):
+        db.dev_issuance_ancestry_anchor_commit(root)
+
+
 def _phase_z_cow_prestart_fixture(tmp_path, monkeypatch):
     """Build one real COW successor whose issuance meta is externally sealed."""
     from agent.governance import db

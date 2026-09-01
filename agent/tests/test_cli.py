@@ -57,6 +57,59 @@ def test_dev_create_cow_successor_receipt_delegates_to_db(tmp_path, monkeypatch)
                         "predecessor_backup": backup, "linked_v3_receipt": linked}
 
 
+def test_dev_running_identity_requires_exact_receipt_derived_issuance_anchor(tmp_path):
+    import agent.cli as cli
+
+    candidate = "b" * 40
+    stable = "c" * 40
+    issuance = "a" * 40
+    source = {
+        "root": str(tmp_path), "branch": cli.AC_DEV_BRANCH,
+        "commit": candidate, "source_sha256": "sha256:" + "d" * 64,
+    }
+    database = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw",
+        "device": 1, "inode": 2,
+        "relative_path_sha256": "sha256:" + "1" * 64,
+        "genesis_sha256": "sha256:" + "2" * 64,
+    }
+    plane = {
+        "schema_version": "ac_runtime_plane_identity.v1", "status": "ready",
+        "plane": "dev", "bind_host": "127.0.0.1", "port": 40008,
+        "expected_port": 40008, "pid": 1234, "worktree_root": str(tmp_path),
+        "branch": cli.AC_DEV_BRANCH, "expected_branch": cli.AC_DEV_BRANCH,
+        "commit": candidate, "worktree_dirty": False,
+        "worktree_dirty_files": [], "stable_anchor_commit": stable,
+        "dev_issuance_ancestry_anchor_commit": issuance,
+        "database_identity": database, "world_id": "ac-dev",
+    }
+    health = {
+        "runtime_plane": "dev", "port": 40008, "bind_host": "127.0.0.1",
+        "pid": 1234, "runtime_loaded_version": candidate,
+        "runtime_stale": False, "runtime_plane_identity": plane,
+        "loaded_runtime_identity": {
+            "schema_version": "governance_loaded_runtime_identity.v1",
+            "loaded_commit": candidate, "loaded_pid": 1234,
+            "worktree_head_version": candidate[:12], "runtime_stale": False,
+            "runtime_stale_reasons": [],
+            "loaded_source_sha256": source["source_sha256"],
+            "worktree_source_sha256": source["source_sha256"],
+        },
+    }
+
+    assert cli._dev_running_identity_matches(
+        health, source, stable_anchor_commit=stable,
+        dev_issuance_ancestry_anchor_commit=issuance,
+        dev_database_identity=database,
+    )
+    assert not cli._dev_running_identity_matches(
+        health, source, stable_anchor_commit=stable,
+        dev_issuance_ancestry_anchor_commit="e" * 40,
+        dev_database_identity=database,
+    )
+
+
 class _GovernanceProbeResponse:
     def __init__(self, *, url, body, headers=None, status=200, expected_limit=None):
         self.url = url

@@ -4396,6 +4396,91 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
     return receipt
 
 
+def dev_issuance_ancestry_anchor_commit(storage_root: Path | str) -> str:
+    """Project the frozen dev issuance anchor from its immutable receipt chain."""
+    root = Path(storage_root).expanduser().absolute()
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or root.resolve(strict=True) != root
+    ):
+        raise ValueError("AC dev issuance ancestry root is invalid")
+    archive = _cow_successor_archive(root)
+    receipts = sorted(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"))
+    if len(receipts) != 1:
+        raise ValueError("AC dev issuance successor receipt is missing or ambiguous")
+    successor, _successor_sha = _cow_raw_receipt(
+        receipts[0], prefix=AC_DEV_COW_SUCCESSOR_PREFIX
+    )
+    history = successor.get("history")
+    stable_binding = successor.get("stable_binding")
+    if not (
+        successor.get("schema_version") == AC_DEV_COW_SUCCESSOR_SCHEMA
+        and successor.get("stage") == "completed"
+        and successor.get("project_id") == AC_PROJECT_ID
+        and successor.get("port") == 40008
+        and successor.get("root") == str(root)
+        and isinstance(history, Mapping)
+        and set(history) == {"adoption", "linked_v3"}
+        and isinstance(stable_binding, Mapping)
+        and set(stable_binding) == {"database", "runtime_commit"}
+        and stable_binding.get("runtime_commit") is None
+    ):
+        raise ValueError("AC dev issuance successor receipt mismatch")
+
+    adoption_ref = history.get("adoption")
+    linked_ref = history.get("linked_v3")
+    if not isinstance(adoption_ref, Mapping) or not isinstance(linked_ref, Mapping):
+        raise ValueError("AC dev issuance receipt references are invalid")
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    linked_path = Path(str(linked_ref.get("path") or "")).absolute()
+    adoption_receipts = sorted(
+        (root / "archive" / "canonical-legacy-postimage-adoption").glob(
+            "adoption.*.json"
+        )
+    )
+    if adoption_receipts != [adoption_path]:
+        raise ValueError("AC dev issuance adoption receipt is missing or ambiguous")
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    linked, linked_sha = _cow_raw_receipt(linked_path)
+    linked_hex = linked_sha.removeprefix("sha256:")
+    linked_sidecar = linked_path.with_suffix(".sha256")
+    if not (
+        dict(adoption_ref) == {"path": str(adoption_path), "sha256": adoption_sha}
+        and dict(linked_ref) == {"path": str(linked_path), "sha256": linked_sha}
+        and adoption_path.parent
+        == root / "archive" / "canonical-legacy-postimage-adoption"
+        and linked_path.parent == root / "archive" / "schema-admission"
+        and linked_path.name == f"{linked_hex}.json"
+        and linked_sidecar.is_file()
+        and not linked_sidecar.is_symlink()
+        and linked_sidecar.read_text(encoding="utf-8")
+        == f"sha256:{linked_hex}  {linked_path.name}\n"
+        and adoption.get("schema_version")
+        == "ac_dev_canonical_legacy_postimage_adoption.v1"
+        and adoption.get("stage") == "completed"
+        and adoption.get("project_id") == AC_PROJECT_ID
+        and adoption.get("port") == 40008
+        and dict(adoption.get("root_identity") or {}).get("path") == str(root)
+        and adoption.get("linked_v3_receipt") == str(linked_path)
+        and adoption.get("linked_v3_receipt_sha256") == linked_sha
+        and linked.get("schema_version") == "ac_dev_offline_schema_admission.v3"
+        and linked.get("stage") == "completed"
+        and linked.get("project_id") == AC_PROJECT_ID
+        and linked.get("port") == 40008
+        and dict(linked.get("root_identity") or {}).get("path") == str(root)
+        and dict(dict(linked.get("source_identity") or {}).get("cli_source") or {})
+        == dict(adoption.get("receipt_source_identity") or {})
+    ):
+        raise ValueError("AC dev issuance receipt chain mismatch")
+    anchor = str(
+        dict(adoption.get("readbacks") or {}).get("stable_runtime_commit") or ""
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", anchor):
+        raise ValueError("AC dev issuance ancestry anchor is invalid")
+    return anchor
+
+
 def validate_dev_cow_successor_preimage(
     storage_root: Path | str, *, linked_v3_receipt: Path,
     source_identity: Mapping[str, object], stable_binding: Mapping[str, object],

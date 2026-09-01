@@ -16475,6 +16475,72 @@ def test_stable_runtime_requires_exact_port_branch_commit_and_anchor(monkeypatch
     assert identity["stable_anchor_commit"] == commit
 
 
+@pytest.mark.parametrize(
+    "rejected_descendant,expected_error",
+    [
+        ("none", ""),
+        ("live", "ac_dev_issuance_anchor_not_live_stable_ancestor"),
+        ("dev", "ac_dev_issuance_anchor_not_dev_ancestor"),
+    ],
+)
+def test_dev_startup_requires_receipt_anchor_ancestor_of_both_worlds(
+    monkeypatch, tmp_path, rejected_descendant, expected_error
+):
+    issuance = "8" * 40
+    live_stable = "9" * 40
+    candidate = "a" * 40
+    database_identity = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw",
+        "device": 1, "inode": 2,
+        "relative_path_sha256": "sha256:" + "1" * 64,
+        "genesis_sha256": "sha256:" + "2" * 64,
+    }
+    identity = {
+        "status": "ready", "violations": [], "plane": "dev",
+        "worktree_root": str(tmp_path), "commit": candidate,
+        "stable_anchor_commit": live_stable,
+        "dev_issuance_ancestry_anchor_commit": issuance,
+        "database_identity": database_identity,
+    }
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(server, "_bind_dev_runtime_artifact_environment", lambda: None)
+    monkeypatch.setattr(server, "_runtime_plane_identity", lambda: dict(identity))
+    monkeypatch.setattr(
+        server, "governance_loaded_runtime_identity",
+        lambda _commit: {"loaded_source_sha256": "sha256:" + "3" * 64},
+    )
+    monkeypatch.setattr(
+        server, "_branch_service_git_output", lambda _root, _args: live_stable,
+    )
+    monkeypatch.setenv("AMING_CLAW_HOME", str(tmp_path.parent / "runtime-home"))
+    connection = sqlite3.connect(":memory:")
+    monkeypatch.setattr(server, "get_connection", lambda _project: connection)
+    monkeypatch.setattr(
+        server, "canonical_ac_database_identity", lambda _conn=None: database_identity,
+    )
+
+    calls = []
+    def ancestry(command, **_kwargs):
+        calls.append(command)
+        descendant = command[-1]
+        rejected = (
+            rejected_descendant == "live" and descendant == live_stable
+        ) or (rejected_descendant == "dev" and descendant == candidate)
+        return SimpleNamespace(returncode=1 if rejected else 0, stdout="", stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", ancestry)
+    if rejected_descendant == "none":
+        result = server._validate_runtime_plane_startup()
+        assert result["dev_issuance_ancestry_anchor_commit"] == issuance
+    else:
+        with pytest.raises(server.GovernanceSingletonError, match=expected_error):
+            server._validate_runtime_plane_startup()
+    assert [call[-2:] for call in calls] == [
+        [issuance, live_stable], [issuance, candidate]
+    ]
+
+
 def _generic_stable_health_fixture(root: Path, commit: str) -> dict[str, Any]:
     source_hash = "sha256:" + "1" * 64
     return {
@@ -16666,6 +16732,7 @@ def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path
     # It now proves the stable commit is a source-only ancestry anchor while
     # runtime state comes from a fresh, dedicated dev-world genesis.
     stable = "c" * 40
+    issuance = "b" * 40
     candidate = "d" * 40
     storage_root = tmp_path / "dev-world"
     receipt = governance_db.bootstrap_dev_governance_store(
@@ -16684,6 +16751,9 @@ def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path
     monkeypatch.setenv("AMING_CLAW_HOME", str(tmp_path / "runtime-home"))
     monkeypatch.delenv("SHARED_VOLUME_PATH", raising=False)
     monkeypatch.setattr(server, "PORT", server.AC_DEV_SERVICE_PORT)
+    monkeypatch.setattr(
+        server, "dev_issuance_ancestry_anchor_commit", lambda _root: issuance,
+    )
     monkeypatch.setattr(
         server,
         "_git_identity",
@@ -16724,6 +16794,7 @@ def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path
 
     assert identity["status"] == "ready"
     assert identity["stable_anchor_commit"] == stable
+    assert identity["dev_issuance_ancestry_anchor_commit"] == issuance
     assert identity["database_identity"] == receipt["database_identity"]
     assert identity["database_identity"]["world_id"] == "ac-dev"
     assert Path(receipt["database_path"]).is_relative_to(storage_root)

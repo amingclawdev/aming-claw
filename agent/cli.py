@@ -218,6 +218,7 @@ def _dev_running_identity_matches(
     expected: Mapping[str, str],
     *,
     stable_anchor_commit: str,
+    dev_issuance_ancestry_anchor_commit: str,
     dev_database_identity: Mapping[str, Any],
 ) -> bool:
     identity = health.get("runtime_plane_identity")
@@ -253,6 +254,8 @@ def _dev_running_identity_matches(
         and identity.get("worktree_dirty") is False
         and identity.get("worktree_dirty_files") == []
         and identity.get("stable_anchor_commit") == stable_anchor_commit
+        and identity.get("dev_issuance_ancestry_anchor_commit")
+        == dev_issuance_ancestry_anchor_commit
         and dev_database_identity.get("schema_version")
         == "ac_governance_database_identity.v2"
         and dev_database_identity.get("world_id") == "ac-dev"
@@ -4203,6 +4206,11 @@ def _durable_dev_launch(
 ) -> None:
     if os.name != "posix":
         raise click.ClickException("AC dev durable launch requires POSIX")
+    from agent.governance.db import dev_issuance_ancestry_anchor_commit
+    try:
+        issuance_ancestry_anchor = dev_issuance_ancestry_anchor_commit(dev_storage)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
     runtime = dev_storage / "runtime" / "durable-launch"
     lock = runtime / "launch.lock"
     durable_phase, bootstrap_binding = _durable_start_phase(dev_storage)
@@ -4293,6 +4301,7 @@ def _durable_dev_launch(
             or stopped or exited
             or not _dev_running_identity_matches(
                 health, source_identity, stable_anchor_commit=stable_anchor_commit,
+                dev_issuance_ancestry_anchor_commit=issuance_ancestry_anchor,
                 dev_database_identity=dict(value.get("database_identity") or {}),
             )
         ):
@@ -4669,6 +4678,7 @@ def _durable_dev_launch(
             raise click.ClickException("AC dev durable child did not become exact healthy listener")
         if not health or not _dev_running_identity_matches(
             health, source_identity, stable_anchor_commit=stable_anchor_commit,
+            dev_issuance_ancestry_anchor_commit=issuance_ancestry_anchor,
             dev_database_identity=database_identity,
         ):
             raise click.ClickException(
@@ -5042,10 +5052,18 @@ def start(
                 and isinstance(runtime_identity.get("database_identity"), Mapping)
                 else {}
             )
+            from agent.governance.db import dev_issuance_ancestry_anchor_commit
+            try:
+                issuance_ancestry_anchor = dev_issuance_ancestry_anchor_commit(
+                    selected_dev_storage
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                issuance_ancestry_anchor = ""
             if not _dev_running_identity_matches(
                 health,
                 dev_identity,
                 stable_anchor_commit=stable_anchor_commit,
+                dev_issuance_ancestry_anchor_commit=issuance_ancestry_anchor,
                 dev_database_identity=reported_database_identity,
             ):
                 raise click.ClickException(

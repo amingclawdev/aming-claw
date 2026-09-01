@@ -51,6 +51,7 @@ from .db import (
     acquire_dev_runtime_writer_lease,
     release_dev_runtime_writer_lease,
     validate_dev_launch_receipt,
+    dev_issuance_ancestry_anchor_commit,
     DBContext,
     independent_connection,
     sqlite_write_lock,
@@ -767,11 +768,19 @@ def _runtime_plane_identity() -> dict[str, Any]:
     )
     violations: list[str] = []
     database_identity: dict[str, object] = {}
+    dev_issuance_anchor = ""
     if plane in {"stable", "dev"}:
         try:
             database_identity = canonical_ac_database_identity()
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             violations.append("database_identity_invalid")
+    if plane == "dev":
+        try:
+            dev_issuance_anchor = dev_issuance_ancestry_anchor_commit(
+                os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", "")
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            violations.append("dev_issuance_ancestry_anchor_invalid")
     if plane not in {"generic", "stable", "dev"}:
         violations.append("runtime_plane_unsupported")
     elif plane == "dev":
@@ -809,7 +818,7 @@ def _runtime_plane_identity() -> dict[str, Any]:
         # Unsupported/generic planes are already reported in ``violations``;
         # never advertise authority to activate graph truth from them.
         activation_policy = {"active_graph_activation_allowed": False}
-    return {
+    identity = {
         "schema_version": "ac_runtime_plane_identity.v1",
         "plane": plane,
         "port": PORT,
@@ -838,6 +847,9 @@ def _runtime_plane_identity() -> dict[str, Any]:
         "status": "ready" if not violations else "invalid",
         "violations": violations,
     }
+    if plane == "dev":
+        identity["dev_issuance_ancestry_anchor_commit"] = dev_issuance_anchor
+    return identity
 
 
 def _validate_runtime_plane_startup() -> dict[str, Any]:
@@ -874,25 +886,28 @@ def _validate_runtime_plane_startup() -> dict[str, Any]:
     runtime_home = Path(runtime_home_raw).expanduser().resolve()
     if runtime_home == root or root in runtime_home.parents:
         raise GovernanceSingletonError("ac_dev_runtime_home_must_be_outside_worktree")
+    issuance_anchor = str(
+        identity.get("dev_issuance_ancestry_anchor_commit") or ""
+    ).strip().lower()
     try:
-        ancestry = subprocess.run(
-            [
-                "git",
-                "merge-base",
-                "--is-ancestor",
-                current_stable_commit,
-                str(identity["commit"]),
-            ],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        stable_ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", issuance_anchor,
+             current_stable_commit], cwd=root, capture_output=True, text=True,
+            timeout=5, check=False,
+        )
+        dev_ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", issuance_anchor,
+             str(identity["commit"])], cwd=root, capture_output=True, text=True,
+            timeout=5, check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise GovernanceSingletonError("ac_dev_stable_anchor_unverifiable") from exc
-    if ancestry.returncode != 0:
-        raise GovernanceSingletonError("ac_dev_stable_anchor_not_ancestor")
+        raise GovernanceSingletonError("ac_dev_issuance_anchor_unverifiable") from exc
+    if stable_ancestry.returncode != 0:
+        raise GovernanceSingletonError(
+            "ac_dev_issuance_anchor_not_live_stable_ancestor"
+        )
+    if dev_ancestry.returncode != 0:
+        raise GovernanceSingletonError("ac_dev_issuance_anchor_not_dev_ancestor")
     try:
         conn = get_connection("aming-claw")
     except Exception as exc:
