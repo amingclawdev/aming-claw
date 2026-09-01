@@ -95840,6 +95840,19 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         isinstance(readiness, Mapping)
         and readiness.get("materialization_required") is True
     )
+    active_snapshot: dict[str, Any] = {}
+    if readiness_compatible and readiness is None:
+        from . import graph_snapshot_store as store
+
+        active_snapshot = (
+            store.get_active_graph_snapshot(conn, project_id) or {}
+        )
+    local_active_graph_present = bool(active_snapshot)
+    exact_schema_no_local_active = bool(
+        readiness_compatible
+        and readiness is None
+        and not local_active_graph_present
+    )
     try:
         world = _operator_supervised_direct_main_dev_world_authority()
     except GovernanceError:
@@ -95882,8 +95895,8 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     eligibility_checks = {
         "strict_direct_graph_first_route_session": strict_direct_position,
         "compatible_graph_materialization_preimage": readiness_compatible,
-        "graph_materialization_required_no_local_active": (
-            materialization_required
+        "graph_materialization_required_or_exact_schema_no_local_active": (
+            materialization_required or exact_schema_no_local_active
         ),
         "classified_dev_cow_runtime_custody": custody_verified,
         "exact_ac_dev_project_world": bool(
@@ -95908,6 +95921,8 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "caller_claims_trusted": False,
         "project_id": project_id,
         "materialization_required": materialization_required,
+        "exact_schema_no_local_active": exact_schema_no_local_active,
+        "local_active_graph_present": local_active_graph_present,
         "contract_runtime_first_missing_line": next_line_id,
         "route_session_authority_verified": strict_direct_position,
         "runtime_custody_verified": custody_verified,
@@ -150497,7 +150512,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         ),
                         "writes_performed": False,
                     }
-                elif graph_readiness is None:
+                elif active_snapshot:
                     graph_bootstrap_projection = {
                         "schema_version": "onboard_route_guide.dev_local_graph_bootstrap.v1",
                         "state": "incompatible",
@@ -150565,9 +150580,18 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                     )
                     graph_bootstrap_projection = {
                         "schema_version": "onboard_route_guide.dev_local_graph_bootstrap.v1",
-                        "state": "materialization_required_no_local_active",
+                        "state": (
+                            "materialization_required_no_local_active"
+                            if graph_readiness is not None
+                            else "exact_schema_no_local_active"
+                        ),
                         "materialization_required": bool(
                             bootstrap_authority.get("materialization_required")
+                        ),
+                        "exact_schema_no_local_active": bool(
+                            bootstrap_authority.get(
+                                "exact_schema_no_local_active"
+                            )
                         ),
                         "local_active_graph_present": False,
                         "graph_query_ready": False,

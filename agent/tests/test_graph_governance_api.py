@@ -24081,19 +24081,20 @@ def test_current_full_reconcile_candidate_exception_records_failed_run(
             RuntimeError("simulated candidate builder crash")
         ),
     )
+    body = {
+        "target_commit_sha": head,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": run_id,
+        "snapshot_id": snapshot_id,
+    }
 
     with pytest.raises(RuntimeError, match="simulated candidate builder crash"):
         server.handle_graph_governance_current_full_reconcile(
             _ctx(
                 {"project_id": PID},
                 method="POST",
-                body={
-                    "target_commit_sha": head,
-                    "activate": True,
-                    "semantic_enrich": False,
-                    "run_id": run_id,
-                    "snapshot_id": snapshot_id,
-                },
+                body=body,
             )
         )
 
@@ -24114,6 +24115,37 @@ def test_current_full_reconcile_candidate_exception_records_failed_run(
     ).fetchone()
     assert dict(claim) == {"status": "released", "terminal_status": "failed"}
     assert (PID, snapshot_id) not in server._CURRENT_FULL_BUILD_KEYS
+
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        lambda *_args, **_kwargs: pytest.fail(
+            "same-commit failed candidate was revived"
+        ),
+    )
+    metric_before_retry = dict(metric)
+    claim_before_retry = dict(claim)
+    retry_status, retry = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert retry_status == 409
+    assert retry["error"] == "current_full_build_identity_terminalized"
+    assert retry["rebuild_started"] is False
+    assert dict(
+        conn.execute(
+            "SELECT * FROM reconcile_run_metrics "
+            "WHERE project_id = ? AND run_id = ?",
+            (PID, run_id),
+        ).fetchone()
+    ) == metric_before_retry
+    assert dict(
+        conn.execute(
+            "SELECT status, terminal_status "
+            "FROM graph_current_full_build_claim_history "
+            "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+            (PID, run_id, snapshot_id),
+        ).fetchone()
+    ) == claim_before_retry
 
 
 def test_current_full_reconcile_run_id_rejects_target_commit_drift(
@@ -207754,6 +207786,8 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
     assert bootstrap["bootstrap_authority"]["eligible"] is True
     assert bootstrap["bootstrap_authority"]["accepted"] is False
     assert bootstrap["bootstrap_authority"]["request_body_exact"] is False
+    assert bootstrap["bootstrap_authority"]["exact_schema_no_local_active"] is False
+    assert bootstrap["bootstrap_authority"]["local_active_graph_present"] is False
     assert server._contract_runtime(conn).current_record(
         case["execution_id"], actor_role="observer"
     )["execution_state_revision"] == before_revision
@@ -207789,21 +207823,22 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
     class BootstrapAdmissionReached(RuntimeError):
         pass
 
-    monkeypatch.setattr(
-        server,
-        "admit_ac_dev_graph_materialization_schema",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            BootstrapAdmissionReached()
-        ),
-    )
-    with pytest.raises(BootstrapAdmissionReached):
-        server.handle_graph_governance_current_full_reconcile(
-            _ctx(
-                {"project_id": case["project_id"]},
-                method="POST",
-                body=copy.deepcopy(adapted_http_body),
-            )
+    with monkeypatch.context() as materialization_request:
+        materialization_request.setattr(
+            server,
+            "admit_ac_dev_graph_materialization_schema",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                BootstrapAdmissionReached()
+            ),
         )
+        with pytest.raises(BootstrapAdmissionReached):
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx(
+                    {"project_id": case["project_id"]},
+                    method="POST",
+                    body=copy.deepcopy(adapted_http_body),
+                )
+            )
 
     with monkeypatch.context() as incompatible:
         incompatible.setattr(
@@ -207858,6 +207893,77 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
         conn,
         project_id="aming-claw",
     )
+    exact_schema = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+    exact_bootstrap = exact_schema["dev_local_graph_bootstrap"]
+    assert exact_bootstrap["state"] == "exact_schema_no_local_active"
+    assert exact_bootstrap["materialization_required"] is False
+    assert exact_bootstrap["exact_schema_no_local_active"] is True
+    assert exact_bootstrap["local_active_graph_present"] is False
+    assert exact_bootstrap["graph_query_ready"] is False
+    assert exact_bootstrap["current_full_reconcile_ready"] is True
+    exact_action = exact_schema["next_legal_action"]
+    assert exact_action["mcp_tool"] == "graph_current_full_reconcile"
+    assert exact_action["copy_safe_body"] == action["copy_safe_body"]
+    exact_http_body = dict(exact_action["copy_safe_body"])
+    exact_http_body.pop("project_id")
+    assert exact_http_body == exact_bootstrap["bootstrap_authority"][
+        "expected_http_body"
+    ]
+    with monkeypatch.context() as exact_request:
+        exact_request.setattr(
+            server,
+            "admit_ac_dev_graph_materialization_schema",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                BootstrapAdmissionReached()
+            ),
+        )
+        with pytest.raises(BootstrapAdmissionReached):
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx(
+                    {"project_id": case["project_id"]},
+                    method="POST",
+                    body=copy.deepcopy(exact_http_body),
+                )
+            )
+
+    stale_candidate = store.create_graph_snapshot(
+        conn,
+        "aming-claw",
+        snapshot_id="dev-onboard-stale-active",
+        commit_sha="f" * 40,
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(
+        conn,
+        "aming-claw",
+        stale_candidate["snapshot_id"],
+        auto_rebuild_projection=False,
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        store,
+        "_current_full_snapshot_provenance_binding",
+        lambda *_args, **_kwargs: {"verified": True},
+    )
+    stale_active = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+    assert stale_active["dev_local_graph_bootstrap"]["state"] == "incompatible"
+    assert stale_active["dev_local_graph_bootstrap"][
+        "local_active_graph_present"
+    ] is True
+    assert stale_active["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
+
     candidate = store.create_graph_snapshot(
         conn,
         "aming-claw",
@@ -207872,6 +207978,23 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
         auto_rebuild_projection=False,
     )
     conn.commit()
+    monkeypatch.setattr(
+        store,
+        "_current_full_snapshot_provenance_binding",
+        lambda *_args, **_kwargs: {"verified": False},
+    )
+    nonexact_active = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+    assert nonexact_active["dev_local_graph_bootstrap"]["state"] == "incompatible"
+    assert nonexact_active["next_legal_action"]["mcp_tool"] == (
+        "onboard_route_guide"
+    )
+
     monkeypatch.setattr(
         store,
         "_current_full_snapshot_provenance_binding",
@@ -207977,6 +208100,183 @@ def test_dev_direct_onboard_preserves_later_contract_runtime_action(
     assert guide["next_legal_action"]["line_id"] == advanced[
         "next_legal_action"
     ]["line_id"]
+
+
+def test_dev_graph_bootstrap_new_head_identity_leaves_b977_failure_immutable(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_commit = "b977cae94bf454d0ca4d809374dc546040c59ac4"
+    new_commit = "c05da96f88f107298453fae815215d1768e095c1"
+    old_run_id = "current-full-" + old_commit[:7]
+    old_snapshot_id = server._current_full_deterministic_snapshot_id(old_commit)
+    claim = store.acquire_current_full_build_claim(
+        conn,
+        "aming-claw",
+        run_id=old_run_id,
+        snapshot_id=old_snapshot_id,
+        commit_sha=old_commit,
+        manager_epoch="old-b977-generation",
+        manager_pid=4242,
+        manager_started_at="2026-09-01T00:00:00Z",
+        manager_start_identity="old-b977-manager",
+        metric_evidence={"idempotency_scope": {}},
+        created_at="2026-09-01T00:00:00Z",
+    )
+    store.terminalize_current_full_build_claim(
+        conn,
+        "aming-claw",
+        claim_id=claim["claim_id"],
+        run_id=old_run_id,
+        snapshot_id=old_snapshot_id,
+        commit_sha=old_commit,
+        terminal_status="failed",
+        manager_start_identity="old-b977-manager",
+        metric_evidence={
+            "phase": "candidate_materialization_failed",
+            "idempotency_scope": {},
+        },
+        created_at="2026-09-01T00:00:01Z",
+    )
+    store.create_graph_snapshot(
+        conn,
+        "aming-claw",
+        snapshot_id=old_snapshot_id,
+        commit_sha=old_commit,
+        snapshot_kind="full",
+        notes=json.dumps({"run_id": old_run_id}),
+    )
+    conn.commit()
+    old_rows_before = tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT run_id,snapshot_id,commit_sha,status,terminal_status "
+            "FROM graph_current_full_build_claim_history "
+            "WHERE project_id='aming-claw'"
+        ).fetchall()
+    ), tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT run_id,snapshot_id,commit_sha,status,evidence_json "
+            "FROM reconcile_run_metrics WHERE project_id='aming-claw'"
+        ).fetchall()
+    ), tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT snapshot_id,commit_sha,snapshot_kind,status,notes "
+            "FROM graph_snapshots WHERE project_id='aming-claw'"
+        ).fetchall()
+    )
+    active_reads = []
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server,
+        "_dev_graph_zero_write_readiness_projection",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        store,
+        "get_active_graph_snapshot",
+        lambda _conn, project_id: active_reads.append(project_id) or None,
+    )
+    root = tmp_path / "new-head"
+    root.mkdir()
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: {
+            "accepted": True,
+            "target_project_root": str(root),
+            "target_head_commit": new_commit,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "active_graph_activation_allowed": True,
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "port": 40008,
+            "cow_successor_verified": True,
+            "source_checkout_verified": True,
+            "live_runtime_custody_verified": True,
+        },
+    )
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: new_commit)
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: True)
+    auth = {
+        "role_source": "observer_session_route_token_ref",
+        "observer_session_id": "obs-new-head",
+        "route_token_ref": "rtok-new-head",
+        "route_token_scope": {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-NEW-HEAD",
+            "task_id": "cex-new-head",
+        },
+    }
+    preflight = {
+        "applicable": True,
+        "active_route_authority": {"passed": True},
+        "contract_runtime_next_line_id": "observer_graph_context",
+    }
+
+    authority = server._dev_direct_graph_bootstrap_reconcile_authority(
+        conn,
+        project_id="aming-claw",
+        auth=auth,
+        direct_main_qa_preflight=preflight,
+    )
+    new_identity = server._current_full_requested_snapshot_identity(
+        conn,
+        project_id="aming-claw",
+        target_commit_sha=new_commit,
+    )
+
+    assert active_reads == ["aming-claw"]
+    assert authority["eligible"] is True
+    assert authority["exact_schema_no_local_active"] is True
+    assert authority["local_active_graph_present"] is False
+    assert authority["expected_http_body"]["target_commit_sha"] == new_commit
+    assert authority["expected_http_body"]["run_id"] == (
+        "current-full-" + new_commit[:7]
+    )
+    assert authority["expected_http_body"]["run_id"] != old_run_id
+    assert "snapshot_id" not in authority["expected_http_body"]
+    assert new_identity["status"] == "missing"
+    assert new_identity["snapshot_id"] != old_snapshot_id
+    assert old_rows_before == (
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT run_id,snapshot_id,commit_sha,status,terminal_status "
+                "FROM graph_current_full_build_claim_history "
+                "WHERE project_id='aming-claw'"
+            ).fetchall()
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT run_id,snapshot_id,commit_sha,status,evidence_json "
+                "FROM reconcile_run_metrics WHERE project_id='aming-claw'"
+            ).fetchall()
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT snapshot_id,commit_sha,snapshot_kind,status,notes "
+                "FROM graph_snapshots WHERE project_id='aming-claw'"
+            ).fetchall()
+        ),
+    )
+    assert conn.execute(
+        "SELECT status FROM graph_snapshots "
+        "WHERE project_id='aming-claw' AND snapshot_id=?",
+        (old_snapshot_id,),
+    ).fetchone()[0] == "candidate"
 
 
 def test_dev_onboard_requires_explicit_backlog_before_db_or_queue(

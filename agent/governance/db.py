@@ -1026,33 +1026,11 @@ def _graph_materialization_inventory(conn: sqlite3.Connection) -> list[tuple[str
 
 
 def _graph_materialization_canonical_inventory() -> list[tuple[str, str, str, str]]:
-    from . import graph_correction_patches, graph_events, graph_snapshot_store
-
-    canonical = sqlite3.connect(":memory:")
-    try:
-        connection_ids = set(
-            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
-        )
-        connection_ids.add(id(canonical))
-        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
-        graph_snapshot_store.ensure_schema(canonical)
-        graph_events.ensure_schema(canonical)
-        graph_correction_patches.ensure_schema(canonical)
-        # ``sqlite_sequence`` is database-global SQLite bookkeeping created as
-        # an incidental consequence of AUTOINCREMENT.  It is not owned by the
-        # graph materialization namespace and may legitimately pre-exist for
-        # an unrelated governance table in an otherwise empty graph preimage.
-        return [
-            row for row in _graph_materialization_inventory(canonical)
-            if row[1] != "sqlite_sequence"
-        ]
-    finally:
-        connection_ids = set(
-            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
-        )
-        connection_ids.discard(id(canonical))
-        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
-        canonical.close()
+    return sorted(
+        row
+        for _owner, _ensure_schema, inventory in _graph_schema_owner_registry()
+        for row in inventory
+    )
 
 
 def _graph_schema_owner_inventory(
@@ -1082,7 +1060,14 @@ def _graph_schema_owner_inventory(
 
 
 def _graph_schema_owner_registry(
-) -> tuple[tuple[str, list[tuple[str, str, str, str]]], ...]:
+) -> tuple[
+    tuple[
+        str,
+        Callable[[sqlite3.Connection], None],
+        list[tuple[str, str, str, str]],
+    ],
+    ...,
+]:
     """Return exact source-derived inventories for every admitted graph owner."""
 
     from . import (
@@ -1094,7 +1079,7 @@ def _graph_schema_owner_registry(
     )
 
     return tuple(
-        (owner, _graph_schema_owner_inventory(ensure_schema))
+        (owner, ensure_schema, _graph_schema_owner_inventory(ensure_schema))
         for owner, ensure_schema in (
             ("graph_snapshot_store", graph_snapshot_store.ensure_schema),
             ("graph_events", graph_events.ensure_schema),
@@ -1126,7 +1111,7 @@ def classify_graph_materialization_preimage(
     known_tables: set[str] = set()
     owner_states: dict[str, str] = {}
     planned: list[tuple[str, str, str, str]] = []
-    for owner, canonical in registry:
+    for owner, _ensure_schema, canonical in registry:
         owner_names = {row[1] for row in canonical}
         owner_tables = {row[2] for row in canonical if row[0] == "table"}
         known_names.update(owner_names)
@@ -1182,7 +1167,7 @@ def _graph_materialization_managed_inventory(
 
 
 def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
-    """Verify the three source-owned rebuildable graph schemas without writes."""
+    """Verify every source-owned rebuildable graph schema without writes."""
 
     try:
         classification = classify_graph_materialization_preimage(conn)
@@ -1196,12 +1181,8 @@ def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
                 }
             },
         ) from exc
-    required = {
-        "graph_snapshot_store",
-        "graph_events",
-        "graph_correction_patches",
-    }
     owner_states = classification["owner_states"]
+    required = set(owner_states)
     if any(owner_states[owner] != "exact" for owner in required):
         planned_objects = list(classification.get("planned_objects") or [])
         raise DevRuntimeSchemaVerificationError(
@@ -1234,8 +1215,6 @@ def admit_ac_dev_graph_materialization_schema(
     verification share one ``BEGIN IMMEDIATE`` transaction.
     """
 
-    from . import graph_correction_patches, graph_events, graph_snapshot_store
-
     if project_id != AC_PROJECT_ID or not _is_dev_runtime():
         raise ValueError("AC dev graph materialization admission is dev/aming-claw only")
     runtime_custody = _require_ac_dev_graph_materialization_runtime_custody(conn)
@@ -1255,7 +1234,10 @@ def admit_ac_dev_graph_materialization_schema(
     ):
         raise ValueError("AC dev graph materialization database identity is not admitted")
 
-    canonical = _graph_materialization_canonical_inventory()
+    registry = _graph_schema_owner_registry()
+    canonical = sorted(
+        row for _owner, _ensure_schema, inventory in registry for row in inventory
+    )
     # Admission initializes absent rebuildable owners, replays exact owners,
     # or applies the one bounded snapshot predecessor.  Other partial,
     # altered, extra, or legacy layouts cannot be laundered by IF NOT EXISTS.
@@ -1272,15 +1254,10 @@ def admit_ac_dev_graph_materialization_schema(
             conn.set_authorizer(None)
             connection_ids.add(id(conn))
             _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
-            graph_snapshot_store.ensure_schema(conn)
-            graph_events.ensure_schema(conn)
-            graph_correction_patches.ensure_schema(conn)
+            for _owner, ensure_schema, _inventory in registry:
+                ensure_schema(conn)
             postimage = classify_graph_materialization_preimage(conn)
-            required = {
-                "graph_snapshot_store",
-                "graph_events",
-                "graph_correction_patches",
-            }
+            required = {owner for owner, _ensure_schema, _inventory in registry}
             if any(
                 postimage["owner_states"][owner] != "exact"
                 for owner in required
@@ -3903,7 +3880,10 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     graph_registry = _graph_schema_owner_registry()
     graph_owner_states = graph_classification.get("owner_states")
     owner_state_values = (
-        [graph_owner_states.get(owner) for owner, _canonical in graph_registry]
+        [
+            graph_owner_states.get(owner)
+            for owner, _ensure_schema, _canonical in graph_registry
+        ]
         if isinstance(graph_owner_states, dict)
         else []
     )
@@ -3912,10 +3892,14 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         and all(state == "exact" for state in owner_state_values)
     )
     graph_known_names = {
-        row[1] for _owner, canonical in graph_registry for row in canonical
+        row[1]
+        for _owner, _ensure_schema, canonical in graph_registry
+        for row in canonical
     }
     graph_known_tables = {
-        row[2] for _owner, canonical in graph_registry for row in canonical
+        row[2]
+        for _owner, _ensure_schema, canonical in graph_registry
+        for row in canonical
         if row[0] == "table"
     }
     actual_graph_inventory = [
@@ -3934,7 +3918,9 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             "graph owners must equal baseline or all be SQL-exact"
         )
     graph_exact_inventory = {
-        row for _owner, canonical in graph_registry for row in canonical
+        row
+        for _owner, _ensure_schema, canonical in graph_registry
+        for row in canonical
         if graph_overlay_exact
     }
     graph_exact_objects = {

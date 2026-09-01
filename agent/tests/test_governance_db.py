@@ -102,7 +102,14 @@ class TestDB(unittest.TestCase):
 
 
 def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(monkeypatch):
-    from agent.governance import db, graph_events, graph_snapshot_store
+    from agent.governance import (
+        asset_impact,
+        asset_projection,
+        db,
+        graph_correction_patches,
+        graph_events,
+        graph_snapshot_store,
+    )
 
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
@@ -134,9 +141,29 @@ def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(mo
         second = db.admit_ac_dev_graph_materialization_schema(
             conn, project_id="aming-claw"
         )
+        owner_states = db.classify_graph_materialization_preimage(conn)[
+            "owner_states"
+        ]
+        assert list(owner_states) == [
+            "graph_snapshot_store",
+            "graph_events",
+            "graph_correction_patches",
+            "asset_projection",
+            "asset_impact",
+        ]
+        assert set(owner_states.values()) == {"exact"}
+        assert [row for row in inventory if row[1] != "sqlite_sequence"] == (
+            db._graph_materialization_canonical_inventory()
+        )
         changes = conn.total_changes
-        graph_snapshot_store.ensure_schema(conn)
-        graph_events.ensure_schema(conn)
+        for ensure_schema in (
+            graph_snapshot_store.ensure_schema,
+            graph_events.ensure_schema,
+            graph_correction_patches.ensure_schema,
+            asset_projection.ensure_schema,
+            asset_impact.ensure_schema,
+        ):
+            ensure_schema(conn)
         assert conn.total_changes == changes
         assert db._graph_materialization_inventory(conn) == inventory
         assert first == second
@@ -176,6 +203,187 @@ def _install_all_graph_owners_for_inventory_test(db, conn):
         asset_impact.ensure_schema,
     ):
         _install_graph_owner_for_preimage_test(db, conn, ensure_schema)
+
+
+@pytest.mark.parametrize("owner", ["asset_projection", "asset_impact"])
+def test_exact_dev_asset_owner_ensure_is_zero_write_and_preserves_outer_transaction(
+    monkeypatch,
+    owner,
+):
+    from agent.governance import asset_impact, asset_projection, db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_all_graph_owners_for_inventory_test(db, conn)
+    conn.execute("CREATE TABLE transaction_probe(value TEXT)")
+    conn.commit()
+    before_inventory = db._graph_materialization_inventory(conn)
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO transaction_probe(value) VALUES('before')")
+    ensure_schema = {
+        "asset_projection": asset_projection.ensure_schema,
+        "asset_impact": asset_impact.ensure_schema,
+    }[owner]
+    ensure_schema(conn)
+
+    assert conn.in_transaction is True
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    conn.execute("INSERT INTO transaction_probe(value) VALUES('after')")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM transaction_probe"
+    ).fetchone()[0] == 2
+    conn.rollback()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM transaction_probe"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.parametrize("drift", ["absent", "partial", "altered"])
+def test_dev_asset_owner_ensure_rejects_schema_drift_typed_and_zero_write(
+    monkeypatch,
+    drift,
+):
+    from agent.governance import asset_projection, db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    if drift != "absent":
+        _install_all_graph_owners_for_inventory_test(db, conn)
+        conn.execute("DROP INDEX idx_graph_asset_projection_path")
+        if drift == "altered":
+            conn.execute(
+                "CREATE INDEX idx_graph_asset_projection_path "
+                "ON graph_asset_projection(project_id, snapshot_id)"
+            )
+        conn.commit()
+    before_inventory = db._graph_materialization_inventory(conn)
+    before_changes = conn.total_changes
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    with pytest.raises(db.DevRuntimeSchemaVerificationError):
+        asset_projection.ensure_schema(conn)
+
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    conn.close()
+
+
+def test_ac_dev_graph_admission_creates_projection_and_impact_atomically(
+    monkeypatch,
+):
+    from agent.governance import (
+        asset_impact,
+        db,
+        graph_correction_patches,
+        graph_events,
+        graph_snapshot_store,
+    )
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    for ensure_schema in (
+        graph_snapshot_store.ensure_schema,
+        graph_events.ensure_schema,
+        graph_correction_patches.ensure_schema,
+    ):
+        _install_graph_owner_for_preimage_test(db, conn, ensure_schema)
+    conn.commit()
+    before = db.classify_graph_materialization_preimage(conn)["owner_states"]
+    assert before["asset_projection"] == "absent"
+    assert before["asset_impact"] == "absent"
+
+    db.admit_ac_dev_graph_materialization_schema(conn, project_id="aming-claw")
+
+    after = db.classify_graph_materialization_preimage(conn)["owner_states"]
+    assert after["asset_projection"] == "exact"
+    assert after["asset_impact"] == "exact"
+
+    rollback_conn = sqlite3.connect(":memory:")
+    rollback_conn.row_factory = sqlite3.Row
+    for ensure_schema in (
+        graph_snapshot_store.ensure_schema,
+        graph_events.ensure_schema,
+        graph_correction_patches.ensure_schema,
+    ):
+        _install_graph_owner_for_preimage_test(db, rollback_conn, ensure_schema)
+    rollback_conn.commit()
+    original_impact_ensure = asset_impact.ensure_schema
+
+    def fail_after_impact_schema(candidate):
+        original_impact_ensure(candidate)
+        if candidate is rollback_conn:
+            raise RuntimeError("impact admission sentinel")
+
+    monkeypatch.setattr(asset_impact, "ensure_schema", fail_after_impact_schema)
+    with pytest.raises(RuntimeError, match="impact admission sentinel"):
+        db.admit_ac_dev_graph_materialization_schema(
+            rollback_conn,
+            project_id="aming-claw",
+        )
+    rolled_back = db.classify_graph_materialization_preimage(rollback_conn)[
+        "owner_states"
+    ]
+    assert rolled_back["asset_projection"] == "absent"
+    assert rolled_back["asset_impact"] == "absent"
+    conn.close()
+    rollback_conn.close()
+
+
+@pytest.mark.parametrize("owner", ["asset_projection", "asset_impact"])
+def test_stable_asset_owner_ensure_preserves_executescript_without_dev_verify(
+    monkeypatch,
+    owner,
+):
+    from agent.governance import asset_impact, asset_projection, db
+
+    module = {
+        "asset_projection": asset_projection,
+        "asset_impact": asset_impact,
+    }[owner]
+    scripts = []
+
+    class StableConnection:
+        def executescript(self, sql):
+            scripts.append(sql)
+
+    monkeypatch.setattr(db, "dev_runtime_verify_only", lambda: False)
+    monkeypatch.setattr(
+        db,
+        "verify_graph_materialization_schema",
+        lambda _conn: pytest.fail("stable ensure reached dev verification"),
+    )
+    monkeypatch.setattr(
+        db,
+        "graph_materialization_admission_active",
+        lambda _conn: False,
+    )
+
+    module.ensure_schema(StableConnection())
+
+    assert scripts == [module.SCHEMA_SQL]
 
 
 def test_graph_materialization_preimage_classifier_accepts_only_exact_predecessor_without_write():
@@ -5672,7 +5880,7 @@ def test_dev_schema_inventory_subtracts_only_five_sql_exact_graph_owners_zero_wr
     conn.commit()
     registry_names = {
         row[1]
-        for _owner, canonical in db._graph_schema_owner_registry()
+        for _owner, _ensure_schema, canonical in db._graph_schema_owner_registry()
         for row in canonical
     }
     assert {
@@ -5706,7 +5914,10 @@ def test_dev_schema_inventory_rejects_nonexact_graph_owner_without_write(drift):
     db.admit_missing_backlog_read_schema(conn)
     _install_all_graph_owners_for_inventory_test(db, conn)
     if drift == "owner_absent":
-        owner_inventory = dict(db._graph_schema_owner_registry())["graph_events"]
+        owner_inventory = {
+            owner: inventory
+            for owner, _ensure_schema, inventory in db._graph_schema_owner_registry()
+        }["graph_events"]
         for kind, name, _table, _sql in owner_inventory:
             if kind in {"view", "trigger", "index"} and not name.startswith(
                 "sqlite_autoindex_"
