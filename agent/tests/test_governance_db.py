@@ -2008,6 +2008,10 @@ def test_canonical_preimage_selects_cow_bridge_only_for_replaced_inode(
     monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _value: None)
     monkeypatch.setattr(runtime_plane, "resolve_ac_dev_storage_root", lambda _stable: root)
     calls = []
+    monkeypatch.setattr(
+        db, "_select_dev_cow_generation_phase",
+        lambda *_args, **_kwargs: db._DevCowGenerationPhase.FIRST_ISSUANCE,
+    )
     monkeypatch.setattr(db, "validate_dev_cow_successor_preimage",
                         lambda *args, **kwargs: calls.append((args, kwargs)))
     monkeypatch.setattr(db, "_validated_canonical_legacy_postimage_adoption",
@@ -2635,6 +2639,115 @@ def test_cow_completed_generation_uses_current_projection_not_issuance_digest(
     ) == receipt
 
 
+def test_cow_generation_phase_selector_is_closed_for_first_and_completed(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    stable = db.verified_stable_database_binding()
+    assert db._select_dev_cow_generation_phase(
+        root, linked_v3_receipt=linked, source_identity=source,
+        stable_binding=stable,
+    ) is db._DevCowGenerationPhase.FIRST_ISSUANCE
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    assert db._select_dev_cow_generation_phase(
+        root, linked_v3_receipt=linked, source_identity=completed_source,
+        stable_binding=stable,
+    ) is db._DevCowGenerationPhase.COMPLETED_GENERATION
+
+
+def test_cow_generation_phase_selector_rejects_ambiguous_and_neither(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    stable = db.verified_stable_database_binding()
+    before = db._durable_database_sha256(database)
+    monkeypatch.setattr(
+        db, "_cow_completed_generation_phase_prerequisites", lambda *_a, **_k: True,
+    )
+    with pytest.raises(ValueError, match="ambiguous"):
+        db._select_dev_cow_generation_phase(
+            root, linked_v3_receipt=linked, source_identity=source,
+            stable_binding=stable,
+        )
+    assert db._durable_database_sha256(database) == before
+    monkeypatch.setattr(
+        db, "_cow_completed_generation_phase_prerequisites", lambda *_a, **_k: False,
+    )
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "UPDATE schema_meta SET value='{}' "
+        "WHERE key='governance_world_current_process_json'"
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    neither_before = db._durable_database_sha256(database)
+    with pytest.raises(ValueError, match="unrecognized"):
+        db._select_dev_cow_generation_phase(
+            root, linked_v3_receipt=linked, source_identity=source,
+            stable_binding=stable,
+        )
+    assert before != neither_before
+    assert db._durable_database_sha256(database) == neither_before
+
+
+@pytest.mark.parametrize("phase", ("first", "completed"))
+def test_cow_phase_validator_error_is_never_fallback_or_masked(
+    tmp_path, monkeypatch, phase,
+):
+    from agent.governance import db
+
+    root, _database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    _phase_z_bind_first_start_runtime(tmp_path, monkeypatch, root)
+    selected = (
+        db._DevCowGenerationPhase.FIRST_ISSUANCE
+        if phase == "first"
+        else db._DevCowGenerationPhase.COMPLETED_GENERATION
+    )
+    monkeypatch.setattr(db, "_select_dev_cow_generation_phase", lambda *_a, **_k: selected)
+    calls = []
+
+    def reject(name):
+        calls.append(name)
+        raise ValueError(name + " validator marker")
+
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_preimage",
+        lambda *_a, **_k: reject("first"),
+    )
+    monkeypatch.setattr(
+        db, "validate_dev_cow_completed_generation_projection",
+        lambda *_a, **_k: reject("completed"),
+    )
+    with pytest.raises(ValueError, match=phase + " validator marker"):
+        db.validate_dev_preimage_only(
+            root, source_identity=source, linked_v3_receipt=linked,
+        )
+    assert calls == [phase]
+
+
+def test_cow_phase_dispatch_has_no_exception_text_control_flow():
+    from agent.governance import db
+    import inspect
+
+    source = inspect.getsource(db._dev_storage_root)
+    assert "except ValueError" not in source
+    assert "issuance schema_meta mismatch" not in source
+    assert "_select_dev_cow_generation_phase" in source
+
+
 def test_cow_completed_generation_transitions_to_new_child_custody(
     tmp_path, monkeypatch,
 ):
@@ -2804,7 +2917,7 @@ def test_cow_first_custody_creates_only_live_process_authority(
     )
     assert child.stdout.strip() == "True"
     db.release_dev_runtime_writer_lease(root)
-    with pytest.raises(ValueError, match="issuance schema_meta"):
+    with pytest.raises(ValueError, match="issuance schema_meta|phase is unrecognized"):
         db.validate_dev_preimage_only(
             root, source_identity=source, linked_v3_receipt=linked,
         )
