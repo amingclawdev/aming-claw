@@ -2741,6 +2741,56 @@ def test_cow_completed_process_axis_rejects_nonprovably_dead_canonical_pid(
         )
 
 
+def test_cow_completed_bootstrap_process_axis_accepts_provably_dead_pid(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    pid = 99999997
+
+    def dead_process(observed, signal_number):
+        assert (observed, signal_number) == (pid, 0)
+        raise ProcessLookupError(observed)
+
+    monkeypatch.setattr(db.os, "kill", dead_process)
+
+    db._validate_dev_cow_completed_process_axis(
+        {"pid": pid, "start_identity": f"pid:{pid}:cli-bootstrap"},
+        root=tmp_path, source_identity={},
+    )
+
+
+@pytest.mark.parametrize("liveness", ("live", "permission", "oserror", "invalid"))
+def test_cow_completed_bootstrap_process_axis_rejects_non_dead_pid(
+    tmp_path, monkeypatch, liveness,
+):
+    from agent.governance import db
+
+    pid = os.getpid() if liveness == "live" else 99999996
+    process = {"pid": pid, "start_identity": f"pid:{pid}:cli-bootstrap"}
+    if liveness == "permission":
+        monkeypatch.setattr(
+            db.os, "kill",
+            lambda *_args: (_ for _ in ()).throw(PermissionError("denied")),
+        )
+    elif liveness == "oserror":
+        monkeypatch.setattr(
+            db.os, "kill",
+            lambda *_args: (_ for _ in ()).throw(OSError("unavailable")),
+        )
+    elif liveness == "invalid":
+        process = {"pid": 0, "start_identity": "pid:0:cli-bootstrap"}
+
+    with pytest.raises(
+        ValueError,
+        match="bootstrap custody mismatch|bootstrap PID is still live|"
+        "bootstrap liveness is unavailable",
+    ):
+        db._validate_dev_cow_completed_process_axis(
+            process, root=tmp_path, source_identity={},
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
     (

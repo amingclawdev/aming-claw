@@ -4814,6 +4814,18 @@ def _validate_dev_cow_completed_process_axis(
         if (type(pid) is not int or pid <= 0
                 or value.get("start_identity") != f"pid:{pid}:cli-bootstrap"):
             raise ValueError("AC dev completed generation bootstrap custody mismatch")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "AC dev completed generation bootstrap liveness is unavailable"
+            ) from exc
+        else:
+            raise ValueError(
+                "AC dev completed generation bootstrap PID is still live"
+            )
         return
     _validate_dev_current_process_custody(
         value, root=root, candidate_source=source_identity,
