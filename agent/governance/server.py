@@ -44,6 +44,7 @@ from .db import (
     AC_PROJECT_ID,
     AC_DATABASE_STABLE_RELATIVE_PATH,
     canonical_ac_database_identity,
+    classify_graph_materialization_preimage,
     DevRuntimeSchemaVerificationError,
     admit_ac_dev_graph_materialization_schema,
     dev_runtime_verify_only,
@@ -20402,6 +20403,98 @@ def handle_graph_governance_events_stream(ctx: RequestContext):
     return STREAMED_RESPONSE
 
 
+_DEV_GRAPH_ZERO_WRITE_EMPTY_TABLES = (
+    "graph_snapshot_refs",
+    "graph_snapshots",
+    "pending_scope_reconcile",
+    "reconcile_run_metrics",
+    "graph_nodes_index",
+    "graph_edges_index",
+)
+
+
+def _dev_graph_zero_write_readiness_projection(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+) -> dict[str, Any] | None:
+    """Project an admitted, not-yet-materialized dev graph without DDL.
+
+    Graph schema creation remains owned by the authorized full/current-full
+    reconcile path.  Readiness GETs may recognize only source-derived owner
+    states; altered or unknown partial schemas remain a typed 409.
+    """
+
+    if _runtime_plane() != "dev" or project_id != AC_PROJECT_ID:
+        return None
+    before_changes = conn.total_changes
+    try:
+        classification = classify_graph_materialization_preimage(conn)
+    except ValueError as exc:
+        raise GovernanceError(
+            "ac_dev_graph_readiness_preimage_incompatible",
+            "AC dev graph readiness preimage is not source-admissible",
+            409,
+            {
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "materialization_required": False,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "pass_synthesized": False,
+            },
+        ) from exc
+    if conn.total_changes != before_changes:
+        raise GovernanceError(
+            "ac_dev_graph_readiness_projection_wrote_state",
+            "AC dev graph readiness classification must be zero-write",
+            500,
+            {
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "zero_write_rejection": True,
+                "writes_performed": True,
+                "pass_synthesized": False,
+            },
+        )
+    owner_states = dict(classification.get("owner_states") or {})
+    if owner_states and all(state == "exact" for state in owner_states.values()):
+        return None
+    row_counts = {
+        table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        for table in _DEV_GRAPH_ZERO_WRITE_EMPTY_TABLES
+    }
+    if any(row_counts.values()):
+        raise GovernanceError(
+            "ac_dev_graph_readiness_preimage_incompatible",
+            "AC dev graph readiness preimage contains materialized graph data",
+            409,
+            {
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "materialization_required": False,
+                "graph_row_counts": row_counts,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "pass_synthesized": False,
+            },
+        )
+    return {
+        "schema_version": "ac_dev_graph_zero_write_readiness.v1",
+        "runtime_plane": "dev",
+        "project_id": project_id,
+        "materialization_required": True,
+        "materialization_entrypoint": "graph_current_full_reconcile",
+        "active_graph_activation_allowed": False,
+        "owner_states": owner_states,
+        "planned_objects": list(classification.get("planned_objects") or []),
+        "graph_row_counts": row_counts,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "pass_synthesized": False,
+    }
+
+
 @route("GET", "/api/graph-governance/{project_id}/status")
 def handle_graph_governance_status(ctx: RequestContext):
     """Return active graph snapshot, scan baseline, and pending scope status."""
@@ -20410,6 +20503,30 @@ def handle_graph_governance_status(ctx: RequestContext):
 
     conn = get_connection(project_id)
     try:
+        readiness = _dev_graph_zero_write_readiness_projection(
+            conn,
+            project_id=project_id,
+        )
+        if readiness is not None:
+            return {
+                "ok": True,
+                **readiness,
+                "active_snapshot_id": "",
+                "graph_snapshot_commit": "",
+                "materialized_graph_baseline_commit": "",
+                "active_snapshot_materialization": {},
+                "active_snapshot_warnings": [],
+                "active_snapshot_rule_fingerprint": {},
+                "active_snapshot_rule_fingerprint_id": "",
+                "scan_baseline_commit": "",
+                "scan_baseline_id": None,
+                "pending_scope_reconcile_count": 0,
+                "pending_scope_reconcile": [],
+                "current_state": {
+                    "state": "materialization_required",
+                    "snapshot_id": "",
+                },
+            }
         status = store.graph_governance_status(conn, project_id)
         status["current_state"] = _dashboard_current_state(
             conn,
@@ -88978,6 +89095,28 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.operations.queue")
+        readiness = _dev_graph_zero_write_readiness_projection(
+            conn,
+            project_id=project_id,
+        )
+        if readiness is not None:
+            return {
+                "ok": True,
+                **readiness,
+                "snapshot_id": "",
+                "active_snapshot_id": "",
+                "count": 0,
+                "operations": [],
+                "summary": {
+                    "by_type": {},
+                    "by_status": {},
+                    "pending_scope_reconcile_count": 0,
+                    "current_state": {
+                        "state": "materialization_required",
+                        "snapshot_id": "",
+                    },
+                },
+            }
         status = store.graph_governance_status(conn, project_id)
         selected_active_snapshot_id = str(
             ctx.query.get("snapshot_id")
@@ -208000,7 +208139,15 @@ def handle_version_check(ctx: RequestContext):
         else:
             target_root = self_root
             root_source = "governance_fallback"
-    live_target_authoritative = root_source in {"explicit_project", "registered_project"}
+    dev_self_root_authoritative = bool(
+        _runtime_plane() == "dev"
+        and pid == AC_PROJECT_ID
+        and target_root == _dev_exact_source_root()
+    )
+    live_target_authoritative = bool(
+        root_source in {"explicit_project", "registered_project"}
+        or dev_self_root_authoritative
+    )
 
     def _prefix_match(left: str, right: str) -> bool:
         return bool(left and right and (left.startswith(right) or right.startswith(left)))
@@ -208064,14 +208211,22 @@ def handle_version_check(ctx: RequestContext):
         git_synced = row["git_synced_at"] or ""
 
     target_chain_version = (
-        (target_state or {}).get("chain_sha")
-        or (target_state or {}).get("version")
-        or (target_head_short if live_target_authoritative else "")
-        or ""
+        target_head
+        if dev_self_root_authoritative
+        else (
+            (target_state or {}).get("chain_sha")
+            or (target_state or {}).get("version")
+            or (target_head_short if live_target_authoritative else "")
+            or ""
+        )
     )
     trailer_source = (target_state or {}).get("source") or ""
     if live_target_authoritative:
-        source = trailer_source or ("git" if target_head else "none")
+        source = (
+            "server_derived_dev_git_head"
+            if dev_self_root_authoritative and target_head
+            else trailer_source or ("git" if target_head else "none")
+        )
         dirty_files = filter_dirty_files((target_state or {}).get("dirty_files") or [])
         if target_state is None:
             dirty_files = filter_dirty_files(
@@ -208114,7 +208269,11 @@ def handle_version_check(ctx: RequestContext):
         ok = False
         parts.append(f"{len(dirty_files)} uncommitted files")
     if not row:
-        parts.append("Project version row is not initialized")
+        parts.append(
+            "Project version row is not initialized (legacy advisory)"
+            if dev_self_root_authoritative
+            else "Project version row is not initialized"
+        )
     elif not synced_head:
         parts.append("Executor has not synced git status yet")
     elif synced_head and not target_synced_with_governance:
@@ -208188,6 +208347,8 @@ def handle_version_check(ctx: RequestContext):
         "runtime_scope": "governance",
         "runtime_match": runtime_match,
         "governance_runtime": governance_runtime,
+        "server_derived_dev_head_authority": dev_self_root_authoritative,
+        "project_version_row_required": not dev_self_root_authoritative,
     }
 
 
@@ -218372,6 +218533,34 @@ def handle_integration_epoch_worldref_seal_linear_unlock(ctx: RequestContext):
 def handle_project_release_operator_head_queue(ctx: RequestContext):
     """Read or mutate the bounded release-operator queue."""
     project_id = ctx.get_project_id()
+    if _runtime_plane() == "dev" and project_id == AC_PROJECT_ID:
+        capability = {
+            "schema_version": "release_operator_head_queue.dev_capability.v1",
+            "runtime_plane": "dev",
+            "project_id": project_id,
+            "available": False,
+            "state": "not_available_in_dev_world",
+            "items": [],
+            "selection": {
+                "selected_backlog_id": "",
+                "selection_source": "explicit_backlog_required",
+            },
+            "schema_materialized": False,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "pass_synthesized": False,
+        }
+        if ctx.method == "GET":
+            return {
+                "ok": True,
+                "release_operator_head_queue": capability,
+            }
+        raise GovernanceError(
+            "release_operator_head_queue_not_available_in_dev_world",
+            "AC dev requires an explicit backlog and does not own release queue state",
+            409,
+            capability,
+        )
     with DBContext(project_id) as conn:
         if ctx.method == "GET":
             return {
@@ -218972,6 +219161,27 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
         or _first_query_value(ctx.query, "bug_id")
         or ""
     ).strip()
+    if (
+        _runtime_plane() == "dev"
+        and project_id == AC_PROJECT_ID
+        and not backlog_id
+    ):
+        raise GovernanceError(
+            "explicit_backlog_required",
+            "AC dev Onboard requires an explicit backlog_id or bug_id",
+            409,
+            {
+                "schema_version": "onboard_route_guide.dev_explicit_backlog.v1",
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "required_fields": ["backlog_id"],
+                "release_operator_head_queue_available": False,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "pass_synthesized": False,
+            },
+        )
     route_token_ref = _contract_runtime_ref_value(
         ctx, "route_token_ref", "observer_route_token_ref"
     )

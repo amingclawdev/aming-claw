@@ -207463,3 +207463,351 @@ def test_executor_session_auth_guards_real_claim_progress_complete_zero_write(
         (task["task_id"],),
     ).fetchone()
     assert tuple(row) == ("executor-worker", "succeeded")
+
+
+def _dev_readiness_predecessor(conn):
+    conn.execute("DROP INDEX idx_pending_scope_branch")
+    conn.execute("DROP INDEX idx_pending_scope_status")
+    conn.commit()
+
+
+def _sqlite_inventory(conn):
+    return conn.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "WHERE type IN ('table','index','trigger','view') "
+        "ORDER BY type,name,tbl_name"
+    ).fetchall()
+
+
+def test_dev_graph_readiness_gets_are_zero_write_for_exact_predecessor(
+    conn, monkeypatch,
+):
+    _dev_readiness_predecessor(conn)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_require_graph_governance_operator", lambda *_args, **_kwargs: {},
+    )
+    before_inventory = _sqlite_inventory(conn)
+    before_changes = conn.total_changes
+
+    status = server.handle_graph_governance_status(
+        _ctx({"project_id": "aming-claw"})
+    )
+    queue = server.handle_graph_governance_operations_queue(
+        _ctx({"project_id": "aming-claw"})
+    )
+
+    expected_states = {
+        "graph_snapshot_store": "pending_scope_index_predecessor",
+        "graph_events": "absent",
+        "graph_correction_patches": "absent",
+        "asset_projection": "exact",
+        "asset_impact": "exact",
+    }
+    for result in (status, queue):
+        assert result["ok"] is True
+        assert result["materialization_required"] is True
+        assert result["owner_states"] == expected_states
+        assert set(result["planned_objects"]) == {
+            "idx_pending_scope_branch",
+            "idx_pending_scope_status",
+        }
+        assert result["graph_row_counts"] == {
+            "graph_snapshot_refs": 0,
+            "graph_snapshots": 0,
+            "pending_scope_reconcile": 0,
+            "reconcile_run_metrics": 0,
+            "graph_nodes_index": 0,
+            "graph_edges_index": 0,
+        }
+        assert result["writes_performed"] is False
+    assert status["active_snapshot_id"] == ""
+    assert queue["operations"] == []
+    assert conn.total_changes == before_changes
+    assert _sqlite_inventory(conn) == before_inventory
+
+
+def test_dev_graph_readiness_rejects_unknown_partial_without_write(
+    conn, monkeypatch,
+):
+    _dev_readiness_predecessor(conn)
+    conn.execute("CREATE TABLE graph_unknown_authority(id TEXT)")
+    conn.commit()
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    before_inventory = _sqlite_inventory(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_status(
+            _ctx({"project_id": "aming-claw"})
+        )
+
+    assert rejected.value.code == "ac_dev_graph_readiness_preimage_incompatible"
+    assert rejected.value.status == 409
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert _sqlite_inventory(conn) == before_inventory
+
+
+def test_dev_graph_readiness_rejects_materialized_rows_without_write(
+    conn, monkeypatch,
+):
+    _dev_readiness_predecessor(conn)
+    conn.execute(
+        "INSERT INTO graph_nodes_index(project_id,snapshot_id,node_id) "
+        "VALUES('aming-claw','candidate','node')"
+    )
+    conn.commit()
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_status(
+            _ctx({"project_id": "aming-claw"})
+        )
+
+    assert rejected.value.code == "ac_dev_graph_readiness_preimage_incompatible"
+    assert rejected.value.status == 409
+    assert rejected.value.details["graph_row_counts"]["graph_nodes_index"] == 1
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+
+
+def test_dev_graph_readiness_becomes_normal_after_authorized_admission(
+    conn, monkeypatch,
+):
+    _dev_readiness_predecessor(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        governance_db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    assert server._dev_graph_zero_write_readiness_projection(
+        conn, project_id="aming-claw",
+    )["materialization_required"] is True
+
+    governance_db.admit_ac_dev_graph_materialization_schema(
+        conn, project_id="aming-claw",
+    )
+
+    assert server._dev_graph_zero_write_readiness_projection(
+        conn, project_id="aming-claw",
+    ) is None
+    normal = server.handle_graph_governance_status(
+        _ctx({"project_id": "aming-claw"})
+    )
+    assert normal["ok"] is True
+    assert normal["active_snapshot_id"] == ""
+    assert "materialization_required" not in normal
+
+
+def test_dev_onboard_requires_explicit_backlog_before_db_or_queue(
+    monkeypatch,
+):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    for name in (
+        "DBContext",
+        "_contract_runtime_require_canonical_authority_registry_complete",
+        "_release_operator_head_queue_view",
+    ):
+        monkeypatch.setattr(
+            server,
+            name,
+            lambda *_args, _name=name, **_kwargs: pytest.fail(
+                f"no-backlog dev guide reached {_name}"
+            ),
+        )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": "aming-claw"},
+                method="POST",
+                body={"role": "observer", "work_type": "operator_supervised_direct_main"},
+            )
+        )
+
+    assert rejected.value.code == "explicit_backlog_required"
+    assert rejected.value.status == 409
+    assert rejected.value.details["writes_performed"] is False
+
+
+def test_dev_explicit_backlog_guide_skips_release_queue_schema(
+    conn, monkeypatch,
+):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_ac_promotion_successor_activation_preguard", lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        server, "_contract_runtime_require_canonical_authority_registry_complete",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        server, "_require_onboard_route_guide_work_type", lambda _value: None,
+    )
+    monkeypatch.setattr(
+        server, "_require_onboard_dev_selector_endpoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        server, "_require_onboard_route_guide_backlog_exists",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime, "get_active_integration_epoch", lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        server, "_onboard_route_guide_service_response",
+        lambda *_args, **_kwargs: {"ok": True, "selected": "explicit"},
+    )
+    before = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'release_operator_head_queue%'"
+    ).fetchall()
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": "AC-EXPLICIT-ROW",
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+            },
+        )
+    )
+
+    assert result == {"ok": True, "selected": "explicit"}
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'release_operator_head_queue%'"
+    ).fetchall() == before == []
+
+
+def test_dev_release_queue_is_capability_only_and_post_is_rejected(monkeypatch):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "DBContext", lambda *_args, **_kwargs: pytest.fail("queue opened DB"),
+    )
+    read = server.handle_project_release_operator_head_queue(
+        _ctx({"project_id": "aming-claw"})
+    )
+    assert read["release_operator_head_queue"]["state"] == (
+        "not_available_in_dev_world"
+    )
+    assert read["release_operator_head_queue"]["schema_materialized"] is False
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": "aming-claw"},
+                method="POST",
+                body={"action": "insert", "backlog_id": "AC-NO-QUEUE"},
+            )
+        )
+    assert rejected.value.code == (
+        "release_operator_head_queue_not_available_in_dev_world"
+    )
+    assert rejected.value.details["writes_performed"] is False
+
+
+def _version_git_repo(root: Path) -> str:
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "codex/ac-dev"], cwd=root,
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=root, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "AC Test"], cwd=root, check=True,
+    )
+    (root / "tracked.txt").write_text("exact\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "exact"], cwd=root,
+        check=True, capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_dev_exact_self_root_version_uses_full_live_head_without_seed(
+    conn, monkeypatch, tmp_path,
+):
+    root = tmp_path / "dev-source"
+    head = _version_git_repo(root)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(server, "_dev_exact_source_root", lambda: root.resolve())
+    monkeypatch.setattr(server, "get_server_version", lambda: head)
+    monkeypatch.setattr(
+        server, "get_governance_runtime_version", lambda default="": head,
+    )
+    before = conn.execute(
+        "SELECT COUNT(*) FROM project_version WHERE project_id='aming-claw'"
+    ).fetchone()[0]
+
+    result = server.handle_version_check(
+        _ctx(
+            {"project_id": "aming-claw"},
+            body={"project_root": str(root)},
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["head"] == head
+    assert result["chain_version"] == head
+    assert result["source"] == "server_derived_dev_git_head"
+    assert result["server_derived_dev_head_authority"] is True
+    assert result["project_version_row_required"] is False
+    assert "legacy advisory" in result["message"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM project_version WHERE project_id='aming-claw'"
+    ).fetchone()[0] == before == 0
+
+
+def test_version_special_authority_is_not_granted_to_stable_or_foreign_root(
+    conn, monkeypatch, tmp_path,
+):
+    exact = tmp_path / "exact-dev"
+    foreign = tmp_path / "foreign"
+    _version_git_repo(exact)
+    _version_git_repo(foreign)
+    monkeypatch.setattr(server, "_dev_exact_source_root", lambda: exact.resolve())
+
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    stable = server.handle_version_check(
+        _ctx(
+            {"project_id": "aming-claw"},
+            body={"project_root": str(exact)},
+        )
+    )
+    assert stable["server_derived_dev_head_authority"] is False
+
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    foreign_result = server.handle_version_check(
+        _ctx(
+            {"project_id": "aming-claw"},
+            body={"project_root": str(foreign)},
+        )
+    )
+    assert foreign_result["server_derived_dev_head_authority"] is False

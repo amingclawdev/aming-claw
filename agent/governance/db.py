@@ -72,7 +72,7 @@ class _DevFirstStartContext:
         "pid", "process_start_identity", "source_root", "source_commit",
         "source_tree", "cli_sha256", "server_sha256", "storage_root",
         "storage_device", "storage_inode", "database_path", "database_device",
-        "database_inode", "database_sha256", "logical_sha256", "_sealed",
+        "database_inode", "world_custody_sha256", "_sealed",
     )
 
     def __init__(self, token: object, **values: object) -> None:
@@ -3816,6 +3816,89 @@ def _database_logical_sha256(database: Path) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+_DEV_LIVE_CUSTODY_META_KEYS = (
+    "schema_version",
+    "governance_world_id",
+    "governance_world_genesis_sha256",
+    "governance_world_genesis_json",
+    "governance_world_source_tip_json",
+    "governance_world_source_tip_sha256",
+    "governance_world_source_tip_revision",
+    "governance_world_current_process_json",
+)
+
+
+def _dev_live_world_custody_sha256(
+    database: Path, *, immutable: bool,
+) -> str:
+    """Hash only immutable world/custody rows while verifying live schema.
+
+    The database is intentionally mutable after first start: backlog, timeline,
+    ContractRuntime, and graph data are normal service state.  This projection
+    keeps the first-start seal over the world and process custody rows without
+    turning every legitimate DML transaction into a new launch authority.
+    """
+
+    query = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+    connection = sqlite3.connect(
+        "file:" + urllib.parse.quote(str(database)) + query,
+        uri=True,
+        timeout=10,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        _verify_existing_schema(connection)
+        _verify_dev_world_schema_inventory(connection)
+        placeholders = ",".join("?" for _ in _DEV_LIVE_CUSTODY_META_KEYS)
+        rows = connection.execute(
+            "SELECT key,value FROM schema_meta WHERE key IN ("
+            + placeholders
+            + ") ORDER BY key",
+            _DEV_LIVE_CUSTODY_META_KEYS,
+        ).fetchall()
+        projection = {str(row["key"]): str(row["value"]) for row in rows}
+    finally:
+        connection.close()
+    if set(projection) != set(_DEV_LIVE_CUSTODY_META_KEYS):
+        raise ValueError("AC dev live world custody projection is incomplete")
+    try:
+        genesis = json.loads(projection["governance_world_genesis_json"])
+        source_tip = json.loads(projection["governance_world_source_tip_json"])
+        process = json.loads(projection["governance_world_current_process_json"])
+        source_revision = int(
+            projection["governance_world_source_tip_revision"]
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AC dev live world custody projection is malformed") from exc
+    if (
+        projection["schema_version"] != str(SCHEMA_VERSION)
+        or projection["governance_world_id"] != AC_DEV_WORLD_ID
+        or not isinstance(genesis, Mapping)
+        or genesis.get("schema_version") != AC_WORLD_GENESIS_SCHEMA
+        or genesis.get("world_id") != AC_DEV_WORLD_ID
+        or genesis.get("project_id") != AC_PROJECT_ID
+        or genesis.get("source_only") is not True
+        or genesis.get("rows_copied") != 0
+        or projection["governance_world_genesis_sha256"]
+        != _world_genesis_hash(genesis)
+        or not isinstance(source_tip, Mapping)
+        or set(source_tip) != _DEV_SOURCE_TIP_KEYS
+        or projection["governance_world_source_tip_sha256"]
+        != _world_source_tip_hash(source_tip)
+        or source_revision < 1
+        or not isinstance(process, Mapping)
+    ):
+        raise ValueError("AC dev live world custody projection is invalid")
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            projection,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _current_first_start_source(source_root: Path) -> dict[str, str]:
     root = source_root.expanduser().resolve(strict=True)
     branch = _git_read_exact(root, "branch", "--show-current").decode().strip()
@@ -3862,6 +3945,9 @@ def _install_dev_first_start_context(
     if (_durable_database_sha256(database) != database_sha256
             or _database_logical_sha256(database) != logical_sha256):
         raise ValueError("AC dev first-start postimage changed before context install")
+    world_custody_sha256 = _dev_live_world_custody_sha256(
+        database, immutable=True,
+    )
     _bind_dev_writer_lease_database_identity(database)
     _DEV_FIRST_START_CONTEXT = _DevFirstStartContext(
         _DEV_FIRST_START_CONTEXT_TOKEN,
@@ -3871,8 +3957,8 @@ def _install_dev_first_start_context(
         server_sha256=source["server_sha256"], storage_root=str(resolved_root),
         storage_device=int(root_stat.st_dev), storage_inode=int(root_stat.st_ino),
         database_path=str(database), database_device=int(database_stat.st_dev),
-        database_inode=int(database_stat.st_ino), database_sha256=database_sha256,
-        logical_sha256=logical_sha256,
+        database_inode=int(database_stat.st_ino),
+        world_custody_sha256=world_custody_sha256,
     )
 
 
@@ -3913,8 +3999,8 @@ def _validate_dev_first_start_context(root: Path) -> bool:
         or context.database_path != str(database)
         or (context.database_device, context.database_inode)
         != (int(database_stat.st_dev), int(database_stat.st_ino))
-        or context.database_sha256 != _durable_database_sha256(database)
-        or context.logical_sha256 != _database_logical_sha256(database)
+        or context.world_custody_sha256
+        != _dev_live_world_custody_sha256(database, immutable=False)
         or not lease_valid
     ):
         raise ValueError("AC dev first-start context binding changed")

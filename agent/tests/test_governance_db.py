@@ -3288,6 +3288,7 @@ def test_cow_prebind_api_rejects_caller_asserted_database_sha(
 def _phase_z_bind_first_start_runtime(tmp_path, monkeypatch, root):
     from agent.governance import db
     import agent.runtime_plane as runtime_plane
+    db._DEV_FIRST_START_CONTEXT = None
     stable_binding = db.verified_stable_database_binding()
     stable_volume = tmp_path / "stable-volume"
     stable_volume.mkdir()
@@ -3353,7 +3354,7 @@ def test_cow_first_custody_creates_only_live_process_authority(
 
 
 @pytest.mark.parametrize(
-    "attack", ("pid", "source", "database_bytes", "context_hash", "root_inode"),
+    "attack", ("pid", "source", "custody_hash", "root_inode"),
 )
 def test_first_start_context_revalidates_every_live_binding(
     tmp_path, monkeypatch, attack,
@@ -3378,18 +3379,11 @@ def test_first_start_context_revalidates_every_live_binding(
             (Path(source["root"]) / "agent" / "governance" / "server.py").write_text(
                 "# changed after context\n", encoding="utf-8",
             )
-        elif attack == "database_bytes":
-            connection = sqlite3.connect(database)
-            connection.execute(
-                "INSERT INTO backlog_bugs(bug_id,created_at,updated_at) "
-                "VALUES('AC-CONTEXT-DRIFT','now','now')"
+        elif attack == "custody_hash":
+            restored = ("world_custody_sha256", context.world_custody_sha256)
+            object.__setattr__(
+                context, "world_custody_sha256", "sha256:" + "0" * 64,
             )
-            connection.commit()
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            connection.close()
-        elif attack == "context_hash":
-            restored = ("database_sha256", context.database_sha256)
-            object.__setattr__(context, "database_sha256", "sha256:" + "0" * 64)
         else:
             restored = ("storage_inode", context.storage_inode)
             object.__setattr__(context, "storage_inode", context.storage_inode + 1)
@@ -3398,6 +3392,84 @@ def test_first_start_context_revalidates_every_live_binding(
     finally:
         if restored is not None:
             object.__setattr__(context, restored[0], restored[1])
+        db.release_dev_runtime_writer_lease(root)
+
+
+def test_first_start_live_context_allows_backlog_and_timeline_dml(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, _database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    _phase_z_bind_first_start_runtime(tmp_path, monkeypatch, root)
+    custody = _phase_z_durable_process(root, source, pid=os.getpid())
+    db.commit_dev_child_custody(
+        root, source_identity=source, process_identity=custody,
+        linked_v3_receipt=linked,
+    )
+    backlog_id = "AC-LIVE-DML-" + os.urandom(8).hex()
+    first = db.get_connection("aming-claw")
+    try:
+        first.execute(
+            "INSERT INTO backlog_bugs(bug_id,created_at,updated_at) VALUES(?,?,?)",
+            (backlog_id, "now", "now"),
+        )
+        first.execute(
+            "INSERT INTO task_timeline_events(project_id,backlog_id,event_type,created_at) "
+            "VALUES(?,?,?,?)",
+            ("aming-claw", backlog_id, "implementation", "now"),
+        )
+        first.commit()
+    finally:
+        first.close()
+
+    second = db.get_connection("aming-claw")
+    try:
+        assert second.execute(
+            "SELECT COUNT(*) FROM backlog_bugs WHERE bug_id=?", (backlog_id,)
+        ).fetchone()[0] == 1
+        assert second.execute(
+            "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id=?",
+            (backlog_id,),
+        ).fetchone()[0] == 1
+    finally:
+        second.close()
+        db.release_dev_runtime_writer_lease(root)
+
+
+@pytest.mark.parametrize("attack", ("world", "schema"))
+def test_first_start_live_context_rejects_world_and_schema_attacks(
+    tmp_path, monkeypatch, attack,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    _phase_z_bind_first_start_runtime(tmp_path, monkeypatch, root)
+    custody = _phase_z_durable_process(root, source, pid=os.getpid())
+    db.commit_dev_child_custody(
+        root, source_identity=source, process_identity=custody,
+        linked_v3_receipt=linked,
+    )
+    attacker = sqlite3.connect(database)
+    try:
+        if attack == "world":
+            attacker.execute(
+                "UPDATE schema_meta SET value='forged-world' "
+                "WHERE key='governance_world_id'"
+            )
+        else:
+            attacker.execute("CREATE TABLE shadow_runtime_attack(id TEXT)")
+        attacker.commit()
+    finally:
+        attacker.close()
+    try:
+        with pytest.raises(ValueError):
+            db._validate_dev_first_start_context(root)
+    finally:
         db.release_dev_runtime_writer_lease(root)
 
 
