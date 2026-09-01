@@ -357,15 +357,6 @@ def _verify_current_cow_successor_source(
         raise ValueError("AC dev COW current source tip is invalid") from exc
     if not isinstance(current, Mapping):
         raise ValueError("AC dev COW current source tip is invalid")
-    try:
-        current_root = Path(str(current.get("root") or "")).resolve(strict=True)
-        cli_source = current_root / "agent" / "cli.py"
-        cli_metadata = cli_source.stat(follow_symlinks=False)
-        current_cli_sha256 = (
-            "sha256:" + hashlib.sha256(cli_source.read_bytes()).hexdigest()
-        )
-    except OSError as exc:
-        raise ValueError("AC dev COW current source tip producer is invalid") from exc
     if (
         adoption_path.parent
         != root / "archive" / "canonical-legacy-postimage-adoption"
@@ -373,14 +364,14 @@ def _verify_current_cow_successor_source(
         or revision < 2
         or meta.get("governance_world_source_tip_sha256")
         != _world_source_tip_hash(current)
-        or cli_source.is_symlink()
-        or not stat.S_ISREG(cli_metadata.st_mode)
-        or cli_source.resolve(strict=True) != cli_source
-        or str(current.get("source_sha256") or "") != current_cli_sha256
         or str(anchor.get("root") or "") != str(current.get("root") or "")
         or str(anchor.get("commit") or "") == str(current.get("commit") or "")
     ):
         raise ValueError("AC dev COW current source descendant authority mismatch")
+    _validate_dev_source_tip_custody(
+        current, stored_sha256=str(meta.get("governance_world_source_tip_sha256") or ""),
+        candidate=current,
+    )
     _verify_dev_source_upgrade(anchor, current)
 
 
@@ -2132,6 +2123,13 @@ def _validated_canonical_legacy_postimage_adoption(
             or dict(linked_source.get("cli_source") or {}) != historical
             or linked_value.get("database_sha256_after") != adoption.get("database_sha256_preimage")):
         raise ValueError("AC dev canonical adoption predecessor mismatch")
+    legacy_process = adoption.get("legacy_process_identity")
+    if not isinstance(legacy_process, Mapping):
+        raise ValueError("AC dev canonical adoption process custody is missing")
+    _validate_dev_current_process_custody(
+        legacy_process, root=root, candidate_source=source_identity,
+        historical_process=legacy_process,
+    )
     for suffix in ("-wal", "-shm", "-journal"):
         companion = Path(str(database) + suffix)
         if companion.exists() or companion.is_symlink():
@@ -2179,11 +2177,12 @@ def _validated_canonical_legacy_postimage_adoption(
         if (tip != expected_tip or meta.get("governance_world_source_tip_sha256")
                 != _world_source_tip_hash(expected_tip)
                 or revision < baseline_revision + 1
-                or not isinstance(process, Mapping)
-                or process.get("source_root") != source_identity.get("root")
-                or process.get("source_commit") != source_identity.get("commit")
-                or process.get("project_id") != AC_PROJECT_ID or process.get("port") != 40008):
+                or not isinstance(process, Mapping)):
             raise ValueError("AC dev canonical adoption post-custody binding mismatch")
+        _validate_dev_current_process_custody(
+            process, root=root, candidate_source=source_identity,
+            historical_process=legacy_process,
+        )
     return root
 
 
@@ -2458,6 +2457,114 @@ def _world_source_tip_hash(source: Mapping[str, object]) -> str:
             ensure_ascii=True,
         ).encode("utf-8")
     ).hexdigest()
+
+
+_DEV_SOURCE_TIP_KEYS = frozenset({"root", "branch", "commit", "source_sha256"})
+_DURABLE_PROCESS_IDENTITY_KEYS = frozenset({
+    "argv", "cwd", "source_root", "source_commit", "source_tree",
+    "dev_storage_root", "project_id", "port", "policy", "launch_id",
+    "pid", "start_identity",
+})
+_DEV_DURABLE_POLICY = {
+    "runtime_plane": "dev", "migration": "verify-only",
+    "stable_deployment": "deny", "graph_activation": "deny",
+    "background_workers": "deny",
+}
+
+
+def _git_read_exact(root: Path, *args: str) -> bytes:
+    result = subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, timeout=10, check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("AC dev custody Git authority is unavailable")
+    return result.stdout
+
+
+def _validate_dev_source_tip_custody(
+    tip: Mapping[str, object], *, stored_sha256: str,
+    candidate: Mapping[str, object],
+) -> None:
+    """Bind a closed historical tip to its producer and a clean descendant."""
+    candidate_tip = {key: candidate.get(key) for key in _DEV_SOURCE_TIP_KEYS}
+    if (set(tip) != _DEV_SOURCE_TIP_KEYS
+            or stored_sha256 != _world_source_tip_hash(tip)):
+        raise ValueError("AC dev source tip custody schema mismatch")
+    try:
+        tip_root = Path(str(tip["root"])).expanduser().resolve(strict=True)
+        candidate_root = Path(str(candidate_tip["root"])).expanduser().resolve(strict=True)
+        candidate_cli = candidate_root / "agent" / "cli.py"
+        candidate_stat = candidate_cli.stat(follow_symlinks=False)
+    except (KeyError, OSError) as exc:
+        raise ValueError("AC dev source tip custody root mismatch") from exc
+    if (str(tip["branch"]) != "codex/ac-dev"
+            or str(candidate_tip["branch"]) != "codex/ac-dev"
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(tip["commit"]))
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(candidate_tip["commit"]))
+            or candidate_cli.is_symlink() or not stat.S_ISREG(candidate_stat.st_mode)
+            or candidate_cli.resolve(strict=True) != candidate_cli):
+        raise ValueError("AC dev source tip custody identity mismatch")
+    historical_bytes = _git_read_exact(
+        tip_root, "show", f"{tip['commit']}:agent/cli.py",
+    )
+    historical_sha = "sha256:" + hashlib.sha256(historical_bytes).hexdigest()
+    candidate_sha = "sha256:" + hashlib.sha256(candidate_cli.read_bytes()).hexdigest()
+    if (tip.get("source_sha256") != historical_sha
+            or candidate_tip.get("source_sha256") != candidate_sha):
+        raise ValueError("AC dev source tip producer hash mismatch")
+    _verify_dev_source_upgrade(tip, candidate_tip)
+
+
+def _validate_dev_current_process_custody(
+    process: Mapping[str, object], *, root: Path,
+    candidate_source: Mapping[str, object],
+    historical_process: Mapping[str, object] | None = None,
+) -> None:
+    """Validate the sole two admitted process-custody projections."""
+    value = dict(process)
+    if set(value) == {"pid", "start_identity"}:
+        pid = value.get("pid")
+        if (type(pid) is not int or pid <= 0
+                or value.get("start_identity") != f"pid:{pid}:cli-bootstrap"
+                or historical_process is None or value != dict(historical_process)):
+            raise ValueError("AC dev bootstrap process custody mismatch")
+        return
+    if set(value) != _DURABLE_PROCESS_IDENTITY_KEYS:
+        raise ValueError("AC dev durable process custody schema mismatch")
+    pid = value.get("pid")
+    argv = value.get("argv")
+    try:
+        source_root = Path(str(value.get("source_root") or "")).resolve(strict=True)
+        cwd = Path(str(value.get("cwd") or "")).resolve(strict=True)
+        dev_root = Path(str(value.get("dev_storage_root") or "")).resolve(strict=True)
+        candidate_root = Path(str(candidate_source.get("root") or "")).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("AC dev durable process custody root mismatch") from exc
+    argv_valid = ((isinstance(argv, list) and bool(argv)
+                   and all(isinstance(item, str) and item for item in argv))
+                  or (isinstance(argv, str) and bool(argv.strip())))
+    command = " ".join(argv) if isinstance(argv, list) else str(argv or "")
+    commit = str(value.get("source_commit") or "").lower()
+    if (type(pid) is not int or pid <= 0 or not argv_valid
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("start_identity") or ""))
+            or source_root != candidate_root or cwd != candidate_root or dev_root != root.resolve(strict=True)
+            or value.get("project_id") != AC_PROJECT_ID or value.get("port") != 40008
+            or value.get("policy") != _DEV_DURABLE_POLICY
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("launch_id") or ""))
+            or value["launch_id"] not in command
+            or "agent.cli" not in command or " start " not in f" {command} "
+            or "--durable-child-launch-id" not in command
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)):
+        raise ValueError("AC dev durable process custody binding mismatch")
+    tree = _git_read_exact(candidate_root, "rev-parse", f"{commit}^{{tree}}").decode().strip()
+    if value.get("source_tree") != tree:
+        raise ValueError("AC dev durable process custody tree mismatch")
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, str(candidate_source.get("commit") or "")],
+        cwd=candidate_root, capture_output=True, timeout=10, check=False,
+    )
+    if ancestor.returncode != 0:
+        raise ValueError("AC dev durable process custody source is not an ancestor")
 
 
 def _verify_dev_source_upgrade(
@@ -4041,7 +4148,22 @@ def validate_dev_cow_successor_preimage(
     if (not isinstance(tip, Mapping) or not isinstance(process, Mapping) or revision < 1
             or meta.get("governance_world_source_tip_sha256") != _world_source_tip_hash(tip)):
         raise ValueError("AC dev COW successor custody binding mismatch")
-    _verify_dev_source_upgrade(dict(tip), dict(source_identity))
+    adoption_ref = dict(history.get("adoption") or {})
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    if adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}:
+        raise ValueError("AC dev COW successor custody history mismatch")
+    historical_process = adoption.get("legacy_process_identity")
+    if not isinstance(historical_process, Mapping):
+        historical_process = None
+    _validate_dev_current_process_custody(
+        process, root=root, candidate_source=source_identity,
+        historical_process=historical_process,
+    )
+    _validate_dev_source_tip_custody(
+        tip, stored_sha256=str(meta.get("governance_world_source_tip_sha256") or ""),
+        candidate=source_identity,
+    )
     return receipt
 
 

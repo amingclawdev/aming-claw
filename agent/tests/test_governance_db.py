@@ -2059,6 +2059,38 @@ def test_cow_receipt_reconstruction_keeps_issuance_schema_after_source_expands(
     assert db.validate_dev_cow_successor_receipt(root) == immutable
 
 
+@pytest.mark.parametrize("mutation", [
+    "empty", "missing", "extra", "bool_pid", "zero_pid", "bad_start",
+])
+def test_cow_bootstrap_process_custody_is_closed_and_history_bound(
+    tmp_path, mutation,
+):
+    from agent.governance import db
+
+    historical = {"pid": 41, "start_identity": "pid:41:cli-bootstrap"}
+    process = dict(historical)
+    if mutation == "empty": process = {}
+    elif mutation == "missing": process.pop("start_identity")
+    elif mutation == "extra": process["project_id"] = "aming-claw"
+    elif mutation == "bool_pid": process["pid"] = True
+    elif mutation == "zero_pid": process.update(pid=0, start_identity="pid:0:cli-bootstrap")
+    elif mutation == "bad_start": process["start_identity"] = "pid:42:cli-bootstrap"
+    with pytest.raises(ValueError, match="process custody"):
+        db._validate_dev_current_process_custody(
+            process, root=tmp_path, candidate_source={},
+            historical_process=historical,
+        )
+
+
+def test_cow_bootstrap_process_custody_accepts_exact_historical_observation(tmp_path):
+    from agent.governance import db
+
+    process = {"pid": 41, "start_identity": "pid:41:cli-bootstrap"}
+    db._validate_dev_current_process_custody(
+        process, root=tmp_path, candidate_source={}, historical_process=process,
+    )
+
+
 @pytest.mark.parametrize("drift", [None, "dirty", "non_descendant", "cli_hash"])
 def test_current_cow_source_requires_clean_strict_same_root_descendant(
     tmp_path, monkeypatch, drift,
@@ -3597,6 +3629,9 @@ def test_canonical_legacy_postimage_adoption_is_exact_zero_connect_ingress(
         "linked_v3_receipt": str(linked),
         "linked_v3_receipt_sha256": "sha256:" + hashlib.sha256(linked_raw).hexdigest(),
         "receipt_source_identity": historical, "candidate_source_identity": source,
+        "legacy_process_identity": {
+            "pid": 39594, "start_identity": "pid:39594:cli-bootstrap",
+        },
     }
     if mutation == "candidate": adoption["candidate_source_identity"] = historical
     elif mutation == "database_sha": adoption["database_sha256_postimage"] = "sha256:" + "0" * 64
