@@ -2219,22 +2219,49 @@ def test_observer_route_context_issue_mcp_boundaries_strip_raw_route_token(monke
         },
     )
     _assert_route_issue_result_is_copy_safe(direct)
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer/route-context/issue",
+            {
+                "project_id": "aming-claw",
+                "task_id": "copy-safe-route-issue",
+                "caller_role": "observer",
+            },
+        )
+    ]
     assert raw_result["route_token"]["token"] == "raw-write-authority"
+
+    stdio_calls = []
+
+    def fake_http(method, path, body):
+        stdio_calls.append((method, path, body))
+        return raw_result
 
     monkeypatch.setattr(
         governance_mcp_server,
         "_http",
-        lambda *args, **kwargs: raw_result,
+        fake_http,
     )
     stdio = governance_mcp_server._dispatch_tool(
         "observer_route_context_issue",
         {
             "project_id": "aming-claw",
             "task_id": "copy-safe-route-issue",
-            "caller_role": "observer",
         },
     )
     _assert_route_issue_result_is_copy_safe(stdio)
+    assert stdio_calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer/route-context/issue",
+            {
+                "project_id": "aming-claw",
+                "task_id": "copy-safe-route-issue",
+                "caller_role": "observer",
+            },
+        )
+    ]
     assert raw_result["nested"]["route_token"]["token"] == (
         "nested-raw-write-authority"
     )

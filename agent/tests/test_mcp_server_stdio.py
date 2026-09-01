@@ -5534,12 +5534,17 @@ def test_mcp_observer_route_context_issue_forwards_token_request():
         },
     )
 
-    assert result == {"ok": True, "route_token_ref": "rtok-test"}
+    assert result == {
+        "ok": True,
+        "route_token_ref": "rtok-test",
+        "raw_route_token_exposed": False,
+    }
     assert calls == [
         (
             "POST",
             "/api/projects/aming-claw/observer/route-context/issue",
             {
+                "project_id": "aming-claw",
                 "caller_role": "observer",
                 "backlog_id": "BUG-ROUTE",
                 "task_id": "BUG-ROUTE",

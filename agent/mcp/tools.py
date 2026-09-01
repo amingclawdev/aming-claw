@@ -8203,7 +8203,7 @@ class ToolDispatcher:
             body = {
                 key: value
                 for key, value in args.items()
-                if key != "project_id" and value is not None
+                if value is not None
             }
             return _copy_safe_observer_route_context_issue_result(
                 self._api(

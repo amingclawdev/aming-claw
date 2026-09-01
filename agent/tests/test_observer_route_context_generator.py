@@ -1195,6 +1195,7 @@ def test_mcp_route_context_issue_forwards_public_parent_identity(monkeypatch):
             "POST",
             f"/api/projects/{_PROJECT}/observer/route-context/issue",
             {
+                "project_id": _PROJECT,
                 "backlog_id": _BACKLOG,
                 "task_id": _TASK,
                 "target_files": _TARGET_FILES,
