@@ -144,14 +144,28 @@ def test_linked_v3_completed_generation_uses_source_backed_projection(
                         lambda value: value)
     historical = []
     calls = []
+    sequence = []
+    completed_receipt = {
+        "history": {
+            "adoption": {"path": "/adoption.json", "sha256": "sha256:" + "2" * 64},
+        },
+    }
     monkeypatch.setattr(
         db, "_select_dev_cow_generation_phase",
         lambda *_args, **_kwargs: db._DevCowGenerationPhase.COMPLETED_GENERATION,
     )
-    monkeypatch.setattr(cli, "_historical_dashboard_bootstrap_adoption",
-                        lambda value: historical.append(value))
-    monkeypatch.setattr(db, "validate_dev_cow_completed_generation_projection",
-                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(
+        cli, "_historical_dashboard_bootstrap_adoption",
+        lambda value, **kwargs: (
+            sequence.append("historical"), historical.append((value, kwargs))
+        )[1],
+    )
+    monkeypatch.setattr(
+        db, "validate_dev_cow_completed_generation_projection",
+        lambda *args, **kwargs: (
+            sequence.append("completed"), calls.append((args, kwargs)), completed_receipt
+        )[2],
+    )
     monkeypatch.setattr(db, "verified_stable_database_binding",
                         lambda: {"stable": True})
     digest, returned = cli._validated_linked_v3_receipt(
@@ -160,9 +174,121 @@ def test_linked_v3_completed_generation_uses_source_backed_projection(
         durable_start_phase=cli._DURABLE_START_LEGACY_ADOPTION,
     )
     assert (digest, returned) == ("sha256:" + "1" * 64, receipt)
-    assert historical == [root]
+    assert historical == [(root, {"completed_generation_axis": {
+        "source_identity": {"commit": "b" * 40}, "receipt": completed_receipt,
+    }})]
+    assert sequence == ["completed", "historical"]
     assert len(calls) == 1
     assert "completed_generation_ref" not in calls[0][1]
+
+
+def _historical_adoption_axis_case(tmp_path, monkeypatch):
+    import agent.cli as cli
+
+    root = tmp_path / "dev"
+    source_root = tmp_path / "source"
+    root.mkdir(); source_root.mkdir()
+    adoption_path = (root / "archive" / "canonical-legacy-postimage-adoption"
+                     / ("adoption." + "3" * 64 + ".json"))
+    linked_path = root / "archive" / "schema-admission" / ("4" * 64 + ".json")
+    adoption_sha = "sha256:" + "3" * 64
+    linked_sha = "sha256:" + "4" * 64
+    anchor = {
+        "branch": cli.AC_DEV_BRANCH, "commit": "a" * 40, "dirty": "",
+        "root": str(source_root), "source_sha256": "sha256:" + "5" * 64,
+        "tree": "6" * 40,
+    }
+    current = {
+        "branch": cli.AC_DEV_BRANCH, "commit": "b" * 40, "dirty": "",
+        "root": str(source_root), "source_sha256": "sha256:" + "7" * 64,
+        "tree": "8" * 40,
+    }
+    adoption = {
+        "schema_version": cli._AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION,
+        "stage": "completed", "project_id": "aming-claw", "port": 40008,
+        "root_identity": cli._admission_identity(root),
+        "database_identity": {
+            "path": str(root / "governance" / "aming-claw" / "governance.db"),
+        },
+        "linked_v3_receipt": str(linked_path),
+        "linked_v3_receipt_sha256": linked_sha,
+        "candidate_source_identity": anchor,
+        "database_sha256_preimage": "sha256:" + "9" * 64,
+    }
+    completed_receipt = {
+        "history": {
+            "adoption": {"path": str(adoption_path), "sha256": adoption_sha},
+        },
+    }
+    monkeypatch.setattr(cli, "_canonical_adoption_receipts", lambda _root: [adoption_path])
+    monkeypatch.setattr(
+        cli, "_read_canonical_adoption_receipt",
+        lambda _path: (adoption, adoption_sha),
+    )
+    monkeypatch.setattr(
+        cli, "_read_admission_receipt",
+        lambda *_args, **_kwargs: (
+            {"database_sha256_after": adoption["database_sha256_preimage"]}, linked_sha,
+        ),
+    )
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: current)
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda *_args, **_kwargs: types.SimpleNamespace(returncode=0),
+    )
+    return cli, root, adoption, adoption_sha, adoption_path, anchor, current, completed_receipt
+
+
+def test_historical_adoption_accepts_validated_descendant_completed_cow_axis(
+    tmp_path, monkeypatch,
+):
+    cli, root, adoption, adoption_sha, adoption_path, _anchor, current, receipt = (
+        _historical_adoption_axis_case(tmp_path, monkeypatch)
+    )
+    assert cli._historical_dashboard_bootstrap_adoption(
+        root,
+        completed_generation_axis={"source_identity": current, "receipt": receipt},
+    ) == (adoption, adoption_sha, adoption_path)
+
+
+@pytest.mark.parametrize("mismatch", ("source", "receipt", "non_descendant"))
+def test_historical_adoption_completed_cow_axis_mismatch_fails_closed(
+    tmp_path, monkeypatch, mismatch,
+):
+    cli, root, _adoption, _sha, _path, _anchor, current, receipt = (
+        _historical_adoption_axis_case(tmp_path, monkeypatch)
+    )
+    axis_source = dict(current)
+    axis_receipt = json.loads(json.dumps(receipt))
+    if mismatch == "source":
+        axis_source["commit"] = "c" * 40
+    elif mismatch == "receipt":
+        axis_receipt["history"]["adoption"]["sha256"] = "sha256:" + "d" * 64
+    else:
+        monkeypatch.setattr(
+            cli.subprocess, "run",
+            lambda *_args, **_kwargs: types.SimpleNamespace(returncode=1),
+        )
+    with pytest.raises(cli.click.ClickException, match="completed source axis mismatch"):
+        cli._historical_dashboard_bootstrap_adoption(
+            root,
+            completed_generation_axis={
+                "source_identity": axis_source, "receipt": axis_receipt,
+            },
+        )
+
+
+def test_historical_adoption_first_generation_remains_exact_source_bound(
+    tmp_path, monkeypatch,
+):
+    cli, root, adoption, adoption_sha, adoption_path, anchor, _current, _receipt = (
+        _historical_adoption_axis_case(tmp_path, monkeypatch)
+    )
+    with pytest.raises(cli.click.ClickException, match="historical adoption mismatch"):
+        cli._historical_dashboard_bootstrap_adoption(root)
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: anchor)
+    assert cli._historical_dashboard_bootstrap_adoption(root) == (
+        adoption, adoption_sha, adoption_path,
+    )
 
 
 @pytest.mark.parametrize("phase", ("first", "completed", "selector"))
@@ -204,7 +330,9 @@ def test_linked_v3_cow_phase_errors_are_bounded_without_fallback(
             db, "_select_dev_cow_generation_phase", lambda *_a, **_k: selected,
         )
     monkeypatch.setattr(cli, "_require_first_cow_runtime_pristine", lambda _root: None)
-    monkeypatch.setattr(cli, "_historical_dashboard_bootstrap_adoption", lambda _root: None)
+    monkeypatch.setattr(
+        cli, "_historical_dashboard_bootstrap_adoption", lambda _root, **_kwargs: None,
+    )
 
     def reject(name):
         calls.append(name)

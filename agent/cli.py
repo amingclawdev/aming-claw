@@ -2732,7 +2732,9 @@ def _bootstrap_regular_database(path: Path, *, label: str) -> dict[str, Any]:
     }
 
 
-def _historical_dashboard_bootstrap_adoption(root: Path) -> tuple[dict[str, Any], str, Path]:
+def _historical_dashboard_bootstrap_adoption(
+    root: Path, *, completed_generation_axis: Mapping[str, object] | None = None,
+) -> tuple[dict[str, Any], str, Path]:
     """Authenticate sealed historical adoption bytes without reading current DB logic.
 
     This deliberately proves receipt content/address/path relationships only.
@@ -2755,6 +2757,40 @@ def _historical_dashboard_bootstrap_adoption(root: Path) -> tuple[dict[str, Any]
         raise click.ClickException("dashboard backlog bootstrap historical linked receipt mismatch") from exc
     database = root / "governance" / "aming-claw" / "governance.db"
     root_stat = root.stat(follow_symlinks=False)
+    source_matches_adoption = adoption.get("candidate_source_identity") == source
+    if completed_generation_axis is not None:
+        axis_source = dict(completed_generation_axis.get("source_identity") or {})
+        axis_receipt = dict(completed_generation_axis.get("receipt") or {})
+        adoption_ref = dict(dict(axis_receipt.get("history") or {}).get("adoption") or {})
+        anchor = dict(adoption.get("candidate_source_identity") or {})
+        adoption_path = adoptions[0].absolute()
+        ancestry = None
+        try:
+            if (
+                axis_source == source
+                and source.get("branch") == AC_DEV_BRANCH
+                and source.get("dirty") == ""
+                and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(source.get("commit") or ""))
+                and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(source.get("tree") or ""))
+                and anchor.get("branch") == AC_DEV_BRANCH
+                and anchor.get("dirty") == ""
+                and anchor.get("root") == source.get("root")
+                and anchor.get("commit") != source.get("commit")
+                and adoption_ref == {"path": str(adoption_path), "sha256": adoption_sha}
+            ):
+                ancestry = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", str(anchor.get("commit") or ""),
+                     str(source.get("commit") or "")],
+                    cwd=Path(str(source.get("root") or "")), capture_output=True,
+                    timeout=10, check=False,
+                )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            ancestry = None
+        if ancestry is None or ancestry.returncode != 0:
+            raise click.ClickException(
+                "dashboard backlog bootstrap completed source axis mismatch"
+            )
+        source_matches_adoption = True
     if (adoption.get("schema_version") != _AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION
             or adoption.get("stage") != "completed"
             or adoption.get("project_id") != "aming-claw" or adoption.get("port") != AC_DEV_SERVICE_PORT
@@ -2763,7 +2799,7 @@ def _historical_dashboard_bootstrap_adoption(root: Path) -> tuple[dict[str, Any]
             or adoption.get("database_identity", {}).get("path") != str(database)
             or adoption.get("linked_v3_receipt") != str(linked.absolute())
             or adoption.get("linked_v3_receipt_sha256") != linked_sha
-            or adoption.get("candidate_source_identity") != source
+            or not source_matches_adoption
             or linked_value.get("database_sha256_after") != adoption.get("database_sha256_preimage")):
         raise click.ClickException("dashboard backlog bootstrap historical adoption mismatch")
     return adoption, adoption_sha, adoptions[0]
@@ -3402,11 +3438,17 @@ def _validated_linked_v3_receipt(
                     stable_binding=stable_binding,
                 )
             elif cow_phase is _db._DevCowGenerationPhase.COMPLETED_GENERATION:
-                _historical_dashboard_bootstrap_adoption(dev_storage)
-                _db.validate_dev_cow_completed_generation_projection(
+                completed_receipt = _db.validate_dev_cow_completed_generation_projection(
                     dev_storage, linked_v3_receipt=receipt_path,
                     source_identity=source_identity,
                     stable_binding=stable_binding,
+                )
+                _historical_dashboard_bootstrap_adoption(
+                    dev_storage,
+                    completed_generation_axis={
+                        "source_identity": dict(source_identity),
+                        "receipt": dict(completed_receipt),
+                    },
                 )
             else:
                 raise ValueError("AC dev COW generation phase is invalid")
