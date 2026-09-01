@@ -3041,13 +3041,39 @@ def _recover_verified_existing_dev_sqlite(
     _revalidate_stable_database_binding(binding)
 
 
+def _migration_capable_source_schema_memory() -> sqlite3.Connection:
+    """Build the current source schema without inheriting runtime-plane policy.
+
+    This connection is an isolated reference producer, never a target database.
+    A dev service must keep verify-only authority over its real connection, but
+    source-contract construction still needs to execute the canonical migration
+    chain in a fresh in-memory database.  Restore the process environment on
+    both success and failure so the reference build cannot widen later target
+    authority.
+    """
+
+    memory = sqlite3.connect(":memory:")
+    memory.row_factory = sqlite3.Row
+    _configure_connection(memory, busy_timeout=10000)
+    previous_plane = os.environ.get(RUNTIME_PLANE_ENV)
+    os.environ[RUNTIME_PLANE_ENV] = "generic"
+    try:
+        _ensure_schema(memory)
+    except BaseException:
+        memory.close()
+        raise
+    finally:
+        if previous_plane is None:
+            os.environ.pop(RUNTIME_PLANE_ENV, None)
+        else:
+            os.environ[RUNTIME_PLANE_ENV] = previous_plane
+    return memory
+
+
 def _source_schema_table_contract() -> tuple[set[str], set[str], set[tuple[str, str, str]]]:
     """Return required tables and the exact baseline sqlite_master inventory."""
 
-    with closing(sqlite3.connect(":memory:")) as memory:
-        memory.row_factory = sqlite3.Row
-        _configure_connection(memory, busy_timeout=10000)
-        _ensure_schema(memory)
+    with closing(_migration_capable_source_schema_memory()) as memory:
         required = {
             str(row[0])
             for row in memory.execute(
@@ -3534,10 +3560,7 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         row for row in _graph_materialization_inventory(conn)
         if row[1] in graph_known_names or row[2] in graph_known_tables
     ]
-    with closing(sqlite3.connect(":memory:")) as source_memory:
-        source_memory.row_factory = sqlite3.Row
-        _configure_connection(source_memory, busy_timeout=10000)
-        _ensure_schema(source_memory)
+    with closing(_migration_capable_source_schema_memory()) as source_memory:
         baseline_graph_inventory = [
             row for row in _graph_materialization_inventory(source_memory)
             if row[1] in graph_known_names or row[2] in graph_known_tables

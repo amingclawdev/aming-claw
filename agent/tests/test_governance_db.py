@@ -4097,6 +4097,104 @@ def test_dev_schema_inventory_accepts_only_exact_backlog_overlay():
         conn.close()
 
 
+def test_dev_schema_inventory_builds_reference_outside_verify_only(monkeypatch):
+    from governance import db
+
+    target = db._migration_capable_source_schema_memory()
+    inventory_before = db._sqlite_master_inventory(target)
+    changes_before = target.total_changes
+    observed_reference_builds = []
+    original_ensure_schema = db._ensure_schema
+
+    def observe_reference_build(connection):
+        observed_reference_builds.append(
+            (connection is target, db.dev_runtime_verify_only())
+        )
+        return original_ensure_schema(connection)
+
+    monkeypatch.setattr(db, "_ensure_schema", observe_reference_build)
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    db._verify_dev_world_schema_inventory(target)
+
+    assert observed_reference_builds
+    assert all(
+        is_target is False and verify_only is False
+        for is_target, verify_only in observed_reference_builds
+    )
+    assert os.environ[db.RUNTIME_PLANE_ENV] == db.DEV_RUNTIME_PLANE
+    assert target.total_changes == changes_before
+    assert db._sqlite_master_inventory(target) == inventory_before
+    target.close()
+
+
+@pytest.mark.parametrize("drift", ["empty", "missing", "invalid"])
+def test_dev_schema_inventory_still_rejects_target_drift_in_dev_plane(
+    monkeypatch, drift
+):
+    from governance import db
+
+    target = sqlite3.connect(":memory:")
+    target.row_factory = sqlite3.Row
+    if drift != "empty":
+        reference = db._migration_capable_source_schema_memory()
+        reference.backup(target)
+        reference.close()
+    if drift == "missing":
+        target.execute("DROP TABLE parallel_branch_runtime_contexts")
+    elif drift == "invalid":
+        target.execute("CREATE TABLE outside_source_contract(value TEXT)")
+    target.commit()
+    inventory_before = db._sqlite_master_inventory(target)
+    changes_before = target.total_changes
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    with pytest.raises(ValueError, match="source schema inventory mismatch"):
+        db._verify_dev_world_schema_inventory(target)
+
+    assert os.environ[db.RUNTIME_PLANE_ENV] == db.DEV_RUNTIME_PLANE
+    assert target.total_changes == changes_before
+    assert db._sqlite_master_inventory(target) == inventory_before
+    target.close()
+
+
+def test_source_reference_builder_does_not_weaken_dev_target_authority(monkeypatch):
+    from governance import db, parallel_branch_runtime
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    reference = db._migration_capable_source_schema_memory()
+    reference.close()
+    target = sqlite3.connect(":memory:")
+
+    with pytest.raises(
+        db.DevRuntimeSchemaVerificationError,
+        match="ac_dev_verify_only_schema_incompatible: parallel_branch_runtime",
+    ):
+        parallel_branch_runtime.ensure_branch_runtime_schema(target)
+
+    assert os.environ[db.RUNTIME_PLANE_ENV] == db.DEV_RUNTIME_PLANE
+    assert target.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+    ).fetchone()[0] == 0
+    target.close()
+
+
+def test_source_reference_builder_restores_runtime_plane_after_failure(monkeypatch):
+    from governance import db
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    def fail_source_build(_connection):
+        assert db.dev_runtime_verify_only() is False
+        raise RuntimeError("source reference sentinel")
+
+    monkeypatch.setattr(db, "_ensure_schema", fail_source_build)
+    with pytest.raises(RuntimeError, match="source reference sentinel"):
+        db._migration_capable_source_schema_memory()
+
+    assert os.environ[db.RUNTIME_PLANE_ENV] == db.DEV_RUNTIME_PLANE
+
+
 def test_dev_schema_inventory_subtracts_only_five_sql_exact_graph_owners_zero_write():
     from governance import db
 
