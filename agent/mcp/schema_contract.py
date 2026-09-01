@@ -9,11 +9,34 @@ other's in-memory tool table.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 
-MCP_TOOL_SCHEMA_VERSION = "2026-08-20.1"
+MCP_TOOL_SCHEMA_VERSION = "2026-09-01.1"
 MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION = MCP_TOOL_SCHEMA_VERSION
+_LOADED_TOOL_SCHEMA_FINGERPRINT = ""
+
+
+def mcp_tool_schema_fingerprint(tools: list[dict[str, Any]]) -> str:
+    """Return a deterministic digest of the exact loaded MCP tool registry."""
+
+    canonical = json.dumps(
+        tools,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def register_loaded_tool_schema(tools: list[dict[str, Any]]) -> str:
+    """Bind metadata to the exact registry loaded by this MCP process."""
+
+    global _LOADED_TOOL_SCHEMA_FINGERPRINT
+    _LOADED_TOOL_SCHEMA_FINGERPRINT = mcp_tool_schema_fingerprint(tools)
+    return _LOADED_TOOL_SCHEMA_FINGERPRINT
 
 
 def mcp_loaded_tool_schema_metadata() -> dict[str, Any]:
@@ -22,6 +45,7 @@ def mcp_loaded_tool_schema_metadata() -> dict[str, Any]:
     return {
         "schema_version": "mcp_loaded_tool_schema.v1",
         "loaded_client_tool_schema_version": MCP_TOOL_SCHEMA_VERSION,
+        "loaded_client_tool_schema_fingerprint": _LOADED_TOOL_SCHEMA_FINGERPRINT,
         "server_tool_schema_version": "",
         "minimum_client_tool_schema_version": "",
         "client_schema_fresh": None,
@@ -65,6 +89,8 @@ def mcp_tool_schema_compatibility(
     loaded_schema_version: str = "",
     server_schema_version: str = MCP_TOOL_SCHEMA_VERSION,
     minimum_client_schema_version: str = MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION,
+    loaded_schema_fingerprint: str = "",
+    server_schema_fingerprint: str = "",
 ) -> dict[str, Any]:
     """Build a stable, copy-safe schema freshness diagnostic."""
 
@@ -73,12 +99,27 @@ def mcp_tool_schema_compatibility(
     minimum = str(
         minimum_client_schema_version or MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION
     ).strip()
-    fresh = loaded == server if loaded else None
+    loaded_fingerprint = str(loaded_schema_fingerprint or "").strip()
+    server_fingerprint = str(server_schema_fingerprint or "").strip()
+    version_fresh = loaded == server if loaded else None
+    fingerprint_fresh = (
+        loaded_fingerprint == server_fingerprint
+        if loaded_fingerprint and server_fingerprint
+        else None
+    )
+    fresh = (
+        version_fresh and fingerprint_fresh
+        if fingerprint_fresh is not None
+        else version_fresh
+    )
     return {
         "schema_version": "mcp_tool_schema_compatibility.v1",
         "loaded_client_tool_schema_version": loaded,
         "server_tool_schema_version": server,
         "minimum_client_tool_schema_version": minimum,
+        "loaded_client_tool_schema_fingerprint": loaded_fingerprint,
+        "server_tool_schema_fingerprint": server_fingerprint,
+        "client_schema_fingerprint_fresh": fingerprint_fresh,
         "client_schema_fresh": fresh,
         "stale_client_possible": fresh is not True,
         "freshness_signal": {

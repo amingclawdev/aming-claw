@@ -20,7 +20,10 @@ from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp import server as plugin_mcp_server
 from agent.mcp import tools as runtime_mcp_tool_module
 from agent.mcp.server import AmingClawMCP
-from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
+from agent.mcp.schema_contract import (
+    MCP_TOOL_SCHEMA_VERSION,
+    mcp_tool_schema_fingerprint,
+)
 from agent.mcp.tools import TOOLS as runtime_mcp_tools
 from agent.mcp.tools import ToolDispatcher
 
@@ -2691,18 +2694,25 @@ def test_governance_mcp_bypass_schema_and_dispatch_preserve_graph_trace_ids(
     assert "graph_trace_ids" not in calls[1][2]
 
 
-def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
-    responses, stderr, returncode = _run_mcp_probe([
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-    ])
+def test_mcp_stdio_tools_list_does_not_require_redis_or_governance(tmp_path):
+    responses, stderr, returncode = _run_mcp_probe(
+        [{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}],
+        extra_args=["--governance-url", "http://127.0.0.1:40008"],
+        extra_env={
+            "AMING_CLAW_DEV_STORAGE_ROOT": str(tmp_path / "dev-storage"),
+        },
+    )
 
     assert returncode == 0
     assert stderr == ""
     tools = responses[0]["result"]["tools"]
     schema_meta = responses[0]["result"]["_meta"]["aming_claw_tool_schema"]
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-20.1"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-09-01.1"
     assert schema_meta["loaded_client_tool_schema_version"] == (
         MCP_TOOL_SCHEMA_VERSION
+    )
+    assert schema_meta["loaded_client_tool_schema_fingerprint"] == (
+        mcp_tool_schema_fingerprint(tools)
     )
     assert schema_meta["server_tool_schema_version"] == ""
     assert schema_meta["client_schema_fresh"] is None
@@ -2710,6 +2720,9 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert schema_meta["status"] == "process_local_loaded_schema"
     assert schema_meta["freshness_signal"]["mcp_tool"] == "runtime_status"
     names = {tool["name"] for tool in tools}
+    assert mcp_tool_schema_fingerprint(tools) == mcp_tool_schema_fingerprint(
+        runtime_mcp_tools
+    )
     assert {"health", "manager_health", "graph_query", "backlog_upsert"}.issubset(names)
     assert {
         "observer_hotfix_enter",

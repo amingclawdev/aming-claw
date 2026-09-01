@@ -28,6 +28,7 @@ from .schema_contract import (
     MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION,
     MCP_TOOL_SCHEMA_VERSION,
     mcp_tool_schema_compatibility,
+    register_loaded_tool_schema,
 )
 
 log = logging.getLogger(__name__)
@@ -3065,6 +3066,10 @@ def _task_timeline_body(args: dict) -> dict:
         "artifact_refs",
         "trace_id",
         "commit_sha",
+        "stage_id",
+        "line_id",
+        "evidence_kind",
+        "runtime_guide_hash",
         "route_token",
         "route_token_ref",
         "route_waiver",
@@ -5047,6 +5052,10 @@ TOOLS: list[dict] = [
                 "artifact_refs": {"type": "object", "description": "Copy-safe artifact references and hashes only; nested raw credential fields are removed."},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
+                "stage_id": {"type": "string"},
+                "line_id": {"type": "string"},
+                "evidence_kind": {"type": "string"},
+                "runtime_guide_hash": {"type": "string"},
                 "qa_session_token": {
                     "type": "string",
                     "description": "Raw QA role token used only as X-Gov-Token; never forwarded into timeline evidence.",
@@ -7274,6 +7283,8 @@ TOOLS: list[dict] = [
         },
     },
 ]
+
+register_loaded_tool_schema(TOOLS)
 
 
 # ---------------------------------------------------------------------------

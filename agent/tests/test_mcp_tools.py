@@ -13,6 +13,7 @@ from agent.mcp import server as plugin_mcp_server
 from agent.mcp import tools as mcp_tools
 from agent.mcp.schema_contract import (
     MCP_TOOL_SCHEMA_VERSION,
+    mcp_tool_schema_fingerprint,
     mcp_tool_schema_compatibility,
 )
 from agent.mcp.tools import TOOLS, ToolDispatcher
@@ -1571,6 +1572,52 @@ def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
     assert "Copy-safe artifact references" in properties["artifact_refs"][
         "description"
     ]
+
+
+def test_managed_task_timeline_append_exposes_exact_runtime_binding_fields():
+    properties = _tool_properties("task_timeline_append")
+    for key in ("stage_id", "line_id", "evidence_kind", "runtime_guide_hash"):
+        assert properties[key] == {"type": "string"}
+
+
+def test_managed_task_timeline_append_preserves_runtime_binding_fields(monkeypatch):
+    calls = []
+    dispatcher = ToolDispatcher(
+        lambda method, path, body=None: calls.append((method, path, body))
+        or {"ok": True},
+        None,
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_qa_role_token_for_scope",
+        lambda *args, **kwargs: ("", None),
+    )
+    binding = {
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "evidence_kind": "verification",
+        "runtime_guide_hash": "sha256:" + "a" * 64,
+    }
+
+    assert dispatcher.dispatch(
+        "task_timeline_append",
+        {"project_id": "aming-claw", "event_type": "qa.graph_context", **binding},
+    ) == {"ok": True}
+    assert calls == [
+        (
+            "POST",
+            "/api/task/aming-claw/timeline",
+            {"event_type": "qa.graph_context", **binding},
+        )
+    ]
+
+
+def test_mcp_tool_schema_fingerprint_is_deterministic_and_change_detecting():
+    first = mcp_tool_schema_fingerprint(TOOLS)
+    assert first == mcp_tool_schema_fingerprint(TOOLS)
+    changed = json.loads(json.dumps(TOOLS))
+    changed[0]["inputSchema"]["properties"]["synthetic_drift"] = {"type": "string"}
+    assert mcp_tool_schema_fingerprint(changed) != first
 
 
 def test_task_timeline_append_schema_exposes_direct_main_qa_runtime_binding_fields():
@@ -7180,7 +7227,7 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
 
 
 def test_current_mcp_schema_bump_marks_pre_current_full_view_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-20.1"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-09-01.1"
     reconcile_properties = _tool_properties("graph_current_full_reconcile")
     assert reconcile_properties["response_view"]["enum"] == [
         "compact",
@@ -7195,10 +7242,24 @@ def test_current_mcp_schema_bump_marks_pre_current_full_view_client_stale():
     )
 
     assert compatibility["loaded_client_tool_schema_version"] == "2026-08-19.1"
-    assert compatibility["server_tool_schema_version"] == "2026-08-20.1"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-20.1"
+    assert compatibility["server_tool_schema_version"] == "2026-09-01.1"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-09-01.1"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
+
+
+def test_mcp_schema_same_version_old_registration_fingerprint_is_not_current():
+    current = mcp_tool_schema_fingerprint(TOOLS)
+    compatibility = mcp_tool_schema_compatibility(
+        loaded_schema_version=MCP_TOOL_SCHEMA_VERSION,
+        server_schema_version=MCP_TOOL_SCHEMA_VERSION,
+        minimum_client_schema_version=MCP_TOOL_SCHEMA_VERSION,
+        loaded_schema_fingerprint="sha256:" + "0" * 64,
+        server_schema_fingerprint=current,
+    )
+
+    assert compatibility["client_schema_fresh"] is False
+    assert compatibility["client_schema_fingerprint_fresh"] is False
 
 
 def test_mcp_runtime_status_current_target_chain_mismatch_blocks_core():
