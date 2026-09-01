@@ -66462,6 +66462,245 @@ def test_graph_governance_query_trace_api_records_source_and_events(conn):
     assert one_shot_trace["trace"]["event_count"] == 1
 
 
+@pytest.mark.parametrize(
+    "handler",
+    [
+        server.handle_graph_governance_query_trace_start,
+        server.handle_graph_governance_query,
+    ],
+)
+def test_dev_first_qa_graph_query_pre_auth_escalation_is_typed_zero_write(
+    conn,
+    monkeypatch,
+    handler,
+):
+    assert governance_db.classify_graph_query_trace_schema(conn)[
+        "owner_state"
+    ] == "absent"
+    before = governance_db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+    admissions = []
+    monkeypatch.setenv(
+        governance_db.RUNTIME_PLANE_ENV,
+        governance_db.DEV_RUNTIME_PLANE,
+    )
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        governance_db,
+        "admit_ac_dev_graph_materialization_schema",
+        lambda *_args, **_kwargs: admissions.append("admitted"),
+    )
+
+    def first_qa_escalation_before_authorization(_ctx, candidate, _body, _action):
+        graph_query_trace.ensure_schema(candidate)
+
+    monkeypatch.setattr(
+        server,
+        "_require_graph_query_capability",
+        first_qa_escalation_before_authorization,
+    )
+
+    with pytest.raises(
+        governance_db.DevRuntimeSchemaVerificationError,
+        match="graph_query_trace",
+    ):
+        handler(
+            _ctx_with_role(
+                {"project_id": PID},
+                "qa",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "qa",
+                    "query_purpose": "independent_verification",
+                },
+            )
+        )
+
+    assert admissions == []
+    assert conn.total_changes == changes
+    assert governance_db._sqlite_master_inventory(conn) == before
+
+
+def test_dev_authorized_observer_start_and_query_admit_trace_owner_without_backfill(
+    conn,
+    monkeypatch,
+):
+    old_commit = "6606f0d4e4b49e10c422c04d993895c458e702b9"
+    descendant_commit = "7b4a9b7c48ed14d42978dd456cb596981c4f23d1"
+    old_run_id = "current-full-" + old_commit[:7]
+    descendant_run_id = "current-full-" + descendant_commit[:7]
+    old_snapshot_id = "full-active-6606-reference"
+    descendant_snapshot_id = "full-descendant-trace-query"
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=old_snapshot_id,
+        commit_sha=old_commit,
+        snapshot_kind="full",
+        notes=json.dumps({"request_id": "req-22bd", "run_id": old_run_id}),
+    )
+    _activate_basic_graph(
+        conn,
+        descendant_snapshot_id,
+        commit_sha=descendant_commit,
+    )
+    old_snapshot_before = tuple(
+        conn.execute(
+            "SELECT snapshot_id,commit_sha,snapshot_kind,status,notes "
+            "FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, old_snapshot_id),
+        ).fetchone()
+    )
+    active_before = tuple(
+        conn.execute(
+            "SELECT project_id,snapshot_id,commit_sha FROM graph_snapshot_refs "
+            "WHERE project_id=? AND ref_name='active'",
+            (PID,),
+        ).fetchone()
+    )
+    assert active_before[1:] == (descendant_snapshot_id, descendant_commit)
+    monkeypatch.setenv(
+        governance_db.RUNTIME_PLANE_ENV,
+        governance_db.DEV_RUNTIME_PLANE,
+    )
+    connection_ids = set(
+        getattr(
+            governance_db._GRAPH_MATERIALIZATION_ADMISSION_LOCAL,
+            "connection_ids",
+            (),
+        )
+    )
+    connection_ids.add(id(conn))
+    governance_db._GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = (
+        frozenset(connection_ids)
+    )
+    try:
+        for _owner, ensure_schema, _inventory in (
+            governance_db._graph_schema_owner_registry()
+        ):
+            ensure_schema(conn)
+        semantic_enrichment._ensure_semantic_state_schema(conn)
+    finally:
+        connection_ids.discard(id(conn))
+        governance_db._GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = (
+            frozenset(connection_ids)
+        )
+    conn.commit()
+    assert governance_db.classify_graph_query_trace_schema(conn)[
+        "owner_state"
+    ] == "absent"
+
+    order = []
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+
+    def authorize(_ctx, _conn, _body, action):
+        order.append(("authorize", action))
+
+    def admit(candidate, *, project_id):
+        order.append(("admit", project_id))
+        governance_db.execute_graph_schema_sql(
+            candidate, graph_query_trace.GRAPH_QUERY_TRACE_SCHEMA_SQL,
+        )
+        candidate.commit()
+        return {"project_id": project_id}
+
+    monkeypatch.setattr(server, "_require_graph_query_capability", authorize)
+    monkeypatch.setattr(
+        governance_db,
+        "admit_ac_dev_graph_materialization_schema",
+        admit,
+    )
+    body = {
+        "snapshot_id": "active",
+        "query_source": "observer",
+        "query_purpose": "gate_validation",
+        "actor": "observer",
+        "run_id": descendant_run_id,
+    }
+
+    started = server.handle_graph_governance_query_trace_start(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST", body=body,
+        )
+    )
+    trace_id = started["trace"]["trace_id"]
+    queried = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **body,
+                "trace_id": trace_id,
+                "tool": "get_node",
+                "args": {"node_id": "L7.1"},
+            },
+        )
+    )
+
+    assert queried["ok"] is True
+    assert order == [
+        ("authorize", "graph-governance.query-trace.start"),
+        ("admit", PID),
+        ("authorize", "graph-governance.query"),
+        ("admit", PID),
+    ]
+    trace = conn.execute(
+        "SELECT snapshot_id,run_id,status FROM graph_query_traces "
+        "WHERE trace_id=?",
+        (trace_id,),
+    ).fetchone()
+    assert tuple(trace) == (
+        descendant_snapshot_id,
+        descendant_run_id,
+        "running",
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_events WHERE trace_id=?",
+        (trace_id,),
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces "
+        "WHERE run_id=? OR task_id=? OR parent_task_id=?",
+        (old_run_id, "req-22bd", "req-22bd"),
+    ).fetchone()[0] == 0
+    assert tuple(
+        conn.execute(
+            "SELECT snapshot_id,commit_sha,snapshot_kind,status,notes "
+            "FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, old_snapshot_id),
+        ).fetchone()
+    ) == old_snapshot_before
+    assert tuple(
+        conn.execute(
+            "SELECT project_id,snapshot_id,commit_sha FROM graph_snapshot_refs "
+            "WHERE project_id=? AND ref_name='active'",
+            (PID,),
+        ).fetchone()
+    ) == active_before
+    assert descendant_run_id != old_run_id
+    assert descendant_snapshot_id != old_snapshot_id
+
+    admissions_before_read_finish = list(order)
+    server.handle_graph_governance_query_trace_get(
+        _ctx_with_role(
+            {"project_id": PID, "trace_id": trace_id}, "observer",
+        )
+    )
+    finished = server.handle_graph_governance_query_trace_finish(
+        _ctx_with_role(
+            {"project_id": PID, "trace_id": trace_id},
+            "observer",
+            method="POST",
+            body={"status": "complete"},
+        )
+    )
+    assert finished["trace"]["status"] == "complete"
+    assert order == admissions_before_read_finish
+
+
 def test_observer_graph_query_route_ref_projects_scope_and_rejects_overrides(conn):
     backlog_id = "AC-OBSERVER-GRAPH-ROUTE"
     task_id = "observer-graph-route-task"

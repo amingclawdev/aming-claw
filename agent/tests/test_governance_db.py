@@ -159,6 +159,9 @@ def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(mo
         assert db.classify_semantic_state_schema(conn)["owner_state"] == (
             "exact"
         )
+        assert db.classify_graph_query_trace_schema(conn)["owner_state"] == (
+            "exact"
+        )
         changes = conn.total_changes
         for ensure_schema in (
             graph_snapshot_store.ensure_schema,
@@ -220,6 +223,49 @@ def test_semantic_state_schema_classifier_and_typed_verifier_are_zero_write(stat
     conn.close()
 
 
+@pytest.mark.parametrize(
+    "state", ["absent", "exact", "partial", "altered", "extra"],
+)
+def test_graph_query_trace_schema_classifier_and_typed_verifier_are_zero_write(state):
+    from agent.governance import db, graph_query_trace
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    if state != "absent":
+        db.execute_graph_schema_sql(conn, graph_query_trace.GRAPH_QUERY_TRACE_SCHEMA_SQL)
+        if state == "partial":
+            conn.execute("DROP INDEX idx_graph_query_traces_project")
+        elif state == "altered":
+            conn.execute("DROP INDEX idx_graph_query_traces_project")
+            conn.execute(
+                "CREATE INDEX idx_graph_query_traces_project "
+                "ON graph_query_traces(project_id, status)"
+            )
+        elif state == "extra":
+            conn.execute("CREATE TABLE graph_query_unknown_owner(value TEXT)")
+        conn.commit()
+    before = db._graph_materialization_inventory(conn)
+    changes = conn.total_changes
+
+    if state in {"absent", "exact"}:
+        classification = db.classify_graph_query_trace_schema(conn)
+        assert classification["owner_state"] == state
+        if state == "exact":
+            assert len([row for row in before if row[0] == "table"]) == 3
+            assert len([row for row in before if row[0] == "index"]) == 5
+            db.verify_graph_query_trace_schema(conn)
+        else:
+            with pytest.raises(db.DevRuntimeSchemaVerificationError):
+                db.verify_graph_query_trace_schema(conn)
+    else:
+        with pytest.raises(db.DevRuntimeSchemaVerificationError):
+            db.verify_graph_query_trace_schema(conn)
+
+    assert conn.total_changes == changes
+    assert db._graph_materialization_inventory(conn) == before
+    conn.close()
+
+
 def test_dev_world_rejects_semantic_exact_without_exact_graph_zero_write():
     from agent.governance import db, reconcile_semantic_enrichment as semantic
 
@@ -250,6 +296,90 @@ def test_completed_projection_rejects_semantic_exact_without_exact_graph_zero_wr
 
     with pytest.raises(ValueError, match="semantic schema requires exact graph owners"):
         db._completed_generation_schema_projections(conn)
+
+    assert conn.total_changes == changes
+    assert db._sqlite_master_inventory(conn) == before
+    conn.close()
+
+
+def _install_post_structural_profile(db, conn, profile):
+    from agent.governance import graph_query_trace
+    from agent.governance import reconcile_semantic_enrichment as semantic
+
+    if profile != "baseline_absent":
+        _install_all_graph_owners_for_inventory_test(db, conn)
+    if profile in {"graph_semantic", "all_exact"}:
+        db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+    if profile in {"all_exact", "graph_trace", "baseline_trace"}:
+        db.execute_graph_schema_sql(
+            conn, graph_query_trace.GRAPH_QUERY_TRACE_SCHEMA_SQL,
+        )
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("profile", "accepted"),
+    [
+        ("baseline_absent", True),
+        ("graph_only", True),
+        ("graph_semantic", True),
+        ("all_exact", True),
+        ("graph_trace", False),
+        ("baseline_trace", False),
+    ],
+)
+def test_dev_world_trace_owner_legal_profiles_are_zero_write(profile, accepted):
+    from agent.governance import db
+
+    conn = db._migration_capable_source_schema_memory()
+    _install_post_structural_profile(db, conn, profile)
+    before = db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+
+    if accepted:
+        db._verify_dev_world_schema_inventory(conn)
+    else:
+        with pytest.raises(ValueError, match="graph-query trace requires"):
+            db._verify_dev_world_schema_inventory(conn)
+
+    assert conn.total_changes == changes
+    assert db._sqlite_master_inventory(conn) == before
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("profile", "accepted"),
+    [
+        ("baseline_absent", True),
+        ("graph_only", True),
+        ("graph_semantic", True),
+        ("all_exact", True),
+        ("graph_trace", False),
+        ("baseline_trace", False),
+    ],
+)
+def test_completed_projection_trace_owner_legal_profiles_bind_both_hashes(
+    profile, accepted,
+):
+    from agent.governance import db
+
+    conn = db._migration_capable_source_schema_memory()
+    for statement in db._authority_projection_schema_statements():
+        conn.execute(statement)
+    conn.commit()
+    expected_authority = db._authority_projection_inventory_in_managed_world(conn)
+    expected_protected = db.backlog_read_schema_protected_inventory(conn)
+    _install_post_structural_profile(db, conn, profile)
+    before = db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+
+    if accepted:
+        authority, protected = db._completed_generation_schema_projections(conn)
+        assert authority == expected_authority
+        assert protected == expected_protected
+    else:
+        with pytest.raises(ValueError, match="trace schema requires"):
+            db._completed_generation_schema_projections(conn)
 
     assert conn.total_changes == changes
     assert db._sqlite_master_inventory(conn) == before
@@ -698,6 +828,58 @@ def test_ac_dev_graph_admission_reclassifies_semantic_race_inside_transaction(
         inject_partial_on_transactional_recheck,
     )
     with pytest.raises(ValueError, match="semantic state schema"):
+        db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw",
+        )
+
+    assert calls == 2
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    conn.close()
+
+
+def test_ac_dev_graph_admission_reclassifies_trace_race_inside_transaction(
+    monkeypatch,
+):
+    from agent.governance import db
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_root_receipt_genesis",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    original = db.classify_graph_query_trace_schema
+    calls = 0
+
+    def inject_partial_on_transactional_recheck(candidate):
+        nonlocal calls
+        calls += 1
+        if candidate is conn and calls == 2:
+            candidate.execute("CREATE TABLE graph_query_traces(trace_id TEXT)")
+        return original(candidate)
+
+    monkeypatch.setattr(
+        db,
+        "classify_graph_query_trace_schema",
+        inject_partial_on_transactional_recheck,
+    )
+    with pytest.raises(ValueError, match="graph-query trace schema"):
         db.admit_ac_dev_graph_materialization_schema(
             conn, project_id="aming-claw",
         )

@@ -653,6 +653,14 @@ def _persisted_fence_token_hash(source: Mapping[str, Any] | None) -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    from . import db
+
+    if db.dev_runtime_verify_only():
+        if db.graph_materialization_admission_active(conn):
+            db.execute_graph_schema_sql(conn, GRAPH_QUERY_TRACE_SCHEMA_SQL)
+            return
+        db.verify_graph_query_trace_schema(conn)
+        return
     store.ensure_schema(conn)
     conn.executescript(GRAPH_QUERY_TRACE_SCHEMA_SQL)
     existing = {

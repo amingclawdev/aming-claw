@@ -92003,7 +92003,10 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
     project_id = ctx.get_project_id()
     body = ctx.body
     from . import graph_query_trace
-    from .db import sqlite_write_lock
+    from .db import (
+        admit_ac_dev_graph_materialization_schema,
+        sqlite_write_lock,
+    )
 
     conn = get_connection(project_id)
     try:
@@ -92018,6 +92021,10 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
         route_proof = mf_sub_proof or observer_proof
         trace_proof = qa_proof
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
+        if _runtime_plane() == "dev":
+            admit_ac_dev_graph_materialization_schema(
+                conn, project_id=project_id,
+            )
         try:
             with sqlite_write_lock():
                 result = graph_query_trace.start_trace(
@@ -92510,7 +92517,10 @@ def handle_graph_governance_query(ctx: RequestContext):
     project_id = ctx.get_project_id()
     body = ctx.body
     from . import graph_query_trace, graph_snapshot_store
-    from .db import sqlite_write_lock
+    from .db import (
+        admit_ac_dev_graph_materialization_schema,
+        sqlite_write_lock,
+    )
 
     tool = str(body.get("tool") or "")
     root = None
@@ -92573,6 +92583,10 @@ def handle_graph_governance_query(ctx: RequestContext):
             if isinstance(root_identity, Mapping) and root_identity.get("query_root"):
                 root = Path(str(root_identity["query_root"]))
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
+        if _runtime_plane() == "dev":
+            admit_ac_dev_graph_materialization_schema(
+                conn, project_id=project_id,
+            )
         try:
             with sqlite_write_lock():
                 result = graph_query_trace.traced_query(

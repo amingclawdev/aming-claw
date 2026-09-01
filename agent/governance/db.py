@@ -1106,6 +1106,22 @@ def _semantic_state_schema_inventory() -> list[tuple[str, str, str, str]]:
         canonical.close()
 
 
+def _graph_query_trace_schema_inventory() -> list[tuple[str, str, str, str]]:
+    """Build the distinct graph-query trace inventory from source SQL."""
+
+    from .graph_query_trace import GRAPH_QUERY_TRACE_SCHEMA_SQL
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        execute_graph_schema_sql(canonical, GRAPH_QUERY_TRACE_SCHEMA_SQL)
+        return [
+            row for row in _graph_materialization_inventory(canonical)
+            if row[1] != "sqlite_sequence"
+        ]
+    finally:
+        canonical.close()
+
+
 _GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING = frozenset(
     {"idx_pending_scope_branch", "idx_pending_scope_status"}
 )
@@ -1124,8 +1140,11 @@ def classify_graph_materialization_preimage(
     actual = _graph_materialization_inventory(conn)
     registry = _graph_schema_owner_registry()
     semantic = _semantic_state_schema_inventory()
+    trace = _graph_query_trace_schema_inventory()
     semantic_names = {row[1] for row in semantic}
     semantic_tables = {row[2] for row in semantic if row[0] == "table"}
+    trace_names = {row[1] for row in trace}
+    trace_tables = {row[2] for row in trace if row[0] == "table"}
     known_names: set[str] = set()
     known_tables: set[str] = set()
     owner_states: dict[str, str] = {}
@@ -1167,6 +1186,8 @@ def classify_graph_materialization_preimage(
         and row[2] not in known_tables
         and row[1] not in semantic_names
         and row[2] not in semantic_tables
+        and row[1] not in trace_names
+        and row[2] not in trace_tables
     ]
     if unknown:
         raise ValueError("AC dev graph materialization preimage has unknown graph authority")
@@ -1255,6 +1276,71 @@ def verify_semantic_state_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def classify_graph_query_trace_schema(conn: sqlite3.Connection) -> dict[str, object]:
+    """Classify the source-owned graph-query trace schema read-only."""
+
+    canonical = _graph_query_trace_schema_inventory()
+    actual = _graph_materialization_inventory(conn)
+    managed = _graph_materialization_managed_inventory(actual, canonical)
+    canonical_names = {row[1] for row in canonical}
+    canonical_tables = {row[2] for row in canonical if row[0] == "table"}
+    unknown = [
+        row for row in actual
+        if (
+            row[1].startswith(("graph_query_", "qa_graph_basis_"))
+            or row[2].startswith(("graph_query_", "qa_graph_basis_"))
+        )
+        and row[1] not in canonical_names
+        and row[2] not in canonical_tables
+    ]
+    if unknown:
+        raise ValueError("AC dev graph-query trace schema has unknown authority")
+    if not managed:
+        state = "absent"
+    elif managed == canonical:
+        state = "exact"
+    else:
+        raise ValueError("AC dev graph-query trace schema is not absent or exact")
+    return {
+        "schema_version": "ac_dev_graph_query_trace_schema_preimage.v1",
+        "owner_state": state,
+        "planned_objects": [row[1] for row in canonical] if state == "absent" else [],
+    }
+
+
+def verify_graph_query_trace_schema(conn: sqlite3.Connection) -> None:
+    """Require the exact graph-query trace owner without issuing DDL."""
+
+    try:
+        classification = classify_graph_query_trace_schema(conn)
+    except ValueError as exc:
+        raise DevRuntimeSchemaVerificationError(
+            "graph_query_trace",
+            component_diagnostics={
+                "graph_query_trace": {
+                    "status": "preimage_incompatible",
+                    "public_safe": True,
+                }
+            },
+        ) from exc
+    if classification["owner_state"] != "exact":
+        raise DevRuntimeSchemaVerificationError(
+            "graph_query_trace",
+            owner_states={
+                "graph_query_trace": str(classification["owner_state"])
+            },
+            planned_objects=list(classification["planned_objects"]),
+            component_diagnostics={
+                "graph_query_trace": {
+                    "status": "incompatible",
+                    "owner_state": str(classification["owner_state"]),
+                    "planned_objects": list(classification["planned_objects"]),
+                    "public_safe": True,
+                }
+            },
+        )
+
+
 def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
     """Verify every source-owned rebuildable graph schema without writes."""
 
@@ -1332,6 +1418,7 @@ def admit_ac_dev_graph_materialization_schema(
     # altered, extra, or legacy layouts cannot be laundered by IF NOT EXISTS.
     classify_graph_materialization_preimage(conn)
     classify_semantic_state_schema(conn)
+    classify_graph_query_trace_schema(conn)
     connection_ids = set(
         getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
     )
@@ -1362,6 +1449,13 @@ def admit_ac_dev_graph_materialization_schema(
                 _ensure_semantic_state_schema(conn)
             if classify_semantic_state_schema(conn)["owner_state"] != "exact":
                 raise ValueError("AC dev semantic state schema postcondition failed")
+            trace_preimage = classify_graph_query_trace_schema(conn)
+            if trace_preimage["owner_state"] == "absent":
+                from .graph_query_trace import ensure_schema as ensure_trace_schema
+
+                ensure_trace_schema(conn)
+            if classify_graph_query_trace_schema(conn)["owner_state"] != "exact":
+                raise ValueError("AC dev graph-query trace schema postcondition failed")
             conn.commit()
     except BaseException:
         conn.rollback()
@@ -3865,13 +3959,19 @@ def _completed_generation_schema_projections(
     ):
         raise ValueError("AC dev graph materialization owner registry mismatch")
     semantic = classify_semantic_state_schema(conn)
+    trace = classify_graph_query_trace_schema(conn)
     graph_exact = all(
         owner_states[owner] == "exact" for owner in required_owners
     )
     semantic_exact = semantic["owner_state"] == "exact"
+    trace_exact = trace["owner_state"] == "exact"
     if semantic_exact and not graph_exact:
         raise ValueError(
             "AC dev completed generation semantic schema requires exact graph owners"
+        )
+    if trace_exact and not (graph_exact and semantic_exact):
+        raise ValueError(
+            "AC dev completed generation trace schema requires exact graph and semantic owners"
         )
     if not graph_exact:
         return authority, protected
@@ -3887,6 +3987,11 @@ def _completed_generation_schema_projections(
         overlay_rows.update(
             (kind, name, table, _backlog_read_normalized_sql(sql))
             for kind, name, table, sql in _semantic_state_schema_inventory()
+        )
+    if trace_exact:
+        overlay_rows.update(
+            (kind, name, table, _backlog_read_normalized_sql(sql))
+            for kind, name, table, sql in _graph_query_trace_schema_inventory()
         )
     canonical_authority_rows = {
         tuple(str(value) for value in row)
@@ -4063,6 +4168,9 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     semantic_classification = classify_semantic_state_schema(conn)
     semantic_inventory = _semantic_state_schema_inventory()
     semantic_exact = semantic_classification["owner_state"] == "exact"
+    trace_classification = classify_graph_query_trace_schema(conn)
+    trace_inventory = _graph_query_trace_schema_inventory()
+    trace_exact = trace_classification["owner_state"] == "exact"
     graph_owner_states = graph_classification.get("owner_states")
     owner_state_values = (
         [
@@ -4080,6 +4188,11 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         raise ValueError(
             "AC dev source schema inventory mismatch: "
             "semantic state requires all graph owners SQL-exact"
+        )
+    if trace_exact and not (graph_overlay_exact and semantic_exact):
+        raise ValueError(
+            "AC dev source schema inventory mismatch: "
+            "graph-query trace requires graph and semantic owners SQL-exact"
         )
     graph_known_names = {
         row[1]
@@ -4129,6 +4242,15 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         name for kind, name, _table, _sql in semantic_inventory
         if semantic_exact and kind == "table"
     }
+    trace_exact_objects = {
+        (kind, name, table)
+        for kind, name, table, _sql in trace_inventory
+        if trace_exact
+    }
+    trace_exact_tables = {
+        name for kind, name, _table, _sql in trace_inventory
+        if trace_exact and kind == "table"
+    }
     # This exception is deliberately all-or-nothing: the SQL-bearing five
     # objects must equal the source plan before *only* their exact namespace
     # can be removed from the baseline source-inventory comparison.
@@ -4148,6 +4270,7 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         (actual - allowed)
         - graph_exact_tables
         - semantic_exact_tables
+        - trace_exact_tables
         - ({managed_table} if managed_exact else set())
     )
     missing = sorted(required - actual)
@@ -4160,6 +4283,7 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             - accepted_overlay
             - graph_exact_objects
             - semantic_exact_objects
+            - trace_exact_objects
         )
         if not (item[0] in {"table", "index"} and item[2] in optional)
     )
