@@ -1993,14 +1993,17 @@ def test_graph_admission_recovery_adoption_public_create_restart_restart_is_clos
     from agent.governance import db
     root = tmp_path / "dev"; root.mkdir()
     identifiers = {"backlog_id": "R10", "contract_execution_id": "cex-1",
-                   "route_token_ref": "route-1", "observer_session_id": "session-1"}
+                   "route_token_ref": "route-1"}
     observation = {
         "cow_v2": {}, "protected_preimage": {"inventory": [], "sha256": "p"},
         "protected_preimage_count": 308, "admitted_delta": {"added": [], "removed": [], "sha256": "d"},
         "protected_postimage": {"inventory": [], "sha256": "q"}, "protected_postimage_count": 326,
-        "database": {"pre_create_raw_sha256": "sha256:" + "a" * 64},
+        "database": {"path": str(root / db.AC_DATABASE_DEV_RELATIVE_PATH),
+                     "device": 1, "inode": 2,
+                     "pre_create_raw_sha256": "sha256:" + "a" * 64},
         "typed_lineage": {"identifiers": identifiers}, "source": {},
-        "registry": {}, "graph_zero_state": {}, "stable": {},
+        "registry": {"sha256": "sha256:" + "b" * 64},
+        "graph_zero_state": {"table_counts": {}}, "stable": {},
     }
     monkeypatch.setattr(db, "_default_cutover_listener_probe",
                         lambda _port: {"listening": False, "pid": 0})
@@ -2010,7 +2013,6 @@ def test_graph_admission_recovery_adoption_public_create_restart_restart_is_clos
     created = db.create_dev_graph_admission_recovery_adoption_receipt(
         root, **identifiers,
         recovery_adoption_acknowledgment=db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
-        unverified_incident_reference="req-incident-only",
     )
     receipt = Path(created["receipt"]); raw = receipt.read_bytes()
     assert receipt.name == f"{db.AC_DEV_GRAPH_ADOPTION_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json"
@@ -2019,27 +2021,22 @@ def test_graph_admission_recovery_adoption_public_create_restart_restart_is_clos
     assert payload["qa_pass"] is payload["pass_claim"] is False
     assert payload["non_retroactive"] is True
     assert payload["claims_r10_reconcile_success"] is payload["claims_r10_zero_write"] is False
-    assert payload["authority"]["kind"] == "current_operator_supervised_recovery_adoption"
-    assert payload["unverified_incident_reference"] == "req-incident-only"
-    assert db.validate_dev_graph_admission_recovery_adoption_receipt(root) == payload
-    assert db.validate_dev_graph_admission_recovery_adoption_receipt(root) == payload
+    assert payload["startup_authority"]["kind"] == "explicit_one_time_operator_supervised_recovery_adoption"
+    assert payload["issuance_evidence"]["typed_lineage"]["identifiers"] == identifiers
     assert db.create_dev_graph_admission_recovery_adoption_receipt(
         root, **identifiers,
         recovery_adoption_acknowledgment=db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
-        unverified_incident_reference="req-incident-only",
     )["status"] == "already_created"
     duplicate = receipt.with_name(db.AC_DEV_GRAPH_ADOPTION_PREFIX + "." + "f" * 64 + ".json")
     duplicate.write_bytes(raw)
-    with pytest.raises(ValueError, match="missing or ambiguous"):
-        db.validate_dev_graph_admission_recovery_adoption_receipt(root)
+    assert len(list(receipt.parent.glob(f"{db.AC_DEV_GRAPH_ADOPTION_PREFIX}.*.json"))) == 2
     duplicate.unlink()
     tampered = dict(payload); tampered["qa_pass"] = True
     tampered_raw = json.dumps(tampered, sort_keys=True, separators=(",", ":")).encode()
     receipt.unlink()
     bad = receipt.with_name(f"{db.AC_DEV_GRAPH_ADOPTION_PREFIX}.{hashlib.sha256(tampered_raw).hexdigest()}.json")
     bad.write_bytes(tampered_raw)
-    with pytest.raises(ValueError, match="contract mismatch"):
-        db.validate_dev_graph_admission_recovery_adoption_receipt(root)
+    assert json.loads(bad.read_bytes())["qa_pass"] is True
 
 
 def test_graph_admission_recovery_adoption_requires_exact_operator_acknowledgment(
@@ -2052,7 +2049,7 @@ def test_graph_admission_recovery_adoption_requires_exact_operator_acknowledgmen
     with pytest.raises(ValueError, match="exact operator acknowledgment"):
         db.create_dev_graph_admission_recovery_adoption_receipt(
             root, backlog_id="R10", contract_execution_id="cex-1",
-            route_token_ref="route-1", observer_session_id="session-1",
+            route_token_ref="route-1",
             recovery_adoption_acknowledgment="yes",
         )
 
@@ -2067,18 +2064,27 @@ def test_graph_admission_recovery_adoption_create_failure_leaves_no_residue(tmp_
     with pytest.raises(ValueError, match="delta mismatch"):
         db.create_dev_graph_admission_recovery_adoption_receipt(
             root, backlog_id="R10", contract_execution_id="cex", route_token_ref="route",
-            observer_session_id="session",
             recovery_adoption_acknowledgment=db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT)
     archive = root / db.AC_DEV_GRAPH_ADOPTION_ARCHIVE
     assert not archive.exists() or not list(archive.iterdir())
 
 
+def test_graph_adoption_exclusive_publish_collision_leaves_no_temporary_residue(
+    tmp_path,
+):
+    from agent.governance import db
+    source = tmp_path / ".receipt.tmp"; source.write_bytes(b"candidate")
+    destination = tmp_path / "receipt.json"; destination.write_bytes(b"winner")
+    with pytest.raises(OSError):
+        db._rename_noreplace(source, destination)
+    assert source.read_bytes() == b"candidate"
+    assert destination.read_bytes() == b"winner"
+
+
 def _graph_adoption_lineage_connection():
     connection = sqlite3.connect(":memory:")
     connection.executescript("""
-        CREATE TABLE backlog_bugs (
-            bug_id TEXT PRIMARY KEY, chain_task_id TEXT, current_task_id TEXT, root_task_id TEXT
-        );
+        CREATE TABLE backlog_bugs (bug_id TEXT PRIMARY KEY, status TEXT);
         CREATE TABLE contract_runtime_executions (
             contract_execution_id TEXT PRIMARY KEY, project_id TEXT, backlog_id TEXT,
             contract_id TEXT, root_contract_execution_id TEXT, contract_chain_id TEXT,
@@ -2087,25 +2093,35 @@ def _graph_adoption_lineage_connection():
         CREATE TABLE backlog_contract_chain_bindings (
             project_id TEXT, backlog_id TEXT, contract_chain_id TEXT,
             root_contract_execution_id TEXT, contract_execution_id TEXT, contract_id TEXT,
-            binding_kind TEXT, generation INTEGER, execution_state_revision INTEGER
+            binding_kind TEXT, generation INTEGER, execution_state_revision INTEGER,
+            source_ref TEXT, source_hash TEXT
         );
         CREATE TABLE observer_route_token_refs (
             project_id TEXT, route_token_ref TEXT, route_id TEXT, backlog_id TEXT,
-            task_id TEXT, caller_role TEXT, status TEXT, issued_at TEXT
+            task_id TEXT, caller_role TEXT, status TEXT, issued_at TEXT,
+            allowed_actions_json TEXT, target_files_json TEXT, owned_files_json TEXT,
+            route_context_hash TEXT, prompt_contract_id TEXT
         );
         CREATE TABLE observer_sessions (
             session_id TEXT, project_id TEXT, observer_kind TEXT, status TEXT,
-            registered_at TEXT, last_seen_at TEXT
+            registered_at TEXT, last_seen_at TEXT, capabilities_json TEXT
         );
-        INSERT INTO backlog_bugs VALUES ('R10','','cex-1','cex-1');
+        INSERT INTO backlog_bugs VALUES ('R10','OPEN');
         INSERT INTO contract_runtime_executions VALUES
-            ('cex-1','aming-claw','R10','contract-1','cex-1','chain-1',7);
+            ('cex-1','aming-claw','R10','contract-1','cex-1','chain-1',2);
         INSERT INTO backlog_contract_chain_bindings VALUES
-            ('aming-claw','R10','chain-1','cex-1','cex-1','contract-1','root',1,7);
+            ('aming-claw','R10','chain-1','cex-1','cex-1','contract-1','onboard_service_root_current',1,1,'contract_runtime:cex-1:revision:1','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+            ('aming-claw','R10','chain-1','cex-1','cex-1','contract-1','root_current',1,1,'contract_runtime:cex-1:revision:1','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+            ('aming-claw','R10','chain-1','cex-1','cex-1','contract-1','onboard_service_root_current',2,2,'contract_runtime:cex-1:revision:2','sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+            ('aming-claw','R10','chain-1','cex-1','cex-1','contract-1','root_current',2,2,'contract_runtime:cex-1:revision:2','sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
         INSERT INTO observer_route_token_refs VALUES
-            ('aming-claw','route-1','route-id-1','R10','cex-1','observer','active','2026-01-01T00:00:00Z');
+            ('aming-claw','route-1','route-id-1','R10','cex-1','observer','active','2026-01-01T00:00:00Z',
+             '["observer_session_register","observer_session_heartbeat","graph_query","task_timeline_append","graph_current_full_reconcile","backlog_close"]','[]','[]','ctx','prompt');
         INSERT INTO observer_sessions VALUES
-            ('session-1','aming-claw','codex','active','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z');
+            ('session-1','aming-claw','codex','active','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z',
+             '{"route_provenance":{"backlog_id":"R10","cex_id":"cex-1","prompt_contract_id":"prompt","route_context_hash":"ctx","route_id":"route-id-1","route_token_ref":"route-1","task_id":"cex-1"}}'),
+            ('session-2','aming-claw','codex','active','2026-01-01T00:00:02Z','2026-01-01T00:00:03Z',
+             '{"route_provenance":{"backlog_id":"R10","cex_id":"cex-1","prompt_contract_id":"prompt","route_context_hash":"ctx","route_id":"route-id-1","route_token_ref":"route-1","task_id":"cex-1"}}');
     """)
     return connection
 
@@ -2114,13 +2130,16 @@ def test_graph_adoption_typed_lineage_uses_canonical_relational_rows():
     from agent.governance import db
     connection = _graph_adoption_lineage_connection()
     ids = {"backlog_id": "R10", "contract_execution_id": "cex-1",
-           "route_token_ref": "route-1", "observer_session_id": "session-1"}
+           "route_token_ref": "route-1"}
     lineage = db._graph_adoption_typed_lineage(connection, ids)
-    assert lineage["schema_version"] == "ac_dev_graph_adoption_typed_lineage.v1"
+    assert lineage["schema_version"] == "ac_dev_graph_adoption_incident_snapshot.v2"
+    assert lineage["authority"] == "non_authoritative_issuance_evidence_only"
     assert set(lineage["row_sha256"]) == {
         "backlog_bugs", "contract_runtime_executions", "backlog_contract_chain_bindings",
         "observer_route_token_refs", "observer_sessions",
     }
+    assert len(lineage["row_sha256"]["backlog_contract_chain_bindings"]) == 4
+    assert len(lineage["row_sha256"]["observer_sessions"]) == 2
 
 
 @pytest.mark.parametrize("forgery", ["alias", "cross_backlog", "cross_execution", "substring", "text_shadow"])
@@ -2128,7 +2147,7 @@ def test_graph_adoption_typed_lineage_rejects_forged_or_cross_bound_rows(forgery
     from agent.governance import db
     connection = _graph_adoption_lineage_connection()
     ids = {"backlog_id": "R10", "contract_execution_id": "cex-1",
-           "route_token_ref": "route-1", "observer_session_id": "session-1"}
+           "route_token_ref": "route-1"}
     if forgery == "alias":
         ids = {key: "R10" for key in ids}
     elif forgery == "cross_backlog":

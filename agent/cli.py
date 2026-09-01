@@ -3276,13 +3276,11 @@ def dev_create_cow_successor_receipt(
 @click.option("--backlog-id", required=True)
 @click.option("--contract-execution-id", required=True)
 @click.option("--route-token-ref", required=True)
-@click.option("--observer-session-id", required=True)
 @click.option("--recovery-adoption-acknowledgment", required=True)
-@click.option("--unverified-incident-reference", default="", help="Optional non-authoritative incident label.")
 def dev_create_graph_admission_recovery_adoption_receipt(
     dev_storage_root: Path, backlog_id: str, contract_execution_id: str,
-    route_token_ref: str, observer_session_id: str,
-    recovery_adoption_acknowledgment: str, unverified_incident_reference: str,
+    route_token_ref: str,
+    recovery_adoption_acknowledgment: str,
 ) -> None:
     """Seal a non-retroactive recovery adoption of one exact graph DDL delta."""
     from agent.governance import db as _db
@@ -3290,9 +3288,8 @@ def dev_create_graph_admission_recovery_adoption_receipt(
         result = _db.create_dev_graph_admission_recovery_adoption_receipt(
             dev_storage_root, backlog_id=backlog_id,
             contract_execution_id=contract_execution_id,
-            route_token_ref=route_token_ref, observer_session_id=observer_session_id,
+            route_token_ref=route_token_ref,
             recovery_adoption_acknowledgment=recovery_adoption_acknowledgment,
-            unverified_incident_reference=unverified_incident_reference,
         )
     except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
         raise click.ClickException(str(exc)) from exc
