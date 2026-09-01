@@ -1419,6 +1419,89 @@ def sqlite_write_lock() -> threading.RLock:
     return _SQLITE_WRITE_LOCK
 
 
+def _canonical_ac_dev_identity_database_path() -> Path:
+    """Resolve the receipt-independent canonical dev DB identity path."""
+
+    raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
+    if not raw:
+        raise RuntimeError(
+            "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
+        )
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
+    stable = _absolute_non_symlink_root(
+        Path(str(binding["shared_volume_path"])), create=False
+    )
+    stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
+    if (
+        not stable_raw
+        or _absolute_non_symlink_root(Path(stable_raw), create=False) != stable
+    ):
+        raise RuntimeError(
+            "AC dev stable shared-volume claim mismatches verified authority"
+        )
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+
+    supplied = Path(raw).expanduser().absolute()
+    if supplied.is_symlink() or supplied != resolve_ac_dev_storage_root(stable):
+        raise ValueError("AC dev storage root must equal canonical resolver output")
+    root = _absolute_non_symlink_root(supplied, create=False)
+    database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+    if (
+        database.is_symlink()
+        or database.parent.resolve(strict=True)
+        != (root / "governance" / AC_PROJECT_ID).absolute()
+    ):
+        raise ValueError("AC dev governance database escaped its world root")
+    return database
+
+
+def _canonical_ac_dev_database_identity(
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, object]:
+    """Derive full dev identity without accepting caller-supplied fields."""
+
+    db_path = _canonical_ac_dev_identity_database_path()
+    metadata = db_path.stat(follow_symlinks=False)
+    if db_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("canonical AC dev database must be a non-symlink file")
+    if db_path.resolve(strict=True) != db_path.absolute():
+        raise ValueError("canonical AC dev database escaped its world root")
+    if conn is not None:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main_paths = [
+            Path(str(row[2])).resolve(strict=True)
+            for row in rows
+            if str(row[1]) == "main" and str(row[2])
+        ]
+        if main_paths != [db_path.resolve(strict=True)]:
+            raise ValueError("opened AC dev database identity mismatch")
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+    else:
+        uri = (
+            "file:" + urllib.parse.quote(str(db_path))
+            + "?mode=ro&immutable=1"
+        )
+        with closing(sqlite3.connect(uri, uri=True)) as identity_conn:
+            meta = dict(identity_conn.execute("SELECT key, value FROM schema_meta"))
+    genesis_sha256 = str(meta.get("governance_world_genesis_sha256") or "")
+    if (
+        meta.get("governance_world_id") != AC_DEV_WORLD_ID
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", genesis_sha256)
+    ):
+        raise ValueError("canonical AC dev database genesis is invalid")
+    return {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID,
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "relative_path_sha256": "sha256:"
+        + hashlib.sha256(AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")).hexdigest(),
+        "genesis_sha256": genesis_sha256,
+    }
+
+
 def canonical_ac_database_identity(
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, object]:
@@ -1432,40 +1515,21 @@ def canonical_ac_database_identity(
     file but cannot nominate a different AC-shaped database.
     """
 
-    if _is_dev_runtime():
-        db_path = _dev_database_path()
-        metadata = db_path.stat(follow_symlinks=False)
-        if db_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-            raise ValueError("canonical AC dev database must be a non-symlink file")
-        if db_path.resolve(strict=True) != db_path.absolute():
-            raise ValueError("canonical AC dev database escaped its world root")
-        if conn is not None:
-            rows = conn.execute("PRAGMA database_list").fetchall()
-            main_paths = [
-                Path(str(row[2])).resolve(strict=True)
-                for row in rows
-                if str(row[1]) == "main" and str(row[2])
-            ]
-            if main_paths != [db_path.resolve(strict=True)]:
-                raise ValueError("opened AC dev database identity mismatch")
-        with closing(sqlite3.connect(db_path)) as identity_conn:
-            meta = dict(identity_conn.execute("SELECT key, value FROM schema_meta"))
-        genesis_sha256 = str(meta.get("governance_world_genesis_sha256") or "")
-        if (
-            meta.get("governance_world_id") != AC_DEV_WORLD_ID
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", genesis_sha256)
-        ):
-            raise ValueError("canonical AC dev database genesis is invalid")
-        return {
-            "schema_version": "ac_governance_database_identity.v2",
-            "world_id": AC_DEV_WORLD_ID,
-            "project_id": AC_PROJECT_ID,
-            "device": int(metadata.st_dev),
-            "inode": int(metadata.st_ino),
-            "relative_path_sha256": "sha256:"
-            + hashlib.sha256(AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")).hexdigest(),
-            "genesis_sha256": genesis_sha256,
-        }
+    opened_dev_database = False
+    runtime_plane = os.environ.get(RUNTIME_PLANE_ENV, "").strip()
+    if (
+        conn is not None
+        and not runtime_plane
+        and os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
+    ):
+        opened = _connection_main_database_identity(conn)
+        if opened is not None:
+            opened_dev_database = (
+                opened[0]
+                == _canonical_ac_dev_identity_database_path().resolve(strict=True)
+            )
+    if _is_dev_runtime() or opened_dev_database:
+        return _canonical_ac_dev_database_identity(conn)
 
     shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
     if not shared_raw:
@@ -4807,7 +4871,6 @@ def validate_dev_preimage_only(
         source_identity=source_identity, allow_postimage=True,
     )
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
-    physical = database.stat(follow_symlinks=False)
     pre_sha256 = _durable_database_sha256(database)
     uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
     connection = sqlite3.connect(uri, uri=True)
@@ -4820,6 +4883,7 @@ def validate_dev_preimage_only(
             if previous_plane is not None:
                 os.environ[RUNTIME_PLANE_ENV] = previous_plane
         meta = dict(connection.execute("SELECT key, value FROM schema_meta"))
+        database_identity = _canonical_ac_dev_database_identity(connection)
     finally:
         connection.close()
     current = {}
@@ -4832,7 +4896,7 @@ def validate_dev_preimage_only(
             raise ValueError("AC dev durable custody projection is invalid")
     return {
         "dev_storage_root": str(root), "database_path": str(database),
-        "database_identity": {"device": int(physical.st_dev), "inode": int(physical.st_ino)},
+        "database_identity": database_identity,
         "database_sha256": pre_sha256, "custody_projection": dict(current),
         "has_genesis": bool(meta.get("governance_world_genesis_sha256")),
     }
@@ -4886,6 +4950,7 @@ def commit_dev_child_custody(
         post_meta = dict(post_conn.execute(
             "SELECT key,value FROM schema_meta"
         ))
+        post_database_identity = _canonical_ac_dev_database_identity(post_conn)
     finally:
         post_conn.close()
     try:
@@ -4923,9 +4988,7 @@ def commit_dev_child_custody(
         **receipt, "database_sha256_before": pre["database_sha256"],
         "database_sha256_after": post_sha256,
         "custody_projection": dict(post_process),
-        "database_identity": {
-            "device": int(physical.st_dev), "inode": int(physical.st_ino),
-        },
+        "database_identity": post_database_identity,
     }
 
 

@@ -57,7 +57,7 @@ def test_dev_create_cow_successor_receipt_delegates_to_db(tmp_path, monkeypatch)
                         "predecessor_backup": backup, "linked_v3_receipt": linked}
 
 
-def test_dev_running_identity_requires_exact_receipt_derived_issuance_anchor(tmp_path):
+def _valid_dev_running_identity_fixture(tmp_path):
     import agent.cli as cli
 
     candidate = "b" * 40
@@ -97,6 +97,15 @@ def test_dev_running_identity_requires_exact_receipt_derived_issuance_anchor(tmp
             "worktree_source_sha256": source["source_sha256"],
         },
     }
+    return source, stable, issuance, database, health
+
+
+def test_dev_running_identity_requires_exact_receipt_derived_issuance_anchor(tmp_path):
+    import agent.cli as cli
+
+    source, stable, issuance, database, health = (
+        _valid_dev_running_identity_fixture(tmp_path)
+    )
 
     assert cli._dev_running_identity_matches(
         health, source, stable_anchor_commit=stable,
@@ -106,6 +115,51 @@ def test_dev_running_identity_requires_exact_receipt_derived_issuance_anchor(tmp
     assert not cli._dev_running_identity_matches(
         health, source, stable_anchor_commit=stable,
         dev_issuance_ancestry_anchor_commit="e" * 40,
+        dev_database_identity=database,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation", "value"),
+    [
+        ("schema_version", "missing", None),
+        ("schema_version", "spoof", "ac_governance_database_identity.v3"),
+        ("schema_version", "spoof", "ac_stable_database_identity.v1"),
+        ("world_id", "missing", None),
+        ("world_id", "spoof", "stable"),
+        ("project_id", "missing", None),
+        ("project_id", "spoof", "foreign-project"),
+        ("device", "missing", None),
+        ("device", "spoof", 0),
+        ("inode", "missing", None),
+        ("inode", "spoof", 0),
+        ("relative_path_sha256", "missing", None),
+        ("relative_path_sha256", "spoof", "sha256:" + "0" * 64),
+        ("genesis_sha256", "missing", None),
+        ("genesis_sha256", "spoof", "sha256:" + "0" * 64),
+    ],
+)
+def test_dev_running_identity_rejects_missing_or_spoofed_database_core_field(
+    tmp_path, field, mutation, value,
+):
+    import agent.cli as cli
+
+    source, stable, issuance, database, health = (
+        _valid_dev_running_identity_fixture(tmp_path)
+    )
+    reported = dict(database)
+    if mutation == "missing":
+        reported.pop(field)
+    else:
+        reported[field] = value
+    health["runtime_plane_identity"] = {
+        **health["runtime_plane_identity"],
+        "database_identity": reported,
+    }
+
+    assert not cli._dev_running_identity_matches(
+        health, source, stable_anchor_commit=stable,
+        dev_issuance_ancestry_anchor_commit=issuance,
         dev_database_identity=database,
     )
 

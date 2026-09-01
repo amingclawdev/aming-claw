@@ -3076,6 +3076,51 @@ def test_cow_phase_dispatch_has_no_exception_text_control_flow():
     assert "_select_dev_cow_generation_phase" in source
 
 
+def test_dev_preimage_identity_is_full_v2_from_same_immutable_connection(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    _phase_z_bind_first_start_runtime(tmp_path, monkeypatch, root)
+    monkeypatch.delenv(db.RUNTIME_PLANE_ENV, raising=False)
+    before = db._durable_database_sha256(database)
+    companions = tuple(Path(str(database) + suffix) for suffix in ("-wal", "-shm"))
+    assert not any(path.exists() for path in companions)
+
+    preimage = db.validate_dev_preimage_only(
+        root, source_identity=source, linked_v3_receipt=linked,
+    )
+    uri = "file:" + str(database) + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        expected = db.canonical_ac_database_identity(connection)
+        original_connect = db.sqlite3.connect
+        monkeypatch.setattr(
+            db.sqlite3, "connect",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("canonical identity opened a second connection")
+            ),
+        )
+        assert db.canonical_ac_database_identity(connection) == expected
+        monkeypatch.setattr(db.sqlite3, "connect", original_connect)
+    finally:
+        connection.close()
+
+    assert preimage["database_identity"] == expected
+    assert tuple(expected) == (
+        "schema_version", "world_id", "project_id", "device", "inode",
+        "relative_path_sha256", "genesis_sha256",
+    )
+    assert expected["schema_version"] == "ac_governance_database_identity.v2"
+    assert expected["world_id"] == "ac-dev"
+    assert expected["project_id"] == "aming-claw"
+    assert db._durable_database_sha256(database) == before
+    assert not any(path.exists() for path in companions)
+
+
 def test_cow_completed_generation_transitions_to_new_child_custody(
     tmp_path, monkeypatch,
 ):
@@ -3098,6 +3143,19 @@ def test_cow_completed_generation_transitions_to_new_child_custody(
     assert result["custody_projection"] == custody
     assert result["database_identity"]["device"] == receipt["successor"]["identity"]["device"]
     assert result["database_identity"]["inode"] == receipt["successor"]["identity"]["inode"]
+    uri = "file:" + str(database) + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        assert result["database_identity"] == db.canonical_ac_database_identity(
+            connection
+        )
+    finally:
+        connection.close()
+    assert result["database_identity"]["schema_version"] == (
+        "ac_governance_database_identity.v2"
+    )
+    assert not Path(str(database) + "-wal").exists()
+    assert not Path(str(database) + "-shm").exists()
     db.release_dev_runtime_writer_lease(root)
 
 
@@ -3211,6 +3269,17 @@ def test_cow_prebind_api_rejects_caller_asserted_database_sha(
             root, source_identity=source, process_identity=custody,
             linked_v3_receipt=linked,
             expected_pre_sha256=caller_asserted_sha,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        db.validate_dev_preimage_only(
+            root, source_identity=source, linked_v3_receipt=linked,
+            database_identity={"device": 1, "inode": 2},
+        )
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        db.commit_dev_child_custody(
+            root, source_identity=source, process_identity=custody,
+            linked_v3_receipt=linked,
+            database_identity={"device": 1, "inode": 2},
         )
     assert not hasattr(db, "select_dev_completed_generation_ref")
     assert not hasattr(db, "_dev_durable_ref")
