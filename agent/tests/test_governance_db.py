@@ -2710,6 +2710,59 @@ def test_cow_generation_phase_selector_is_closed_for_first_and_completed(
     ) is db._DevCowGenerationPhase.COMPLETED_GENERATION
 
 
+def test_cow_completed_phase_selector_builds_source_reference_outside_dev_plane(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    stable = db.verified_stable_database_binding()
+    before = db._durable_database_sha256(database)
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    assert db._select_dev_cow_generation_phase(
+        root, linked_v3_receipt=linked, source_identity=completed_source,
+        stable_binding=stable,
+    ) is db._DevCowGenerationPhase.COMPLETED_GENERATION
+
+    assert os.environ[db.RUNTIME_PLANE_ENV] == db.DEV_RUNTIME_PLANE
+    assert db._durable_database_sha256(database) == before
+
+
+def test_cow_completed_phase_selector_rejects_target_schema_mismatch_in_dev_plane(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE parallel_branch_runtime_contexts")
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    before = db._durable_database_sha256(database)
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    with pytest.raises(ValueError, match="source schema inventory mismatch"):
+        db._select_dev_cow_generation_phase(
+            root, linked_v3_receipt=linked, source_identity=completed_source,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+
+    assert os.environ[db.RUNTIME_PLANE_ENV] == db.DEV_RUNTIME_PLANE
+    assert db._durable_database_sha256(database) == before
+
+
 def test_cow_generation_phase_selector_rejects_ambiguous_and_neither(
     tmp_path, monkeypatch,
 ):

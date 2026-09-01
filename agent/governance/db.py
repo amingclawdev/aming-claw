@@ -3170,10 +3170,7 @@ def _authority_projection_schema_statements() -> tuple[str, ...]:
 
 
 def _canonical_authority_projection_schema_inventory(*, include_plan: bool) -> tuple[tuple[str, str, str, str], ...]:
-    with closing(sqlite3.connect(":memory:")) as memory:
-        memory.row_factory = sqlite3.Row
-        _configure_connection(memory, busy_timeout=10000)
-        _ensure_schema(memory)
+    with closing(_migration_capable_source_schema_memory()) as memory:
         if include_plan:
             for statement in _authority_projection_schema_statements():
                 memory.execute(statement)
@@ -3193,10 +3190,7 @@ def authority_projection_schema_plan() -> dict[str, object]:
 
 def authority_projection_schema_inventory() -> dict[str, object]:
     """Return the exact full source-owned inventory for receipt preflight."""
-    with closing(sqlite3.connect(":memory:")) as memory:
-        memory.row_factory = sqlite3.Row
-        _configure_connection(memory, busy_timeout=10000)
-        _ensure_schema(memory)
+    with closing(_migration_capable_source_schema_memory()) as memory:
         for statement in _authority_projection_schema_statements():
             memory.execute(statement)
         return backlog_read_schema_inventory(memory)
@@ -3809,12 +3803,15 @@ def _cow_database_observation(
         # SQLite world to aming-claw.  backlog_bugs itself intentionally has no
         # project_id column, so authenticate its exact source-owned ABI before
         # reading the whole project-bound table.
-        with closing(sqlite3.connect(":memory:")) as canonical:
-            canonical.row_factory = sqlite3.Row
-            _configure_connection(canonical, busy_timeout=10000)
-            if historical_source_schema is None:
-                _ensure_schema(canonical)
-            else:
+        canonical_memory = (
+            _migration_capable_source_schema_memory()
+            if historical_source_schema is None
+            else sqlite3.connect(":memory:")
+        )
+        with closing(canonical_memory) as canonical:
+            if historical_source_schema is not None:
+                canonical.row_factory = sqlite3.Row
+                _configure_connection(canonical, busy_timeout=10000)
                 # Immutable receipt replay owns its issuance-time source
                 # inventory below.  It needs only the source-defined backlog
                 # ABI here; current optional migration inventory must not
