@@ -5564,7 +5564,7 @@ def _durable_stop_v2_fixture(tmp_path, monkeypatch):
                         lambda _database, *, include_postimage: dict(after if include_postimage else before))
     monkeypatch.setattr(cli, "_validate_durable_stop_launch_chain", lambda **_kwargs: ({}, {}))
     monkeypatch.setattr(cli, "_durable_stop_health_matches", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(cli, "_validated_linked_v3_receipt", lambda *_args, **_kwargs: (
+    monkeypatch.setattr(cli, "_validated_durable_stop_linked_v3_chain", lambda **_kwargs: (
         "sha256:" + "e" * 64, {},
     ))
     state = {"alive": True}
@@ -5576,12 +5576,272 @@ def _durable_stop_v2_fixture(tmp_path, monkeypatch):
     return cli, dev, runtime, receipt, launch_sha, target, before, after, state, immutable
 
 
+def _durable_stop_linked_chain_fixture(tmp_path, monkeypatch):
+    import copy
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"
+    database = root / db.AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True)
+    genesis = "sha256:" + "1" * 64
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT);"
+    )
+    connection.executemany("INSERT INTO schema_meta VALUES (?,?)", [
+        ("governance_world_id", "ac-dev"),
+        ("governance_world_genesis_sha256", genesis),
+    ])
+    connection.commit()
+    connection.close()
+    database_metadata = database.stat(follow_symlinks=False)
+    current_identity = cli._canonical_dev_database_identity_projection(database)
+
+    linked = root / "archive" / "schema-admission" / "linked.json"
+    linked.parent.mkdir(parents=True)
+    linked.write_text("immutable linked v3\n", encoding="utf-8")
+    linked_digest = "sha256:" + hashlib.sha256(linked.read_bytes()).hexdigest()
+    canonical_linked = linked.with_name(f"{linked_digest[7:]}.json")
+    linked.rename(canonical_linked)
+
+    stable_database = tmp_path / "stable.db"
+    stable_database.write_bytes(b"stable")
+    stable_metadata = stable_database.stat(follow_symlinks=False)
+    stable_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": stable_metadata.st_dev,
+        "inode": stable_metadata.st_ino,
+        "stable_relative_path_sha256": "sha256:" + "2" * 64,
+    }
+    successor_receipt = {
+        "schema_version": db.AC_DEV_COW_SUCCESSOR_SCHEMA,
+        "stage": "completed",
+        "project_id": "aming-claw",
+        "port": cli.AC_DEV_SERVICE_PORT,
+        "root": str(root),
+        "genesis": {"raw_json": "frozen genesis", "sha256": genesis},
+        "history": {"linked_v3": {
+            "path": str(canonical_linked), "sha256": linked_digest,
+        }},
+        "successor": {
+            "governance_world_id": "ac-dev",
+            "genesis_json": "frozen genesis",
+            "genesis_sha256": genesis,
+            "identity": {
+                "path": str(database),
+                "device": database_metadata.st_dev,
+                "inode": database_metadata.st_ino,
+                "nlink": database_metadata.st_nlink,
+                # Historical issuance bytes are intentionally not stop authority.
+                "sha256": "sha256:" + "3" * 64,
+            },
+        },
+        "stable_binding": {"database": stable_identity, "runtime_commit": None},
+    }
+    stable = {
+        "database_path": str(stable_database),
+        "stable_database_identity": stable_identity,
+    }
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_receipt",
+        lambda _root: copy.deepcopy(successor_receipt),
+    )
+    monkeypatch.setattr(
+        db, "verified_stable_database_binding", lambda: copy.deepcopy(stable),
+    )
+    launch = {
+        "linked_v3_receipt_sha256": linked_digest,
+        "database_identity": current_identity,
+        # DML changed bytes after launch; this must never become stop authority.
+        "database_sha256_after": "sha256:" + "4" * 64,
+    }
+    custody = {
+        "database_identity": current_identity,
+        "world_custody_sha256": "sha256:" + "5" * 64,
+    }
+    return (
+        cli, db, root, database, canonical_linked, launch, custody,
+        successor_receipt, stable,
+    )
+
+
+def test_durable_stop_linked_chain_binds_successor_without_mutable_db_sha(
+    tmp_path, monkeypatch,
+):
+    (cli, _db, root, database, _linked, launch, custody,
+     successor, _stable) = _durable_stop_linked_chain_fixture(tmp_path, monkeypatch)
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE runtime_dml(id TEXT PRIMARY KEY,payload TEXT);"
+        "INSERT INTO runtime_dml VALUES('fresh','not in issuance bytes');"
+    )
+    connection.commit()
+    connection.close()
+
+    digest, returned = cli._validated_durable_stop_linked_v3_chain(
+        dev_storage=root,
+        database=database,
+        launch_receipt=launch,
+        database_custody=custody,
+    )
+
+    assert digest == launch["linked_v3_receipt_sha256"]
+    assert returned == successor
+    assert launch["database_sha256_after"] != successor["successor"]["identity"]["sha256"]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "launch_digest", "linked_path", "successor_path", "successor_device",
+        "successor_inode", "successor_nlink", "world", "project", "genesis",
+        "custody_world", "custody_project", "custody_genesis", "launch_custody",
+        "stable_drift", "stable_alias",
+    ],
+)
+def test_durable_stop_linked_chain_rejects_binding_drift_before_stop(
+    tmp_path, monkeypatch, drift,
+):
+    import copy
+
+    (cli, db, root, database, linked, launch, custody,
+     successor, stable) = _durable_stop_linked_chain_fixture(tmp_path, monkeypatch)
+    changed_successor = copy.deepcopy(successor)
+    changed_launch = copy.deepcopy(launch)
+    changed_custody = copy.deepcopy(custody)
+    changed_stable = copy.deepcopy(stable)
+    if drift == "launch_digest":
+        changed_launch["linked_v3_receipt_sha256"] = "sha256:" + "a" * 64
+    elif drift == "linked_path":
+        changed_successor["history"]["linked_v3"]["path"] = str(linked) + ".other"
+    elif drift.startswith("successor_"):
+        field = drift.removeprefix("successor_")
+        changed_successor["successor"]["identity"][field] = (
+            str(database) + ".other" if field == "path" else 999999
+        )
+    elif drift == "world":
+        changed_successor["successor"]["governance_world_id"] = "other"
+    elif drift == "project":
+        changed_successor["project_id"] = "other"
+    elif drift == "genesis":
+        changed_successor["successor"]["genesis_sha256"] = "sha256:" + "b" * 64
+    elif drift.startswith("custody_"):
+        field = (
+            drift.removeprefix("custody_") + "_id"
+            if drift != "custody_genesis"
+            else "genesis_sha256"
+        )
+        changed_custody["database_identity"][field] = "other"
+    elif drift == "launch_custody":
+        changed_launch["database_identity"]["inode"] = 999999
+    elif drift == "stable_drift":
+        changed_stable["stable_database_identity"]["inode"] = 999999
+    else:
+        metadata = database.stat(follow_symlinks=False)
+        alias_identity = {
+            **changed_stable["stable_database_identity"],
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+        }
+        changed_stable["database_path"] = str(database)
+        changed_stable["stable_database_identity"] = alias_identity
+        changed_successor["stable_binding"]["database"] = alias_identity
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_receipt",
+        lambda _root: changed_successor,
+    )
+    monkeypatch.setattr(
+        db, "verified_stable_database_binding", lambda: changed_stable,
+    )
+
+    with pytest.raises(cli.click.ClickException, match="COW successor chain mismatch"):
+        cli._validated_durable_stop_linked_v3_chain(
+            dev_storage=root,
+            database=database,
+            launch_receipt=changed_launch,
+            database_custody=changed_custody,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_chain", ["missing", "duplicate", "malformed", "adoption", "sidecar", "hash"],
+)
+def test_durable_stop_linked_chain_rejects_invalid_immutable_issuance(
+    tmp_path, monkeypatch, invalid_chain,
+):
+    (cli, db, root, database, _linked, launch, custody,
+     _successor, _stable) = _durable_stop_linked_chain_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_receipt",
+        lambda _root: (_ for _ in ()).throw(
+            ValueError(f"{invalid_chain} immutable successor chain")
+        ),
+    )
+
+    with pytest.raises(cli.click.ClickException, match="COW successor chain mismatch"):
+        cli._validated_durable_stop_linked_v3_chain(
+            dev_storage=root,
+            database=database,
+            launch_receipt=launch,
+            database_custody=custody,
+        )
+
+
+def test_durable_stop_only_routes_around_start_selector():
+    import inspect
+    import agent.cli as cli
+
+    stop_source = inspect.getsource(cli._durable_dev_stop)
+    launch_source = inspect.getsource(cli._durable_dev_launch)
+    start_source = inspect.getsource(cli.start.callback)
+    generic_source = inspect.getsource(cli._validated_linked_v3_receipt)
+    assert "_validated_durable_stop_linked_v3_chain(" in stop_source
+    assert "_validated_linked_v3_receipt(" not in stop_source
+    assert "_validated_linked_v3_receipt(" in launch_source
+    assert "_validated_linked_v3_receipt(" in start_source
+    assert "_select_dev_cow_generation_phase(" in generic_source
+
+
+def test_durable_stop_linked_chain_failure_is_pre_signal_and_receipt_free(
+    tmp_path, monkeypatch,
+):
+    (cli, dev, runtime, _receipt, _launch_sha, _target, _before, _after,
+     _state, _immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
+    signals = []
+    monkeypatch.setattr(
+        cli,
+        "_validated_durable_stop_linked_v3_chain",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            cli.click.ClickException("AC dev durable stop COW successor chain mismatch")
+        ),
+    )
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    with pytest.raises(cli.click.ClickException, match="COW successor chain mismatch"):
+        cli._durable_dev_stop(dev)
+
+    assert signals == []
+    assert list(runtime.glob("stop-challenge.*.json")) == []
+    assert list(runtime.glob("exit.*.json")) == []
+    assert list(runtime.glob("stop.*.json")) == []
+
+
 def test_durable_stop_clean_descendant_allows_dml_and_seals_final_postimage(
     tmp_path, monkeypatch,
 ):
     (cli, dev, runtime, receipt, launch_sha, target, before, after,
      state, immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
     signals = []
+    selector_calls = []
+    from agent.governance import db
+    monkeypatch.setattr(db, "_select_dev_cow_generation_phase", lambda *_a, **_k: (
+        selector_calls.append(True),
+        (_ for _ in ()).throw(AssertionError("start selector called during stop")),
+    )[1])
+    monkeypatch.setattr(cli, "_validated_linked_v3_receipt", lambda *_a, **_k: (
+        _ for _ in ()
+    ).throw(AssertionError("generic linked-v3 validator called during stop")))
     def fake_kill(pid, sig):
         signals.append((pid, sig))
         if sig == cli.signal.SIGTERM:
@@ -5607,6 +5867,7 @@ def test_durable_stop_clean_descendant_allows_dml_and_seals_final_postimage(
     assert stop["target_source_identity"]["commit"] == target["commit"]
     assert stop["database_custody_before"] == before
     assert stop["database_custody_after"] == after
+    assert selector_calls == []
     assert all(path.read_bytes() == raw for path, raw in immutable.items())
 
 
@@ -5676,6 +5937,8 @@ def test_durable_stop_health_binds_loaded_old_and_clean_target_world(drift):
 
 @pytest.mark.parametrize(
     "attack,expected", [
+        ("launch_chain", "launch receipt chain mismatch"),
+        ("health", "process identity mismatch"),
         ("source_ref_moved", "pre-TERM CAS mismatch"),
         ("database_world_drift", "pre-TERM CAS mismatch"),
         ("process_identity", "process identity mismatch"),
@@ -5686,8 +5949,20 @@ def test_durable_stop_health_binds_loaded_old_and_clean_target_world(drift):
 )
 def test_durable_stop_v2_attacks_fail_closed(tmp_path, monkeypatch, attack, expected):
     (cli, dev, runtime, receipt, launch_sha, target, before, _after,
-     state, _immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
+    state, _immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
     signals = []
+    if attack == "launch_chain":
+        monkeypatch.setattr(
+            cli,
+            "_validate_durable_stop_launch_chain",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                cli.click.ClickException("AC dev durable stop launch receipt chain mismatch")
+            ),
+        )
+    if attack == "health":
+        monkeypatch.setattr(
+            cli, "_durable_stop_health_matches", lambda *_args, **_kwargs: False,
+        )
     if attack == "preforged_challenge":
         cli._durable_content_receipt(runtime, "stop-challenge", {
             "launch_sha256": launch_sha, "forged": True,
@@ -5723,10 +5998,13 @@ def test_durable_stop_v2_attacks_fail_closed(tmp_path, monkeypatch, attack, expe
     monkeypatch.setattr(cli.os, "kill", fake_kill)
     with pytest.raises(cli.click.ClickException, match=expected):
         cli._durable_dev_stop(dev)
-    if attack in {"source_ref_moved", "database_world_drift", "process_identity",
-                  "preforged_challenge"}:
+    if attack in {"launch_chain", "health", "source_ref_moved",
+                  "database_world_drift", "process_identity", "preforged_challenge"}:
         assert signals == []
     elif attack == "missing_exit":
         assert signals == [(receipt["pid"], cli.signal.SIGTERM), (receipt["pid"], 0)]
     else:
         assert signals[0] == (receipt["pid"], cli.signal.SIGTERM)
+    if not signals:
+        assert list(runtime.glob("exit.*.json")) == []
+        assert list(runtime.glob("stop.*.json")) == []

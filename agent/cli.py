@@ -4428,6 +4428,120 @@ def _validate_durable_stop_launch_chain(
     return pending, readiness
 
 
+def _validated_durable_stop_linked_v3_chain(
+    *, dev_storage: Path, database: Path,
+    launch_receipt: Mapping[str, object],
+    database_custody: Mapping[str, object],
+) -> tuple[str, dict[str, Any]]:
+    """Validate frozen COW issuance for stop without replaying start policy.
+
+    The linked-v3 receipt describes the predecessor inode, while a durable
+    stop acts on the live COW successor.  Replaying the start-phase selector
+    here would therefore require a free listener and misclassify ordinary DML.
+    This projection instead authenticates the immutable successor chain and
+    binds only physical/world custody; mutable database bytes are deliberately
+    outside stop authority.
+    """
+
+    from agent.governance import db as _db
+
+    root = dev_storage.expanduser().absolute()
+    linked_digest = str(launch_receipt.get("linked_v3_receipt_sha256") or "")
+    if not _exact_sha256(linked_digest):
+        raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
+    linked_path = (
+        root / "archive" / "schema-admission" / f"{linked_digest[7:]}.json"
+    ).absolute()
+    expected_database = (root / _db.AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+    try:
+        if (
+            root.is_symlink()
+            or root.resolve(strict=True) != root
+            or database.absolute() != expected_database
+            or database.is_symlink()
+            or database.resolve(strict=True) != expected_database
+        ):
+            raise ValueError("noncanonical stop database")
+        successor_receipt = _db.validate_dev_cow_successor_receipt(root)
+        stable = _db.verified_stable_database_binding()
+        stable_database = Path(str(stable.get("database_path") or "")).absolute()
+        stable_metadata = stable_database.stat(follow_symlinks=False)
+        database_metadata = database.stat(follow_symlinks=False)
+        current_identity = _canonical_dev_database_identity_projection(database)
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
+        raise click.ClickException(
+            "AC dev durable stop COW successor chain mismatch"
+        ) from exc
+
+    history = successor_receipt.get("history")
+    successor = successor_receipt.get("successor")
+    genesis = successor_receipt.get("genesis")
+    stable_binding = successor_receipt.get("stable_binding")
+    claimed_custody = database_custody.get("database_identity")
+    launch_database_identity = launch_receipt.get("database_identity")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            history,
+            successor,
+            genesis,
+            stable_binding,
+            claimed_custody,
+            launch_database_identity,
+        )
+    ):
+        raise click.ClickException("AC dev durable stop COW successor chain mismatch")
+
+    linked_ref = dict(history.get("linked_v3") or {})
+    successor_identity = dict(successor.get("identity") or {})
+    frozen_stable_identity = dict(stable_binding.get("database") or {})
+    current_stable_identity = dict(stable.get("stable_database_identity") or {})
+    current_physical_identity = {
+        "path": str(expected_database),
+        "device": int(database_metadata.st_dev),
+        "inode": int(database_metadata.st_ino),
+        "nlink": int(database_metadata.st_nlink),
+    }
+    stable_physical_identity = (
+        int(stable_metadata.st_dev), int(stable_metadata.st_ino)
+    )
+    if (
+        successor_receipt.get("schema_version")
+        != _db.AC_DEV_COW_SUCCESSOR_SCHEMA
+        or successor_receipt.get("stage") != "completed"
+        or successor_receipt.get("project_id") != "aming-claw"
+        or successor_receipt.get("port") != AC_DEV_SERVICE_PORT
+        or successor_receipt.get("root") != str(root)
+        or linked_ref != {"path": str(linked_path), "sha256": linked_digest}
+        or {
+            key: successor_identity.get(key)
+            for key in ("path", "device", "inode", "nlink")
+        }
+        != current_physical_identity
+        or database_metadata.st_nlink != 1
+        or dict(claimed_custody) != current_identity
+        or dict(launch_database_identity) != current_identity
+        or current_identity.get("world_id") != successor.get("governance_world_id")
+        or current_identity.get("project_id") != successor_receipt.get("project_id")
+        or current_identity.get("genesis_sha256") != successor.get("genesis_sha256")
+        or current_identity.get("genesis_sha256") != genesis.get("sha256")
+        or successor.get("genesis_json") != genesis.get("raw_json")
+        or frozen_stable_identity != current_stable_identity
+        or stable_database.is_symlink()
+        or not stat.S_ISREG(stable_metadata.st_mode)
+        or stable_database.resolve(strict=True) != stable_database
+        or stable_physical_identity
+        != (
+            current_stable_identity.get("device"),
+            current_stable_identity.get("inode"),
+        )
+        or (database_metadata.st_dev, database_metadata.st_ino)
+        == stable_physical_identity
+    ):
+        raise click.ClickException("AC dev durable stop COW successor chain mismatch")
+    return linked_digest, dict(successor_receipt)
+
+
 def _durable_dev_launch(
     *, dev_storage: Path, database: Path, database_identity: Mapping[str, object],
     source_identity: Mapping[str, object], stable_anchor_commit: str,
@@ -5100,27 +5214,12 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         current_source=current_source, database=database,
         database_custody=database_custody_before,
     )
-    linked_digest = str(receipt.get("linked_v3_receipt_sha256") or "")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", linked_digest):
-        raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
-    linked_path = dev_storage / "archive" / "schema-admission" / f"{linked_digest[7:]}.json"
-    # A live stop must not call the bootstrap start selector: that selector
-    # deliberately proves a stopped/free listener.  Phase is bound by this
-    # immutable completed launch receipt instead.
-    bootstrap_binding = receipt.get("dashboard_bootstrap")
-    if bootstrap_binding is None:
-        durable_phase = _DURABLE_START_LEGACY_ADOPTION
-    elif isinstance(bootstrap_binding, Mapping):
-        durable_phase = _DURABLE_START_COMPLETED_BOOTSTRAP
-    else:
-        raise click.ClickException("AC dev durable stop launch phase is malformed")
-    validated_digest, _ = _validated_linked_v3_receipt(
-        linked_path, dev_storage=dev_storage, database=database,
-        database_identity=database_identity, source_identity=current_source,
-        allow_postimage=True, durable_start_phase=durable_phase,
+    _validated_durable_stop_linked_v3_chain(
+        dev_storage=dev_storage,
+        database=database,
+        launch_receipt=receipt,
+        database_custody=database_custody_before,
     )
-    if validated_digest != linked_digest:
-        raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
     process = _posix_process_identity(pid)
     current_health = _probe_governance(AC_DEV_SERVICE_PORT, timeout=0.5)
     if (
