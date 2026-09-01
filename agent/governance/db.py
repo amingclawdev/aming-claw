@@ -2263,10 +2263,21 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
                 )
             if _validate_dev_first_start_context(root):
                 return root
-            validate_dev_cow_successor_preimage(
-                root, linked_v3_receipt=isolated_receipt,
-                source_identity=source_identity or {}, stable_binding=binding,
-            )
+            try:
+                validate_dev_cow_successor_preimage(
+                    root, linked_v3_receipt=isolated_receipt,
+                    source_identity=source_identity or {}, stable_binding=binding,
+                )
+            except ValueError as exc:
+                if str(exc) != "AC dev COW successor issuance schema_meta mismatch":
+                    raise
+                try:
+                    validate_dev_cow_completed_generation_projection(
+                        root, linked_v3_receipt=isolated_receipt,
+                        source_identity=source_identity or {}, stable_binding=binding,
+                    )
+                except ValueError:
+                    raise exc
             return root
         return _validated_isolated_dev_receipt(
             isolated_receipt, root, source_identity or {}, binding,
@@ -4353,6 +4364,108 @@ def validate_dev_cow_successor_preimage(
     return receipt
 
 
+_COW_COMPLETED_GENERATION_META_KEYS = frozenset({
+    "schema_version", "governance_world_id",
+    "governance_world_genesis_json", "governance_world_genesis_sha256",
+    "governance_world_source_tip_json", "governance_world_source_tip_sha256",
+    "governance_world_source_tip_revision",
+    "governance_world_current_process_json",
+})
+
+
+def validate_dev_cow_completed_generation_projection(
+    storage_root: Path | str, *, linked_v3_receipt: Path,
+    source_identity: Mapping[str, object], stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate a live COW generation without reviving issuance-era rows."""
+    root = Path(storage_root).expanduser().absolute()
+    receipt = validate_dev_cow_successor_receipt(root)
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    linked_path = linked_v3_receipt.expanduser().absolute()
+    linked_sha = "sha256:" + hashlib.sha256(linked_path.read_bytes()).hexdigest()
+    successor = dict(receipt.get("successor") or {})
+    identity = dict(successor.get("identity") or {})
+    history = dict(receipt.get("history") or {})
+    current = _cow_regular_identity(database)
+    stable_identity = dict(stable_binding.get("stable_database_identity") or {})
+    issuance_stable = dict(
+        dict(receipt.get("stable_binding") or {}).get("database") or {}
+    )
+    if (
+        dict(history.get("linked_v3") or {})
+        != {"path": str(linked_path), "sha256": linked_sha}
+        or identity.get("path") != str(database)
+        or identity.get("device") != current["device"]
+        or identity.get("inode") != current["inode"]
+        or identity.get("nlink") != current["nlink"]
+        or issuance_stable != stable_identity
+        or (current["device"], current["inode"])
+        == (stable_identity.get("device"), stable_identity.get("inode"))
+    ):
+        raise ValueError("AC dev COW completed generation current binding mismatch")
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(database) + suffix)
+        if companion.exists() or companion.is_symlink():
+            raise ValueError("AC dev COW completed generation requires sidecar-free bytes")
+    _assert_no_external_sqlite_holders(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(conn)
+        _verify_dev_world_schema_inventory(conn)
+        inventory = _authority_projection_inventory_in_managed_world(conn)
+        if (len(inventory["inventory"]) != 308
+                or inventory != authority_projection_schema_inventory()):
+            raise ValueError("AC dev COW completed generation exact schema inventory mismatch")
+        _verify_current_dev_backlog_runtime_invariants(
+            conn,
+            expected_protected_inventory=dict(
+                successor.get("protected_inventory") or {}
+            ),
+        )
+        meta = {str(key): str(value) for key, value in conn.execute(
+            "SELECT key,value FROM schema_meta ORDER BY key"
+        )}
+        if set(meta) != _COW_COMPLETED_GENERATION_META_KEYS:
+            raise ValueError("AC dev COW completed generation schema_meta drift")
+        if (meta.get("governance_world_genesis_json") != successor.get("genesis_json")
+                or meta.get("governance_world_genesis_sha256")
+                != successor.get("genesis_sha256")
+                or meta.get("governance_world_id") != AC_DEV_WORLD_ID):
+            raise ValueError("AC dev COW completed generation genesis mismatch")
+        _verify_current_cow_successor_source(conn, root, receipt)
+    finally:
+        conn.close()
+    try:
+        tip = json.loads(meta["governance_world_source_tip_json"])
+        process = json.loads(meta["governance_world_current_process_json"])
+        revision = int(meta["governance_world_source_tip_revision"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("AC dev COW completed generation custody metadata is invalid") from exc
+    if (not isinstance(tip, Mapping) or not isinstance(process, Mapping)
+            or revision < 2
+            or meta["governance_world_source_tip_sha256"]
+            != _world_source_tip_hash(tip)):
+        raise ValueError("AC dev COW completed generation custody binding mismatch")
+    adoption_ref = dict(history.get("adoption") or {})
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    if adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}:
+        raise ValueError("AC dev COW completed generation custody history mismatch")
+    historical_process = adoption.get("legacy_process_identity")
+    if not isinstance(historical_process, Mapping):
+        historical_process = None
+    _validate_dev_current_process_custody(
+        process, root=root, candidate_source=source_identity,
+        historical_process=historical_process,
+    )
+    _validate_dev_source_tip_custody(
+        tip, stored_sha256=meta["governance_world_source_tip_sha256"],
+        candidate=source_identity,
+    )
+    return receipt
+
+
 def _verify_current_dev_backlog_runtime_invariants(
     conn: sqlite3.Connection, *, expected_protected_inventory: Mapping[str, object]
 ) -> None:
@@ -4801,6 +4914,7 @@ def bootstrap_dev_governance_store(
     if database.is_symlink():
         raise ValueError("AC dev governance database cannot be a symlink")
     cow_successor_receipt: dict[str, object] | None = None
+    cow_first_issuance = False
     if not created:
         # Resolve the exceptional physical successor before opening the writer;
         # receipt validation includes the no-holder/no-sidecar admission gate.
@@ -4812,6 +4926,9 @@ def bootstrap_dev_governance_store(
             probe_meta = dict(probe.execute(
                 "SELECT key,value FROM schema_meta WHERE key='governance_world_genesis_json'"
             ))
+            probe_schema_meta_sha256 = _sqlite_logical_projection(probe).get(
+                "schema_meta"
+            )
         except sqlite3.Error as exc:
             raise ValueError("existing AC dev world genesis is unreadable") from exc
         finally:
@@ -4825,13 +4942,28 @@ def bootstrap_dev_governance_store(
         if (probe_stored.get("device"), probe_stored.get("inode")) != (
                 int(probe_stat.st_dev), int(probe_stat.st_ino)):
             cow_successor_receipt = validate_dev_cow_successor_receipt(root)
+            issuance_schema_meta = str(dict(
+                dict(cow_successor_receipt.get("successor") or {}).get(
+                    "protected_projection"
+                ) or {}
+            ).get("schema_meta") or "")
+            cow_first_issuance = (
+                probe_schema_meta_sha256 == issuance_schema_meta
+            )
+            if not cow_first_issuance and linked_v3_receipt is not None:
+                validate_dev_cow_completed_generation_projection(
+                    root, linked_v3_receipt=linked_v3_receipt,
+                    source_identity=source_identity,
+                    stable_binding=verified_stable_database_binding(),
+                )
     lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
     acquire_dev_runtime_writer_lease(root)
     conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row
-        if cow_successor_receipt is not None and linked_v3_receipt is not None:
+        if (cow_successor_receipt is not None and cow_first_issuance
+                and linked_v3_receipt is not None):
             pre_sha256 = _durable_database_sha256(database)
             transition = _commit_first_cow_child_custody(
                 conn, root=root, linked_v3_receipt=linked_v3_receipt,

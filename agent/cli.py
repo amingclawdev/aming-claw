@@ -3388,12 +3388,20 @@ def _validated_linked_v3_receipt(
     linked_database_identity = dict(receipt.get("database_identity") or {})
     if (linked_database_identity.get("device"), linked_database_identity.get("inode")) != (
             canonical_database_identity.get("device"), canonical_database_identity.get("inode")):
-        _require_first_cow_runtime_pristine(dev_storage)
-        _db.validate_dev_cow_successor_preimage(
-            dev_storage, linked_v3_receipt=receipt_path,
-            source_identity=source_identity,
-            stable_binding=_db.verified_stable_database_binding(),
-        )
+        if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
+            _historical_dashboard_bootstrap_adoption(dev_storage)
+            _db.validate_dev_cow_completed_generation_projection(
+                dev_storage, linked_v3_receipt=receipt_path,
+                source_identity=source_identity,
+                stable_binding=_db.verified_stable_database_binding(),
+            )
+        else:
+            _require_first_cow_runtime_pristine(dev_storage)
+            _db.validate_dev_cow_successor_preimage(
+                dev_storage, linked_v3_receipt=receipt_path,
+                source_identity=source_identity,
+                stable_binding=_db.verified_stable_database_binding(),
+            )
         return digest, receipt
     if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
         # Bootstrap owns the current postimage; this re-authenticates only the
@@ -4581,8 +4589,10 @@ def start(
                         linked_v3_receipt=durable_child_linked_v3_receipt,
                     )
                 elif phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
-                    raise click.ClickException(
-                        "AC dev completed generation cannot authorize a new start"
+                    committed = commit_dev_child_custody(
+                        dev_storage, source_identity=dev_identity or {},
+                        process_identity=custody,
+                        linked_v3_receipt=durable_child_linked_v3_receipt,
                     )
                 else:
                     raise click.ClickException("AC dev durable child phase is invalid")

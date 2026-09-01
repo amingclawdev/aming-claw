@@ -2576,6 +2576,136 @@ def test_cow_prestart_requires_exact_issuance_schema_meta_projection(
         )
 
 
+def _advance_cow_to_completed_generation(database, root, source):
+    from agent.governance import db
+
+    commit = _advance_dev_source(Path(source["root"]), "completed-generation")
+    completed_source = {**source, "commit": commit}
+    completed_source["tree"] = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=source["root"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    completed_source["source_sha256"] = "sha256:" + hashlib.sha256(
+        (Path(source["root"]) / "agent" / "cli.py").read_bytes()
+    ).hexdigest()
+    process = _phase_z_durable_process(root, completed_source, pid=42)
+    completed_tip = {
+        key: completed_source[key] for key in db._DEV_SOURCE_TIP_KEYS
+    }
+    connection = sqlite3.connect(database)
+    connection.executemany(
+        "UPDATE schema_meta SET value=? WHERE key=?",
+        (
+            (json.dumps(completed_tip, sort_keys=True, separators=(",", ":")),
+             "governance_world_source_tip_json"),
+            (db._world_source_tip_hash(completed_tip),
+             "governance_world_source_tip_sha256"),
+            ("3", "governance_world_source_tip_revision"),
+            (json.dumps(process, sort_keys=True, separators=(",", ":")),
+             "governance_world_current_process_json"),
+        ),
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    return completed_source
+
+
+def test_cow_completed_generation_uses_current_projection_not_issuance_digest(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    connection = sqlite3.connect(database)
+    try:
+        assert db._sqlite_logical_projection(connection)["schema_meta"] != (
+            receipt["successor"]["protected_projection"]["schema_meta"]
+        )
+    finally:
+        connection.close()
+    assert db.validate_dev_cow_completed_generation_projection(
+        root, linked_v3_receipt=linked, source_identity=completed_source,
+        stable_binding=db.verified_stable_database_binding(),
+    ) == receipt
+
+
+def test_cow_completed_generation_transitions_to_new_child_custody(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    _phase_z_bind_first_start_runtime(tmp_path, monkeypatch, root)
+    custody = _phase_z_durable_process(root, completed_source, pid=os.getpid())
+    result = db.commit_dev_child_custody(
+        root, source_identity=completed_source, process_identity=custody,
+        linked_v3_receipt=linked,
+    )
+    assert result["created"] is False
+    assert result["restart_safe"] is True
+    assert result["custody_projection"] == custody
+    assert result["database_identity"]["device"] == receipt["successor"]["identity"]["device"]
+    assert result["database_identity"]["inode"] == receipt["successor"]["identity"]["inode"]
+    db.release_dev_runtime_writer_lease(root)
+
+
+@pytest.mark.parametrize(
+    "drift", ("path", "inode", "history", "schema_meta", "schema")
+)
+def test_cow_completed_generation_rejects_drift_before_write(
+    tmp_path, monkeypatch, drift,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    before = db._durable_database_sha256(database)
+    validation_root = root
+    if drift == "path":
+        validation_root = tmp_path / "foreign-dev"
+        shutil.copytree(root, validation_root)
+    elif drift == "inode":
+        replacement = database.with_suffix(".replacement")
+        shutil.copyfile(database, replacement)
+        os.replace(replacement, database)
+    elif drift == "history":
+        linked.write_bytes(linked.read_bytes() + b"\n")
+    else:
+        connection = sqlite3.connect(database)
+        if drift == "schema_meta":
+            connection.execute(
+                "INSERT INTO schema_meta(key,value) VALUES('foreign','value')"
+            )
+        else:
+            connection.execute("CREATE TABLE foreign_generation(value TEXT)")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+    with pytest.raises(ValueError, match="completed generation|successor|schema inventory"):
+        db.validate_dev_cow_completed_generation_projection(
+            validation_root, linked_v3_receipt=linked,
+            source_identity=completed_source,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+    if drift in {"path", "inode", "history"}:
+        assert db._durable_database_sha256(database) == before
+
+
 def test_cow_prebind_api_rejects_caller_asserted_database_sha(
     tmp_path, monkeypatch,
 ):

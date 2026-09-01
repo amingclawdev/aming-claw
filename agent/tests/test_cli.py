@@ -119,6 +119,43 @@ def test_linked_v3_validator_uses_cow_preimage_for_replaced_inode(tmp_path, monk
     assert "completed_generation_ref" not in calls[0][1]
 
 
+def test_linked_v3_completed_generation_uses_source_backed_projection(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"; database = root / "governance.db"
+    database.parent.mkdir(); database.write_bytes(b"completed")
+    linked = root / "linked.json"; linked.write_bytes(b"linked")
+    current = cli._admission_identity(database)
+    receipt = {
+        "database_identity": {**current, "inode": current["inode"] + 1},
+        "source_identity": {"cli_source": {"commit": "a" * 40}},
+    }
+    monkeypatch.setattr(cli, "_read_admission_receipt",
+                        lambda *_args, **_kwargs: (receipt, "sha256:" + "1" * 64))
+    monkeypatch.setattr(cli, "_validated_historical_admission_source_identity",
+                        lambda value: value)
+    historical = []
+    calls = []
+    monkeypatch.setattr(cli, "_historical_dashboard_bootstrap_adoption",
+                        lambda value: historical.append(value))
+    monkeypatch.setattr(db, "validate_dev_cow_completed_generation_projection",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(db, "verified_stable_database_binding",
+                        lambda: {"stable": True})
+    digest, returned = cli._validated_linked_v3_receipt(
+        linked, dev_storage=root, database=database,
+        database_identity=current, source_identity={"commit": "b" * 40},
+        durable_start_phase=cli._DURABLE_START_COMPLETED_BOOTSTRAP,
+    )
+    assert (digest, returned) == ("sha256:" + "1" * 64, receipt)
+    assert historical == [root]
+    assert len(calls) == 1
+    assert "completed_generation_ref" not in calls[0][1]
+
+
 @pytest.mark.parametrize("artifact", ("file", "symlink", "directory"))
 def test_first_cow_runtime_rejects_every_existing_artifact(tmp_path, artifact):
     import agent.cli as cli
