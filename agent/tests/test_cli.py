@@ -5515,25 +5515,36 @@ def test_backlog_read_admission_can_join_caller_transaction_and_roll_back(tmp_pa
     connection.close()
 
 
-@pytest.mark.parametrize(
-    "attack", ["identity_drift", "postimage_drift", "preforged_exit", "missing_exit_after_term"],
-)
-def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
+def _durable_stop_v2_fixture(tmp_path, monkeypatch):
     import agent.cli as cli
 
     dev = tmp_path / "dev"; runtime = dev / "runtime" / "durable-launch"; runtime.mkdir(parents=True)
     source = tmp_path / "source"; (source / "agent" / "governance").mkdir(parents=True)
+    (source / "agent" / "cli.py").write_text("target cli\n", encoding="utf-8")
     server = source / "agent" / "governance" / "server.py"; server.write_text("server\n", encoding="utf-8")
     database = dev / "governance" / "aming-claw" / "governance.db"; database.parent.mkdir(parents=True); database.write_bytes(b"db")
     details = database.stat()
     log = runtime / "governance.log"; log.write_text("", encoding="utf-8")
+    identity = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw",
+        "device": details.st_dev, "inode": details.st_ino,
+        "relative_path_sha256": "sha256:" + "8" * 64,
+        "genesis_sha256": "sha256:" + "9" * 64,
+    }
+    target = {
+        "root": str(source), "branch": "codex/ac-dev", "commit": "b" * 40,
+        "tree": "c" * 40, "dirty": "", "source_sha256": "sha256:" + "d" * 64,
+    }
+    before = {"database_identity": identity, "world_custody_sha256": "sha256:" + "e" * 64}
+    after = {**before, "database_sha256": "sha256:" + "f" * 64}
     receipt = {
         "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "completed",
         "launch_id": "fixture", "pid": 424242, "project_id": "aming-claw", "port": 40008,
         "dev_storage_root": str(dev), "source_root": str(source), "source_commit": "a" * 40,
         "source_tree": "b" * 40, "server_sha256": "sha256:" + hashlib.sha256(server.read_bytes()).hexdigest(),
         "python": str(Path(sys.executable).resolve()), "database_path": str(database),
-        "database_identity": {"path": str(database), "device": details.st_dev, "inode": details.st_ino},
+        "database_identity": identity,
         "process": {"start_identity": "sha256:" + "c" * 64,
                     "argv": f"{sys.executable} child --launch-id fixture", "cwd": str(source)},
         "argv": [sys.executable, "child", "--launch-id", "fixture"], "cwd": str(source), "exit_receipt": str(runtime / "exit-status.json"),
@@ -5545,41 +5556,177 @@ def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
         "readiness_sha256": "sha256:" + "f" * 64,
         "database_sha256_before": "sha256:" + "1" * 64,
         "database_sha256_after": "sha256:" + hashlib.sha256(database.read_bytes()).hexdigest(),
-        "health": {"pid": 424242},
     }
-    cli._durable_content_receipt(runtime, "launch", receipt)
-    monkeypatch.setattr(cli, "_source_git_identity", lambda: {
-        "root": str(source), "commit": "a" * 40, "tree": "b" * 40, "dirty": "",
-    })
-    if attack == "postimage_drift":
-        database.write_bytes(b"drift")
-        expected = "bound identity mismatch"
-    if attack in {"preforged_exit", "missing_exit_after_term"}:
-        cli._durable_content_receipt(runtime, "exit", {"forged": True})
-        if attack == "missing_exit_after_term":
-            for candidate in runtime.glob("exit.*.json"):
-                candidate.unlink()
-        monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: receipt["process"])
-        monkeypatch.setattr(cli, "_durable_listener_pid", lambda _port: receipt["pid"])
-        monkeypatch.setattr(cli, "_probe_governance", lambda *_args, **_kwargs: receipt["health"])
-        expected = "exit receipt is missing"
-    elif attack == "identity_drift":
-        monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: {
-            "start_identity": "sha256:" + "d" * 64, "argv": "attacker", "cwd": str(source),
-        })
-        expected = "process identity mismatch"
+    launch_path, launch_sha = cli._durable_content_receipt(runtime, "launch", receipt)
+    immutable = {launch_path: launch_path.read_bytes()}
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: dict(target))
+    monkeypatch.setattr(cli, "_durable_stop_database_custody",
+                        lambda _database, *, include_postimage: dict(after if include_postimage else before))
+    monkeypatch.setattr(cli, "_validate_durable_stop_launch_chain", lambda **_kwargs: ({}, {}))
+    monkeypatch.setattr(cli, "_durable_stop_health_matches", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(cli, "_validated_linked_v3_receipt", lambda *_args, **_kwargs: (
         "sha256:" + "e" * 64, {},
     ))
+    state = {"alive": True}
+    monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: receipt["process"])
+    monkeypatch.setattr(cli, "_durable_listener_pid",
+                        lambda _port: receipt["pid"] if state["alive"] else 0)
+    monkeypatch.setattr(cli, "_probe_governance",
+                        lambda *_args, **_kwargs: {"pid": receipt["pid"]} if state["alive"] else {})
+    return cli, dev, runtime, receipt, launch_sha, target, before, after, state, immutable
+
+
+def test_durable_stop_clean_descendant_allows_dml_and_seals_final_postimage(
+    tmp_path, monkeypatch,
+):
+    (cli, dev, runtime, receipt, launch_sha, target, before, after,
+     state, immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
     signals = []
     def fake_kill(pid, sig):
         signals.append((pid, sig))
-        if attack in {"missing_exit_after_term", "preforged_exit"} and sig == 0:
+        if sig == cli.signal.SIGTERM:
+            challenge_path = next(runtime.glob("stop-challenge.*.json"))
+            challenge, challenge_sha = cli._read_durable_content_receipt(
+                challenge_path, "stop-challenge",
+            )
+            cli._durable_content_receipt(runtime, "exit", {
+                "schema_version": "ac_dev_durable_exit.v1", "pid": pid,
+                "status": "terminated", "exit_code": 143, "exception_type": "SystemExit",
+                "launch_sha256": launch_sha, "challenge_sha256": challenge_sha,
+                "binding": challenge["binding"],
+            })
+            state["alive"] = False
+        elif sig == 0 and not state["alive"]:
+            raise ProcessLookupError
+    monkeypatch.setattr(cli.os, "kill", fake_kill)
+    cli._durable_dev_stop(dev)
+    stop_path = next(runtime.glob("stop.*.json"))
+    stop, _ = cli._read_durable_content_receipt(stop_path, "stop")
+    assert signals == [(receipt["pid"], cli.signal.SIGTERM), (receipt["pid"], 0)]
+    assert stop["schema_version"] == "ac_dev_durable_stop.v2"
+    assert stop["target_source_identity"]["commit"] == target["commit"]
+    assert stop["database_custody_before"] == before
+    assert stop["database_custody_after"] == after
+    assert all(path.read_bytes() == raw for path, raw in immutable.items())
+
+
+@pytest.mark.parametrize(
+    "drift", ["loaded_commit", "loaded_source", "target_commit", "target_dirty",
+              "database_inode", "database_world", "worktree_source", "stale_reason"],
+)
+def test_durable_stop_health_binds_loaded_old_and_clean_target_world(drift):
+    import copy
+    import agent.cli as cli
+
+    old, target = "a" * 40, "b" * 40
+    database = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw", "device": 1, "inode": 2,
+        "relative_path_sha256": "sha256:" + "3" * 64,
+        "genesis_sha256": "sha256:" + "4" * 64,
+    }
+    receipt = {"pid": 17, "source_commit": old,
+               "server_sha256": "sha256:" + "5" * 64}
+    source = {"root": "/source", "commit": target,
+              "server_sha256": "sha256:" + "6" * 64}
+    health = {
+        "runtime_plane": "dev", "port": 40008, "bind_host": "127.0.0.1",
+        "pid": 17, "runtime_loaded_version": old, "runtime_stale": True,
+        "runtime_plane_identity": {
+            "schema_version": "ac_runtime_plane_identity.v1", "status": "ready",
+            "plane": "dev", "pid": 17, "worktree_root": "/source",
+            "branch": "codex/ac-dev", "expected_branch": "codex/ac-dev",
+            "commit": target, "worktree_dirty": False, "worktree_dirty_files": [],
+            "database_identity": database, "world_id": "ac-dev",
+        },
+        "loaded_runtime_identity": {
+            "schema_version": "governance_loaded_runtime_identity.v1",
+            "loaded_commit": old, "loaded_pid": 17,
+            "loaded_source_sha256": receipt["server_sha256"],
+            "worktree_head_version": target[:8],
+            "worktree_source_sha256": source["server_sha256"],
+            "runtime_stale": True,
+            "runtime_stale_reasons": ["worktree_head_moved", "loaded_source_file_changed"],
+        },
+    }
+    assert cli._durable_stop_health_matches(
+        health, receipt=receipt, target_source=source, database_identity=database,
+    )
+    changed = copy.deepcopy(health)
+    if drift == "loaded_commit":
+        changed["loaded_runtime_identity"]["loaded_commit"] = target
+    elif drift == "loaded_source":
+        changed["loaded_runtime_identity"]["loaded_source_sha256"] = "sha256:" + "0" * 64
+    elif drift == "target_commit":
+        changed["runtime_plane_identity"]["commit"] = old
+    elif drift == "target_dirty":
+        changed["runtime_plane_identity"]["worktree_dirty"] = True
+    elif drift == "database_inode":
+        changed["runtime_plane_identity"]["database_identity"]["inode"] = 99
+    elif drift == "database_world":
+        changed["runtime_plane_identity"]["database_identity"]["world_id"] = "other"
+    elif drift == "worktree_source":
+        changed["loaded_runtime_identity"]["worktree_source_sha256"] = "sha256:" + "0" * 64
+    else:
+        changed["loaded_runtime_identity"]["runtime_stale_reasons"] = []
+    assert not cli._durable_stop_health_matches(
+        changed, receipt=receipt, target_source=source, database_identity=database,
+    )
+
+
+@pytest.mark.parametrize(
+    "attack,expected", [
+        ("source_ref_moved", "pre-TERM CAS mismatch"),
+        ("database_world_drift", "pre-TERM CAS mismatch"),
+        ("process_identity", "process identity mismatch"),
+        ("preforged_challenge", "terminal chain already exists"),
+        ("missing_exit", "exit receipt is missing"),
+        ("term_timeout", "TERM timeout"),
+    ],
+)
+def test_durable_stop_v2_attacks_fail_closed(tmp_path, monkeypatch, attack, expected):
+    (cli, dev, runtime, receipt, launch_sha, target, before, _after,
+     state, _immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
+    signals = []
+    if attack == "preforged_challenge":
+        cli._durable_content_receipt(runtime, "stop-challenge", {
+            "launch_sha256": launch_sha, "forged": True,
+        })
+    if attack == "process_identity":
+        monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: {
+            **receipt["process"], "start_identity": "sha256:" + "0" * 64,
+        })
+    if attack == "source_ref_moved":
+        calls = {"count": 0}
+        def source_read():
+            calls["count"] += 1
+            return dict(target) if calls["count"] < 2 else {**target, "commit": "c" * 40}
+        monkeypatch.setattr(cli, "_source_git_identity", source_read)
+    if attack == "database_world_drift":
+        calls = {"count": 0}
+        def custody(_database, *, include_postimage):
+            calls["count"] += 1
+            return dict(before) if calls["count"] < 2 else {
+                **before, "world_custody_sha256": "sha256:" + "0" * 64,
+            }
+        monkeypatch.setattr(cli, "_durable_stop_database_custody", custody)
+    if attack == "term_timeout":
+        ticks = iter((0.0, 11.0, 12.0))
+        monkeypatch.setattr(cli.time, "monotonic", lambda: next(ticks))
+
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+        if sig == cli.signal.SIGTERM and attack == "missing_exit":
+            state["alive"] = False
+        elif sig == 0 and attack == "missing_exit":
             raise ProcessLookupError
     monkeypatch.setattr(cli.os, "kill", fake_kill)
     with pytest.raises(cli.click.ClickException, match=expected):
         cli._durable_dev_stop(dev)
-    if attack in {"missing_exit_after_term", "preforged_exit"}:
+    if attack in {"source_ref_moved", "database_world_drift", "process_identity",
+                  "preforged_challenge"}:
+        assert signals == []
+    elif attack == "missing_exit":
         assert signals == [(receipt["pid"], cli.signal.SIGTERM), (receipt["pid"], 0)]
     else:
-        assert signals == []
+        assert signals[0] == (receipt["pid"], cli.signal.SIGTERM)

@@ -4272,6 +4272,162 @@ def _historical_durable_source_chain_is_valid(
         return False
 
 
+def _durable_stop_database_custody(
+    database: Path, *, include_postimage: bool,
+) -> dict[str, object]:
+    """Project immutable world custody without freezing ordinary dev DML."""
+
+    from agent.governance import db as _db
+    try:
+        identity = _canonical_dev_database_identity_projection(database)
+        custody_sha256 = _db._dev_live_world_custody_sha256(
+            database, immutable=False,
+        )
+        result: dict[str, object] = {
+            "database_identity": identity,
+            "world_custody_sha256": custody_sha256,
+        }
+        if include_postimage:
+            result["database_sha256"] = _db._durable_database_sha256(database)
+        if (_canonical_dev_database_identity_projection(database) != identity
+                or _db._dev_live_world_custody_sha256(
+                    database, immutable=False,
+                ) != custody_sha256):
+            raise click.ClickException(
+                "AC dev durable stop database custody changed during read"
+            )
+        return result
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
+        if isinstance(exc, click.ClickException):
+            raise
+        raise click.ClickException(
+            "AC dev durable stop database custody is invalid"
+        ) from exc
+
+
+def _durable_stop_target_source(source: Mapping[str, object]) -> dict[str, object]:
+    root = Path(str(source.get("root") or "")).resolve(strict=True)
+    server = root / "agent" / "governance" / "server.py"
+    return {
+        **dict(source),
+        "server_sha256": "sha256:" + hashlib.sha256(server.read_bytes()).hexdigest(),
+    }
+
+
+def _durable_stop_health_matches(
+    health: Mapping[str, object], *, receipt: Mapping[str, object],
+    target_source: Mapping[str, object], database_identity: Mapping[str, object],
+) -> bool:
+    """Bind the loaded historical process and its live clean target world."""
+
+    identity = health.get("runtime_plane_identity")
+    loaded = health.get("loaded_runtime_identity")
+    if not isinstance(identity, Mapping) or not isinstance(loaded, Mapping):
+        return False
+    reasons = loaded.get("runtime_stale_reasons")
+    return bool(
+        health.get("runtime_plane") == "dev"
+        and health.get("port") == AC_DEV_SERVICE_PORT
+        and health.get("bind_host") == "127.0.0.1"
+        and health.get("pid") == receipt.get("pid")
+        and health.get("runtime_loaded_version") == receipt.get("source_commit")
+        and health.get("runtime_stale") is True
+        and identity.get("schema_version") == "ac_runtime_plane_identity.v1"
+        and identity.get("status") == "ready"
+        and identity.get("plane") == "dev"
+        and identity.get("pid") == receipt.get("pid")
+        and identity.get("worktree_root") == target_source.get("root")
+        and identity.get("branch") == AC_DEV_BRANCH
+        and identity.get("expected_branch") == AC_DEV_BRANCH
+        and identity.get("commit") == target_source.get("commit")
+        and identity.get("worktree_dirty") is False
+        and identity.get("worktree_dirty_files") == []
+        and identity.get("database_identity") == dict(database_identity)
+        and identity.get("world_id") == "ac-dev"
+        and loaded.get("schema_version") == "governance_loaded_runtime_identity.v1"
+        and loaded.get("loaded_commit") == receipt.get("source_commit")
+        and loaded.get("loaded_pid") == receipt.get("pid")
+        and loaded.get("loaded_source_sha256") == receipt.get("server_sha256")
+        and _git_commit_identity_matches(
+            loaded.get("worktree_head_version"), target_source.get("commit")
+        )
+        and loaded.get("worktree_source_sha256")
+        == target_source.get("server_sha256")
+        and loaded.get("runtime_stale") is True
+        and isinstance(reasons, list)
+        and "worktree_head_moved" in reasons
+    )
+
+
+def _validate_durable_stop_launch_chain(
+    *, runtime: Path, receipt: Mapping[str, object], launch_sha256: str,
+    current_source: Mapping[str, object], database: Path,
+    database_custody: Mapping[str, object],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate immutable launch members while permitting post-launch DML."""
+
+    pending_sha = str(receipt.get("pending_sha256") or "")
+    readiness_sha = str(receipt.get("readiness_sha256") or "")
+    if not (_exact_sha256(launch_sha256) and _exact_sha256(pending_sha)
+            and _exact_sha256(readiness_sha)):
+        raise click.ClickException("AC dev durable stop receipt chain mismatch")
+    pending, pending_read = _read_durable_content_receipt(
+        runtime / f"pending.{pending_sha[7:]}.json", "pending",
+    )
+    readiness, readiness_read = _read_durable_content_receipt(
+        runtime / f"readiness.{readiness_sha[7:]}.json", "readiness",
+    )
+    current_commit = str(current_source.get("commit") or "")
+    launch_commit = str(receipt.get("source_commit") or "")
+    current_identity = dict(database_custody.get("database_identity") or {})
+    claimed_identity = dict(receipt.get("database_identity") or {})
+    pending_source = pending.get("source_identity")
+    identity_is_v2 = claimed_identity.get("schema_version") == (
+        "ac_governance_database_identity.v2"
+    )
+    legacy_postimage_exact = False
+    if not identity_is_v2:
+        from agent.governance import db as _db
+        try:
+            legacy_postimage_exact = (
+                claimed_identity
+                == {key: _admission_identity(database)[key]
+                    for key in ("device", "inode")}
+                and receipt.get("database_sha256_after")
+                == _db._durable_database_sha256(database)
+            )
+        except (OSError, RuntimeError, ValueError):
+            legacy_postimage_exact = False
+    if (
+        current_commit == launch_commit
+        or not _historical_durable_source_chain_is_valid(
+            current=current_source, completed=receipt, pending=pending,
+        )
+        or pending_read != pending_sha or readiness_read != readiness_sha
+        or pending.get("schema_version") != "ac_dev_durable_pending.v1"
+        or pending.get("stage") != "pending"
+        or pending.get("launch_id") != receipt.get("launch_id")
+        or not isinstance(pending_source, Mapping)
+        or pending_source.get("commit") != launch_commit
+        or pending.get("database_sha256_before")
+        != receipt.get("database_sha256_before")
+        or readiness.get("schema_version") != "ac_dev_durable_readiness.v1"
+        or readiness.get("stage") != "ready_unbound"
+        or readiness.get("pending_sha256") != pending_sha
+        or readiness.get("launch_id") != receipt.get("launch_id")
+        or readiness.get("pid") != receipt.get("pid")
+        or readiness.get("database_sha256_before")
+        != receipt.get("database_sha256_before")
+        or readiness.get("database_sha256_after")
+        != receipt.get("database_sha256_after")
+        or readiness.get("database_identity") != claimed_identity
+        or not ((identity_is_v2 and claimed_identity == current_identity)
+                or (not identity_is_v2 and legacy_postimage_exact))
+    ):
+        raise click.ClickException("AC dev durable stop receipt chain mismatch")
+    return pending, readiness
+
+
 def _durable_dev_launch(
     *, dev_storage: Path, database: Path, database_identity: Mapping[str, object],
     source_identity: Mapping[str, object], stable_anchor_commit: str,
@@ -4431,6 +4587,10 @@ def _durable_dev_launch(
     for path in runtime.glob("stop.*.json"):
         value, digest = _read_durable_content_receipt(path, "stop")
         stop_values.append((value, digest))
+    challenge_values = {}
+    for path in runtime.glob("stop-challenge.*.json"):
+        value, digest = _read_durable_content_receipt(path, "stop-challenge")
+        challenge_values[digest] = value
     exit_values = {}
     for path in runtime.glob("exit.*.json"):
         value, digest = _read_durable_content_receipt(path, "exit")
@@ -4488,10 +4648,39 @@ def _durable_dev_launch(
         bootstrap_binding["historical_launch_id"] = selected[0][1].get("launch_id")
     elif existing_launches:
         current_postimage = current_database_sha256()
-        matching_postimages = [
-            digest for _path, value, digest in existing_launches
-            if value.get("database_sha256_after") == current_postimage
-        ]
+        current_database_identity = _canonical_dev_database_identity_projection(database)
+        matching_postimages = []
+        for _path, value, digest in existing_launches:
+            if value.get("database_sha256_after") == current_postimage:
+                matching_postimages.append(digest)
+                continue
+            matching_stops = [stop for stop, _stop_digest in stop_values
+                              if stop.get("launch_sha256") == digest]
+            if len(matching_stops) != 1:
+                continue
+            stop = matching_stops[0]
+            challenge = challenge_values.get(str(stop.get("challenge_sha256") or ""))
+            exit_value = exit_values.get(str(stop.get("exit_sha256") or ""))
+            after = dict(stop.get("database_custody_after") or {})
+            if (
+                stop.get("schema_version") == "ac_dev_durable_stop.v2"
+                and isinstance(challenge, Mapping)
+                and challenge.get("schema_version")
+                == "ac_dev_durable_stop_challenge.v2"
+                and challenge.get("launch_sha256") == digest
+                and isinstance(exit_value, Mapping)
+                and exit_value.get("launch_sha256") == digest
+                and exit_value.get("challenge_sha256")
+                == stop.get("challenge_sha256")
+                and exit_value.get("binding") == _durable_exit_binding(value, digest)
+                and after.get("database_identity") == current_database_identity
+                and after.get("database_sha256") == current_postimage
+                and challenge.get("database_custody_before")
+                == stop.get("database_custody_before")
+                and challenge.get("target_source_identity")
+                == stop.get("target_source_identity")
+            ):
+                matching_postimages.append(digest)
         if len(matching_postimages) != 1:
             raise click.ClickException(
                 "AC dev durable completed generation postimage is missing or ambiguous"
@@ -4779,11 +4968,16 @@ def _verified_durable_stopped_chain(dev_storage: Path) -> tuple[Path, str]:
                 for value, digest in (_read_durable_content_receipt(path, prefix),)}
     launches, pendings, readinesses = read("launch"), read("pending"), read("readiness")
     challenges, exits, stops = read("stop-challenge"), read("exit"), read("stop")
-    if not launches or list(runtime.glob("abnormal.*.json")):
+    if not launches:
         raise click.ClickException("AC dev durable stopped chain is missing or ambiguous")
-    terminals: dict[str, tuple[Path, str]] = {}
-    predecessors: dict[str, str] = {}
-    used: set[str] = set()
+    database = dev_storage / "governance" / "aming-claw" / "governance.db"
+    current_identity = _canonical_dev_database_identity_projection(database)
+    from agent.governance import db as _db
+    try:
+        current_postimage = _db._durable_database_sha256(database)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException("AC dev durable stopped terminal DB mismatch") from exc
+    terminals: list[tuple[Path, str, dict[str, Any]]] = []
     for launch_sha, (_launch_path, launch) in launches.items():
         pending_sha, readiness_sha = launch.get("pending_sha256"), launch.get("readiness_sha256")
         matching_challenges = [(sha, value) for sha, (_path, value) in challenges.items()
@@ -4793,35 +4987,45 @@ def _verified_durable_stopped_chain(dev_storage: Path) -> tuple[Path, str]:
         if (not isinstance(pending_sha, str) or pending_sha not in pendings
                 or not isinstance(readiness_sha, str) or readiness_sha not in readinesses
                 or len(matching_challenges) != 1 or len(matching_stops) != 1):
-            raise click.ClickException("AC dev durable stopped chain is incomplete")
+            continue
         challenge_sha, challenge = matching_challenges[0]
         stop_sha, stop_path, stop = matching_stops[0]
         exit_sha = stop.get("exit_sha256")
         if (exit_sha not in exits or stop.get("challenge_sha256") != challenge_sha
                 or exits[exit_sha][1].get("launch_sha256") != launch_sha
                 or exits[exit_sha][1].get("challenge_sha256") != challenge_sha
+                or exits[exit_sha][1].get("binding")
+                != _durable_exit_binding(launch, launch_sha)
                 or launch.get("stage") != "completed"
                 or launch.get("dev_storage_root") != str(dev_storage)):
-            raise click.ClickException("AC dev durable stopped chain binding mismatch")
-        used.update({launch_sha, pending_sha, readiness_sha, challenge_sha, exit_sha, stop_sha})
-        binding = launch.get("dashboard_bootstrap")
-        if isinstance(binding, Mapping):
-            prior = str(binding.get("historical_launch_sha256") or "")
-            if prior not in launches or prior == launch_sha:
-                raise click.ClickException("AC dev durable stopped bootstrap predecessor mismatch")
-            predecessors[launch_sha] = prior
-        terminals[launch_sha] = (stop_path, stop_sha)
-    if any(predecessors.get(node) == node for node in predecessors):
-        raise click.ClickException("AC dev durable stopped chain cycle")
-    children = set(predecessors.values())
-    maximal = [node for node in terminals if node not in children]
-    if len(maximal) != 1 or len(used) != sum(len(group) for group in (launches, pendings, readinesses, challenges, exits, stops)):
+            continue
+        if stop.get("schema_version") == "ac_dev_durable_stop.v2":
+            before = dict(stop.get("database_custody_before") or {})
+            after = dict(stop.get("database_custody_after") or {})
+            target = dict(stop.get("target_source_identity") or {})
+            valid_postimage = bool(
+                challenge.get("schema_version") == "ac_dev_durable_stop_challenge.v2"
+                and challenge.get("binding") == _durable_exit_binding(launch, launch_sha)
+                and challenge.get("target_source_identity") == target
+                and challenge.get("database_custody_before") == before
+                and after.get("database_identity") == current_identity
+                and after.get("database_sha256") == current_postimage
+                and before.get("database_identity") == current_identity
+                and before.get("world_custody_sha256")
+                == after.get("world_custody_sha256")
+            )
+        else:
+            valid_postimage = bool(
+                stop.get("schema_version") == "ac_dev_durable_stop.v1"
+                and challenge.get("schema_version")
+                == "ac_dev_durable_stop_challenge.v1"
+                and launch.get("database_sha256_after") == current_postimage
+            )
+        if valid_postimage:
+            terminals.append((stop_path, stop_sha, launch))
+    if len(terminals) != 1:
         raise click.ClickException("AC dev durable stopped chain is ambiguous")
-    launch_sha = maximal[0]
-    stop_path, stop_sha = terminals[launch_sha]
-    launch = launches[launch_sha][1]
-    if launch.get("database_sha256_after") != _file_sha256(dev_storage / "governance" / "aming-claw" / "governance.db"):
-        raise click.ClickException("AC dev durable stopped terminal DB mismatch")
+    stop_path, stop_sha, launch = terminals[0]
     try:
         _posix_process_identity(int(launch.get("pid") or 0))
     except click.ClickException:
@@ -4867,10 +5071,11 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         database = Path(str(receipt.get("database_path") or "")).resolve(strict=True)
         log_path = Path(str(receipt.get("log_path") or "")).resolve(strict=True)
         current_source = _source_git_identity()
+        target_source = _durable_stop_target_source(current_source)
         database_identity = _admission_identity(database)
-        server_sha = "sha256:" + hashlib.sha256(
-            (source_root / "agent" / "governance" / "server.py").read_bytes()
-        ).hexdigest()
+        database_custody_before = _durable_stop_database_custody(
+            database, include_postimage=False,
+        )
     except (OSError, ValueError) as exc:
         raise click.ClickException("AC dev durable stop bound identity is unavailable") from exc
     if (
@@ -4881,18 +5086,20 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         or receipt.get("log_identity") != _admission_identity(log_path)
         or log_path.parent != runtime.resolve(strict=True)
         or current_source.get("root") != str(source_root)
-        or current_source.get("commit") != receipt.get("source_commit")
-        or current_source.get("tree") != receipt.get("source_tree")
+        or current_source.get("commit") == receipt.get("source_commit")
         or current_source.get("dirty") != ""
-        or server_sha != receipt.get("server_sha256")
         or receipt.get("python") != str(Path(sys.executable).resolve())
         or receipt.get("cwd") != str(source_root)
         or receipt.get("policy") != {"runtime_plane": "dev", "migration": "verify-only",
             "stable_deployment": "deny", "graph_activation": "deny",
             "background_workers": "deny"}
-        or receipt.get("database_sha256_after") != _file_sha256(database)
     ):
         raise click.ClickException("AC dev durable stop bound identity mismatch")
+    _validate_durable_stop_launch_chain(
+        runtime=runtime, receipt=receipt, launch_sha256=launch_sha256,
+        current_source=current_source, database=database,
+        database_custody=database_custody_before,
+    )
     linked_digest = str(receipt.get("linked_v3_receipt_sha256") or "")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", linked_digest):
         raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
@@ -4921,18 +5128,53 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         or not isinstance(receipt.get("argv"), list)
         or receipt.get("launch_id") not in process["argv"]
         or _durable_listener_pid(AC_DEV_SERVICE_PORT) != pid
-        or not current_health or current_health.get("pid") != pid
+        or not current_health
+        or not _durable_stop_health_matches(
+            current_health, receipt=receipt, target_source=target_source,
+            database_identity=dict(database_custody_before["database_identity"]),
+        )
     ):
         raise click.ClickException("AC dev durable stop process identity mismatch")
+    matching_challenges = [path for path in runtime.glob("stop-challenge.*.json")
+                           if _read_durable_content_receipt(
+                               path, "stop-challenge",
+                           )[0].get("launch_sha256") == launch_sha256]
+    matching_exits = [path for path in runtime.glob("exit.*.json")
+                      if _read_durable_content_receipt(
+                          path, "exit",
+                      )[0].get("launch_sha256") == launch_sha256]
+    matching_stops = [path for path in runtime.glob("stop.*.json")
+                      if _read_durable_content_receipt(
+                          path, "stop",
+                      )[0].get("launch_sha256") == launch_sha256]
+    if matching_challenges or matching_exits or matching_stops:
+        raise click.ClickException("AC dev durable stop terminal chain already exists")
     before_exits = {path.name for path in runtime.glob("exit.*.json")}
     challenge_payload = {
-        "schema_version": "ac_dev_durable_stop_challenge.v1", "stage": "term_requested",
+        "schema_version": "ac_dev_durable_stop_challenge.v2", "stage": "term_requested",
         "nonce": secrets.token_hex(32), "launch_sha256": launch_sha256,
         "binding": _durable_exit_binding(receipt, launch_sha256),
+        "target_source_identity": target_source,
+        "database_custody_before": database_custody_before,
     }
     challenge_path, challenge_sha256 = _durable_content_receipt(
         runtime, "stop-challenge", challenge_payload,
     )
+    process_cas = _posix_process_identity(pid)
+    health_cas = _probe_governance(AC_DEV_SERVICE_PORT, timeout=0.5)
+    if (
+        _durable_stop_target_source(_source_git_identity()) != target_source
+        or _durable_stop_database_custody(database, include_postimage=False)
+        != database_custody_before
+        or process_cas != process
+        or _durable_listener_pid(AC_DEV_SERVICE_PORT) != pid
+        or not health_cas
+        or not _durable_stop_health_matches(
+            health_cas, receipt=receipt, target_source=target_source,
+            database_identity=dict(database_custody_before["database_identity"]),
+        )
+    ):
+        raise click.ClickException("AC dev durable stop pre-TERM CAS mismatch")
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -4962,10 +5204,26 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         }
     ):
         raise click.ClickException("AC dev durable child exit receipt is malformed")
+    if _durable_listener_pid(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("AC dev durable stop listener remained bound")
+    database_custody_after = _durable_stop_database_custody(
+        database, include_postimage=True,
+    )
+    if (
+        _durable_stop_target_source(_source_git_identity()) != target_source
+        or database_custody_after.get("database_identity")
+        != database_custody_before.get("database_identity")
+        or database_custody_after.get("world_custody_sha256")
+        != database_custody_before.get("world_custody_sha256")
+    ):
+        raise click.ClickException("AC dev durable stop post-TERM custody mismatch")
     stopped, stopped_sha256 = _durable_content_receipt(runtime, "stop", {
-        "schema_version": "ac_dev_durable_stop.v1", "stage": "completed",
+        "schema_version": "ac_dev_durable_stop.v2", "stage": "completed",
         "launch_sha256": launch_sha256, "challenge_sha256": challenge_sha256,
         "exit_sha256": exit_sha256,
+        "target_source_identity": target_source,
+        "database_custody_before": database_custody_before,
+        "database_custody_after": database_custody_after,
     })
     click.echo(json.dumps({"status": "stopped", "pid": pid, "receipt": str(stopped)}, sort_keys=True))
 
