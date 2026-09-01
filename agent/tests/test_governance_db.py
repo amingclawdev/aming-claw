@@ -2703,6 +2703,44 @@ def test_cow_completed_process_axis_transitions_exact_dead_pre_normalization_arg
         )
 
 
+@pytest.mark.parametrize("liveness", ("live", "permission_denied"))
+def test_cow_completed_process_axis_rejects_nonprovably_dead_canonical_pid(
+    tmp_path, monkeypatch, liveness,
+):
+    from agent.governance import db
+
+    source_root, source_commit = _dev_source_repo(tmp_path)
+    subprocess.run(
+        ["git", "branch", "-M", "codex/ac-dev"], cwd=source_root, check=True,
+    )
+    source = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": source_commit,
+        "tree": subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=source_root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip(),
+        "source_sha256": "sha256:" + hashlib.sha256(
+            (source_root / "agent" / "cli.py").read_bytes()
+        ).hexdigest(),
+    }
+    root = tmp_path / "dev-world"
+    root.mkdir()
+    pid = os.getpid() if liveness == "live" else 99999998
+    process = _phase_z_durable_process(root, source, pid=pid)
+    if liveness == "permission_denied":
+        monkeypatch.setattr(
+            db.os, "kill",
+            lambda *_args: (_ for _ in ()).throw(PermissionError("denied")),
+        )
+
+    with pytest.raises(ValueError, match="PID is still live|liveness is unavailable"):
+        db._validate_dev_cow_completed_process_axis(
+            process, root=root, source_identity=source,
+            historical_source_tip=source,
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -2953,8 +2991,50 @@ def _defer_completed_source_and_open_clean_successor(
     }
 
 
+def _real_empty_wal_index_bytes(tmp_path, database):
+    """Capture SQLite's own WAL-index after a real TRUNCATE checkpoint."""
+
+    copied = tmp_path / "wal-index-source.db"
+    shutil.copyfile(database, copied)
+    connection = sqlite3.connect(copied)
+    assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    connection.execute(f"PRAGMA user_version={user_version + 1}")
+    connection.commit()
+    assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (
+        0, 0, 0,
+    )
+    wal = Path(str(copied) + "-wal")
+    shm = Path(str(copied) + "-shm")
+    assert wal.stat().st_size == 0
+    raw = shm.read_bytes()
+    connection.close()
+    assert len(raw) == 32768
+    return raw
+
+
+def _real_fresh_empty_wal_index_bytes(tmp_path, database):
+    """Capture SQLite's fresh read-only WAL-index with reset page state."""
+
+    copied = tmp_path / "fresh-wal-index-source.db"
+    shutil.copyfile(database, copied)
+    connection = sqlite3.connect(copied)
+    assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    connection.close()
+    connection = sqlite3.connect(copied)
+    connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+    wal = Path(str(copied) + "-wal")
+    shm = Path(str(copied) + "-shm")
+    assert wal.stat().st_size == 0
+    raw = shm.read_bytes()
+    connection.close()
+    assert len(raw) == 32768
+    return raw
+
+
+@pytest.mark.parametrize("wal_index_state", ("truncate", "fresh"))
 def test_completed_cow_restart_accepts_content_addressed_tip_and_inert_sidecars(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, wal_index_state,
 ):
     from agent.governance import db
 
@@ -2967,7 +3047,12 @@ def test_completed_cow_restart_accepts_content_addressed_tip_and_inert_sidecars(
     wal = Path(str(database) + "-wal")
     shm = Path(str(database) + "-shm")
     wal.write_bytes(b"")
-    shm.write_bytes(b"\0" * 32768)
+    wal_index = (
+        _real_empty_wal_index_bytes(tmp_path, database)
+        if wal_index_state == "truncate"
+        else _real_fresh_empty_wal_index_bytes(tmp_path, database)
+    )
+    shm.write_bytes(wal_index)
     before = {
         "database": database.read_bytes(), "wal": wal.read_bytes(),
         "shm": shm.read_bytes(),
@@ -2985,6 +3070,57 @@ def test_completed_cow_restart_accepts_content_addressed_tip_and_inert_sidecars(
         ["git", "status", "--porcelain"], cwd=historical["root"], check=True,
         capture_output=True, text=True,
     ).stdout.strip() == "M agent/cli.py"
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "random", "all_zero", "single_bit_header", "single_bit_tail",
+        "same_size_checkpoint",
+    ),
+)
+def test_completed_cow_restart_rejects_forged_same_size_wal_index_zero_write(
+    tmp_path, monkeypatch, forgery,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    current = _advance_cow_to_completed_generation(database, root, source)
+    canonical = bytearray(_real_empty_wal_index_bytes(tmp_path, database))
+    if forgery == "random":
+        forged = bytearray().join(
+            hashlib.sha256(str(index).encode()).digest()
+            for index in range(1024)
+        )
+    elif forgery == "all_zero":
+        forged = bytearray(32768)
+    elif forgery == "single_bit_header":
+        canonical[8] ^= 0x01
+        forged = canonical
+    elif forgery == "single_bit_tail":
+        canonical[136] ^= 0x01
+        forged = canonical
+    else:
+        # Preserve both checksummed headers but forge the checkpoint/read-mark
+        # authority to look used rather than SQLite's canonical empty state.
+        canonical[108:112] = (0).to_bytes(4, sys.byteorder)
+        forged = canonical
+    assert len(forged) == 32768
+    wal = Path(str(database) + "-wal")
+    shm = Path(str(database) + "-shm")
+    wal.write_bytes(b"")
+    shm.write_bytes(forged)
+    before = database.read_bytes(), wal.read_bytes(), shm.read_bytes()
+
+    with pytest.raises(ValueError, match="WAL-index"):
+        db.validate_dev_cow_completed_generation_projection(
+            root, linked_v3_receipt=linked, source_identity=current,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+
+    assert (database.read_bytes(), wal.read_bytes(), shm.read_bytes()) == before
 
 
 @pytest.mark.parametrize("defect", ("nonempty_wal", "bad_shm", "listener", "holder"))

@@ -2768,15 +2768,20 @@ def _validate_dev_current_process_custody(
         argv, root=root.resolve(strict=True), source_root=custody_source_root,
         launch_id=launch_id,
     )
-    if completed_dead_pre_normalization and not argv_canonical:
+    if completed_dead_pre_normalization:
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("AC dev completed process custody PID is invalid")
         try:
-            os.kill(int(pid), 0)
+            os.kill(pid, 0)
         except ProcessLookupError:
-            process_is_dead = True
-        except (OSError, TypeError, ValueError):
-            process_is_dead = False
+            pass
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "AC dev completed process custody liveness is unavailable"
+            ) from exc
         else:
-            process_is_dead = False
+            raise ValueError("AC dev completed process custody PID is still live")
+    if completed_dead_pre_normalization and not argv_canonical:
         try:
             listener = subprocess.run(
                 ["lsof", "-nP", "-iTCP:40008", "-sTCP:LISTEN", "-t"],
@@ -2788,8 +2793,7 @@ def _validate_dev_current_process_custody(
         except (OSError, subprocess.SubprocessError):
             no_dev_listener = False
         argv_canonical = bool(
-            process_is_dead
-            and no_dev_listener
+            no_dev_listener
             and _dev_durable_completed_pre_normalization_argv_is_canonical(
                 argv, root=root.resolve(strict=True), source_root=custody_source_root,
                 launch_id=launch_id,
@@ -4818,6 +4822,173 @@ def _validate_dev_cow_completed_process_axis(
     )
 
 
+def _validate_sqlite_empty_wal_index_residue(
+    database: Path, shm: Path, expected_stat: os.stat_result,
+) -> None:
+    """Validate SQLite's documented 32 KiB WAL-index after TRUNCATE."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(shm, flags)
+    try:
+        opened = os.fstat(descriptor)
+        expected_identity = (
+            int(expected_stat.st_dev), int(expected_stat.st_ino),
+            int(expected_stat.st_nlink), int(expected_stat.st_size),
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (
+                int(opened.st_dev), int(opened.st_ino), int(opened.st_nlink),
+                int(opened.st_size),
+            ) != expected_identity
+        ):
+            raise ValueError("AC dev COW completed generation SHM identity changed")
+        chunks = []
+        remaining = int(opened.st_size) + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        closed_over = os.fstat(descriptor)
+        if (
+            int(closed_over.st_dev), int(closed_over.st_ino),
+            int(closed_over.st_nlink), int(closed_over.st_size),
+        ) != expected_identity:
+            raise ValueError("AC dev COW completed generation SHM changed while read")
+    finally:
+        os.close(descriptor)
+    current = shm.stat(follow_symlinks=False)
+    if (
+        int(current.st_dev), int(current.st_ino), int(current.st_nlink),
+        int(current.st_size),
+    ) != expected_identity:
+        raise ValueError("AC dev COW completed generation SHM path changed")
+    if len(raw) != 32768 or raw[:48] != raw[48:96]:
+        raise ValueError("AC dev COW completed generation WAL-index copies differ")
+
+    endian = "<" if sys.byteorder == "little" else ">"
+    try:
+        (
+            version, unused, change, initialized, big_endian_checksum,
+            wal_page_size, max_frame, database_pages, frame_checksum_1,
+            frame_checksum_2, salt_1, salt_2, header_checksum_1,
+            header_checksum_2,
+        ) = struct.unpack(f"{endian}IIIBBHIIIIIIII", raw[:48])
+        (
+            backfill, read_mark_0, read_mark_1, read_mark_2, read_mark_3,
+            read_mark_4, lock_region, backfill_attempted, checkpoint_unused,
+        ) = struct.unpack(f"{endian}I5I8sII", raw[96:136])
+    except struct.error as exc:
+        raise ValueError("AC dev COW completed generation WAL-index is malformed") from exc
+
+    checksum_1 = 0
+    checksum_2 = 0
+    header_words = struct.unpack(f"{endian}10I", raw[:40])
+    for index in range(0, len(header_words), 2):
+        checksum_1 = (
+            checksum_1 + header_words[index] + checksum_2
+        ) & 0xFFFFFFFF
+        checksum_2 = (
+            checksum_2 + header_words[index + 1] + checksum_1
+        ) & 0xFFFFFFFF
+
+    descriptor = os.open(database, flags)
+    try:
+        database_header = os.read(descriptor, 100)
+    finally:
+        os.close(descriptor)
+    if len(database_header) != 100 or database_header[:16] != b"SQLite format 3\0":
+        raise ValueError("AC dev COW completed generation database header is invalid")
+    database_page_size = int.from_bytes(database_header[16:18], "big")
+    if database_page_size == 1:
+        database_page_size = 65536
+    database_page_count = int.from_bytes(database_header[28:32], "big")
+    valid_page_size = (
+        wal_page_size == 1
+        or (
+            512 <= wal_page_size <= 32768
+            and wal_page_size & (wal_page_size - 1) == 0
+        )
+    )
+    reset_empty_page_state = wal_page_size == 0 and database_pages == 0
+    retained_empty_page_state = (
+        valid_page_size
+        and (65536 if wal_page_size == 1 else wal_page_size)
+        == database_page_size
+        and database_pages == database_page_count
+    )
+    valid_empty_page_state = (
+        reset_empty_page_state
+        or retained_empty_page_state
+    )
+    read_marks = (
+        read_mark_0, read_mark_1, read_mark_2, read_mark_3, read_mark_4,
+    )
+    valid_checkpoint_state = (
+        (
+            reset_empty_page_state
+            and change >= 0
+            and read_marks in {
+                (0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+                (0, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+            }
+        )
+        or (
+            retained_empty_page_state
+            and change >= 1
+            and (salt_1 != 0 or salt_2 != 0)
+            and read_marks
+            == (0, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+        )
+    )
+    if (
+        version != 3007000
+        or unused != 0
+        or initialized != 1
+        or big_endian_checksum not in {0, 1}
+        or not valid_empty_page_state
+        or not valid_checkpoint_state
+        or max_frame != 0
+        or (header_checksum_1, header_checksum_2)
+        != (checksum_1, checksum_2)
+        or backfill != 0
+        or lock_region != b"\0" * 8
+        or backfill_attempted != 0
+        or checkpoint_unused != 0
+    ):
+        raise ValueError("AC dev COW completed generation WAL-index is not empty")
+
+    # The remainder of the first 32 KiB WAL-index region is a page-number
+    # array followed by SQLite's 8192-slot linear-probe hash table.  Although
+    # these entries are stale when mxFrame is zero, their exact internal
+    # relationship distinguishes SQLite residue from arbitrary same-size
+    # bytes and makes a single-bit substitution detectable without rewriting
+    # the sidecar.
+    page_numbers = struct.unpack(f"{endian}4062I", raw[136:16384])
+    hash_slots = struct.unpack(f"{endian}8192H", raw[16384:32768])
+    try:
+        stale_frame_count = page_numbers.index(0)
+    except ValueError:
+        stale_frame_count = len(page_numbers)
+    stale_pages = page_numbers[:stale_frame_count]
+    if (
+        any(page_numbers[stale_frame_count:])
+        or any(page <= 0 or page > database_page_count for page in stale_pages)
+    ):
+        raise ValueError("AC dev COW completed generation WAL-index pages are invalid")
+    expected_hash_slots = [0] * 8192
+    for frame_index, page_number in enumerate(stale_pages, start=1):
+        slot = (page_number * 383) & 8191
+        while expected_hash_slots[slot]:
+            slot = (slot + 1) & 8191
+        expected_hash_slots[slot] = frame_index
+    if tuple(expected_hash_slots) != hash_slots:
+        raise ValueError("AC dev COW completed generation WAL-index hash is invalid")
+
+
 def _validate_dev_cow_stopped_sidecar_residue(database: Path) -> None:
     """Accept only SQLite's inert stopped residue without changing its bytes."""
 
@@ -4854,11 +5025,9 @@ def _validate_dev_cow_stopped_sidecar_residue(database: Path) -> None:
     if wal_stat is not None and int(wal_stat.st_size) != 0:
         raise ValueError("AC dev COW completed generation WAL is not empty")
     if shm_stat is not None:
-        # SQLite's WAL-index mapping is allocated in one 32 KiB region.  With
-        # no live holder it is non-authoritative residue only when paired with
-        # the empty WAL that made it; arbitrary or linked bytes remain closed.
         if wal_stat is None or int(shm_stat.st_size) != 32768:
             raise ValueError("AC dev COW completed generation SHM residue is invalid")
+        _validate_sqlite_empty_wal_index_residue(database, shm, shm_stat)
 
 
 def _validated_dev_cow_completed_generation_axis(
