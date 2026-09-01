@@ -28,6 +28,16 @@ CODEX_WORKER_MCP_ENV_VARS = (
     "AMING_WORKER_SESSION_TOKEN",
     "AMING_WORKER_FENCE_TOKEN",
 )
+CODEX_MCP_TRANSPORTS = {
+    "aming-claw": {
+        "project_id": "stable-governance",
+        "governance_url": "http://127.0.0.1:40000",
+    },
+    "aming-claw-dev": {
+        "project_id": "aming-claw",
+        "governance_url": "http://127.0.0.1:40008",
+    },
+}
 REQUIRED_PLUGIN_FILES = (
     ".codex-plugin/plugin.json",
     ".agents/plugins/marketplace.json",
@@ -441,6 +451,13 @@ def validate_plugin_root(plugin_root: Path) -> list[str]:
         except json.JSONDecodeError as exc:
             raise PluginInstallError(f"invalid JSON in {rel}: {exc}") from exc
 
+    mcp_ok, mcp_detail = _validate_mcp_runtime_entrypoint(
+        root / ".mcp.json",
+        require_absolute=False,
+    )
+    if not mcp_ok:
+        raise PluginInstallError(mcp_detail)
+
     return list(REQUIRED_PLUGIN_FILES)
 
 
@@ -519,35 +536,58 @@ def _cache_runtime_mcp_config(plugin_root: Path, *, python_executable: Optional[
     servers = payload.get("mcpServers") if isinstance(payload, dict) else {}
     if not isinstance(servers, dict):
         servers = {}
-    server = dict(servers.get("aming-claw") or {})
 
     runtime_root = str(plugin_root.expanduser().resolve())
-    server["command"] = python_executable or str(server.get("command") or "python")
-    if not isinstance(server.get("args"), list) or not server["args"]:
+    source_command = str(
+        python_executable
+        or (servers.get("aming-claw") or {}).get("command")
+        or sys.executable
+    ).strip()
+    command_path = Path(source_command).expanduser()
+    if command_path.is_absolute():
+        absolute_command = str(command_path.resolve())
+    elif os.sep in source_command or (os.altsep and os.altsep in source_command):
+        absolute_command = str((plugin_root.expanduser().resolve() / command_path).resolve())
+    else:
+        discovered_command = shutil.which(source_command)
+        if not discovered_command:
+            raise PluginInstallError(
+                f"cannot resolve MCP Python command to an absolute path: {source_command}"
+            )
+        absolute_command = str(Path(discovered_command).expanduser().resolve())
+
+    generated_servers = dict(servers)
+    for server_name, transport in CODEX_MCP_TRANSPORTS.items():
+        server = dict(servers.get(server_name) or servers.get("aming-claw") or {})
+        project_id = transport["project_id"]
+        governance_url = transport["governance_url"]
+        server["command"] = absolute_command
         server["args"] = [
             "-m",
             "agent.mcp.server",
             "--project",
-            "aming-claw",
+            project_id,
             "--workers",
             "0",
             "--governance-url",
-            "http://localhost:40000",
+            governance_url,
         ]
-    server["cwd"] = runtime_root
-    server["env_vars"] = list(CODEX_WORKER_MCP_ENV_VARS)
+        server["cwd"] = runtime_root
+        server["env_vars"] = list(CODEX_WORKER_MCP_ENV_VARS)
 
-    env = server.get("env") if isinstance(server.get("env"), dict) else {}
-    env = dict(env)
-    pythonpath = str(env.get("PYTHONPATH") or "")
-    parts = [part for part in pythonpath.split(os.pathsep) if part]
-    if runtime_root not in parts:
-        parts.insert(0, runtime_root)
-    env["PYTHONPATH"] = os.pathsep.join(parts)
-    server["env"] = env
+        env = server.get("env") if isinstance(server.get("env"), dict) else {}
+        env = dict(env)
+        pythonpath = str(env.get("PYTHONPATH") or "")
+        parts = [part for part in pythonpath.split(os.pathsep) if part]
+        if runtime_root not in parts:
+            parts.insert(0, runtime_root)
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+        env["AMING_CLAW_MCP_PROJECT_ID"] = project_id
+        env["GOVERNANCE_URL"] = governance_url
+        server["env"] = env
+        generated_servers[server_name] = server
 
-    payload["mcpServers"] = servers
-    payload["mcpServers"]["aming-claw"] = server
+    payload["mcpServers"] = generated_servers
     return payload
 
 
@@ -669,18 +709,24 @@ def _toml_array(values: Sequence[object]) -> str:
 
 def _codex_runtime_config_toml(plugin_root: Path, *, python_executable: Optional[str] = None) -> str:
     payload = _cache_runtime_mcp_config(plugin_root, python_executable=python_executable)
-    server = payload["mcpServers"]["aming-claw"]
-    lines = [
-        "[mcp_servers.aming-claw]",
-        f"command = {_toml_quote(str(server.get('command') or 'python'))}",
-        f"args = {_toml_array([str(arg) for arg in server.get('args') or []])}",
-        f"env_vars = {_toml_array([str(item) for item in server.get('env_vars') or []])}",
-    ]
-    env = server.get("env") if isinstance(server.get("env"), dict) else {}
-    if env:
-        lines.extend(["", "[mcp_servers.aming-claw.env]"])
-        for key in sorted(str(item) for item in env):
-            lines.append(f"{key} = {_toml_quote(str(env[key]))}")
+    lines: list[str] = []
+    for server_name in CODEX_MCP_TRANSPORTS:
+        server = payload["mcpServers"][server_name]
+        if lines:
+            lines.append("")
+        lines.extend(
+            [
+                f"[mcp_servers.{server_name}]",
+                f"command = {_toml_quote(str(server.get('command') or 'python'))}",
+                f"args = {_toml_array([str(arg) for arg in server.get('args') or []])}",
+                f"env_vars = {_toml_array([str(item) for item in server.get('env_vars') or []])}",
+            ]
+        )
+        env = server.get("env") if isinstance(server.get("env"), dict) else {}
+        if env:
+            lines.extend(["", f"[mcp_servers.{server_name}.env]"])
+            for key in sorted(str(item) for item in env):
+                lines.append(f"{key} = {_toml_quote(str(env[key]))}")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1720,14 +1766,8 @@ def _check_claude_manifest(plugin_root: Path) -> DoctorCheck:
 
 def _check_mcp_config(plugin_root: Path) -> DoctorCheck:
     path = plugin_root / ".mcp.json"
-    try:
-        payload = _read_json_file(path)
-    except Exception as exc:
-        return _doctor_check("mcp_config", "fail", f"{path}: {exc}")
-    servers = payload.get("mcpServers") if isinstance(payload, dict) else {}
-    if not isinstance(servers, dict) or "aming-claw" not in servers:
-        return _doctor_check("mcp_config", "fail", "missing mcpServers.aming-claw")
-    return _doctor_check("mcp_config", "ok", str(path))
+    ok, detail = _validate_mcp_runtime_entrypoint(path, require_absolute=False)
+    return _doctor_check("mcp_config", "ok" if ok else "fail", detail)
 
 
 def _mcp_server_from(path: Path) -> tuple[dict, str]:
@@ -1852,38 +1892,80 @@ def _extract_toml_string(block: str, key: str) -> str:
     return value
 
 
-def _validate_mcp_runtime_entrypoint(mcp_path: Path) -> tuple[bool, str]:
+def _mcp_arg_value(args: Sequence[object], flag: str) -> str:
+    normalized = [str(arg) for arg in args]
+    try:
+        index = normalized.index(flag)
+    except ValueError:
+        return ""
+    return normalized[index + 1] if index + 1 < len(normalized) else ""
+
+
+def _validate_mcp_runtime_entrypoint(
+    mcp_path: Path,
+    *,
+    require_absolute: bool = True,
+) -> tuple[bool, str]:
     try:
         payload = _read_json_file(mcp_path)
     except Exception as exc:
         return False, f"{mcp_path}: {exc}"
     servers = payload.get("mcpServers") if isinstance(payload, dict) else {}
-    server = servers.get("aming-claw") if isinstance(servers, dict) else None
-    if not isinstance(server, dict):
-        return False, f"{mcp_path}: missing mcpServers.aming-claw"
-    command = str(server.get("command") or "").strip()
-    if not command:
-        return False, f"{mcp_path}: mcpServers.aming-claw.command is empty"
-    args = server.get("args")
-    if not isinstance(args, list) or "agent.mcp.server" not in [str(arg) for arg in args]:
-        return False, f"{mcp_path}: mcpServers.aming-claw.args must launch agent.mcp.server"
-    env_vars = server.get("env_vars")
-    if env_vars != list(CODEX_WORKER_MCP_ENV_VARS):
-        return False, f"{mcp_path}: mcpServers.aming-claw.env_vars must be the worker auth allowlist"
+    if not isinstance(servers, dict):
+        return False, f"{mcp_path}: missing mcpServers"
 
-    cwd = Path(str(server.get("cwd") or ".")).expanduser()
-    if not cwd.is_absolute():
-        cwd = (mcp_path.parent / cwd).resolve()
-    runtime_paths = [cwd]
-    env = server.get("env") if isinstance(server.get("env"), dict) else {}
-    for item in str(env.get("PYTHONPATH") or "").split(os.pathsep):
-        if item:
-            runtime_paths.append(Path(item).expanduser())
-    for candidate in runtime_paths:
-        if (candidate / "agent" / "mcp" / "server.py").is_file():
-            return True, f"{mcp_path}: runtime import root {candidate}"
-    checked = ", ".join(str(path) for path in runtime_paths)
-    return False, f"{mcp_path}: cannot import agent.mcp.server from cwd/PYTHONPATH ({checked})"
+    validated: list[str] = []
+    for server_name, transport in CODEX_MCP_TRANSPORTS.items():
+        server = servers.get(server_name)
+        if not isinstance(server, dict):
+            return False, f"{mcp_path}: missing mcpServers.{server_name}"
+        command = str(server.get("command") or "").strip()
+        if not command:
+            return False, f"{mcp_path}: mcpServers.{server_name}.command is empty"
+        if require_absolute and not Path(command).expanduser().is_absolute():
+            return False, f"{mcp_path}: mcpServers.{server_name}.command must be absolute"
+        args = server.get("args")
+        if not isinstance(args, list) or "agent.mcp.server" not in [str(arg) for arg in args]:
+            return False, f"{mcp_path}: mcpServers.{server_name}.args must launch agent.mcp.server"
+        if _mcp_arg_value(args, "--project") != transport["project_id"]:
+            return False, f"{mcp_path}: mcpServers.{server_name} has the wrong project identity"
+        if _mcp_arg_value(args, "--governance-url") != transport["governance_url"]:
+            return False, f"{mcp_path}: mcpServers.{server_name} has the wrong governance world"
+        env_vars = server.get("env_vars")
+        if env_vars != list(CODEX_WORKER_MCP_ENV_VARS):
+            return False, f"{mcp_path}: mcpServers.{server_name}.env_vars must be the worker auth allowlist"
+
+        raw_cwd = str(server.get("cwd") or ".")
+        cwd = Path(raw_cwd).expanduser()
+        if require_absolute and not cwd.is_absolute():
+            return False, f"{mcp_path}: mcpServers.{server_name}.cwd must be absolute"
+        if not cwd.is_absolute():
+            cwd = (mcp_path.parent / cwd).resolve()
+        runtime_paths = [cwd]
+        env = server.get("env") if isinstance(server.get("env"), dict) else {}
+        if str(env.get("AMING_CLAW_MCP_PROJECT_ID") or "") != transport["project_id"]:
+            return False, f"{mcp_path}: mcpServers.{server_name} env project identity is stale"
+        if str(env.get("GOVERNANCE_URL") or "") != transport["governance_url"]:
+            return False, f"{mcp_path}: mcpServers.{server_name} env governance world is stale"
+        pythonpath_items = [
+            Path(item).expanduser()
+            for item in str(env.get("PYTHONPATH") or "").split(os.pathsep)
+            if item
+        ]
+        if require_absolute and any(not item.is_absolute() for item in pythonpath_items):
+            return False, f"{mcp_path}: mcpServers.{server_name}.env.PYTHONPATH must be absolute"
+        runtime_paths.extend(pythonpath_items)
+        if not any(
+            (candidate / "agent" / "mcp" / "server.py").is_file()
+            for candidate in runtime_paths
+        ):
+            checked = ", ".join(str(path) for path in runtime_paths)
+            return False, (
+                f"{mcp_path}: mcpServers.{server_name} cannot import "
+                f"agent.mcp.server from cwd/PYTHONPATH ({checked})"
+            )
+        validated.append(server_name)
+    return True, f"{mcp_path}: validated MCP transports {', '.join(validated)}"
 
 
 def _validate_codex_runtime_config(config_path: Path) -> tuple[bool, str]:
@@ -1892,30 +1974,49 @@ def _validate_codex_runtime_config(config_path: Path) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"{config_path}: {exc}"
     servers = payload.get("mcp_servers") if isinstance(payload, dict) else {}
-    server = servers.get("aming-claw") if isinstance(servers, dict) else None
-    if not isinstance(server, dict):
-        return False, f"{config_path}: missing mcp_servers.aming-claw"
-    command = str(server.get("command") or "").strip()
-    if not command:
-        return False, f"{config_path}: mcp_servers.aming-claw.command is empty"
-    args = server.get("args")
-    if not isinstance(args, list) or "agent.mcp.server" not in [str(arg) for arg in args]:
-        return False, f"{config_path}: mcp_servers.aming-claw.args must launch agent.mcp.server"
-    env_vars = server.get("env_vars")
-    if env_vars != list(CODEX_WORKER_MCP_ENV_VARS):
-        return False, f"{config_path}: mcp_servers.aming-claw.env_vars must be the worker auth allowlist"
+    if not isinstance(servers, dict):
+        return False, f"{config_path}: missing mcp_servers"
+    validated: list[str] = []
+    for server_name, transport in CODEX_MCP_TRANSPORTS.items():
+        server = servers.get(server_name)
+        if not isinstance(server, dict):
+            return False, f"{config_path}: missing mcp_servers.{server_name}"
+        command = str(server.get("command") or "").strip()
+        if not command or not Path(command).expanduser().is_absolute():
+            return False, f"{config_path}: mcp_servers.{server_name}.command must be absolute"
+        args = server.get("args")
+        if not isinstance(args, list) or "agent.mcp.server" not in [str(arg) for arg in args]:
+            return False, f"{config_path}: mcp_servers.{server_name}.args must launch agent.mcp.server"
+        if _mcp_arg_value(args, "--project") != transport["project_id"]:
+            return False, f"{config_path}: mcp_servers.{server_name} has the wrong project identity"
+        if _mcp_arg_value(args, "--governance-url") != transport["governance_url"]:
+            return False, f"{config_path}: mcp_servers.{server_name} has the wrong governance world"
+        if server.get("env_vars") != list(CODEX_WORKER_MCP_ENV_VARS):
+            return False, f"{config_path}: mcp_servers.{server_name}.env_vars must be the worker auth allowlist"
 
-    env = server.get("env") if isinstance(server.get("env"), dict) else {}
-    runtime_paths = [
-        Path(item).expanduser()
-        for item in str(env.get("PYTHONPATH") or "").split(os.pathsep)
-        if item
-    ]
-    for candidate in runtime_paths:
-        if (candidate / "agent" / "mcp" / "server.py").is_file():
-            return True, f"{config_path}: Codex MCP runtime import root {candidate}"
-    checked = ", ".join(str(path) for path in runtime_paths) or "<empty PYTHONPATH>"
-    return False, f"{config_path}: cannot import agent.mcp.server from PYTHONPATH ({checked})"
+        env = server.get("env") if isinstance(server.get("env"), dict) else {}
+        if str(env.get("AMING_CLAW_MCP_PROJECT_ID") or "") != transport["project_id"]:
+            return False, f"{config_path}: mcp_servers.{server_name} env project identity is stale"
+        if str(env.get("GOVERNANCE_URL") or "") != transport["governance_url"]:
+            return False, f"{config_path}: mcp_servers.{server_name} env governance world is stale"
+        runtime_paths = [
+            Path(item).expanduser()
+            for item in str(env.get("PYTHONPATH") or "").split(os.pathsep)
+            if item
+        ]
+        if not runtime_paths or any(not item.is_absolute() for item in runtime_paths):
+            return False, f"{config_path}: mcp_servers.{server_name}.env.PYTHONPATH must be absolute"
+        if not any(
+            (candidate / "agent" / "mcp" / "server.py").is_file()
+            for candidate in runtime_paths
+        ):
+            checked = ", ".join(str(path) for path in runtime_paths)
+            return False, (
+                f"{config_path}: mcp_servers.{server_name} cannot import "
+                f"agent.mcp.server from PYTHONPATH ({checked})"
+            )
+        validated.append(server_name)
+    return True, f"{config_path}: validated Codex MCP transports {', '.join(validated)}"
 
 
 def _validate_codex_marketplace_root(root: Path) -> tuple[bool, str]:

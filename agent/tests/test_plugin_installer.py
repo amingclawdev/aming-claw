@@ -11,6 +11,7 @@ import pytest
 
 from agent.plugin_installer import (
     AI_CLI_REQUIREMENTS,
+    CODEX_MCP_TRANSPORTS,
     CODEX_PLUGIN_ID,
     CODEX_WORKER_MCP_ENV_VARS,
     DEFAULT_PLUGIN_VERSION,
@@ -89,14 +90,40 @@ def _write_plugin_fixture(root: Path) -> None:
                         "-m",
                         "agent.mcp.server",
                         "--project",
-                        "aming-claw",
+                        "stable-governance",
                         "--workers",
                         "0",
+                        "--governance-url",
+                        "http://127.0.0.1:40000",
                     ],
                     "cwd": ".",
                     "env_vars": list(CODEX_WORKER_MCP_ENV_VARS),
-                    "env": {"PYTHONDONTWRITEBYTECODE": "1"},
-                }
+                    "env": {
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                        "AMING_CLAW_MCP_PROJECT_ID": "stable-governance",
+                        "GOVERNANCE_URL": "http://127.0.0.1:40000",
+                    },
+                },
+                "aming-claw-dev": {
+                    "command": "python",
+                    "args": [
+                        "-m",
+                        "agent.mcp.server",
+                        "--project",
+                        "aming-claw",
+                        "--workers",
+                        "0",
+                        "--governance-url",
+                        "http://127.0.0.1:40008",
+                    ],
+                    "cwd": ".",
+                    "env_vars": list(CODEX_WORKER_MCP_ENV_VARS),
+                    "env": {
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                        "AMING_CLAW_MCP_PROJECT_ID": "aming-claw",
+                        "GOVERNANCE_URL": "http://127.0.0.1:40008",
+                    },
+                },
             }
         },
         "agent/mcp/resources/seed-graph-summary.json": seed_payload,
@@ -236,6 +263,29 @@ def test_validate_plugin_root_requires_expected_assets(tmp_path):
     assert ".codex-plugin/plugin.json" in validated
     assert "skills/aming-claw-onboard/SKILL.md" in validated
     assert "Archive/skills/index.json" in validated
+
+
+def test_validate_plugin_root_requires_both_world_scoped_mcp_transports(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    mcp_path = tmp_path / ".mcp.json"
+    payload = json.loads(mcp_path.read_text(encoding="utf-8"))
+    payload["mcpServers"].pop("aming-claw-dev")
+    mcp_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PluginInstallError, match="missing mcpServers.aming-claw-dev"):
+        validate_plugin_root(tmp_path)
+
+
+def test_validate_plugin_root_rejects_cross_world_mcp_endpoint(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    mcp_path = tmp_path / ".mcp.json"
+    payload = json.loads(mcp_path.read_text(encoding="utf-8"))
+    stable = payload["mcpServers"]["aming-claw"]
+    stable["args"][-1] = "http://127.0.0.1:40008"
+    mcp_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PluginInstallError, match="wrong governance world"):
+        validate_plugin_root(tmp_path)
 
 
 def test_default_plugin_update_state_path_uses_user_state_home(tmp_path, monkeypatch):
@@ -610,8 +660,13 @@ def test_doctor_plugin_fails_when_enabled_cache_is_missing(tmp_path):
 def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path):
     _write_plugin_fixture(tmp_path)
     codex_home = tmp_path / "codex-home"
+    python = (tmp_path / "python3.12").resolve()
 
-    target = install_codex_plugin_cache(tmp_path, codex_home=codex_home, python_executable="python3.12")
+    target = install_codex_plugin_cache(
+        tmp_path,
+        codex_home=codex_home,
+        python_executable=str(python),
+    )
 
     assert target == (
         codex_home
@@ -638,19 +693,41 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
     assert not (target / "agent" / "mcp" / "server.py").exists()
 
     mcp = json.loads((target / ".mcp.json").read_text(encoding="utf-8"))
-    server = mcp["mcpServers"]["aming-claw"]
-    assert server["command"] == "python3.12"
-    assert server["cwd"] == str(tmp_path.resolve())
-    assert str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(os.pathsep)
-    assert server["args"][:2] == ["-m", "agent.mcp.server"]
-    assert server["env_vars"] == list(CODEX_WORKER_MCP_ENV_VARS)
+    assert set(CODEX_MCP_TRANSPORTS).issubset(mcp["mcpServers"])
+    for server_name, transport in CODEX_MCP_TRANSPORTS.items():
+        server = mcp["mcpServers"][server_name]
+        assert server["command"] == str(python)
+        assert Path(server["command"]).is_absolute()
+        assert server["cwd"] == str(tmp_path.resolve())
+        assert Path(server["cwd"]).is_absolute()
+        pythonpath = server["env"]["PYTHONPATH"].split(os.pathsep)
+        assert str(tmp_path.resolve()) in pythonpath
+        assert all(Path(item).is_absolute() for item in pythonpath)
+        assert server["args"] == [
+            "-m",
+            "agent.mcp.server",
+            "--project",
+            transport["project_id"],
+            "--workers",
+            "0",
+            "--governance-url",
+            transport["governance_url"],
+        ]
+        assert server["env"]["AMING_CLAW_MCP_PROJECT_ID"] == transport["project_id"]
+        assert server["env"]["GOVERNANCE_URL"] == transport["governance_url"]
+        assert server["env_vars"] == list(CODEX_WORKER_MCP_ENV_VARS)
 
     codex_config = _load_toml_text((target / ".codex" / "config.toml").read_text(encoding="utf-8"))
-    codex_server = codex_config["mcp_servers"]["aming-claw"]
-    assert codex_server["command"] == "python3.12"
-    assert codex_server["args"][:2] == ["-m", "agent.mcp.server"]
-    assert str(tmp_path.resolve()) in codex_server["env"]["PYTHONPATH"].split(os.pathsep)
-    assert codex_server["env_vars"] == list(CODEX_WORKER_MCP_ENV_VARS)
+    assert set(CODEX_MCP_TRANSPORTS).issubset(codex_config["mcp_servers"])
+    for server_name, transport in CODEX_MCP_TRANSPORTS.items():
+        codex_server = codex_config["mcp_servers"][server_name]
+        assert codex_server["command"] == str(python)
+        assert codex_server["args"][3] == transport["project_id"]
+        assert codex_server["args"][-1] == transport["governance_url"]
+        assert str(tmp_path.resolve()) in codex_server["env"]["PYTHONPATH"].split(os.pathsep)
+        assert codex_server["env"]["AMING_CLAW_MCP_PROJECT_ID"] == transport["project_id"]
+        assert codex_server["env"]["GOVERNANCE_URL"] == transport["governance_url"]
+        assert codex_server["env_vars"] == list(CODEX_WORKER_MCP_ENV_VARS)
 
 
 def test_install_codex_plugin_cache_never_materializes_worker_auth_values(tmp_path, monkeypatch):
@@ -851,7 +928,9 @@ def test_doctor_plugin_fails_when_cache_mcp_cannot_import_runtime(tmp_path):
     )
     mcp_path = cache_target / ".mcp.json"
     payload = json.loads(mcp_path.read_text(encoding="utf-8"))
-    payload["mcpServers"]["aming-claw"]["cwd"] = "."
+    payload["mcpServers"]["aming-claw"]["cwd"] = str(
+        (tmp_path / "missing-runtime").resolve()
+    )
     payload["mcpServers"]["aming-claw"]["env"].pop("PYTHONPATH", None)
     mcp_path.write_text(json.dumps(payload), encoding="utf-8")
 

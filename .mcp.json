@@ -2,7 +2,7 @@
   "mcpServers": {
     "aming-claw": {
       "command": "./.venv/bin/python",
-      "args": ["-m", "agent.mcp.server", "--project", "aming-claw", "--workers", "0", "--governance-url", "http://localhost:40000"],
+      "args": ["-m", "agent.mcp.server", "--project", "stable-governance", "--workers", "0", "--governance-url", "http://127.0.0.1:40000"],
       "cwd": ".",
       "env_vars": [
         "AMING_WORKER_SESSION_TOKEN",
@@ -11,7 +11,25 @@
       "env": {
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",
-        "GOVERNANCE_URL": "http://localhost:40000",
+        "AMING_CLAW_MCP_PROJECT_ID": "stable-governance",
+        "GOVERNANCE_URL": "http://127.0.0.1:40000",
+        "MANAGER_URL": "http://127.0.0.1:40101",
+        "MEMORY_BACKEND": "docker"
+      }
+    },
+    "aming-claw-dev": {
+      "command": "./.venv/bin/python",
+      "args": ["-m", "agent.mcp.server", "--project", "aming-claw", "--workers", "0", "--governance-url", "http://127.0.0.1:40008"],
+      "cwd": ".",
+      "env_vars": [
+        "AMING_WORKER_SESSION_TOKEN",
+        "AMING_WORKER_FENCE_TOKEN"
+      ],
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "AMING_CLAW_MCP_PROJECT_ID": "aming-claw",
+        "GOVERNANCE_URL": "http://127.0.0.1:40008",
         "MANAGER_URL": "http://127.0.0.1:40101",
         "MEMORY_BACKEND": "docker"
       }

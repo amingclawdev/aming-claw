@@ -20,6 +20,7 @@ from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp import server as plugin_mcp_server
 from agent.mcp import tools as runtime_mcp_tool_module
 from agent.mcp.server import AmingClawMCP
+from agent.plugin_installer import CODEX_MCP_TRANSPORTS
 from agent.mcp.schema_contract import (
     MCP_TOOL_SCHEMA_VERSION,
     mcp_tool_schema_fingerprint,
@@ -2749,6 +2750,14 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance(tmp_path):
     assert "qa_session_token_ref" in tool_by_name["task_timeline_append"][
         "inputSchema"
     ]["properties"]
+    assert {
+        "stage_id",
+        "line_id",
+        "evidence_kind",
+        "runtime_guide_hash",
+    }.issubset(
+        tool_by_name["task_timeline_append"]["inputSchema"]["properties"]
+    )
     for tool_name in (
         "contract_runtime_current",
         "contract_runtime_guide",
@@ -2758,6 +2767,104 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance(tmp_path):
         properties = tool_by_name[tool_name]["inputSchema"]["properties"]
         assert "backlog_id" in properties
         assert "qa_session_token_ref" in properties
+
+
+def test_plugin_declares_two_runnable_world_isolated_mcp_processes(tmp_path):
+    config = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
+    servers = config["mcpServers"]
+    for server_name, transport in CODEX_MCP_TRANSPORTS.items():
+        server = servers[server_name]
+        env = {
+            **os.environ,
+            **server.get("env", {}),
+            "PYTHONPATH": str(ROOT),
+            "AMING_CLAW_DEV_STORAGE_ROOT": str(tmp_path / "dev-storage"),
+        }
+        proc = subprocess.run(
+            [sys.executable, *server["args"]],
+            cwd=ROOT,
+            env=env,
+            input=json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+            )
+            + "\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stderr == ""
+        response = json.loads(proc.stdout.strip())
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        timeline_fields = tools["task_timeline_append"]["inputSchema"]["properties"]
+        assert {"stage_id", "line_id", "evidence_kind", "runtime_guide_hash"}.issubset(
+            timeline_fields
+        )
+        assert server["env"]["AMING_CLAW_MCP_PROJECT_ID"] == transport["project_id"]
+        assert server["env"]["GOVERNANCE_URL"] == transport["governance_url"]
+
+
+def test_dual_mcp_transports_reject_cross_world_calls_before_http(monkeypatch, tmp_path):
+    dev_root = tmp_path / "dev-world"
+    dev_root.mkdir()
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
+    stable = AmingClawMCP(
+        project_id="stable-governance",
+        governance_url="http://127.0.0.1:40000",
+        workspace=str(tmp_path),
+        redis_url="redis://127.0.0.1:40079/0",
+        max_workers=0,
+    )
+    dev = AmingClawMCP(
+        project_id="aming-claw",
+        governance_url="http://127.0.0.1:40008",
+        workspace=str(tmp_path),
+        redis_url="redis://127.0.0.1:40079/0",
+        max_workers=0,
+    )
+    stable_calls = []
+    dev_calls = []
+    monkeypatch.setattr(
+        stable,
+        "_request_json",
+        lambda method, url, data, timeout: stable_calls.append((method, url, data))
+        or {"ok": True},
+    )
+    monkeypatch.setattr(
+        dev,
+        "_request_json",
+        lambda method, url, data, timeout: dev_calls.append((method, url, data))
+        or {"ok": True},
+    )
+
+    assert stable._http(
+        "GET",
+        "/api/backlog/drift-gym",
+        {"project_id": "drift-gym"},
+    ) == {"ok": True}
+    assert stable_calls[0][1].startswith("http://127.0.0.1:40000/")
+    stable_count = len(stable_calls)
+    assert stable._http(
+        "POST",
+        "/api/projects/aming-claw/backlog",
+        {"project_id": "aming-claw"},
+    )["error"] == "mcp_world_project_scope_mismatch"
+    assert len(stable_calls) == stable_count
+
+    assert dev._http(
+        "GET",
+        "/api/backlog/aming-claw",
+        {"project_id": "aming-claw"},
+    ) == {"ok": True}
+    assert dev_calls[0][1].startswith("http://127.0.0.1:40008/")
+    dev_count = len(dev_calls)
+    assert dev._http(
+        "POST",
+        "/api/projects/drift-gym/backlog",
+        {"project_id": "drift-gym"},
+    )["error"] == "mcp_world_project_scope_mismatch"
+    assert len(dev_calls) == dev_count
 
 
 def test_mcp_stdio_backlog_upsert_schema_exposes_structured_acceptance_scope():
