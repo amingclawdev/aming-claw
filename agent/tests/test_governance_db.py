@@ -3344,6 +3344,134 @@ def test_completed_cow_basic_restart_preserves_database_and_refreshes_only_basic
     db.release_dev_runtime_writer_lease(root)
 
 
+def test_completed_cow_basic_restart_returns_before_normal_sqlite_connect(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, historical, _stable, launch_path = (
+        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+    )
+    current = _defer_completed_source_and_open_clean_successor(
+        tmp_path, historical,
+    )
+    wal = Path(str(database) + "-wal")
+    shm = Path(str(database) + "-shm")
+    wal.write_bytes(b"")
+    shm.write_bytes(_real_fresh_empty_wal_index_bytes(tmp_path, database))
+    artifacts_before = db._dev_cow_basic_restart_artifact_snapshot(database)
+    launch_before = launch_path.read_bytes()
+    original_classifier = db._validate_dev_cow_completed_basic_restart
+    original_connect = db.sqlite3.connect
+    original_upgrade = db._verify_dev_source_upgrade
+    upgrade_modes = []
+    classifier_calls = 0
+
+    def guarded_upgrade(previous, candidate, **kwargs):
+        upgrade_modes.append(kwargs.get("historical_worktree_advisory", False))
+        if not kwargs.get("historical_worktree_advisory", False):
+            raise AssertionError("non-advisory upgrade must not run")
+        return original_upgrade(previous, candidate, **kwargs)
+
+    def classify_then_close_sqlite(*args, **kwargs):
+        nonlocal classifier_calls
+        result = original_classifier(*args, **kwargs)
+        classifier_calls += 1
+        if classifier_calls == 2:
+            monkeypatch.setattr(
+                db.sqlite3, "connect",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("normal SQLite connect ran after classifier")
+                ),
+            )
+        return result
+
+    monkeypatch.setattr(db, "_verify_dev_source_upgrade", guarded_upgrade)
+    monkeypatch.setattr(
+        db, "_validate_dev_cow_completed_basic_restart",
+        classify_then_close_sqlite,
+    )
+    process = {
+        "pid": os.getpid(),
+        "start_identity": f"pid:{os.getpid()}:cli-bootstrap",
+    }
+
+    binding = db.bootstrap_dev_governance_store(
+        root, source_identity=current, process_identity=process,
+    )
+
+    monkeypatch.setattr(db.sqlite3, "connect", original_connect)
+    assert classifier_calls == 2
+    assert upgrade_modes and all(upgrade_modes)
+    assert binding["restart_safe"] is True
+    assert binding["source_upgraded"] is False
+    assert binding["source_tip_identity"] == {
+        key: historical[key] for key in db._DEV_SOURCE_TIP_KEYS
+    }
+    assert binding["current_process_identity"] != process
+    assert binding["database_identity"]["device"] == database.stat().st_dev
+    assert binding["database_identity"]["inode"] == database.stat().st_ino
+    assert binding["genesis_sha256"] == binding["database_identity"]["genesis_sha256"]
+    assert db._dev_cow_basic_restart_artifact_snapshot(database) == artifacts_before
+    assert launch_path.read_bytes() == launch_before
+    lease = db._DEV_DATABASE_WRITER_LEASES[str(database.absolute())]
+    assert lease["database_device"] == database.stat().st_dev
+    assert lease["database_inode"] == database.stat().st_ino
+    db.release_dev_runtime_writer_lease(root)
+
+
+def test_completed_cow_basic_restart_early_return_failure_releases_new_lease(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, candidate, _stable, launch_path = (
+        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+    )
+    original_classifier = db._validate_dev_cow_completed_basic_restart
+    original_connect = db.sqlite3.connect
+    before = db._dev_cow_basic_restart_artifact_snapshot(database)
+    launch_before = launch_path.read_bytes()
+    classifier_calls = 0
+
+    def classify_with_stale_snapshot(*args, **kwargs):
+        nonlocal classifier_calls
+        result = original_classifier(*args, **kwargs)
+        classifier_calls += 1
+        if classifier_calls < 2:
+            return result
+        result = {**result, "artifacts": {**result["artifacts"]}}
+        result["artifacts"]["database"] = {
+            **result["artifacts"]["database"], "sha256": "sha256:" + "f" * 64,
+        }
+        monkeypatch.setattr(
+            db.sqlite3, "connect",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("normal SQLite connect ran after classifier")
+            ),
+        )
+        return result
+
+    monkeypatch.setattr(
+        db, "_validate_dev_cow_completed_basic_restart",
+        classify_with_stale_snapshot,
+    )
+    with pytest.raises(ValueError, match="artifacts changed under lease"):
+        db.bootstrap_dev_governance_store(
+            root, source_identity=candidate,
+            process_identity={
+                "pid": os.getpid(),
+                "start_identity": f"pid:{os.getpid()}:cli-bootstrap",
+            },
+        )
+
+    monkeypatch.setattr(db.sqlite3, "connect", original_connect)
+    assert classifier_calls == 2
+    assert str(database.absolute()) not in db._DEV_DATABASE_WRITER_LEASES
+    assert db._dev_cow_basic_restart_artifact_snapshot(database) == before
+    assert launch_path.read_bytes() == launch_before
+
+
 @pytest.mark.parametrize(
     "defect",
     ("receipt_missing", "successor", "custody", "world", "schema", "source", "listener"),

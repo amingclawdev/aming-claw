@@ -5201,6 +5201,24 @@ def validate_dev_cow_completed_generation_projection(
     return receipt
 
 
+def _dev_cow_basic_restart_artifact_snapshot(
+    database: Path,
+) -> dict[str, dict[str, object] | None]:
+    """Capture the exact stopped SQLite files without opening the database."""
+
+    snapshot: dict[str, dict[str, object] | None] = {}
+    for name, suffix in (
+        ("database", ""), ("wal", "-wal"), ("shm", "-shm"),
+        ("journal", "-journal"),
+    ):
+        path = Path(str(database) + suffix)
+        if not path.exists() and not path.is_symlink():
+            snapshot[name] = None
+            continue
+        snapshot[name] = _cow_regular_identity(path)
+    return snapshot
+
+
 def _validate_dev_cow_completed_basic_restart(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     stable_binding: Mapping[str, object],
@@ -5268,12 +5286,17 @@ def _validate_dev_cow_completed_basic_restart(
         or _database_logical_sha256(database) != logical_before
     ):
         raise ValueError("AC dev COW completed basic restart preflight changed the database")
+    artifacts = _dev_cow_basic_restart_artifact_snapshot(database)
+    if str(dict(artifacts.get("database") or {}).get("sha256") or "") != database_before:
+        raise ValueError("AC dev COW completed basic restart database snapshot changed")
     return {
         "receipt": receipt,
         "linked_v3_receipt": linked_path,
         "database_sha256": database_before,
         "logical_sha256": logical_before,
         "historical_process": process,
+        "axis": axis,
+        "artifacts": artifacts,
     }
 
 
@@ -5804,6 +5827,95 @@ def bootstrap_dev_governance_store(
     acquire_dev_runtime_writer_lease(root)
     conn: sqlite3.Connection | None = None
     try:
+        if basic_cow_restart is not None:
+            # The completed-generation classifier has already verified the
+            # schema, inventory, world/genesis, historical custody, clean
+            # descendant source, stopped listener/process, receipt chain and
+            # inert sidecars through immutable reads.  Opening a normal SQLite
+            # connection here would both repeat the obsolete live-handoff
+            # source rule and allow SQLite to delete stopped WAL/SHM residue.
+            # Revalidate only raw physical bytes after taking the writer lease,
+            # bind that lease to the exact DB inode, and preserve historical
+            # process/source-tip provenance for the server's basic receipt.
+            current_artifacts = _dev_cow_basic_restart_artifact_snapshot(database)
+            if (
+                current_artifacts != basic_cow_restart.get("artifacts")
+                or str(
+                    dict(current_artifacts.get("database") or {}).get("sha256")
+                    or ""
+                ) != basic_cow_restart.get("database_sha256")
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart artifacts changed under lease"
+                )
+            axis = dict(basic_cow_restart.get("axis") or {})
+            meta = dict(axis.get("meta") or {})
+            try:
+                genesis = json.loads(meta["governance_world_genesis_json"])
+                source_tip_identity = dict(axis["tip"])
+                current_process_identity = dict(axis["process"])
+                source_tip_revision = int(axis["revision"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "AC dev COW completed basic restart projection is incomplete"
+                ) from exc
+            genesis_sha256 = str(meta.get("governance_world_genesis_sha256") or "")
+            source_tip_sha256 = str(
+                meta.get("governance_world_source_tip_sha256") or ""
+            )
+            if (
+                not isinstance(genesis, Mapping)
+                or genesis.get("world_id") != AC_DEV_WORLD_ID
+                or genesis.get("project_id") != AC_PROJECT_ID
+                or genesis_sha256 != _world_genesis_hash(genesis)
+                or source_tip_sha256 != _world_source_tip_hash(source_tip_identity)
+                or source_tip_revision < 2
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart projection changed"
+                )
+            _bind_dev_writer_lease_database_identity(database)
+            metadata = database.stat(follow_symlinks=False)
+            identity = {
+                "schema_version": "ac_governance_database_identity.v2",
+                "world_id": AC_DEV_WORLD_ID,
+                "project_id": AC_PROJECT_ID,
+                "device": int(metadata.st_dev),
+                "inode": int(metadata.st_ino),
+                "relative_path_sha256": "sha256:" + hashlib.sha256(
+                    AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")
+                ).hexdigest(),
+                "genesis_sha256": genesis_sha256,
+            }
+            if expected_database_identity is not None and (
+                dict(expected_database_identity) != identity
+            ):
+                raise ValueError("AC dev source upgrade database identity mismatch")
+            if source != source_tip_identity:
+                if (
+                    expected_source_tip_sha256
+                    and expected_source_tip_sha256 != source_tip_sha256
+                ):
+                    raise ValueError("AC dev source tip CAS mismatch")
+                if expected_previous_process_identity is not None and (
+                    dict(expected_previous_process_identity)
+                    != current_process_identity
+                ):
+                    raise ValueError("AC dev source upgrade process identity mismatch")
+            return {
+                **dict(genesis),
+                "genesis_sha256": genesis_sha256,
+                "database_path": str(database),
+                "database_identity": identity,
+                "created": False,
+                "restart_safe": True,
+                "legacy_rows_imported": False,
+                "current_process_identity": current_process_identity,
+                "source_tip_identity": source_tip_identity,
+                "source_tip_sha256": source_tip_sha256,
+                "source_tip_revision": source_tip_revision,
+                "source_upgraded": False,
+            }
         conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row
         if (cow_successor_receipt is not None
