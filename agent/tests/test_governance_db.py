@@ -2626,6 +2626,7 @@ def test_cow_completed_generation_uses_current_projection_not_issuance_digest(
     completed_source = _advance_cow_to_completed_generation(
         database, root, source,
     )
+    assert completed_source["branch"] == "codex/ac-dev"
     connection = sqlite3.connect(database)
     try:
         assert db._sqlite_logical_projection(connection)["schema_meta"] != (
@@ -2771,6 +2772,38 @@ def test_cow_completed_generation_transitions_to_new_child_custody(
     assert result["database_identity"]["device"] == receipt["successor"]["identity"]["device"]
     assert result["database_identity"]["inode"] == receipt["successor"]["identity"]["inode"]
     db.release_dev_runtime_writer_lease(root)
+
+
+def test_public_linked_v3_prevalidator_admits_real_completed_cow_projection(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+    import agent.cli as cli
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    historical = []
+    monkeypatch.setattr(
+        cli, "_historical_dashboard_bootstrap_adoption",
+        lambda value: historical.append(value),
+    )
+    monkeypatch.setattr(
+        cli, "_validated_historical_admission_source_identity",
+        lambda _value: {"cli_source": completed_source},
+    )
+    digest, linked_receipt = cli._validated_linked_v3_receipt(
+        linked, dev_storage=root, database=database,
+        database_identity=cli._admission_identity(database),
+        source_identity=completed_source,
+        durable_start_phase=cli._DURABLE_START_LEGACY_ADOPTION,
+    )
+    assert digest == "sha256:" + hashlib.sha256(linked.read_bytes()).hexdigest()
+    assert linked_receipt["database_identity"]["inode"] != database.stat().st_ino
+    assert historical == [root]
 
 
 @pytest.mark.parametrize(

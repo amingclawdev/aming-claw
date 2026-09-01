@@ -105,12 +105,17 @@ def test_linked_v3_validator_uses_cow_preimage_for_replaced_inode(tmp_path, monk
         cli, "_require_first_cow_runtime_pristine",
         lambda value: pristine.append(value),
     )
+    monkeypatch.setattr(
+        db, "_select_dev_cow_generation_phase",
+        lambda *_args, **_kwargs: db._DevCowGenerationPhase.FIRST_ISSUANCE,
+    )
     monkeypatch.setattr(db, "validate_dev_cow_successor_preimage",
                         lambda *args, **kwargs: calls.append((args, kwargs)))
     monkeypatch.setattr(db, "verified_stable_database_binding", lambda: {"stable": True})
     digest, returned = cli._validated_linked_v3_receipt(
         linked, dev_storage=root, database=database,
         database_identity=current, source_identity={"commit": "b" * 40},
+        durable_start_phase=cli._DURABLE_START_COMPLETED_BOOTSTRAP,
     )
     assert digest == "sha256:" + "1" * 64
     assert returned is receipt
@@ -139,6 +144,10 @@ def test_linked_v3_completed_generation_uses_source_backed_projection(
                         lambda value: value)
     historical = []
     calls = []
+    monkeypatch.setattr(
+        db, "_select_dev_cow_generation_phase",
+        lambda *_args, **_kwargs: db._DevCowGenerationPhase.COMPLETED_GENERATION,
+    )
     monkeypatch.setattr(cli, "_historical_dashboard_bootstrap_adoption",
                         lambda value: historical.append(value))
     monkeypatch.setattr(db, "validate_dev_cow_completed_generation_projection",
@@ -148,12 +157,74 @@ def test_linked_v3_completed_generation_uses_source_backed_projection(
     digest, returned = cli._validated_linked_v3_receipt(
         linked, dev_storage=root, database=database,
         database_identity=current, source_identity={"commit": "b" * 40},
-        durable_start_phase=cli._DURABLE_START_COMPLETED_BOOTSTRAP,
+        durable_start_phase=cli._DURABLE_START_LEGACY_ADOPTION,
     )
     assert (digest, returned) == ("sha256:" + "1" * 64, receipt)
     assert historical == [root]
     assert len(calls) == 1
     assert "completed_generation_ref" not in calls[0][1]
+
+
+@pytest.mark.parametrize("phase", ("first", "completed", "selector"))
+def test_linked_v3_cow_phase_errors_are_bounded_without_fallback(
+    tmp_path, monkeypatch, phase,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"; database = root / "governance.db"
+    database.parent.mkdir(); database.write_bytes(b"generation")
+    linked = root / "linked.json"; linked.write_bytes(b"linked")
+    current = cli._admission_identity(database)
+    receipt = {
+        "database_identity": {**current, "inode": current["inode"] + 1},
+        "source_identity": {"cli_source": {"commit": "a" * 40}},
+    }
+    monkeypatch.setattr(
+        cli, "_read_admission_receipt",
+        lambda *_args, **_kwargs: (receipt, "sha256:" + "1" * 64),
+    )
+    monkeypatch.setattr(
+        cli, "_validated_historical_admission_source_identity", lambda value: value,
+    )
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: {"stable": True})
+    calls = []
+    if phase == "selector":
+        monkeypatch.setattr(
+            db, "_select_dev_cow_generation_phase",
+            lambda *_a, **_k: (_ for _ in ()).throw(ValueError("selector marker")),
+        )
+    else:
+        selected = (
+            db._DevCowGenerationPhase.FIRST_ISSUANCE
+            if phase == "first"
+            else db._DevCowGenerationPhase.COMPLETED_GENERATION
+        )
+        monkeypatch.setattr(
+            db, "_select_dev_cow_generation_phase", lambda *_a, **_k: selected,
+        )
+    monkeypatch.setattr(cli, "_require_first_cow_runtime_pristine", lambda _root: None)
+    monkeypatch.setattr(cli, "_historical_dashboard_bootstrap_adoption", lambda _root: None)
+
+    def reject(name):
+        calls.append(name)
+        raise ValueError(name + " validator marker")
+
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_preimage",
+        lambda *_a, **_k: reject("first"),
+    )
+    monkeypatch.setattr(
+        db, "validate_dev_cow_completed_generation_projection",
+        lambda *_a, **_k: reject("completed"),
+    )
+    marker = "selector" if phase == "selector" else phase + " validator"
+    with pytest.raises(cli.click.ClickException, match=marker):
+        cli._validated_linked_v3_receipt(
+            linked, dev_storage=root, database=database,
+            database_identity=current, source_identity={"commit": "b" * 40},
+        )
+    assert calls == ([] if phase == "selector" else [phase])
 
 
 @pytest.mark.parametrize("artifact", ("file", "symlink", "directory"))

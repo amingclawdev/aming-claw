@@ -3388,20 +3388,30 @@ def _validated_linked_v3_receipt(
     linked_database_identity = dict(receipt.get("database_identity") or {})
     if (linked_database_identity.get("device"), linked_database_identity.get("inode")) != (
             canonical_database_identity.get("device"), canonical_database_identity.get("inode")):
-        if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
-            _historical_dashboard_bootstrap_adoption(dev_storage)
-            _db.validate_dev_cow_completed_generation_projection(
+        try:
+            stable_binding = _db.verified_stable_database_binding()
+            cow_phase = _db._select_dev_cow_generation_phase(
                 dev_storage, linked_v3_receipt=receipt_path,
-                source_identity=source_identity,
-                stable_binding=_db.verified_stable_database_binding(),
+                source_identity=source_identity, stable_binding=stable_binding,
             )
-        else:
-            _require_first_cow_runtime_pristine(dev_storage)
-            _db.validate_dev_cow_successor_preimage(
-                dev_storage, linked_v3_receipt=receipt_path,
-                source_identity=source_identity,
-                stable_binding=_db.verified_stable_database_binding(),
-            )
+            if cow_phase is _db._DevCowGenerationPhase.FIRST_ISSUANCE:
+                _require_first_cow_runtime_pristine(dev_storage)
+                _db.validate_dev_cow_successor_preimage(
+                    dev_storage, linked_v3_receipt=receipt_path,
+                    source_identity=source_identity,
+                    stable_binding=stable_binding,
+                )
+            elif cow_phase is _db._DevCowGenerationPhase.COMPLETED_GENERATION:
+                _historical_dashboard_bootstrap_adoption(dev_storage)
+                _db.validate_dev_cow_completed_generation_projection(
+                    dev_storage, linked_v3_receipt=receipt_path,
+                    source_identity=source_identity,
+                    stable_binding=stable_binding,
+                )
+            else:
+                raise ValueError("AC dev COW generation phase is invalid")
+        except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
+            raise click.ClickException(str(exc)) from exc
         return digest, receipt
     if durable_start_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
         # Bootstrap owns the current postimage; this re-authenticates only the
