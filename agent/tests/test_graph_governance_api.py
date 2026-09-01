@@ -99070,6 +99070,10 @@ def _record_close_timeline(
 
 
 def _insert_simple_mf_close_backlog(conn, backlog_id: str) -> None:
+    # Direct Onboard now distinguishes a successful empty authority query from
+    # a missing ContractRuntime schema.  Ordinary fixtures model a healthy,
+    # empty authority table explicitly; fault tests insert their row directly.
+    SQLiteContractExecutionStore(conn)
     conn.execute(
         """INSERT INTO backlog_bugs
            (bug_id, title, status, mf_type, bypass_policy_json, created_at, updated_at)
@@ -200034,6 +200038,8 @@ def test_fresh_unbound_direct_world_rejects_exact_dev_selector_zero_write(
     assert ownership["world"] == "unbound"
     assert ownership["contract_execution_state"] == "fresh_unbound"
     assert ownership["contract_execution_count"] == 0
+    assert ownership["contract_execution_query_succeeded"] is True
+    assert ownership["contract_execution_query_status"] == "succeeded"
     assert ownership["complete"] is False
     assert ownership["fresh_start_allowed"] is True
     assert ownership["violations"] == []
@@ -200056,6 +200062,182 @@ def test_fresh_unbound_direct_world_rejects_exact_dev_selector_zero_write(
         "http://127.0.0.1:40008"
     )
     assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+def test_direct_world_missing_execution_authority_table_fails_closed_zero_write(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "DP-V2-DIRECT-MISSING-EXECUTION-AUTHORITY-TABLE"
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, mf_type, bypass_policy_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            backlog_id,
+            "Missing execution authority table",
+            "MF_IN_PROGRESS",
+            "chain_rescue",
+            '{"mf_type":"chain_rescue"}',
+            "2026-09-01T00:00:00Z",
+            "2026-09-01T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type='table' AND name='contract_runtime_executions'"
+    ).fetchone()[0] == 0
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: {
+            "schema_version": (
+                "operator_supervised_direct_main.dev_selector_authority.v1"
+            ),
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "authority_hash": "sha256:" + "a" * 64,
+        },
+    )
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+    before_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id=?",
+        (backlog_id,),
+    ).fetchone()[0]
+
+    ownership = (
+        server._operator_supervised_direct_main_persisted_world_ownership(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+        )
+    )
+    assert ownership["world"] == ""
+    assert ownership["contract_execution_state"] == "invalid"
+    assert ownership["contract_execution_count"] == 0
+    assert ownership["contract_execution_query_succeeded"] is False
+    assert ownership["contract_execution_query_status"] == "failed"
+    assert ownership["complete"] is False
+    assert ownership["fresh_start_allowed"] is False
+    assert ownership["violations"] == [
+        "contract_execution_authority_query_failed"
+    ]
+    with pytest.raises(GovernanceError) as rejected:
+        server._require_onboard_dev_selector_endpoint(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            request_body={},
+            role="observer",
+            work_type="operator_supervised_direct_main",
+        )
+    assert rejected.value.code == (
+        "ac_onboard_runtime_world_ownership_unresolved"
+    )
+    assert rejected.value.details["violations"] == [
+        "contract_execution_authority_query_failed"
+    ]
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type='table' AND name='contract_runtime_executions'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id=?",
+        (backlog_id,),
+    ).fetchone()[0] == before_timeline_count
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+def test_direct_world_forced_execution_authority_read_error_fails_closed_zero_write(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "DP-V2-DIRECT-FORCED-EXECUTION-AUTHORITY-READ-ERROR"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: {
+            "schema_version": (
+                "operator_supervised_direct_main.dev_selector_authority.v1"
+            ),
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "authority_hash": "sha256:" + "b" * 64,
+        },
+    )
+
+    class ForcedExecutionAuthorityReadError(_NoCloseConn):
+        def execute(self, sql, parameters=()):
+            if "FROM contract_runtime_executions" in str(sql):
+                raise sqlite3.OperationalError(
+                    "forced Direct execution authority read error"
+                )
+            return self._conn.execute(sql, parameters)
+
+    failing_conn = ForcedExecutionAuthorityReadError(conn)
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+    before_execution_count = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE project_id=? AND backlog_id=?",
+        (PID, backlog_id),
+    ).fetchone()[0]
+    before_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id=?",
+        (backlog_id,),
+    ).fetchone()[0]
+
+    ownership = (
+        server._operator_supervised_direct_main_persisted_world_ownership(
+            failing_conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+        )
+    )
+    assert ownership["world"] == ""
+    assert ownership["contract_execution_state"] == "invalid"
+    assert ownership["contract_execution_count"] == 0
+    assert ownership["contract_execution_query_succeeded"] is False
+    assert ownership["contract_execution_query_status"] == "failed"
+    assert ownership["complete"] is False
+    assert ownership["fresh_start_allowed"] is False
+    assert ownership["violations"] == [
+        "contract_execution_authority_query_failed"
+    ]
+    with pytest.raises(GovernanceError) as rejected:
+        server._require_onboard_dev_selector_endpoint(
+            failing_conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            request_body={},
+            role="observer",
+            work_type="operator_supervised_direct_main",
+        )
+    assert rejected.value.code == (
+        "ac_onboard_runtime_world_ownership_unresolved"
+    )
+    assert rejected.value.details["violations"] == [
+        "contract_execution_authority_query_failed"
+    ]
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE project_id=? AND backlog_id=?",
+        (PID, backlog_id),
+    ).fetchone()[0] == before_execution_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id=?",
+        (backlog_id,),
+    ).fetchone()[0] == before_timeline_count
     assert conn.total_changes == before
     assert tuple(conn.iterdump()) == before_rows
 

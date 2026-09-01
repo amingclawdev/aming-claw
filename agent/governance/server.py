@@ -146573,6 +146573,7 @@ def _operator_supervised_direct_main_persisted_world_ownership(
         "SELECT bug_id FROM backlog_bugs WHERE bug_id = ?",
         (backlog_id,),
     ).fetchall()
+    execution_query_succeeded = False
     try:
         execution_rows = conn.execute(
             """SELECT project_id, backlog_id, contract_id,
@@ -146582,6 +146583,7 @@ def _operator_supervised_direct_main_persisted_world_ownership(
                  AND contract_id = ?""",
             (project_id, backlog_id, "operator_supervised_direct_main"),
         ).fetchall()
+        execution_query_succeeded = True
     except sqlite3.Error:
         execution_rows = []
 
@@ -146617,6 +146619,8 @@ def _operator_supervised_direct_main_persisted_world_ownership(
     violations: list[str] = []
     if not backlog_id or len(backlog_rows) != 1:
         violations.append("backlog_identity_not_unique")
+    if not execution_query_succeeded:
+        violations.append("contract_execution_authority_query_failed")
     if len(execution_rows) > 1:
         violations.append("contract_execution_identity_not_unique")
     if execution_rows and len(valid_records) != 1:
@@ -146624,7 +146628,7 @@ def _operator_supervised_direct_main_persisted_world_ownership(
 
     world = ""
     execution_id = ""
-    if not violations and not execution_rows:
+    if execution_query_succeeded and not violations and not execution_rows:
         # A unique backlog with no Direct ContractExecution is the normal
         # pre-route state for a fresh generation.  There is no persisted
         # runtime world to recover yet; Onboard may mint the deterministic
@@ -146692,6 +146696,10 @@ def _operator_supervised_direct_main_persisted_world_ownership(
             else "invalid"
         ),
         "contract_execution_count": len(execution_rows),
+        "contract_execution_query_succeeded": execution_query_succeeded,
+        "contract_execution_query_status": (
+            "succeeded" if execution_query_succeeded else "failed"
+        ),
         "contract_execution_id": execution_id,
         "complete": world in {"stable", "dev"} and not violations,
         "fresh_start_allowed": world == "unbound" and not violations,
@@ -147352,11 +147360,6 @@ def _require_onboard_dev_selector_endpoint(
         project_id=project_id,
         backlog_id=backlog_id,
     )
-    ownership = _operator_supervised_direct_main_persisted_world_ownership(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-    )
     has_explicit_selector = any(
         str(value or "").strip()
         for field in _onboard_runtime_selector_keys()
@@ -147364,6 +147367,24 @@ def _require_onboard_dev_selector_endpoint(
             request_body,
             field,
         )
+    )
+    uses_dev_selector = (
+        _operator_supervised_direct_main_request_uses_dev_selector(
+            request_body,
+            selector_authority=authority,
+        )
+    )
+    direct_route_requested = bool(
+        str(role or "").strip() == "observer"
+        and str(work_type or "").strip()
+        in {"direct_main", "operator_supervised_direct_main"}
+    )
+    if not direct_route_requested and not has_explicit_selector:
+        return authority
+    ownership = _operator_supervised_direct_main_persisted_world_ownership(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
     )
     if ownership["world"] == "stable":
         if _runtime_plane() == "stable" or not has_explicit_selector:
@@ -147430,17 +147451,20 @@ def _require_onboard_dev_selector_endpoint(
             )
         return authority
     if ownership["world"] == "unbound":
-        if _runtime_plane() == "dev" or not (
-            _operator_supervised_direct_main_request_uses_dev_selector(
-                request_body,
-                selector_authority=authority,
-            )
-        ):
+        if _runtime_plane() == "dev" or not uses_dev_selector:
             return authority
         # A fresh stable generation has no CEX world to inherit.  Exact dev
         # selectors still belong on 40008, while ordinary external-project
         # roots/heads/refs remain valid target selectors on stable.
-    if not ownership.get("complete") and not has_explicit_selector:
+    authority_query_failed = (
+        "contract_execution_authority_query_failed"
+        in set(ownership.get("violations") or ())
+    )
+    if (
+        not ownership.get("complete")
+        and not has_explicit_selector
+        and not authority_query_failed
+    ):
         # Selector-free reads retain the existing ContractRuntime/path-specific
         # validation behavior.  As soon as a caller supplies world-like claims,
         # only a fresh-unbound row or complete persisted ownership may proceed.
