@@ -4190,6 +4190,93 @@ def test_cow_generation_phase_selector_is_closed_for_first_and_completed(
     ) is db._DevCowGenerationPhase.COMPLETED_GENERATION
 
 
+def test_cow_completed_generation_accepts_exact_graph_overlay_read_only(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    connection = sqlite3.connect(database)
+    _install_all_graph_owners_for_inventory_test(db, connection)
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    changes_before = connection.total_changes
+    authority, protected = db._completed_generation_schema_projections(connection)
+    assert connection.total_changes == changes_before
+    assert authority == db.authority_projection_schema_inventory()
+    assert len(authority["inventory"]) == db.AC_AUTHORITY_SCHEMA_INVENTORY_COUNT
+    assert protected == receipt["successor"]["protected_inventory"]
+    canonical_graph_rows = {
+        (kind, name, table, db._backlog_read_normalized_sql(sql))
+        for _owner, _ensure_schema, inventory in db._graph_schema_owner_registry()
+        for kind, name, table, sql in inventory
+    }
+    canonical_authority_rows = {
+        tuple(row) for row in db.authority_projection_schema_inventory()["inventory"]
+    }
+    assert len(canonical_graph_rows) == 104
+    assert len(canonical_graph_rows & canonical_authority_rows) == 86
+    assert len(canonical_graph_rows - canonical_authority_rows) == 18
+    logical_before = db._sqlite_logical_projection(connection)
+    connection.close()
+    bytes_before = database.read_bytes()
+    stable = db.verified_stable_database_binding()
+
+    assert db.validate_dev_cow_completed_generation_projection(
+        root, linked_v3_receipt=linked, source_identity=completed_source,
+        stable_binding=stable,
+    ) == receipt
+    assert db._select_dev_cow_generation_phase(
+        root, linked_v3_receipt=linked, source_identity=completed_source,
+        stable_binding=stable,
+    ) is db._DevCowGenerationPhase.COMPLETED_GENERATION
+
+    assert database.read_bytes() == bytes_before
+    connection = sqlite3.connect(database)
+    try:
+        assert db._sqlite_logical_projection(connection) == logical_before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("drift", ["partial", "altered", "unknown"])
+def test_completed_generation_graph_overlay_rejects_drift_zero_write(drift):
+    from agent.governance import db
+
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    db._ensure_schema(connection)
+    db.admit_missing_backlog_read_schema(connection)
+    _install_all_graph_owners_for_inventory_test(db, connection)
+    if drift == "partial":
+        connection.execute("DROP INDEX idx_graph_asset_projection_path")
+    elif drift == "altered":
+        connection.execute("DROP INDEX idx_graph_asset_projection_path")
+        connection.execute(
+            "CREATE INDEX idx_graph_asset_projection_path "
+            "ON graph_asset_projection(project_id, snapshot_id)"
+        )
+    else:
+        connection.execute(
+            "CREATE TABLE graph_unknown_completed_generation(value TEXT)"
+        )
+    connection.commit()
+    inventory_before = db._graph_materialization_inventory(connection)
+    changes_before = connection.total_changes
+
+    with pytest.raises(ValueError, match="graph"):
+        db._completed_generation_schema_projections(connection)
+
+    assert connection.total_changes == changes_before
+    assert db._graph_materialization_inventory(connection) == inventory_before
+    connection.close()
+
+
 def test_cow_completed_phase_selector_builds_source_reference_outside_dev_plane(
     tmp_path, monkeypatch,
 ):

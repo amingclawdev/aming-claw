@@ -3743,6 +3743,73 @@ def backlog_read_schema_protected_inventory(conn: sqlite3.Connection) -> dict[st
     )
 
 
+def _completed_generation_schema_projections(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Project an exact graph overlay out of completed-generation bindings."""
+
+    authority = _authority_projection_inventory_in_managed_world(conn)
+    protected = backlog_read_schema_protected_inventory(conn)
+    classification = classify_graph_materialization_preimage(conn)
+    registry = _graph_schema_owner_registry()
+    required_owners = frozenset({
+        "graph_snapshot_store",
+        "graph_events",
+        "graph_correction_patches",
+        "asset_projection",
+        "asset_impact",
+    })
+    owner_states = dict(classification.get("owner_states") or {})
+    if (
+        {owner for owner, _ensure_schema, _inventory in registry} != required_owners
+        or set(owner_states) != required_owners
+    ):
+        raise ValueError("AC dev graph materialization owner registry mismatch")
+    if any(owner_states[owner] != "exact" for owner in required_owners):
+        return authority, protected
+
+    canonical_graph_rows = {
+        (kind, name, table, _backlog_read_normalized_sql(sql))
+        for _owner, _ensure_schema, inventory in registry
+        for kind, name, table, sql in inventory
+    }
+    canonical_authority_rows = {
+        tuple(str(value) for value in row)
+        for row in authority_projection_schema_inventory()["inventory"]
+    }
+    additive_rows = canonical_graph_rows - canonical_authority_rows
+    authority_rows = tuple(
+        tuple(str(value) for value in row) for row in authority["inventory"]
+    )
+    protected_rows = tuple(
+        tuple(str(value) for value in row) for row in protected["inventory"]
+    )
+    protected_additive_rows = {
+        (
+            kind,
+            name,
+            table,
+            "sha256:" + hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        )
+        for kind, name, table, sql in additive_rows
+    }
+    if (
+        not additive_rows.issubset(set(authority_rows))
+        or not protected_additive_rows.issubset(set(protected_rows))
+    ):
+        raise ValueError("AC dev completed generation graph overlay mismatch")
+    return (
+        _schema_inventory_binding(
+            tuple(row for row in authority_rows if row not in additive_rows),
+            hash_sql=False,
+        ),
+        _schema_inventory_binding(
+            tuple(row for row in protected_rows if row not in protected_additive_rows),
+            hash_sql=False,
+        ),
+    )
+
+
 def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
     """Classify the bounded backlog-read plan without writing.
 
@@ -5192,7 +5259,7 @@ def _validated_dev_cow_completed_generation_axis(
     _validate_dev_cow_stopped_sidecar_residue(database)
     if not _quick_check_returns_literal_ok(conn):
         raise ValueError("AC dev COW completed generation quick-check failed")
-    inventory = _authority_projection_inventory_in_managed_world(conn)
+    inventory, protected_inventory = _completed_generation_schema_projections(conn)
     issuance_schema_meta = str(
         dict(successor.get("protected_projection") or {}).get("schema_meta") or ""
     )
@@ -5215,12 +5282,11 @@ def _validated_dev_cow_completed_generation_axis(
         or meta.get("governance_world_id") != AC_DEV_WORLD_ID
         or revision < 2 or not isinstance(tip, Mapping)
         or not isinstance(process, Mapping)
-        or len(inventory["inventory"]) != 308
+        or len(inventory["inventory"]) != AC_AUTHORITY_SCHEMA_INVENTORY_COUNT
         or inventory != authority_projection_schema_inventory()
         or backlog_read_schema_managed_inventory(conn)
         != canonical_backlog_read_schema_managed_inventory()
-        or backlog_read_schema_protected_inventory(conn)
-        != dict(successor.get("protected_inventory") or {})
+        or protected_inventory != dict(successor.get("protected_inventory") or {})
     ):
         raise ValueError("AC dev COW completed generation projection mismatch")
     _validate_dev_cow_historical_source_provenance(
