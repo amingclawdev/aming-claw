@@ -1987,19 +1987,19 @@ def test_ac_dev_cow_successor_validator_rejects_missing(tmp_path):
         db.validate_dev_cow_successor_receipt(root)
 
 
-def test_graph_admission_recovery_adoption_is_unique_content_addressed_and_closed(
+def test_graph_admission_recovery_adoption_public_create_restart_restart_is_closed(
     tmp_path, monkeypatch,
 ):
     from agent.governance import db
     root = tmp_path / "dev"; root.mkdir()
-    identifiers = {"backlog_id": "R10", "request_id": "req-1",
+    identifiers = {"backlog_id": "R10", "contract_execution_id": "cex-1",
                    "route_token_ref": "route-1", "observer_session_id": "session-1"}
     observation = {
         "cow_v2": {}, "protected_preimage": {"inventory": [], "sha256": "p"},
         "protected_preimage_count": 308, "admitted_delta": {"added": [], "removed": [], "sha256": "d"},
         "protected_postimage": {"inventory": [], "sha256": "q"}, "protected_postimage_count": 326,
         "database": {"pre_create_raw_sha256": "sha256:" + "a" * 64},
-        "r10_evidence": {"identifiers": identifiers}, "source": {},
+        "typed_lineage": {"identifiers": identifiers}, "source": {},
         "registry": {}, "graph_zero_state": {}, "stable": {},
     }
     monkeypatch.setattr(db, "_default_cutover_listener_probe",
@@ -2007,7 +2007,11 @@ def test_graph_admission_recovery_adoption_is_unique_content_addressed_and_close
     monkeypatch.setattr(db, "_graph_adoption_observation", lambda _root, supplied: (
         observation if dict(supplied) == identifiers else (_ for _ in ()).throw(ValueError("ids"))
     ))
-    created = db.create_dev_graph_admission_recovery_adoption_receipt(root, **identifiers)
+    created = db.create_dev_graph_admission_recovery_adoption_receipt(
+        root, **identifiers,
+        recovery_adoption_acknowledgment=db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
+        unverified_incident_reference="req-incident-only",
+    )
     receipt = Path(created["receipt"]); raw = receipt.read_bytes()
     assert receipt.name == f"{db.AC_DEV_GRAPH_ADOPTION_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json"
     payload = json.loads(raw)
@@ -2015,8 +2019,15 @@ def test_graph_admission_recovery_adoption_is_unique_content_addressed_and_close
     assert payload["qa_pass"] is payload["pass_claim"] is False
     assert payload["non_retroactive"] is True
     assert payload["claims_r10_reconcile_success"] is payload["claims_r10_zero_write"] is False
+    assert payload["authority"]["kind"] == "current_operator_supervised_recovery_adoption"
+    assert payload["unverified_incident_reference"] == "req-incident-only"
     assert db.validate_dev_graph_admission_recovery_adoption_receipt(root) == payload
-    assert db.create_dev_graph_admission_recovery_adoption_receipt(root, **identifiers)["status"] == "already_created"
+    assert db.validate_dev_graph_admission_recovery_adoption_receipt(root) == payload
+    assert db.create_dev_graph_admission_recovery_adoption_receipt(
+        root, **identifiers,
+        recovery_adoption_acknowledgment=db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
+        unverified_incident_reference="req-incident-only",
+    )["status"] == "already_created"
     duplicate = receipt.with_name(db.AC_DEV_GRAPH_ADOPTION_PREFIX + "." + "f" * 64 + ".json")
     duplicate.write_bytes(raw)
     with pytest.raises(ValueError, match="missing or ambiguous"):
@@ -2031,6 +2042,21 @@ def test_graph_admission_recovery_adoption_is_unique_content_addressed_and_close
         db.validate_dev_graph_admission_recovery_adoption_receipt(root)
 
 
+def test_graph_admission_recovery_adoption_requires_exact_operator_acknowledgment(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+    root = tmp_path / "dev"; root.mkdir()
+    monkeypatch.setattr(db, "_default_cutover_listener_probe",
+                        lambda _port: {"listening": False, "pid": 0})
+    with pytest.raises(ValueError, match="exact operator acknowledgment"):
+        db.create_dev_graph_admission_recovery_adoption_receipt(
+            root, backlog_id="R10", contract_execution_id="cex-1",
+            route_token_ref="route-1", observer_session_id="session-1",
+            recovery_adoption_acknowledgment="yes",
+        )
+
+
 def test_graph_admission_recovery_adoption_create_failure_leaves_no_residue(tmp_path, monkeypatch):
     from agent.governance import db
     root = tmp_path / "dev"; root.mkdir()
@@ -2040,10 +2066,83 @@ def test_graph_admission_recovery_adoption_create_failure_leaves_no_residue(tmp_
                         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("delta mismatch")))
     with pytest.raises(ValueError, match="delta mismatch"):
         db.create_dev_graph_admission_recovery_adoption_receipt(
-            root, backlog_id="R10", request_id="req", route_token_ref="route",
-            observer_session_id="session")
+            root, backlog_id="R10", contract_execution_id="cex", route_token_ref="route",
+            observer_session_id="session",
+            recovery_adoption_acknowledgment=db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT)
     archive = root / db.AC_DEV_GRAPH_ADOPTION_ARCHIVE
     assert not archive.exists() or not list(archive.iterdir())
+
+
+def _graph_adoption_lineage_connection():
+    connection = sqlite3.connect(":memory:")
+    connection.executescript("""
+        CREATE TABLE backlog_bugs (
+            bug_id TEXT PRIMARY KEY, chain_task_id TEXT, current_task_id TEXT, root_task_id TEXT
+        );
+        CREATE TABLE contract_runtime_executions (
+            contract_execution_id TEXT PRIMARY KEY, project_id TEXT, backlog_id TEXT,
+            contract_id TEXT, root_contract_execution_id TEXT, contract_chain_id TEXT,
+            execution_state_revision INTEGER
+        );
+        CREATE TABLE backlog_contract_chain_bindings (
+            project_id TEXT, backlog_id TEXT, contract_chain_id TEXT,
+            root_contract_execution_id TEXT, contract_execution_id TEXT, contract_id TEXT,
+            binding_kind TEXT, generation INTEGER, execution_state_revision INTEGER
+        );
+        CREATE TABLE observer_route_token_refs (
+            project_id TEXT, route_token_ref TEXT, route_id TEXT, backlog_id TEXT,
+            task_id TEXT, caller_role TEXT, status TEXT, issued_at TEXT
+        );
+        CREATE TABLE observer_sessions (
+            session_id TEXT, project_id TEXT, observer_kind TEXT, status TEXT,
+            registered_at TEXT, last_seen_at TEXT
+        );
+        INSERT INTO backlog_bugs VALUES ('R10','','cex-1','cex-1');
+        INSERT INTO contract_runtime_executions VALUES
+            ('cex-1','aming-claw','R10','contract-1','cex-1','chain-1',7);
+        INSERT INTO backlog_contract_chain_bindings VALUES
+            ('aming-claw','R10','chain-1','cex-1','cex-1','contract-1','root',1,7);
+        INSERT INTO observer_route_token_refs VALUES
+            ('aming-claw','route-1','route-id-1','R10','cex-1','observer','active','2026-01-01T00:00:00Z');
+        INSERT INTO observer_sessions VALUES
+            ('session-1','aming-claw','codex','active','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z');
+    """)
+    return connection
+
+
+def test_graph_adoption_typed_lineage_uses_canonical_relational_rows():
+    from agent.governance import db
+    connection = _graph_adoption_lineage_connection()
+    ids = {"backlog_id": "R10", "contract_execution_id": "cex-1",
+           "route_token_ref": "route-1", "observer_session_id": "session-1"}
+    lineage = db._graph_adoption_typed_lineage(connection, ids)
+    assert lineage["schema_version"] == "ac_dev_graph_adoption_typed_lineage.v1"
+    assert set(lineage["row_sha256"]) == {
+        "backlog_bugs", "contract_runtime_executions", "backlog_contract_chain_bindings",
+        "observer_route_token_refs", "observer_sessions",
+    }
+
+
+@pytest.mark.parametrize("forgery", ["alias", "cross_backlog", "cross_execution", "substring", "text_shadow"])
+def test_graph_adoption_typed_lineage_rejects_forged_or_cross_bound_rows(forgery):
+    from agent.governance import db
+    connection = _graph_adoption_lineage_connection()
+    ids = {"backlog_id": "R10", "contract_execution_id": "cex-1",
+           "route_token_ref": "route-1", "observer_session_id": "session-1"}
+    if forgery == "alias":
+        ids = {key: "R10" for key in ids}
+    elif forgery == "cross_backlog":
+        connection.execute("UPDATE observer_route_token_refs SET backlog_id='OTHER'")
+    elif forgery == "cross_execution":
+        connection.execute("UPDATE observer_route_token_refs SET task_id='cex-other'")
+    elif forgery == "substring":
+        ids["route_token_ref"] = "route"
+    else:
+        connection.execute("CREATE TABLE unrelated_text (value TEXT)")
+        connection.execute("INSERT INTO unrelated_text VALUES ('route-shadow')")
+        ids["route_token_ref"] = "route-shadow"
+    with pytest.raises(ValueError, match="distinct|missing or ambiguous"):
+        db._graph_adoption_typed_lineage(connection, ids)
 
 
 def test_cow_receipt_reconstruction_keeps_issuance_schema_after_source_expands(

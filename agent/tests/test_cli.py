@@ -68,13 +68,18 @@ def test_dev_create_graph_admission_recovery_adoption_receipt_delegates(tmp_path
     result = CliRunner().invoke(main, [
         "dev-create-graph-admission-recovery-adoption-receipt",
         "--dev-storage-root", str(root), "--backlog-id", "R10",
-        "--request-id", "req-1", "--route-token-ref", "route-1",
+        "--contract-execution-id", "cex-1", "--route-token-ref", "route-1",
         "--observer-session-id", "session-1",
+        "--recovery-adoption-acknowledgment", db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
+        "--unverified-incident-reference", "req-incident-only",
     ])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["status"] == "created"
-    assert observed == {"storage_root": root, "backlog_id": "R10", "request_id": "req-1",
-                        "route_token_ref": "route-1", "observer_session_id": "session-1"}
+    assert observed == {"storage_root": root, "backlog_id": "R10",
+                        "contract_execution_id": "cex-1", "route_token_ref": "route-1",
+                        "observer_session_id": "session-1",
+                        "recovery_adoption_acknowledgment": db.AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT,
+                        "unverified_incident_reference": "req-incident-only"}
 
 
 class _GovernanceProbeResponse:

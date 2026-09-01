@@ -60,6 +60,7 @@ AC_DEV_COW_SUCCESSOR_PREFIX = "successor-v2"
 AC_DEV_GRAPH_ADOPTION_SCHEMA = "ac_dev_graph_admission_recovery_adoption.v1"
 AC_DEV_GRAPH_ADOPTION_ARCHIVE = "archive/graph-admission-recovery-adoption"
 AC_DEV_GRAPH_ADOPTION_PREFIX = "recovery-adoption"
+AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT = "I AUTHORIZE CURRENT GRAPH POSTIMAGE RECOVERY ADOPTION"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
@@ -4012,32 +4013,78 @@ def _graph_adoption_source_binding() -> dict[str, object]:
             "tree": git("rev-parse", "HEAD^{tree}")}
 
 
-def _graph_adoption_r10_evidence(
+def _graph_adoption_typed_lineage(
     conn: sqlite3.Connection, identifiers: Mapping[str, str],
 ) -> dict[str, object]:
-    """Bind persisted rows containing each exact R10 identifier, without trusting a caller row."""
-    hits: dict[str, list[dict[str, object]]] = {key: [] for key in identifiers}
-    for table_row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-    ):
-        table = str(table_row[0])
-        columns = [str(row[1]) for row in conn.execute(
-            f"PRAGMA table_info({_sqlite_quote_identifier(table)})"
-        )]
-        if not columns:
-            continue
-        quoted = ",".join(_sqlite_quote_identifier(column) for column in columns)
-        for row in conn.execute(f"SELECT {quoted} FROM {_sqlite_quote_identifier(table)}"):
-            encoded = [_sqlite_projection_value(value) for value in row]
-            text_values = {str(value) for value in row if isinstance(value, str)}
-            for key, value in identifiers.items():
-                if value in text_values:
-                    hits[key].append({"table": table, "columns": columns,
-                                      "row_sha256": _canonical_json_hash(encoded)})
-    if any(not value for value in hits.values()):
-        raise ValueError("AC dev graph recovery adoption R10 persisted evidence is incomplete")
-    return {"identifiers": dict(identifiers), "hits": hits,
-            "sha256": _canonical_json_hash({"identifiers": dict(identifiers), "hits": hits})}
+    """Prove distinct, typed canonical rows; arbitrary text is never lineage."""
+    backlog_id = identifiers["backlog_id"]
+    execution_id = identifiers["contract_execution_id"]
+    route_ref = identifiers["route_token_ref"]
+    session_id = identifiers["observer_session_id"]
+    if len({backlog_id, execution_id, route_ref, session_id}) != 4:
+        raise ValueError("AC dev graph recovery adoption identifiers must be mutually distinct")
+
+    def one(sql: str, params: tuple[str, ...], label: str) -> list[object]:
+        rows = conn.execute(sql, params).fetchall()
+        if len(rows) != 1:
+            raise ValueError(f"AC dev graph recovery adoption {label} lineage is missing or ambiguous")
+        return list(rows[0])
+
+    backlog = one(
+        "SELECT bug_id, chain_task_id, current_task_id, root_task_id FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,), "backlog",
+    )
+    execution = one(
+        "SELECT contract_execution_id, project_id, backlog_id, contract_id, "
+        "root_contract_execution_id, contract_chain_id, execution_state_revision "
+        "FROM contract_runtime_executions WHERE contract_execution_id = ? AND project_id = ? AND backlog_id = ?",
+        (execution_id, AC_PROJECT_ID, backlog_id), "ContractRuntime",
+    )
+    binding = one(
+        "SELECT project_id, backlog_id, contract_chain_id, root_contract_execution_id, "
+        "contract_execution_id, contract_id, binding_kind, generation, execution_state_revision "
+        "FROM backlog_contract_chain_bindings WHERE project_id = ? AND backlog_id = ? "
+        "AND contract_execution_id = ? AND contract_chain_id = ? AND contract_id = ? "
+        "AND root_contract_execution_id = ?",
+        (AC_PROJECT_ID, backlog_id, execution_id, str(execution[5]), str(execution[3]),
+         str(execution[4])), "contract-chain binding",
+    )
+    route = one(
+        "SELECT project_id, route_token_ref, route_id, backlog_id, task_id, caller_role, status, issued_at "
+        "FROM observer_route_token_refs WHERE project_id = ? AND route_token_ref = ? "
+        "AND backlog_id = ? AND task_id = ?",
+        (AC_PROJECT_ID, route_ref, backlog_id, execution_id), "route",
+    )
+    session = one(
+        "SELECT session_id, project_id, observer_kind, status, registered_at, last_seen_at "
+        "FROM observer_sessions WHERE session_id = ? AND project_id = ?",
+        (session_id, AC_PROJECT_ID), "observer-session",
+    )
+    rows = {
+        "backlog_bugs": backlog,
+        "contract_runtime_executions": execution,
+        "backlog_contract_chain_bindings": binding,
+        "observer_route_token_refs": route,
+        "observer_sessions": session,
+    }
+    return {
+        "schema_version": "ac_dev_graph_adoption_typed_lineage.v1",
+        "identifiers": dict(identifiers),
+        "canonical_columns": {
+            "backlog_bugs": ["bug_id", "chain_task_id", "current_task_id", "root_task_id"],
+            "contract_runtime_executions": ["contract_execution_id", "project_id", "backlog_id", "contract_id", "root_contract_execution_id", "contract_chain_id", "execution_state_revision"],
+            "backlog_contract_chain_bindings": ["project_id", "backlog_id", "contract_chain_id", "root_contract_execution_id", "contract_execution_id", "contract_id", "binding_kind", "generation", "execution_state_revision"],
+            "observer_route_token_refs": ["project_id", "route_token_ref", "route_id", "backlog_id", "task_id", "caller_role", "status", "issued_at"],
+            "observer_sessions": ["session_id", "project_id", "observer_kind", "status", "registered_at", "last_seen_at"],
+        },
+        "row_sha256": {table: _canonical_json_hash(
+            [_sqlite_projection_value(value) for value in row]
+        ) for table, row in rows.items()},
+        "sha256": _canonical_json_hash({
+            table: [_sqlite_projection_value(value) for value in row]
+            for table, row in rows.items()
+        }),
+    }
 
 
 def _graph_adoption_observation(root: Path, identifiers: Mapping[str, str]) -> dict[str, object]:
@@ -4065,7 +4112,7 @@ def _graph_adoption_observation(root: Path, identifiers: Mapping[str, str]) -> d
         if removed or len(pre_rows) != 308 or len(post_rows) != 326 or len(added) != 18 \
                 or set(added) != expected_added:
             raise ValueError("AC dev graph recovery adoption protected inventory delta mismatch")
-        evidence = _graph_adoption_r10_evidence(conn, identifiers)
+        lineage = _graph_adoption_typed_lineage(conn, identifiers)
         zero = _graph_adoption_zero_state(conn)
     finally:
         conn.close()
@@ -4083,7 +4130,7 @@ def _graph_adoption_observation(root: Path, identifiers: Mapping[str, str]) -> d
         "database": {"path": str(database), "device": int(meta.st_dev),
                      "inode": int(meta.st_ino), "pre_create_raw_sha256": "sha256:" + hashlib.sha256(database.read_bytes()).hexdigest(),
                      "quick_check": "ok"},
-        "r10_evidence": evidence, "source": source, "registry": registry,
+        "typed_lineage": lineage, "source": source, "registry": registry,
         "graph_zero_state": zero,
         "stable": {"database_identity": dict(stable.get("stable_database_identity") or {}),
                    "commit": stable.get("commit") or stable.get("stable_head"),
@@ -4092,8 +4139,10 @@ def _graph_adoption_observation(root: Path, identifiers: Mapping[str, str]) -> d
 
 
 def create_dev_graph_admission_recovery_adoption_receipt(
-    storage_root: Path | str, *, backlog_id: str, request_id: str,
+    storage_root: Path | str, *, backlog_id: str, contract_execution_id: str,
     route_token_ref: str, observer_session_id: str,
+    recovery_adoption_acknowledgment: str,
+    unverified_incident_reference: str = "",
 ) -> dict[str, object]:
     root = Path(storage_root).expanduser().absolute()
     if root.is_symlink() or root.resolve(strict=True) != root:
@@ -4101,14 +4150,21 @@ def create_dev_graph_admission_recovery_adoption_receipt(
     listener = _default_cutover_listener_probe(40008)
     if listener.get("listening") or int(listener.get("pid") or 0):
         raise ValueError("AC dev graph recovery adoption requires stopped port 40008")
-    identifiers = {"backlog_id": backlog_id, "request_id": request_id,
+    identifiers = {"backlog_id": backlog_id, "contract_execution_id": contract_execution_id,
                    "route_token_ref": route_token_ref, "observer_session_id": observer_session_id}
     if any(not isinstance(value, str) or not value.strip() for value in identifiers.values()):
         raise ValueError("AC dev graph recovery adoption identifiers are required")
+    if recovery_adoption_acknowledgment != AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT:
+        raise ValueError("AC dev graph recovery adoption requires exact operator acknowledgment")
+    if not isinstance(unverified_incident_reference, str):
+        raise ValueError("AC dev graph recovery adoption incident reference must be text")
     observation = _graph_adoption_observation(root, identifiers)
     payload = {"schema_version": AC_DEV_GRAPH_ADOPTION_SCHEMA, "stage": "recovery_adoption",
                "qa_pass": False, "pass_claim": False, "non_retroactive": True,
                "claims_r10_reconcile_success": False, "claims_r10_zero_write": False,
+               "authority": {"kind": "current_operator_supervised_recovery_adoption",
+                             "acknowledgment": recovery_adoption_acknowledgment},
+               "unverified_incident_reference": unverified_incident_reference,
                "project_id": AC_PROJECT_ID, "port": 40008, "root": str(root), **observation}
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     digest = hashlib.sha256(raw).hexdigest()
@@ -4157,9 +4213,10 @@ def validate_dev_graph_admission_recovery_adoption_receipt(
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("AC dev graph recovery adoption receipt is invalid") from exc
     fixed = {"schema_version", "stage", "qa_pass", "pass_claim", "non_retroactive",
-             "claims_r10_reconcile_success", "claims_r10_zero_write", "project_id", "port", "root"}
+             "claims_r10_reconcile_success", "claims_r10_zero_write", "authority",
+             "unverified_incident_reference", "project_id", "port", "root"}
     observation_keys = {"cow_v2", "protected_preimage", "protected_preimage_count", "admitted_delta",
-                        "protected_postimage", "protected_postimage_count", "database", "r10_evidence",
+                        "protected_postimage", "protected_postimage_count", "database", "typed_lineage",
                         "source", "registry", "graph_zero_state", "stable"}
     if set(receipt) != fixed | observation_keys or any((
         receipt.get("schema_version") != AC_DEV_GRAPH_ADOPTION_SCHEMA,
@@ -4167,9 +4224,12 @@ def validate_dev_graph_admission_recovery_adoption_receipt(
         receipt.get("pass_claim") is not False, receipt.get("non_retroactive") is not True,
         receipt.get("claims_r10_reconcile_success") is not False,
         receipt.get("claims_r10_zero_write") is not False, receipt.get("project_id") != AC_PROJECT_ID,
+        receipt.get("authority") != {"kind": "current_operator_supervised_recovery_adoption",
+                                     "acknowledgment": AC_DEV_GRAPH_ADOPTION_ACKNOWLEDGMENT},
+        not isinstance(receipt.get("unverified_incident_reference"), str),
         receipt.get("port") != 40008, receipt.get("root") != str(root))):
         raise ValueError("AC dev graph recovery adoption receipt contract mismatch")
-    identifiers = dict(dict(receipt.get("r10_evidence") or {}).get("identifiers") or {})
+    identifiers = dict(dict(receipt.get("typed_lineage") or {}).get("identifiers") or {})
     current = _graph_adoption_observation(root, identifiers)
     # The raw-file digest is explicitly the stopped pre-create observation.
     # Ordinary governed startup may update mutable process/source-tip rows, so
