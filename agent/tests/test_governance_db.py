@@ -2497,12 +2497,23 @@ def _phase_z_durable_process(root, source, *, pid):
         "sha256:" + hashlib.sha256(started.encode()).hexdigest()
         if started else "sha256:" + str(pid + 1)[-1] * 64
     )
+    runtime = root / "runtime" / "durable-launch"
     return {
         "pid": pid,
         "start_identity": start_identity,
         "argv": [
-            sys.executable, "-m", "agent.cli", "start",
+            str(Path(sys.executable).resolve(strict=True)),
+            str((Path(source["root"]) / "agent" / "cli.py").resolve(strict=True)),
+            "start", "--runtime-plane", "dev", "--port", "40008",
+            "--dev-storage-root", str(root),
+            "--stable-anchor-commit", "a" * 40,
+            "--durable-child-runtime-dir", str(runtime),
             "--durable-child-launch-id", launch_id,
+            "--durable-child-control-fd", "5",
+            "--durable-child-pending-receipt",
+            str(runtime / ("pending." + "b" * 64 + ".json")),
+            "--durable-child-linked-v3-receipt",
+            str(root / "archive" / "schema-admission" / ("c" * 64 + ".json")),
         ],
         "cwd": source["root"],
         "source_root": source["root"],
@@ -2518,6 +2529,124 @@ def _phase_z_durable_process(root, source, *, pid):
         },
         "launch_id": launch_id,
     }
+
+
+def test_cow_durable_process_custody_accepts_exact_normalized_launcher_argv(
+    tmp_path,
+):
+    from agent.governance import db
+
+    source_root, source_commit = _dev_source_repo(tmp_path)
+    subprocess.run(
+        ["git", "branch", "-M", "codex/ac-dev"], cwd=source_root, check=True,
+    )
+    root = tmp_path / "dev-world"
+    root.mkdir()
+    source = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": source_commit, "source_sha256": "sha256:" + "d" * 64,
+    }
+    process = _phase_z_durable_process(root, source, pid=42)
+
+    db._validate_dev_current_process_custody(
+        process, root=root, candidate_source=source,
+    )
+
+
+def test_cow_completed_process_axis_transitions_exact_dead_pre_normalization_argv(
+    tmp_path,
+):
+    from agent.governance import db
+
+    source_root, source_commit = _dev_source_repo(tmp_path)
+    subprocess.run(
+        ["git", "branch", "-M", "codex/ac-dev"], cwd=source_root, check=True,
+    )
+    source = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": source_commit,
+        "tree": subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=source_root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip(),
+        "source_sha256": "sha256:" + "d" * 64,
+    }
+    root = tmp_path / "dev-world"
+    root.mkdir()
+    process = _phase_z_durable_process(root, source, pid=99999999)
+    process["argv"] = process["argv"][1:]
+    candidate_commit = _advance_dev_source(source_root, "normalized-custody-successor")
+    candidate = {
+        **source,
+        "commit": candidate_commit,
+        "tree": subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=source_root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip(),
+        "source_sha256": "sha256:" + hashlib.sha256(
+            (source_root / "agent" / "cli.py").read_bytes()
+        ).hexdigest(),
+    }
+
+    db._validate_dev_cow_completed_process_axis(
+        process, root=root, source_identity=candidate,
+    )
+    with pytest.raises(ValueError, match="durable process custody binding mismatch"):
+        db._validate_dev_current_process_custody(
+            process, root=root, candidate_source=candidate,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "module_string", "alternate_script", "duplicate_option",
+        "missing_option", "reordered_options", "wrong_root", "wrong_port",
+        "wrong_project", "wrong_launch_id",
+    ),
+)
+def test_cow_durable_process_custody_rejects_noncanonical_launcher_argv(
+    tmp_path, mutation,
+):
+    from agent.governance import db
+
+    source_root, source_commit = _dev_source_repo(tmp_path)
+    subprocess.run(
+        ["git", "branch", "-M", "codex/ac-dev"], cwd=source_root, check=True,
+    )
+    root = tmp_path / "dev-world"
+    root.mkdir()
+    source = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": source_commit, "source_sha256": "sha256:" + "d" * 64,
+    }
+    process = _phase_z_durable_process(root, source, pid=42)
+    argv = process["argv"]
+    if mutation == "module_string":
+        argv[1] = "agent.cli"
+    elif mutation == "alternate_script":
+        alternate = source_root / "agent" / "alternate_cli.py"
+        alternate.write_text("# alternate\n", encoding="utf-8")
+        argv[1] = str(alternate.resolve(strict=True))
+    elif mutation == "duplicate_option":
+        argv.extend(("--port", "40008"))
+    elif mutation == "missing_option":
+        del argv[5:7]
+    elif mutation == "reordered_options":
+        argv[3:7] = argv[5:7] + argv[3:5]
+    elif mutation == "wrong_root":
+        argv[8] = str(tmp_path / "other-world")
+    elif mutation == "wrong_port":
+        argv[6] = "40009"
+    elif mutation == "wrong_project":
+        process["project_id"] = "other-project"
+    else:
+        process["launch_id"] = "e" * 24
+
+    with pytest.raises(ValueError, match="durable process custody binding mismatch"):
+        db._validate_dev_current_process_custody(
+            process, root=root, candidate_source=source,
+        )
 
 
 @pytest.mark.parametrize(

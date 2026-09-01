@@ -4621,9 +4621,31 @@ def start(
             control = socket.socket(fileno=durable_child_control_fd)
             control.settimeout(15)
             child_process = _posix_process_identity(os.getpid())
+            try:
+                python_executable = Path(sys.executable).resolve(strict=True)
+                cli_script = Path(sys.argv[0]).absolute()
+                expected_cli_script = (source_root / "agent" / "cli.py").absolute()
+                python_stat = python_executable.stat(follow_symlinks=False)
+                cli_stat = cli_script.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise click.ClickException(
+                    "AC dev durable child command identity is unavailable"
+                ) from exc
+            if (
+                python_executable.is_symlink()
+                or not stat.S_ISREG(python_stat.st_mode)
+                or cli_script.is_symlink()
+                or not stat.S_ISREG(cli_stat.st_mode)
+                or cli_script.resolve(strict=True) != cli_script
+                or cli_script != expected_cli_script
+            ):
+                raise click.ClickException(
+                    "AC dev durable child command identity mismatch"
+                )
             custody = {
                 "pid": os.getpid(), "start_identity": child_process["start_identity"],
-                "argv": sys.argv, "cwd": child_process["cwd"],
+                "argv": [str(python_executable), str(cli_script), *sys.argv[1:]],
+                "cwd": child_process["cwd"],
                 "source_root": str(source_root), "source_commit": (dev_identity or {})["commit"],
                 "source_tree": (dev_identity or {})["tree"], "dev_storage_root": str(dev_storage),
                 "project_id": "aming-claw", "port": AC_DEV_SERVICE_PORT,

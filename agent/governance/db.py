@@ -2501,6 +2501,86 @@ _DEV_DURABLE_POLICY = {
 }
 
 
+def _dev_durable_process_argv_is_canonical(
+    argv: object, *, root: Path, source_root: Path, launch_id: str,
+) -> bool:
+    """Recognize only the normalized argv produced by the durable child."""
+
+    if not isinstance(argv, list) or len(argv) != 21:
+        return False
+    if not all(isinstance(item, str) and item for item in argv):
+        return False
+    try:
+        executable = Path(argv[0])
+        executable_stat = executable.stat(follow_symlinks=False)
+        script = Path(argv[1])
+        script_stat = script.stat(follow_symlinks=False)
+        expected_executable = Path(sys.executable).resolve(strict=True)
+        expected_script = (source_root / "agent" / "cli.py").absolute()
+        expected_script_stat = expected_script.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    if (
+        not executable.is_absolute()
+        or executable.is_symlink()
+        or not stat.S_ISREG(executable_stat.st_mode)
+        or executable.resolve(strict=True) != executable
+        or executable != expected_executable
+        or expected_script.is_symlink()
+        or not stat.S_ISREG(expected_script_stat.st_mode)
+        or expected_script.resolve(strict=True) != expected_script
+        or not script.is_absolute()
+        or script.is_symlink()
+        or not stat.S_ISREG(script_stat.st_mode)
+        or script.resolve(strict=True) != script
+        or script != expected_script
+    ):
+        return False
+    runtime = (root / "runtime" / "durable-launch").absolute()
+    pending = Path(argv[18])
+    linked = Path(argv[20])
+    expected = [
+        str(executable), str(script), "start",
+        "--runtime-plane", "dev",
+        "--port", "40008",
+        "--dev-storage-root", str(root),
+        "--stable-anchor-commit", argv[10],
+        "--durable-child-runtime-dir", str(runtime),
+        "--durable-child-launch-id", launch_id,
+        "--durable-child-control-fd", argv[16],
+        "--durable-child-pending-receipt", str(pending),
+        "--durable-child-linked-v3-receipt", str(linked),
+    ]
+    return bool(
+        argv == expected
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", argv[10])
+        and re.fullmatch(r"[0-9]+", argv[16])
+        and pending.is_absolute()
+        and pending.parent == runtime
+        and re.fullmatch(r"pending\.[0-9a-f]{64}\.json", pending.name)
+        and linked.is_absolute()
+        and linked.parent == root / "archive" / "schema-admission"
+        and re.fullmatch(r"[0-9a-f]{64}\.json", linked.name)
+    )
+
+
+def _dev_durable_completed_pre_normalization_argv_is_canonical(
+    argv: object, *, root: Path, source_root: Path, launch_id: str,
+) -> bool:
+    """Recognize the exact child ``sys.argv`` sealed before normalization."""
+
+    if not isinstance(argv, list):
+        return False
+    try:
+        executable = str(Path(sys.executable).resolve(strict=True))
+    except OSError:
+        return False
+    return _dev_durable_process_argv_is_canonical(
+        [executable, *argv], root=root, source_root=source_root,
+        launch_id=launch_id,
+    )
+
+
 def _git_read_exact(root: Path, *args: str) -> bytes:
     result = subprocess.run(
         ["git", *args], cwd=root, capture_output=True, timeout=10, check=False,
@@ -2548,6 +2628,7 @@ def _validate_dev_current_process_custody(
     process: Mapping[str, object], *, root: Path,
     candidate_source: Mapping[str, object],
     historical_process: Mapping[str, object] | None = None,
+    completed_dead_pre_normalization: bool = False,
 ) -> None:
     """Validate the sole two admitted process-custody projections."""
     value = dict(process)
@@ -2569,20 +2650,46 @@ def _validate_dev_current_process_custody(
         candidate_root = Path(str(candidate_source.get("root") or "")).resolve(strict=True)
     except OSError as exc:
         raise ValueError("AC dev durable process custody root mismatch") from exc
-    argv_valid = ((isinstance(argv, list) and bool(argv)
-                   and all(isinstance(item, str) and item for item in argv))
-                  or (isinstance(argv, str) and bool(argv.strip())))
-    command = " ".join(argv) if isinstance(argv, list) else str(argv or "")
     commit = str(value.get("source_commit") or "").lower()
-    if (type(pid) is not int or pid <= 0 or not argv_valid
+    launch_id = str(value.get("launch_id") or "")
+    argv_canonical = _dev_durable_process_argv_is_canonical(
+        argv, root=root.resolve(strict=True), source_root=candidate_root,
+        launch_id=launch_id,
+    )
+    if completed_dead_pre_normalization and not argv_canonical:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            process_is_dead = True
+        except (OSError, TypeError, ValueError):
+            process_is_dead = False
+        else:
+            process_is_dead = False
+        try:
+            listener = subprocess.run(
+                ["lsof", "-nP", "-iTCP:40008", "-sTCP:LISTEN", "-t"],
+                capture_output=True, timeout=3, check=False,
+            )
+            no_dev_listener = (
+                listener.returncode in {0, 1} and not listener.stdout.strip()
+            )
+        except (OSError, subprocess.SubprocessError):
+            no_dev_listener = False
+        argv_canonical = bool(
+            process_is_dead
+            and no_dev_listener
+            and _dev_durable_completed_pre_normalization_argv_is_canonical(
+                argv, root=root.resolve(strict=True), source_root=candidate_root,
+                launch_id=launch_id,
+            )
+        )
+    if (type(pid) is not int or pid <= 0
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("start_identity") or ""))
             or source_root != candidate_root or cwd != candidate_root or dev_root != root.resolve(strict=True)
             or value.get("project_id") != AC_PROJECT_ID or value.get("port") != 40008
             or value.get("policy") != _DEV_DURABLE_POLICY
-            or not re.fullmatch(r"[0-9a-f]{24}", str(value.get("launch_id") or ""))
-            or value["launch_id"] not in command
-            or "agent.cli" not in command or " start " not in f" {command} "
-            or "--durable-child-launch-id" not in command
+            or not re.fullmatch(r"[0-9a-f]{24}", launch_id)
+            or not argv_canonical
             or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)):
         raise ValueError("AC dev durable process custody binding mismatch")
     tree = _git_read_exact(candidate_root, "rev-parse", f"{commit}^{{tree}}").decode().strip()
@@ -4412,6 +4519,7 @@ def _validate_dev_cow_completed_process_axis(
         return
     _validate_dev_current_process_custody(
         value, root=root, candidate_source=source_identity,
+        completed_dead_pre_normalization=True,
     )
 
 
