@@ -200102,6 +200102,44 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     assert ownership["world"] == "stable"
     assert ownership["contract_execution_id"] == execution_id
     assert ownership["complete"] is True
+    attacks: list[dict[str, Any]] = []
+    binding_extra = copy.deepcopy(binding)
+    binding_extra["unexpected_authority"] = True
+    attacks.append(binding_extra)
+    world_extra = copy.deepcopy(binding)
+    world_extra["pre_mutation_world_ref"]["unexpected_authority"] = True
+    unsigned_world_extra = dict(world_extra["pre_mutation_world_ref"])
+    unsigned_world_extra.pop("authority_hash")
+    world_extra["pre_mutation_world_ref"]["authority_hash"] = (
+        server.stable_sha256(unsigned_world_extra)
+    )
+    attacks.append(world_extra)
+    route_extra = copy.deepcopy(binding)
+    route_extra["route_identity"]["unexpected_authority"] = True
+    attacks.append(route_extra)
+    missing_key = copy.deepcopy(binding)
+    missing_key.pop("target_files")
+    attacks.append(missing_key)
+    wrong_type = copy.deepcopy(binding)
+    wrong_type["owned_files"] = "paper/dg-r6.tex"
+    attacks.append(wrong_type)
+    for attack in attacks:
+        unsigned_attack = dict(attack)
+        unsigned_attack.pop("binding_hash")
+        attack["binding_hash"] = server.stable_sha256(unsigned_attack)
+        assert not (
+            server._operator_supervised_direct_main_legacy_empty_stable_world_valid(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                execution_id=execution_id,
+                binding=attack,
+            )
+        )
+    with pytest.raises(ValueError, match="duplicate persisted Direct Main JSON key"):
+        server._operator_supervised_direct_main_closed_json_object(
+            [("runtime_world_authority", {}), ("runtime_world_authority", {})]
+        )
     assert conn.total_changes == before
     assert tuple(conn.iterdump()) == before_rows
 

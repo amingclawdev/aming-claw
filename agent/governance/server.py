@@ -146585,7 +146585,12 @@ def _operator_supervised_direct_main_persisted_world_ownership(
     valid_records: list[tuple[str, Mapping[str, Any]]] = []
     for row in execution_rows:
         try:
-            record = json.loads(str(row["record_json"] or "{}"))
+            record = json.loads(
+                str(row["record_json"] or "{}"),
+                object_pairs_hook=(
+                    _operator_supervised_direct_main_closed_json_object
+                ),
+            )
         except (TypeError, ValueError):
             continue
         execution_id = str(row["contract_execution_id"] or "").strip()
@@ -146696,6 +146701,116 @@ def _operator_supervised_direct_main_connection_database_path(conn) -> Path:
         return Path()
 
 
+def _operator_supervised_direct_main_closed_json_object(
+    pairs: Sequence[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate persisted Direct Main JSON key")
+        value[key] = item
+    return value
+
+
+_legacy_empty_stable_binding_keys = frozenset(
+    {
+        "schema_version",
+        "strict_runtime_binding_required",
+        "server_derived",
+        "caller_claims_trusted",
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "route_identity",
+        "owned_files",
+        "target_files",
+        "target_project_root",
+        "worktree_path",
+        "base_commit",
+        "target_head_commit",
+        "pre_mutation_world_ref",
+        "runtime_world_authority",
+        "stable_visible_chain_projection_written",
+        "same_execution_retry_allowed",
+        "same_generation_retry_allowed",
+        "post_hoc_pass_backfill_allowed",
+        "binding_hash",
+    }
+)
+_legacy_empty_stable_world_ref_keys = frozenset(
+    {
+        "schema_version",
+        "accepted",
+        "status",
+        "server_derived",
+        "caller_claims_trusted",
+        "project_id",
+        "target_project_root",
+        "worktree_path",
+        "base_commit",
+        "target_head_commit",
+        "repository_root_exact",
+        "resolution_error",
+        "zero_write_on_failure",
+        "authority_hash",
+    }
+)
+_legacy_empty_stable_route_identity_keys = frozenset(
+    {
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_token_ref",
+    }
+)
+
+
+def _operator_supervised_direct_main_legacy_empty_closed_shapes_valid(
+    binding: Mapping[str, Any],
+    world_ref: Mapping[str, Any],
+    route: Mapping[str, Any],
+) -> bool:
+    if (
+        set(binding) != _legacy_empty_stable_binding_keys
+        or set(world_ref) != _legacy_empty_stable_world_ref_keys
+        or set(route) != _legacy_empty_stable_route_identity_keys
+    ):
+        return False
+    binding_string_fields = {
+        "schema_version", "project_id", "backlog_id",
+        "contract_execution_id", "target_project_root", "worktree_path",
+        "base_commit", "target_head_commit", "binding_hash",
+    }
+    binding_bool_fields = {
+        "strict_runtime_binding_required", "server_derived",
+        "caller_claims_trusted", "stable_visible_chain_projection_written",
+        "same_execution_retry_allowed", "same_generation_retry_allowed",
+        "post_hoc_pass_backfill_allowed",
+    }
+    world_string_fields = {
+        "schema_version", "status", "project_id", "target_project_root",
+        "worktree_path", "base_commit", "target_head_commit",
+        "resolution_error", "authority_hash",
+    }
+    world_bool_fields = {
+        "accepted", "server_derived", "caller_claims_trusted",
+        "repository_root_exact", "zero_write_on_failure",
+    }
+    return bool(
+        all(type(binding.get(field)) is str for field in binding_string_fields)
+        and all(type(binding.get(field)) is bool for field in binding_bool_fields)
+        and type(binding.get("owned_files")) is list
+        and type(binding.get("target_files")) is list
+        and all(type(item) is str for item in binding["owned_files"])
+        and all(type(item) is str for item in binding["target_files"])
+        and type(binding.get("runtime_world_authority")) is dict
+        and not binding["runtime_world_authority"]
+        and all(type(world_ref.get(field)) is str for field in world_string_fields)
+        and all(type(world_ref.get(field)) is bool for field in world_bool_fields)
+        and all(type(route.get(field)) is str for field in route)
+    )
 def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
     conn,
     *,
@@ -146769,7 +146884,10 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
     base = str(binding.get("base_commit") or "").strip().lower()
     head = str(binding.get("target_head_commit") or "").strip().lower()
     return bool(
-        binding.get("schema_version")
+        _operator_supervised_direct_main_legacy_empty_closed_shapes_valid(
+            binding, world_ref, route
+        )
+        and binding.get("schema_version")
         == "operator_supervised_direct_main.runtime_binding.v1"
         and binding.get("strict_runtime_binding_required") is True
         and binding.get("server_derived") is True
@@ -147134,7 +147252,7 @@ def _require_onboard_dev_selector_endpoint(
         )
     )
     if ownership["world"] == "stable":
-        if _runtime_plane() == "stable":
+        if _runtime_plane() == "stable" or not has_explicit_selector:
             return authority
         raise GovernanceError(
             "ac_onboard_stable_world_wrong_endpoint",
