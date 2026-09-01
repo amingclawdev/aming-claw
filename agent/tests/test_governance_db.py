@@ -1987,6 +1987,65 @@ def test_ac_dev_cow_successor_validator_rejects_missing(tmp_path):
         db.validate_dev_cow_successor_receipt(root)
 
 
+def test_graph_admission_recovery_adoption_is_unique_content_addressed_and_closed(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+    root = tmp_path / "dev"; root.mkdir()
+    identifiers = {"backlog_id": "R10", "request_id": "req-1",
+                   "route_token_ref": "route-1", "observer_session_id": "session-1"}
+    observation = {
+        "cow_v2": {}, "protected_preimage": {"inventory": [], "sha256": "p"},
+        "protected_preimage_count": 308, "admitted_delta": {"added": [], "removed": [], "sha256": "d"},
+        "protected_postimage": {"inventory": [], "sha256": "q"}, "protected_postimage_count": 326,
+        "database": {"pre_create_raw_sha256": "sha256:" + "a" * 64},
+        "r10_evidence": {"identifiers": identifiers}, "source": {},
+        "registry": {}, "graph_zero_state": {}, "stable": {},
+    }
+    monkeypatch.setattr(db, "_default_cutover_listener_probe",
+                        lambda _port: {"listening": False, "pid": 0})
+    monkeypatch.setattr(db, "_graph_adoption_observation", lambda _root, supplied: (
+        observation if dict(supplied) == identifiers else (_ for _ in ()).throw(ValueError("ids"))
+    ))
+    created = db.create_dev_graph_admission_recovery_adoption_receipt(root, **identifiers)
+    receipt = Path(created["receipt"]); raw = receipt.read_bytes()
+    assert receipt.name == f"{db.AC_DEV_GRAPH_ADOPTION_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json"
+    payload = json.loads(raw)
+    assert payload["stage"] == "recovery_adoption"
+    assert payload["qa_pass"] is payload["pass_claim"] is False
+    assert payload["non_retroactive"] is True
+    assert payload["claims_r10_reconcile_success"] is payload["claims_r10_zero_write"] is False
+    assert db.validate_dev_graph_admission_recovery_adoption_receipt(root) == payload
+    assert db.create_dev_graph_admission_recovery_adoption_receipt(root, **identifiers)["status"] == "already_created"
+    duplicate = receipt.with_name(db.AC_DEV_GRAPH_ADOPTION_PREFIX + "." + "f" * 64 + ".json")
+    duplicate.write_bytes(raw)
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        db.validate_dev_graph_admission_recovery_adoption_receipt(root)
+    duplicate.unlink()
+    tampered = dict(payload); tampered["qa_pass"] = True
+    tampered_raw = json.dumps(tampered, sort_keys=True, separators=(",", ":")).encode()
+    receipt.unlink()
+    bad = receipt.with_name(f"{db.AC_DEV_GRAPH_ADOPTION_PREFIX}.{hashlib.sha256(tampered_raw).hexdigest()}.json")
+    bad.write_bytes(tampered_raw)
+    with pytest.raises(ValueError, match="contract mismatch"):
+        db.validate_dev_graph_admission_recovery_adoption_receipt(root)
+
+
+def test_graph_admission_recovery_adoption_create_failure_leaves_no_residue(tmp_path, monkeypatch):
+    from agent.governance import db
+    root = tmp_path / "dev"; root.mkdir()
+    monkeypatch.setattr(db, "_default_cutover_listener_probe",
+                        lambda _port: {"listening": False, "pid": 0})
+    monkeypatch.setattr(db, "_graph_adoption_observation",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("delta mismatch")))
+    with pytest.raises(ValueError, match="delta mismatch"):
+        db.create_dev_graph_admission_recovery_adoption_receipt(
+            root, backlog_id="R10", request_id="req", route_token_ref="route",
+            observer_session_id="session")
+    archive = root / db.AC_DEV_GRAPH_ADOPTION_ARCHIVE
+    assert not archive.exists() or not list(archive.iterdir())
+
+
 def test_cow_receipt_reconstruction_keeps_issuance_schema_after_source_expands(
     tmp_path, monkeypatch,
 ):

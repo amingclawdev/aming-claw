@@ -57,6 +57,26 @@ def test_dev_create_cow_successor_receipt_delegates_to_db(tmp_path, monkeypatch)
                         "predecessor_backup": backup, "linked_v3_receipt": linked}
 
 
+def test_dev_create_graph_admission_recovery_adoption_receipt_delegates(tmp_path, monkeypatch):
+    from agent.governance import db
+    root = tmp_path / "dev"; root.mkdir()
+    observed = {}
+    def create(storage_root, **kwargs):
+        observed.update({"storage_root": storage_root, **kwargs})
+        return {"status": "created", "receipt": "/receipt", "receipt_sha256": "sha256:" + "b" * 64}
+    monkeypatch.setattr(db, "create_dev_graph_admission_recovery_adoption_receipt", create)
+    result = CliRunner().invoke(main, [
+        "dev-create-graph-admission-recovery-adoption-receipt",
+        "--dev-storage-root", str(root), "--backlog-id", "R10",
+        "--request-id", "req-1", "--route-token-ref", "route-1",
+        "--observer-session-id", "session-1",
+    ])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["status"] == "created"
+    assert observed == {"storage_root": root, "backlog_id": "R10", "request_id": "req-1",
+                        "route_token_ref": "route-1", "observer_session_id": "session-1"}
+
+
 class _GovernanceProbeResponse:
     def __init__(self, *, url, body, headers=None, status=200, expected_limit=None):
         self.url = url

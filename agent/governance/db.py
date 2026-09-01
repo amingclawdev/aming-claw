@@ -57,6 +57,9 @@ AC_DEV_LAUNCH_RECEIPT_NAME = "launch-receipt.json"
 AC_DEV_COW_SUCCESSOR_SCHEMA = "ac_dev_cow_database_successor.v2"
 AC_DEV_COW_SUCCESSOR_ARCHIVE = "archive/cow-database-successor"
 AC_DEV_COW_SUCCESSOR_PREFIX = "successor-v2"
+AC_DEV_GRAPH_ADOPTION_SCHEMA = "ac_dev_graph_admission_recovery_adoption.v1"
+AC_DEV_GRAPH_ADOPTION_ARCHIVE = "archive/graph-admission-recovery-adoption"
+AC_DEV_GRAPH_ADOPTION_PREFIX = "recovery-adoption"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
@@ -3968,6 +3971,221 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
         raise ValueError("AC dev COW successor reconstructed issuance payload mismatch")
     return receipt
 
+
+def _canonical_json_hash(value: object) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _graph_adoption_registry_binding() -> dict[str, object]:
+    owners = []
+    for owner, rows in _graph_schema_owner_registry():
+        objects = [[kind, name, table, "sha256:" + hashlib.sha256(sql.encode()).hexdigest()]
+                   for kind, name, table, sql in rows]
+        owners.append({"owner": owner, "objects": objects,
+                       "source_sha256": _canonical_json_hash(objects)})
+    return {"owners": owners, "sha256": _canonical_json_hash(owners)}
+
+
+def _graph_adoption_zero_state(conn: sqlite3.Connection) -> dict[str, object]:
+    tables = sorted({row[1] for _owner, rows in _graph_schema_owner_registry()
+                     for row in rows if row[0] == "table"})
+    counts = {name: int(conn.execute(
+        f"SELECT COUNT(*) FROM {_sqlite_quote_identifier(name)}"
+    ).fetchone()[0]) for name in tables}
+    if any(counts.values()):
+        raise ValueError("AC dev graph recovery adoption requires empty graph data and refs")
+    return {"table_counts": counts, "sha256": _canonical_json_hash(counts)}
+
+
+def _graph_adoption_source_binding() -> dict[str, object]:
+    root = Path(__file__).resolve().parents[2]
+    def git(*args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=root, text=True,
+                                capture_output=True, timeout=10, check=False)
+        if result.returncode:
+            raise ValueError("AC dev graph recovery adoption source is unavailable")
+        return result.stdout.strip()
+    if git("status", "--porcelain"):
+        raise ValueError("AC dev graph recovery adoption requires clean source")
+    return {"root": str(root), "commit": git("rev-parse", "HEAD"),
+            "tree": git("rev-parse", "HEAD^{tree}")}
+
+
+def _graph_adoption_r10_evidence(
+    conn: sqlite3.Connection, identifiers: Mapping[str, str],
+) -> dict[str, object]:
+    """Bind persisted rows containing each exact R10 identifier, without trusting a caller row."""
+    hits: dict[str, list[dict[str, object]]] = {key: [] for key in identifiers}
+    for table_row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ):
+        table = str(table_row[0])
+        columns = [str(row[1]) for row in conn.execute(
+            f"PRAGMA table_info({_sqlite_quote_identifier(table)})"
+        )]
+        if not columns:
+            continue
+        quoted = ",".join(_sqlite_quote_identifier(column) for column in columns)
+        for row in conn.execute(f"SELECT {quoted} FROM {_sqlite_quote_identifier(table)}"):
+            encoded = [_sqlite_projection_value(value) for value in row]
+            text_values = {str(value) for value in row if isinstance(value, str)}
+            for key, value in identifiers.items():
+                if value in text_values:
+                    hits[key].append({"table": table, "columns": columns,
+                                      "row_sha256": _canonical_json_hash(encoded)})
+    if any(not value for value in hits.values()):
+        raise ValueError("AC dev graph recovery adoption R10 persisted evidence is incomplete")
+    return {"identifiers": dict(identifiers), "hits": hits,
+            "sha256": _canonical_json_hash({"identifiers": dict(identifiers), "hits": hits})}
+
+
+def _graph_adoption_observation(root: Path, identifiers: Mapping[str, str]) -> dict[str, object]:
+    cow = validate_dev_cow_successor_receipt(root)
+    cow_path = next(_cow_successor_archive(root).glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"))
+    cow_raw_sha = "sha256:" + hashlib.sha256(cow_path.read_bytes()).hexdigest()
+    database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+    meta = database.stat(follow_symlinks=False)
+    if database.is_symlink() or not stat.S_ISREG(meta.st_mode) or database.resolve(strict=True) != database:
+        raise ValueError("AC dev graph recovery adoption database identity is invalid")
+    if any(Path(str(database) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+        raise ValueError("AC dev graph recovery adoption database has sidecars")
+    conn = sqlite3.connect("file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1", uri=True)
+    try:
+        if not _quick_check_returns_literal_ok(conn):
+            raise ValueError("AC dev graph recovery adoption quick-check failed")
+        preimage = dict(dict(cow.get("successor") or {}).get("protected_inventory") or {})
+        postimage = backlog_read_schema_protected_inventory(conn)
+        pre_rows = {tuple(row) for row in preimage.get("inventory", [])}
+        post_rows = {tuple(row) for row in postimage.get("inventory", [])}
+        added, removed = sorted(post_rows - pre_rows), sorted(pre_rows - post_rows)
+        registry = _graph_adoption_registry_binding()
+        registry_rows = {tuple(row) for owner in registry["owners"] for row in owner["objects"]}
+        expected_added = registry_rows - pre_rows
+        if removed or len(pre_rows) != 308 or len(post_rows) != 326 or len(added) != 18 \
+                or set(added) != expected_added:
+            raise ValueError("AC dev graph recovery adoption protected inventory delta mismatch")
+        evidence = _graph_adoption_r10_evidence(conn, identifiers)
+        zero = _graph_adoption_zero_state(conn)
+    finally:
+        conn.close()
+    source = _graph_adoption_source_binding()
+    stable = verified_stable_database_binding()
+    _revalidate_stable_database_binding(stable)
+    health = dict(stable.get("health") or {})
+    return {
+        "cow_v2": {"path": str(cow_path), "raw_sha256": cow_raw_sha,
+                   "binding_sha256": _canonical_json_hash(cow)},
+        "protected_preimage": preimage, "protected_preimage_count": len(pre_rows),
+        "admitted_delta": {"added": [list(row) for row in added], "removed": [],
+                           "sha256": _canonical_json_hash([list(row) for row in added])},
+        "protected_postimage": postimage, "protected_postimage_count": len(post_rows),
+        "database": {"path": str(database), "device": int(meta.st_dev),
+                     "inode": int(meta.st_ino), "pre_create_raw_sha256": "sha256:" + hashlib.sha256(database.read_bytes()).hexdigest(),
+                     "quick_check": "ok"},
+        "r10_evidence": evidence, "source": source, "registry": registry,
+        "graph_zero_state": zero,
+        "stable": {"database_identity": dict(stable.get("stable_database_identity") or {}),
+                   "commit": stable.get("commit") or stable.get("stable_head"),
+                   "pid": health.get("pid") or health.get("process_id")},
+    }
+
+
+def create_dev_graph_admission_recovery_adoption_receipt(
+    storage_root: Path | str, *, backlog_id: str, request_id: str,
+    route_token_ref: str, observer_session_id: str,
+) -> dict[str, object]:
+    root = Path(storage_root).expanduser().absolute()
+    if root.is_symlink() or root.resolve(strict=True) != root:
+        raise ValueError("AC dev graph recovery adoption root is invalid")
+    listener = _default_cutover_listener_probe(40008)
+    if listener.get("listening") or int(listener.get("pid") or 0):
+        raise ValueError("AC dev graph recovery adoption requires stopped port 40008")
+    identifiers = {"backlog_id": backlog_id, "request_id": request_id,
+                   "route_token_ref": route_token_ref, "observer_session_id": observer_session_id}
+    if any(not isinstance(value, str) or not value.strip() for value in identifiers.values()):
+        raise ValueError("AC dev graph recovery adoption identifiers are required")
+    observation = _graph_adoption_observation(root, identifiers)
+    payload = {"schema_version": AC_DEV_GRAPH_ADOPTION_SCHEMA, "stage": "recovery_adoption",
+               "qa_pass": False, "pass_claim": False, "non_retroactive": True,
+               "claims_r10_reconcile_success": False, "claims_r10_zero_write": False,
+               "project_id": AC_PROJECT_ID, "port": 40008, "root": str(root), **observation}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    archive = root / AC_DEV_GRAPH_ADOPTION_ARCHIVE
+    archive.mkdir(parents=True, exist_ok=True)
+    if archive.is_symlink() or archive.resolve(strict=True) != archive:
+        raise ValueError("AC dev graph recovery adoption archive is invalid")
+    destination = archive / f"{AC_DEV_GRAPH_ADOPTION_PREFIX}.{digest}.json"
+    existing = sorted(archive.glob(f"{AC_DEV_GRAPH_ADOPTION_PREFIX}.*.json"))
+    if existing:
+        if existing == [destination] and destination.read_bytes() == raw:
+            return {"status": "already_created", "receipt": str(destination),
+                    "receipt_sha256": "sha256:" + digest}
+        raise ValueError("AC dev graph recovery adoption receipt is ambiguous")
+    temporary = archive / f".{AC_DEV_GRAPH_ADOPTION_PREFIX}.{digest}.{os.getpid()}.tmp"
+    descriptor = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o444)
+        os.write(descriptor, raw); os.fsync(descriptor); os.close(descriptor); descriptor = None
+        os.link(temporary, destination, follow_symlinks=False)
+        os.unlink(temporary)
+        directory_fd = os.open(archive, os.O_RDONLY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
+    except BaseException:
+        if descriptor is not None: os.close(descriptor)
+        try: temporary.unlink()
+        except FileNotFoundError: pass
+        raise
+    return {"status": "created", "receipt": str(destination),
+            "receipt_sha256": "sha256:" + digest}
+
+
+def validate_dev_graph_admission_recovery_adoption_receipt(
+    storage_root: Path | str,
+) -> dict[str, object]:
+    root = Path(storage_root).expanduser().absolute()
+    archive = root / AC_DEV_GRAPH_ADOPTION_ARCHIVE
+    receipts = sorted(archive.glob(f"{AC_DEV_GRAPH_ADOPTION_PREFIX}.*.json")) if archive.is_dir() else []
+    if len(receipts) != 1:
+        raise ValueError("AC dev graph recovery adoption receipt is missing or ambiguous")
+    raw = receipts[0].read_bytes(); digest = hashlib.sha256(raw).hexdigest()
+    if receipts[0].name != f"{AC_DEV_GRAPH_ADOPTION_PREFIX}.{digest}.json":
+        raise ValueError("AC dev graph recovery adoption receipt digest mismatch")
+    try: receipt = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("AC dev graph recovery adoption receipt is invalid") from exc
+    fixed = {"schema_version", "stage", "qa_pass", "pass_claim", "non_retroactive",
+             "claims_r10_reconcile_success", "claims_r10_zero_write", "project_id", "port", "root"}
+    observation_keys = {"cow_v2", "protected_preimage", "protected_preimage_count", "admitted_delta",
+                        "protected_postimage", "protected_postimage_count", "database", "r10_evidence",
+                        "source", "registry", "graph_zero_state", "stable"}
+    if set(receipt) != fixed | observation_keys or any((
+        receipt.get("schema_version") != AC_DEV_GRAPH_ADOPTION_SCHEMA,
+        receipt.get("stage") != "recovery_adoption", receipt.get("qa_pass") is not False,
+        receipt.get("pass_claim") is not False, receipt.get("non_retroactive") is not True,
+        receipt.get("claims_r10_reconcile_success") is not False,
+        receipt.get("claims_r10_zero_write") is not False, receipt.get("project_id") != AC_PROJECT_ID,
+        receipt.get("port") != 40008, receipt.get("root") != str(root))):
+        raise ValueError("AC dev graph recovery adoption receipt contract mismatch")
+    identifiers = dict(dict(receipt.get("r10_evidence") or {}).get("identifiers") or {})
+    current = _graph_adoption_observation(root, identifiers)
+    # The raw-file digest is explicitly the stopped pre-create observation.
+    # Ordinary governed startup may update mutable process/source-tip rows, so
+    # subsequent validation re-proves inode, quick_check, closed schema delta,
+    # R10 evidence and graph-zero state without rewriting that historical fact.
+    receipt_database = dict(receipt.get("database") or {})
+    raw_sha = str(receipt_database.get("pre_create_raw_sha256") or "")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", raw_sha):
+        raise ValueError("AC dev graph recovery adoption pre-create database hash is invalid")
+    current_database = dict(current.get("database") or {})
+    current_database["pre_create_raw_sha256"] = raw_sha
+    current["database"] = current_database
+    if any(receipt.get(key) != value for key, value in current.items()):
+        raise ValueError("AC dev graph recovery adoption current binding mismatch")
+    return receipt
+
 def _verify_current_dev_backlog_runtime_invariants(
     conn: sqlite3.Connection, *, expected_protected_inventory: Mapping[str, object]
 ) -> None:
@@ -4405,13 +4623,19 @@ def bootstrap_dev_governance_store(
             _verify_existing_schema(conn)
             _verify_dev_world_schema_inventory(conn)
             if cow_successor_receipt is not None:
+                issuance_inventory = dict(
+                    dict(cow_successor_receipt.get("successor") or {}).get(
+                        "protected_inventory"
+                    ) or {}
+                )
+                current_inventory = backlog_read_schema_protected_inventory(conn)
+                if current_inventory == issuance_inventory:
+                    expected_inventory = issuance_inventory
+                else:
+                    graph_adoption = validate_dev_graph_admission_recovery_adoption_receipt(root)
+                    expected_inventory = dict(graph_adoption.get("protected_postimage") or {})
                 _verify_current_dev_backlog_runtime_invariants(
-                    conn,
-                    expected_protected_inventory=dict(
-                        dict(cow_successor_receipt.get("successor") or {}).get(
-                            "protected_inventory"
-                        ) or {}
-                    ),
+                    conn, expected_protected_inventory=expected_inventory,
                 )
             meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
             try:
