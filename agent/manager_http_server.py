@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from agent.runtime_plane import resolve_runtime_plane
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -31,6 +33,7 @@ log = logging.getLogger(__name__)
 
 MANAGER_HTTP_HOST = "127.0.0.1"
 MANAGER_HTTP_PORT = 40101
+AC_DEV_MANAGER_HTTP_PORT = 40109
 
 _HEALTH_CHECK_TIMEOUT = 30  # seconds to wait for governance health endpoint
 _HEALTH_CHECK_INTERVAL = 1  # seconds between health polls
@@ -106,6 +109,57 @@ def derive_runtime_deployment_verification_status(
 def _project_root() -> Path:
     """Return the project root directory (parent of agent/)."""
     return Path(__file__).resolve().parent.parent
+
+
+def _existing_non_symlink_root(path: Path, label: str) -> Path:
+    """Validate an existing physical storage authority without creating it."""
+    absolute = path.expanduser().absolute()
+    if not absolute.exists():
+        raise FileNotFoundError(f"{label} does not exist: {absolute}")
+    if absolute.is_symlink() or not absolute.is_dir():
+        raise ValueError(f"{label} must be a non-symlink directory")
+    if absolute.resolve(strict=True) != absolute:
+        raise ValueError(f"{label} escaped its physical root")
+    return absolute
+
+
+def _canonical_storage_root(plane_name: str) -> Path:
+    """Return the established storage authority for exactly one runtime plane."""
+    if plane_name == "dev":
+        from agent.governance.db import _dev_runtime_root
+
+        return _dev_runtime_root(create=False)
+    return _existing_non_symlink_root(
+        _project_root() / "shared-volume", "stable shared-volume root",
+    )
+
+
+def plane_bound_manager_identity(
+    project_id: str, governance_url: str, storage_root: str,
+) -> dict:
+    """Validate the immutable custody boundary for one manager sidecar."""
+    plane = resolve_runtime_plane(project_id)
+    if not isinstance(governance_url, str) or governance_url != plane.governance_url:
+        raise ValueError("manager sidecar governance URL crosses the project runtime plane")
+    if not isinstance(storage_root, str) or not storage_root or storage_root != storage_root.strip():
+        raise ValueError("manager sidecar requires explicit project, governance URL, and storage root")
+    supplied_root = _existing_non_symlink_root(
+        Path(storage_root), "manager sidecar storage root",
+    )
+    canonical_root = _canonical_storage_root(plane.name)
+    supplied_stat = supplied_root.stat(follow_symlinks=False)
+    canonical_stat = canonical_root.stat(follow_symlinks=False)
+    if (
+        supplied_root != canonical_root
+        or (supplied_stat.st_dev, supplied_stat.st_ino)
+        != (canonical_stat.st_dev, canonical_stat.st_ino)
+    ):
+        raise ValueError("manager sidecar storage root crosses the project runtime plane")
+    return {"project_id": plane.project_id, "plane": plane.name,
+            "governance_url": plane.governance_url, "manager_url": plane.manager_url,
+            "executor_url": plane.executor_url, "storage_root": str(canonical_root),
+            "sidecar_port": urlparse(plane.manager_url).port,
+            "storage_device": canonical_stat.st_dev, "storage_inode": canonical_stat.st_ino}
 
 
 def _profile_auth_controller():
@@ -369,30 +423,44 @@ def _ensure_plugin_clone_checkout(chain_version: str, branch_ref: str = "") -> s
     return resolved
 
 
-def _governance_url() -> str:
-    return os.getenv("GOVERNANCE_URL", "http://localhost:40000")
-
-
-def _governance_port() -> int:
-    url = _governance_url()
+def _require_bound_identity(identity: dict) -> dict:
+    """Reject a missing or tampered sidecar custody identity before effects."""
+    if not isinstance(identity, dict):
+        raise RuntimeError("manager sidecar has no immutable launch identity")
     try:
-        parsed = urlparse(url)
-        return parsed.port or 40000
-    except Exception:
-        return 40000
+        plane = resolve_runtime_plane(identity.get("project_id"))
+        root = _existing_non_symlink_root(
+            Path(identity.get("storage_root", "")), "manager sidecar storage root",
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("manager sidecar launch identity is invalid") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("manager sidecar storage authority is unavailable") from exc
+    expected = {
+        "project_id": plane.project_id, "plane": plane.name,
+        "governance_url": plane.governance_url, "manager_url": plane.manager_url,
+        "executor_url": plane.executor_url,
+        "sidecar_port": urlparse(plane.manager_url).port,
+        "storage_root": str(root),
+        "storage_device": root.stat(follow_symlinks=False).st_dev,
+        "storage_inode": root.stat(follow_symlinks=False).st_ino,
+    }
+    for field, value in expected.items():
+        if identity.get(field) != value:
+            raise RuntimeError("manager sidecar launch identity is inconsistent")
+    return identity
 
 
-def _governance_log_paths(chain_version: str) -> tuple[Path, Path]:
+def _governance_log_paths(identity: dict, chain_version: str) -> tuple[Path, Path]:
     """Return durable stdout/stderr log paths for a spawned governance process."""
-    project_root = _project_root()
-    shared_root = Path(os.getenv("SHARED_VOLUME_PATH", str(project_root / "shared-volume")))
-    log_dir = shared_root / "codex-tasks" / "logs"
+    bound = _require_bound_identity(identity)
+    log_dir = Path(bound["storage_root"]) / "codex-tasks" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     safe_version = "".join(
         ch for ch in (chain_version or "unknown") if ch.isalnum() or ch in ("-", "_")
     )[:32] or "unknown"
-    prefix = f"governance-redeploy-{_governance_port()}-{safe_version}-{stamp}"
+    prefix = f"governance-redeploy-{urlparse(bound['governance_url']).port}-{safe_version}-{stamp}"
     return log_dir / f"{prefix}.out.log", log_dir / f"{prefix}.err.log"
 
 
@@ -416,9 +484,9 @@ def _find_governance_process() -> Optional[int]:
         return None
 
 
-def _governance_listener_pids(port: Optional[int] = None) -> tuple[int, ...]:
+def _governance_listener_pids(port: int) -> tuple[int, ...]:
     """Return only the process IDs that own the governance TCP listener."""
-    port = _governance_port() if port is None else int(port)
+    port = int(port)
     if sys.platform == "win32":
         result = subprocess.run(
             ["netstat", "-ano"], capture_output=True, text=True, timeout=5
@@ -470,7 +538,7 @@ def _listener_and_process_stopped(pid: int, port: int) -> bool:
     return not _pid_exists(pid) and not _governance_listener_pids(port)
 
 
-def _stop_governance_process() -> bool:
+def _stop_governance_process(identity: dict) -> bool:
     """Attempt to stop the currently running governance process.
 
     Probes existing governance, sends SIGTERM with 5s timeout, then SIGKILL
@@ -478,7 +546,8 @@ def _stop_governance_process() -> bool:
 
     Returns True if a process was stopped or none was running.
     """
-    port = _governance_port()
+    bound = _require_bound_identity(identity)
+    port = urlparse(bound["governance_url"]).port
     try:
         listener_pids = _governance_listener_pids(port)
         if not listener_pids:
@@ -533,12 +602,16 @@ def _stop_governance_process() -> bool:
     return False
 
 
-def _spawn_governance_process(chain_version: str) -> subprocess.Popen:
+def _spawn_governance_process(identity: dict, chain_version: str) -> subprocess.Popen:
     """Spawn a new governance process with correct CWD and PYTHONPATH."""
+    bound = _require_bound_identity(identity)
     project_root = _project_root()
-    stdout_log, stderr_log = _governance_log_paths(chain_version)
+    stdout_log, stderr_log = _governance_log_paths(bound, chain_version)
 
     env = os.environ.copy()
+    for key in ("GOVERNANCE_URL", "GOVERNANCE_PORT", "EXECUTOR_PROJECT_ID",
+                "PROJECT_ID", "SHARED_VOLUME_PATH", "EXECUTOR_API_PORT", "MANAGER_URL"):
+        env.pop(key, None)
     existing_pythonpath = env.get("PYTHONPATH", "")
     project_root_str = str(project_root)
     if project_root_str not in existing_pythonpath:
@@ -549,6 +622,15 @@ def _spawn_governance_process(chain_version: str) -> subprocess.Popen:
         )
     env["GOVERNANCE_STDOUT_LOG"] = str(stdout_log)
     env["GOVERNANCE_STDERR_LOG"] = str(stderr_log)
+    env.update({
+        "GOVERNANCE_URL": bound["governance_url"],
+        "GOVERNANCE_PORT": str(urlparse(bound["governance_url"]).port),
+        "PROJECT_ID": bound["project_id"],
+        "EXECUTOR_PROJECT_ID": bound["project_id"],
+        "SHARED_VOLUME_PATH": bound["storage_root"],
+        "MANAGER_URL": bound["manager_url"],
+        "EXECUTOR_API_PORT": str(urlparse(bound["executor_url"]).port),
+    })
 
     # The bundled Windows Python uses python312._pth, where "." resolves to the
     # runtime directory, not the process cwd.  Running with "-m agent..." can
@@ -608,6 +690,7 @@ def _governance_runtime_source_sha256() -> str:
 
 
 def _wait_for_health(
+    identity: dict,
     proc: subprocess.Popen,
     expected_runtime_head: str,
     expected_source_sha256: str,
@@ -617,7 +700,9 @@ def _wait_for_health(
     import urllib.request
     import urllib.error
 
-    gov_url = _governance_url()
+    bound = _require_bound_identity(identity)
+    gov_url = bound["governance_url"]
+    governance_port = urlparse(gov_url).port
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
@@ -625,7 +710,7 @@ def _wait_for_health(
             log.error("manager_http_server: spawned governance PID %d exited", proc.pid)
             return False
         try:
-            if _governance_listener_pids() != (proc.pid,):
+            if _governance_listener_pids(governance_port) != (proc.pid,):
                 time.sleep(_HEALTH_CHECK_INTERVAL)
                 continue
             req = urllib.request.Request(f"{gov_url}/api/health", method="GET")
@@ -668,7 +753,7 @@ def _wait_for_health(
                                 proc.pid,
                             )
                             return False
-                        if _governance_listener_pids() != (proc.pid,):
+                        if _governance_listener_pids(governance_port) != (proc.pid,):
                             log.error(
                                 "manager_http_server: governance PID %d lost listener ownership during health probe",
                                 proc.pid,
@@ -687,7 +772,7 @@ def _wait_for_health(
     return False
 
 
-def _write_chain_version(chain_version: str) -> bool:
+def _write_chain_version(identity: dict, chain_version: str) -> bool:
     """Write chain_version to governance DB via /api/version-update.
 
     Only called after successful spawn + health check.
@@ -696,8 +781,9 @@ def _write_chain_version(chain_version: str) -> bool:
     import urllib.request
     import urllib.error
 
-    gov_url = _governance_url()
-    project_id = os.getenv("EXECUTOR_PROJECT_ID", os.getenv("PROJECT_ID", "aming-claw"))
+    bound = _require_bound_identity(identity)
+    gov_url = bound["governance_url"]
+    project_id = bound["project_id"]
     url = f"{gov_url}/api/version-update/{project_id}"
     data = json.dumps({
         "chain_version": chain_version,
@@ -757,6 +843,9 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8"))
         except Exception:
             return {}
+
+    def _bound_identity(self) -> dict:
+        return _require_bound_identity(getattr(self.server, "manager_identity", None))
 
     def do_POST(self):
         """Route POST requests."""
@@ -864,6 +953,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                 "service": "manager_http_server",
                 "runtime_version": runtime_version,
                 **_runtime_checkout_branch_state(),
+                "manager_identity": getattr(self.server, "manager_identity", {}),
             })
             return
         self._send_json({"ok": False, "detail": "Not found"}, 404)
@@ -872,12 +962,17 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         """POST /api/manager/respawn-executor — write manager_signal.json."""
         body = self._read_json_body()
         try:
-            state_dir = _project_root() / "shared-volume" / "codex-tasks" / "state"
+            identity = self._bound_identity()
+            root = Path(identity["storage_root"])
+            state_dir = root if identity["plane"] == "dev" else root / "codex-tasks" / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             sig = {
                 "action": "restart",
                 "requested_action": "respawn_executor",
                 "chain_version": body.get("chain_version", ""),
+                "project_id": identity["project_id"],
+                "governance_url": identity["governance_url"],
+                "executor_url": identity["executor_url"],
                 "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             (state_dir / "manager_signal.json").write_text(json.dumps(sig), encoding="utf-8")
@@ -899,6 +994,12 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         Response (JSON):
           {"ok": true/false, "detail": "...", "pid": <int or null>}
         """
+        try:
+            identity = self._bound_identity()
+        except RuntimeError as exc:
+            self._send_json({"ok": False, "detail": str(exc), "error_code": "CROSS_PLANE_MANAGER"}, 409)
+            return
+
         # Mutual-exclusion guard — refuse to redeploy service_manager
         if target in _FORBIDDEN_TARGETS:
             self._send_json(
@@ -981,7 +1082,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
 
         # Step 1: Stop the exact TCP listener owner and prove it exited.
         try:
-            stopped = _stop_governance_process()
+            stopped = _stop_governance_process(identity)
         except Exception as exc:
             log.error("manager_http_server: error stopping governance: %s", exc)
             stopped = False
@@ -1011,7 +1112,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
 
         # Step 2: Spawn new governance with correct CWD/PYTHONPATH
         try:
-            proc = _spawn_governance_process(chain_version)
+            proc = _spawn_governance_process(identity, chain_version)
         except Exception as exc:
             log.error("manager_http_server: failed to spawn governance: %s", exc)
             self._send_json(
@@ -1036,7 +1137,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
             return
 
         # Step 3: Health-poll /api/health up to 30s
-        healthy = _wait_for_health(proc, runtime_head, expected_source_sha256)
+        healthy = _wait_for_health(identity, proc, runtime_head, expected_source_sha256)
 
         if not healthy:
             self._send_json(
@@ -1061,7 +1162,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
             return
 
         # Step 4: Write chain_version to DB (only on success)
-        version_written = _write_chain_version(chain_version)
+        version_written = _write_chain_version(identity, chain_version)
 
         if not version_written:
             self._send_json(
@@ -1089,7 +1190,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         # spawned runtime identity immediately before returning success so a
         # process/listener transition during that write cannot be hidden.
         if not _wait_for_health(
-            proc, runtime_head, expected_source_sha256, timeout=5
+            identity, proc, runtime_head, expected_source_sha256, timeout=5
         ):
             detail = "Governance runtime identity changed after version update"
             self._send_json(
@@ -1147,19 +1248,29 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
 def create_server(
     host: str = MANAGER_HTTP_HOST,
     port: int = MANAGER_HTTP_PORT,
+    *,
+    project_id: str,
+    governance_url: str,
+    storage_root: str,
 ) -> ThreadingHTTPServer:
-    """Create a ThreadingHTTPServer bound to host:port."""
+    """Create a sidecar bound to one project-plane custody identity."""
+    identity = plane_bound_manager_identity(project_id, governance_url, storage_root)
+    if int(port) not in {0, int(identity["sidecar_port"])}:
+        raise ValueError("manager sidecar port does not match its project-plane identity")
     server = ThreadingHTTPServer((host, port), ManagerHTTPHandler)
+    server.manager_identity = identity
     return server
 
 
-def run_server(host: str = MANAGER_HTTP_HOST, port: int = MANAGER_HTTP_PORT) -> None:
+def run_server(host: str = MANAGER_HTTP_HOST, port: int = MANAGER_HTTP_PORT, *,
+               project_id: str, governance_url: str, storage_root: str) -> None:
     """Run the HTTP server (blocking). Intended to be called from a thread.
 
-    Contract: service_manager.py imports and calls this function from its
-    sidecar thread. Signature must remain (host, port) -> None.
+    The caller must supply the same explicit project, governance listener, and
+    storage root that launched the manager; there is no host-global sidecar.
     """
-    server = create_server(host, port)
+    server = create_server(host, port, project_id=project_id,
+                           governance_url=governance_url, storage_root=storage_root)
     log.info("manager_http_server: starting on %s:%d", host, port)
     try:
         server.serve_forever()
@@ -1175,4 +1286,4 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
     )
-    run_server()
+    raise SystemExit("manager_http_server must be launched by a plane-bound ServiceManager")

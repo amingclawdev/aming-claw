@@ -104,7 +104,15 @@ ALLOWED_PATCH_TYPES = LOW_RISK_PATCH_TYPES | STRUCTURAL_PATCH_TYPES | {"mark_orp
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(GRAPH_CORRECTION_SCHEMA_SQL)
+    from . import db
+
+    if db.dev_runtime_verify_only() and not db.graph_materialization_admission_active(conn):
+        db.verify_graph_materialization_schema(conn)
+        return
+    if db.graph_materialization_admission_active(conn):
+        db.execute_graph_schema_sql(conn, GRAPH_CORRECTION_SCHEMA_SQL)
+    else:
+        conn.executescript(GRAPH_CORRECTION_SCHEMA_SQL)
 
 
 def _json(data: Any) -> str:

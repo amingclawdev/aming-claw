@@ -29,6 +29,25 @@ def conn(tmp_path, monkeypatch):
     c.close()
 
 
+@pytest.fixture(autouse=True)
+def _stable_graph_activation_connection(monkeypatch):
+    """Graph-store unit fixtures model a verified stable DB by default.
+
+    Physical connection classification itself is covered in test_governance_db;
+    individual store tests do not own a live stable authority fixture.
+    """
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "schema_version": "ac_graph_activation_policy.v1",
+            "runtime_plane": "stable",
+            "active_graph_activation_allowed": True,
+            "classification_reason": "test_verified_stable_connection",
+        },
+    )
+
+
 def _claim_owner(suffix: str = "one") -> dict[str, object]:
     return {
         "manager_epoch": f"epoch-{suffix}",
@@ -75,6 +94,92 @@ def test_schema_migration_is_idempotent(conn):
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
     ).fetchone()
     assert version["value"] == str(db.SCHEMA_VERSION)
+
+
+def test_dev_component_schema_guard_is_exact_verify_only(conn, monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    store.ensure_schema(conn)
+    conn.execute("CREATE TABLE graph_unowned_extra (id TEXT PRIMARY KEY)")
+    conn.commit()
+    before = conn.total_changes
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    with pytest.raises(db.DevRuntimeSchemaVerificationError):
+        store.ensure_schema(conn)
+    assert conn.total_changes == before
+
+
+def test_active_graph_effects_bind_to_durable_database_world_not_environment(
+    conn, monkeypatch
+):
+    """A dev DB cannot activate even if an outer caller claims stable."""
+    store.ensure_schema(conn)
+    candidate = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="dev-candidate-only",
+        commit_sha="dev-commit",
+        snapshot_kind="full",
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "active_graph_activation_allowed": False,
+        },
+    )
+
+    with pytest.raises(ValueError, match="forbidden"):
+        store.activate_graph_snapshot(
+            conn,
+            PID,
+            candidate["snapshot_id"],
+            auto_rebuild_projection=False,
+        )
+
+    assert store.get_active_graph_snapshot(conn, PID) is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id = ?", (PID,)
+    ).fetchone()[0] == 0
+    # Candidate construction remains a legal dev-world operation.
+    assert store.get_graph_snapshot(conn, PID, candidate["snapshot_id"])["status"] == "candidate"
+
+
+def test_active_graph_effects_reject_missing_or_unknown_database_world_before_refs(
+    conn,
+    monkeypatch,
+):
+    store.ensure_schema(conn)
+    candidate = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="unknown-world-candidate",
+        commit_sha="unknown-commit",
+        snapshot_kind="full",
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "unknown",
+            "active_graph_activation_allowed": False,
+        },
+    )
+
+    with pytest.raises(ValueError, match="forbidden"):
+        store.activate_graph_snapshot(
+            conn,
+            PID,
+            candidate["snapshot_id"],
+            auto_rebuild_projection=False,
+            schema_ready=True,
+        )
+
+    assert store.get_active_graph_snapshot(conn, PID) is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id = ?", (PID,)
+    ).fetchone()[0] == 0
 
 
 def _generation(

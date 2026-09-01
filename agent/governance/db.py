@@ -17,9 +17,17 @@ import re
 import fcntl
 import subprocess
 import errno
+import math
+import struct
+import urllib.request
+import urllib.error
+import urllib.parse
+import shutil
+import tempfile
+from enum import Enum
 from contextlib import closing
 from pathlib import Path
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -34,6 +42,7 @@ AC_PROJECT_ID = "aming-claw"
 DEV_RUNTIME_PLANE = "dev"
 RUNTIME_PLANE_ENV = "AMING_CLAW_RUNTIME_PLANE"
 AC_DEV_STORAGE_ROOT_ENV = "AMING_CLAW_DEV_STORAGE_ROOT"
+AC_STABLE_SHARED_VOLUME_ENV = "AMING_CLAW_SHARED_VOLUME"
 AC_DEV_WORLD_ID = "ac-dev"
 AC_STABLE_WORLD_ID = "ac-stable"
 AC_WORLD_GENESIS_SCHEMA = "ac_governance_world_genesis.v1"
@@ -44,10 +53,555 @@ AC_DATABASE_STABLE_RELATIVE_PATH = (
 AC_DATABASE_DEV_RELATIVE_PATH = "governance/aming-claw/governance.db"
 AC_LEGACY_ARCHIVE_SIZE_BYTES = 178_625_794_048
 AC_DEV_CUTOVER_SCHEMA = "ac_dev_world_cutover.v1"
+AC_DEV_LAUNCH_RECEIPT_SCHEMA = "ac_dev_launch_receipt.v1"
+AC_DEV_LAUNCH_RECEIPT_NAME = "launch-receipt.json"
+AC_DEV_COW_SUCCESSOR_SCHEMA = "ac_dev_cow_database_successor.v2"
+AC_DEV_COW_SUCCESSOR_ARCHIVE = "archive/cow-database-successor"
+AC_DEV_COW_SUCCESSOR_PREFIX = "successor-v2"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
+_DEV_FIRST_START_CONTEXT_TOKEN = object()
+
+
+class _DevFirstStartContext:
+    """One-process proof that the issuance preimage made its sole transition."""
+
+    __slots__ = (
+        "pid", "process_start_identity", "source_root", "source_commit",
+        "source_tree", "cli_sha256", "server_sha256", "storage_root",
+        "storage_device", "storage_inode", "database_path", "database_device",
+        "database_inode", "world_custody_sha256", "_sealed",
+    )
+
+    def __init__(self, token: object, **values: object) -> None:
+        if token is not _DEV_FIRST_START_CONTEXT_TOKEN:
+            raise TypeError("AC dev first-start context is module-private")
+        for name in self.__slots__[:-1]:
+            object.__setattr__(self, name, values[name])
+        object.__setattr__(self, "_sealed", token)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise TypeError("AC dev first-start context is immutable")
+
+    def __copy__(self) -> object:
+        raise TypeError("AC dev first-start context cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> object:
+        raise TypeError("AC dev first-start context cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("AC dev first-start context cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("AC dev first-start context cannot be serialized")
+
+
+_DEV_FIRST_START_CONTEXT: _DevFirstStartContext | None = None
+
+
+def _sqlite_quote_identifier(identifier: str) -> str:
+    """Return one deterministic SQLite double-quoted identifier."""
+    if not isinstance(identifier, str):
+        raise TypeError("SQLite identifier must be text")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _sqlite_projection_value(value: object) -> list[str]:
+    """Encode one SQLite value without type, sign, or byte ambiguity."""
+    if value is None:
+        return ["null", ""]
+    # sqlite3 returns INTEGER as int.  Treat an injected Python bool by the
+    # same SQLite storage-class policy instead of inventing a BOOLEAN class.
+    if isinstance(value, bool):
+        return ["integer", "1" if value else "0"]
+    if isinstance(value, int):
+        return ["integer", str(value)]
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ["float", "nan"]
+        if math.isinf(value):
+            return ["float", "+inf" if value > 0 else "-inf"]
+        # IEEE-754 bytes are exact and preserve -0.0 independently of +0.0.
+        return ["float64-be", struct.pack(">d", value).hex()]
+    if isinstance(value, str):
+        # JSON's UTF-8 encoding is deterministic; the tag separates TEXT from BLOB.
+        return ["text-utf8", value]
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return ["blob-hex", bytes(value).hex()]
+    raise TypeError("unsupported SQLite projection value type: " + type(value).__name__)
+
+
+def _sqlite_logical_projection(
+    connection: sqlite3.Connection, *, exclude_tables: frozenset[str] = frozenset(),
+) -> dict[str, str]:
+    """Hash ordered tables/columns/rows with one lossless tagged encoding."""
+    tables = [str(row[0]) for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ) if str(row[0]) not in exclude_tables and not str(row[0]).startswith("sqlite_")]
+    projection: dict[str, str] = {}
+    for table in tables:
+        quoted_table = _sqlite_quote_identifier(table)
+        columns = [str(row[1]) for row in connection.execute(
+            f"PRAGMA table_info({quoted_table})"
+        )]
+        quoted_columns = ",".join(_sqlite_quote_identifier(column) for column in columns)
+        rows = connection.execute(
+            f"SELECT {quoted_columns} FROM {quoted_table}"
+        ).fetchall()
+        encoded_rows = [[_sqlite_projection_value(value) for value in row] for row in rows]
+        encoded_rows.sort(key=lambda row: json.dumps(
+            row, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8"))
+        payload = {
+            "table": table,
+            "columns": columns,
+            "rows": encoded_rows,
+        }
+        projection[table] = "sha256:" + hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")).hexdigest()
+    return projection
+def _stable_health_request() -> dict[str, object]:
+    """Fixed read-only localhost stable health boundary."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:40000/api/health", timeout=2) as response:
+            payload = json.loads(response.read(65536).decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError("AC stable authority is unavailable") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("AC stable authority health is invalid")
+    return payload
+
+
+def _stable_process_identity(pid: int) -> tuple[str, str, str]:
+    """Read start, argv and cwd from the OS; a PID alone is never authority."""
+    if not isinstance(pid, int) or pid <= 0:
+        raise RuntimeError("AC stable authority PID is invalid")
+    start = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=2, check=False).stdout.strip()
+    command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=2, check=False).stdout.strip()
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        # macOS does not expose procfs.  ``lsof`` is the OS-owned equivalent
+        # for a process's current directory; do not weaken this to a PID-only
+        # check when procfs is absent.
+        try:
+            lsof = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            cwd = next(
+                (line[1:] for line in lsof.stdout.splitlines() if line.startswith("n")),
+                "",
+            )
+        except (OSError, subprocess.SubprocessError):
+            cwd = ""
+    if not start or not command or not cwd:
+        raise RuntimeError("AC stable authority process identity is unavailable")
+    return start, command, cwd
+
+
+def _verified_stable_binding() -> dict[str, object]:
+    """Read-only fixed-40000 + unique stable-worktree authority for AC dev."""
+    health = _stable_health_request()
+    if not isinstance(health, Mapping) or not (
+        health.get("status") == "ok" and health.get("service") == "governance"
+        and health.get("port") == 40000 and health.get("runtime_plane") == "stable"
+        and health.get("runtime_stale") is False
+        and isinstance(health.get("pid"), int) and health["pid"] > 0
+    ):
+        raise RuntimeError("AC stable authority health is invalid")
+    _start, command, cwd = _stable_process_identity(int(health["pid"]))
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=5, check=False)
+    roots = []
+    for block in result.stdout.strip().split("\n\n"):
+        fields = dict(line.split(" ", 1) if " " in line else (line, "") for line in block.splitlines())
+        if fields.get("branch") == "refs/heads/codex/direct-no-pass-post-reconcile-r2" and fields.get("worktree"):
+            roots.append(Path(fields["worktree"]).resolve(strict=True))
+    if len(roots) != 1:
+        raise RuntimeError("AC stable authority worktree is unavailable")
+    stable_root = roots[0]
+    server_command = "agent.governance.server" in command or (
+        "-m agent.cli" in command and " start " in f" {command} "
+    )
+    if (
+        not _start
+        or Path(cwd).resolve(strict=True) != stable_root
+        or not server_command
+    ):
+        raise RuntimeError("AC stable authority process binding is invalid")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=stable_root, capture_output=True, text=True, timeout=5, check=False).stdout.strip().lower()
+    source_path = stable_root / "agent" / "governance" / "server.py"
+    source_hash = "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
+    identity = health.get("runtime_plane_identity") if isinstance(health.get("runtime_plane_identity"), Mapping) else {}
+    loaded = health.get("loaded_runtime_identity") if isinstance(health.get("loaded_runtime_identity"), Mapping) else {}
+    if not (
+        health.get("runtime_loaded_version") == head
+        and identity.get("worktree_root") == str(stable_root)
+        and identity.get("branch") == "codex/direct-no-pass-post-reconcile-r2"
+        and identity.get("commit") == head
+        and identity.get("stable_anchor_commit") == head
+        and loaded.get("loaded_commit") == head
+        and loaded.get("loaded_source_path") == str(source_path)
+        and loaded.get("loaded_source_sha256") == source_hash
+        and loaded.get("worktree_source_sha256") == source_hash
+        and "aming-claw" not in set(identity.get("project_allowlist") or [])
+    ):
+        raise RuntimeError("AC stable authority source identity is invalid")
+    shared = roots[0] / "shared-volume"
+    if not shared.is_dir() or shared.is_symlink() or shared.resolve(strict=True) != shared:
+        raise RuntimeError("AC stable authority shared volume is invalid")
+    return {"shared_volume_path": str(shared), "health": dict(health), "stable_head": head}
+
+
+def verified_stable_database_binding(
+    requested_shared_volume: str | None = None,
+    *,
+    stable_anchor_commit: str | None = None,
+) -> dict[str, object]:
+    """Return the one verified stable DB binding, with TOCTOU revalidation data."""
+    binding = _verified_stable_binding()
+    shared = _absolute_non_symlink_root(
+        Path(str(binding["shared_volume_path"])), create=False
+    )
+    if requested_shared_volume is not None:
+        requested = _absolute_non_symlink_root(
+            Path(requested_shared_volume), create=False
+        )
+        if requested != shared:
+            raise RuntimeError("AC dev runtime requires the exact stable-worktree shared volume")
+    head = str(binding["stable_head"])
+    if stable_anchor_commit is not None and str(stable_anchor_commit).lower() != head:
+        raise RuntimeError("stable service authority changed while binding its database")
+    database = (shared / Path(AC_DATABASE_STABLE_RELATIVE_PATH).relative_to("shared-volume")).absolute()
+    before = database.stat(follow_symlinks=False)
+    if (
+        database.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+        or database.resolve(strict=True) != database
+    ):
+        raise RuntimeError("AC dev runtime canonical stable database identity is invalid")
+    identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(before.st_dev),
+        "inode": int(before.st_ino),
+        "stable_relative_path_sha256": "sha256:" + hashlib.sha256(
+            AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
+    health_identity = dict(binding["health"].get("runtime_plane_identity") or {})
+    if (
+        health_identity.get("database_identity") != identity
+        or health_identity.get("stable_database_identity") != identity
+    ):
+        raise RuntimeError("stable service database identity differs from the stable worktree")
+    after = database.stat(follow_symlinks=False)
+    if (
+        database.is_symlink()
+        or not stat.S_ISREG(after.st_mode)
+        or (int(after.st_dev), int(after.st_ino)) != (int(before.st_dev), int(before.st_ino))
+    ):
+        raise RuntimeError("stable database identity changed while binding")
+    return {
+        **binding,
+        "shared_volume_path": str(shared),
+        "database_path": str(database),
+        "stable_database_identity": identity,
+    }
+
+
+def _revalidate_stable_database_binding(binding: Mapping[str, object]) -> None:
+    """Fail before a dev root, receipt, or DB effect if the stable DB was swapped."""
+    database = Path(str(binding.get("database_path") or ""))
+    expected = binding.get("stable_database_identity")
+    if not database or not isinstance(expected, Mapping):
+        raise RuntimeError("stable database binding is incomplete")
+    metadata = database.stat(follow_symlinks=False)
+    actual = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(metadata.st_dev), "inode": int(metadata.st_ino),
+        "stable_relative_path_sha256": "sha256:" + hashlib.sha256(
+            AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
+    if database.is_symlink() or not stat.S_ISREG(metadata.st_mode) or actual != dict(expected):
+        raise RuntimeError("stable database identity changed before dev effect")
+
+
+def _connection_main_database_identity(
+    conn: sqlite3.Connection,
+) -> tuple[Path, os.stat_result] | None:
+    """Read the exact physical main SQLite file already opened by ``conn``."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main_paths = [
+            str(row[2] or "")
+            for row in rows
+            if str(row[1] or "") == "main"
+        ]
+    except sqlite3.Error:
+        return None
+    if len(main_paths) != 1 or not main_paths[0]:
+        return None
+    candidate = Path(main_paths[0])
+    try:
+        if (
+            not candidate.is_absolute()
+            or candidate.is_symlink()
+            or not candidate.is_file()
+            or candidate.resolve(strict=True) != candidate
+        ):
+            return None
+        metadata = candidate.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return candidate, metadata
+
+
+def _unknown_graph_activation_connection(reason: str) -> dict[str, object]:
+    from agent.runtime_plane import graph_activation_policy
+
+    return {**graph_activation_policy("unknown"), "classification_reason": reason}
+
+
+def _verify_current_cow_successor_source(
+    conn: sqlite3.Connection, root: Path, successor_receipt: Mapping[str, object],
+) -> None:
+    """Bind immutable adoption history to the clean current canonical descendant."""
+
+    adoption_ref = dict(
+        dict(successor_receipt.get("history") or {}).get("adoption") or {}
+    )
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    anchor = dict(adoption.get("candidate_source_identity") or {})
+    meta = dict(conn.execute(
+        "SELECT key,value FROM schema_meta WHERE key IN "
+        "('governance_world_source_tip_json','governance_world_source_tip_sha256',"
+        "'governance_world_source_tip_revision')"
+    ))
+    try:
+        current = json.loads(str(meta.get("governance_world_source_tip_json") or ""))
+        revision = int(meta.get("governance_world_source_tip_revision") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AC dev COW current source tip is invalid") from exc
+    if not isinstance(current, Mapping):
+        raise ValueError("AC dev COW current source tip is invalid")
+    if (
+        adoption_path.parent
+        != root / "archive" / "canonical-legacy-postimage-adoption"
+        or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
+        or revision < 2
+        or meta.get("governance_world_source_tip_sha256")
+        != _world_source_tip_hash(current)
+        or str(anchor.get("root") or "") != str(current.get("root") or "")
+        or str(anchor.get("commit") or "") == str(current.get("commit") or "")
+    ):
+        raise ValueError("AC dev COW current source descendant authority mismatch")
+    _validate_dev_source_tip_custody(
+        current, stored_sha256=str(meta.get("governance_world_source_tip_sha256") or ""),
+        candidate=current,
+    )
+    _verify_dev_source_upgrade(anchor, current)
+
+
+def _quick_check_returns_literal_ok(conn: sqlite3.Connection) -> bool:
+    """Accept only SQLite's exact one-column, string ``ok`` result."""
+
+    row = conn.execute("PRAGMA quick_check").fetchone()
+    if row is None:
+        return False
+    try:
+        if len(row) != 1:
+            return False
+        value = row[0]
+    except (IndexError, KeyError, TypeError):
+        return False
+    return type(value) is str and value == "ok"
+
+
+def classify_graph_activation_connection(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Classify an opened graph DB without accepting caller/environment plane claims.
+
+    Active graph truth is allowed only when this *opened connection* is the
+    exact live stable database.  A dev connection is recognized from the
+    canonical external root, receipt, and genesis invariants and is denied.
+    Everything else is ``unknown`` and denied before a graph ref, event, or
+    projection can be written.
+    """
+    from agent.runtime_plane import graph_activation_policy, resolve_ac_dev_storage_root
+
+    opened = _connection_main_database_identity(conn)
+    if opened is None:
+        return _unknown_graph_activation_connection("main_database_identity_unavailable")
+    database, before = opened
+    try:
+        binding = verified_stable_database_binding()
+        stable_database = Path(str(binding["database_path"])).absolute()
+        stable_identity = dict(binding["stable_database_identity"])
+        if (
+            database == stable_database
+            and int(before.st_dev) == int(stable_identity["device"])
+            and int(before.st_ino) == int(stable_identity["inode"])
+        ):
+            _revalidate_stable_database_binding(binding)
+            after = stable_database.stat(follow_symlinks=False)
+            if (
+                not stable_database.is_symlink()
+                and stat.S_ISREG(after.st_mode)
+                and (int(after.st_dev), int(after.st_ino))
+                == (int(before.st_dev), int(before.st_ino))
+            ):
+                return {
+                    **graph_activation_policy("stable"),
+                    "classification_reason": "verified_stable_database_binding",
+                }
+    except (KeyError, OSError, RuntimeError, ValueError, sqlite3.Error):
+        # A stable verification failure cannot be rescued by a claimed plane.
+        pass
+
+    try:
+        # This derives the dev root from live stable authority, rather than
+        # trusting AMING_CLAW_DEV_STORAGE_ROOT or a store caller.
+        binding = verified_stable_database_binding()
+        stable = Path(str(binding["shared_volume_path"])).absolute()
+        root = resolve_ac_dev_storage_root(stable)
+        expected_database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+        if database != expected_database:
+            return _unknown_graph_activation_connection("main_database_not_canonical_world")
+        root_meta = root.stat(follow_symlinks=False)
+        if root.is_symlink() or root.resolve(strict=True) != root:
+            return _unknown_graph_activation_connection("dev_storage_root_identity_invalid")
+        receipt_path = root / AC_DEV_LAUNCH_RECEIPT_NAME
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return _unknown_graph_activation_connection("dev_launch_receipt_missing")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        stable_meta = stable.stat(follow_symlinks=False)
+        stable_parent_meta = stable.parent.stat(follow_symlinks=False)
+        server_source = Path(__file__).with_name("server.py")
+        source_sha256 = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
+        required_receipt = {
+            "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
+            "world_id": AC_DEV_WORLD_ID,
+            "project_id": AC_PROJECT_ID,
+            "runtime_plane": DEV_RUNTIME_PLANE,
+            "port": 40008,
+            "background": False,
+            "storage_root": str(root),
+            "storage_device": int(root_meta.st_dev),
+            "storage_inode": int(root_meta.st_ino),
+            "stable_shared_volume": str(stable),
+            "stable_shared_volume_device": int(stable_meta.st_dev),
+            "stable_shared_volume_inode": int(stable_meta.st_ino),
+            "stable_parent_device": int(stable_parent_meta.st_dev),
+            "stable_parent_inode": int(stable_parent_meta.st_ino),
+            "source_sha256": source_sha256,
+        }
+        if not isinstance(receipt, Mapping) or any(
+            receipt.get(key) != value for key, value in required_receipt.items()
+        ):
+            return _unknown_graph_activation_connection("dev_launch_receipt_mismatch")
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+        genesis = json.loads(str(meta.get("governance_world_genesis_json") or ""))
+        genesis_hash = str(meta.get("governance_world_genesis_sha256") or "")
+        expected_genesis_hash = _world_genesis_hash(genesis)
+        database_identity = dict(genesis.get("database_identity") or {})
+        storage_identity = dict(genesis.get("storage_root_identity") or {})
+        genesis_is_current_database = (
+            meta.get("governance_world_id") == AC_DEV_WORLD_ID
+            and genesis_hash == expected_genesis_hash
+            and genesis.get("schema_version") == AC_WORLD_GENESIS_SCHEMA
+            and genesis.get("world_id") == AC_DEV_WORLD_ID
+            and genesis.get("project_id") == AC_PROJECT_ID
+            and genesis.get("source_only") is True
+            and genesis.get("rows_copied") == 0
+            and database_identity.get("device") == int(before.st_dev)
+            and database_identity.get("inode") == int(before.st_ino)
+            and storage_identity.get("path") == str(root)
+            and storage_identity.get("device") == int(root_meta.st_dev)
+            and storage_identity.get("inode") == int(root_meta.st_ino)
+        )
+        cow_successor_verified = False
+        if not genesis_is_current_database:
+            # A validated v2 COW receipt is the sole authority for replacing
+            # genesis' immutable predecessor inode.  Its validator reconstructs
+            # and content-checks the complete receipt/history chain; no caller
+            # claim or mutable live row participates in this decision.
+            successor_receipt = validate_dev_cow_successor_receipt(root)
+            successor = dict(successor_receipt.get("successor") or {})
+            successor_identity = dict(successor.get("identity") or {})
+            predecessor = dict(
+                dict(successor_receipt.get("predecessor") or {}).get("backup") or {}
+            )
+            receipt_genesis = dict(successor_receipt.get("genesis") or {})
+            cow_successor_verified = (
+                meta.get("governance_world_id") == AC_DEV_WORLD_ID
+                and genesis_hash == expected_genesis_hash
+                and genesis.get("schema_version") == AC_WORLD_GENESIS_SCHEMA
+                and genesis.get("world_id") == AC_DEV_WORLD_ID
+                and genesis.get("project_id") == AC_PROJECT_ID
+                and genesis.get("source_only") is True
+                and genesis.get("rows_copied") == 0
+                and storage_identity.get("path") == str(root)
+                and storage_identity.get("device") == int(root_meta.st_dev)
+                and storage_identity.get("inode") == int(root_meta.st_ino)
+                and receipt_genesis.get("raw_json")
+                == str(meta.get("governance_world_genesis_json") or "")
+                and receipt_genesis.get("sha256") == genesis_hash
+                and predecessor.get("device") == database_identity.get("device")
+                and predecessor.get("inode") == database_identity.get("inode")
+                and successor_identity.get("path") == str(expected_database)
+                and successor_identity.get("device") == int(before.st_dev)
+                and successor_identity.get("inode") == int(before.st_ino)
+            )
+            if not cow_successor_verified:
+                return _unknown_graph_activation_connection(
+                    "dev_cow_successor_identity_invalid"
+                )
+            if not _quick_check_returns_literal_ok(conn):
+                return _unknown_graph_activation_connection(
+                    "dev_cow_successor_current_database_invalid"
+                )
+            # Graph materialization identity is anchored by the immutable COW
+            # receipt/history chain, the opened inode, and the current source
+            # descendant below.  Do not turn unrelated optional subsystem
+            # inventory (for example parallel-branch runtime tables) into a
+            # second identity authority.  Ordinary dev startup continues to
+            # verify the complete source inventory at its existing call sites;
+            # the graph admission separately accepts only its exact canonical
+            # managed namespace or a completely empty one before issuing DDL.
+            _verify_current_cow_successor_source(
+                conn, root, successor_receipt,
+            )
+        _revalidate_stable_database_binding(binding)
+        after = expected_database.stat(follow_symlinks=False)
+        if (
+            expected_database.is_symlink()
+            or not stat.S_ISREG(after.st_mode)
+            or (int(after.st_dev), int(after.st_ino))
+            != (int(before.st_dev), int(before.st_ino))
+        ):
+            return _unknown_graph_activation_connection("dev_database_identity_changed")
+        return {
+            **graph_activation_policy("dev"),
+            "classification_reason": (
+                "verified_dev_cow_successor_receipt_history"
+                if cow_successor_verified
+                else "verified_dev_root_receipt_genesis"
+            ),
+        }
+    except (json.JSONDecodeError, KeyError, OSError, RuntimeError, ValueError, sqlite3.Error):
+        return _unknown_graph_activation_connection("dev_database_binding_unverified")
 
 _DEV_DENIED_SCHEMA_ACTIONS = frozenset(
     code
@@ -324,6 +878,300 @@ def dev_runtime_verify_only() -> bool:
     return _is_dev_runtime()
 
 
+_GRAPH_MATERIALIZATION_ADMISSION_LOCAL = threading.local()
+
+
+def graph_materialization_admission_active(conn: sqlite3.Connection) -> bool:
+    """Return whether ``conn`` is inside the one bounded graph-schema admission."""
+
+    return id(conn) in getattr(
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", frozenset()
+    )
+
+
+def execute_graph_schema_sql(conn: sqlite3.Connection, sql: str) -> None:
+    """Execute a schema script without ``executescript``'s implicit COMMIT.
+
+    This path is used only by the dev materialization admission.  Stable keeps
+    the historical ``executescript`` behavior byte-for-byte at each owner.
+    """
+
+    statement = ""
+    for line in str(sql).splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("graph schema source contains an incomplete statement")
+
+
+def _graph_materialization_inventory(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
+    rows = conn.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "WHERE type IN ('table','index','trigger','view') ORDER BY type,name,tbl_name"
+    ).fetchall()
+    return [tuple(str(value or "") for value in row) for row in rows]
+
+
+def _graph_materialization_canonical_inventory() -> list[tuple[str, str, str, str]]:
+    from . import graph_correction_patches, graph_events, graph_snapshot_store
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        connection_ids = set(
+            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+        )
+        connection_ids.add(id(canonical))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        graph_snapshot_store.ensure_schema(canonical)
+        graph_events.ensure_schema(canonical)
+        graph_correction_patches.ensure_schema(canonical)
+        # ``sqlite_sequence`` is database-global SQLite bookkeeping created as
+        # an incidental consequence of AUTOINCREMENT.  It is not owned by the
+        # graph materialization namespace and may legitimately pre-exist for
+        # an unrelated governance table in an otherwise empty graph preimage.
+        return [
+            row for row in _graph_materialization_inventory(canonical)
+            if row[1] != "sqlite_sequence"
+        ]
+    finally:
+        connection_ids = set(
+            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+        )
+        connection_ids.discard(id(canonical))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        canonical.close()
+
+
+def _graph_schema_owner_inventory(
+    ensure_schema: Callable[[sqlite3.Connection], None],
+) -> list[tuple[str, str, str, str]]:
+    """Build one source owner's exact inventory in an isolated database."""
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        connection_ids = set(
+            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+        )
+        connection_ids.add(id(canonical))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        ensure_schema(canonical)
+        return [
+            row for row in _graph_materialization_inventory(canonical)
+            if row[1] != "sqlite_sequence"
+        ]
+    finally:
+        connection_ids = set(
+            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+        )
+        connection_ids.discard(id(canonical))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        canonical.close()
+
+
+def _graph_schema_owner_registry(
+) -> tuple[tuple[str, list[tuple[str, str, str, str]]], ...]:
+    """Return exact source-derived inventories for every admitted graph owner."""
+
+    from . import (
+        asset_impact,
+        asset_projection,
+        graph_correction_patches,
+        graph_events,
+        graph_snapshot_store,
+    )
+
+    return tuple(
+        (owner, _graph_schema_owner_inventory(ensure_schema))
+        for owner, ensure_schema in (
+            ("graph_snapshot_store", graph_snapshot_store.ensure_schema),
+            ("graph_events", graph_events.ensure_schema),
+            ("graph_correction_patches", graph_correction_patches.ensure_schema),
+            ("asset_projection", asset_projection.ensure_schema),
+            ("asset_impact", asset_impact.ensure_schema),
+        )
+    )
+
+
+_GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING = frozenset(
+    {"idx_pending_scope_branch", "idx_pending_scope_status"}
+)
+
+
+def classify_graph_materialization_preimage(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Classify graph schema ownership without DDL or data writes.
+
+    Each source owner may be wholly absent or SQL-exact.  The snapshot owner
+    additionally admits one bounded predecessor that differs only by the two
+    source-defined pending-scope indexes.  No prefix-wide allowlist is used.
+    """
+
+    actual = _graph_materialization_inventory(conn)
+    registry = _graph_schema_owner_registry()
+    known_names: set[str] = set()
+    known_tables: set[str] = set()
+    owner_states: dict[str, str] = {}
+    planned: list[tuple[str, str, str, str]] = []
+    for owner, canonical in registry:
+        owner_names = {row[1] for row in canonical}
+        owner_tables = {row[2] for row in canonical if row[0] == "table"}
+        known_names.update(owner_names)
+        known_tables.update(owner_tables)
+        managed = [
+            row for row in actual
+            if row[1] in owner_names or row[2] in owner_tables
+        ]
+        if not managed:
+            owner_states[owner] = "absent"
+            continue
+        if managed == canonical:
+            owner_states[owner] = "exact"
+            continue
+        if owner == "graph_snapshot_store":
+            missing = [row for row in canonical if row not in managed]
+            if (
+                {row[1] for row in missing}
+                == _GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING
+                and all(row[0] == "index" for row in missing)
+                and managed == [row for row in canonical if row not in missing]
+            ):
+                owner_states[owner] = "pending_scope_index_predecessor"
+                planned.extend(missing)
+                continue
+        raise ValueError(
+            f"AC dev graph materialization owner preimage is not absent or exact: {owner}"
+        )
+
+    unknown = [
+        row for row in actual
+        if (row[1].startswith("graph_") or row[2].startswith("graph_"))
+        and row[1] not in known_names
+        and row[2] not in known_tables
+    ]
+    if unknown:
+        raise ValueError("AC dev graph materialization preimage has unknown graph authority")
+    return {
+        "schema_version": "ac_dev_graph_materialization_preimage.v1",
+        "owner_states": owner_states,
+        "planned_ddl": [row[3] for row in planned],
+        "planned_objects": [row[1] for row in planned],
+    }
+
+
+def _graph_materialization_managed_inventory(
+    inventory: Sequence[tuple[str, str, str, str]],
+    canonical: Sequence[tuple[str, str, str, str]],
+) -> list[tuple[str, str, str, str]]:
+    names = {row[1] for row in canonical}
+    tables = {row[2] for row in canonical if row[0] == "table"}
+    return [row for row in inventory if row[1] in names or row[2] in tables]
+
+
+def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
+    """Verify the three source-owned rebuildable graph schemas without writes."""
+
+    try:
+        classification = classify_graph_materialization_preimage(conn)
+    except ValueError as exc:
+        raise DevRuntimeSchemaVerificationError(
+            "graph_materialization",
+        ) from exc
+    required = {
+        "graph_snapshot_store",
+        "graph_events",
+        "graph_correction_patches",
+    }
+    owner_states = classification["owner_states"]
+    if any(owner_states[owner] != "exact" for owner in required):
+        raise DevRuntimeSchemaVerificationError("graph_materialization")
+
+
+def admit_ac_dev_graph_materialization_schema(
+    conn: sqlite3.Connection, *, project_id: str
+) -> dict[str, object]:
+    """Initialize/verify only the source-owned graph materialization schema.
+
+    Authority is derived from the opened database's physical world identity;
+    caller plane claims cannot widen it.  All owner DDL and postcondition
+    verification share one ``BEGIN IMMEDIATE`` transaction.
+    """
+
+    from . import graph_correction_patches, graph_events, graph_snapshot_store
+
+    if project_id != AC_PROJECT_ID or not _is_dev_runtime():
+        raise ValueError("AC dev graph materialization admission is dev/aming-claw only")
+    runtime_custody = _require_ac_dev_graph_materialization_runtime_custody(conn)
+    database_identity = canonical_ac_database_identity(conn)
+    if (
+        database_identity.get("world_id") != AC_DEV_WORLD_ID
+        or database_identity.get("project_id") != AC_PROJECT_ID
+    ):
+        raise ValueError("AC dev graph materialization custody identity is not admitted")
+    policy = classify_graph_activation_connection(conn)
+    if (
+        policy.get("runtime_plane") != DEV_RUNTIME_PLANE
+        or policy.get("classification_reason") not in {
+            "verified_dev_root_receipt_genesis",
+            "verified_dev_cow_successor_receipt_history",
+        }
+        or policy.get("active_graph_activation_allowed") is not False
+    ):
+        raise ValueError("AC dev graph materialization database identity is not admitted")
+
+    canonical = _graph_materialization_canonical_inventory()
+    # Admission initializes absent rebuildable owners, replays exact owners,
+    # or applies the one bounded snapshot predecessor.  Other partial,
+    # altered, extra, or legacy layouts cannot be laundered by IF NOT EXISTS.
+    classify_graph_materialization_preimage(conn)
+    connection_ids = set(
+        getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+    )
+    if id(conn) in connection_ids:
+        raise RuntimeError("nested graph materialization admission is forbidden")
+    prior_authorizer = _dev_schema_authorizer
+    try:
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            conn.set_authorizer(None)
+            connection_ids.add(id(conn))
+            _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+            graph_snapshot_store.ensure_schema(conn)
+            graph_events.ensure_schema(conn)
+            graph_correction_patches.ensure_schema(conn)
+            postimage = classify_graph_materialization_preimage(conn)
+            required = {
+                "graph_snapshot_store",
+                "graph_events",
+                "graph_correction_patches",
+            }
+            if any(
+                postimage["owner_states"][owner] != "exact"
+                for owner in required
+            ):
+                raise ValueError("AC dev graph materialization schema postcondition failed")
+            conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        connection_ids.discard(id(conn))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        conn.set_authorizer(prior_authorizer)
+    return {
+        "schema_version": "ac_dev_graph_materialization_admission.v1",
+        "project_id": project_id,
+        "runtime_plane": DEV_RUNTIME_PLANE,
+        "world_id": AC_DEV_WORLD_ID,
+        "object_count": len(canonical),
+        "active_graph_activation_allowed": False,
+        "runtime_custody": runtime_custody,
+    }
+
+
 def verify_existing_schema_capabilities(
     conn: sqlite3.Connection,
     *,
@@ -571,6 +1419,89 @@ def sqlite_write_lock() -> threading.RLock:
     return _SQLITE_WRITE_LOCK
 
 
+def _canonical_ac_dev_identity_database_path() -> Path:
+    """Resolve the receipt-independent canonical dev DB identity path."""
+
+    raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
+    if not raw:
+        raise RuntimeError(
+            "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
+        )
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
+    stable = _absolute_non_symlink_root(
+        Path(str(binding["shared_volume_path"])), create=False
+    )
+    stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
+    if (
+        not stable_raw
+        or _absolute_non_symlink_root(Path(stable_raw), create=False) != stable
+    ):
+        raise RuntimeError(
+            "AC dev stable shared-volume claim mismatches verified authority"
+        )
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+
+    supplied = Path(raw).expanduser().absolute()
+    if supplied.is_symlink() or supplied != resolve_ac_dev_storage_root(stable):
+        raise ValueError("AC dev storage root must equal canonical resolver output")
+    root = _absolute_non_symlink_root(supplied, create=False)
+    database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+    if (
+        database.is_symlink()
+        or database.parent.resolve(strict=True)
+        != (root / "governance" / AC_PROJECT_ID).absolute()
+    ):
+        raise ValueError("AC dev governance database escaped its world root")
+    return database
+
+
+def _canonical_ac_dev_database_identity(
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, object]:
+    """Derive full dev identity without accepting caller-supplied fields."""
+
+    db_path = _canonical_ac_dev_identity_database_path()
+    metadata = db_path.stat(follow_symlinks=False)
+    if db_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("canonical AC dev database must be a non-symlink file")
+    if db_path.resolve(strict=True) != db_path.absolute():
+        raise ValueError("canonical AC dev database escaped its world root")
+    if conn is not None:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main_paths = [
+            Path(str(row[2])).resolve(strict=True)
+            for row in rows
+            if str(row[1]) == "main" and str(row[2])
+        ]
+        if main_paths != [db_path.resolve(strict=True)]:
+            raise ValueError("opened AC dev database identity mismatch")
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+    else:
+        uri = (
+            "file:" + urllib.parse.quote(str(db_path))
+            + "?mode=ro&immutable=1"
+        )
+        with closing(sqlite3.connect(uri, uri=True)) as identity_conn:
+            meta = dict(identity_conn.execute("SELECT key, value FROM schema_meta"))
+    genesis_sha256 = str(meta.get("governance_world_genesis_sha256") or "")
+    if (
+        meta.get("governance_world_id") != AC_DEV_WORLD_ID
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", genesis_sha256)
+    ):
+        raise ValueError("canonical AC dev database genesis is invalid")
+    return {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID,
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "relative_path_sha256": "sha256:"
+        + hashlib.sha256(AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")).hexdigest(),
+        "genesis_sha256": genesis_sha256,
+    }
+
+
 def canonical_ac_database_identity(
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, object]:
@@ -584,40 +1515,21 @@ def canonical_ac_database_identity(
     file but cannot nominate a different AC-shaped database.
     """
 
-    if _is_dev_runtime():
-        db_path = _dev_database_path()
-        metadata = db_path.stat(follow_symlinks=False)
-        if db_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-            raise ValueError("canonical AC dev database must be a non-symlink file")
-        if db_path.resolve(strict=True) != db_path.absolute():
-            raise ValueError("canonical AC dev database escaped its world root")
-        if conn is not None:
-            rows = conn.execute("PRAGMA database_list").fetchall()
-            main_paths = [
-                Path(str(row[2])).resolve(strict=True)
-                for row in rows
-                if str(row[1]) == "main" and str(row[2])
-            ]
-            if main_paths != [db_path.resolve(strict=True)]:
-                raise ValueError("opened AC dev database identity mismatch")
-        with closing(sqlite3.connect(db_path)) as identity_conn:
-            meta = dict(identity_conn.execute("SELECT key, value FROM schema_meta"))
-        genesis_sha256 = str(meta.get("governance_world_genesis_sha256") or "")
-        if (
-            meta.get("governance_world_id") != AC_DEV_WORLD_ID
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", genesis_sha256)
-        ):
-            raise ValueError("canonical AC dev database genesis is invalid")
-        return {
-            "schema_version": "ac_governance_database_identity.v2",
-            "world_id": AC_DEV_WORLD_ID,
-            "project_id": AC_PROJECT_ID,
-            "device": int(metadata.st_dev),
-            "inode": int(metadata.st_ino),
-            "relative_path_sha256": "sha256:"
-            + hashlib.sha256(AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")).hexdigest(),
-            "genesis_sha256": genesis_sha256,
-        }
+    opened_dev_database = False
+    runtime_plane = os.environ.get(RUNTIME_PLANE_ENV, "").strip()
+    if (
+        conn is not None
+        and not runtime_plane
+        and os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
+    ):
+        opened = _connection_main_database_identity(conn)
+        if opened is not None:
+            opened_dev_database = (
+                opened[0]
+                == _canonical_ac_dev_identity_database_path().resolve(strict=True)
+            )
+    if _is_dev_runtime() or opened_dev_database:
+        return _canonical_ac_dev_database_identity(conn)
 
     shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
     if not shared_raw:
@@ -1158,13 +2070,471 @@ def _absolute_non_symlink_root(path: Path, *, create: bool) -> Path:
     return absolute
 
 
-def _dev_storage_root(*, create: bool = False) -> Path:
+def _validated_isolated_dev_receipt(
+    receipt_path: Path, root: Path, source_identity: Mapping[str, object],
+    stable_binding: Mapping[str, object], *, allow_postimage: bool = False,
+) -> Path:
+    archive = root / "archive" / "schema-admission"
+    path = receipt_path.expanduser().absolute()
+    details = path.lstat()
+    match = re.fullmatch(r"([0-9a-f]{64})\.json", path.name)
+    if (not stat.S_ISREG(details.st_mode) or details.st_nlink != 1 or path.is_symlink()
+            or path.resolve(strict=True) != path or path.parent.resolve(strict=True) != archive.resolve(strict=True)
+            or match is None):
+        raise ValueError("AC dev isolated receipt is not a canonical regular file")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != match.group(1):
+        raise ValueError("AC dev isolated receipt raw digest mismatch")
+    sidecar = archive / f"{match.group(1)}.sha256"
+    side = sidecar.lstat()
+    if (not stat.S_ISREG(side.st_mode) or side.st_nlink != 1 or sidecar.is_symlink()
+            or sidecar.read_text(encoding="utf-8") != f"sha256:{match.group(1)}  {path.name}\n"):
+        raise ValueError("AC dev isolated receipt sidecar mismatch")
+    receipt = json.loads(raw)
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    root_stat = root.stat(follow_symlinks=False)
+    db_stat = database.stat(follow_symlinks=False)
+    inventory = receipt.get("schema_inventory_after") if isinstance(receipt, Mapping) else None
+    plan_sha = "sha256:" + hashlib.sha256(
+        json.dumps(authority_projection_schema_plan(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    digest = hashlib.sha256()
+    descriptor = os.open(database, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    expected_source = dict(source_identity)
+    source = receipt.get("source_identity") if isinstance(receipt, Mapping) else None
+    cli_source = source.get("cli_source") if isinstance(source, Mapping) else None
+    receipt_database_sha = str(receipt.get("database_sha256_after") or "")
+    current_database_sha = "sha256:" + digest.hexdigest()
+    if (
+        receipt.get("schema_version") != "ac_dev_offline_schema_admission.v3"
+        or receipt.get("stage") != "completed" or receipt.get("changed") is not False
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("previous_receipt_sha256") or ""))
+        or receipt.get("project_id") != AC_PROJECT_ID or receipt.get("port") != 40008
+        or receipt.get("root_identity") != {"path": str(root), "device": int(root_stat.st_dev), "inode": int(root_stat.st_ino)}
+        or receipt.get("database_identity") != {"path": str(database), "device": int(db_stat.st_dev), "inode": int(db_stat.st_ino)}
+        or (receipt_database_sha != current_database_sha and not allow_postimage)
+        or cli_source != expected_source or receipt.get("plan_sha256") != plan_sha
+        or not isinstance(inventory, Mapping)
+        or inventory.get("sha256") != AC_AUTHORITY_SCHEMA_INVENTORY_SHA256
+        or not isinstance(inventory.get("inventory"), list)
+        or len(inventory["inventory"]) != AC_AUTHORITY_SCHEMA_INVENTORY_COUNT
+        or "sha256:" + hashlib.sha256(json.dumps(
+            inventory["inventory"], separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")).hexdigest() != AC_AUTHORITY_SCHEMA_INVENTORY_SHA256
+    ):
+        raise ValueError("AC dev isolated receipt binding mismatch")
+    if receipt_database_sha != current_database_sha:
+        # A linked-v3 receipt is immutable authority for the admitted preimage.
+        # After the child-owned custody transaction the current database is a
+        # postimage, so validate its source-owned genesis without pretending
+        # that the historical receipt names the new bytes.
+        uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            meta = dict(connection.execute(
+                "SELECT key, value FROM schema_meta WHERE key IN "
+                "('governance_world_id','governance_world_genesis_json',"
+                "'governance_world_genesis_sha256')"
+            ))
+            genesis = json.loads(str(meta.get("governance_world_genesis_json") or ""))
+            if (meta.get("governance_world_id") != AC_DEV_WORLD_ID
+                    or not isinstance(genesis, Mapping)
+                    or genesis.get("world_id") != AC_DEV_WORLD_ID
+                    or genesis.get("project_id") != AC_PROJECT_ID
+                    or meta.get("governance_world_genesis_sha256") != _world_genesis_hash(genesis)):
+                raise ValueError("AC dev isolated postimage genesis mismatch")
+        finally:
+            connection.close()
+    stable_database = Path(str(stable_binding["database_path"])).resolve(strict=True)
+    stable_stat = stable_database.stat(follow_symlinks=False)
+    stable_root = Path(str(stable_binding["shared_volume_path"])).resolve(strict=True)
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    canonical_dev_root = resolve_ac_dev_storage_root(stable_root)
+    source_root = Path(str(source_identity.get("root") or "")).resolve(strict=True)
+    if ((db_stat.st_dev, db_stat.st_ino) == (stable_stat.st_dev, stable_stat.st_ino)
+            or root in {stable_root, canonical_dev_root, source_root}
+            or root in stable_root.parents or stable_root in root.parents
+            or root in source_root.parents or source_root in root.parents):
+        raise ValueError("AC dev isolated root overlaps stable custody")
+    return root
+
+
+def _validated_canonical_legacy_postimage_adoption(
+    root: Path, receipt_path: Path, source_identity: Mapping[str, object],
+    stable_binding: Mapping[str, object],
+) -> Path:
+    """Accept only the immutable audited bridge from the canonical legacy world."""
+    directory = root / "archive" / "canonical-legacy-postimage-adoption"
+    receipts = sorted(directory.glob("adoption.*.json")) if directory.is_dir() else []
+    if len(receipts) != 1:
+        raise ValueError("AC dev canonical adoption receipt is missing or ambiguous")
+    path = receipts[0]
+    match = re.fullmatch(r"adoption\.([0-9a-f]{64})\.json", path.name)
+    raw = path.read_bytes()
+    try:
+        adoption = json.loads(raw)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("AC dev canonical adoption receipt is unreadable") from exc
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    root_stat = root.stat(follow_symlinks=False)
+    db_stat = database.stat(follow_symlinks=False)
+    digest = hashlib.sha256()
+    descriptor = os.open(database, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    current_sha256 = "sha256:" + digest.hexdigest()
+    linked = receipt_path.expanduser().absolute()
+    linked_raw = linked.read_bytes()
+    linked_digest = "sha256:" + hashlib.sha256(linked_raw).hexdigest()
+    candidate = dict(adoption.get("candidate_source_identity") or {}) if isinstance(adoption, Mapping) else {}
+    stable_database = Path(str(stable_binding["database_path"])).resolve(strict=True)
+    stable_stat = stable_database.stat(follow_symlinks=False)
+    if (
+        path.is_symlink() or not path.is_file() or match is None
+        or hashlib.sha256(raw).hexdigest() != match.group(1)
+        or adoption.get("schema_version") != "ac_dev_canonical_legacy_postimage_adoption.v1"
+        or adoption.get("stage") != "completed"
+        or adoption.get("project_id") != AC_PROJECT_ID or adoption.get("port") != 40008
+        or adoption.get("root_identity") != {
+            "path": str(root), "device": int(root_stat.st_dev), "inode": int(root_stat.st_ino),
+        }
+        or adoption.get("database_identity") != {
+            "path": str(database), "device": int(db_stat.st_dev), "inode": int(db_stat.st_ino),
+        }
+        or adoption.get("linked_v3_receipt") != str(linked)
+        or adoption.get("linked_v3_receipt_sha256") != linked_digest
+        or candidate != dict(source_identity)
+        or (db_stat.st_dev, db_stat.st_ino) == (stable_stat.st_dev, stable_stat.st_ino)
+    ):
+        raise ValueError("AC dev canonical adoption receipt mismatch")
+    historical = dict(adoption.get("receipt_source_identity") or {})
+    try:
+        linked_value = json.loads(linked_raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("AC dev canonical adoption linked receipt is unreadable") from exc
+    linked_source = linked_value.get("source_identity") if isinstance(linked_value, Mapping) else None
+    if (not isinstance(linked_source, Mapping)
+            or dict(linked_source.get("cli_source") or {}) != historical
+            or linked_value.get("database_sha256_after") != adoption.get("database_sha256_preimage")):
+        raise ValueError("AC dev canonical adoption predecessor mismatch")
+    legacy_process = adoption.get("legacy_process_identity")
+    if not isinstance(legacy_process, Mapping):
+        raise ValueError("AC dev canonical adoption process custody is missing")
+    _validate_dev_current_process_custody(
+        legacy_process, root=root, candidate_source=source_identity,
+        historical_process=legacy_process,
+    )
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(database) + suffix)
+        if companion.exists() or companion.is_symlink():
+            raise ValueError("AC dev canonical adoption sidecar drift")
+    if adoption.get("database_sha256_postimage") != current_sha256:
+        # Once the adoption receipt has authorized the legacy postimage, the
+        # ordinary child custody transaction may advance only the same four
+        # schema_meta custody fields.  Re-prove every other logical byte.
+        if (not isinstance(adoption.get("non_schema_meta_projection"), Mapping)
+                or not isinstance(adoption.get("schema_meta_postimage"), Mapping)):
+            raise ValueError("AC dev canonical adoption post-custody authority is incomplete")
+        uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("AC dev canonical adoption post-custody quick-check failed")
+            projection = _sqlite_logical_projection(
+                connection, exclude_tables=frozenset({"schema_meta"}),
+            )
+            meta = {str(key): str(value) for key, value in connection.execute(
+                "SELECT key,value FROM schema_meta ORDER BY key"
+            )}
+        finally:
+            connection.close()
+        if projection != adoption.get("non_schema_meta_projection"):
+            raise ValueError("AC dev canonical adoption post-custody projection mismatch")
+        baseline_meta = dict(adoption.get("schema_meta_postimage") or {})
+        custody_fields = {
+            "governance_world_current_process_json", "governance_world_source_tip_json",
+            "governance_world_source_tip_revision", "governance_world_source_tip_sha256",
+        }
+        if ({key: value for key, value in meta.items() if key not in custody_fields}
+                != {key: value for key, value in baseline_meta.items() if key not in custody_fields}):
+            raise ValueError("AC dev canonical adoption post-custody metadata mismatch")
+        try:
+            tip = json.loads(meta["governance_world_source_tip_json"])
+            process = json.loads(meta["governance_world_current_process_json"])
+            revision = int(meta["governance_world_source_tip_revision"])
+            baseline_revision = int(baseline_meta["governance_world_source_tip_revision"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("AC dev canonical adoption post-custody metadata is invalid") from exc
+        expected_tip = {key: source_identity.get(key) for key in (
+            "root", "branch", "commit", "source_sha256",
+        )}
+        if (tip != expected_tip or meta.get("governance_world_source_tip_sha256")
+                != _world_source_tip_hash(expected_tip)
+                or revision < baseline_revision + 1
+                or not isinstance(process, Mapping)):
+            raise ValueError("AC dev canonical adoption post-custody binding mismatch")
+        _validate_dev_current_process_custody(
+            process, root=root, candidate_source=source_identity,
+            historical_process=legacy_process,
+        )
+    return root
+
+
+def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = None,
+                      source_identity: Mapping[str, object] | None = None,
+                      allow_postimage: bool = False) -> Path:
+    """Resolve the only AC dev world; raw env values are assertions, not authority."""
+    # Reject the missing required dev claim before contacting any authority or
+    # resolving a potentially hostile sibling path.  This is zero-mutation.
     raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
     if not raw:
         raise RuntimeError(
             "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
         )
-    return _absolute_non_symlink_root(Path(raw), create=create)
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
+    stable = _absolute_non_symlink_root(Path(str(binding["shared_volume_path"])), create=False)
+    stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
+    if not stable_raw or _absolute_non_symlink_root(Path(stable_raw), create=False) != stable:
+        raise RuntimeError("AC dev stable shared-volume claim mismatches verified authority")
+    supplied = Path(raw).expanduser().absolute()
+    if isolated_receipt is not None:
+        root = _absolute_non_symlink_root(supplied, create=False)
+        from agent.runtime_plane import resolve_ac_dev_storage_root
+        try:
+            canonical_root = resolve_ac_dev_storage_root(stable)
+        except (OSError, RuntimeError, ValueError):
+            canonical_root = None
+        if canonical_root is not None and root == canonical_root:
+            linked = json.loads(isolated_receipt.expanduser().absolute().read_bytes())
+            linked_identity = dict(linked.get("database_identity") or {}) if isinstance(
+                linked, Mapping
+            ) else {}
+            database = root / AC_DATABASE_DEV_RELATIVE_PATH
+            current = database.stat(follow_symlinks=False)
+            linked_physical = (linked_identity.get("device"), linked_identity.get("inode"))
+            if (not all(isinstance(value, int) for value in linked_physical)
+                    or linked_physical == (int(current.st_dev), int(current.st_ino))):
+                return _validated_canonical_legacy_postimage_adoption(
+                    root, isolated_receipt, source_identity or {}, binding,
+                )
+            if _validate_dev_first_start_context(root):
+                return root
+            cow_phase = _select_dev_cow_generation_phase(
+                root, linked_v3_receipt=isolated_receipt,
+                source_identity=source_identity or {}, stable_binding=binding,
+            )
+            if cow_phase is _DevCowGenerationPhase.FIRST_ISSUANCE:
+                validate_dev_cow_successor_preimage(
+                    root, linked_v3_receipt=isolated_receipt,
+                    source_identity=source_identity or {}, stable_binding=binding,
+                )
+            else:
+                validate_dev_cow_completed_generation_projection(
+                    root, linked_v3_receipt=isolated_receipt,
+                    source_identity=source_identity or {}, stable_binding=binding,
+                )
+            return root
+        return _validated_isolated_dev_receipt(
+            isolated_receipt, root, source_identity or {}, binding,
+            allow_postimage=allow_postimage,
+        )
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    expected = resolve_ac_dev_storage_root(stable)
+    # Compare before any mkdir/open; a symlink/traversal is an invalid claim.
+    if supplied.is_symlink():
+        raise ValueError("AC dev storage root cannot be a symlink")
+    if supplied != expected:
+        root = _absolute_non_symlink_root(supplied, create=False)
+        if not _validate_dev_first_start_context(root):
+            raise ValueError("AC dev storage root must equal canonical resolver output")
+        return root
+    root = _absolute_non_symlink_root(expected, create=create)
+    archive = _cow_successor_archive(root)
+    if archive.is_dir():
+        receipts = list(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"))
+        if receipts:
+            receipt = validate_dev_cow_successor_receipt(root)
+            successor = dict(receipt.get("successor") or {})
+            identity = dict(successor.get("identity") or {})
+            database = root / AC_DATABASE_DEV_RELATIVE_PATH
+            physical = database.stat(follow_symlinks=False)
+            if (identity.get("device"), identity.get("inode")) == (
+                int(physical.st_dev), int(physical.st_ino),
+            ) and not _validate_dev_first_start_context(root):
+                # A completed COW generation is also a valid stopped-world
+                # preimage for the ordinary foreground launcher.  Its runtime
+                # authority is deliberately composed from the existing basic
+                # launch receipt and writer lease rather than the durable
+                # first-start context.  Before those live bindings exist,
+                # re-prove the complete persisted generation and stopped state
+                # without changing SQLite or any receipt.
+                if _validate_dev_basic_runtime_custody(
+                    root, stable_binding=binding,
+                ):
+                    return root
+                _validate_dev_cow_completed_basic_restart(
+                    root, source_identity=source_identity or {},
+                    stable_binding=binding,
+                )
+    return root
+
+
+def dev_launch_receipt_path(storage_root: Path | str) -> Path:
+    root = _absolute_non_symlink_root(Path(storage_root), create=False)
+    return root / AC_DEV_LAUNCH_RECEIPT_NAME
+
+
+def write_dev_launch_receipt(
+    storage_root: Path | str, *, stable_shared_volume: Path | str,
+    source_sha256: str, port: int, project_id: str = AC_PROJECT_ID,
+) -> dict[str, object]:
+    """Persist the source-backed foreground launch admission before server exec."""
+    root = _absolute_non_symlink_root(Path(storage_root), create=False)
+    stable = _absolute_non_symlink_root(Path(stable_shared_volume), create=False)
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
+    current_stable = str(binding.get("shared_volume_path") or "")
+    if not current_stable or _absolute_non_symlink_root(Path(current_stable), create=False) != stable:
+        raise ValueError("AC dev launch receipt stable volume is not current canonical authority")
+    if project_id != AC_PROJECT_ID or port != 40008:
+        raise ValueError("AC dev launch receipt requires exact project and port")
+    if root == stable or stable in root.parents or root in stable.parents:
+        raise ValueError("AC dev launch receipt root must be disjoint from stable volume")
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    if root != resolve_ac_dev_storage_root(stable):
+        raise ValueError("AC dev launch receipt root must be canonical resolver output")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source_sha256 or "")):
+        raise ValueError("AC dev launch receipt source hash is invalid")
+    root_stat = root.stat(follow_symlinks=False)
+    stable_stat = stable.stat(follow_symlinks=False)
+    parent_stat = stable.parent.stat(follow_symlinks=False)
+    receipt = {
+        "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
+        "world_id": AC_DEV_WORLD_ID, "project_id": AC_PROJECT_ID,
+        "runtime_plane": DEV_RUNTIME_PLANE, "port": 40008, "background": False,
+        "storage_root": str(root), "storage_device": int(root_stat.st_dev), "storage_inode": int(root_stat.st_ino),
+        "stable_shared_volume": str(stable),
+        "stable_shared_volume_device": int(stable_stat.st_dev),
+        "stable_shared_volume_inode": int(stable_stat.st_ino),
+        "stable_parent_device": int(parent_stat.st_dev), "stable_parent_inode": int(parent_stat.st_ino),
+        "source_sha256": str(source_sha256),
+    }
+    path = root / AC_DEV_LAUNCH_RECEIPT_NAME
+    if path.exists() and path.is_symlink():
+        raise ValueError("AC dev launch receipt cannot be a symlink")
+    temporary = root / (AC_DEV_LAUNCH_RECEIPT_NAME + ".tmp")
+    # The authority is live filesystem identity, not this receipt's path claim.
+    stable_after = stable.stat(follow_symlinks=False)
+    if (int(stable_after.st_dev), int(stable_after.st_ino)) != (int(stable_stat.st_dev), int(stable_stat.st_ino)):
+        raise ValueError("AC dev launch receipt stable volume changed during creation")
+    temporary.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, path)
+    return receipt
+
+
+def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str) -> dict[str, object]:
+    """Fail closed before a dev server opens SQLite or takes the writer lease."""
+    supplied = Path(storage_root).expanduser().absolute()
+    root = _dev_storage_root(create=False)
+    if supplied != root:
+        raise ValueError("AC dev launch receipt storage root mismatch")
+    if _validate_dev_first_start_context(root):
+        # The completed receipt proves only process/listener release.  Root and
+        # database custody have already been re-proved by the live context.
+        runtime = root / "runtime" / "durable-launch"
+        candidates = []
+        for item in runtime.glob("launch.*.json"):
+            try:
+                value = json.loads(item.read_bytes())
+            except (OSError, ValueError, TypeError):
+                continue
+            if isinstance(value, Mapping) and value.get("pid") == os.getpid():
+                candidates.append(item)
+        if len(candidates) != 1:
+            raise ValueError("AC dev isolated durable launch receipt is missing")
+        candidate = candidates[0]
+        match = re.fullmatch(r"launch\.([0-9a-f]{64})\.json", candidate.name)
+        raw = candidate.read_bytes()
+        try:
+            durable = json.loads(raw)
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError("AC dev isolated durable launch receipt is unreadable") from exc
+        database = root / AC_DATABASE_DEV_RELATIVE_PATH
+        database_stat = database.stat(follow_symlinks=False)
+        if (candidate.is_symlink() or match is None
+                or hashlib.sha256(raw).hexdigest() != match.group(1)
+                or not isinstance(durable, Mapping)
+                or durable.get("schema_version") != "ac_dev_durable_launch.v1"
+                or durable.get("stage") != "completed"
+                or durable.get("pid") != os.getpid()
+                or durable.get("dev_storage_root") != str(root)
+                or durable.get("database_path") != str(database)
+                or durable.get("project_id") != AC_PROJECT_ID
+                or durable.get("port") != 40008
+                or durable.get("server_sha256") != source_sha256
+                or dict(durable.get("database_identity") or {}).get("device") != int(database_stat.st_dev)
+                or dict(durable.get("database_identity") or {}).get("inode") != int(database_stat.st_ino)
+                or durable.get("policy") != {"runtime_plane": "dev", "migration": "verify-only",
+                    "stable_deployment": "deny", "graph_activation": "deny",
+                    "background_workers": "deny"}):
+            raise ValueError("AC dev isolated durable launch receipt mismatch")
+        return dict(durable)
+
+    return _validate_dev_basic_launch_receipt(
+        root, source_sha256=source_sha256,
+        stable_binding=verified_stable_database_binding(),
+    )
+
+
+def _validate_dev_basic_launch_receipt(
+    root: Path, *, source_sha256: str,
+    stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the canonical non-durable receipt without resolving root again."""
+    path = root / AC_DEV_LAUNCH_RECEIPT_NAME
+    if not path.is_file() or path.is_symlink() or path.resolve(strict=True) != path:
+        raise ValueError("AC dev launch receipt is missing or invalid")
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("AC dev launch receipt is unreadable") from exc
+    root_stat = root.stat(follow_symlinks=False)
+    required = {"schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA, "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID, "runtime_plane": DEV_RUNTIME_PLANE, "port": 40008,
+        "background": False, "storage_root": str(root), "storage_device": int(root_stat.st_dev),
+        "storage_inode": int(root_stat.st_ino), "source_sha256": source_sha256}
+    if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in required.items()):
+        raise ValueError("AC dev launch receipt mismatch")
+    _revalidate_stable_database_binding(stable_binding)
+    stable = _absolute_non_symlink_root(
+        Path(str(stable_binding.get("shared_volume_path") or "")), create=False,
+    )
+    if receipt.get("stable_shared_volume") != str(stable):
+        raise ValueError("AC dev launch receipt stable volume claim mismatch")
+    stable_stat = stable.stat(follow_symlinks=False)
+    if (
+        receipt.get("stable_shared_volume_device") != int(stable_stat.st_dev)
+        or receipt.get("stable_shared_volume_inode") != int(stable_stat.st_ino)
+    ):
+        raise ValueError("AC dev launch receipt stable volume identity changed")
+    parent_stat = stable.parent.stat(follow_symlinks=False)
+    if receipt.get("stable_parent_device") != int(parent_stat.st_dev) or receipt.get("stable_parent_inode") != int(parent_stat.st_ino):
+        raise ValueError("AC dev launch receipt stable parent identity changed")
+    if root == stable or stable in root.parents or root in stable.parents:
+        raise ValueError("AC dev launch receipt cross-world root invalid")
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    if root != resolve_ac_dev_storage_root(stable):
+        raise ValueError("AC dev launch receipt root is not the canonical resolver output")
+    return receipt
 
 
 def _dev_runtime_root(*, create: bool = False) -> Path:
@@ -1209,9 +2579,256 @@ def _world_source_tip_hash(source: Mapping[str, object]) -> str:
     ).hexdigest()
 
 
+_DEV_SOURCE_TIP_KEYS = frozenset({"root", "branch", "commit", "source_sha256"})
+_DURABLE_PROCESS_IDENTITY_KEYS = frozenset({
+    "argv", "cwd", "source_root", "source_commit", "source_tree",
+    "dev_storage_root", "project_id", "port", "policy", "launch_id",
+    "pid", "start_identity",
+})
+_DEV_DURABLE_POLICY = {
+    "runtime_plane": "dev", "migration": "verify-only",
+    "stable_deployment": "deny", "graph_activation": "deny",
+    "background_workers": "deny",
+}
+
+
+def _dev_durable_process_argv_is_canonical(
+    argv: object, *, root: Path, source_root: Path, launch_id: str,
+) -> bool:
+    """Recognize only the normalized argv produced by the durable child."""
+
+    if not isinstance(argv, list) or len(argv) != 21:
+        return False
+    if not all(isinstance(item, str) and item for item in argv):
+        return False
+    try:
+        executable = Path(argv[0])
+        executable_stat = executable.stat(follow_symlinks=False)
+        script = Path(argv[1])
+        script_stat = script.stat(follow_symlinks=False)
+        expected_executable = Path(sys.executable).resolve(strict=True)
+        expected_script = (source_root / "agent" / "cli.py").absolute()
+        expected_script_stat = expected_script.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    if (
+        not executable.is_absolute()
+        or executable.is_symlink()
+        or not stat.S_ISREG(executable_stat.st_mode)
+        or executable.resolve(strict=True) != executable
+        or executable != expected_executable
+        or expected_script.is_symlink()
+        or not stat.S_ISREG(expected_script_stat.st_mode)
+        or expected_script.resolve(strict=True) != expected_script
+        or not script.is_absolute()
+        or script.is_symlink()
+        or not stat.S_ISREG(script_stat.st_mode)
+        or script.resolve(strict=True) != script
+        or script != expected_script
+    ):
+        return False
+    runtime = (root / "runtime" / "durable-launch").absolute()
+    pending = Path(argv[18])
+    linked = Path(argv[20])
+    expected = [
+        str(executable), str(script), "start",
+        "--runtime-plane", "dev",
+        "--port", "40008",
+        "--dev-storage-root", str(root),
+        "--stable-anchor-commit", argv[10],
+        "--durable-child-runtime-dir", str(runtime),
+        "--durable-child-launch-id", launch_id,
+        "--durable-child-control-fd", argv[16],
+        "--durable-child-pending-receipt", str(pending),
+        "--durable-child-linked-v3-receipt", str(linked),
+    ]
+    return bool(
+        argv == expected
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", argv[10])
+        and re.fullmatch(r"[0-9]+", argv[16])
+        and pending.is_absolute()
+        and pending.parent == runtime
+        and re.fullmatch(r"pending\.[0-9a-f]{64}\.json", pending.name)
+        and linked.is_absolute()
+        and linked.parent == root / "archive" / "schema-admission"
+        and re.fullmatch(r"[0-9a-f]{64}\.json", linked.name)
+    )
+
+
+def _dev_durable_completed_pre_normalization_argv_is_canonical(
+    argv: object, *, root: Path, source_root: Path, launch_id: str,
+) -> bool:
+    """Recognize the exact child ``sys.argv`` sealed before normalization."""
+
+    if not isinstance(argv, list):
+        return False
+    try:
+        executable = str(Path(sys.executable).resolve(strict=True))
+    except OSError:
+        return False
+    return _dev_durable_process_argv_is_canonical(
+        [executable, *argv], root=root, source_root=source_root,
+        launch_id=launch_id,
+    )
+
+
+def _git_read_exact(root: Path, *args: str) -> bytes:
+    result = subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, timeout=10, check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("AC dev custody Git authority is unavailable")
+    return result.stdout
+
+
+def _validate_dev_source_tip_custody(
+    tip: Mapping[str, object], *, stored_sha256: str,
+    candidate: Mapping[str, object], historical_worktree_advisory: bool = False,
+) -> None:
+    """Bind a closed historical tip to its producer and a clean descendant."""
+    candidate_tip = {key: candidate.get(key) for key in _DEV_SOURCE_TIP_KEYS}
+    if (set(tip) != _DEV_SOURCE_TIP_KEYS
+            or stored_sha256 != _world_source_tip_hash(tip)):
+        raise ValueError("AC dev source tip custody schema mismatch")
+    try:
+        tip_root = Path(str(tip["root"])).expanduser().resolve(strict=True)
+        candidate_root = Path(str(candidate_tip["root"])).expanduser().resolve(strict=True)
+        candidate_cli = candidate_root / "agent" / "cli.py"
+        candidate_stat = candidate_cli.stat(follow_symlinks=False)
+    except (KeyError, OSError) as exc:
+        raise ValueError("AC dev source tip custody root mismatch") from exc
+    if (str(tip["branch"]) != "codex/ac-dev"
+            or str(candidate_tip["branch"]) != "codex/ac-dev"
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(tip["commit"]))
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(candidate_tip["commit"]))
+            or candidate_cli.is_symlink() or not stat.S_ISREG(candidate_stat.st_mode)
+            or candidate_cli.resolve(strict=True) != candidate_cli):
+        raise ValueError("AC dev source tip custody identity mismatch")
+    # A completed generation stores the producer checkout path as provenance,
+    # not as a perpetual lease on that worktree's HEAD or index.  Read the
+    # content-addressed historical object from the current clean checkout's
+    # shared repository.  `_verify_dev_source_upgrade` still proves that both
+    # registered worktrees share the same Git object store before this can be
+    # admitted.
+    historical_object_root = candidate_root if historical_worktree_advisory else tip_root
+    historical_bytes = _git_read_exact(
+        historical_object_root, "show", f"{tip['commit']}:agent/cli.py",
+    )
+    if historical_worktree_advisory:
+        for path in ("agent/governance/server.py", "agent/governance/db.py"):
+            if not _git_read_exact(
+                historical_object_root, "show", f"{tip['commit']}:{path}",
+            ):
+                raise ValueError("AC dev source tip producer object is incomplete")
+    historical_sha = "sha256:" + hashlib.sha256(historical_bytes).hexdigest()
+    candidate_sha = "sha256:" + hashlib.sha256(candidate_cli.read_bytes()).hexdigest()
+    if (tip.get("source_sha256") != historical_sha
+            or candidate_tip.get("source_sha256") != candidate_sha):
+        raise ValueError("AC dev source tip producer hash mismatch")
+    _verify_dev_source_upgrade(
+        tip, candidate_tip,
+        historical_worktree_advisory=historical_worktree_advisory,
+    )
+
+
+def _validate_dev_current_process_custody(
+    process: Mapping[str, object], *, root: Path,
+    candidate_source: Mapping[str, object],
+    historical_process: Mapping[str, object] | None = None,
+    completed_dead_pre_normalization: bool = False,
+    historical_source_tip: Mapping[str, object] | None = None,
+) -> None:
+    """Validate the sole two admitted process-custody projections."""
+    value = dict(process)
+    if set(value) == {"pid", "start_identity"}:
+        pid = value.get("pid")
+        if (type(pid) is not int or pid <= 0
+                or value.get("start_identity") != f"pid:{pid}:cli-bootstrap"
+                or historical_process is None or value != dict(historical_process)):
+            raise ValueError("AC dev bootstrap process custody mismatch")
+        return
+    if set(value) != _DURABLE_PROCESS_IDENTITY_KEYS:
+        raise ValueError("AC dev durable process custody schema mismatch")
+    pid = value.get("pid")
+    argv = value.get("argv")
+    try:
+        source_root = Path(str(value.get("source_root") or "")).resolve(strict=True)
+        cwd = Path(str(value.get("cwd") or "")).resolve(strict=True)
+        dev_root = Path(str(value.get("dev_storage_root") or "")).resolve(strict=True)
+        candidate_root = Path(str(candidate_source.get("root") or "")).resolve(strict=True)
+        custody_source_root = (
+            Path(str(historical_source_tip.get("root") or "")).resolve(strict=True)
+            if historical_source_tip is not None else candidate_root
+        )
+    except OSError as exc:
+        raise ValueError("AC dev durable process custody root mismatch") from exc
+    commit = str(value.get("source_commit") or "").lower()
+    launch_id = str(value.get("launch_id") or "")
+    argv_canonical = _dev_durable_process_argv_is_canonical(
+        argv, root=root.resolve(strict=True), source_root=custody_source_root,
+        launch_id=launch_id,
+    )
+    if completed_dead_pre_normalization:
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("AC dev completed process custody PID is invalid")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "AC dev completed process custody liveness is unavailable"
+            ) from exc
+        else:
+            raise ValueError("AC dev completed process custody PID is still live")
+    if completed_dead_pre_normalization and not argv_canonical:
+        try:
+            listener = subprocess.run(
+                ["lsof", "-nP", "-iTCP:40008", "-sTCP:LISTEN", "-t"],
+                capture_output=True, timeout=3, check=False,
+            )
+            no_dev_listener = (
+                listener.returncode in {0, 1} and not listener.stdout.strip()
+            )
+        except (OSError, subprocess.SubprocessError):
+            no_dev_listener = False
+        argv_canonical = bool(
+            no_dev_listener
+            and _dev_durable_completed_pre_normalization_argv_is_canonical(
+                argv, root=root.resolve(strict=True), source_root=custody_source_root,
+                launch_id=launch_id,
+            )
+        )
+    historical_commit = str(
+        historical_source_tip.get("commit") if historical_source_tip is not None else ""
+    ).lower()
+    expected_commit = historical_commit
+    if (type(pid) is not int or pid <= 0
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("start_identity") or ""))
+            or source_root != custody_source_root or cwd != custody_source_root
+            or dev_root != root.resolve(strict=True)
+            or value.get("project_id") != AC_PROJECT_ID or value.get("port") != 40008
+            or value.get("policy") != _DEV_DURABLE_POLICY
+            or not re.fullmatch(r"[0-9a-f]{24}", launch_id)
+            or not argv_canonical
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
+            or (expected_commit and commit != expected_commit)):
+        raise ValueError("AC dev durable process custody binding mismatch")
+    tree = _git_read_exact(candidate_root, "rev-parse", f"{commit}^{{tree}}").decode().strip()
+    if value.get("source_tree") != tree:
+        raise ValueError("AC dev durable process custody tree mismatch")
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, str(candidate_source.get("commit") or "")],
+        cwd=candidate_root, capture_output=True, timeout=10, check=False,
+    )
+    if ancestor.returncode != 0:
+        raise ValueError("AC dev durable process custody source is not an ancestor")
+
+
 def _verify_dev_source_upgrade(
     previous: Mapping[str, object],
     candidate: Mapping[str, object],
+    *, historical_worktree_advisory: bool = False,
 ) -> None:
     """Verify one clean exact-branch Git descendant without changing source."""
 
@@ -1224,18 +2841,16 @@ def _verify_dev_source_upgrade(
         ).expanduser().resolve(strict=True)
     except OSError as exc:
         raise ValueError("AC dev source upgrade root mismatch") from exc
-    if candidate_root != previous_root:
-        raise ValueError("AC dev source upgrade root mismatch")
     if (
         str(previous.get("branch") or "") != "codex/ac-dev"
         or str(candidate.get("branch") or "") != "codex/ac-dev"
     ):
         raise ValueError("AC dev source upgrade branch mismatch")
 
-    def git(*args: str) -> str:
+    def git(root: Path, *args: str) -> str:
         result = subprocess.run(
             ["git", *args],
-            cwd=candidate_root,
+            cwd=root,
             capture_output=True,
             text=True,
             timeout=10,
@@ -1245,14 +2860,75 @@ def _verify_dev_source_upgrade(
             raise ValueError("AC dev source upgrade Git identity unavailable")
         return result.stdout.strip()
 
-    if Path(git("rev-parse", "--show-toplevel")).resolve(strict=True) != candidate_root:
+    if Path(git(candidate_root, "rev-parse", "--show-toplevel")).resolve(strict=True) != candidate_root:
         raise ValueError("AC dev source upgrade top-level mismatch")
-    if git("branch", "--show-current") != "codex/ac-dev":
+    if git(candidate_root, "branch", "--show-current") != "codex/ac-dev":
         raise ValueError("AC dev source upgrade checked-out branch mismatch")
-    if git("status", "--porcelain"):
+    if git(candidate_root, "status", "--porcelain"):
         raise ValueError("AC dev source upgrade requires a clean worktree")
-    if git("rev-parse", "HEAD").lower() != str(candidate.get("commit") or ""):
+    if git(candidate_root, "rev-parse", "HEAD").lower() != str(candidate.get("commit") or ""):
         raise ValueError("AC dev source upgrade HEAD mismatch")
+    if git(candidate_root, "rev-parse", "refs/heads/codex/ac-dev").lower() != str(candidate.get("commit") or ""):
+        raise ValueError("AC dev source upgrade canonical ref mismatch")
+
+    if candidate_root != previous_root:
+        # A live pointer-only handoff still requires an exact detached old
+        # checkout.  A stopped completed generation is different: its stored
+        # path is historical provenance, so that registered worktree may have
+        # moved to a deferred branch or acquired an operator draft.  In both
+        # cases continuity comes from one shared Git object store, an exact
+        # clean canonical candidate, and content-addressed ancestry.
+        try:
+            dev_storage = Path(os.environ[AC_DEV_STORAGE_ROOT_ENV]).expanduser().resolve(strict=True)
+            binding = verified_stable_database_binding()
+            stable_storage = Path(str(binding.get("shared_volume_path") or "")).expanduser().resolve(strict=True)
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("AC dev source upgrade protected roots unavailable") from exc
+        for source_root in (previous_root, candidate_root):
+            if (
+                source_root == dev_storage or source_root in dev_storage.parents
+                or dev_storage in source_root.parents or source_root == stable_storage
+                or source_root in stable_storage.parents or stable_storage in source_root.parents
+            ):
+                raise ValueError("AC dev source upgrade source/storage roots overlap")
+        if Path(git(previous_root, "rev-parse", "--show-toplevel")).resolve(strict=True) != previous_root:
+            raise ValueError("AC dev source upgrade previous top-level mismatch")
+        previous_common = Path(git(previous_root, "rev-parse", "--git-common-dir"))
+        candidate_common = Path(git(candidate_root, "rev-parse", "--git-common-dir"))
+        if not previous_common.is_absolute():
+            previous_common = previous_root / previous_common
+        if not candidate_common.is_absolute():
+            candidate_common = candidate_root / candidate_common
+        if previous_common.resolve(strict=True) != candidate_common.resolve(strict=True):
+            raise ValueError("AC dev source upgrade Git common-dir mismatch")
+        worktrees = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=candidate_root,
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if worktrees.returncode != 0:
+            raise ValueError("AC dev source upgrade worktree registry unavailable")
+        registered = {
+            Path(line.removeprefix("worktree ")).resolve(strict=True)
+            for line in worktrees.stdout.splitlines() if line.startswith("worktree ")
+        }
+        if previous_root not in registered or candidate_root not in registered:
+            raise ValueError("AC dev source upgrade worktree is not registered")
+        previous_commit = str(previous.get("commit") or "").lower()
+        if not historical_worktree_advisory:
+            previous_symbolic = subprocess.run(
+                ["git", "symbolic-ref", "-q", "HEAD"], cwd=previous_root,
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if (
+                previous_symbolic.returncode == 0
+                or git(previous_root, "rev-parse", "HEAD").lower() != previous_commit
+                or git(previous_root, "status", "--porcelain")
+                or git(previous_root, "rev-parse", "HEAD^{tree}")
+                != git(previous_root, "rev-parse", f"{previous_commit}^{{tree}}")
+            ):
+                raise ValueError("AC dev source upgrade previous worktree is not exact detached state")
+        if str(candidate.get("commit") or "").lower() == previous_commit:
+            raise ValueError("AC dev source upgrade pointer-only candidate is not a strict descendant")
     ancestor = subprocess.run(
         [
             "git",
@@ -1302,6 +2978,17 @@ def _writer_process_start_identity() -> str:
     ).hexdigest()
 
 
+def _current_custody_start_identity() -> str:
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True,
+        text=True, timeout=2, check=False,
+    )
+    started = result.stdout.strip() if result.returncode == 0 else ""
+    if not started:
+        raise RuntimeError("AC dev custody process start identity is unavailable")
+    return "sha256:" + hashlib.sha256(started.encode("utf-8")).hexdigest()
+
+
 def acquire_dev_runtime_writer_lease(storage_root: Path | str) -> dict[str, object]:
     """Hold the dedicated dev database's OS writer fence for this process."""
 
@@ -1346,16 +3033,19 @@ def acquire_dev_runtime_writer_lease(storage_root: Path | str) -> dict[str, obje
 def release_dev_runtime_writer_lease(storage_root: Path | str) -> None:
     """Release this process's dedicated dev writer fence during shutdown."""
 
+    global _DEV_FIRST_START_CONTEXT
     root = Path(storage_root).expanduser().absolute()
     key = str((root / AC_DATABASE_DEV_RELATIVE_PATH).absolute())
     with _DEV_DATABASE_WRITER_LEASES_LOCK:
         receipt = _DEV_DATABASE_WRITER_LEASES.pop(key, None)
-        if not receipt:
-            return
-        handle = receipt.get("handle")
-        if handle is not None and not getattr(handle, "closed", True):
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
+        if receipt:
+            handle = receipt.get("handle")
+            if handle is not None and not getattr(handle, "closed", True):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                handle.close()
+        context = _DEV_FIRST_START_CONTEXT
+        if context is not None and context.storage_root == str(root):
+            _DEV_FIRST_START_CONTEXT = None
 
 
 def _bind_dev_writer_lease_database_identity(database: Path) -> None:
@@ -1374,13 +3064,249 @@ def _bind_dev_writer_lease_database_identity(database: Path) -> None:
         receipt["database_device"], receipt["database_inode"] = actual
 
 
+_SQLITE_ADOPTION_SUFFIXES = ("", "-wal", "-shm", "-journal")
+
+
+def _sqlite_adoption_identity(path: Path, *, required: bool) -> dict[str, object] | None:
+    """Capture one non-following SQLite artifact identity for adoption CAS.
+
+    This deliberately omits size and mtime: a successful checkpoint is expected
+    to change those.  Device/inode/type are the substitution boundary.
+    """
+
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if required:
+            raise ValueError("AC dev SQLite adoption artifact is missing")
+        return None
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("AC dev SQLite adoption artifact is not a regular file")
+    if path.resolve(strict=True) != path.absolute():
+        raise ValueError("AC dev SQLite adoption artifact escaped its world")
+    return {
+        "path": str(path.absolute()),
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "mode": int(stat.S_IFMT(metadata.st_mode)),
+    }
+
+
+def _sqlite_adoption_snapshot(root: Path, database: Path) -> dict[str, object]:
+    """Read physical identities without following caller-controlled paths."""
+
+    root_meta = root.stat(follow_symlinks=False)
+    if root.is_symlink() or not stat.S_ISDIR(root_meta.st_mode):
+        raise ValueError("AC dev SQLite adoption root identity is invalid")
+    return {
+        "root": {"device": int(root_meta.st_dev), "inode": int(root_meta.st_ino)},
+        "database": _sqlite_adoption_identity(database, required=True),
+        "companions": {
+            suffix: _sqlite_adoption_identity(Path(str(database) + suffix), required=False)
+            for suffix in ("-wal", "-shm", "-journal")
+        },
+    }
+
+
+def _assert_sqlite_adoption_identity(
+    before: Mapping[str, object], root: Path, database: Path,
+    *, checkpoint_result: tuple[int, int, int],
+) -> None:
+    """Reject every substitution after a bounded SQLite checkpoint.
+
+    A successful ``TRUNCATE`` is allowed to remove an existing WAL/SHM file on
+    close.  It is never allowed to make a different inode look legitimate:
+    accepting a replacement would turn a narrow SQLite recovery into an
+    attacker-controlled adoption path.
+    """
+
+    after = _sqlite_adoption_snapshot(root, database)
+    if after["root"] != before.get("root") or after["database"] != before.get("database"):
+        raise ValueError("AC dev SQLite adoption identity changed during recovery")
+    # A rollback journal is never a resumable dev-world artifact.  WAL/SHM may
+    # disappear after a successful TRUNCATE checkpoint, but a new journal is a
+    # concurrent/foreign writer signal and must fail closed.
+    if after["companions"].get("-journal") is not None:
+        raise ValueError("AC dev SQLite adoption found rollback journal")
+    if checkpoint_result != (0, 0, 0):
+        raise RuntimeError("AC dev SQLite adoption checkpoint did not truncate")
+    before_companions = dict(before.get("companions") or {})
+    after_companions = dict(after.get("companions") or {})
+    for suffix in ("-wal", "-shm"):
+        previous = before_companions.get(suffix)
+        current = after_companions.get(suffix)
+        if previous == current:
+            continue
+        # SQLite may remove its own sidecar after a completed truncate.  A
+        # changed-but-present file is an atomic replacement/recreation and is
+        # deliberately not accepted without a stronger directory-fd protocol.
+        if previous is not None and current is None:
+            continue
+        raise ValueError(
+            "AC dev SQLite adoption companion identity changed during recovery"
+        )
+
+
+def _assert_no_external_sqlite_holders(database: Path) -> None:
+    """Fail closed when another process has one of this world's SQLite files open."""
+
+    paths = {str(Path(str(database) + suffix).absolute()) for suffix in _SQLITE_ADOPTION_SUFFIXES}
+    try:
+        result = subprocess.run(
+            ["lsof", "-n", "-Fpn", *sorted(paths)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("AC dev SQLite holder inspection is unavailable") from exc
+    pids = {
+        int(line[1:])
+        for line in result.stdout.splitlines()
+        if line.startswith("p") and line[1:].isdigit()
+    }
+    foreign = pids - {os.getpid()}
+    if foreign:
+        raise RuntimeError("AC dev SQLite adoption has external holders")
+
+
+def _validate_existing_adoption_receipt(root: Path) -> None:
+    """Validate a prior canonical receipt without requiring its old source hash.
+
+    The new receipt is written by the CLI only after this recovery and any
+    source-tip upgrade succeed.  Requiring the current hash here would make a
+    legitimate descendant restart impossible; accepting a copied receipt would
+    make it unsafe, so all physical stable/root fields are rechecked.
+    """
+
+    path = root / AC_DEV_LAUNCH_RECEIPT_NAME
+    if path.is_symlink() or not path.is_file() or path.resolve(strict=True) != path:
+        raise ValueError("existing AC dev launch receipt is missing or invalid")
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("existing AC dev launch receipt is unreadable") from exc
+    if not isinstance(receipt, Mapping):
+        raise ValueError("existing AC dev launch receipt is invalid")
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
+    stable = _absolute_non_symlink_root(
+        Path(str(binding.get("shared_volume_path") or "")), create=False
+    )
+    root_stat = root.stat(follow_symlinks=False)
+    stable_stat = stable.stat(follow_symlinks=False)
+    parent_stat = stable.parent.stat(follow_symlinks=False)
+    required = {
+        "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
+        "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID,
+        "runtime_plane": DEV_RUNTIME_PLANE,
+        "port": 40008,
+        "background": False,
+        "storage_root": str(root),
+        "storage_device": int(root_stat.st_dev),
+        "storage_inode": int(root_stat.st_ino),
+        "stable_shared_volume": str(stable),
+        "stable_shared_volume_device": int(stable_stat.st_dev),
+        "stable_shared_volume_inode": int(stable_stat.st_ino),
+        "stable_parent_device": int(parent_stat.st_dev),
+        "stable_parent_inode": int(parent_stat.st_ino),
+    }
+    if any(receipt.get(key) != value for key, value in required.items()):
+        raise ValueError("existing AC dev launch receipt mismatch")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("source_sha256") or "")):
+        raise ValueError("existing AC dev launch receipt source hash is invalid")
+
+
+def _recover_verified_existing_dev_sqlite(
+    root: Path,
+    database: Path,
+    *,
+    _after_checkpoint_for_test=None,
+) -> None:
+    """Bounded source-owned recovery for a stopped, verified dev world.
+
+    No unlink is performed.  SQLite owns any WAL/SHM changes through a fully
+    completed TRUNCATE checkpoint; errors leave source-tip/receipt state alone.
+    """
+
+    before = _sqlite_adoption_snapshot(root, database)
+    if before["companions"].get("-journal") is not None:
+        raise ValueError("AC dev SQLite adoption rejects rollback journal state")
+    wal = Path(str(database) + "-wal")
+    if wal.exists():
+        wal_size = wal.stat(follow_symlinks=False).st_size
+        if wal_size:
+            header = wal.read_bytes()[:32]
+            if len(header) != 32 or header[:4] not in (
+                b"\x37\x7f\x06\x82", b"\x37\x7f\x06\x83"
+            ):
+                raise ValueError("AC dev SQLite adoption WAL is malformed")
+            page_size = int.from_bytes(header[8:12], "big")
+            if page_size == 1:
+                page_size = 65536
+            if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+                raise ValueError("AC dev SQLite adoption WAL page size is malformed")
+            if (wal_size - 32) % (page_size + 24):
+                raise ValueError("AC dev SQLite adoption WAL frame layout is malformed")
+    _assert_no_external_sqlite_holders(database)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(str(database), timeout=0, isolation_level=None)
+        for pragma in ("integrity_check", "quick_check"):
+            rows = [str(row[0]).lower() for row in conn.execute(f"PRAGMA {pragma}")]
+            if rows != ["ok"]:
+                raise ValueError(f"AC dev SQLite adoption {pragma} failed")
+        result = tuple(int(value) for value in conn.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone())
+        if result != (0, 0, 0):
+            raise RuntimeError("AC dev SQLite adoption checkpoint is incomplete")
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("AC dev SQLite adoption recovery failed") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    if _after_checkpoint_for_test is not None:
+        _after_checkpoint_for_test()
+    _assert_sqlite_adoption_identity(
+        before, root, database, checkpoint_result=result
+    )
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
+
+
+def _migration_capable_source_schema_memory() -> sqlite3.Connection:
+    """Build the current source schema without inheriting runtime-plane policy.
+
+    This connection is an isolated reference producer, never a target database.
+    A dev service must keep verify-only authority over its real connection, but
+    source-contract construction still needs to execute the canonical migration
+    chain in a fresh in-memory database.  Restore the process environment on
+    both success and failure so the reference build cannot widen later target
+    authority.
+    """
+
+    memory = sqlite3.connect(":memory:")
+    memory.row_factory = sqlite3.Row
+    _configure_connection(memory, busy_timeout=10000)
+    previous_plane = os.environ.get(RUNTIME_PLANE_ENV)
+    os.environ[RUNTIME_PLANE_ENV] = "generic"
+    try:
+        _ensure_schema(memory)
+    except BaseException:
+        memory.close()
+        raise
+    finally:
+        if previous_plane is None:
+            os.environ.pop(RUNTIME_PLANE_ENV, None)
+        else:
+            os.environ[RUNTIME_PLANE_ENV] = previous_plane
+    return memory
+
+
 def _source_schema_table_contract() -> tuple[set[str], set[str], set[tuple[str, str, str]]]:
     """Return required tables and the exact baseline sqlite_master inventory."""
 
-    with closing(sqlite3.connect(":memory:")) as memory:
-        memory.row_factory = sqlite3.Row
-        _configure_connection(memory, busy_timeout=10000)
-        _ensure_schema(memory)
+    with closing(_migration_capable_source_schema_memory()) as memory:
         required = {
             str(row[0])
             for row in memory.execute(
@@ -1409,14 +3335,421 @@ def _source_schema_inventory_hash(conn: sqlite3.Connection, required: set[str]) 
     ).hexdigest()
 
 
+# This is deliberately a small, separately-versioned schema capability.  It is
+# not a second general migration engine: the only admissible drift is a pristine
+# absence of these named objects in an otherwise verified AC dev world.
+BACKLOG_READ_SCHEMA_PLAN_VERSION = "ac_dev_backlog_read_schema_plan.v1"
+BACKLOG_READ_SCHEMA_RESOURCE = "backlog"
+BACKLOG_READ_SCHEMA_TABLE_DEFINITION = (
+    (("resource", "TEXT", 0, None, 1), "resource TEXT PRIMARY KEY"),
+    (("generation", "INTEGER", 1, "1", 0), "generation INTEGER NOT NULL DEFAULT 1"),
+    (("updated_at", "TEXT", 1, "''", 0), "updated_at TEXT NOT NULL DEFAULT ''"),
+)
+BACKLOG_READ_SCHEMA_TABLE_XINFO = tuple(
+    (*metadata, 0) for metadata, _sql in BACKLOG_READ_SCHEMA_TABLE_DEFINITION
+)
+BACKLOG_READ_SCHEMA_INDEX_SQL = (
+    "CREATE INDEX idx_backlog_bugs_dashboard_keyset "
+    "ON backlog_bugs(updated_at DESC, created_at DESC, bug_id DESC)"
+)
+BACKLOG_READ_SCHEMA_TABLE_SQL = (
+    "CREATE TABLE dashboard_backlog_cache_generation ("
+    + ", ".join(sql for _metadata, sql in BACKLOG_READ_SCHEMA_TABLE_DEFINITION)
+    + ")"
+)
+BACKLOG_READ_SCHEMA_SEED_SQL = (
+    "INSERT INTO dashboard_backlog_cache_generation "
+    "(resource, generation, updated_at) VALUES ('backlog', 1, CURRENT_TIMESTAMP)"
+)
+BACKLOG_READ_SCHEMA_TRIGGER_SQL: Mapping[str, str] = {
+    event: (
+        f"CREATE TRIGGER trg_dashboard_backlog_cache_{event.lower()} "
+        f"AFTER {event} ON backlog_bugs BEGIN "
+        "UPDATE dashboard_backlog_cache_generation "
+        "SET generation = generation + 1, updated_at = CURRENT_TIMESTAMP "
+        "WHERE resource = 'backlog'; END"
+    )
+    for event in ("INSERT", "UPDATE", "DELETE")
+}
+BACKLOG_READ_SCHEMA_OBJECTS = frozenset({
+    "dashboard_backlog_cache_generation",
+    "idx_backlog_bugs_dashboard_keyset",
+    *(f"trg_dashboard_backlog_cache_{event.lower()}" for event in BACKLOG_READ_SCHEMA_TRIGGER_SQL),
+})
+
+# This is a second, deliberately fixed admission capability.  It is not a
+# migration framework: all definitions are exported by their owning modules,
+# and an admission may only create a pristine absence of the complete set.
+AC_AUTHORITY_SCHEMA_PLAN_VERSION = "ac_dev_authority_projection_schema_plan.v1"
+AC_AUTHORITY_SCHEMA_INVENTORY_COUNT = 308
+AC_AUTHORITY_SCHEMA_INVENTORY_SHA256 = (
+    "sha256:76684bd3ece70dcae94e1b9678abf57ef74ca2d7dffdc4166414e5ca74cd7999"
+)
+AC_AUTHORITY_SCHEMA_TABLES = frozenset({
+    "observer_route_token_refs",
+    "contract_runtime_executions",
+    "worker_implementation_test_results_corrections",
+    "backlog_contract_chain_bindings",
+    "contract_chain_edges",
+    "backlog_contract_chain_current",
+})
+
+
+def _authority_projection_schema_statements() -> tuple[str, ...]:
+    """Compose, but never duplicate, the six-owner authority DDL."""
+    from .contracts.runtime import authority_projection_schema_statements
+    from .observer_route_context import authority_route_registry_schema_statements
+    return authority_route_registry_schema_statements() + authority_projection_schema_statements()
+
+
+def _canonical_authority_projection_schema_inventory(*, include_plan: bool) -> tuple[tuple[str, str, str, str], ...]:
+    with closing(_migration_capable_source_schema_memory()) as memory:
+        if include_plan:
+            for statement in _authority_projection_schema_statements():
+                memory.execute(statement)
+        return _sqlite_master_inventory(memory)
+
+
+def authority_projection_schema_plan() -> dict[str, object]:
+    statements = _authority_projection_schema_statements()
+    return {
+        "schema_version": AC_AUTHORITY_SCHEMA_PLAN_VERSION,
+        "tables": tuple(sorted(AC_AUTHORITY_SCHEMA_TABLES)),
+        "statements_sha256": "sha256:" + hashlib.sha256(
+            json.dumps(statements, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def authority_projection_schema_inventory() -> dict[str, object]:
+    """Return the exact full source-owned inventory for receipt preflight."""
+    with closing(_migration_capable_source_schema_memory()) as memory:
+        for statement in _authority_projection_schema_statements():
+            memory.execute(statement)
+        return backlog_read_schema_inventory(memory)
+
+
+def authority_projection_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Fail closed unless this is exactly the six-object pristine absence."""
+    base = _canonical_authority_projection_schema_inventory(include_plan=False)
+    full = _canonical_authority_projection_schema_inventory(include_plan=True)
+    actual = _sqlite_master_inventory(conn)
+    base_map = {(k, n, t): s for k, n, t, s in base}
+    full_map = {(k, n, t): s for k, n, t, s in full}
+    actual_map = {(k, n, t): s for k, n, t, s in actual}
+    invalid: list[str] = []
+    for key in sorted(set(actual_map) - set(full_map)):
+        invalid.append("inventory_extra:" + ":".join(key))
+    for key in sorted(set(base_map) - set(actual_map)):
+        invalid.append("inventory_missing:" + ":".join(key))
+    for key in sorted(set(actual_map) & set(full_map)):
+        if actual_map[key] != full_map[key]:
+            invalid.append("inventory_altered:" + ":".join(key))
+    plan_keys = set(full_map) - set(base_map)
+    present = plan_keys & set(actual_map)
+    if present and present != plan_keys:
+        invalid.append("inventory_partial_plan")
+    # A table can be absent while one of its auto indexes is necessarily also
+    # absent.  sqlite_master inventories explicit objects; validate all PK and
+    # UNIQUE autoindexes separately so an altered replacement cannot hide.
+    for table in sorted(AC_AUTHORITY_SCHEMA_TABLES):
+        if table in {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}:
+            expected = _DEV_SCHEMA_PRIMARY_KEYS.get(table)
+            columns = tuple(str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})") if int(r[5]))
+            if expected and columns != expected:
+                invalid.append("primary_key_altered:" + table)
+    missing = [] if present == plan_keys else sorted(AC_AUTHORITY_SCHEMA_TABLES)
+    return {"missing": missing, "invalid": sorted(set(invalid))}
+
+
+def admit_missing_authority_projection_schema(conn: sqlite3.Connection) -> dict[str, object]:
+    """Create the complete authority namespace in one caller-owned txn."""
+    before = authority_projection_schema_drift(conn)
+    if before["invalid"]:
+        raise ValueError("AC dev authority schema admission rejects invalid drift")
+    if not before["missing"]:
+        return {"changed": False, "missing": []}
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _authority_projection_schema_statements():
+            conn.execute(statement)
+        after = authority_projection_schema_drift(conn)
+        if after["missing"] or after["invalid"]:
+            raise ValueError("AC dev authority schema admission postcondition failed")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {"changed": True, "missing": before["missing"]}
+
+
+def backlog_read_schema_plan() -> dict[str, object]:
+    """Return the one canonical operator plan shared by stable/dev/CLI."""
+    return {
+        "schema_version": BACKLOG_READ_SCHEMA_PLAN_VERSION,
+        "table": "dashboard_backlog_cache_generation",
+        "index": "idx_backlog_bugs_dashboard_keyset",
+        "triggers": tuple(sorted(BACKLOG_READ_SCHEMA_TRIGGER_SQL)),
+        "allowed_objects": tuple(sorted(BACKLOG_READ_SCHEMA_OBJECTS)),
+    }
+
+
+def _backlog_read_normalized_sql(value: object) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().rstrip(";"))
+    return re.sub(r"\s*([(),;])\s*", r"\1", normalized.replace(" IF NOT EXISTS ", " "))
+
+
+def _sqlite_master_inventory(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
+    """Return the complete managed SQLite namespace, including SQL bodies.
+
+    Names alone are not a schema authority: a shadow trigger or a table with an
+    altered definition can change the meaning of the same read path.  SQLite's
+    internal autoindexes do not have sqlite_master SQL rows and are deliberately
+    outside this source-derived inventory.
+    """
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master "
+        "WHERE type IN ('table', 'index', 'trigger', 'view') "
+        "ORDER BY type, name, tbl_name"
+    ).fetchall()
+    return tuple(
+        (str(kind), str(name), str(table), _backlog_read_normalized_sql(sql))
+        for kind, name, table, sql in rows
+    )
+
+
+def _canonical_backlog_read_schema_inventory(*, include_plan: bool) -> tuple[tuple[str, str, str, str], ...]:
+    """Materialize the source-owned backlog plan without a runtime plane.
+
+    Receipt reconstruction needs the immutable SQL producer, not a simulated
+    service startup.  In particular, do not run migrations or DEV-plane
+    authorizers here: optional subsystem inventory is live-runtime authority,
+    while these exact backlog objects are a separately versioned source ABI.
+    """
+    with closing(sqlite3.connect(":memory:")) as memory:
+        memory.row_factory = sqlite3.Row
+        _configure_connection(memory, busy_timeout=10000)
+        memory.executescript(SCHEMA_SQL)
+        if include_plan:
+            memory.execute(BACKLOG_READ_SCHEMA_TABLE_SQL)
+            memory.execute(BACKLOG_READ_SCHEMA_INDEX_SQL)
+            memory.execute(BACKLOG_READ_SCHEMA_SEED_SQL)
+            for sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.values():
+                memory.execute(sql)
+        return _sqlite_master_inventory(memory)
+
+
+def backlog_read_schema_inventory(conn: sqlite3.Connection) -> dict[str, object]:
+    """Return a content-addressed complete inventory for receipt binding."""
+    inventory = _sqlite_master_inventory(conn)
+    encoded = json.dumps(inventory, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return {
+        # Receipts are JSON, so keep the public value JSON-native as well;
+        # otherwise a parsed receipt (lists) cannot equal a fresh observation
+        # (tuples) despite identical canonical bytes.
+        "inventory": [list(item) for item in inventory],
+        "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _authority_projection_inventory_in_managed_world(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Project the 308 source-owned objects out of the separate backlog overlay."""
+    managed = _backlog_read_managed_object_names() | frozenset({
+        "sqlite_autoindex_dashboard_backlog_cache_generation_1",
+    })
+    inventory = tuple(
+        row for row in _sqlite_master_inventory(conn) if row[1] not in managed
+    )
+    encoded = json.dumps(
+        inventory, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    return {
+        "inventory": [list(item) for item in inventory],
+        "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _backlog_read_managed_object_names() -> frozenset[str]:
+    """The only sqlite_master names an offline backlog admission may create."""
+    return frozenset({
+        "dashboard_backlog_cache_generation",
+        "idx_backlog_bugs_dashboard_keyset",
+        *(f"trg_dashboard_backlog_cache_{event.lower()}"
+          for event in BACKLOG_READ_SCHEMA_TRIGGER_SQL),
+    })
+
+
+def _schema_inventory_binding(
+    rows: tuple[tuple[str, str, str, str], ...], *, hash_sql: bool,
+) -> dict[str, object]:
+    """Serialize a deterministic SQLite inventory without trusting names alone."""
+    values = tuple(
+        (kind, name, table, "sha256:" + hashlib.sha256(sql.encode("utf-8")).hexdigest())
+        if hash_sql else (kind, name, table, sql)
+        for kind, name, table, sql in rows
+    )
+    encoded = json.dumps(values, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return {
+        "inventory": [list(item) for item in values],
+        "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def backlog_read_schema_managed_inventory(conn: sqlite3.Connection) -> dict[str, object]:
+    """Bind exactly the five source-owned backlog-read objects, and no others."""
+    names = _backlog_read_managed_object_names()
+    return _schema_inventory_binding(
+        tuple(row for row in _sqlite_master_inventory(conn) if row[1] in names),
+        hash_sql=False,
+    )
+
+
+def canonical_backlog_read_schema_managed_inventory() -> dict[str, object]:
+    """Return the exact post-admission managed-object binding without a target DB."""
+    names = _backlog_read_managed_object_names()
+    return _schema_inventory_binding(
+        tuple(
+            row for row in _canonical_backlog_read_schema_inventory(include_plan=True)
+            if row[1] in names
+        ),
+        hash_sql=False,
+    )
+
+
+def backlog_read_schema_protected_inventory(conn: sqlite3.Connection) -> dict[str, object]:
+    """Bind every non-managed object before an offline admission mutates sqlite."""
+    names = _backlog_read_managed_object_names()
+    return _schema_inventory_binding(
+        tuple(
+            row for row in _sqlite_master_inventory(conn)
+            if row[1] not in names
+            and not row[1].startswith("sqlite_autoindex_dashboard_backlog_cache_generation_")
+        ),
+        hash_sql=True,
+    )
+
+
+def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Classify the bounded backlog-read plan without writing.
+
+    ``missing`` is the *only* class the offline admission may repair.  Any
+    definition mismatch, partial seed, or unexpected similarly-named object is
+    hostile drift and must remain a zero-write rejection.
+    """
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master "
+        "WHERE name IN (%s)" % ",".join("?" for _ in BACKLOG_READ_SCHEMA_OBJECTS),
+        tuple(sorted(BACKLOG_READ_SCHEMA_OBJECTS)),
+    ).fetchall()
+    actual = {str(row[1]): tuple(row) for row in rows}
+    missing: list[str] = []
+    invalid: list[str] = []
+    table = actual.get("dashboard_backlog_cache_generation")
+    if table is None:
+        missing.append("generation_table")
+    elif table[0] != "table" or _backlog_read_normalized_sql(table[3]) != _backlog_read_normalized_sql(BACKLOG_READ_SCHEMA_TABLE_SQL):
+        invalid.append("generation_table")
+        invalid.append("inventory_altered:table:dashboard_backlog_cache_generation")
+    index = actual.get("idx_backlog_bugs_dashboard_keyset")
+    if index is None:
+        missing.append("keyset_index")
+    elif index[0] != "index" or index[2] != "backlog_bugs" or _backlog_read_normalized_sql(index[3]) != _backlog_read_normalized_sql(BACKLOG_READ_SCHEMA_INDEX_SQL):
+        invalid.append("keyset_index")
+        invalid.append("inventory_altered:index:idx_backlog_bugs_dashboard_keyset")
+    for event, sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.items():
+        name = f"trg_dashboard_backlog_cache_{event.lower()}"
+        trigger = actual.get(name)
+        if trigger is None:
+            missing.append(f"trigger_{event.lower()}")
+        elif trigger[0] != "trigger" or trigger[2] != "backlog_bugs" or _backlog_read_normalized_sql(trigger[3]) != _backlog_read_normalized_sql(sql):
+            invalid.append(f"trigger_{event.lower()}")
+            invalid.append("inventory_altered:trigger:" + name)
+    if table is not None and "generation_table" not in invalid:
+        seeds = conn.execute(
+            "SELECT resource, generation, updated_at FROM dashboard_backlog_cache_generation "
+            "WHERE resource=?", (BACKLOG_READ_SCHEMA_RESOURCE,)
+        ).fetchall()
+        if not seeds:
+            missing.append("backlog_generation_seed")
+        elif len(seeds) != 1 or str(seeds[0][0]) != BACKLOG_READ_SCHEMA_RESOURCE or int(seeds[0][1]) < 1 or not str(seeds[0][2]):
+            invalid.append("backlog_generation_seed")
+    # This admission owns only the bounded backlog-read namespace.  Runtime,
+    # observer, worker, and contract objects are protected by the caller's
+    # complete inventory/projection binding; treating them as backlog drift
+    # would incorrectly force a pristine whole-world database.
+    managed_names = _backlog_read_managed_object_names()
+    base_names = {name for _kind, name, _table, _sql in _canonical_backlog_read_schema_inventory(include_plan=False)}
+    for kind, name, table_name, _sql in _sqlite_master_inventory(conn):
+        # Any collision/shadow object that claims the managed backlog naming
+        # domain remains fail-closed; unrelated objects do not.
+        if name in managed_names or name.startswith("sqlite_autoindex_dashboard_backlog_cache_generation_"):
+            continue
+        if name not in base_names and ("dashboard" in name.lower() or name.startswith("shadow_backlog")):
+            invalid.append("inventory_extra:" + ":".join((kind, name, table_name)))
+    # A partially materialized managed object set is never repairable: only
+    # the pristine absence of all five objects may be admitted.
+    if any(name in actual for name in managed_names) and missing:
+        invalid.append("inventory_partial_plan")
+    return {"missing": sorted(set(missing)), "invalid": sorted(set(invalid))}
+
+
+def ensure_backlog_read_schema(conn: sqlite3.Connection) -> None:
+    """Stable-only initializer for the bounded backlog-read plan."""
+    conn.execute(BACKLOG_READ_SCHEMA_TABLE_SQL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+    conn.execute(BACKLOG_READ_SCHEMA_INDEX_SQL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
+    conn.execute(BACKLOG_READ_SCHEMA_SEED_SQL.replace("INSERT INTO", "INSERT OR IGNORE INTO", 1))
+    for sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.values():
+        conn.execute(sql.replace("CREATE TRIGGER", "CREATE TRIGGER IF NOT EXISTS", 1))
+    conn.commit()
+
+
+def admit_missing_backlog_read_schema(
+    conn: sqlite3.Connection, *, commit: bool = True,
+) -> dict[str, object]:
+    """Apply exactly the known missing-object set in one caller-owned transaction."""
+    before = backlog_read_schema_drift(conn)
+    if before["invalid"]:
+        raise ValueError("AC dev schema admission rejects invalid backlog-read drift")
+    if not before["missing"]:
+        return {"changed": False, "missing": []}
+    if commit:
+        conn.execute("BEGIN IMMEDIATE")
+    elif not conn.in_transaction:
+        raise ValueError("caller-owned backlog-read admission requires an active transaction")
+    try:
+        # The preflight allows only pristine absences; each statement is
+        # unconditional so a concurrent/create race becomes a rollback.
+        if "generation_table" in before["missing"]:
+            conn.execute(BACKLOG_READ_SCHEMA_TABLE_SQL)
+        if "keyset_index" in before["missing"]:
+            conn.execute(BACKLOG_READ_SCHEMA_INDEX_SQL)
+        if (
+            "generation_table" in before["missing"]
+            or "backlog_generation_seed" in before["missing"]
+        ):
+            conn.execute(BACKLOG_READ_SCHEMA_SEED_SQL)
+        for event, sql in BACKLOG_READ_SCHEMA_TRIGGER_SQL.items():
+            if f"trigger_{event.lower()}" in before["missing"]:
+                conn.execute(sql)
+        after = backlog_read_schema_drift(conn)
+        if after["missing"] or after["invalid"]:
+            raise ValueError("AC dev schema admission postcondition failed")
+        if commit:
+            conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {"changed": True, "missing": before["missing"]}
+
+
 def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     required, allowed, source_objects = _source_schema_table_contract()
     actual = {
         str(row[0])
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    unknown = sorted(actual - allowed)
-    missing = sorted(required - actual)
     actual_objects = {
         (str(row[0]), str(row[1]), str(row[2]))
         for row in conn.execute(
@@ -1424,10 +3757,88 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             "WHERE type IN ('table', 'index', 'trigger', 'view')"
         )
     }
+    managed_exact = (
+        backlog_read_schema_managed_inventory(conn)
+        == canonical_backlog_read_schema_managed_inventory()
+    )
+    managed_table = "dashboard_backlog_cache_generation"
+    managed_names = _backlog_read_managed_object_names()
+    managed_autoindex = "sqlite_autoindex_dashboard_backlog_cache_generation_1"
+    graph_classification = classify_graph_materialization_preimage(conn)
+    graph_registry = _graph_schema_owner_registry()
+    graph_owner_states = graph_classification.get("owner_states")
+    owner_state_values = (
+        [graph_owner_states.get(owner) for owner, _canonical in graph_registry]
+        if isinstance(graph_owner_states, dict)
+        else []
+    )
+    graph_overlay_exact = bool(
+        owner_state_values
+        and all(state == "exact" for state in owner_state_values)
+    )
+    graph_known_names = {
+        row[1] for _owner, canonical in graph_registry for row in canonical
+    }
+    graph_known_tables = {
+        row[2] for _owner, canonical in graph_registry for row in canonical
+        if row[0] == "table"
+    }
+    actual_graph_inventory = [
+        row for row in _graph_materialization_inventory(conn)
+        if row[1] in graph_known_names or row[2] in graph_known_tables
+    ]
+    with closing(_migration_capable_source_schema_memory()) as source_memory:
+        baseline_graph_inventory = [
+            row for row in _graph_materialization_inventory(source_memory)
+            if row[1] in graph_known_names or row[2] in graph_known_tables
+        ]
+    graph_baseline_exact = actual_graph_inventory == baseline_graph_inventory
+    if not (graph_overlay_exact or graph_baseline_exact):
+        raise ValueError(
+            "AC dev source schema inventory mismatch: "
+            "graph owners must equal baseline or all be SQL-exact"
+        )
+    graph_exact_inventory = {
+        row for _owner, canonical in graph_registry for row in canonical
+        if graph_overlay_exact
+    }
+    graph_exact_objects = {
+        (kind, name, table) for kind, name, table, _sql in graph_exact_inventory
+    }
+    graph_exact_tables = {
+        name for kind, name, _table, _sql in graph_exact_inventory
+        if kind == "table"
+    }
+    # This exception is deliberately all-or-nothing: the SQL-bearing five
+    # objects must equal the source plan before *only* their exact namespace
+    # can be removed from the baseline source-inventory comparison.
+    accepted_overlay = set()
+    if managed_exact:
+        accepted_overlay = {
+            (kind, name, table)
+            for kind, name, table in actual_objects
+            if name in managed_names
+            or (kind == "index" and name == managed_autoindex and table == managed_table)
+        }
+        if ("table", managed_table, managed_table) not in accepted_overlay or (
+                "index", managed_autoindex, managed_table) not in accepted_overlay:
+            accepted_overlay = set()
+            managed_exact = False
+    unknown = sorted(
+        (actual - allowed)
+        - graph_exact_tables
+        - ({managed_table} if managed_exact else set())
+    )
+    missing = sorted(required - actual)
     optional = allowed - required
     unknown_objects = sorted(
         item
-        for item in actual_objects - source_objects
+        for item in (
+            actual_objects
+            - source_objects
+            - accepted_overlay
+            - graph_exact_objects
+        )
         if not (item[0] in {"table", "index"} and item[2] in optional)
     )
     if unknown or missing or unknown_objects:
@@ -1435,6 +3846,1914 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             "AC dev source schema inventory mismatch: "
             f"unknown={unknown}, missing={missing}, unknown_objects={unknown_objects}"
         )
+
+
+def _durable_database_sha256(database: Path) -> str:
+    """Hash one stable, no-follow database inode."""
+    before = database.stat(follow_symlinks=False)
+    if database.is_symlink() or not stat.S_ISREG(before.st_mode):
+        raise ValueError("AC dev durable database is not a canonical regular file")
+    descriptor = os.open(database, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256()
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+        raise ValueError("AC dev durable database changed during hashing")
+    return "sha256:" + digest.hexdigest()
+
+
+def _database_logical_sha256(database: Path) -> str:
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        projection = _sqlite_logical_projection(connection)
+    finally:
+        connection.close()
+    return "sha256:" + hashlib.sha256(json.dumps(
+        projection, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")).hexdigest()
+
+
+_DEV_LIVE_CUSTODY_META_KEYS = (
+    "schema_version",
+    "governance_world_id",
+    "governance_world_genesis_sha256",
+    "governance_world_genesis_json",
+    "governance_world_source_tip_json",
+    "governance_world_source_tip_sha256",
+    "governance_world_source_tip_revision",
+    "governance_world_current_process_json",
+)
+
+
+def _dev_live_world_custody_sha256(
+    database: Path, *, immutable: bool,
+) -> str:
+    """Hash only immutable world/custody rows while verifying live schema.
+
+    The database is intentionally mutable after first start: backlog, timeline,
+    ContractRuntime, and graph data are normal service state.  This projection
+    keeps the first-start seal over the world and process custody rows without
+    turning every legitimate DML transaction into a new launch authority.
+    """
+
+    query = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+    connection = sqlite3.connect(
+        "file:" + urllib.parse.quote(str(database)) + query,
+        uri=True,
+        timeout=10,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        _verify_existing_schema(connection)
+        _verify_dev_world_schema_inventory(connection)
+        placeholders = ",".join("?" for _ in _DEV_LIVE_CUSTODY_META_KEYS)
+        rows = connection.execute(
+            "SELECT key,value FROM schema_meta WHERE key IN ("
+            + placeholders
+            + ") ORDER BY key",
+            _DEV_LIVE_CUSTODY_META_KEYS,
+        ).fetchall()
+        projection = {str(row["key"]): str(row["value"]) for row in rows}
+    finally:
+        connection.close()
+    if set(projection) != set(_DEV_LIVE_CUSTODY_META_KEYS):
+        raise ValueError("AC dev live world custody projection is incomplete")
+    try:
+        genesis = json.loads(projection["governance_world_genesis_json"])
+        source_tip = json.loads(projection["governance_world_source_tip_json"])
+        process = json.loads(projection["governance_world_current_process_json"])
+        source_revision = int(
+            projection["governance_world_source_tip_revision"]
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AC dev live world custody projection is malformed") from exc
+    if (
+        projection["schema_version"] != str(SCHEMA_VERSION)
+        or projection["governance_world_id"] != AC_DEV_WORLD_ID
+        or not isinstance(genesis, Mapping)
+        or genesis.get("schema_version") != AC_WORLD_GENESIS_SCHEMA
+        or genesis.get("world_id") != AC_DEV_WORLD_ID
+        or genesis.get("project_id") != AC_PROJECT_ID
+        or genesis.get("source_only") is not True
+        or genesis.get("rows_copied") != 0
+        or projection["governance_world_genesis_sha256"]
+        != _world_genesis_hash(genesis)
+        or not isinstance(source_tip, Mapping)
+        or set(source_tip) != _DEV_SOURCE_TIP_KEYS
+        or projection["governance_world_source_tip_sha256"]
+        != _world_source_tip_hash(source_tip)
+        or source_revision < 1
+        or not isinstance(process, Mapping)
+    ):
+        raise ValueError("AC dev live world custody projection is invalid")
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            projection,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _current_first_start_source(source_root: Path) -> dict[str, str]:
+    root = source_root.expanduser().resolve(strict=True)
+    branch = _git_read_exact(root, "branch", "--show-current").decode().strip()
+    commit = _git_read_exact(root, "rev-parse", "HEAD").decode().strip().lower()
+    tree = _git_read_exact(root, "rev-parse", "HEAD^{tree}").decode().strip().lower()
+    dirty = _git_read_exact(root, "status", "--porcelain").decode()
+    cli_path = root / "agent" / "cli.py"
+    server_path = root / "agent" / "governance" / "server.py"
+    if (branch != "codex/ac-dev" or dirty or cli_path.is_symlink()
+            or server_path.is_symlink() or not cli_path.is_file()
+            or not server_path.is_file()):
+        raise ValueError("AC dev first-start source binding is invalid")
+    return {
+        "root": str(root), "branch": branch, "commit": commit, "tree": tree,
+        "cli_sha256": "sha256:" + hashlib.sha256(cli_path.read_bytes()).hexdigest(),
+        "server_sha256": "sha256:" + hashlib.sha256(server_path.read_bytes()).hexdigest(),
+    }
+
+
+def _install_dev_first_start_context(
+    root: Path, *, source_identity: Mapping[str, object], database_sha256: str,
+    logical_sha256: str,
+) -> None:
+    """Install the sole non-persistent post-transition authority."""
+    global _DEV_FIRST_START_CONTEXT
+    resolved_root = root.expanduser().resolve(strict=True)
+    claimed_source_root = Path(str(source_identity.get("root") or "")).resolve(
+        strict=True
+    )
+    loaded_source_root = Path(__file__).resolve(strict=True).parents[2]
+    if claimed_source_root != loaded_source_root:
+        raise ValueError("AC dev first-start loaded source root mismatch")
+    source = _current_first_start_source(claimed_source_root)
+    expected_source = {
+        "root": source["root"], "branch": source["branch"],
+        "commit": source["commit"], "tree": source["tree"],
+        "source_sha256": source["cli_sha256"], "dirty": "",
+    }
+    if dict(source_identity) != expected_source:
+        raise ValueError("AC dev first-start source identity mismatch")
+    database = resolved_root / AC_DATABASE_DEV_RELATIVE_PATH
+    root_stat = resolved_root.stat(follow_symlinks=False)
+    database_stat = database.stat(follow_symlinks=False)
+    if (_durable_database_sha256(database) != database_sha256
+            or _database_logical_sha256(database) != logical_sha256):
+        raise ValueError("AC dev first-start postimage changed before context install")
+    world_custody_sha256 = _dev_live_world_custody_sha256(
+        database, immutable=True,
+    )
+    _bind_dev_writer_lease_database_identity(database)
+    _DEV_FIRST_START_CONTEXT = _DevFirstStartContext(
+        _DEV_FIRST_START_CONTEXT_TOKEN,
+        pid=os.getpid(), process_start_identity=_writer_process_start_identity(),
+        source_root=source["root"], source_commit=source["commit"],
+        source_tree=source["tree"], cli_sha256=source["cli_sha256"],
+        server_sha256=source["server_sha256"], storage_root=str(resolved_root),
+        storage_device=int(root_stat.st_dev), storage_inode=int(root_stat.st_ino),
+        database_path=str(database), database_device=int(database_stat.st_dev),
+        database_inode=int(database_stat.st_ino),
+        world_custody_sha256=world_custody_sha256,
+    )
+
+
+def _validate_dev_first_start_context(root: Path) -> bool:
+    context = _DEV_FIRST_START_CONTEXT
+    if context is None:
+        return False
+    if (type(context) is not _DevFirstStartContext
+            or context._sealed is not _DEV_FIRST_START_CONTEXT_TOKEN):
+        raise ValueError("AC dev first-start context is forged")
+    resolved_root = root.expanduser().resolve(strict=True)
+    database = resolved_root / AC_DATABASE_DEV_RELATIVE_PATH
+    root_stat = resolved_root.stat(follow_symlinks=False)
+    database_stat = database.stat(follow_symlinks=False)
+    source = _current_first_start_source(Path(context.source_root))
+    if Path(__file__).resolve(strict=True).parents[2] != Path(context.source_root):
+        raise ValueError("AC dev first-start loaded source root changed")
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = _DEV_DATABASE_WRITER_LEASES.get(str(database))
+        lease_valid = bool(lease) and (
+            int(lease.get("owner_pid") or 0) == os.getpid()
+            and lease.get("owner_start_identity") == _writer_process_start_identity()
+            and (lease.get("database_device"), lease.get("database_inode"))
+            == (int(database_stat.st_dev), int(database_stat.st_ino))
+            and not getattr(lease.get("handle"), "closed", True)
+        )
+    if (
+        context.pid != os.getpid()
+        or context.process_start_identity != _writer_process_start_identity()
+        or context.source_root != source["root"]
+        or context.source_commit != source["commit"]
+        or context.source_tree != source["tree"]
+        or context.cli_sha256 != source["cli_sha256"]
+        or context.server_sha256 != source["server_sha256"]
+        or context.storage_root != str(resolved_root)
+        or (context.storage_device, context.storage_inode)
+        != (int(root_stat.st_dev), int(root_stat.st_ino))
+        or context.database_path != str(database)
+        or (context.database_device, context.database_inode)
+        != (int(database_stat.st_dev), int(database_stat.st_ino))
+        or context.world_custody_sha256
+        != _dev_live_world_custody_sha256(database, immutable=False)
+        or not lease_valid
+    ):
+        raise ValueError("AC dev first-start context binding changed")
+    return True
+
+
+def _cow_regular_identity(path: Path, *, nlink: int | None = None) -> dict[str, object]:
+    absolute = path.expanduser().absolute()
+    metadata = absolute.stat(follow_symlinks=False)
+    if (absolute.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+            or absolute.resolve(strict=True) != absolute
+            or (nlink is not None and int(metadata.st_nlink) != nlink)):
+        raise ValueError("AC dev COW successor artifact is not canonical")
+    return {"path": str(absolute), "device": int(metadata.st_dev),
+            "inode": int(metadata.st_ino), "size": int(metadata.st_size),
+            "nlink": int(metadata.st_nlink), "sha256": _durable_database_sha256(absolute)}
+
+
+def _cow_raw_receipt(path: Path, *, prefix: str = "") -> tuple[dict[str, object], str]:
+    absolute = path.expanduser().absolute()
+    metadata = absolute.stat(follow_symlinks=False)
+    if (absolute.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+            or int(metadata.st_nlink) != 1 or absolute.resolve(strict=True) != absolute):
+        raise ValueError("AC dev COW successor evidence is not canonical")
+    raw = absolute.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if prefix:
+        if (re.fullmatch(rf"{re.escape(prefix)}\.([0-9a-f]{{64}})\.json", absolute.name) is None
+                or absolute.name != f"{prefix}.{digest}.json"):
+            raise ValueError("AC dev COW successor receipt digest mismatch")
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError("AC dev COW successor evidence is unreadable") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("AC dev COW successor evidence is invalid")
+    return dict(value), "sha256:" + digest
+
+
+def _cow_database_observation(
+    database: Path, *, expected_rows: int = 3603, require_managed: bool = True,
+    nlink: int | None = 1,
+    historical_source_schema: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    identity = _cow_regular_identity(database, nlink=nlink)
+    for suffix in ("-wal", "-shm", "-journal"):
+        if Path(str(database) + suffix).exists() or Path(str(database) + suffix).is_symlink():
+            raise ValueError("AC dev COW successor database has sidecars")
+    _assert_no_external_sqlite_holders(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise ValueError("AC dev COW successor quick-check failed")
+        # Root/genesis/receipt/service validation already binds this complete
+        # SQLite world to aming-claw.  backlog_bugs itself intentionally has no
+        # project_id column, so authenticate its exact source-owned ABI before
+        # reading the whole project-bound table.
+        canonical_memory = (
+            _migration_capable_source_schema_memory()
+            if historical_source_schema is None
+            else sqlite3.connect(":memory:")
+        )
+        with closing(canonical_memory) as canonical:
+            if historical_source_schema is not None:
+                canonical.row_factory = sqlite3.Row
+                _configure_connection(canonical, busy_timeout=10000)
+                # Immutable receipt replay owns its issuance-time source
+                # inventory below.  It needs only the source-defined backlog
+                # ABI here; current optional migration inventory must not
+                # become a second reconstruction authority.
+                canonical.executescript(SCHEMA_SQL)
+            expected_sql_row = canonical.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='backlog_bugs'"
+            ).fetchone()
+            expected_columns = [tuple(row) for row in canonical.execute(
+                'PRAGMA table_info("backlog_bugs")'
+            )]
+            if require_managed:
+                ensure_backlog_read_schema(canonical)
+            if historical_source_schema is None:
+                expected_required, _expected_allowed, _expected_objects = (
+                    _source_schema_table_contract()
+                )
+                expected_placeholders = ",".join("?" for _ in expected_required)
+                expected_source_inventory = [tuple(row) for row in canonical.execute(
+                    "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+                    f"WHERE tbl_name IN ({expected_placeholders}) ORDER BY type,name,tbl_name",
+                    tuple(sorted(expected_required)),
+                )]
+                expected_source_sha = _source_schema_inventory_hash(
+                    canonical, expected_required
+                )
+            else:
+                historical_required = historical_source_schema.get("required_tables")
+                historical_inventory = historical_source_schema.get("inventory")
+                expected_source_sha = str(
+                    historical_source_schema.get("sha256") or ""
+                )
+                if (
+                    not isinstance(historical_required, list)
+                    or not historical_required
+                    or historical_required != sorted(set(historical_required))
+                    or not all(isinstance(name, str) and name for name in historical_required)
+                    or not isinstance(historical_inventory, list)
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_source_sha)
+                ):
+                    raise ValueError("AC dev COW historical source schema authority is invalid")
+                expected_required = set(historical_required)
+                try:
+                    expected_source_inventory = [
+                        tuple(str(value) for value in row)
+                        for row in historical_inventory
+                    ]
+                except TypeError as exc:
+                    raise ValueError(
+                        "AC dev COW historical source schema inventory is invalid"
+                    ) from exc
+                if (
+                    any(len(row) != 4 for row in expected_source_inventory)
+                    or expected_source_inventory != sorted(expected_source_inventory)
+                    or any(row[2] not in expected_required for row in expected_source_inventory)
+                    or "sha256:" + hashlib.sha256(json.dumps(
+                        expected_source_inventory, separators=(",", ":")
+                    ).encode("utf-8")).hexdigest() != expected_source_sha
+                ):
+                    raise ValueError("AC dev COW historical source schema inventory is invalid")
+        actual_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='backlog_bugs'"
+        ).fetchone()
+        actual_columns = [tuple(row) for row in conn.execute(
+            'PRAGMA table_info("backlog_bugs")'
+        )]
+        if (expected_sql_row is None or actual_sql_row is None
+                or _backlog_read_normalized_sql(actual_sql_row[0])
+                != _backlog_read_normalized_sql(expected_sql_row[0])
+                or actual_columns != expected_columns):
+            raise ValueError("AC dev COW successor backlog table ABI mismatch")
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+        row_count = int(conn.execute("SELECT COUNT(*) FROM backlog_bugs").fetchone()[0])
+        status_counts = {
+            str(status): int(count) for status, count in conn.execute(
+                "SELECT status,COUNT(*) FROM backlog_bugs GROUP BY status ORDER BY status"
+            )
+        }
+        managed = backlog_read_schema_managed_inventory(conn)
+        canonical_managed = canonical_backlog_read_schema_managed_inventory()
+        drift = backlog_read_schema_drift(conn)
+        protected_inventory = backlog_read_schema_protected_inventory(conn)
+        protected_projection = _sqlite_logical_projection(
+            conn, exclude_tables=frozenset({"backlog_bugs", "dashboard_backlog_cache_generation"}),
+        )
+        backlog_projection = _sqlite_logical_projection(conn).get("backlog_bugs")
+        required_tables = set(expected_required)
+        placeholders = ",".join("?" for _ in required_tables)
+        source_inventory = [tuple(row) for row in conn.execute(
+            "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+            f"WHERE tbl_name IN ({placeholders}) ORDER BY type,name,tbl_name",
+            tuple(sorted(required_tables)),
+        )]
+        source_schema = {
+            "required_tables": sorted(required_tables),
+            "inventory": [list(row) for row in source_inventory],
+            "sha256": _source_schema_inventory_hash(conn, required_tables),
+        }
+        if historical_source_schema is None:
+            _verify_dev_world_schema_inventory(conn)
+    finally:
+        conn.close()
+    if (row_count != expected_rows
+            or (require_managed and managed != canonical_managed)
+            or (require_managed and drift.get("invalid"))
+            or source_inventory != expected_source_inventory
+            or source_schema["sha256"] != expected_source_sha):
+        raise ValueError("AC dev COW successor backlog projection is invalid")
+    return {"identity": identity, "quick_check": "ok", "row_count": row_count,
+            "status_counts": status_counts, "managed_inventory": managed,
+            "managed_inventory_drift": [], "protected_inventory": protected_inventory,
+            "protected_projection": protected_projection,
+            "backlog_projection_sha256": backlog_projection,
+            "source_schema": source_schema,
+            "governance_world_id": str(meta.get("governance_world_id") or ""),
+            "genesis_json": str(meta.get("governance_world_genesis_json") or ""),
+            "genesis_sha256": str(meta.get("governance_world_genesis_sha256") or "")}
+
+
+def _cow_successor_archive(root: Path) -> Path:
+    return root / AC_DEV_COW_SUCCESSOR_ARCHIVE
+
+
+def create_dev_cow_successor_receipt(
+    storage_root: Path | str, *, operator_receipt: Path, predecessor_backup: Path,
+    linked_v3_receipt: Path,
+) -> dict[str, object]:
+    """Create the sole immutable authority for an operator-supervised DB COW."""
+    root = Path(storage_root).expanduser().absolute()
+    if root.is_symlink() or root.resolve(strict=True) != root:
+        raise ValueError("AC dev COW successor root is invalid")
+    listener = _default_cutover_listener_probe(40008)
+    if listener.get("listening") or int(listener.get("pid") or 0):
+        raise ValueError("AC dev COW successor requires stopped port 40008")
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    successor = _cow_database_observation(database)
+    backup_path = predecessor_backup.expanduser().absolute()
+    backup = _cow_regular_identity(backup_path)
+    if backup_path.parent != root / "archive" / "operator-exception-backups":
+        raise ValueError("AC dev COW successor backup is outside its archive")
+    backup_observation = _cow_database_observation(
+        backup_path, expected_rows=0, require_managed=False, nlink=None,
+    )
+    operator_path = operator_receipt.expanduser().absolute()
+    operator, operator_sha = _cow_raw_receipt(operator_path, prefix="cow-import")
+    if operator_path.parent != root / "archive" / "operator-exceptions":
+        raise ValueError("AC dev COW successor operator evidence is outside its archive")
+    if (operator.get("schema_version") != "ac_dev_operator_exception_cow_import.v1"
+            or operator.get("qa_pass") is not False or operator.get("release_authority") is not False
+            or operator.get("rows") != 3603 or not operator.get("decisions")
+            or operator.get("backup_sha256") != backup["sha256"]
+            or operator.get("target_sha256_before") != backup["sha256"]
+            or operator.get("target_sha256_after") != successor["identity"]["sha256"]):
+        raise ValueError("AC dev COW successor operator evidence mismatch")
+    if (backup_observation["governance_world_id"] != AC_DEV_WORLD_ID
+            or successor["governance_world_id"] != AC_DEV_WORLD_ID
+            or backup_observation["genesis_json"] != successor["genesis_json"]
+            or backup_observation["genesis_sha256"] != successor["genesis_sha256"]
+            or backup_observation["protected_inventory"] != successor["protected_inventory"]
+            or backup_observation["protected_projection"] != successor["protected_projection"]):
+        raise ValueError("AC dev COW successor protected preimage mismatch")
+    try:
+        genesis = json.loads(str(successor["genesis_json"]))
+    except ValueError as exc:
+        raise ValueError("AC dev COW successor genesis is unreadable") from exc
+    canonical_genesis_raw = json.dumps(
+        dict(genesis), sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ) if isinstance(genesis, Mapping) else ""
+    rows_copied = genesis.get("rows_copied") if isinstance(genesis, Mapping) else None
+    if (not isinstance(genesis, Mapping)
+            or genesis.get("schema_version") != AC_WORLD_GENESIS_SCHEMA
+            or genesis.get("world_id") != AC_DEV_WORLD_ID
+            or genesis.get("project_id") != AC_PROJECT_ID
+            or genesis.get("source_only") is not True
+            or not isinstance(rows_copied, int) or isinstance(rows_copied, bool)
+            or rows_copied != 0
+            or successor["genesis_json"] != canonical_genesis_raw
+            or successor["genesis_sha256"] != _world_genesis_hash(genesis)
+            or dict(genesis.get("database_identity") or {}).get("device") != backup["device"]
+            or dict(genesis.get("database_identity") or {}).get("inode") != backup["inode"]):
+        raise ValueError("AC dev COW successor predecessor genesis mismatch")
+    linked_path = linked_v3_receipt.expanduser().absolute()
+    linked, linked_sha = _cow_raw_receipt(linked_path)
+    if linked_path.parent != root / "archive" / "schema-admission":
+        raise ValueError("AC dev COW successor linked receipt is outside its archive")
+    linked_hex = linked_sha.removeprefix("sha256:")
+    linked_sidecar = linked_path.with_suffix(".sha256")
+    if (linked_path.name != f"{linked_hex}.json" or linked_sidecar.is_symlink()
+            or not linked_sidecar.is_file()
+            or linked_sidecar.read_text(encoding="utf-8")
+            != f"sha256:{linked_hex}  {linked_path.name}\n"):
+        raise ValueError("AC dev COW successor linked receipt sidecar mismatch")
+    adoptions = sorted((root / "archive" / "canonical-legacy-postimage-adoption").glob("adoption.*.json"))
+    if len(adoptions) != 1:
+        raise ValueError("AC dev COW successor adoption evidence is missing or ambiguous")
+    adoption, adoption_sha = _cow_raw_receipt(adoptions[0], prefix="adoption")
+    if (adoption.get("schema_version") != "ac_dev_canonical_legacy_postimage_adoption.v1"
+            or adoption.get("stage") != "completed"
+            or adoption.get("project_id") != AC_PROJECT_ID or adoption.get("port") != 40008
+            or linked.get("schema_version") != "ac_dev_offline_schema_admission.v3"
+            or linked.get("stage") != "completed"
+            or adoption.get("linked_v3_receipt") != str(linked_path)
+            or adoption.get("linked_v3_receipt_sha256") != linked_sha
+            or linked.get("database_identity", {}).get("device") != backup["device"]
+            or linked.get("database_identity", {}).get("inode") != backup["inode"]):
+        raise ValueError("AC dev COW successor historical chain mismatch")
+    stable = verified_stable_database_binding()
+    _revalidate_stable_database_binding(stable)
+    stable_db = Path(str(stable["database_path"]))
+    stable_metadata = stable_db.stat(follow_symlinks=False)
+    stable_identity = dict(stable["stable_database_identity"])
+    if (stable_db.is_symlink() or not stat.S_ISREG(stable_metadata.st_mode)
+            or (stable_identity["device"], stable_identity["inode"]) == (
+                successor["identity"]["device"], successor["identity"]["inode"])):
+        raise ValueError("AC dev COW successor aliases stable database")
+    payload = {"schema_version": AC_DEV_COW_SUCCESSOR_SCHEMA, "stage": "completed",
+               "project_id": AC_PROJECT_ID, "port": 40008, "root": str(root),
+               "listener": {"host": "127.0.0.1", "port": 40008, "listening": False},
+               "genesis": {"raw_json": successor["genesis_json"],
+                           "sha256": successor["genesis_sha256"]},
+               "predecessor": {"backup": backup}, "successor": successor,
+               "operator_evidence": {"path": str(operator_path), "sha256": operator_sha,
+                                     "payload": operator},
+               "history": {"linked_v3": {"path": str(linked_path), "sha256": linked_sha},
+                           "adoption": {"path": str(adoptions[0]), "sha256": adoption_sha}},
+               "stable_binding": {"database": stable_identity,
+                                  "runtime_commit": stable.get("commit")}}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    archive = _cow_successor_archive(root)
+    archive.mkdir(parents=True, exist_ok=True)
+    if archive.is_symlink() or archive.resolve(strict=True) != archive:
+        raise ValueError("AC dev COW successor archive is invalid")
+    existing = sorted(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"))
+    destination = archive / f"{AC_DEV_COW_SUCCESSOR_PREFIX}.{digest}.json"
+    if existing:
+        if existing != [destination] or destination.read_bytes() != raw:
+            raise ValueError("AC dev COW successor receipt is ambiguous")
+        return {"receipt": str(destination), "receipt_sha256": "sha256:" + digest,
+                "status": "already_created"}
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o444)
+    try:
+        os.write(descriptor, raw)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_fd = os.open(archive, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {"receipt": str(destination), "receipt_sha256": "sha256:" + digest,
+            "status": "created"}
+
+
+def _cow_historical_backlog_snapshot(
+    root: Path, operator: Mapping[str, object]
+) -> tuple[dict[str, object], list[tuple[object, ...]], list[str]]:
+    snapshot_sha = str(operator.get("snapshot_sha256") or "")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", snapshot_sha):
+        raise ValueError("AC dev COW successor historical snapshot authority is invalid")
+    archive = root / "archive" / "staging" / "dashboard-backlog-snapshots"
+    snapshot = archive / f"snapshot.{snapshot_sha.removeprefix('sha256:')}.sqlite"
+    identity = _cow_regular_identity(snapshot)
+    if identity["sha256"] != snapshot_sha:
+        raise ValueError("AC dev COW successor historical snapshot hash mismatch")
+    manifests = sorted(archive.glob("manifest.*.json"))
+    if len(manifests) != 1:
+        raise ValueError("AC dev COW successor historical snapshot manifest is ambiguous")
+    manifest, manifest_sha = _cow_raw_receipt(manifests[0], prefix="manifest")
+    uri = "file:" + urllib.parse.quote(str(snapshot)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise ValueError("AC dev COW successor historical snapshot is corrupt")
+        columns = [str(row[1]) for row in conn.execute('PRAGMA table_info("backlog_bugs")')]
+        quoted = ",".join(_sqlite_quote_identifier(name) for name in columns)
+        rows = [tuple(row) for row in conn.execute(
+            f'SELECT {quoted} FROM "backlog_bugs" ORDER BY "bug_id"'
+        )]
+        status_index = columns.index("status")
+        statuses: dict[str, int] = {}
+        for row in rows:
+            status = str(row[status_index])
+            statuses[status] = statuses.get(status, 0) + 1
+        backlog_projection = _sqlite_logical_projection(conn).get("backlog_bugs")
+    finally:
+        conn.close()
+    if (
+        manifest.get("schema_version") != "ac_dev_dashboard_backlog_snapshot.v1"
+        or manifest.get("destination_path") != str(snapshot)
+        or manifest.get("destination_sha256") != snapshot_sha
+        or manifest.get("row_count") != len(rows)
+        or manifest.get("status_counts") != dict(sorted(statuses.items()))
+        or manifest_sha != "sha256:" + manifests[0].stem.removeprefix("manifest.")
+    ):
+        raise ValueError("AC dev COW successor historical snapshot manifest mismatch")
+    return {
+        "row_count": len(rows),
+        "status_counts": dict(sorted(statuses.items())),
+        "backlog_projection_sha256": backlog_projection,
+    }, rows, columns
+
+
+def _reconstruct_dev_cow_successor_payload(
+    root: Path, receipt: Mapping[str, object]
+) -> dict[str, object]:
+    legacy_paths = sorted(_cow_successor_archive(root).glob("successor.*.json"))
+    if len(legacy_paths) != 1:
+        raise ValueError("AC dev COW successor historical v1 authority is missing or ambiguous")
+    legacy, _legacy_sha = _cow_raw_receipt(legacy_paths[0], prefix="successor")
+    operator_ref = dict(receipt.get("operator_evidence") or {})
+    operator_path = Path(str(operator_ref.get("path") or ""))
+    operator, operator_sha = _cow_raw_receipt(operator_path, prefix="cow-import")
+    predecessor_ref = dict(dict(receipt.get("predecessor") or {}).get("backup") or {})
+    predecessor_path = Path(str(predecessor_ref.get("path") or ""))
+    predecessor = _cow_regular_identity(predecessor_path)
+    history_ref = dict(receipt.get("history") or {})
+    linked_ref = dict(history_ref.get("linked_v3") or {})
+    adoption_ref = dict(history_ref.get("adoption") or {})
+    linked_path = Path(str(linked_ref.get("path") or ""))
+    adoption_path = Path(str(adoption_ref.get("path") or ""))
+    linked, linked_sha = _cow_raw_receipt(linked_path)
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    quarantine_ref = dict(adoption.get("quarantine_manifest") or {})
+    quarantine_path = Path(str(quarantine_ref.get("path") or ""))
+    _quarantine, quarantine_sha = _cow_raw_receipt(quarantine_path, prefix="manifest")
+    if (
+        legacy.get("schema_version") != "ac_dev_cow_database_successor.v1"
+        or legacy.get("stage") != "completed"
+        or legacy.get("project_id") != AC_PROJECT_ID
+        or legacy.get("port") != 40008
+        or legacy.get("root") != str(root)
+        or legacy.get("listener")
+        != {"host": "127.0.0.1", "port": 40008, "listening": False}
+        or legacy.get("predecessor") != receipt.get("predecessor")
+        or legacy.get("operator_evidence") != receipt.get("operator_evidence")
+        or legacy.get("history") != receipt.get("history")
+        or operator_path.parent != root / "archive" / "operator-exceptions"
+        or predecessor_path.parent != root / "archive" / "operator-exception-backups"
+        or linked_path.parent != root / "archive" / "schema-admission"
+        or adoption_path.parent != root / "archive" / "canonical-legacy-postimage-adoption"
+        or operator_ref != {"path": str(operator_path), "sha256": operator_sha, "payload": operator}
+        or linked_ref != {"path": str(linked_path), "sha256": linked_sha}
+        or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
+        or quarantine_ref != {"path": str(quarantine_path), "sha256": quarantine_sha}
+        or adoption.get("linked_v3_receipt") != str(linked_path)
+        or adoption.get("linked_v3_receipt_sha256") != linked_sha
+        or operator.get("schema_version") != "ac_dev_operator_exception_cow_import.v1"
+        or operator.get("qa_pass") is not False
+        or operator.get("release_authority") is not False
+        or not operator.get("decisions")
+        or operator.get("backup_sha256") != predecessor["sha256"]
+        or operator.get("target_sha256_before") != predecessor["sha256"]
+        or linked.get("schema_version") != "ac_dev_offline_schema_admission.v3"
+        or linked.get("stage") != "completed"
+        or linked.get("project_id") != AC_PROJECT_ID
+        or linked.get("port") != 40008
+        or dict(linked.get("database_identity") or {}).get("device")
+        != predecessor["device"]
+        or dict(linked.get("database_identity") or {}).get("inode")
+        != predecessor["inode"]
+        or adoption.get("schema_version")
+        != "ac_dev_canonical_legacy_postimage_adoption.v1"
+        or adoption.get("stage") != "completed"
+        or adoption.get("project_id") != AC_PROJECT_ID
+        or adoption.get("port") != 40008
+        or quarantine_path.parent.parent
+        != root / "quarantine" / "schema-admission-sidecars"
+        or _quarantine.get("schema_version")
+        != "aming-claw.schema-admission-sidecar-quarantine.v1"
+        or _quarantine.get("stage") != "completed"
+    ):
+        raise ValueError("AC dev COW successor historical artifact chain mismatch")
+    linked_sidecar = linked_path.with_suffix(".sha256")
+    if (
+        linked_sidecar.is_symlink()
+        or not linked_sidecar.is_file()
+        or linked_sidecar.read_text(encoding="utf-8")
+        != f"{linked_sha}  {linked_path.name}\n"
+    ):
+        raise ValueError("AC dev COW successor historical linked receipt mismatch")
+    snapshot, rows, columns = _cow_historical_backlog_snapshot(root, operator)
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix="ac-cow-reconstruct-", suffix=".sqlite")
+    os.close(descriptor)
+    temporary = Path(temporary_name).resolve(strict=True)
+    try:
+        shutil.copyfile(predecessor_path, temporary)
+        os.chmod(temporary, 0o600)
+        conn = sqlite3.connect(str(temporary), isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            admit_missing_backlog_read_schema(conn, commit=False)
+            quoted = ",".join(_sqlite_quote_identifier(name) for name in columns)
+            placeholders = ",".join("?" for _ in columns)
+            conn.executemany(
+                f'INSERT INTO "backlog_bugs" ({quoted}) VALUES ({placeholders})', rows
+            )
+            conn.commit()
+            if tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()) != (0, 0, 0):
+                raise ValueError("AC dev COW successor reconstruction checkpoint failed")
+        finally:
+            conn.close()
+        reconstructed = _cow_database_observation(
+            temporary,
+            historical_source_schema=dict(
+                dict(receipt.get("successor") or {}).get("source_schema") or {}
+            ),
+        )
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                Path(str(temporary) + suffix).unlink()
+            except FileNotFoundError:
+                pass
+    historical_successor = dict(legacy.get("successor") or {})
+    historical_identity = dict(historical_successor.get("identity") or {})
+    if (
+        set(historical_identity) != {"path", "device", "inode", "size", "nlink", "sha256"}
+        or historical_identity.get("path") != str(root / AC_DATABASE_DEV_RELATIVE_PATH)
+        or historical_identity.get("sha256") != operator.get("target_sha256_after")
+        or historical_identity.get("size") != reconstructed["identity"]["size"]
+    ):
+        raise ValueError("AC dev COW successor historical v1 database authority mismatch")
+    reconstructed["identity"] = historical_identity
+    reconstructed.update(snapshot)
+    stable_binding = dict(legacy.get("stable_binding") or {})
+    stable_identity = dict(stable_binding.get("database") or {})
+    if (
+        set(stable_binding) != {"database", "runtime_commit"}
+        or set(stable_identity)
+        != {"schema_version", "device", "inode", "stable_relative_path_sha256"}
+        or stable_identity.get("schema_version") != "ac_stable_database_identity.v1"
+        or (stable_identity.get("device"), stable_identity.get("inode"))
+        == (historical_identity.get("device"), historical_identity.get("inode"))
+    ):
+        raise ValueError("AC dev COW successor historical v1 stable authority mismatch")
+    return {
+        "schema_version": AC_DEV_COW_SUCCESSOR_SCHEMA, "stage": "completed",
+        "project_id": AC_PROJECT_ID, "port": 40008, "root": str(root),
+        "listener": dict(legacy["listener"]),
+        "genesis": {"raw_json": reconstructed["genesis_json"],
+                    "sha256": reconstructed["genesis_sha256"]},
+        "predecessor": {"backup": predecessor}, "successor": reconstructed,
+        "operator_evidence": {"path": str(operator_path), "sha256": operator_sha,
+                              "payload": operator},
+        "history": {"linked_v3": {"path": str(linked_path), "sha256": linked_sha},
+                    "adoption": {"path": str(adoption_path), "sha256": adoption_sha}},
+        "stable_binding": stable_binding,
+    }
+
+
+def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, object]:
+    """Revalidate immutable v2 issuance evidence, never mutable live rows."""
+    root = Path(storage_root).expanduser().absolute()
+    archive = _cow_successor_archive(root)
+    receipts = sorted(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json")) if archive.is_dir() else []
+    if len(receipts) != 1:
+        raise ValueError("AC dev COW successor receipt is missing or ambiguous")
+    receipt, digest = _cow_raw_receipt(receipts[0], prefix=AC_DEV_COW_SUCCESSOR_PREFIX)
+    if (receipt.get("schema_version") != AC_DEV_COW_SUCCESSOR_SCHEMA
+            or receipt.get("stage") != "completed" or receipt.get("project_id") != AC_PROJECT_ID
+            or receipt.get("port") != 40008 or receipt.get("root") != str(root)):
+        raise ValueError("AC dev COW successor receipt mismatch")
+    expected = _reconstruct_dev_cow_successor_payload(root, receipt)
+    receipt_canonical = json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    expected_canonical = json.dumps(
+        expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if receipt_canonical != expected_canonical:
+        raise ValueError("AC dev COW successor reconstructed issuance payload mismatch")
+    return receipt
+
+
+def dev_issuance_ancestry_anchor_commit(storage_root: Path | str) -> str:
+    """Project the frozen dev issuance anchor from its immutable receipt chain."""
+    root = Path(storage_root).expanduser().absolute()
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or root.resolve(strict=True) != root
+    ):
+        raise ValueError("AC dev issuance ancestry root is invalid")
+    archive = _cow_successor_archive(root)
+    receipts = sorted(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"))
+    if len(receipts) != 1:
+        raise ValueError("AC dev issuance successor receipt is missing or ambiguous")
+    successor, _successor_sha = _cow_raw_receipt(
+        receipts[0], prefix=AC_DEV_COW_SUCCESSOR_PREFIX
+    )
+    history = successor.get("history")
+    stable_binding = successor.get("stable_binding")
+    if not (
+        successor.get("schema_version") == AC_DEV_COW_SUCCESSOR_SCHEMA
+        and successor.get("stage") == "completed"
+        and successor.get("project_id") == AC_PROJECT_ID
+        and successor.get("port") == 40008
+        and successor.get("root") == str(root)
+        and isinstance(history, Mapping)
+        and set(history) == {"adoption", "linked_v3"}
+        and isinstance(stable_binding, Mapping)
+        and set(stable_binding) == {"database", "runtime_commit"}
+        and stable_binding.get("runtime_commit") is None
+    ):
+        raise ValueError("AC dev issuance successor receipt mismatch")
+
+    adoption_ref = history.get("adoption")
+    linked_ref = history.get("linked_v3")
+    if not isinstance(adoption_ref, Mapping) or not isinstance(linked_ref, Mapping):
+        raise ValueError("AC dev issuance receipt references are invalid")
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    linked_path = Path(str(linked_ref.get("path") or "")).absolute()
+    adoption_receipts = sorted(
+        (root / "archive" / "canonical-legacy-postimage-adoption").glob(
+            "adoption.*.json"
+        )
+    )
+    if adoption_receipts != [adoption_path]:
+        raise ValueError("AC dev issuance adoption receipt is missing or ambiguous")
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    linked, linked_sha = _cow_raw_receipt(linked_path)
+    linked_hex = linked_sha.removeprefix("sha256:")
+    linked_sidecar = linked_path.with_suffix(".sha256")
+    if not (
+        dict(adoption_ref) == {"path": str(adoption_path), "sha256": adoption_sha}
+        and dict(linked_ref) == {"path": str(linked_path), "sha256": linked_sha}
+        and adoption_path.parent
+        == root / "archive" / "canonical-legacy-postimage-adoption"
+        and linked_path.parent == root / "archive" / "schema-admission"
+        and linked_path.name == f"{linked_hex}.json"
+        and linked_sidecar.is_file()
+        and not linked_sidecar.is_symlink()
+        and linked_sidecar.read_text(encoding="utf-8")
+        == f"sha256:{linked_hex}  {linked_path.name}\n"
+        and adoption.get("schema_version")
+        == "ac_dev_canonical_legacy_postimage_adoption.v1"
+        and adoption.get("stage") == "completed"
+        and adoption.get("project_id") == AC_PROJECT_ID
+        and adoption.get("port") == 40008
+        and dict(adoption.get("root_identity") or {}).get("path") == str(root)
+        and adoption.get("linked_v3_receipt") == str(linked_path)
+        and adoption.get("linked_v3_receipt_sha256") == linked_sha
+        and linked.get("schema_version") == "ac_dev_offline_schema_admission.v3"
+        and linked.get("stage") == "completed"
+        and linked.get("project_id") == AC_PROJECT_ID
+        and linked.get("port") == 40008
+        and dict(linked.get("root_identity") or {}).get("path") == str(root)
+        and dict(dict(linked.get("source_identity") or {}).get("cli_source") or {})
+        == dict(adoption.get("receipt_source_identity") or {})
+    ):
+        raise ValueError("AC dev issuance receipt chain mismatch")
+    anchor = str(
+        dict(adoption.get("readbacks") or {}).get("stable_runtime_commit") or ""
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", anchor):
+        raise ValueError("AC dev issuance ancestry anchor is invalid")
+    return anchor
+
+
+def validate_dev_cow_successor_preimage(
+    storage_root: Path | str, *, linked_v3_receipt: Path,
+    source_identity: Mapping[str, object], stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the exact live post-COW inode against immutable v2 authority."""
+    root = Path(storage_root).expanduser().absolute()
+    receipt = validate_dev_cow_successor_receipt(root)
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    linked_path = linked_v3_receipt.expanduser().absolute()
+    linked_sha = "sha256:" + hashlib.sha256(linked_path.read_bytes()).hexdigest()
+    history = dict(receipt.get("history") or {})
+    successor = dict(receipt.get("successor") or {})
+    expected_identity = dict(successor.get("identity") or {})
+    current = _cow_regular_identity(database)
+    stable_identity = dict(stable_binding.get("stable_database_identity") or {})
+    issuance_stable = dict(dict(receipt.get("stable_binding") or {}).get("database") or {})
+    if (
+        dict(history.get("linked_v3") or {})
+        != {"path": str(linked_path), "sha256": linked_sha}
+        or expected_identity.get("path") != str(database)
+        or expected_identity.get("device") != current["device"]
+        or expected_identity.get("inode") != current["inode"]
+        or expected_identity.get("nlink") != current["nlink"]
+        or issuance_stable != stable_identity
+        or (current["device"], current["inode"])
+        == (stable_identity.get("device"), stable_identity.get("inode"))
+    ):
+        raise ValueError("AC dev COW successor current binding mismatch")
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(database) + suffix)
+        if companion.exists() or companion.is_symlink():
+            raise ValueError("AC dev COW successor requires sidecar-free bytes")
+    _assert_no_external_sqlite_holders(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(conn)
+        _verify_dev_world_schema_inventory(conn)
+        actual_inventory = _authority_projection_inventory_in_managed_world(conn)
+        canonical_inventory = authority_projection_schema_inventory()
+        if (len(actual_inventory["inventory"]) != 308
+                or actual_inventory != canonical_inventory):
+            raise ValueError("AC dev COW successor exact schema inventory mismatch")
+        _verify_current_dev_backlog_runtime_invariants(
+            conn,
+            expected_protected_inventory=dict(successor.get("protected_inventory") or {}),
+        )
+        meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
+        current_schema_meta_sha256 = _sqlite_logical_projection(conn).get(
+            "schema_meta"
+        )
+    finally:
+        conn.close()
+    issuance_schema_meta_sha256 = str(
+        dict(successor.get("protected_projection") or {}).get("schema_meta")
+        or ""
+    )
+    if not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", issuance_schema_meta_sha256
+    ):
+        raise ValueError("AC dev COW successor issuance schema_meta authority is invalid")
+    if current_schema_meta_sha256 != issuance_schema_meta_sha256:
+        raise ValueError("AC dev COW successor issuance schema_meta mismatch")
+    if (meta.get("governance_world_genesis_json") != successor.get("genesis_json")
+            or meta.get("governance_world_genesis_sha256") != successor.get("genesis_sha256")
+            or meta.get("governance_world_id") != AC_DEV_WORLD_ID):
+        raise ValueError("AC dev COW successor genesis mismatch")
+    try:
+        tip = json.loads(str(meta.get("governance_world_source_tip_json") or ""))
+        process = json.loads(str(meta.get("governance_world_current_process_json") or ""))
+        revision = int(meta.get("governance_world_source_tip_revision") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AC dev COW successor custody metadata is invalid") from exc
+    if (not isinstance(tip, Mapping) or not isinstance(process, Mapping) or revision < 1
+            or meta.get("governance_world_source_tip_sha256") != _world_source_tip_hash(tip)):
+        raise ValueError("AC dev COW successor custody binding mismatch")
+    adoption_ref = dict(history.get("adoption") or {})
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    if adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}:
+        raise ValueError("AC dev COW successor custody history mismatch")
+    historical_process = adoption.get("legacy_process_identity")
+    if not isinstance(historical_process, Mapping):
+        historical_process = None
+    _validate_dev_current_process_custody(
+        process, root=root, candidate_source=source_identity,
+        historical_process=historical_process,
+    )
+    _validate_dev_source_tip_custody(
+        tip, stored_sha256=str(meta.get("governance_world_source_tip_sha256") or ""),
+        candidate=source_identity,
+    )
+    return receipt
+
+
+_COW_COMPLETED_GENERATION_META_KEYS = frozenset({
+    "schema_version", "governance_world_id",
+    "governance_world_genesis_json", "governance_world_genesis_sha256",
+    "governance_world_source_tip_json", "governance_world_source_tip_sha256",
+    "governance_world_source_tip_revision",
+    "governance_world_current_process_json",
+})
+
+
+class _DevCowGenerationPhase(Enum):
+    FIRST_ISSUANCE = "first_issuance"
+    COMPLETED_GENERATION = "completed_generation"
+
+
+def _validate_dev_cow_completed_process_axis(
+    process: Mapping[str, object], *, root: Path,
+    source_identity: Mapping[str, object],
+    historical_source_tip: Mapping[str, object] | None = None,
+) -> None:
+    """Validate current custody without rebinding it to adoption-era PID."""
+    value = dict(process)
+    if set(value) == {"pid", "start_identity"}:
+        pid = value.get("pid")
+        if (type(pid) is not int or pid <= 0
+                or value.get("start_identity") != f"pid:{pid}:cli-bootstrap"):
+            raise ValueError("AC dev completed generation bootstrap custody mismatch")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "AC dev completed generation bootstrap liveness is unavailable"
+            ) from exc
+        else:
+            raise ValueError(
+                "AC dev completed generation bootstrap PID is still live"
+            )
+        return
+    _validate_dev_current_process_custody(
+        value, root=root, candidate_source=source_identity,
+        completed_dead_pre_normalization=True,
+        historical_source_tip=historical_source_tip,
+    )
+
+
+def _validate_sqlite_empty_wal_index_residue(
+    database: Path, shm: Path, expected_stat: os.stat_result,
+) -> None:
+    """Validate SQLite's documented 32 KiB WAL-index after TRUNCATE."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(shm, flags)
+    try:
+        opened = os.fstat(descriptor)
+        expected_identity = (
+            int(expected_stat.st_dev), int(expected_stat.st_ino),
+            int(expected_stat.st_nlink), int(expected_stat.st_size),
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (
+                int(opened.st_dev), int(opened.st_ino), int(opened.st_nlink),
+                int(opened.st_size),
+            ) != expected_identity
+        ):
+            raise ValueError("AC dev COW completed generation SHM identity changed")
+        chunks = []
+        remaining = int(opened.st_size) + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        closed_over = os.fstat(descriptor)
+        if (
+            int(closed_over.st_dev), int(closed_over.st_ino),
+            int(closed_over.st_nlink), int(closed_over.st_size),
+        ) != expected_identity:
+            raise ValueError("AC dev COW completed generation SHM changed while read")
+    finally:
+        os.close(descriptor)
+    current = shm.stat(follow_symlinks=False)
+    if (
+        int(current.st_dev), int(current.st_ino), int(current.st_nlink),
+        int(current.st_size),
+    ) != expected_identity:
+        raise ValueError("AC dev COW completed generation SHM path changed")
+    if len(raw) != 32768 or raw[:48] != raw[48:96]:
+        raise ValueError("AC dev COW completed generation WAL-index copies differ")
+
+    endian = "<" if sys.byteorder == "little" else ">"
+    try:
+        (
+            version, unused, change, initialized, big_endian_checksum,
+            wal_page_size, max_frame, database_pages, frame_checksum_1,
+            frame_checksum_2, salt_1, salt_2, header_checksum_1,
+            header_checksum_2,
+        ) = struct.unpack(f"{endian}IIIBBHIIIIIIII", raw[:48])
+        (
+            backfill, read_mark_0, read_mark_1, read_mark_2, read_mark_3,
+            read_mark_4, lock_region, backfill_attempted, checkpoint_unused,
+        ) = struct.unpack(f"{endian}I5I8sII", raw[96:136])
+    except struct.error as exc:
+        raise ValueError("AC dev COW completed generation WAL-index is malformed") from exc
+
+    checksum_1 = 0
+    checksum_2 = 0
+    header_words = struct.unpack(f"{endian}10I", raw[:40])
+    for index in range(0, len(header_words), 2):
+        checksum_1 = (
+            checksum_1 + header_words[index] + checksum_2
+        ) & 0xFFFFFFFF
+        checksum_2 = (
+            checksum_2 + header_words[index + 1] + checksum_1
+        ) & 0xFFFFFFFF
+
+    descriptor = os.open(database, flags)
+    try:
+        database_header = os.read(descriptor, 100)
+    finally:
+        os.close(descriptor)
+    if len(database_header) != 100 or database_header[:16] != b"SQLite format 3\0":
+        raise ValueError("AC dev COW completed generation database header is invalid")
+    database_page_size = int.from_bytes(database_header[16:18], "big")
+    if database_page_size == 1:
+        database_page_size = 65536
+    database_page_count = int.from_bytes(database_header[28:32], "big")
+    valid_page_size = (
+        wal_page_size == 1
+        or (
+            512 <= wal_page_size <= 32768
+            and wal_page_size & (wal_page_size - 1) == 0
+        )
+    )
+    reset_empty_page_state = wal_page_size == 0 and database_pages == 0
+    retained_empty_page_state = (
+        valid_page_size
+        and (65536 if wal_page_size == 1 else wal_page_size)
+        == database_page_size
+        and database_pages == database_page_count
+    )
+    valid_empty_page_state = (
+        reset_empty_page_state
+        or retained_empty_page_state
+    )
+    read_marks = (
+        read_mark_0, read_mark_1, read_mark_2, read_mark_3, read_mark_4,
+    )
+    valid_checkpoint_state = (
+        (
+            reset_empty_page_state
+            and change >= 0
+            and read_marks in {
+                (0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+                (0, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+            }
+        )
+        or (
+            retained_empty_page_state
+            and change >= 1
+            and (salt_1 != 0 or salt_2 != 0)
+            and read_marks
+            == (0, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+        )
+    )
+    if (
+        version != 3007000
+        or unused != 0
+        or initialized != 1
+        or big_endian_checksum not in {0, 1}
+        or not valid_empty_page_state
+        or not valid_checkpoint_state
+        or max_frame != 0
+        or (header_checksum_1, header_checksum_2)
+        != (checksum_1, checksum_2)
+        or backfill != 0
+        or lock_region != b"\0" * 8
+        or backfill_attempted != 0
+        or checkpoint_unused != 0
+    ):
+        raise ValueError("AC dev COW completed generation WAL-index is not empty")
+
+    # The remainder of the first 32 KiB WAL-index region is a page-number
+    # array followed by SQLite's 8192-slot linear-probe hash table.  Although
+    # these entries are stale when mxFrame is zero, their exact internal
+    # relationship distinguishes SQLite residue from arbitrary same-size
+    # bytes and makes a single-bit substitution detectable without rewriting
+    # the sidecar.
+    page_numbers = struct.unpack(f"{endian}4062I", raw[136:16384])
+    hash_slots = struct.unpack(f"{endian}8192H", raw[16384:32768])
+    try:
+        stale_frame_count = page_numbers.index(0)
+    except ValueError:
+        stale_frame_count = len(page_numbers)
+    stale_pages = page_numbers[:stale_frame_count]
+    if (
+        any(page_numbers[stale_frame_count:])
+        or any(page <= 0 or page > database_page_count for page in stale_pages)
+    ):
+        raise ValueError("AC dev COW completed generation WAL-index pages are invalid")
+    expected_hash_slots = [0] * 8192
+    for frame_index, page_number in enumerate(stale_pages, start=1):
+        slot = (page_number * 383) & 8191
+        while expected_hash_slots[slot]:
+            slot = (slot + 1) & 8191
+        expected_hash_slots[slot] = frame_index
+    if tuple(expected_hash_slots) != hash_slots:
+        raise ValueError("AC dev COW completed generation WAL-index hash is invalid")
+
+
+def _validate_dev_cow_stopped_sidecar_residue(database: Path) -> None:
+    """Accept only SQLite's inert stopped residue without changing its bytes."""
+
+    listener = _default_cutover_listener_probe(40008)
+    if (
+        listener.get("port") != 40008
+        or listener.get("listening") is not False
+        or int(listener.get("pid") or 0) != 0
+    ):
+        raise ValueError("AC dev COW completed generation has a live listener")
+    _assert_no_external_sqlite_holders(database)
+    journal = Path(str(database) + "-journal")
+    if journal.exists() or journal.is_symlink():
+        raise ValueError("AC dev COW completed generation has rollback journal residue")
+    wal = Path(str(database) + "-wal")
+    shm = Path(str(database) + "-shm")
+
+    def regular_single_link(path: Path) -> os.stat_result | None:
+        try:
+            details = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(details.st_mode)
+            or int(details.st_nlink) != 1
+            or path.resolve(strict=True) != path.absolute()
+        ):
+            raise ValueError("AC dev COW completed generation sidecar is not canonical")
+        return details
+
+    wal_stat = regular_single_link(wal)
+    shm_stat = regular_single_link(shm)
+    if wal_stat is not None and int(wal_stat.st_size) != 0:
+        raise ValueError("AC dev COW completed generation WAL is not empty")
+    if shm_stat is not None:
+        if wal_stat is None or int(shm_stat.st_size) != 32768:
+            raise ValueError("AC dev COW completed generation SHM residue is invalid")
+        _validate_sqlite_empty_wal_index_residue(database, shm, shm_stat)
+
+
+def _validated_dev_cow_completed_generation_axis(
+    conn: sqlite3.Connection, *, root: Path, receipt: Mapping[str, object],
+    linked_v3_receipt: Path, source_identity: Mapping[str, object],
+    stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the one persisted completed-generation axis read-only."""
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    linked_path = linked_v3_receipt.expanduser().absolute()
+    successor = dict(receipt.get("successor") or {})
+    identity = dict(successor.get("identity") or {})
+    history = dict(receipt.get("history") or {})
+    current = _cow_regular_identity(database)
+    stable_identity = dict(stable_binding.get("stable_database_identity") or {})
+    issuance_stable = dict(
+        dict(receipt.get("stable_binding") or {}).get("database") or {}
+    )
+    linked_sha = "sha256:" + hashlib.sha256(linked_path.read_bytes()).hexdigest()
+    try:
+        meta = {str(key): str(value) for key, value in conn.execute(
+            "SELECT key,value FROM schema_meta ORDER BY key"
+        )}
+        tip = json.loads(meta["governance_world_source_tip_json"])
+        process = json.loads(meta["governance_world_current_process_json"])
+        revision = int(meta["governance_world_source_tip_revision"])
+    except (KeyError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise ValueError("AC dev COW completed generation custody metadata is invalid") from exc
+    _validate_dev_cow_stopped_sidecar_residue(database)
+    if not _quick_check_returns_literal_ok(conn):
+        raise ValueError("AC dev COW completed generation quick-check failed")
+    inventory = _authority_projection_inventory_in_managed_world(conn)
+    issuance_schema_meta = str(
+        dict(successor.get("protected_projection") or {}).get("schema_meta") or ""
+    )
+    if (
+        dict(history.get("linked_v3") or {})
+        != {"path": str(linked_path), "sha256": linked_sha}
+        or identity.get("path") != str(database)
+        or identity.get("device") != current["device"]
+        or identity.get("inode") != current["inode"]
+        or identity.get("nlink") != current["nlink"]
+        or issuance_stable != stable_identity
+        or (current["device"], current["inode"])
+        == (stable_identity.get("device"), stable_identity.get("inode"))
+        or set(meta) != _COW_COMPLETED_GENERATION_META_KEYS
+        or _sqlite_logical_projection(conn).get("schema_meta")
+        == issuance_schema_meta
+        or meta.get("governance_world_genesis_json") != successor.get("genesis_json")
+        or meta.get("governance_world_genesis_sha256")
+        != successor.get("genesis_sha256")
+        or meta.get("governance_world_id") != AC_DEV_WORLD_ID
+        or revision < 2 or not isinstance(tip, Mapping)
+        or not isinstance(process, Mapping)
+        or meta.get("governance_world_source_tip_sha256")
+        != _world_source_tip_hash(tip)
+        or len(inventory["inventory"]) != 308
+        or inventory != authority_projection_schema_inventory()
+        or backlog_read_schema_managed_inventory(conn)
+        != canonical_backlog_read_schema_managed_inventory()
+        or backlog_read_schema_protected_inventory(conn)
+        != dict(successor.get("protected_inventory") or {})
+    ):
+        raise ValueError("AC dev COW completed generation projection mismatch")
+    adoption_ref = dict(history.get("adoption") or {})
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    if adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}:
+        raise ValueError("AC dev COW completed generation custody history mismatch")
+    anchor = dict(adoption.get("candidate_source_identity") or {})
+    if (str(anchor.get("root") or "") != str(tip.get("root") or "")
+            or str(anchor.get("commit") or "") == str(tip.get("commit") or "")):
+        raise ValueError("AC dev COW completed generation historical tip is not closed")
+    candidate_root = Path(str(source_identity.get("root") or ""))
+    anchor_ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", str(anchor.get("commit") or ""),
+         str(tip.get("commit") or "")],
+        cwd=candidate_root, capture_output=True,
+        timeout=10, check=False,
+    )
+    if anchor_ancestry.returncode != 0:
+        raise ValueError("AC dev COW completed generation historical tip is not an ancestor")
+    _validate_dev_source_tip_custody(
+        tip, stored_sha256=meta["governance_world_source_tip_sha256"],
+        candidate=source_identity, historical_worktree_advisory=True,
+    )
+    _validate_dev_cow_completed_process_axis(
+        process, root=root, source_identity=source_identity,
+        historical_source_tip=tip,
+    )
+    return {"receipt": dict(receipt), "meta": meta, "tip": dict(tip),
+            "process": dict(process), "revision": revision}
+
+
+def _select_dev_cow_generation_phase(
+    storage_root: Path | str, *, linked_v3_receipt: Path,
+    source_identity: Mapping[str, object], stable_binding: Mapping[str, object],
+) -> _DevCowGenerationPhase:
+    """Select exactly one source-derived COW generation phase, or fail closed."""
+    root = Path(storage_root).expanduser().absolute()
+    receipt = validate_dev_cow_successor_receipt(root)
+    successor = dict(receipt.get("successor") or {})
+    issuance_schema_meta = str(
+        dict(successor.get("protected_projection") or {}).get("schema_meta") or ""
+    )
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", issuance_schema_meta):
+        raise ValueError("AC dev COW generation issuance anchor is invalid")
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(conn)
+        _verify_dev_world_schema_inventory(conn)
+        current_schema_meta = _sqlite_logical_projection(conn).get("schema_meta")
+        first = current_schema_meta == issuance_schema_meta
+        try:
+            _validated_dev_cow_completed_generation_axis(
+                conn, root=root, receipt=receipt,
+                linked_v3_receipt=linked_v3_receipt,
+                source_identity=source_identity, stable_binding=stable_binding,
+            )
+        except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
+            completed = False
+        else:
+            completed = True
+    finally:
+        conn.close()
+    phases = []
+    if first:
+        phases.append(_DevCowGenerationPhase.FIRST_ISSUANCE)
+    if completed:
+        phases.append(_DevCowGenerationPhase.COMPLETED_GENERATION)
+    if len(phases) != 1:
+        reason = "ambiguous" if phases else "unrecognized"
+        raise ValueError(f"AC dev COW generation phase is {reason}")
+    return phases[0]
+
+
+def validate_dev_cow_completed_generation_projection(
+    storage_root: Path | str, *, linked_v3_receipt: Path,
+    source_identity: Mapping[str, object], stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate a live COW generation through the shared persisted axis."""
+    root = Path(storage_root).expanduser().absolute()
+    receipt = validate_dev_cow_successor_receipt(root)
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(conn)
+        _verify_dev_world_schema_inventory(conn)
+        _validated_dev_cow_completed_generation_axis(
+            conn, root=root, receipt=receipt,
+            linked_v3_receipt=linked_v3_receipt,
+            source_identity=source_identity, stable_binding=stable_binding,
+        )
+    finally:
+        conn.close()
+    return receipt
+
+
+def _dev_cow_basic_restart_artifact_snapshot(
+    database: Path,
+) -> dict[str, dict[str, object] | None]:
+    """Capture the exact stopped SQLite files without opening the database."""
+
+    snapshot: dict[str, dict[str, object] | None] = {}
+    for name, suffix in (
+        ("database", ""), ("wal", "-wal"), ("shm", "-shm"),
+        ("journal", "-journal"),
+    ):
+        path = Path(str(database) + suffix)
+        if not path.exists() and not path.is_symlink():
+            snapshot[name] = None
+            continue
+        snapshot[name] = _cow_regular_identity(path)
+    return snapshot
+
+
+def _dev_cow_basic_restart_source_snapshot(
+    source_identity: Mapping[str, object],
+) -> dict[str, object]:
+    """Capture the exact clean candidate source used by this loaded DB code."""
+
+    root = Path(str(source_identity.get("root") or "")).expanduser().resolve(
+        strict=True
+    )
+    source = _current_first_start_source(root)
+    canonical_ref = _git_read_exact(
+        root, "rev-parse", "refs/heads/codex/ac-dev"
+    ).decode().strip().lower()
+    expected = {
+        "root": source["root"],
+        "branch": source["branch"],
+        "commit": source["commit"],
+        "tree": source["tree"],
+        "source_sha256": source["cli_sha256"],
+        "dirty": "",
+    }
+    if dict(source_identity) != expected or canonical_ref != source["commit"]:
+        raise ValueError("AC dev COW completed basic restart source identity mismatch")
+    paths = {
+        "cli": root / "agent" / "cli.py",
+        "server": root / "agent" / "governance" / "server.py",
+        "database_runtime": root / "agent" / "governance" / "db.py",
+    }
+    if Path(__file__).resolve(strict=True) != paths["database_runtime"]:
+        raise ValueError("AC dev COW completed basic restart loaded source mismatch")
+    files = {
+        name: _cow_regular_identity(path, nlink=1)
+        for name, path in paths.items()
+    }
+    if (
+        dict(files["cli"])["sha256"] != source["cli_sha256"]
+        or dict(files["server"])["sha256"] != source["server_sha256"]
+    ):
+        raise ValueError("AC dev COW completed basic restart source content mismatch")
+    return {
+        "root": source["root"],
+        "branch": source["branch"],
+        "canonical_ref": canonical_ref,
+        "commit": source["commit"],
+        "tree": source["tree"],
+        "dirty": "",
+        "files": files,
+    }
+
+
+def _validate_dev_cow_basic_restart_writer_lease(
+    database: Path,
+) -> None:
+    """Re-prove the newly acquired in-memory writer lease before return."""
+
+    metadata = database.stat(follow_symlinks=False)
+    key = str(database.absolute())
+    owner_start_identity = _writer_process_start_identity()
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = _DEV_DATABASE_WRITER_LEASES.get(key)
+        if (
+            lease is None
+            or int(lease.get("owner_pid") or 0) != os.getpid()
+            or lease.get("owner_start_identity") != owner_start_identity
+            or getattr(lease.get("handle"), "closed", True)
+            or (lease.get("database_device"), lease.get("database_inode"))
+            != (int(metadata.st_dev), int(metadata.st_ino))
+        ):
+            raise ValueError(
+                "AC dev COW completed basic restart writer lease changed under lease"
+            )
+
+
+def _validate_dev_cow_completed_basic_restart(
+    storage_root: Path | str, *, source_identity: Mapping[str, object],
+    stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Admit one stopped completed COW world to the ordinary launcher.
+
+    This is a read-only preflight.  The persisted source tip and process are
+    historical custody provenance; the ordinary runtime later derives current
+    authority from clean Git, the refreshed basic launch receipt, and its
+    writer lease.  A first-issuance generation still requires the dedicated
+    first-start custody transition and is never admitted here.
+    """
+
+    root = Path(storage_root).expanduser().absolute()
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    database_before = _durable_database_sha256(database)
+    logical_before = _database_logical_sha256(database)
+    receipt = validate_dev_cow_successor_receipt(root)
+    linked_ref = dict(dict(receipt.get("history") or {}).get("linked_v3") or {})
+    linked_path = Path(str(linked_ref.get("path") or "")).expanduser().absolute()
+    if not linked_path.is_file() or linked_path.is_symlink():
+        raise ValueError("AC dev COW completed basic restart linked receipt is missing")
+    linked_sha256 = "sha256:" + hashlib.sha256(linked_path.read_bytes()).hexdigest()
+    if linked_ref != {"path": str(linked_path), "sha256": linked_sha256}:
+        raise ValueError("AC dev COW completed basic restart linked receipt mismatch")
+    phase = _select_dev_cow_generation_phase(
+        root, linked_v3_receipt=linked_path, source_identity=source_identity,
+        stable_binding=stable_binding,
+    )
+    if phase is not _DevCowGenerationPhase.COMPLETED_GENERATION:
+        raise ValueError("AC dev COW postimage requires live first-start custody")
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(conn)
+        _verify_dev_world_schema_inventory(conn)
+        axis = _validated_dev_cow_completed_generation_axis(
+            conn, root=root, receipt=receipt, linked_v3_receipt=linked_path,
+            source_identity=source_identity, stable_binding=stable_binding,
+        )
+    finally:
+        conn.close()
+    listener = _default_cutover_listener_probe(40008)
+    if (
+        listener.get("port") != 40008
+        or listener.get("listening") is not False
+        or int(listener.get("pid") or 0) != 0
+    ):
+        raise ValueError("AC dev COW completed basic restart requires a stopped listener")
+    process = dict(axis.get("process") or {})
+    if set(process) == _DURABLE_PROCESS_IDENTITY_KEYS:
+        try:
+            os.kill(int(process.get("pid") or 0), 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "AC dev COW completed basic restart process state is unavailable"
+            ) from exc
+        else:
+            raise ValueError("AC dev COW completed basic restart process is still live")
+    _validate_existing_adoption_receipt(root)
+    if (
+        _durable_database_sha256(database) != database_before
+        or _database_logical_sha256(database) != logical_before
+    ):
+        raise ValueError("AC dev COW completed basic restart preflight changed the database")
+    artifacts = _dev_cow_basic_restart_artifact_snapshot(database)
+    if str(dict(artifacts.get("database") or {}).get("sha256") or "") != database_before:
+        raise ValueError("AC dev COW completed basic restart database snapshot changed")
+    source_snapshot = _dev_cow_basic_restart_source_snapshot(source_identity)
+    linked_snapshot = _cow_regular_identity(linked_path, nlink=1)
+    basic_receipt_snapshot = _cow_regular_identity(
+        root / AC_DEV_LAUNCH_RECEIPT_NAME, nlink=1,
+    )
+    return {
+        "receipt": receipt,
+        "linked_v3_receipt": linked_path,
+        "linked_v3_receipt_snapshot": linked_snapshot,
+        "basic_launch_receipt_snapshot": basic_receipt_snapshot,
+        "source_snapshot": source_snapshot,
+        "database_sha256": database_before,
+        "logical_sha256": logical_before,
+        "historical_process": process,
+        "axis": axis,
+        "artifacts": artifacts,
+    }
+
+
+def _validate_dev_basic_runtime_custody(
+    storage_root: Path | str, *, stable_binding: Mapping[str, object],
+) -> bool:
+    """Compose existing receipt and lease authority for a live basic runtime."""
+
+    root = Path(storage_root).expanduser().absolute()
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    try:
+        metadata = database.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = _DEV_DATABASE_WRITER_LEASES.get(str(database.absolute()))
+        if lease is None:
+            return False
+        if (
+            getattr(lease.get("handle"), "closed", True)
+            or int(lease.get("owner_pid") or 0) != os.getpid()
+            or lease.get("owner_start_identity") != _writer_process_start_identity()
+            or (lease.get("database_device"), lease.get("database_inode"))
+            != (int(metadata.st_dev), int(metadata.st_ino))
+        ):
+            raise ValueError("AC dev basic runtime writer custody mismatch")
+    loaded_root = Path(__file__).resolve(strict=True).parents[2]
+    source = _current_first_start_source(loaded_root)
+    _validate_dev_basic_launch_receipt(
+        root, source_sha256=source["server_sha256"],
+        stable_binding=stable_binding,
+    )
+    return True
+
+
+def _verify_current_dev_backlog_runtime_invariants(
+    conn: sqlite3.Connection, *, expected_protected_inventory: Mapping[str, object]
+) -> None:
+    """Validate mutable backlog state through schema/generation invariants."""
+
+    if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise ValueError("existing AC dev world quick-check failed")
+    drift = backlog_read_schema_drift(conn)
+    if drift.get("missing") or drift.get("invalid"):
+        raise ValueError(
+            "existing AC dev backlog storage managed generation is invalid"
+        )
+    if (
+        backlog_read_schema_managed_inventory(conn)
+        != canonical_backlog_read_schema_managed_inventory()
+    ):
+        raise ValueError("existing AC dev backlog managed inventory changed")
+    if (
+        backlog_read_schema_protected_inventory(conn)
+        != dict(expected_protected_inventory)
+    ):
+        raise ValueError("existing AC dev backlog protected inventory changed")
+
+
+def validate_dev_preimage_only(
+    storage_root: Path | str, *, source_identity: Mapping[str, object],
+    linked_v3_receipt: Path,
+) -> dict[str, object]:
+    """Validate an admitted preimage or exact source-owned custody postimage.
+
+    This function is deliberately immutable: it takes no writer lease, creates
+    no directory, and opens SQLite only through immutable read-only mode.
+    """
+    root = _dev_storage_root(
+        create=False, isolated_receipt=linked_v3_receipt,
+        source_identity=source_identity, allow_postimage=True,
+    )
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    pre_sha256 = _durable_database_sha256(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(connection)
+        previous_plane = os.environ.pop(RUNTIME_PLANE_ENV, None)
+        try:
+            _verify_dev_world_schema_inventory(connection)
+        finally:
+            if previous_plane is not None:
+                os.environ[RUNTIME_PLANE_ENV] = previous_plane
+        meta = dict(connection.execute("SELECT key, value FROM schema_meta"))
+        database_identity = _canonical_ac_dev_database_identity(connection)
+    finally:
+        connection.close()
+    current = {}
+    if meta.get("governance_world_current_process_json"):
+        try:
+            current = json.loads(str(meta["governance_world_current_process_json"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("AC dev durable custody projection is unreadable") from exc
+        if not isinstance(current, Mapping):
+            raise ValueError("AC dev durable custody projection is invalid")
+    return {
+        "dev_storage_root": str(root), "database_path": str(database),
+        "database_identity": database_identity,
+        "database_sha256": pre_sha256, "custody_projection": dict(current),
+        "has_genesis": bool(meta.get("governance_world_genesis_sha256")),
+    }
+
+
+def commit_dev_child_custody(
+    storage_root: Path | str, *, source_identity: Mapping[str, object],
+    process_identity: Mapping[str, object], linked_v3_receipt: Path,
+) -> dict[str, object]:
+    """Child-owned, CAS-bound custody commit used before any listener bind."""
+    pre = validate_dev_preimage_only(
+        storage_root, source_identity=source_identity,
+        linked_v3_receipt=linked_v3_receipt,
+    )
+    # The child has not bound and this is the sole explicitly authorized
+    # bootstrap transaction.  Source-contract construction must not inherit
+    # the later live server's verify-only capability mode (which would reject
+    # its pristine in-memory contract database before comparison).
+    previous_plane = os.environ.pop(RUNTIME_PLANE_ENV, None)
+    try:
+        receipt = bootstrap_dev_governance_store(
+            storage_root, source_identity=source_identity,
+            process_identity=process_identity, linked_v3_receipt=linked_v3_receipt,
+        )
+    finally:
+        if previous_plane is not None:
+            os.environ[RUNTIME_PLANE_ENV] = previous_plane
+    database = Path(str(receipt["database_path"]))
+    # The writer is closed by bootstrap.  Own durable bytes before readiness.
+    checkpoint = sqlite3.connect(str(database), timeout=30)
+    try:
+        result = tuple(checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+        if result != (0, 0, 0):
+            raise RuntimeError("AC dev durable child checkpoint did not truncate")
+    finally:
+        checkpoint.close()
+    physical = database.stat(follow_symlinks=False)
+    if physical.st_nlink != 1:
+        raise ValueError("AC dev durable child postimage identity mismatch")
+    post_sha256 = _durable_database_sha256(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    post_conn = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(post_conn)
+        previous_plane = os.environ.pop(RUNTIME_PLANE_ENV, None)
+        try:
+            _verify_dev_world_schema_inventory(post_conn)
+        finally:
+            if previous_plane is not None:
+                os.environ[RUNTIME_PLANE_ENV] = previous_plane
+        post_meta = dict(post_conn.execute(
+            "SELECT key,value FROM schema_meta"
+        ))
+        post_database_identity = _canonical_ac_dev_database_identity(post_conn)
+    finally:
+        post_conn.close()
+    try:
+        post_process = json.loads(str(
+            post_meta.get("governance_world_current_process_json") or ""
+        ))
+        post_tip = json.loads(str(
+            post_meta.get("governance_world_source_tip_json") or ""
+        ))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AC dev durable child custody projection is unreadable") from exc
+    if (
+        not isinstance(post_process, Mapping)
+        or not isinstance(post_tip, Mapping)
+        or dict(post_process) != dict(process_identity)
+    ):
+        raise ValueError("AC dev durable child custody projection mismatch")
+    root = Path(storage_root).expanduser().absolute()
+    _validate_dev_current_process_custody(
+        post_process, root=root, candidate_source=source_identity,
+    )
+    _validate_dev_source_tip_custody(
+        post_tip,
+        stored_sha256=str(
+            post_meta.get("governance_world_source_tip_sha256") or ""
+        ),
+        candidate=source_identity,
+    )
+    logical_sha256 = _database_logical_sha256(database)
+    _install_dev_first_start_context(
+        root, source_identity=source_identity, database_sha256=post_sha256,
+        logical_sha256=logical_sha256,
+    )
+    return {
+        **receipt, "database_sha256_before": pre["database_sha256"],
+        "database_sha256_after": post_sha256,
+        "custody_projection": dict(post_process),
+        "database_identity": post_database_identity,
+    }
+
+
+_FIRST_COW_CUSTODY_KEYS = (
+    "governance_world_source_tip_json", "governance_world_source_tip_sha256",
+    "governance_world_source_tip_revision", "governance_world_current_process_json",
+)
+
+
+def _commit_first_cow_child_custody(
+    conn: sqlite3.Connection, *, root: Path, linked_v3_receipt: Path,
+    source_identity: Mapping[str, object], process_identity: Mapping[str, object],
+) -> dict[str, object]:
+    """Perform the one issuance-authorized custody transition atomically."""
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    stable = verified_stable_database_binding()
+    linked_v3_receipt = linked_v3_receipt.expanduser().absolute()
+    pre_receipt = validate_dev_cow_successor_preimage(
+        root, linked_v3_receipt=linked_v3_receipt,
+        source_identity=source_identity, stable_binding=stable,
+    )
+    pre_identity = _cow_regular_identity(database)
+    linked_sha256 = "sha256:" + hashlib.sha256(
+        linked_v3_receipt.read_bytes()
+    ).hexdigest()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # SQLite creates its own WAL/SHM or rollback journal at BEGIN IMMEDIATE.
+        # The sidecar-free admission immediately above precedes the lock; once
+        # locked, re-prove every immutable/physical binding and reject every
+        # sidecar except this connection's regular transient journal.
+        receipt = validate_dev_cow_successor_receipt(root)
+        successor = dict(receipt.get("successor") or {})
+        identity = dict(successor.get("identity") or {})
+        current = _cow_regular_identity(database)
+        history = dict(receipt.get("history") or {})
+        stable_identity = dict(stable.get("stable_database_identity") or {})
+        issuance_stable = dict(
+            dict(receipt.get("stable_binding") or {}).get("database") or {}
+        )
+        transaction_sidecars: dict[str, tuple[int, int]] = {}
+        sidecars_valid = True
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(str(database) + suffix)
+            if not sidecar.exists():
+                continue
+            details = sidecar.stat(follow_symlinks=False)
+            if sidecar.is_symlink() or not stat.S_ISREG(details.st_mode):
+                sidecars_valid = False
+                continue
+            transaction_sidecars[suffix] = (int(details.st_dev), int(details.st_ino))
+        locked_reasons = []
+        if receipt != pre_receipt:
+            locked_reasons.append("receipt")
+        if current != pre_identity:
+            locked_reasons.append("database")
+        if (identity.get("path") != str(database)
+                or identity.get("device") != current["device"]
+                or identity.get("inode") != current["inode"]):
+            locked_reasons.append("identity")
+        if dict(history.get("linked_v3") or {}) != {
+                    "path": str(linked_v3_receipt), "sha256": linked_sha256,
+                }:
+            locked_reasons.append("linked")
+        if issuance_stable != stable_identity:
+            locked_reasons.append("stable")
+        if not sidecars_valid:
+            locked_reasons.append("sidecar")
+        if locked_reasons:
+            raise ValueError(
+                "AC dev first-start locked physical binding changed: "
+                + ",".join(locked_reasons)
+            )
+        _assert_no_external_sqlite_holders(database)
+        before_meta = {str(key): str(value) for key, value in conn.execute(
+            "SELECT key,value FROM schema_meta ORDER BY key"
+        )}
+        before_projection = _sqlite_logical_projection(conn)
+        issuance_schema_meta = str(
+            dict(successor.get("protected_projection") or {}).get("schema_meta") or ""
+        )
+        inventory = _authority_projection_inventory_in_managed_world(conn)
+        if (len(inventory["inventory"]) != 308
+                or inventory != authority_projection_schema_inventory()
+                or before_projection.get("schema_meta") != issuance_schema_meta
+                or backlog_read_schema_managed_inventory(conn)
+                != dict(successor.get("managed_inventory") or {})
+                or backlog_read_schema_protected_inventory(conn)
+                != dict(successor.get("protected_inventory") or {})):
+            raise ValueError("AC dev first-start issuance projection mismatch")
+        try:
+            previous_tip = json.loads(before_meta["governance_world_source_tip_json"])
+            previous_process = json.loads(
+                before_meta["governance_world_current_process_json"]
+            )
+            previous_revision = int(
+                before_meta["governance_world_source_tip_revision"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("AC dev first-start custody preimage is malformed") from exc
+        if not isinstance(previous_tip, Mapping) or not isinstance(previous_process, Mapping):
+            raise ValueError("AC dev first-start custody preimage is malformed")
+        _validate_dev_source_tip_custody(
+            previous_tip,
+            stored_sha256=before_meta["governance_world_source_tip_sha256"],
+            candidate=source_identity,
+        )
+        _validate_dev_current_process_custody(
+            process_identity, root=root, candidate_source=source_identity,
+        )
+        if (process_identity.get("pid") != os.getpid()
+                or process_identity.get("start_identity")
+                != _current_custody_start_identity()):
+            raise ValueError("AC dev first-start custody is not the current process")
+        source_tip = {key: source_identity.get(key) for key in _DEV_SOURCE_TIP_KEYS}
+        source_changed = dict(previous_tip) != source_tip
+        updates = {
+            "governance_world_source_tip_json": json.dumps(
+                source_tip, sort_keys=True, separators=(",", ":")
+            ),
+            "governance_world_source_tip_sha256": _world_source_tip_hash(source_tip),
+            "governance_world_source_tip_revision": str(
+                previous_revision + (1 if source_changed else 0)
+            ),
+            "governance_world_current_process_json": json.dumps(
+                dict(process_identity), sort_keys=True, separators=(",", ":")
+            ),
+        }
+        if dict(process_identity) == dict(previous_process):
+            raise ValueError("AC dev first-start process custody did not advance")
+        for key in _FIRST_COW_CUSTODY_KEYS:
+            cursor = conn.execute(
+                "UPDATE schema_meta SET value=? WHERE key=? AND value=?",
+                (updates[key], key, before_meta.get(key)),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("AC dev first-start custody CAS changed")
+        after_meta = {str(key): str(value) for key, value in conn.execute(
+            "SELECT key,value FROM schema_meta ORDER BY key"
+        )}
+        changed = {key for key in before_meta if before_meta[key] != after_meta.get(key)}
+        noncustody_before = {
+            key: value for key, value in before_meta.items()
+            if key not in _FIRST_COW_CUSTODY_KEYS
+        }
+        noncustody_after = {
+            key: value for key, value in after_meta.items()
+            if key not in _FIRST_COW_CUSTODY_KEYS
+        }
+        after_projection = _sqlite_logical_projection(conn)
+        sidecars_after = {}
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(str(database) + suffix)
+            if sidecar.exists():
+                details = sidecar.stat(follow_symlinks=False)
+                sidecars_after[suffix] = (int(details.st_dev), int(details.st_ino))
+        if (not changed
+                or "governance_world_current_process_json" not in changed
+                or not changed <= set(_FIRST_COW_CUSTODY_KEYS)
+                or noncustody_after != noncustody_before
+                or any(after_meta.get(key) != updates[key]
+                       for key in _FIRST_COW_CUSTODY_KEYS)
+                or {key: value for key, value in after_projection.items()
+                    if key != "schema_meta"}
+                != {key: value for key, value in before_projection.items()
+                    if key != "schema_meta"}
+                or sidecars_after != transaction_sidecars
+                or _authority_projection_inventory_in_managed_world(conn) != inventory):
+            raise ValueError("AC dev first-start custody postcondition failed")
+        logical_sha256 = "sha256:" + hashlib.sha256(json.dumps(
+            after_projection, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")).hexdigest()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "receipt": receipt, "schema_meta_before": before_meta,
+        "schema_meta_after": after_meta, "logical_sha256": logical_sha256,
+        "changed_custody_keys": sorted(changed),
+        "custody_delta": {
+            key: {"before": before_meta[key], "after": after_meta[key]}
+            for key in changed
+        },
+    }
 
 
 def bootstrap_dev_governance_store(
@@ -1445,6 +5764,7 @@ def bootstrap_dev_governance_store(
     expected_source_tip_sha256: str = "",
     expected_previous_process_identity: Mapping[str, object] | None = None,
     expected_database_identity: Mapping[str, object] | None = None,
+    linked_v3_receipt: Path | None = None,
 ) -> dict[str, object]:
     """Create or verify the source-only AC dev world without copying stable rows.
 
@@ -1455,15 +5775,21 @@ def bootstrap_dev_governance_store(
     """
 
     root_input = Path(storage_root).expanduser().absolute()
-    if root_input.is_symlink():
-        raise ValueError("AC dev storage root cannot be a symlink")
+    # Bootstrap is an ingress too: reject a caller-selected world before it
+    # can create a directory or initialize SQLite.
+    env_raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
+    if not env_raw or Path(env_raw).expanduser().absolute() != root_input:
+        raise ValueError("AC dev bootstrap storage root env mismatch")
     root_existed = root_input.exists()
     shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
     if shared_raw:
         shared = Path(shared_raw).expanduser().absolute()
         if root_input == shared or root_input in shared.parents or shared in root_input.parents:
             raise ValueError("AC dev storage root must be disjoint from shared storage")
-    root = _absolute_non_symlink_root(root_input, create=not root_input.exists())
+    root = _dev_storage_root(
+        create=not root_existed, isolated_receipt=linked_v3_receipt,
+        source_identity=source_identity, allow_postimage=True,
+    )
     source = {
         "root": str(source_identity.get("root") or "").strip(),
         "branch": str(source_identity.get("branch") or "").strip(),
@@ -1476,6 +5802,12 @@ def bootstrap_dev_governance_store(
         "pid": int(process_identity.get("pid") or 0),
         "start_identity": str(process_identity.get("start_identity") or "").strip(),
     }
+    for key in (
+        "argv", "cwd", "source_root", "source_commit", "source_tree",
+        "dev_storage_root", "project_id", "port", "policy", "launch_id",
+    ):
+        if key in process_identity:
+            process[key] = process_identity[key]
     if not (
         source["root"]
         and source["branch"] == "codex/ac-dev"
@@ -1486,20 +5818,29 @@ def bootstrap_dev_governance_store(
     ):
         raise ValueError("AC dev source/process bootstrap identity is incomplete")
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
-    if root_existed and not database.exists():
+    created = not database.exists()
+    # A root that pre-existed without its DB is neither a fresh bootstrap nor a
+    # proven prior world.  Do not create child directories in that case.
+    if root_existed and created:
         raise ValueError("AC dev fresh bootstrap requires an absent dedicated root")
-    database.parent.mkdir(parents=True, exist_ok=True)
+    if not created and linked_v3_receipt is None:
+        _validate_existing_adoption_receipt(root)
+    else:
+        database.parent.mkdir(parents=True, exist_ok=True)
     if database.parent.is_symlink() or database.parent.resolve(strict=True) != database.parent:
         raise ValueError("AC dev governance directory cannot be a symlink")
     companions = [
-        candidate
-        for suffix in ("-wal", "-shm", "-journal")
+        candidate for suffix in ("-wal", "-shm", "-journal")
         if (candidate := Path(str(database) + suffix)).exists()
     ]
-    if companions:
+    # Only a verified existing world can recover SQLite's normal WAL/SHM
+    # artifacts.  A fresh ingress remains hostile to every preloaded byte.
+    if created and companions:
         raise ValueError("AC dev bootstrap rejects reused WAL/SHM/journal state")
-    lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
-    acquire_dev_runtime_writer_lease(root)
+    if not created:
+        _sqlite_adoption_identity(database, required=True)
+    for companion in companions:
+        _sqlite_adoption_identity(companion, required=True)
     genesis = {
         "schema_version": AC_WORLD_GENESIS_SCHEMA,
         "world_id": AC_DEV_WORLD_ID,
@@ -1515,16 +5856,248 @@ def bootstrap_dev_governance_store(
     source_tip_revision = 1
     current_process_identity = dict(process)
     source_upgraded = False
-    created = not database.exists()
     if database.is_symlink():
         raise ValueError("AC dev governance database cannot be a symlink")
+    cow_successor_receipt: dict[str, object] | None = None
+    cow_phase: _DevCowGenerationPhase | None = None
+    basic_cow_restart: dict[str, object] | None = None
+    if not created:
+        # Resolve the exceptional physical successor before opening the writer;
+        # receipt validation includes the no-holder/no-sidecar admission gate.
+        probe = sqlite3.connect(
+            "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1",
+            uri=True,
+        )
+        try:
+            probe_meta = dict(probe.execute(
+                "SELECT key,value FROM schema_meta WHERE key='governance_world_genesis_json'"
+            ))
+        except sqlite3.Error as exc:
+            raise ValueError("existing AC dev world genesis is unreadable") from exc
+        finally:
+            probe.close()
+        try:
+            probe_genesis = json.loads(str(probe_meta.get("governance_world_genesis_json") or ""))
+        except ValueError:
+            probe_genesis = {}
+        probe_stored = dict(probe_genesis.get("database_identity") or {}) if isinstance(probe_genesis, Mapping) else {}
+        probe_stat = database.stat(follow_symlinks=False)
+        if (probe_stored.get("device"), probe_stored.get("inode")) != (
+                int(probe_stat.st_dev), int(probe_stat.st_ino)):
+            cow_successor_receipt = validate_dev_cow_successor_receipt(root)
+            if linked_v3_receipt is not None:
+                cow_phase = _select_dev_cow_generation_phase(
+                    root, linked_v3_receipt=linked_v3_receipt,
+                    source_identity=source_identity,
+                    stable_binding=verified_stable_database_binding(),
+                )
+                if cow_phase is _DevCowGenerationPhase.COMPLETED_GENERATION:
+                    validate_dev_cow_completed_generation_projection(
+                        root, linked_v3_receipt=linked_v3_receipt,
+                        source_identity=source_identity,
+                        stable_binding=verified_stable_database_binding(),
+                    )
+            else:
+                basic_cow_restart = _validate_dev_cow_completed_basic_restart(
+                    root, source_identity=source_identity,
+                    stable_binding=verified_stable_database_binding(),
+                )
+                cow_phase = _DevCowGenerationPhase.COMPLETED_GENERATION
+    lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
+    acquire_dev_runtime_writer_lease(root)
     conn: sqlite3.Connection | None = None
     try:
+        if basic_cow_restart is not None:
+            # The completed-generation classifier has already verified the
+            # schema, inventory, world/genesis, historical custody, clean
+            # descendant source, stopped listener/process, receipt chain and
+            # inert sidecars through immutable reads.  Opening a normal SQLite
+            # connection here would both repeat the obsolete live-handoff
+            # source rule and allow SQLite to delete stopped WAL/SHM residue.
+            # Revalidate only raw physical bytes after taking the writer lease,
+            # bind that lease to the exact DB inode, and preserve historical
+            # process/source-tip provenance for the server's basic receipt.
+            current_artifacts = _dev_cow_basic_restart_artifact_snapshot(database)
+            if (
+                current_artifacts != basic_cow_restart.get("artifacts")
+                or str(
+                    dict(current_artifacts.get("database") or {}).get("sha256")
+                    or ""
+                ) != basic_cow_restart.get("database_sha256")
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart artifacts changed under lease"
+                )
+            if (
+                _dev_cow_basic_restart_source_snapshot(source_identity)
+                != basic_cow_restart.get("source_snapshot")
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart source changed under lease"
+                )
+            linked_receipt = Path(
+                str(basic_cow_restart.get("linked_v3_receipt") or "")
+            ).expanduser().absolute()
+            if (
+                _cow_regular_identity(linked_receipt, nlink=1)
+                != basic_cow_restart.get("linked_v3_receipt_snapshot")
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart linked receipt changed under lease"
+                )
+            if (
+                _cow_regular_identity(
+                    root / AC_DEV_LAUNCH_RECEIPT_NAME, nlink=1,
+                )
+                != basic_cow_restart.get("basic_launch_receipt_snapshot")
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart basic receipt changed under lease"
+                )
+            axis = dict(basic_cow_restart.get("axis") or {})
+            meta = dict(axis.get("meta") or {})
+            try:
+                genesis = json.loads(meta["governance_world_genesis_json"])
+                source_tip_identity = dict(axis["tip"])
+                current_process_identity = dict(axis["process"])
+                source_tip_revision = int(axis["revision"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "AC dev COW completed basic restart projection is incomplete"
+                ) from exc
+            genesis_sha256 = str(meta.get("governance_world_genesis_sha256") or "")
+            source_tip_sha256 = str(
+                meta.get("governance_world_source_tip_sha256") or ""
+            )
+            if (
+                not isinstance(genesis, Mapping)
+                or genesis.get("world_id") != AC_DEV_WORLD_ID
+                or genesis.get("project_id") != AC_PROJECT_ID
+                or genesis_sha256 != _world_genesis_hash(genesis)
+                or source_tip_sha256 != _world_source_tip_hash(source_tip_identity)
+                or source_tip_revision < 2
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart projection changed"
+                )
+            _bind_dev_writer_lease_database_identity(database)
+            metadata = database.stat(follow_symlinks=False)
+            identity = {
+                "schema_version": "ac_governance_database_identity.v2",
+                "world_id": AC_DEV_WORLD_ID,
+                "project_id": AC_PROJECT_ID,
+                "device": int(metadata.st_dev),
+                "inode": int(metadata.st_ino),
+                "relative_path_sha256": "sha256:" + hashlib.sha256(
+                    AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")
+                ).hexdigest(),
+                "genesis_sha256": genesis_sha256,
+            }
+            if expected_database_identity is not None and (
+                dict(expected_database_identity) != identity
+            ):
+                raise ValueError("AC dev source upgrade database identity mismatch")
+            if source != source_tip_identity:
+                if (
+                    expected_source_tip_sha256
+                    and expected_source_tip_sha256 != source_tip_sha256
+                ):
+                    raise ValueError("AC dev source tip CAS mismatch")
+                if expected_previous_process_identity is not None and (
+                    dict(expected_previous_process_identity)
+                    != current_process_identity
+                ):
+                    raise ValueError("AC dev source upgrade process identity mismatch")
+            result = {
+                **dict(genesis),
+                "genesis_sha256": genesis_sha256,
+                "database_path": str(database),
+                "database_identity": identity,
+                "created": False,
+                "restart_safe": True,
+                "legacy_rows_imported": False,
+                "current_process_identity": current_process_identity,
+                "source_tip_identity": source_tip_identity,
+                "source_tip_sha256": source_tip_sha256,
+                "source_tip_revision": source_tip_revision,
+                "source_upgraded": False,
+            }
+            _validate_dev_cow_basic_restart_writer_lease(database)
+            return result
         conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row
-        if created:
+        if (cow_successor_receipt is not None
+                and cow_phase is _DevCowGenerationPhase.FIRST_ISSUANCE
+                and linked_v3_receipt is not None):
+            pre_sha256 = _durable_database_sha256(database)
+            transition = _commit_first_cow_child_custody(
+                conn, root=root, linked_v3_receipt=linked_v3_receipt,
+                source_identity=source_identity, process_identity=process,
+            )
+            conn.close()
+            conn = None
+            checkpoint = sqlite3.connect(str(database), timeout=30)
+            try:
+                if tuple(checkpoint.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()) != (0, 0, 0):
+                    raise RuntimeError("AC dev first-start checkpoint failed")
+            finally:
+                checkpoint.close()
+            _bind_dev_writer_lease_database_identity(database)
+            post_sha256 = _durable_database_sha256(database)
+            logical_sha256 = _database_logical_sha256(database)
+            if logical_sha256 != transition["logical_sha256"]:
+                raise ValueError("AC dev first-start logical postimage changed")
+            _install_dev_first_start_context(
+                root, source_identity=source_identity, database_sha256=post_sha256,
+                logical_sha256=logical_sha256,
+            )
+            meta = dict(transition["schema_meta_after"])
+            genesis = json.loads(meta["governance_world_genesis_json"])
+            current_process_identity = json.loads(
+                meta["governance_world_current_process_json"]
+            )
+            source_tip_identity = json.loads(
+                meta["governance_world_source_tip_json"]
+            )
+            source_tip_sha256 = meta["governance_world_source_tip_sha256"]
+            source_tip_revision = int(meta["governance_world_source_tip_revision"])
+            genesis_sha256 = meta["governance_world_genesis_sha256"]
+            metadata = database.stat(follow_symlinks=False)
+            identity = {
+                "schema_version": "ac_governance_database_identity.v2",
+                "world_id": AC_DEV_WORLD_ID, "project_id": AC_PROJECT_ID,
+                "device": int(metadata.st_dev), "inode": int(metadata.st_ino),
+                "relative_path_sha256": "sha256:" + hashlib.sha256(
+                    AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")
+                ).hexdigest(), "genesis_sha256": genesis_sha256,
+            }
+            return {
+                **dict(genesis), "genesis_sha256": genesis_sha256,
+                "database_path": str(database), "database_identity": identity,
+                "created": False, "restart_safe": False,
+                "legacy_rows_imported": False,
+                "current_process_identity": current_process_identity,
+                "source_tip_identity": source_tip_identity,
+                "source_tip_sha256": source_tip_sha256,
+                "source_tip_revision": source_tip_revision,
+                "source_upgraded": bool(transition["changed_custody_keys"]),
+                "database_sha256_before": pre_sha256,
+                "database_sha256_after": post_sha256,
+                "custody_delta": transition["custody_delta"],
+            }
+        admitted_preimage = False
+        if not created and linked_v3_receipt is not None:
+            existing_meta = dict(conn.execute(
+                "SELECT key, value FROM schema_meta WHERE key IN "
+                "('governance_world_genesis_sha256','governance_world_genesis_json')"
+            ))
+            admitted_preimage = not bool(existing_meta.get("governance_world_genesis_sha256"))
+        if created or admitted_preimage:
             _configure_connection(conn, busy_timeout=10000)
-            _ensure_schema(conn)
+            if created:
+                _ensure_schema(conn)
             _verify_dev_world_schema_inventory(conn)
             required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
             for table in sorted(
@@ -1577,6 +6150,15 @@ def bootstrap_dev_governance_store(
         else:
             _verify_existing_schema(conn)
             _verify_dev_world_schema_inventory(conn)
+            if cow_successor_receipt is not None:
+                _verify_current_dev_backlog_runtime_invariants(
+                    conn,
+                    expected_protected_inventory=dict(
+                        dict(cow_successor_receipt.get("successor") or {}).get(
+                            "protected_inventory"
+                        ) or {}
+                    ),
+                )
             meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
             try:
                 stored_genesis = json.loads(
@@ -1601,17 +6183,32 @@ def bootstrap_dev_governance_store(
             current_root = root.stat(follow_symlinks=False)
             current_database = database.stat(follow_symlinks=False)
             if (
-                stored_database.get("device") != int(current_database.st_dev)
-                or stored_database.get("inode") != int(current_database.st_ino)
+                (stored_database.get("device") != int(current_database.st_dev)
+                 or stored_database.get("inode") != int(current_database.st_ino))
                 or stored_root.get("path") != str(root)
                 or stored_root.get("device") != int(current_root.st_dev)
                 or stored_root.get("inode") != int(current_root.st_ino)
             ):
-                raise ValueError("existing AC dev world storage/database identity changed")
+                # A content-addressed COW successor is the only authority that
+                # may replace the physical genesis inode.  Genesis bytes and
+                # every logical/source-schema check below remain authoritative.
+                if (stored_root.get("path") != str(root)
+                        or stored_root.get("device") != int(current_root.st_dev)
+                        or stored_root.get("inode") != int(current_root.st_ino)):
+                    raise ValueError("existing AC dev world storage/database identity changed")
+                if cow_successor_receipt is None:
+                    raise ValueError("existing AC dev world COW successor receipt is missing")
+                predecessor = dict(dict(cow_successor_receipt.get("predecessor") or {}).get("backup") or {})
+                successor_identity = dict(dict(cow_successor_receipt.get("successor") or {}).get("identity") or {})
+                if (stored_database.get("device") != predecessor.get("device")
+                        or stored_database.get("inode") != predecessor.get("inode")
+                        or successor_identity.get("device") != int(current_database.st_dev)
+                        or successor_identity.get("inode") != int(current_database.st_ino)):
+                    raise ValueError("existing AC dev world COW successor identity mismatch")
             required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
-            if stored_genesis.get("source_schema_sha256") != _source_schema_inventory_hash(
-                conn, required_tables
-            ):
+            if (cow_successor_receipt is None
+                    and stored_genesis.get("source_schema_sha256")
+                    != _source_schema_inventory_hash(conn, required_tables)):
                 raise ValueError("existing AC dev source schema contract changed")
             genesis = dict(stored_genesis)
             genesis_sha256 = stored_hash
@@ -1674,7 +6271,29 @@ def bootstrap_dev_governance_store(
                     != current_process_identity
                 ):
                     raise ValueError("AC dev source upgrade process identity mismatch")
-                _verify_dev_source_upgrade(source_tip_identity, source)
+            # Receipt, stable binding, schema/genesis, physical identity and
+            # exact clean source lineage are now all verified before SQLite
+            # may touch WAL.  The same check is intentional on a no-op restart.
+            _verify_dev_source_upgrade(source_tip_identity, source)
+            if basic_cow_restart is None:
+                _recover_verified_existing_dev_sqlite(root, database)
+            if basic_cow_restart is not None:
+                # The ordinary foreground service does not become a new
+                # persisted custody generation.  Keep source-tip/process
+                # provenance and every database byte unchanged; current
+                # authority is the clean source, basic receipt, and live lease.
+                conn.close()
+                conn = None
+                if (
+                    _durable_database_sha256(database)
+                    != basic_cow_restart["database_sha256"]
+                    or _database_logical_sha256(database)
+                    != basic_cow_restart["logical_sha256"]
+                ):
+                    raise ValueError(
+                        "AC dev COW completed basic restart changed the database"
+                    )
+            elif source != source_tip_identity:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     locked_meta = dict(
@@ -1725,6 +6344,26 @@ def bootstrap_dev_governance_store(
                 source_tip_revision += 1
                 current_process_identity = dict(process)
                 source_upgraded = True
+            elif process != current_process_identity:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    locked_value = conn.execute(
+                        "SELECT value FROM schema_meta WHERE key = "
+                        "'governance_world_current_process_json'"
+                    ).fetchone()
+                    locked_process = json.loads(str(locked_value[0] or "{}")) if locked_value else {}
+                    if locked_process != current_process_identity:
+                        raise ValueError("AC dev current process custody changed while locked")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                        ("governance_world_current_process_json",
+                         json.dumps(process, sort_keys=True, separators=(",", ":"))),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                current_process_identity = dict(process)
     except Exception:
         if conn is not None:
             conn.close()
@@ -1841,7 +6480,7 @@ def _default_cutover_listener_probe(port: int) -> dict[str, object]:
     """Inspect one local listener without starting, stopping, or signalling it."""
 
     result = subprocess.run(
-        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fp"],
+        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fpn"],
         capture_output=True,
         text=True,
         timeout=5,
@@ -1872,12 +6511,108 @@ def _default_cutover_listener_probe(port: int) -> dict[str, object]:
         "listening": bool(pid),
         "pid": pid,
         "process_start_identity": start_identity,
+        "listener_addresses": sorted(
+            {
+                line[1:].removesuffix(" (LISTEN)")
+                for line in result.stdout.splitlines()
+                if line.startswith("n") and line[1:].strip()
+            }
+        ),
         "source_commit": (
             os.environ.get("AMING_CLAW_STABLE_ANCHOR_COMMIT", "").strip().lower()
             if int(port) == 40000
             else ""
         ),
     }
+
+
+def _require_ac_dev_graph_materialization_runtime_custody(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Prove this process owns the exact live dev listener and DB lease."""
+
+    opened = _connection_main_database_identity(conn)
+    if opened is None:
+        raise ValueError("AC dev graph materialization database identity is unavailable")
+    database, metadata = opened
+    expected_database = _dev_database_path()
+    if (
+        database != expected_database
+        or (int(metadata.st_dev), int(metadata.st_ino))
+        != (
+            int(expected_database.stat(follow_symlinks=False).st_dev),
+            int(expected_database.stat(follow_symlinks=False).st_ino),
+        )
+    ):
+        raise ValueError("AC dev graph materialization database custody mismatch")
+
+    server_source = Path(__file__).with_name("server.py")
+    source_sha256 = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
+    launch = validate_dev_launch_receipt(
+        _dev_storage_root(create=False), source_sha256=source_sha256
+    )
+    if (
+        launch.get("runtime_plane") != DEV_RUNTIME_PLANE
+        or launch.get("world_id", AC_DEV_WORLD_ID) != AC_DEV_WORLD_ID
+        or launch.get("project_id") != AC_PROJECT_ID
+        or launch.get("port") != 40008
+        or launch.get("background", False) is not False
+    ):
+        raise ValueError("AC dev graph materialization launch custody mismatch")
+
+    listener = _default_cutover_listener_probe(40008)
+    _validate_ac_dev_graph_materialization_listener(listener)
+
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = _DEV_DATABASE_WRITER_LEASES.get(str(expected_database))
+        if (
+            not lease
+            or getattr(lease.get("handle"), "closed", True)
+            or lease.get("owner_pid") != os.getpid()
+            or lease.get("owner_start_identity") != _writer_process_start_identity()
+            or lease.get("database_device") != int(metadata.st_dev)
+            or lease.get("database_inode") != int(metadata.st_ino)
+        ):
+            raise ValueError("AC dev graph materialization writer custody mismatch")
+    return {
+        "schema_version": "ac_dev_graph_materialization_runtime_custody.v1",
+        "runtime_plane": DEV_RUNTIME_PLANE,
+        "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID,
+        "host": "127.0.0.1",
+        "port": 40008,
+        "pid": os.getpid(),
+        "database_device": int(metadata.st_dev),
+        "database_inode": int(metadata.st_ino),
+    }
+
+
+def _validate_ac_dev_graph_materialization_listener(
+    listener: Mapping[str, object],
+) -> None:
+    """Validate an OS-observed exact loopback listener owned by this process."""
+
+    if (
+        listener.get("port") != 40008
+        or listener.get("listening") is not True
+        or int(listener.get("pid") or 0) != os.getpid()
+        or listener.get("listener_addresses") != ["127.0.0.1:40008"]
+    ):
+        raise ValueError("AC dev graph materialization listener custody mismatch")
+    process_started = subprocess.run(
+        ["ps", "-p", str(os.getpid()), "-o", "lstart="],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    if (
+        process_started.returncode != 0
+        or not process_started.stdout.strip()
+        or str(listener.get("process_start_identity") or "").strip()
+        != process_started.stdout.strip()
+    ):
+        raise ValueError("AC dev graph materialization listener process mismatch")
 
 
 def _fd_sparse_content_digest(descriptor: int, *, size: int) -> str:

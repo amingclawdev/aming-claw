@@ -37,6 +37,11 @@ from agent.manager_http_server import (
 import agent.manager_http_server as manager_http_server
 
 
+_TEST_IDENTITY = manager_http_server.plane_bound_manager_identity(
+    "proj", "http://127.0.0.1:40000", str(_root / "shared-volume"),
+)
+
+
 def _make_request(server_address, method, path, body=None):
     """Send an HTTP request to the test server and return (status, body_dict)."""
     import urllib.request
@@ -63,7 +68,11 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Start a test HTTP server on a random port."""
-        cls.server = create_server("127.0.0.1", 0)  # port 0 = random available
+        cls.server = create_server(
+            "127.0.0.1", 0, project_id="proj",
+            governance_url="http://127.0.0.1:40000",
+            storage_root=str(_root / "shared-volume"),
+        )  # port 0 = random available
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
@@ -118,7 +127,8 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         self.assertEqual(body["chain_version"], "abc1234")
 
         # AC4: version-update called exactly once
-        mock_write.assert_called_once_with("abc1234")
+        self.assertEqual(mock_write.call_args.args[0]["project_id"], "proj")
+        self.assertEqual(mock_write.call_args.args[1], "abc1234")
 
     @patch(
         "agent.manager_http_server._ensure_plugin_clone_checkout",
@@ -197,7 +207,7 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertFalse(body["ok"])
         self.assertEqual(body["step"], "stop")
-        mock_stop.assert_called_once_with()
+        self.assertEqual(mock_stop.call_args.args[0]["project_id"], "proj")
         mock_spawn.assert_not_called()
         mock_health.assert_not_called()
         mock_write.assert_not_called()
@@ -259,7 +269,8 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertEqual(body["step"], "post_version_identity_probe")
         self.assertEqual(mock_health.call_count, 2)
-        mock_write.assert_called_once_with("a0266c5d")
+        self.assertEqual(mock_write.call_args.args[0]["project_id"], "proj")
+        self.assertEqual(mock_write.call_args.args[1], "a0266c5d")
 
     def test_redeploy_unknown_target_404(self):
         """Unknown target returns 404."""
@@ -308,14 +319,14 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
             "_governance_listener_pids",
             return_value=(67041, 84539),
         ), patch.object(manager_http_server.os, "kill") as mock_kill:
-            self.assertFalse(manager_http_server._stop_governance_process())
+            self.assertFalse(manager_http_server._stop_governance_process(_TEST_IDENTITY))
         mock_kill.assert_not_called()
 
     def test_no_listener_is_already_stopped(self):
         with patch.object(
             manager_http_server, "_governance_listener_pids", return_value=()
         ), patch.object(manager_http_server.os, "kill") as mock_kill:
-            self.assertTrue(manager_http_server._stop_governance_process())
+            self.assertTrue(manager_http_server._stop_governance_process(_TEST_IDENTITY))
         mock_kill.assert_not_called()
 
     def test_stop_signals_only_the_exact_listener_owner(self):
@@ -328,7 +339,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
             "_listener_and_process_stopped",
             return_value=True,
         ), patch.object(manager_http_server.os, "kill") as mock_kill:
-            self.assertTrue(manager_http_server._stop_governance_process())
+            self.assertTrue(manager_http_server._stop_governance_process(_TEST_IDENTITY))
         mock_kill.assert_called_once_with(67041, manager_http_server.signal.SIGTERM)
 
     def test_health_rejects_old_listener_after_spawned_process_exits(self):
@@ -342,7 +353,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
         ):
             self.assertFalse(
                 manager_http_server._wait_for_health(
-                    proc,
+                    _TEST_IDENTITY, proc,
                     "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
                     "sha256:" + "a" * 64,
                     timeout=0.01,
@@ -382,7 +393,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
         ), patch("urllib.request.urlopen", return_value=response):
             self.assertTrue(
                 manager_http_server._wait_for_health(
-                    proc,
+                    _TEST_IDENTITY, proc,
                     exact_commit,
                     "sha256:" + "a" * 64,
                     timeout=0.05,
@@ -423,7 +434,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
         ):
             self.assertFalse(
                 manager_http_server._wait_for_health(
-                    proc,
+                    _TEST_IDENTITY, proc,
                     "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
                     "sha256:" + "a" * 64,
                     timeout=0.01,
@@ -464,7 +475,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
         ):
             self.assertFalse(
                 manager_http_server._wait_for_health(
-                    proc,
+                    _TEST_IDENTITY, proc,
                     "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
                     "sha256:" + "a" * 64,
                     timeout=0.01,
@@ -505,7 +516,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
         ):
             self.assertFalse(
                 manager_http_server._wait_for_health(
-                    proc,
+                    _TEST_IDENTITY, proc,
                     "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
                     "sha256:" + "a" * 64,
                     timeout=0.01,
@@ -667,7 +678,11 @@ class TestRedeployEndpointRuntimeCheckout(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.server = create_server("127.0.0.1", 0)
+        cls.server = create_server(
+            "127.0.0.1", 0, project_id="proj",
+            governance_url="http://127.0.0.1:40000",
+            storage_root=str(_root / "shared-volume"),
+        )
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
@@ -785,7 +800,11 @@ class TestRedeployResponseCarriesProbeDerivedStatus(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.server = create_server("127.0.0.1", 0)
+        cls.server = create_server(
+            "127.0.0.1", 0, project_id="proj",
+            governance_url="http://127.0.0.1:40000",
+            storage_root=str(_root / "shared-volume"),
+        )
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()

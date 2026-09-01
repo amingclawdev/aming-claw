@@ -9,6 +9,7 @@ Covers AC1-AC5 from the PRD:
 """
 
 import json
+from pathlib import Path
 import subprocess
 import types
 from unittest import mock
@@ -20,7 +21,31 @@ import pytest
 # Helper: build a minimal ExecutorWorker-like object with _execute_merge
 # ---------------------------------------------------------------------------
 
-def _make_worker(workspace="/tmp/ws", base_url="http://localhost:40000", project_id="test"):
+def _git(cmd, cwd):
+    return subprocess.run(["git", *cmd], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _ensure_git_repo(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if (path / ".git").exists():
+        return
+    _git(["init"], str(path))
+    _git(["config", "user.email", "test@example.invalid"], str(path))
+    _git(["config", "user.name", "Test"], str(path))
+    (path / "README").write_text("base\n", encoding="utf-8")
+    _git(["add", "README"], str(path))
+    _git(["commit", "-m", "base"], str(path))
+
+
+def _add_worktree(repo, name, branch):
+    root = Path(repo)
+    worktree = root / ".worktrees" / name
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    _git(["worktree", "add", "-b", branch, str(worktree), "HEAD"], str(root))
+    return worktree
+
+def _make_worker(workspace=None, base_url="http://localhost:40000", project_id="test"):
     """Return a lightweight stub that has _execute_merge bound."""
     # Import the real module to get _execute_merge's code
     import importlib
@@ -46,8 +71,18 @@ def _make_worker(workspace="/tmp/ws", base_url="http://localhost:40000", project
 
     spec.loader.exec_module(mod)
 
+    workspace = workspace or str(Path(__file__).resolve().parents[2])
+    _ensure_git_repo(workspace)
     worker = object.__new__(mod.ExecutorWorker)
-    worker.workspace = workspace
+    from agent.runtime_plane import bind_workspace_identity
+    worker.workspace_identity = bind_workspace_identity(str(Path(workspace).resolve()))
+    worker.workspace = worker.workspace_identity.root
+    worker._task_worktrees = {}
+    worker._validated_workspace = mod.ExecutorWorker._validated_workspace.__get__(worker)
+    worker._register_task_worktree = mod.ExecutorWorker._register_task_worktree.__get__(worker)
+    worker._handoff_task_worktree = mod.ExecutorWorker._handoff_task_worktree.__get__(worker)
+    worker._validated_task_worktree = mod.ExecutorWorker._validated_task_worktree.__get__(worker)
+    worker._revalidate_effect_workspace = mod.ExecutorWorker._revalidate_effect_workspace.__get__(worker)
     worker.base_url = base_url
     worker.project_id = project_id
     worker._report_progress = lambda tid, data: None
@@ -249,8 +284,8 @@ def test_noop_worktree_branch_already_ancestor_returns_success(tmp_path):
     worker._branch_exists = lambda branch: True
     worker._branch_already_merged = lambda branch: True
     worker._remove_worktree = mock.Mock()
-    worktree = tmp_path / "dev-task"
-    worktree.mkdir()
+    worktree = _add_worktree(tmp_path, "dev-task", "dev/task-parent-6")
+    worker._register_task_worktree("task-parent-6", str(worktree))
 
     metadata = {
         "parent_task_id": "task-parent-6",
@@ -259,21 +294,11 @@ def test_noop_worktree_branch_already_ancestor_returns_success(tmp_path):
         "changed_files": [],
     }
 
-    def _run(cmd, **kwargs):
-        cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
-        result = subprocess.CompletedProcess(cmd, 0)
-        result.stdout = ""
-        result.stderr = ""
-        if "rev-parse HEAD" in cmd_str:
-            result.stdout = "abc123456789\n"
-        return result
-
-    with mock.patch("subprocess.run", side_effect=_run):
-        result = worker._execute_merge("task-merge-6", metadata)
+    result = worker._execute_merge("task-merge-6", metadata)
 
     assert result["status"] == "succeeded"
     assert result["result"]["merge_mode"] == "already_merged_replay"
-    assert result["result"]["merge_commit"] == "abc123456789"
+    assert result["result"]["merge_commit"] == _git(["rev-parse", "HEAD"], str(tmp_path)).stdout.strip()
     assert result["result"]["files_changed"] == 0
 
 
@@ -282,13 +307,15 @@ def test_reconcile_merge_advances_target_branch_not_main(tmp_path):
     worker = _make_worker(workspace=str(tmp_path))
     worker._branch_exists = lambda branch: True
     worker._branch_already_merged = lambda branch, target_ref="HEAD": False
-    worker._create_integration_worktree = mock.Mock(
-        return_value=(str(tmp_path / "merge-task"), "merge/task-merge-7", "")
-    )
+    worker._ensure_branch_at_ref = mock.Mock(return_value=(True, ""))
     worker._remove_worktree = mock.Mock()
     worker._api = mock.Mock()
-    worktree = tmp_path / "dev-task"
-    worktree.mkdir()
+    worktree = _add_worktree(tmp_path, "dev-task", "dev/task-parent-7")
+    integration = _add_worktree(tmp_path, "merge-task", "merge/task-merge-7")
+    worker._register_task_worktree("task-parent-7", str(worktree))
+    worker._create_integration_worktree = mock.Mock(
+        return_value=(str(integration), "merge/task-merge-7", "")
+    )
     metadata = {
         "parent_task_id": "task-parent-7",
         "operation_type": "reconcile-cluster",
@@ -299,9 +326,12 @@ def test_reconcile_merge_advances_target_branch_not_main(tmp_path):
         "changed_files": ["agent/example.py"],
     }
     run_calls = []
+    real_run = subprocess.run
 
     def _run(cmd, **kwargs):
         run_calls.append((cmd, kwargs.get("cwd")))
+        if cmd[:2] == ["git", "rev-parse"]:
+            return real_run(cmd, **kwargs)
         result = subprocess.CompletedProcess(cmd, 0)
         result.stdout = ""
         result.stderr = ""
@@ -332,33 +362,20 @@ def test_reconcile_merge_advances_target_branch_not_main(tmp_path):
 def test_reconcile_dev_worktree_uses_target_branch_base(tmp_path):
     """Dev worktrees for reconcile clusters are created from the session branch."""
     worker = _make_worker(workspace=str(tmp_path))
+    _git(["branch", "reconcile/p-test-session"], str(tmp_path))
     worker._ensure_branch_at_ref = mock.Mock(return_value=(True, ""))
-    run_calls = []
-
-    def _run(cmd, **kwargs):
-        run_calls.append((cmd, kwargs.get("cwd")))
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    with mock.patch("subprocess.run", side_effect=_run), mock.patch("os.makedirs"):
-        worktree_path, branch = worker._create_worktree(
-            "task-dev-8",
-            base_ref="reconcile/p-test-session",
-            base_commit="base123",
-        )
+    worktree_path, branch = worker._create_worktree(
+        "task-dev-8",
+        base_ref="reconcile/p-test-session",
+        base_commit="base123",
+    )
 
     assert branch == "dev/task-dev-8"
     assert worktree_path
     worker._ensure_branch_at_ref.assert_called_once_with(
         "reconcile/p-test-session", "base123"
     )
-    assert any(
-        call[0] == [
-            "git", "worktree", "add", "-b", "dev/task-dev-8",
-            str(tmp_path / ".worktrees" / "dev-task-dev-8"),
-            "reconcile/p-test-session",
-        ]
-        for call in run_calls
-    )
+    assert _git(["rev-parse", "--show-toplevel"], worktree_path).stdout.strip() == worktree_path
 
 
 def test_reconcile_deploy_skips_main_redeploy():

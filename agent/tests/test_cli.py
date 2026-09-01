@@ -3,7 +3,10 @@
 import os
 import hashlib
 import json
+import re
 import subprocess
+import shutil
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -24,6 +27,141 @@ except ImportError:
     HAS_CLICK = False
 
 pytestmark = pytest.mark.skipif(not HAS_CLICK, reason="click not installed")
+
+
+def test_dev_create_cow_successor_receipt_delegates_to_db(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    root = tmp_path / "dev"
+    root.mkdir()
+    operator = tmp_path / "operator.json"
+    backup = tmp_path / "backup.sqlite"
+    linked = tmp_path / "linked.json"
+    for path in (operator, backup, linked):
+        path.write_text("{}", encoding="utf-8")
+    observed = {}
+
+    def create(storage_root, **kwargs):
+        observed.update({"storage_root": storage_root, **kwargs})
+        return {"status": "created", "receipt": "/receipt", "receipt_sha256": "sha256:" + "a" * 64}
+
+    monkeypatch.setattr(db, "create_dev_cow_successor_receipt", create)
+    result = CliRunner().invoke(main, [
+        "dev-create-cow-successor-receipt", "--dev-storage-root", str(root),
+        "--operator-receipt", str(operator), "--predecessor-backup", str(backup),
+        "--linked-v3-receipt", str(linked),
+    ])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["status"] == "created"
+    assert observed == {"storage_root": root, "operator_receipt": operator,
+                        "predecessor_backup": backup, "linked_v3_receipt": linked}
+
+
+def _valid_dev_running_identity_fixture(tmp_path):
+    import agent.cli as cli
+
+    candidate = "b" * 40
+    stable = "c" * 40
+    issuance = "a" * 40
+    source = {
+        "root": str(tmp_path), "branch": cli.AC_DEV_BRANCH,
+        "commit": candidate, "source_sha256": "sha256:" + "d" * 64,
+    }
+    database = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw",
+        "device": 1, "inode": 2,
+        "relative_path_sha256": "sha256:" + "1" * 64,
+        "genesis_sha256": "sha256:" + "2" * 64,
+    }
+    plane = {
+        "schema_version": "ac_runtime_plane_identity.v1", "status": "ready",
+        "plane": "dev", "bind_host": "127.0.0.1", "port": 40008,
+        "expected_port": 40008, "pid": 1234, "worktree_root": str(tmp_path),
+        "branch": cli.AC_DEV_BRANCH, "expected_branch": cli.AC_DEV_BRANCH,
+        "commit": candidate, "worktree_dirty": False,
+        "worktree_dirty_files": [], "stable_anchor_commit": stable,
+        "dev_issuance_ancestry_anchor_commit": issuance,
+        "database_identity": database, "world_id": "ac-dev",
+    }
+    health = {
+        "runtime_plane": "dev", "port": 40008, "bind_host": "127.0.0.1",
+        "pid": 1234, "runtime_loaded_version": candidate,
+        "runtime_stale": False, "runtime_plane_identity": plane,
+        "loaded_runtime_identity": {
+            "schema_version": "governance_loaded_runtime_identity.v1",
+            "loaded_commit": candidate, "loaded_pid": 1234,
+            "worktree_head_version": candidate[:12], "runtime_stale": False,
+            "runtime_stale_reasons": [],
+            "loaded_source_sha256": source["source_sha256"],
+            "worktree_source_sha256": source["source_sha256"],
+        },
+    }
+    return source, stable, issuance, database, health
+
+
+def test_dev_running_identity_requires_exact_receipt_derived_issuance_anchor(tmp_path):
+    import agent.cli as cli
+
+    source, stable, issuance, database, health = (
+        _valid_dev_running_identity_fixture(tmp_path)
+    )
+
+    assert cli._dev_running_identity_matches(
+        health, source, stable_anchor_commit=stable,
+        dev_issuance_ancestry_anchor_commit=issuance,
+        dev_database_identity=database,
+    )
+    assert not cli._dev_running_identity_matches(
+        health, source, stable_anchor_commit=stable,
+        dev_issuance_ancestry_anchor_commit="e" * 40,
+        dev_database_identity=database,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation", "value"),
+    [
+        ("schema_version", "missing", None),
+        ("schema_version", "spoof", "ac_governance_database_identity.v3"),
+        ("schema_version", "spoof", "ac_stable_database_identity.v1"),
+        ("world_id", "missing", None),
+        ("world_id", "spoof", "stable"),
+        ("project_id", "missing", None),
+        ("project_id", "spoof", "foreign-project"),
+        ("device", "missing", None),
+        ("device", "spoof", 0),
+        ("inode", "missing", None),
+        ("inode", "spoof", 0),
+        ("relative_path_sha256", "missing", None),
+        ("relative_path_sha256", "spoof", "sha256:" + "0" * 64),
+        ("genesis_sha256", "missing", None),
+        ("genesis_sha256", "spoof", "sha256:" + "0" * 64),
+    ],
+)
+def test_dev_running_identity_rejects_missing_or_spoofed_database_core_field(
+    tmp_path, field, mutation, value,
+):
+    import agent.cli as cli
+
+    source, stable, issuance, database, health = (
+        _valid_dev_running_identity_fixture(tmp_path)
+    )
+    reported = dict(database)
+    if mutation == "missing":
+        reported.pop(field)
+    else:
+        reported[field] = value
+    health["runtime_plane_identity"] = {
+        **health["runtime_plane_identity"],
+        "database_identity": reported,
+    }
+
+    assert not cli._dev_running_identity_matches(
+        health, source, stable_anchor_commit=stable,
+        dev_issuance_ancestry_anchor_commit=issuance,
+        dev_database_identity=database,
+    )
 
 
 class _GovernanceProbeResponse:
@@ -50,6 +188,297 @@ class _GovernanceProbeResponse:
         if self.expected_limit is not None:
             assert limit == self.expected_limit
         return self.body[:limit]
+
+
+def test_linked_v3_validator_uses_cow_preimage_for_replaced_inode(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"; database = root / "governance.db"
+    database.parent.mkdir(); database.write_bytes(b"successor")
+    linked = root / "linked.json"; linked.write_bytes(b"linked")
+    current = cli._admission_identity(database)
+    receipt = {
+        "database_identity": {**current, "inode": current["inode"] + 1},
+        "source_identity": {"cli_source": {"commit": "a" * 40}},
+    }
+    monkeypatch.setattr(cli, "_read_admission_receipt",
+                        lambda *_args, **_kwargs: (receipt, "sha256:" + "1" * 64))
+    monkeypatch.setattr(cli, "_validated_historical_admission_source_identity",
+                        lambda value: value)
+    calls = []
+    pristine = []
+    monkeypatch.setattr(
+        cli, "_require_first_cow_runtime_pristine",
+        lambda value: pristine.append(value),
+    )
+    monkeypatch.setattr(
+        db, "_select_dev_cow_generation_phase",
+        lambda *_args, **_kwargs: db._DevCowGenerationPhase.FIRST_ISSUANCE,
+    )
+    monkeypatch.setattr(db, "validate_dev_cow_successor_preimage",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: {"stable": True})
+    digest, returned = cli._validated_linked_v3_receipt(
+        linked, dev_storage=root, database=database,
+        database_identity=current, source_identity={"commit": "b" * 40},
+        durable_start_phase=cli._DURABLE_START_COMPLETED_BOOTSTRAP,
+    )
+    assert digest == "sha256:" + "1" * 64
+    assert returned is receipt
+    assert pristine == [root]
+    assert len(calls) == 1
+    assert "completed_generation_ref" not in calls[0][1]
+
+
+def test_linked_v3_completed_generation_uses_source_backed_projection(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"; database = root / "governance.db"
+    database.parent.mkdir(); database.write_bytes(b"completed")
+    linked = root / "linked.json"; linked.write_bytes(b"linked")
+    current = cli._admission_identity(database)
+    receipt = {
+        "database_identity": {**current, "inode": current["inode"] + 1},
+        "source_identity": {"cli_source": {"commit": "a" * 40}},
+    }
+    monkeypatch.setattr(cli, "_read_admission_receipt",
+                        lambda *_args, **_kwargs: (receipt, "sha256:" + "1" * 64))
+    monkeypatch.setattr(cli, "_validated_historical_admission_source_identity",
+                        lambda value: value)
+    historical = []
+    calls = []
+    sequence = []
+    completed_receipt = {
+        "history": {
+            "adoption": {"path": "/adoption.json", "sha256": "sha256:" + "2" * 64},
+        },
+    }
+    monkeypatch.setattr(
+        db, "_select_dev_cow_generation_phase",
+        lambda *_args, **_kwargs: db._DevCowGenerationPhase.COMPLETED_GENERATION,
+    )
+    monkeypatch.setattr(
+        cli, "_historical_dashboard_bootstrap_adoption",
+        lambda value, **kwargs: (
+            sequence.append("historical"), historical.append((value, kwargs))
+        )[1],
+    )
+    monkeypatch.setattr(
+        db, "validate_dev_cow_completed_generation_projection",
+        lambda *args, **kwargs: (
+            sequence.append("completed"), calls.append((args, kwargs)), completed_receipt
+        )[2],
+    )
+    monkeypatch.setattr(db, "verified_stable_database_binding",
+                        lambda: {"stable": True})
+    digest, returned = cli._validated_linked_v3_receipt(
+        linked, dev_storage=root, database=database,
+        database_identity=current, source_identity={"commit": "b" * 40},
+        durable_start_phase=cli._DURABLE_START_LEGACY_ADOPTION,
+    )
+    assert (digest, returned) == ("sha256:" + "1" * 64, receipt)
+    assert historical == [(root, {"completed_generation_axis": {
+        "source_identity": {"commit": "b" * 40}, "receipt": completed_receipt,
+    }})]
+    assert sequence == ["completed", "historical"]
+    assert len(calls) == 1
+    assert "completed_generation_ref" not in calls[0][1]
+
+
+def _historical_adoption_axis_case(tmp_path, monkeypatch):
+    import agent.cli as cli
+
+    root = tmp_path / "dev"
+    source_root = tmp_path / "source"
+    root.mkdir(); source_root.mkdir()
+    adoption_path = (root / "archive" / "canonical-legacy-postimage-adoption"
+                     / ("adoption." + "3" * 64 + ".json"))
+    linked_path = root / "archive" / "schema-admission" / ("4" * 64 + ".json")
+    adoption_sha = "sha256:" + "3" * 64
+    linked_sha = "sha256:" + "4" * 64
+    anchor = {
+        "branch": cli.AC_DEV_BRANCH, "commit": "a" * 40, "dirty": "",
+        "root": str(source_root), "source_sha256": "sha256:" + "5" * 64,
+        "tree": "6" * 40,
+    }
+    current = {
+        "branch": cli.AC_DEV_BRANCH, "commit": "b" * 40, "dirty": "",
+        "root": str(source_root), "source_sha256": "sha256:" + "7" * 64,
+        "tree": "8" * 40,
+    }
+    adoption = {
+        "schema_version": cli._AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION,
+        "stage": "completed", "project_id": "aming-claw", "port": 40008,
+        "root_identity": cli._admission_identity(root),
+        "database_identity": {
+            "path": str(root / "governance" / "aming-claw" / "governance.db"),
+        },
+        "linked_v3_receipt": str(linked_path),
+        "linked_v3_receipt_sha256": linked_sha,
+        "candidate_source_identity": anchor,
+        "database_sha256_preimage": "sha256:" + "9" * 64,
+    }
+    completed_receipt = {
+        "history": {
+            "adoption": {"path": str(adoption_path), "sha256": adoption_sha},
+        },
+    }
+    monkeypatch.setattr(cli, "_canonical_adoption_receipts", lambda _root: [adoption_path])
+    monkeypatch.setattr(
+        cli, "_read_canonical_adoption_receipt",
+        lambda _path: (adoption, adoption_sha),
+    )
+    monkeypatch.setattr(
+        cli, "_read_admission_receipt",
+        lambda *_args, **_kwargs: (
+            {"database_sha256_after": adoption["database_sha256_preimage"]}, linked_sha,
+        ),
+    )
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: current)
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda *_args, **_kwargs: types.SimpleNamespace(returncode=0),
+    )
+    return cli, root, adoption, adoption_sha, adoption_path, anchor, current, completed_receipt
+
+
+def test_historical_adoption_accepts_validated_descendant_completed_cow_axis(
+    tmp_path, monkeypatch,
+):
+    cli, root, adoption, adoption_sha, adoption_path, _anchor, current, receipt = (
+        _historical_adoption_axis_case(tmp_path, monkeypatch)
+    )
+    assert cli._historical_dashboard_bootstrap_adoption(
+        root,
+        completed_generation_axis={"source_identity": current, "receipt": receipt},
+    ) == (adoption, adoption_sha, adoption_path)
+
+
+@pytest.mark.parametrize("mismatch", ("source", "receipt", "non_descendant"))
+def test_historical_adoption_completed_cow_axis_mismatch_fails_closed(
+    tmp_path, monkeypatch, mismatch,
+):
+    cli, root, _adoption, _sha, _path, _anchor, current, receipt = (
+        _historical_adoption_axis_case(tmp_path, monkeypatch)
+    )
+    axis_source = dict(current)
+    axis_receipt = json.loads(json.dumps(receipt))
+    if mismatch == "source":
+        axis_source["commit"] = "c" * 40
+    elif mismatch == "receipt":
+        axis_receipt["history"]["adoption"]["sha256"] = "sha256:" + "d" * 64
+    else:
+        monkeypatch.setattr(
+            cli.subprocess, "run",
+            lambda *_args, **_kwargs: types.SimpleNamespace(returncode=1),
+        )
+    with pytest.raises(cli.click.ClickException, match="completed source axis mismatch"):
+        cli._historical_dashboard_bootstrap_adoption(
+            root,
+            completed_generation_axis={
+                "source_identity": axis_source, "receipt": axis_receipt,
+            },
+        )
+
+
+def test_historical_adoption_first_generation_remains_exact_source_bound(
+    tmp_path, monkeypatch,
+):
+    cli, root, adoption, adoption_sha, adoption_path, anchor, _current, _receipt = (
+        _historical_adoption_axis_case(tmp_path, monkeypatch)
+    )
+    with pytest.raises(cli.click.ClickException, match="historical adoption mismatch"):
+        cli._historical_dashboard_bootstrap_adoption(root)
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: anchor)
+    assert cli._historical_dashboard_bootstrap_adoption(root) == (
+        adoption, adoption_sha, adoption_path,
+    )
+
+
+@pytest.mark.parametrize("phase", ("first", "completed", "selector"))
+def test_linked_v3_cow_phase_errors_are_bounded_without_fallback(
+    tmp_path, monkeypatch, phase,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"; database = root / "governance.db"
+    database.parent.mkdir(); database.write_bytes(b"generation")
+    linked = root / "linked.json"; linked.write_bytes(b"linked")
+    current = cli._admission_identity(database)
+    receipt = {
+        "database_identity": {**current, "inode": current["inode"] + 1},
+        "source_identity": {"cli_source": {"commit": "a" * 40}},
+    }
+    monkeypatch.setattr(
+        cli, "_read_admission_receipt",
+        lambda *_args, **_kwargs: (receipt, "sha256:" + "1" * 64),
+    )
+    monkeypatch.setattr(
+        cli, "_validated_historical_admission_source_identity", lambda value: value,
+    )
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: {"stable": True})
+    calls = []
+    if phase == "selector":
+        monkeypatch.setattr(
+            db, "_select_dev_cow_generation_phase",
+            lambda *_a, **_k: (_ for _ in ()).throw(ValueError("selector marker")),
+        )
+    else:
+        selected = (
+            db._DevCowGenerationPhase.FIRST_ISSUANCE
+            if phase == "first"
+            else db._DevCowGenerationPhase.COMPLETED_GENERATION
+        )
+        monkeypatch.setattr(
+            db, "_select_dev_cow_generation_phase", lambda *_a, **_k: selected,
+        )
+    monkeypatch.setattr(cli, "_require_first_cow_runtime_pristine", lambda _root: None)
+    monkeypatch.setattr(
+        cli, "_historical_dashboard_bootstrap_adoption", lambda _root, **_kwargs: None,
+    )
+
+    def reject(name):
+        calls.append(name)
+        raise ValueError(name + " validator marker")
+
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_preimage",
+        lambda *_a, **_k: reject("first"),
+    )
+    monkeypatch.setattr(
+        db, "validate_dev_cow_completed_generation_projection",
+        lambda *_a, **_k: reject("completed"),
+    )
+    marker = "selector" if phase == "selector" else phase + " validator"
+    with pytest.raises(cli.click.ClickException, match=marker):
+        cli._validated_linked_v3_receipt(
+            linked, dev_storage=root, database=database,
+            database_identity=current, source_identity={"commit": "b" * 40},
+        )
+    assert calls == ([] if phase == "selector" else [phase])
+
+
+@pytest.mark.parametrize("artifact", ("file", "symlink", "directory"))
+def test_first_cow_runtime_rejects_every_existing_artifact(tmp_path, artifact):
+    import agent.cli as cli
+
+    dev = tmp_path / "dev"; runtime = dev / "runtime" / "durable-launch"
+    runtime.mkdir(parents=True)
+    target = runtime / "current"
+    if artifact == "file":
+        target.write_text("forged", encoding="utf-8")
+    elif artifact == "directory":
+        target.mkdir()
+    else:
+        foreign = tmp_path / "foreign"; foreign.write_text("forged", encoding="utf-8")
+        target.symlink_to(foreign)
+    with pytest.raises(cli.click.ClickException, match="must be pristine"):
+        cli._require_first_cow_runtime_pristine(dev)
+    assert not hasattr(cli, "_completed_durable_generation_ref")
 
 
 @pytest.mark.parametrize(
@@ -3465,6 +3894,7 @@ class TestACDevRuntimeCli:
         dev_storage_root = tmp_path / "dev-world"
         calls = []
         legacy_start = types.ModuleType("start_governance")
+        legacy_start.__file__ = "<test-start-governance>"
 
         def reject_legacy_start(_name):
             pytest.fail("dev startup must not import the legacy backfill wrapper")
@@ -3533,7 +3963,6 @@ class TestACDevRuntimeCli:
         assert os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] == cli.AC_STABLE_ANCHOR_COMMIT
         assert os.environ["AMING_CLAW_ALLOWED_PROJECT_IDS"] == "aming-claw"
         assert os.environ["AMING_CLAW_DB_MIGRATION_POLICY"] == "verify-only"
-        assert os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "dev-world-only"
         assert os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] == "deny"
         assert os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] == str(
             dev_storage_root.resolve()
@@ -3545,7 +3974,6 @@ class TestACDevRuntimeCli:
             "AMING_CLAW_STABLE_ANCHOR_COMMIT",
             "AMING_CLAW_ALLOWED_PROJECT_IDS",
             "AMING_CLAW_DB_MIGRATION_POLICY",
-            "AMING_CLAW_ACTIVE_GRAPH_MUTATION",
             "AMING_CLAW_STABLE_DEPLOYMENT",
             "SHARED_VOLUME_PATH",
             "AMING_CLAW_HOME",
@@ -3854,3 +4282,1729 @@ def test_v27_dev_startup_does_not_use_cutover_marker_as_authority():
     assert "_require_dev_cutover_activation(" not in start_source
     assert "validate_dev_world_cutover_activation(" not in startup_source
     assert "AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH" not in start_source
+
+
+def test_durable_start_never_uses_generic_occupied_health_fastpath():
+    import inspect
+
+    import agent.cli as cli
+
+    startup_source = inspect.getsource(cli.start.callback)
+    assert "not durable_launch and health" in startup_source
+    assert "not durable_launch and _port_is_open(port)" in startup_source
+    assert startup_source.index("not durable_launch and health") < startup_source.index(
+        "_durable_dev_launch("
+    )
+
+
+def test_durable_recovery_requires_old_child_absent_and_port_free_before_spawn():
+    import inspect
+
+    import agent.cli as cli
+
+    launch_source = inspect.getsource(cli._durable_dev_launch)
+    live_hold = '"AC dev durable recovery child is still live"'
+    port_hold = '"AC dev durable recovery requires free port 40008"'
+    spawn = "_posix_detached_popen("
+    assert live_hold in launch_source and port_hold in launch_source
+    assert launch_source.index(live_hold) < launch_source.index(spawn)
+    assert launch_source.index(port_hold) < launch_source.index(spawn)
+    assert '"AC dev durable multiple live generations"' in launch_source
+    assert '"AC dev durable live child remained unbound"' in launch_source
+    assert '"AC dev durable unknown listener owns port 40008"' in launch_source
+    assert '"AC dev durable completed generation is unclassifiable"' in launch_source
+    assert '"AC dev durable multiple dead unsealed generations"' in launch_source
+    seal = '"stage": "completed_child_absent"'
+    assert seal in launch_source
+    assert launch_source.index(seal) < launch_source.index(spawn)
+    assert "_durable_exit_binding(value, digest)" in launch_source
+
+
+def test_exact_custody_rebaseline_ignores_draft_then_prepares_and_consumes(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"; runtime = root / "runtime" / "durable-launch"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True); runtime.mkdir(parents=True)
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT);"
+        "CREATE TABLE evidence(id TEXT PRIMARY KEY,payload TEXT);"
+        "INSERT INTO evidence VALUES('one','unchanged');")
+    connection.commit(); connection.close()
+    launch_id = "a" * 24
+    source = {"root": str(tmp_path / "source"), "branch": cli.AC_DEV_BRANCH,
+              "commit": "b" * 40, "tree": "c" * 40,
+              "source_sha256": "sha256:" + "d" * 64, "dirty": ""}
+    Path(source["root"]).mkdir()
+    linked = root / "archive" / "schema-admission" / "linked.json"
+    linked.parent.mkdir(parents=True); linked.write_text("{}", encoding="utf-8")
+    lock = runtime / "launch.lock"
+    lock_value = {"schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION,
+                  "stage": "locked", "launch_id": launch_id}
+    cli._posix_exclusive_json(lock, lock_value)
+    pending_value = {
+        "schema_version": "ac_dev_durable_pending.v1", "stage": "pending",
+        "launch_id": launch_id, "source_identity": source,
+        "dev_storage_root": str(root), "database_path": str(database),
+        "linked_v3_receipt": str(linked),
+    }
+    pending, pending_sha = cli._durable_content_receipt(runtime, "pending", pending_value)
+    cli._posix_exclusive_json(runtime / f"launch-{launch_id}.failed.json", {
+        "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "failed",
+        "launch_id": launch_id, "pid": 987654,
+    })
+    cli._durable_content_receipt(runtime, "abnormal", {
+        "schema_version": "ac_dev_durable_abnormal_seal.v1",
+        "stage": "preimage_retryable", "pending_sha256": "sha256:" + "e" * 64,
+        "readiness_sha256": "", "database_sha256": "sha256:" + "f" * 64,
+    })
+    drafts = root / "archive" / "preimplementation-drafts" / "draft"
+    cli._durable_content_receipt(drafts, "durable-custody-rebaseline", {"draft": True})
+    stable_identity = {"device": 9, "inode": 10}
+    stable_health = {"pid": 111, "runtime_loaded_version": "1" * 40,
+                     "runtime_stale": False, "runtime_plane": "stable", "port": 40000}
+    monkeypatch.setattr(cli, "_dev_source_identity_precheck", lambda: source)
+    monkeypatch.setattr(cli, "_validated_linked_v3_receipt", lambda *_a, **_k: (
+        "sha256:" + "1" * 64, {}))
+    monkeypatch.setattr(cli, "_probe_governance", lambda _port: stable_health)
+    monkeypatch.setattr(cli, "_durable_listener_pid", lambda _port: 0)
+    monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: (_ for _ in ()).throw(
+        cli.click.ClickException("absent")))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_a, **_k: types.SimpleNamespace(
+        returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(db, "_assert_no_external_sqlite_holders", lambda _path: None)
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda **_k: {
+        "stable_head": stable_health["runtime_loaded_version"],
+        "stable_database_identity": stable_identity,
+    })
+    stat_before = database.stat(); digest_before = cli._file_sha256(database)
+    with pytest.raises(cli.click.ClickException, match="missing or ambiguous"):
+        cli._consume_exact_custody_rebaseline(
+            dev_storage=root, database=database, source_identity=source,
+            lock=lock, lock_value=lock_value, pending_path=pending,
+            pending_value=pending_value, pending_digest=pending_sha)
+    prepared = cli._prepare_exact_custody_rebaseline(
+        root, expected_sha256=digest_before, expected_device=stat_before.st_dev,
+        expected_inode=stat_before.st_ino)
+    replay = cli._prepare_exact_custody_rebaseline(
+        root, expected_sha256=digest_before, expected_device=stat_before.st_dev,
+        expected_inode=stat_before.st_ino)
+    assert prepared["status"] == "prepared" and replay["status"] == "already_prepared"
+    assert prepared["receipt_sha256"] == cli._consume_exact_custody_rebaseline(
+        dev_storage=root, database=database, source_identity=source,
+        lock=lock, lock_value=lock_value, pending_path=pending,
+        pending_value=pending_value, pending_digest=pending_sha)
+    assert cli._file_sha256(database) == digest_before
+    assert (database.stat().st_dev, database.stat().st_ino) == (
+        stat_before.st_dev, stat_before.st_ino)
+    assert Path(prepared["backup"]).stat().st_mode & 0o777 == 0o400
+
+
+def _pre_readiness_projection_fixture(cli, tmp_path):
+    from agent.governance import db
+
+    source = {
+        "root": str(tmp_path / "source"), "branch": cli.AC_DEV_BRANCH,
+        "commit": "c" * 40, "tree": "d" * 40,
+        "source_sha256": "sha256:" + "e" * 64, "dirty": "",
+    }
+    prior_tip = {
+        "root": source["root"], "branch": cli.AC_DEV_BRANCH,
+        "commit": "a" * 40, "source_sha256": "sha256:" + "b" * 64,
+    }
+    after_tip = {key: source[key] for key in db._DEV_SOURCE_TIP_KEYS}
+    policy = dict(db._DEV_DURABLE_POLICY)
+    prior_process = {
+        "argv": ["prior"], "cwd": source["root"], "source_root": source["root"],
+        "source_commit": prior_tip["commit"], "source_tree": "1" * 40,
+        "dev_storage_root": str(tmp_path / "dev"), "project_id": "aming-claw",
+        "port": 40008, "policy": policy, "launch_id": "1" * 24,
+        "pid": 111, "start_identity": "sha256:" + "2" * 64,
+    }
+    after_process = {
+        "argv": ["current"], "cwd": source["root"], "source_root": source["root"],
+        "source_commit": source["commit"], "source_tree": source["tree"],
+        "dev_storage_root": str(tmp_path / "dev"), "project_id": "aming-claw",
+        "port": 40008, "policy": policy,
+        "launch_id": cli._PRE_READINESS_CUSTODY_POSTIMAGE["launch_id"],
+        "pid": 222, "start_identity": "sha256:" + "3" * 64,
+    }
+    unchanged = {"schema_version": "47", "governance_world_id": "ac-dev"}
+    before_meta = {
+        **unchanged,
+        "governance_world_current_process_json": json.dumps(
+            prior_process, sort_keys=True, separators=(",", ":")
+        ),
+        "governance_world_source_tip_json": json.dumps(
+            prior_tip, sort_keys=True, separators=(",", ":")
+        ),
+        "governance_world_source_tip_revision": "22",
+        "governance_world_source_tip_sha256": db._world_source_tip_hash(prior_tip),
+    }
+    after_meta = {
+        **unchanged,
+        "governance_world_current_process_json": json.dumps(
+            after_process, sort_keys=True, separators=(",", ":")
+        ),
+        "governance_world_source_tip_json": json.dumps(
+            after_tip, sort_keys=True, separators=(",", ":")
+        ),
+        "governance_world_source_tip_revision": "23",
+        "governance_world_source_tip_sha256": db._world_source_tip_hash(after_tip),
+    }
+    counts = {f"table_{number}": number for number in range(84)}
+    logical = {"schema_meta": "sha256:" + "4" * 64,
+               "evidence": "sha256:" + "5" * 64}
+    common = {
+        "quick_check": "ok", "integrity_check": "ok",
+        "sqlite_master_count": 314,
+        "sqlite_master_sha256": cli._PRE_READINESS_CUSTODY_POSTIMAGE[
+            "sqlite_master_sha256"
+        ],
+        "table_row_counts": counts, "table_logical_digests": logical,
+    }
+    baseline = {**common, "schema_meta": before_meta}
+    current = {**common, "schema_meta": after_meta,
+               "table_row_counts": dict(counts),
+               "table_logical_digests": {**logical, "schema_meta": "sha256:" + "6" * 64}}
+    pending = {"source_identity": source}
+    failed = {"pid": 222}
+    return baseline, current, pending, failed, source
+
+
+def test_pre_readiness_custody_delta_accepts_only_four_key_transition(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    baseline, current, pending, failed, source = _pre_readiness_projection_fixture(
+        cli, tmp_path
+    )
+    monkeypatch.setattr(db, "_validate_dev_source_tip_custody", lambda *_a, **_k: None)
+    monkeypatch.setattr(db, "_validate_dev_current_process_custody", lambda *_a, **_k: None)
+    result = cli._validate_pre_readiness_custody_delta(
+        baseline=baseline, current=current, pending=pending, failed=failed,
+        source_identity=source, dev_storage=tmp_path / "dev",
+    )
+    assert result["baseline_revision"] == 22
+    assert result["postimage_revision"] == 23
+    assert set(result["custody_delta"]) == set(db._FIRST_COW_CUSTODY_KEYS)
+
+
+@pytest.mark.parametrize(
+    "drift", [
+        "extra_meta", "table_count", "row_count", "logical", "pid", "port",
+        "policy", "revision", "source_hash", "ancestry",
+    ],
+)
+def test_pre_readiness_custody_delta_rejects_one_drift_per_invariant(
+    tmp_path, monkeypatch, drift,
+):
+    import agent.cli as cli
+    from agent.governance import db
+
+    baseline, current, pending, failed, source = _pre_readiness_projection_fixture(
+        cli, tmp_path
+    )
+    monkeypatch.setattr(db, "_validate_dev_source_tip_custody", lambda *_a, **_k: None)
+    monkeypatch.setattr(db, "_validate_dev_current_process_custody", lambda *_a, **_k: None)
+    if drift == "extra_meta":
+        current["schema_meta"]["unexpected"] = "drift"
+    elif drift == "table_count":
+        current["table_row_counts"].pop("table_83")
+    elif drift == "row_count":
+        current["table_row_counts"]["table_0"] = 999
+    elif drift == "logical":
+        current["table_logical_digests"]["evidence"] = "sha256:" + "7" * 64
+    else:
+        process = json.loads(current["schema_meta"]["governance_world_current_process_json"])
+        if drift == "pid":
+            process["pid"] = 333
+        elif drift == "port":
+            process["port"] = 40000
+        elif drift == "policy":
+            process["policy"]["migration"] = "write"
+        elif drift == "revision":
+            current["schema_meta"]["governance_world_source_tip_revision"] = "24"
+        elif drift == "source_hash":
+            current["schema_meta"]["governance_world_source_tip_sha256"] = "sha256:" + "8" * 64
+        elif drift == "ancestry":
+            monkeypatch.setattr(
+                db, "_validate_dev_source_tip_custody",
+                lambda *_a, **_k: (_ for _ in ()).throw(ValueError("ancestry drift")),
+            )
+        current["schema_meta"]["governance_world_current_process_json"] = json.dumps(
+            process, sort_keys=True, separators=(",", ":")
+        )
+    with pytest.raises(cli.click.ClickException):
+        cli._validate_pre_readiness_custody_delta(
+            baseline=baseline, current=current, pending=pending, failed=failed,
+            source_identity=source, dev_storage=tmp_path / "dev",
+        )
+
+
+def test_durable_readiness_timeout_is_named_bounded_and_shared():
+    import inspect
+    import agent.cli as cli
+
+    launch = inspect.getsource(cli._durable_dev_launch)
+    start = inspect.getsource(cli.start.callback)
+    assert cli._AC_DEV_DURABLE_READINESS_TIMEOUT_SEC == 45.0
+    assert "parent_sock.settimeout(_AC_DEV_DURABLE_READINESS_TIMEOUT_SEC)" in launch
+    assert "time.monotonic() + _AC_DEV_DURABLE_READINESS_TIMEOUT_SEC" in launch
+    assert "control.settimeout(_AC_DEV_DURABLE_READINESS_TIMEOUT_SEC)" in start
+
+
+def test_readiness_timeout_terms_exact_child_and_seals_recoverable_failure(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+
+    class Child:
+        pid = 424242
+        def poll(self):
+            return None
+
+    signals = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    launch_id = "a" * 24
+    failure = cli._record_failed_durable_launch(
+        child=Child(), runtime=tmp_path, launch_id=launch_id,
+        error=cli.socket.timeout("readiness"),
+    )
+    payload = json.loads(failure.read_text(encoding="utf-8"))
+    assert signals == [(Child.pid, cli.signal.SIGTERM)]
+    assert payload == {
+        "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION,
+        "stage": "failed", "launch_id": launch_id, "pid": Child.pid,
+        "failure_class": "readiness_timeout", "recoverable": True,
+        "term_signal_sent": True, "kill_signal_sent": False,
+    }
+
+
+def test_pre_readiness_consumer_binds_paths_inodes_port_and_ancestry():
+    import inspect
+    import agent.cli as cli
+
+    source = inspect.getsource(cli._consume_pre_readiness_custody_only_postimage)
+    for required in (
+        "receipt_database.get(\"device\")", "receipt_database.get(\"inode\")",
+        "baseline_path.parent", "pending_value.get(\"database_identity\")",
+        "_durable_listener_pid(AC_DEV_SERVICE_PORT)",
+        '"git", "merge-base", "--is-ancestor"',
+        "_pre_readiness_sqlite_snapshot(database)",
+    ):
+        assert required in source
+
+
+def _historical_durable_source_fixture(cli, tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    (root / "agent" / "governance").mkdir(parents=True)
+    cli_path = root / "agent" / "cli.py"
+    server_path = root / "agent" / "governance" / "server.py"
+    cli_path.write_text("historical cli\n", encoding="utf-8")
+    server_path.write_text("historical server\n", encoding="utf-8")
+
+    def git(*args):
+        result = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-b", cli.AC_DEV_BRANCH)
+    git("config", "user.email", "tests@example.invalid")
+    git("config", "user.name", "AC Tests")
+    git("add", ".")
+    git("commit", "-m", "historical")
+    historical_commit = git("rev-parse", "HEAD")
+    historical_tree = git("rev-parse", "HEAD^{tree}")
+    historical_cli_sha = "sha256:" + hashlib.sha256(cli_path.read_bytes()).hexdigest()
+    historical_server_sha = "sha256:" + hashlib.sha256(server_path.read_bytes()).hexdigest()
+    cli_path.write_text("historical cli\ncurrent descendant\n", encoding="utf-8")
+    git("add", "agent/cli.py")
+    git("commit", "-m", "current")
+    current_commit = git("rev-parse", "HEAD")
+    current = {
+        "root": str(root), "branch": cli.AC_DEV_BRANCH,
+        "commit": current_commit, "tree": git("rev-parse", "HEAD^{tree}"),
+        "source_sha256": "sha256:" + hashlib.sha256(cli_path.read_bytes()).hexdigest(),
+        "dirty": "",
+    }
+    completed = {
+        "source_root": str(root), "source_commit": historical_commit,
+        "source_tree": historical_tree, "server_sha256": historical_server_sha,
+    }
+    pending = {"source_identity": {
+        "root": str(root), "branch": cli.AC_DEV_BRANCH,
+        "commit": historical_commit, "tree": historical_tree,
+        "source_sha256": historical_cli_sha, "dirty": "",
+    }}
+    sibling = git("commit-tree", historical_tree, "-m", "non-descendant")
+    monkeypatch.setattr(cli, "__file__", str(cli_path))
+    return current, completed, pending, sibling
+
+
+def test_historical_durable_source_accepts_receipt_bound_ancestor(
+    tmp_path, monkeypatch,
+):
+    import agent.cli as cli
+
+    current, completed, pending, _sibling = _historical_durable_source_fixture(
+        cli, tmp_path, monkeypatch,
+    )
+    assert cli._historical_durable_source_chain_is_valid(
+        current=current, completed=completed, pending=pending,
+    )
+
+
+@pytest.mark.parametrize(
+    "drift", [
+        "missing_object", "tree", "server", "pending_tuple", "pending_cli",
+        "non_descendant", "current_dirty", "current_branch", "current_head",
+    ],
+)
+def test_historical_durable_source_rejects_each_core_invariant(
+    tmp_path, monkeypatch, drift,
+):
+    import agent.cli as cli
+
+    current, completed, pending, sibling = _historical_durable_source_fixture(
+        cli, tmp_path, monkeypatch,
+    )
+    if drift == "missing_object":
+        completed["source_commit"] = pending["source_identity"]["commit"] = "0" * 40
+    elif drift == "tree":
+        completed["source_tree"] = pending["source_identity"]["tree"] = "0" * 40
+    elif drift == "server":
+        completed["server_sha256"] = "sha256:" + "0" * 64
+    elif drift == "pending_tuple":
+        pending["source_identity"]["root"] = str(tmp_path / "foreign")
+    elif drift == "pending_cli":
+        pending["source_identity"]["source_sha256"] = "sha256:" + "0" * 64
+    elif drift == "non_descendant":
+        completed["source_commit"] = pending["source_identity"]["commit"] = sibling
+    elif drift == "current_dirty":
+        current["dirty"] = "agent/cli.py"
+    elif drift == "current_branch":
+        current["branch"] = "codex/foreign"
+    elif drift == "current_head":
+        current["commit"] = pending["source_identity"]["commit"]
+    assert not cli._historical_durable_source_chain_is_valid(
+        current=current, completed=completed, pending=pending,
+    )
+
+
+def test_dev_admit_schema_rejects_wrong_plane_before_database_write(tmp_path):
+    root = tmp_path / "external-dev-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    import sqlite3
+
+    conn = sqlite3.connect(database)
+    conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE backlog_bugs (bug_id TEXT, updated_at TEXT, created_at TEXT)")
+    conn.executemany(
+        "INSERT INTO schema_meta VALUES (?, ?)",
+        [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")],
+    )
+    conn.commit()
+    conn.close()
+    (root / "launch-receipt.json").write_text(
+        json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}),
+        encoding="utf-8",
+    )
+    before = database.read_bytes()
+    result = CliRunner().invoke(
+        main,
+        ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "wrong", "--port", "40008"],
+    )
+    assert result.exit_code != 0
+    assert database.read_bytes() == before
+
+
+def test_dev_admit_schema_repairs_exact_missing_set_offline(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-dev-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    import sqlite3
+
+    conn = sqlite3.connect(database)
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")])
+    conn.commit()
+    conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    result = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008"])
+    assert result.exit_code == 0, result.output
+    output = json.loads(result.output)
+    assert output["status"] == "admitted"
+    assert Path(output["receipt_path"]).is_file()
+    receipt_path = Path(output["receipt_path"])
+    assert output["receipt_sha256"] == "sha256:" + hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    conn = sqlite3.connect(database)
+    try:
+        assert conn.execute("SELECT generation FROM dashboard_backlog_cache_generation WHERE resource='backlog'").fetchone()[0] >= 1
+    finally:
+        conn.close()
+    resumed = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(receipt_path)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "already_admitted"
+
+
+def test_dev_admit_authority_schema_offline_receipt_and_resume(tmp_path, monkeypatch):
+    """The new CLI path uses the same quarantine/backup receipt choreography."""
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-authority-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"),
+        ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ])
+    conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(
+        json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}),
+        encoding="utf-8",
+    )
+    command = ["dev-admit-authority-schema", "--dev-storage-root", str(root),
+               "--project-id", "aming-claw", "--port", "40008"]
+    first = CliRunner().invoke(main, command)
+    assert first.exit_code == 0, first.output
+    output = json.loads(first.output)
+    receipt = Path(output["receipt_path"])
+    assert output["status"] == "admitted" and receipt.is_file()
+    receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+    durable_hash = "sha256:" + hashlib.sha256(database.read_bytes()).hexdigest()
+    assert receipt_payload["changed"] is True
+    assert receipt_payload["database_sha256_after"] == durable_hash == output["post_sha256"]
+    conn = sqlite3.connect(database)
+    try:
+        assert db.authority_projection_schema_drift(conn) == {"missing": [], "invalid": []}
+    finally:
+        conn.close()
+    resumed = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "already_admitted"
+
+
+def test_dev_admit_authority_schema_existing_byte_recertification_is_read_only_and_stale_resume_fails(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: {
+        "root": "/source/ac-dev", "branch": "codex/ac-dev", "commit": "a" * 40,
+        "tree": "b" * 40, "source_sha256": "sha256:" + "c" * 64, "dirty": "",
+    })
+    root = tmp_path / "external-authority-recertify"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"),
+        ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ])
+    conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    command = ["dev-admit-authority-schema", "--dev-storage-root", str(root),
+               "--project-id", "aming-claw", "--port", "40008"]
+    admitted = CliRunner().invoke(main, command)
+    assert admitted.exit_code == 0, admitted.output
+    stale_receipt = Path(json.loads(admitted.output)["receipt_path"])
+
+    generic = CliRunner().invoke(main, command + ["--recertify-existing-bytes"])
+    assert generic.exit_code != 0 and "requires an argument" in generic.output
+    same_hash_bytes = database.read_bytes()
+    same_hash = CliRunner().invoke(
+        main, command + ["--recertify-existing-bytes", str(stale_receipt)]
+    )
+    assert same_hash.exit_code != 0
+    assert "requires a stale completed receipt" in same_hash.output
+    assert database.read_bytes() == same_hash_bytes
+
+    changed = sqlite3.connect(database)
+    changed.execute("PRAGMA user_version=313")
+    changed.commit(); changed.close()
+    current_bytes = database.read_bytes()
+    rejected = CliRunner().invoke(main, command + ["--resume-receipt", str(stale_receipt)])
+    assert rejected.exit_code != 0
+    assert "completed receipt does not match current database" in rejected.output
+    assert database.read_bytes() == current_bytes
+    conflicting = CliRunner().invoke(main, command + [
+        "--resume-receipt", str(stale_receipt),
+        "--recertify-existing-bytes", str(stale_receipt),
+    ])
+    assert conflicting.exit_code != 0
+    assert "no resume receipt" in conflicting.output
+    assert database.read_bytes() == current_bytes
+    # The source-owned repair necessarily runs from a successor CLI commit;
+    # historical source identity remains immutable predecessor evidence.
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: {
+        "root": "/source/ac-dev", "branch": "codex/ac-dev", "commit": "d" * 40,
+        "tree": "e" * 40, "source_sha256": "sha256:" + "f" * 64, "dirty": "",
+    })
+
+    old_receipt_bytes = stale_receipt.read_bytes()
+    old_sidecar = stale_receipt.with_suffix(".sha256")
+    old_sidecar_bytes = old_sidecar.read_bytes()
+    recertified = CliRunner().invoke(
+        main, command + ["--recertify-existing-bytes", str(stale_receipt)]
+    )
+    assert recertified.exit_code == 0, recertified.output
+    output = json.loads(recertified.output)
+    assert output["status"] == "recertified_existing_bytes"
+    assert output["changed"] is False and output["missing"] == []
+    assert database.read_bytes() == current_bytes
+    receipt = Path(output["receipt_path"])
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["previous_receipt_sha256"] == "sha256:" + hashlib.sha256(old_receipt_bytes).hexdigest()
+    assert payload["database_sha256_before"] == payload["database_sha256_after"]
+    assert payload["database_sha256_after"] == "sha256:" + hashlib.sha256(current_bytes).hexdigest()
+    assert stale_receipt.read_bytes() == old_receipt_bytes
+    assert old_sidecar.read_bytes() == old_sidecar_bytes
+    resumed = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "already_admitted"
+
+
+@pytest.mark.parametrize(
+    "mismatch", [
+        "rolled_back", "project", "port", "root", "database", "source", "plan",
+        "inventory_count", "inventory_hash", "backup", "chain", "content_hash",
+        "sidecar", "symlink", "wrong_path",
+    ],
+)
+def test_dev_admit_authority_schema_recertification_rejects_foreign_predecessor_before_target_sqlite_open(tmp_path, monkeypatch, mismatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: {
+        "root": "/source/ac-dev", "branch": "codex/ac-dev", "commit": "a" * 40,
+        "tree": "b" * 40, "source_sha256": "sha256:" + "c" * 64, "dirty": "",
+    })
+    root = tmp_path / "external-authority-noncompleted"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database); conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ]); conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    command = ["dev-admit-authority-schema", "--dev-storage-root", str(root),
+               "--project-id", "aming-claw", "--port", "40008"]
+    admitted = CliRunner().invoke(main, command)
+    assert admitted.exit_code == 0, admitted.output
+    completed = Path(json.loads(admitted.output)["receipt_path"])
+    archive = completed.parent
+    payload = json.loads(completed.read_text(encoding="utf-8"))
+    forged = completed
+    if mismatch == "rolled_back":
+        payload["stage"] = "rolled_back"
+    elif mismatch == "project":
+        payload["project_id"] = "foreign"
+    elif mismatch == "port":
+        payload["port"] = 40009
+    elif mismatch == "root":
+        payload["root_identity"] = {**payload["root_identity"], "inode": -1}
+    elif mismatch == "database":
+        payload["database_identity"] = {**payload["database_identity"], "inode": -1}
+    elif mismatch == "source":
+        payload["source_identity"] = {**payload["source_identity"], "cli_source_sha256": "sha256:" + "0" * 64}
+    elif mismatch == "plan":
+        payload["plan_sha256"] = "sha256:" + "0" * 64
+    elif mismatch == "inventory_count":
+        payload["schema_inventory_after"] = {
+            **payload["schema_inventory_after"],
+            "inventory": payload["schema_inventory_after"]["inventory"][:-1],
+        }
+    elif mismatch == "inventory_hash":
+        payload["schema_inventory_after"] = {
+            **payload["schema_inventory_after"], "sha256": "sha256:" + "0" * 64,
+        }
+    elif mismatch == "backup":
+        payload["backup"] = {**payload["backup"], "sha256": "sha256:" + "0" * 64}
+    elif mismatch == "chain":
+        payload["previous_receipt_sha256"] = "sha256:" + "0" * 64
+    elif mismatch == "content_hash":
+        completed.write_bytes(completed.read_bytes() + b"\n")
+    elif mismatch == "sidecar":
+        completed.with_suffix(".sha256").write_text("foreign\n", encoding="utf-8")
+    elif mismatch == "symlink":
+        forged = archive / ("0" * 64 + ".json")
+        forged.symlink_to(completed)
+    elif mismatch == "wrong_path":
+        forged = tmp_path / completed.name
+        cli.shutil.copy2(completed, forged)
+    if mismatch not in {"content_hash", "sidecar", "symlink", "wrong_path"}:
+        forged, _digest = cli._write_admission_receipt(archive, payload)
+    opened = []
+    writer_calls = []
+    original_connect = cli.sqlite3.connect
+    def tracked_connect(target, *args, **kwargs):
+        opened.append(str(target))
+        return original_connect(target, *args, **kwargs)
+    monkeypatch.setattr(cli.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(cli, "_write_admission_receipt", lambda *_args, **_kwargs: writer_calls.append("receipt"))
+    monkeypatch.setattr(cli.shutil, "copy2", lambda *_args, **_kwargs: writer_calls.append("copy"))
+    monkeypatch.setattr(cli.os, "replace", lambda *_args, **_kwargs: writer_calls.append("replace"))
+    monkeypatch.setattr(cli.Path, "mkdir", lambda *_args, **_kwargs: writer_calls.append("mkdir"))
+    before = database.read_bytes()
+    rejected = CliRunner().invoke(
+        main, command + ["--recertify-existing-bytes", str(forged)]
+    )
+    assert rejected.exit_code != 0
+    assert database.read_bytes() == before
+    assert opened == []
+    assert writer_calls == []
+
+
+@pytest.mark.parametrize("path_class", ["missing", "nonregular"])
+def test_dev_admit_authority_schema_recertification_path_rejection_has_zero_connect_or_writer(tmp_path, monkeypatch, path_class):
+    import agent.cli as cli
+
+    root = tmp_path / "root"; root.mkdir()
+    predecessor = tmp_path / "missing.json"
+    if path_class == "nonregular":
+        predecessor.mkdir()
+    connect_calls = []
+    writer_calls = []
+    monkeypatch.setattr(cli.sqlite3, "connect", lambda *_args, **_kwargs: connect_calls.append("connect"))
+    monkeypatch.setattr(cli, "_write_admission_receipt", lambda *_args, **_kwargs: writer_calls.append("receipt"))
+    monkeypatch.setattr(cli.shutil, "copy2", lambda *_args, **_kwargs: writer_calls.append("copy"))
+    monkeypatch.setattr(cli.os, "replace", lambda *_args, **_kwargs: writer_calls.append("replace"))
+    monkeypatch.setattr(cli.Path, "mkdir", lambda *_args, **_kwargs: writer_calls.append("mkdir"))
+    result = CliRunner().invoke(main, [
+        "dev-admit-authority-schema", "--dev-storage-root", str(root),
+        "--project-id", "aming-claw", "--port", "40008",
+        "--recertify-existing-bytes", str(predecessor),
+    ])
+    assert result.exit_code != 0
+    assert connect_calls == [] and writer_calls == []
+
+
+@pytest.mark.parametrize("drift", ["wal_replacement", "database_replacement", "database_hash"])
+def test_dev_admit_authority_schema_rejects_real_post_checkpoint_identity_or_hash_drift(tmp_path, monkeypatch, drift):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / ("external-authority-" + drift)
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database); conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ]); conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+
+    def hostile_drift():
+        if drift == "wal_replacement":
+            wal = Path(str(database) + "-wal")
+            replacement = tmp_path / "replacement-wal"
+            replacement.write_bytes(wal.read_bytes())
+            os.replace(replacement, wal)
+        elif drift == "database_replacement":
+            replacement = tmp_path / "replacement-db"
+            replacement.write_bytes(database.read_bytes())
+            os.replace(replacement, database)
+        else:
+            with database.open("r+b") as handle:
+                handle.seek(68)
+                value = handle.read(1)
+                handle.seek(68)
+                handle.write(bytes([value[0] ^ 1]))
+
+    with pytest.raises(cli.click.ClickException, match="identity|sidecar|drifted"):
+        cli._offline_dev_schema_admission(
+            root, project_id="aming-claw", port=40008, resume_receipt=None,
+            authority_projection=True, _after_checkpoint_for_test=hostile_drift,
+        )
+    archive = root / "archive" / "schema-admission"
+    assert not list(archive.glob("*.json"))
+    if drift != "database_replacement":
+        check = sqlite3.connect(database)
+        try:
+            assert dict(check.execute("SELECT key,value FROM schema_meta"))["governance_world_source_tip_json"] == "{}"
+        finally:
+            check.close()
+
+
+def test_dev_admit_authority_schema_checkpoint_busy_emits_no_completed_receipt(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+    import types
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-authority-busy"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database); conn.execute("PRAGMA journal_mode=WAL")
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ]); conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    reader = sqlite3.connect(database)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    original_run = cli.subprocess.run
+    def no_external_holders(args, *positional, **kwargs):
+        if args and args[0] == "lsof":
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        return original_run(args, *positional, **kwargs)
+    monkeypatch.setattr(cli.subprocess, "run", no_external_holders)
+    try:
+        with pytest.raises(cli.click.ClickException, match="checkpoint did not truncate"):
+            cli._offline_dev_schema_admission(
+                root, project_id="aming-claw", port=40008,
+                resume_receipt=None, authority_projection=True,
+            )
+    finally:
+        reader.close()
+    assert not list((root / "archive" / "schema-admission").glob("*.json"))
+
+
+def test_dev_admit_authority_schema_rollback_receipt_resumes_without_drift(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-authority-rollback"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database); conn.execute("PRAGMA journal_mode=WAL"); db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ]); conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps(
+        {"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    command = ["dev-admit-authority-schema", "--dev-storage-root", str(root),
+               "--project-id", "aming-claw", "--port", "40008"]
+    original = db.admit_missing_authority_projection_schema
+    def interrupted(connection):
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("CREATE TABLE authority_admission_interrupted (id TEXT)")
+        raise sqlite3.OperationalError("forced authority interruption")
+    monkeypatch.setattr(db, "admit_missing_authority_projection_schema", interrupted)
+    failed = CliRunner().invoke(main, command)
+    assert failed.exit_code != 0
+    match = re.search(r"receipt=([^ ]+) sha256=(sha256:[0-9a-f]{64})", failed.output)
+    assert match, failed.output
+    receipt = Path(match.group(1)); payload = json.loads(receipt.read_text())
+    assert payload["stage"] == "rolled_back"
+    assert payload["schema_inventory_before"] == payload["schema_inventory_after"]
+    conn = sqlite3.connect(database)
+    try:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name='authority_admission_interrupted'").fetchone() is None
+        assert dict(conn.execute("SELECT key,value FROM schema_meta"))["governance_world_source_tip_json"] == "{}"
+    finally:
+        conn.close()
+    monkeypatch.setattr(db, "admit_missing_authority_projection_schema", original)
+    resumed = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "admitted"
+    before = database.read_bytes()
+    receipt.write_text("{}", encoding="utf-8")
+    tampered = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
+    assert tampered.exit_code != 0 and database.read_bytes() == before
+
+
+def test_dev_admit_schema_rejects_tampered_or_foreign_resume_before_effect(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-dev-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")])
+    conn.commit()
+    conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+    first = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008"])
+    assert first.exit_code == 0, first.output
+    receipt = Path(json.loads(first.output)["receipt_path"])
+    before = database.read_bytes()
+    receipt.write_text("{}", encoding="utf-8")
+    tampered = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(receipt)])
+    assert tampered.exit_code != 0
+    assert "digest mismatch" in tampered.output
+    assert database.read_bytes() == before
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text("{}", encoding="utf-8")
+    result = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(foreign)])
+    assert result.exit_code != 0
+    assert database.read_bytes() == before
+
+
+def test_dev_admit_schema_forced_ddl_error_emits_rollback_receipt_and_resumes(tmp_path, monkeypatch):
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-dev-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [("governance_world_id", "ac-dev"), ("governance_world_genesis_json", "{}"), ("governance_world_source_tip_json", "{}")])
+    conn.commit()
+    conn.close()
+    (root / "launch-receipt.json").write_text(json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}), encoding="utf-8")
+
+    def forced_ddl_error(connection):
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("CREATE TABLE interrupted_schema_admission (id TEXT)")
+        raise sqlite3.OperationalError("forced DDL interruption")
+
+    original_admission = db.admit_missing_backlog_read_schema
+    monkeypatch.setattr(db, "admit_missing_backlog_read_schema", forced_ddl_error)
+    failed = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008"])
+    assert failed.exit_code != 0
+    match = re.search(r"receipt=([^ ]+) sha256=(sha256:[0-9a-f]{64})", failed.output)
+    assert match, failed.output
+    rollback_receipt = Path(match.group(1))
+    payload = json.loads(rollback_receipt.read_text(encoding="utf-8"))
+    assert payload["stage"] == "rolled_back"
+    assert payload["schema_inventory_before"] == payload["schema_inventory_after"]
+    check = sqlite3.connect(database)
+    try:
+        assert check.execute("SELECT name FROM sqlite_master WHERE name='interrupted_schema_admission'").fetchone() is None
+    finally:
+        check.close()
+    monkeypatch.setattr(db, "admit_missing_backlog_read_schema", original_admission)
+    rollback_database_bytes = database.read_bytes()
+
+    changed = sqlite3.connect(database)
+    changed.execute("PRAGMA user_version = 194")
+    changed.commit()
+    changed.close()
+    user_version_drift = database.read_bytes()
+    rejected_user_version = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(rollback_receipt)])
+    assert rejected_user_version.exit_code != 0
+    assert "rollback receipt does not match current database" in rejected_user_version.output
+    assert database.read_bytes() == user_version_drift
+
+    database.write_bytes(rollback_database_bytes)
+    arbitrary_bytes = bytearray(database.read_bytes())
+    arbitrary_bytes[68] ^= 1  # SQLite application_id: semantically inert but byte-distinct.
+    database.write_bytes(arbitrary_bytes)
+    arbitrary_byte_drift = database.read_bytes()
+    rejected_byte_drift = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(rollback_receipt)])
+    assert rejected_byte_drift.exit_code != 0
+    assert "rollback receipt does not match current database" in rejected_byte_drift.output
+    assert database.read_bytes() == arbitrary_byte_drift
+
+    database.write_bytes(rollback_database_bytes)
+    resumed = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(rollback_receipt)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "admitted"
+
+
+def test_admission_database_sha256_reads_bounded_chunks_without_mutating_file(tmp_path, monkeypatch):
+    import agent.cli as cli
+
+    database = tmp_path / "governance.db"
+    payload = b"AC-dev-digest\n" * (3 * 1024 * 1024 // len(b"AC-dev-digest\n") + 1)
+    database.write_bytes(payload)
+    before = database.read_bytes()
+    expected_identity = cli._admission_identity(database)
+    original_read = cli.os.read
+    read_sizes = []
+
+    def bounded_read(descriptor, amount):
+        read_sizes.append(amount)
+        return original_read(descriptor, amount)
+
+    monkeypatch.setattr(cli.os, "read", bounded_read)
+    digest = cli._admission_database_sha256(database, expected_identity=expected_identity)
+
+    assert digest == "sha256:" + hashlib.sha256(before).hexdigest()
+    assert read_sizes and max(read_sizes) <= 1024 * 1024
+    assert database.read_bytes() == before
+
+
+def test_posix_detached_popen_survives_launcher_parent_on_real_temp_port(tmp_path):
+    import socket
+    import signal
+    import time
+
+    if os.name != "posix":
+        pytest.skip("POSIX lifecycle only")
+    probe = socket.socket(); probe.bind(("127.0.0.1", 0)); port = probe.getsockname()[1]; probe.close()
+    log = tmp_path / "child.log"
+    child_code = (
+        "import socket,time,sys; "
+        "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); "
+        "s.bind(('127.0.0.1',int(sys.argv[1]))); s.listen(); time.sleep(60)"
+    )
+    launcher_code = (
+        "import os,sys; from pathlib import Path; from agent.cli import _posix_detached_popen; "
+        "fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); "
+        "p=_posix_detached_popen([sys.executable,'-c',sys.argv[3],sys.argv[1]],cwd=Path.cwd(),log_fd=fd); "
+        "os.close(fd); print(p.pid,flush=True)"
+    )
+    launcher = subprocess.run(
+        [sys.executable, "-c", launcher_code, str(port), str(log), child_code],
+        cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+        timeout=10, check=True,
+    )
+    pid = int(launcher.stdout.strip())
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            pytest.fail("detached child did not survive launcher parent")
+        os.kill(pid, 0)
+    finally:
+        os.kill(pid, signal.SIGTERM)
+
+
+def test_posix_exclusive_durable_receipt_rejects_collision_and_symlink(tmp_path):
+    import agent.cli as cli
+
+    receipt = tmp_path / "receipt.json"
+    cli._posix_exclusive_json(receipt, {"stage": "pending"})
+    before = receipt.read_bytes()
+    with pytest.raises(cli.click.ClickException, match="collision"):
+        cli._posix_exclusive_json(receipt, {"stage": "completed"})
+    assert receipt.read_bytes() == before
+    target = tmp_path / "target"; target.write_text("target", encoding="utf-8")
+    link = tmp_path / "link.json"; link.symlink_to(target)
+    with pytest.raises(cli.click.ClickException, match="canonical"):
+        cli._posix_exclusive_json(link, {"stage": "pending"})
+
+    pending = tmp_path / "launch.pending.json"
+    completed = tmp_path / "launch.completed.json"
+    cli._posix_exclusive_json(pending, {"stage": "completed", "final": True})
+    inode = pending.stat().st_ino
+    cli._noreplace_promote(pending, completed)
+    assert not pending.exists()
+    assert completed.stat().st_ino == inode
+    assert json.loads(completed.read_text(encoding="utf-8")) == {"final": True, "stage": "completed"}
+
+
+def test_posix_durable_launch_lock_has_exactly_one_concurrent_winner(tmp_path):
+    import concurrent.futures
+    import agent.cli as cli
+
+    lock = tmp_path / "launch.lock"
+    def contender(number):
+        try:
+            cli._posix_exclusive_json(lock, {"winner": number})
+            return number
+        except cli.click.ClickException:
+            return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(contender, range(16)))
+    winners = [value for value in results if value is not None]
+    assert len(winners) == 1
+    assert json.loads(lock.read_text(encoding="utf-8")) == {"winner": winners[0]}
+
+    launch, digest = cli._durable_content_receipt(tmp_path, "launch", {"immutable": True})
+    assert launch.name == f"launch.{digest[7:]}.json"
+    payload, read_digest = cli._read_durable_content_receipt(launch, "launch")
+    assert payload == {"immutable": True} and read_digest == digest
+    with pytest.raises(cli.click.ClickException, match="collision"):
+        cli._durable_content_receipt(tmp_path, "launch", {"immutable": True})
+
+
+def test_posix_detached_popen_uses_no_shell_new_session_and_devnull(tmp_path, monkeypatch):
+    import agent.cli as cli
+
+    captured = {}
+    sentinel = object()
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda argv, **kwargs: (
+        captured.update(argv=argv, **kwargs) or sentinel
+    ))
+    result = cli._posix_detached_popen(
+        [sys.executable, "-m", "agent.cli"], cwd=tmp_path, log_fd=17,
+    )
+    assert result is sentinel
+    assert captured == {
+        "argv": [sys.executable, "-m", "agent.cli"], "cwd": tmp_path,
+        "stdin": subprocess.DEVNULL, "stdout": 17, "stderr": 17,
+        "start_new_session": True, "shell": False, "close_fds": True, "pass_fds": (),
+    }
+
+
+def test_durable_exit_binding_discriminates_every_authorized_launch_field():
+    import copy
+    import agent.cli as cli
+
+    receipt = {
+        "launch_id": "launch", "pid": 123,
+        "process": {"start_identity": "sha256:" + "1" * 64},
+        "argv": ["python", "-m", "agent.cli"], "cwd": "/source",
+        "python": "/python", "source_commit": "a" * 40, "source_tree": "b" * 40,
+        "server_sha256": "sha256:" + "2" * 64, "source_root": "/source",
+        "database_path": "/dev/governance.db", "database_identity": {"device": 1, "inode": 2},
+        "dev_storage_root": "/dev", "project_id": "aming-claw", "port": 40008,
+        "policy": {"runtime_plane": "dev", "migration": "verify-only",
+                   "stable_deployment": "deny", "graph_activation": "deny",
+                   "background_workers": "deny"},
+        "linked_v3_receipt_sha256": "sha256:" + "4" * 64,
+        "log_path": "/dev/log", "log_identity": {"path": "/dev/log", "device": 3, "inode": 4},
+        "readiness_sha256": "sha256:" + "5" * 64,
+        "database_sha256_before": "sha256:" + "6" * 64,
+        "database_sha256_after": "sha256:" + "7" * 64,
+    }
+    baseline = cli._durable_exit_binding(receipt, "sha256:" + "3" * 64)
+    assert baseline["completed_receipt_sha256"] == "sha256:" + "3" * 64
+    for field in ("launch_id", "pid", "argv", "cwd", "python", "source_commit", "source_tree",
+                  "server_sha256", "source_root", "database_path", "database_identity",
+                  "dev_storage_root", "project_id", "port", "policy",
+                  "linked_v3_receipt_sha256", "log_path", "log_identity",
+                  "readiness_sha256", "database_sha256_before", "database_sha256_after"):
+        mutated = copy.deepcopy(receipt)
+        mutated[field] = ["mutated"] if field == "argv" else "mutated"
+        assert cli._durable_exit_binding(mutated, "sha256:" + "3" * 64) != baseline, field
+    mutated = copy.deepcopy(receipt); mutated["process"]["start_identity"] = "mutated"
+    assert cli._durable_exit_binding(mutated, "sha256:" + "3" * 64) != baseline
+
+
+def test_durable_child_runtime_is_exactly_inside_bound_dev_root(tmp_path):
+    import agent.cli as cli
+
+    dev = tmp_path / "dev"
+    runtime = dev / "runtime" / "durable-launch"
+    runtime.mkdir(parents=True)
+    assert cli._validated_durable_runtime_dir(runtime, dev) == runtime.resolve()
+    external = tmp_path / "external"; external.mkdir()
+    with pytest.raises(cli.click.ClickException, match="outside its bound dev root"):
+        cli._validated_durable_runtime_dir(external, dev)
+    link = dev / "runtime-link"; link.symlink_to(runtime)
+    with pytest.raises(cli.click.ClickException, match="outside its bound dev root"):
+        cli._validated_durable_runtime_dir(link, dev)
+
+
+def test_canonical_legacy_postimage_projection_excludes_only_schema_meta(tmp_path):
+    import agent.cli as cli
+
+    before = tmp_path / "before.db"
+    connection = sqlite3.connect(before)
+    connection.executescript(
+        "CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT);"
+        "CREATE TABLE evidence(id TEXT PRIMARY KEY,payload TEXT);"
+        "INSERT INTO evidence VALUES('one','immutable');"
+        "INSERT INTO schema_meta VALUES('schema_version','47');"
+    )
+    connection.commit(); connection.close()
+    after = tmp_path / "after.db"; shutil.copy2(before, after)
+    connection = sqlite3.connect(after)
+    for key, value in {
+        "governance_world_current_process_json": '{"pid":1}',
+        "governance_world_source_tip_json": '{"commit":"a"}',
+        "governance_world_source_tip_revision": "3",
+        "governance_world_source_tip_sha256": "sha256:" + "a" * 64,
+    }.items():
+        connection.execute("INSERT INTO schema_meta VALUES(?,?)", (key, value))
+    connection.commit(); connection.close()
+    before_projection, before_meta = cli._immutable_sqlite_projection(before)
+    after_projection, after_meta = cli._immutable_sqlite_projection(after)
+    assert before_projection == after_projection
+    assert set(after_meta) - set(before_meta) == {
+        "governance_world_current_process_json", "governance_world_source_tip_json",
+        "governance_world_source_tip_revision", "governance_world_source_tip_sha256",
+    }
+    connection = sqlite3.connect(after)
+    connection.execute("UPDATE evidence SET payload='drift'"); connection.commit(); connection.close()
+    drifted_projection, _ = cli._immutable_sqlite_projection(after)
+    assert drifted_projection != before_projection
+
+
+def test_dashboard_backlog_projection_is_lossless_ordered_and_large(tmp_path):
+    import agent.cli as cli
+    from agent.governance import db
+
+    database = tmp_path / "historical.db"
+    connection = sqlite3.connect(database)
+    db._ensure_schema(connection)
+    columns = [str(row[1]) for row in connection.execute("PRAGMA table_info(backlog_bugs)")]
+    defaults = {}
+    for row in connection.execute("PRAGMA table_info(backlog_bugs)"):
+        name, default = str(row[1]), row[4]
+        defaults[name] = "" if default is None else str(default).strip("'")
+    rows = []
+    for number in reversed(range(3603)):
+        value = dict(defaults)
+        value.update({
+            "bug_id": f"AC-BOOTSTRAP-{number:04d}",
+            "title": "large-" + ("雪\x00" * 64 if number == 17 else str(number)),
+            "status": "FIXED" if number % 3 == 0 else "OPEN",
+            "created_at": "2026-08-31T00:00:00Z", "updated_at": "2026-08-31T00:00:00Z",
+        })
+        rows.append(tuple(value[name] for name in columns))
+    quoted = ",".join(db._sqlite_quote_identifier(name) for name in columns)
+    connection.executemany(
+        f"INSERT INTO backlog_bugs ({quoted}) VALUES ({','.join('?' for _ in columns)})", rows,
+    )
+    connection.commit()
+    first, ordered = cli._dashboard_backlog_table_projection(connection)
+    connection.execute("CREATE TABLE reordered AS SELECT * FROM backlog_bugs ORDER BY bug_id DESC")
+    connection.execute("DELETE FROM backlog_bugs")
+    connection.execute(f"INSERT INTO backlog_bugs ({quoted}) SELECT {quoted} FROM reordered")
+    connection.commit()
+    second, reordered = cli._dashboard_backlog_table_projection(connection)
+    connection.close()
+
+    assert first == second
+    assert first["row_count"] == 3603
+    assert first["status_counts"] == {"FIXED": 1201, "OPEN": 2402}
+    assert [row[0] for row in ordered] == [row[0] for row in reordered]
+    assert ordered[17][1].endswith("雪\x00" * 64)
+
+
+def test_backlog_read_admission_can_join_caller_transaction_and_roll_back(tmp_path):
+    from agent.governance import db
+
+    database = tmp_path / "target.db"
+    connection = sqlite3.connect(database, isolation_level=None)
+    db._ensure_schema(connection)
+    connection.execute("BEGIN IMMEDIATE")
+    result = db.admit_missing_backlog_read_schema(connection, commit=False)
+    connection.execute(
+        "INSERT INTO backlog_bugs(bug_id,created_at,updated_at) VALUES('AC-TXN','now','now')"
+    )
+    connection.rollback()
+    assert result["changed"] is True
+    assert connection.execute("SELECT count(*) FROM backlog_bugs").fetchone() == (0,)
+    assert db.backlog_read_schema_drift(connection)["missing"]
+    connection.close()
+
+
+def _durable_stop_v2_fixture(tmp_path, monkeypatch):
+    import agent.cli as cli
+
+    dev = tmp_path / "dev"; runtime = dev / "runtime" / "durable-launch"; runtime.mkdir(parents=True)
+    source = tmp_path / "source"; (source / "agent" / "governance").mkdir(parents=True)
+    (source / "agent" / "cli.py").write_text("target cli\n", encoding="utf-8")
+    server = source / "agent" / "governance" / "server.py"; server.write_text("server\n", encoding="utf-8")
+    database = dev / "governance" / "aming-claw" / "governance.db"; database.parent.mkdir(parents=True); database.write_bytes(b"db")
+    details = database.stat()
+    log = runtime / "governance.log"; log.write_text("", encoding="utf-8")
+    identity = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw",
+        "device": details.st_dev, "inode": details.st_ino,
+        "relative_path_sha256": "sha256:" + "8" * 64,
+        "genesis_sha256": "sha256:" + "9" * 64,
+    }
+    target = {
+        "root": str(source), "branch": "codex/ac-dev", "commit": "b" * 40,
+        "tree": "c" * 40, "dirty": "", "source_sha256": "sha256:" + "d" * 64,
+    }
+    before = {"database_identity": identity, "world_custody_sha256": "sha256:" + "e" * 64}
+    after = {**before, "database_sha256": "sha256:" + "f" * 64}
+    receipt = {
+        "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "completed",
+        "launch_id": "fixture", "pid": 424242, "project_id": "aming-claw", "port": 40008,
+        "dev_storage_root": str(dev), "source_root": str(source), "source_commit": "a" * 40,
+        "source_tree": "b" * 40, "server_sha256": "sha256:" + hashlib.sha256(server.read_bytes()).hexdigest(),
+        "python": str(Path(sys.executable).resolve()), "database_path": str(database),
+        "database_identity": identity,
+        "process": {"start_identity": "sha256:" + "c" * 64,
+                    "argv": f"{sys.executable} child --launch-id fixture", "cwd": str(source)},
+        "argv": [sys.executable, "child", "--launch-id", "fixture"], "cwd": str(source), "exit_receipt": str(runtime / "exit-status.json"),
+        "linked_v3_receipt_sha256": "sha256:" + "e" * 64,
+        "policy": {"runtime_plane": "dev", "migration": "verify-only",
+                   "stable_deployment": "deny", "graph_activation": "deny",
+                   "background_workers": "deny"},
+        "log_path": str(log), "log_identity": cli._admission_identity(log),
+        "readiness_sha256": "sha256:" + "f" * 64,
+        "database_sha256_before": "sha256:" + "1" * 64,
+        "database_sha256_after": "sha256:" + hashlib.sha256(database.read_bytes()).hexdigest(),
+    }
+    launch_path, launch_sha = cli._durable_content_receipt(runtime, "launch", receipt)
+    immutable = {launch_path: launch_path.read_bytes()}
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: dict(target))
+    monkeypatch.setattr(cli, "_durable_stop_database_custody",
+                        lambda _database, *, include_postimage: dict(after if include_postimage else before))
+    monkeypatch.setattr(cli, "_validate_durable_stop_launch_chain", lambda **_kwargs: ({}, {}))
+    monkeypatch.setattr(cli, "_durable_stop_health_matches", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(cli, "_validated_durable_stop_linked_v3_chain", lambda **_kwargs: (
+        "sha256:" + "e" * 64, {},
+    ))
+    state = {"alive": True}
+    monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: receipt["process"])
+    monkeypatch.setattr(cli, "_durable_listener_pid",
+                        lambda _port: receipt["pid"] if state["alive"] else 0)
+    monkeypatch.setattr(cli, "_probe_governance",
+                        lambda *_args, **_kwargs: {"pid": receipt["pid"]} if state["alive"] else {})
+    return cli, dev, runtime, receipt, launch_sha, target, before, after, state, immutable
+
+
+def _durable_stop_linked_chain_fixture(tmp_path, monkeypatch):
+    import copy
+    import agent.cli as cli
+    from agent.governance import db
+
+    root = tmp_path / "dev"
+    database = root / db.AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True)
+    genesis = "sha256:" + "1" * 64
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT);"
+    )
+    connection.executemany("INSERT INTO schema_meta VALUES (?,?)", [
+        ("governance_world_id", "ac-dev"),
+        ("governance_world_genesis_sha256", genesis),
+    ])
+    connection.commit()
+    connection.close()
+    database_metadata = database.stat(follow_symlinks=False)
+    current_identity = cli._canonical_dev_database_identity_projection(database)
+
+    linked = root / "archive" / "schema-admission" / "linked.json"
+    linked.parent.mkdir(parents=True)
+    linked.write_text("immutable linked v3\n", encoding="utf-8")
+    linked_digest = "sha256:" + hashlib.sha256(linked.read_bytes()).hexdigest()
+    canonical_linked = linked.with_name(f"{linked_digest[7:]}.json")
+    linked.rename(canonical_linked)
+
+    stable_database = tmp_path / "stable.db"
+    stable_database.write_bytes(b"stable")
+    stable_metadata = stable_database.stat(follow_symlinks=False)
+    stable_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": stable_metadata.st_dev,
+        "inode": stable_metadata.st_ino,
+        "stable_relative_path_sha256": "sha256:" + "2" * 64,
+    }
+    successor_receipt = {
+        "schema_version": db.AC_DEV_COW_SUCCESSOR_SCHEMA,
+        "stage": "completed",
+        "project_id": "aming-claw",
+        "port": cli.AC_DEV_SERVICE_PORT,
+        "root": str(root),
+        "genesis": {"raw_json": "frozen genesis", "sha256": genesis},
+        "history": {"linked_v3": {
+            "path": str(canonical_linked), "sha256": linked_digest,
+        }},
+        "successor": {
+            "governance_world_id": "ac-dev",
+            "genesis_json": "frozen genesis",
+            "genesis_sha256": genesis,
+            "identity": {
+                "path": str(database),
+                "device": database_metadata.st_dev,
+                "inode": database_metadata.st_ino,
+                "nlink": database_metadata.st_nlink,
+                # Historical issuance bytes are intentionally not stop authority.
+                "sha256": "sha256:" + "3" * 64,
+            },
+        },
+        "stable_binding": {"database": stable_identity, "runtime_commit": None},
+    }
+    stable = {
+        "database_path": str(stable_database),
+        "stable_database_identity": stable_identity,
+    }
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_receipt",
+        lambda _root: copy.deepcopy(successor_receipt),
+    )
+    monkeypatch.setattr(
+        db, "verified_stable_database_binding", lambda: copy.deepcopy(stable),
+    )
+    launch = {
+        "linked_v3_receipt_sha256": linked_digest,
+        "database_identity": current_identity,
+        # DML changed bytes after launch; this must never become stop authority.
+        "database_sha256_after": "sha256:" + "4" * 64,
+    }
+    custody = {
+        "database_identity": current_identity,
+        "world_custody_sha256": "sha256:" + "5" * 64,
+    }
+    return (
+        cli, db, root, database, canonical_linked, launch, custody,
+        successor_receipt, stable,
+    )
+
+
+def test_durable_stop_linked_chain_binds_successor_without_mutable_db_sha(
+    tmp_path, monkeypatch,
+):
+    (cli, _db, root, database, _linked, launch, custody,
+     successor, _stable) = _durable_stop_linked_chain_fixture(tmp_path, monkeypatch)
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE runtime_dml(id TEXT PRIMARY KEY,payload TEXT);"
+        "INSERT INTO runtime_dml VALUES('fresh','not in issuance bytes');"
+    )
+    connection.commit()
+    connection.close()
+
+    digest, returned = cli._validated_durable_stop_linked_v3_chain(
+        dev_storage=root,
+        database=database,
+        launch_receipt=launch,
+        database_custody=custody,
+    )
+
+    assert digest == launch["linked_v3_receipt_sha256"]
+    assert returned == successor
+    assert launch["database_sha256_after"] != successor["successor"]["identity"]["sha256"]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "launch_digest", "linked_path", "successor_path", "successor_device",
+        "successor_inode", "successor_nlink", "world", "project", "genesis",
+        "custody_world", "custody_project", "custody_genesis", "launch_custody",
+        "stable_drift", "stable_alias",
+    ],
+)
+def test_durable_stop_linked_chain_rejects_binding_drift_before_stop(
+    tmp_path, monkeypatch, drift,
+):
+    import copy
+
+    (cli, db, root, database, linked, launch, custody,
+     successor, stable) = _durable_stop_linked_chain_fixture(tmp_path, monkeypatch)
+    changed_successor = copy.deepcopy(successor)
+    changed_launch = copy.deepcopy(launch)
+    changed_custody = copy.deepcopy(custody)
+    changed_stable = copy.deepcopy(stable)
+    if drift == "launch_digest":
+        changed_launch["linked_v3_receipt_sha256"] = "sha256:" + "a" * 64
+    elif drift == "linked_path":
+        changed_successor["history"]["linked_v3"]["path"] = str(linked) + ".other"
+    elif drift.startswith("successor_"):
+        field = drift.removeprefix("successor_")
+        changed_successor["successor"]["identity"][field] = (
+            str(database) + ".other" if field == "path" else 999999
+        )
+    elif drift == "world":
+        changed_successor["successor"]["governance_world_id"] = "other"
+    elif drift == "project":
+        changed_successor["project_id"] = "other"
+    elif drift == "genesis":
+        changed_successor["successor"]["genesis_sha256"] = "sha256:" + "b" * 64
+    elif drift.startswith("custody_"):
+        field = (
+            drift.removeprefix("custody_") + "_id"
+            if drift != "custody_genesis"
+            else "genesis_sha256"
+        )
+        changed_custody["database_identity"][field] = "other"
+    elif drift == "launch_custody":
+        changed_launch["database_identity"]["inode"] = 999999
+    elif drift == "stable_drift":
+        changed_stable["stable_database_identity"]["inode"] = 999999
+    else:
+        metadata = database.stat(follow_symlinks=False)
+        alias_identity = {
+            **changed_stable["stable_database_identity"],
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+        }
+        changed_stable["database_path"] = str(database)
+        changed_stable["stable_database_identity"] = alias_identity
+        changed_successor["stable_binding"]["database"] = alias_identity
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_receipt",
+        lambda _root: changed_successor,
+    )
+    monkeypatch.setattr(
+        db, "verified_stable_database_binding", lambda: changed_stable,
+    )
+
+    with pytest.raises(cli.click.ClickException, match="COW successor chain mismatch"):
+        cli._validated_durable_stop_linked_v3_chain(
+            dev_storage=root,
+            database=database,
+            launch_receipt=changed_launch,
+            database_custody=changed_custody,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_chain", ["missing", "duplicate", "malformed", "adoption", "sidecar", "hash"],
+)
+def test_durable_stop_linked_chain_rejects_invalid_immutable_issuance(
+    tmp_path, monkeypatch, invalid_chain,
+):
+    (cli, db, root, database, _linked, launch, custody,
+     _successor, _stable) = _durable_stop_linked_chain_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        db, "validate_dev_cow_successor_receipt",
+        lambda _root: (_ for _ in ()).throw(
+            ValueError(f"{invalid_chain} immutable successor chain")
+        ),
+    )
+
+    with pytest.raises(cli.click.ClickException, match="COW successor chain mismatch"):
+        cli._validated_durable_stop_linked_v3_chain(
+            dev_storage=root,
+            database=database,
+            launch_receipt=launch,
+            database_custody=custody,
+        )
+
+
+def test_durable_stop_only_routes_around_start_selector():
+    import inspect
+    import agent.cli as cli
+
+    stop_source = inspect.getsource(cli._durable_dev_stop)
+    launch_source = inspect.getsource(cli._durable_dev_launch)
+    start_source = inspect.getsource(cli.start.callback)
+    generic_source = inspect.getsource(cli._validated_linked_v3_receipt)
+    assert "_validated_durable_stop_linked_v3_chain(" in stop_source
+    assert "_validated_linked_v3_receipt(" not in stop_source
+    assert "_validated_linked_v3_receipt(" in launch_source
+    assert "_validated_linked_v3_receipt(" in start_source
+    assert "_select_dev_cow_generation_phase(" in generic_source
+
+
+def test_durable_stop_linked_chain_failure_is_pre_signal_and_receipt_free(
+    tmp_path, monkeypatch,
+):
+    (cli, dev, runtime, _receipt, _launch_sha, _target, _before, _after,
+     _state, _immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
+    signals = []
+    monkeypatch.setattr(
+        cli,
+        "_validated_durable_stop_linked_v3_chain",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            cli.click.ClickException("AC dev durable stop COW successor chain mismatch")
+        ),
+    )
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    with pytest.raises(cli.click.ClickException, match="COW successor chain mismatch"):
+        cli._durable_dev_stop(dev)
+
+    assert signals == []
+    assert list(runtime.glob("stop-challenge.*.json")) == []
+    assert list(runtime.glob("exit.*.json")) == []
+    assert list(runtime.glob("stop.*.json")) == []
+
+
+def test_durable_stop_clean_descendant_allows_dml_and_seals_final_postimage(
+    tmp_path, monkeypatch,
+):
+    (cli, dev, runtime, receipt, launch_sha, target, before, after,
+     state, immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
+    signals = []
+    selector_calls = []
+    from agent.governance import db
+    monkeypatch.setattr(db, "_select_dev_cow_generation_phase", lambda *_a, **_k: (
+        selector_calls.append(True),
+        (_ for _ in ()).throw(AssertionError("start selector called during stop")),
+    )[1])
+    monkeypatch.setattr(cli, "_validated_linked_v3_receipt", lambda *_a, **_k: (
+        _ for _ in ()
+    ).throw(AssertionError("generic linked-v3 validator called during stop")))
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+        if sig == cli.signal.SIGTERM:
+            challenge_path = next(runtime.glob("stop-challenge.*.json"))
+            challenge, challenge_sha = cli._read_durable_content_receipt(
+                challenge_path, "stop-challenge",
+            )
+            cli._durable_content_receipt(runtime, "exit", {
+                "schema_version": "ac_dev_durable_exit.v1", "pid": pid,
+                "status": "terminated", "exit_code": 143, "exception_type": "SystemExit",
+                "launch_sha256": launch_sha, "challenge_sha256": challenge_sha,
+                "binding": challenge["binding"],
+            })
+            state["alive"] = False
+        elif sig == 0 and not state["alive"]:
+            raise ProcessLookupError
+    monkeypatch.setattr(cli.os, "kill", fake_kill)
+    cli._durable_dev_stop(dev)
+    stop_path = next(runtime.glob("stop.*.json"))
+    stop, _ = cli._read_durable_content_receipt(stop_path, "stop")
+    assert signals == [(receipt["pid"], cli.signal.SIGTERM), (receipt["pid"], 0)]
+    assert stop["schema_version"] == "ac_dev_durable_stop.v2"
+    assert stop["target_source_identity"]["commit"] == target["commit"]
+    assert stop["database_custody_before"] == before
+    assert stop["database_custody_after"] == after
+    assert selector_calls == []
+    assert all(path.read_bytes() == raw for path, raw in immutable.items())
+
+
+@pytest.mark.parametrize(
+    "drift", ["loaded_commit", "loaded_source", "target_commit", "target_dirty",
+              "database_inode", "database_world", "worktree_source", "stale_reason"],
+)
+def test_durable_stop_health_binds_loaded_old_and_clean_target_world(drift):
+    import copy
+    import agent.cli as cli
+
+    old, target = "a" * 40, "b" * 40
+    database = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw", "device": 1, "inode": 2,
+        "relative_path_sha256": "sha256:" + "3" * 64,
+        "genesis_sha256": "sha256:" + "4" * 64,
+    }
+    receipt = {"pid": 17, "source_commit": old,
+               "server_sha256": "sha256:" + "5" * 64}
+    source = {"root": "/source", "commit": target,
+              "server_sha256": "sha256:" + "6" * 64}
+    health = {
+        "runtime_plane": "dev", "port": 40008, "bind_host": "127.0.0.1",
+        "pid": 17, "runtime_loaded_version": old, "runtime_stale": True,
+        "runtime_plane_identity": {
+            "schema_version": "ac_runtime_plane_identity.v1", "status": "ready",
+            "plane": "dev", "pid": 17, "worktree_root": "/source",
+            "branch": "codex/ac-dev", "expected_branch": "codex/ac-dev",
+            "commit": target, "worktree_dirty": False, "worktree_dirty_files": [],
+            "database_identity": database, "world_id": "ac-dev",
+        },
+        "loaded_runtime_identity": {
+            "schema_version": "governance_loaded_runtime_identity.v1",
+            "loaded_commit": old, "loaded_pid": 17,
+            "loaded_source_sha256": receipt["server_sha256"],
+            "worktree_head_version": target[:8],
+            "worktree_source_sha256": source["server_sha256"],
+            "runtime_stale": True,
+            "runtime_stale_reasons": ["worktree_head_moved", "loaded_source_file_changed"],
+        },
+    }
+    assert cli._durable_stop_health_matches(
+        health, receipt=receipt, target_source=source, database_identity=database,
+    )
+    changed = copy.deepcopy(health)
+    if drift == "loaded_commit":
+        changed["loaded_runtime_identity"]["loaded_commit"] = target
+    elif drift == "loaded_source":
+        changed["loaded_runtime_identity"]["loaded_source_sha256"] = "sha256:" + "0" * 64
+    elif drift == "target_commit":
+        changed["runtime_plane_identity"]["commit"] = old
+    elif drift == "target_dirty":
+        changed["runtime_plane_identity"]["worktree_dirty"] = True
+    elif drift == "database_inode":
+        changed["runtime_plane_identity"]["database_identity"]["inode"] = 99
+    elif drift == "database_world":
+        changed["runtime_plane_identity"]["database_identity"]["world_id"] = "other"
+    elif drift == "worktree_source":
+        changed["loaded_runtime_identity"]["worktree_source_sha256"] = "sha256:" + "0" * 64
+    else:
+        changed["loaded_runtime_identity"]["runtime_stale_reasons"] = []
+    assert not cli._durable_stop_health_matches(
+        changed, receipt=receipt, target_source=source, database_identity=database,
+    )
+
+
+@pytest.mark.parametrize(
+    "attack,expected", [
+        ("launch_chain", "launch receipt chain mismatch"),
+        ("health", "process identity mismatch"),
+        ("source_ref_moved", "pre-TERM CAS mismatch"),
+        ("database_world_drift", "pre-TERM CAS mismatch"),
+        ("process_identity", "process identity mismatch"),
+        ("preforged_challenge", "terminal chain already exists"),
+        ("missing_exit", "exit receipt is missing"),
+        ("term_timeout", "TERM timeout"),
+    ],
+)
+def test_durable_stop_v2_attacks_fail_closed(tmp_path, monkeypatch, attack, expected):
+    (cli, dev, runtime, receipt, launch_sha, target, before, _after,
+    state, _immutable) = _durable_stop_v2_fixture(tmp_path, monkeypatch)
+    signals = []
+    if attack == "launch_chain":
+        monkeypatch.setattr(
+            cli,
+            "_validate_durable_stop_launch_chain",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                cli.click.ClickException("AC dev durable stop launch receipt chain mismatch")
+            ),
+        )
+    if attack == "health":
+        monkeypatch.setattr(
+            cli, "_durable_stop_health_matches", lambda *_args, **_kwargs: False,
+        )
+    if attack == "preforged_challenge":
+        cli._durable_content_receipt(runtime, "stop-challenge", {
+            "launch_sha256": launch_sha, "forged": True,
+        })
+    if attack == "process_identity":
+        monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: {
+            **receipt["process"], "start_identity": "sha256:" + "0" * 64,
+        })
+    if attack == "source_ref_moved":
+        calls = {"count": 0}
+        def source_read():
+            calls["count"] += 1
+            return dict(target) if calls["count"] < 2 else {**target, "commit": "c" * 40}
+        monkeypatch.setattr(cli, "_source_git_identity", source_read)
+    if attack == "database_world_drift":
+        calls = {"count": 0}
+        def custody(_database, *, include_postimage):
+            calls["count"] += 1
+            return dict(before) if calls["count"] < 2 else {
+                **before, "world_custody_sha256": "sha256:" + "0" * 64,
+            }
+        monkeypatch.setattr(cli, "_durable_stop_database_custody", custody)
+    if attack == "term_timeout":
+        ticks = iter((0.0, 11.0, 12.0))
+        monkeypatch.setattr(cli.time, "monotonic", lambda: next(ticks))
+
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+        if sig == cli.signal.SIGTERM and attack == "missing_exit":
+            state["alive"] = False
+        elif sig == 0 and attack == "missing_exit":
+            raise ProcessLookupError
+    monkeypatch.setattr(cli.os, "kill", fake_kill)
+    with pytest.raises(cli.click.ClickException, match=expected):
+        cli._durable_dev_stop(dev)
+    if attack in {"launch_chain", "health", "source_ref_moved",
+                  "database_world_drift", "process_identity", "preforged_challenge"}:
+        assert signals == []
+    elif attack == "missing_exit":
+        assert signals == [(receipt["pid"], cli.signal.SIGTERM), (receipt["pid"], 0)]
+    else:
+        assert signals[0] == (receipt["pid"], cli.signal.SIGTERM)
+    if not signals:
+        assert list(runtime.glob("exit.*.json")) == []
+        assert list(runtime.glob("stop.*.json")) == []

@@ -18,13 +18,13 @@ from executor_worker import ExecutorWorker
 
 
 @pytest.fixture
-def worker():
+def worker(tmp_path):
     """Create a worker with mocked API calls."""
     w = ExecutorWorker(
         project_id="test-project",
-        governance_url="http://localhost:40006",
+        governance_url="http://127.0.0.1:40000",
         worker_id="test-worker",
-        workspace="/tmp/test-workspace",
+        workspace=str(tmp_path),
     )
     # Stub out _api so no real HTTP calls are made
     w._api = MagicMock(return_value={"error": "mocked"})

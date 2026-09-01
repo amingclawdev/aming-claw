@@ -34,6 +34,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
+from agent.runtime_plane import bind_workspace_identity, resolve_runtime_plane
 
 # B48 FIX B (observer-hotfix 2026-04-23): Ensure the project root is on
 # sys.path so `from agent.manager_http_server import run_server` works when
@@ -61,6 +63,8 @@ EXECUTOR_SESSION_TOKEN_ENV = "AMING_EXECUTOR_SESSION_TOKEN"
 
 _RELOAD_TIMEOUT: int = int(os.getenv("SERVICE_RELOAD_TIMEOUT", "120"))
 _POLL_INTERVAL: float = float(os.getenv("SERVICE_POLL_INTERVAL", "2"))
+_STABLE_MANAGER_SIDECAR_PORT = 40101
+_AC_DEV_MANAGER_SIDECAR_PORT = 40109
 
 _agent_dir = str(Path(__file__).resolve().parent)
 
@@ -96,30 +100,39 @@ def _default_project_id() -> str:
 def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str:
     """Bind one manager/executor generation to exactly one governance world."""
 
-    raw = str(project_id or "").strip()
-    canonical = re.sub(r"-+", "-", re.sub(r"[\s_]+", "-", raw)).lower().strip("-")
-    if canonical == "aming-claw" and raw != "aming-claw":
-        raise ValueError("AC ServiceManager project id must be exact aming-claw")
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", canonical):
-        raise ValueError("ServiceManager project id is invalid")
-    if canonical != "aming-claw":
-        selected = str(requested_url or "http://127.0.0.1:40000").rstrip("/")
-        if selected.endswith(":40008"):
-            raise ValueError("port 40008 is reserved to exact project aming-claw")
-        return selected
-    expected = os.getenv(
-        "AC_DEV_GOVERNANCE_URL", "http://127.0.0.1:40008"
-    ).rstrip("/")
-    selected = str(requested_url or expected).rstrip("/")
-    if selected not in {expected, "http://localhost:40008"}:
-        raise ValueError(
-            f"project {canonical} is bound to governance world {expected}, got {selected}"
-        )
-    return expected
+    plane = resolve_runtime_plane(project_id)
+    if requested_url and requested_url != plane.governance_url:
+        raise ValueError("ServiceManager governance URL crosses the project runtime plane")
+    return plane.governance_url
 
 
 def _default_workspace() -> str:
-    return os.getenv("CODEX_WORKSPACE", str(_repo_root()))
+    return ""
+
+
+def _plane_bound_manager_identity(
+    project_id: str, governance_url: str, storage_root: Optional[str] = None,
+    *, allow_test_port: bool = False,
+) -> dict:
+    """Return the immutable manager/sidecar identity for one runtime plane.
+
+    A manager is never a host-global service: the project, governance listener,
+    storage root, and sidecar port form one custody boundary.
+    """
+    if allow_test_port:
+        raise ValueError("ServiceManager sidecar requires canonical runtime identity")
+    from agent.manager_http_server import plane_bound_manager_identity
+
+    project = project_id
+    url = _world_bound_governance_url(project, governance_url)
+    if storage_root is None:
+        if project == "aming-claw":
+            from agent.governance.db import _dev_runtime_root
+
+            storage_root = str(_dev_runtime_root(create=False))
+        else:
+            storage_root = str(_repo_root() / "shared-volume")
+    return plane_bound_manager_identity(project, url, storage_root)
 
 
 def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) -> list[str]:
@@ -141,23 +154,14 @@ def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) 
     ]
 
 
-def _shared_log_dir(project_id: str = "") -> Path:
-    selected_project = str(project_id or _default_project_id()).strip()
-    if selected_project == "aming-claw":
-        from agent.governance.db import _dev_runtime_root
-
-        return _dev_runtime_root(create=True) / "logs"
-    return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "logs"
+def _identity_log_dir(identity: dict) -> Path:
+    root = Path(identity["storage_root"])
+    return root / "logs" if identity["plane"] == "dev" else root / "codex-tasks" / "logs"
 
 
-def _signal_file_path(project_id: str = "") -> Path:
-    """Path to the manager restart signal file (manager_signal.json)."""
-    selected_project = str(project_id or _default_project_id()).strip()
-    if selected_project == "aming-claw":
-        from agent.governance.db import _dev_runtime_root
-
-        return _dev_runtime_root(create=True) / "manager_signal.json"
-    return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "state" / "manager_signal.json"
+def _identity_signal_file_path(identity: dict) -> Path:
+    root = Path(identity["storage_root"])
+    return root / "manager_signal.json" if identity["plane"] == "dev" else root / "codex-tasks" / "state" / "manager_signal.json"
 
 
 # ---------------------------------------------------------------------------
@@ -187,16 +191,19 @@ class ServiceManager:
         poll_interval: float = _POLL_INTERVAL,
         workspace: Optional[str] = None,
     ) -> None:
-        self.project_id = project_id or _default_project_id()
+        self.project_id = project_id if project_id is not None else _default_project_id()
         self.governance_url = _world_bound_governance_url(
             self.project_id,
             governance_url
             if governance_url is not None
             else os.getenv("GOVERNANCE_URL", ""),
         )
+        self.manager_identity: Optional[dict] = None
+        self.sidecar_port: Optional[int] = None
         self.reload_timeout = reload_timeout
         self.poll_interval = poll_interval
-        self.workspace = workspace or _default_workspace()
+        self.workspace_identity = bind_workspace_identity(workspace) if workspace else None
+        self.workspace = self.workspace_identity.root if self.workspace_identity else ""
 
         self._managed_executor = executor_cmd is None
         self._executor_cmd: list = executor_cmd or _default_executor_cmd(
@@ -227,6 +234,14 @@ class ServiceManager:
     # ------------------------------------------------------------------
     # start / stop
     # ------------------------------------------------------------------
+
+    def _bound_manager_identity(self) -> dict:
+        if self.manager_identity is None:
+            self.manager_identity = _plane_bound_manager_identity(
+                self.project_id, self.governance_url,
+            )
+            self.sidecar_port = int(self.manager_identity["sidecar_port"])
+        return self.manager_identity
 
     def start(self) -> bool:
         """Spawn the executor subprocess if it is not already running.
@@ -450,6 +465,10 @@ class ServiceManager:
             log.info("ServiceManager: sidecar already running")
             return
 
+        identity = self._bound_manager_identity()
+
+        # Bind the full launch identity immediately before a listening sidecar
+        # exists.  Construction alone is deliberately side-effect free.
         self._sidecar_crashed = False
 
         def _sidecar_runner():
@@ -465,8 +484,17 @@ class ServiceManager:
             """
             try:
                 from agent.manager_http_server import run_server
-                log.info("ServiceManager: sidecar thread starting manager_http_server")
-                run_server()
+                log.info(
+                    "ServiceManager: sidecar thread starting manager_http_server "
+                    "for %s/%s on %d",
+                    identity["plane"], self.project_id, self.sidecar_port,
+                )
+                run_server(
+                    port=self.sidecar_port,
+                    project_id=self.project_id,
+                    governance_url=self.governance_url,
+                    storage_root=identity["storage_root"],
+                )
             except Exception as exc:
                 log.error(
                     "ServiceManager: sidecar crashed (non-fatal, monitor loop continues): %s",
@@ -627,7 +655,7 @@ class ServiceManager:
         * Valid restart signal → stop current executor, start fresh one, delete
           signal file.  Does NOT increment circuit breaker (R5).
         """
-        signal_path = _signal_file_path(self.project_id)
+        signal_path = _identity_signal_file_path(self._bound_manager_identity())
         if not signal_path.exists():
             return
 
@@ -711,11 +739,25 @@ class ServiceManager:
 
     def _spawn_executor_process(self) -> subprocess.Popen:
         """Spawn the executor and redirect output to a persistent host log file."""
+        identity = self._bound_manager_identity()
+        if self._managed_executor and self.workspace_identity is None:
+            raise ValueError("managed executor requires an explicit workspace root")
         child_env = os.environ.copy()
+        for key in ("GOVERNANCE_URL", "EXECUTOR_PROJECT_ID", "PROJECT_ID",
+                    "SHARED_VOLUME_PATH", "EXECUTOR_API_PORT", "MANAGER_URL"):
+            child_env.pop(key, None)
+        child_env.update({
+            "GOVERNANCE_URL": identity["governance_url"],
+            "EXECUTOR_PROJECT_ID": identity["project_id"],
+            "PROJECT_ID": identity["project_id"],
+            "SHARED_VOLUME_PATH": identity["storage_root"],
+            "MANAGER_URL": identity["manager_url"],
+            "EXECUTOR_API_PORT": str(urlparse(identity["executor_url"]).port),
+        })
         if self._managed_executor:
             token = self._verified_executor_session_token()
             child_env[EXECUTOR_SESSION_TOKEN_ENV] = token
-        log_dir = _shared_log_dir(self.project_id)
+        log_dir = _identity_log_dir(identity)
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = log_dir / f"service-manager-executor-{self.project_id}.log"
         stderr_path = log_dir / f"service-manager-executor-{self.project_id}.err.log"
@@ -845,8 +887,6 @@ def _install_signal_handlers(stop_fn: Callable[[], None]) -> None:
 def main() -> None:
     import argparse
 
-    _load_env_file()
-
     parser = argparse.ArgumentParser(
         description="Host-side ServiceManager that supervises agent.executor_worker",
     )
@@ -857,9 +897,8 @@ def main() -> None:
         help="Governance base URL (use nginx entrypoint, e.g. http://localhost:40000)",
     )
     parser.add_argument(
-        "--workspace",
-        default=_default_workspace(),
-        help="Host workspace passed to executor_worker",
+        "--workspace-root", "--workspace", dest="workspace", default="",
+        help="Existing absolute workspace root passed to executor_worker",
     )
     parser.add_argument(
         "--status-only",
@@ -868,13 +907,39 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Bind the full plane/storage authority before creating any log directory,
+    # handler, status probe, thread, or subprocess.
+    identity = _plane_bound_manager_identity(args.project, args.governance_url)
+    workspace_identity = bind_workspace_identity(args.workspace) if args.workspace else None
+    _load_env_file()
+    for key, expected in {
+        "PROJECT_ID": identity["project_id"],
+        "EXECUTOR_PROJECT_ID": identity["project_id"],
+        "GOVERNANCE_URL": identity["governance_url"],
+        "MANAGER_URL": identity["manager_url"],
+        "EXECUTOR_API_PORT": str(urlparse(identity["executor_url"]).port),
+        "SHARED_VOLUME_PATH": identity["storage_root"],
+    }.items():
+        configured = os.getenv(key)
+        if configured and configured != expected:
+            raise ValueError(f"ServiceManager environment {key} crosses bound runtime identity")
+    manager = ServiceManager(
+        project_id=args.project,
+        governance_url=args.governance_url,
+        workspace=args.workspace,
+    )
+    manager.manager_identity = identity
+    manager.workspace_identity = workspace_identity
+    manager.workspace = workspace_identity.root if workspace_identity else ""
+    manager.sidecar_port = int(identity["sidecar_port"])
+
     # B48 FIX A (observer-hotfix 2026-04-23): Add RotatingFileHandler so SM logs
     # are captured to disk. Previously -WindowStyle Hidden + basicConfig with no
     # FileHandler silently discarded every SM log message. See
     # docs/dev/b48-investigation-and-fix-proposal.md §2.
     from logging.handlers import RotatingFileHandler
 
-    _log_dir = _shared_log_dir(args.project)
+    _log_dir = _identity_log_dir(identity)
     _log_dir.mkdir(parents=True, exist_ok=True)
     _sm_log_path = _log_dir / f"service-manager-{args.project}.log"
 
@@ -898,18 +963,11 @@ def main() -> None:
     )
     log.info("ServiceManager logging initialized: file=%s (B48 Fix A)", _sm_log_path)
 
-    manager = ServiceManager(
-        project_id=args.project,
-        governance_url=args.governance_url,
-        workspace=args.workspace,
-    )
-
     if args.status_only:
         print(manager.status())
         return
 
     os.environ.setdefault("GOVERNANCE_URL", args.governance_url)
-    os.environ.setdefault("CODEX_WORKSPACE", args.workspace)
     _install_signal_handlers(manager.stop)
 
     # R4: Start sidecar HTTP server before executor

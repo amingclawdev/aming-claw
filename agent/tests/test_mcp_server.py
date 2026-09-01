@@ -277,3 +277,17 @@ def test_tools_call_world_scope_gate_rejects_before_first_http(monkeypatch, tmp_
         {"project_id": "drift-gym"},
     ) == expected
     assert dev_calls == []
+
+
+@pytest.mark.parametrize("project_id", ["", " aming-claw", "aming-claw ", "amingClaw", "aming_claw"])
+def test_mcp_plane_identity_rejects_raw_noncanonical_project_ids(project_id):
+    with pytest.raises(ValueError):
+        stdio_mcp_server._canonical_governance_url(project_id, "")
+    with pytest.raises(ValueError):
+        stdio_mcp_server.AmingClawMCP(
+            project_id=project_id,
+            governance_url="",
+            workspace="/must-not-be-created",
+            redis_url="redis://127.0.0.1:40079/0",
+            max_workers=0,
+        )

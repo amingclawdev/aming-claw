@@ -30,7 +30,6 @@ import tempfile
 import time
 import argparse
 import threading
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -46,6 +45,12 @@ if _proj_root not in sys.path:
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
+from agent.runtime_plane import (
+    GitWorktreeIdentity, WorkspaceIdentity, bind_git_worktree_identity,
+    bind_workspace_identity, resolve_runtime_plane,
+    validate_current_git_worktree_identity, validate_current_workspace_identity,
+)
+
 log = logging.getLogger("executor_worker")
 
 # --- Configuration ---
@@ -55,7 +60,7 @@ log = logging.getLogger("executor_worker")
 GOVERNANCE_URL = os.getenv("GOVERNANCE_URL", "")
 POLL_INTERVAL = int(os.getenv("EXECUTOR_POLL_INTERVAL", "10"))
 WORKER_ID = os.getenv("EXECUTOR_WORKER_ID", f"executor-{os.getpid()}")
-WORKSPACE = os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[1]))
+WORKSPACE = ""
 
 # R2: MAX_CONCURRENT_WORKERS — configurable via env var, default 2, clamped to [1, 5]
 MAX_CONCURRENT_WORKERS = min(5, max(1, int(os.getenv("MAX_CONCURRENT_WORKERS", "2"))))
@@ -71,24 +76,10 @@ EXECUTOR_SESSION_TOKEN_ENV = "AMING_EXECUTOR_SESSION_TOKEN"
 
 
 def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str:
-    raw = str(project_id or "").strip()
-    canonical = re.sub(r"-+", "-", re.sub(r"[\s_]+", "-", raw)).lower().strip("-")
-    if canonical == "aming-claw" and raw != "aming-claw":
-        raise ValueError("AC executor project id must be exact aming-claw")
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", canonical):
-        raise ValueError("executor project id is invalid")
-    selected = str(requested_url or "").rstrip("/")
-    if canonical == "aming-claw":
-        expected = os.getenv(
-            "AC_DEV_GOVERNANCE_URL", "http://127.0.0.1:40008"
-        ).rstrip("/")
-        if selected and selected not in {expected, "http://localhost:40008"}:
-            raise ValueError("AC executor is bound exclusively to dev port 40008")
-        return expected
-    selected = selected or "http://127.0.0.1:40000"
-    if selected.endswith(":40008"):
-        raise ValueError("port 40008 is reserved to exact project aming-claw")
-    return selected
+    plane = resolve_runtime_plane(project_id)
+    if requested_url and requested_url != plane.governance_url:
+        raise ValueError("executor governance URL crosses the project runtime plane")
+    return plane.governance_url
 
 
 def _world_bound_log_root(project_id: str, workspace: str) -> Path:
@@ -96,7 +87,9 @@ def _world_bound_log_root(project_id: str, workspace: str) -> Path:
         from agent.governance.db import _dev_runtime_root
 
         return _dev_runtime_root(create=True) / "logs"
-    return Path(workspace or ".") / "shared-volume" / "codex-tasks" / "logs"
+    if not workspace:
+        raise ValueError("executor requires an explicit workspace")
+    return Path(workspace) / "shared-volume" / "codex-tasks" / "logs"
 
 
 def _world_bound_pid_path(project_id: str) -> Path:
@@ -415,11 +408,17 @@ class ExecutorWorker:
     def __init__(self, project_id: str, governance_url: str = GOVERNANCE_URL,
                  worker_id: str = WORKER_ID, workspace: str = WORKSPACE,
                  session_token: Optional[str] = None):
-        self.project_id = project_id
+        plane = resolve_runtime_plane(project_id)
+        self.workspace_identity = bind_workspace_identity(workspace)
+        self.project_id = plane.project_id
         self.base_url = _world_bound_governance_url(project_id, governance_url)
         self.worker_id = worker_id
-        self.workspace = workspace
-        self.log_root = _world_bound_log_root(project_id, workspace)
+        self.workspace = self.workspace_identity.root
+        self._root_git_identity: Optional[GitWorktreeIdentity] = None
+        # task id -> immutable Git identity.  Children may only receive the
+        # exact registered identity of their logical root task.
+        self._task_worktrees: Dict[str, GitWorktreeIdentity] = {}
+        self.log_root = _world_bound_log_root(self.project_id, self.workspace)
         self._session_token = str(
             os.getenv(EXECUTOR_SESSION_TOKEN_ENV, "")
             if session_token is None
@@ -432,6 +431,100 @@ class ExecutorWorker:
         self._consecutive_empty_polls = 0  # tracks consecutive polls with no task
         self._start_time = time.monotonic()
         self.last_claimed_at = time.monotonic()  # R5: tracked by ServiceManager watchdog
+
+    def _validated_workspace(self) -> str:
+        return validate_current_workspace_identity(self.workspace_identity).root
+
+    def _register_task_worktree(self, task_id: str, worktree_path: str,
+                                logical_task_id: str = "") -> str:
+        """Register a newly materialized Git worktree for one logical task."""
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task id is required for worktree registration")
+        logical_task_id = logical_task_id or task_id
+        worktree = bind_git_worktree_identity(worktree_path, logical_task_id)
+        root = Path(self._validated_workspace())
+        if not Path(worktree.workspace.root).is_relative_to(root):
+            raise ValueError("task worktree escapes executor workspace")
+        existing = self._task_worktrees.get(task_id)
+        if existing is not None and existing != worktree:
+            raise ValueError("task already has a different registered worktree identity")
+        self._task_worktrees[task_id] = worktree
+        return worktree.workspace.root
+
+    def _handoff_task_worktree(self, parent_task_id: str, task_id: str,
+                               candidate: str) -> str:
+        """Bind a child to its parent's live immutable worktree identity.
+
+        Metadata paths are merely untrusted routing claims.  The parent must
+        already be registered in this executor and the claimed path must match
+        the live physical and Git facts before the child receives authority.
+        """
+        parent = self._task_worktrees.get(parent_task_id)
+        if parent is None:
+            raise ValueError("parent task has no registered worktree identity")
+        if candidate != parent.workspace.root:
+            raise ValueError("child worktree claim does not match parent identity")
+        validate_current_git_worktree_identity(parent)
+        existing = self._task_worktrees.get(task_id)
+        if existing is not None and existing != parent:
+            raise ValueError("child task already has a different worktree identity")
+        self._task_worktrees[task_id] = parent
+        return parent.workspace.root
+
+    def _validated_task_worktree(self, task_id: str, candidate: str) -> str:
+        worktree = self._task_worktrees.get(task_id)
+        if worktree is None or candidate != worktree.workspace.root:
+            raise ValueError("task has no bound worktree identity")
+        validate_current_git_worktree_identity(worktree)
+        if not Path(worktree.workspace.root).is_relative_to(Path(self._validated_workspace())):
+            raise ValueError("task worktree escapes executor workspace")
+        return worktree.workspace.root
+
+    def _revalidate_effect_workspace(self, task_id: str, candidate: str) -> str:
+        """Authorize one imminent custody effect against live Git identity.
+
+        Effects never trust metadata paths.  Task-owned worktrees must have a
+        registered receipt; the executor root is bound to its own explicit
+        logical authority only when the effect is about to run.
+        """
+        if candidate == self.workspace:
+            root = self._validated_workspace()
+            if getattr(self, "_root_git_identity", None) is None:
+                self._root_git_identity = bind_git_worktree_identity(root, "executor-root")
+            validate_current_git_worktree_identity(self._root_git_identity)
+            return self._root_git_identity.workspace.root
+        if task_id in self._task_worktrees:
+            return self._validated_task_worktree(task_id, candidate)
+        raise ValueError("effect workspace has no registered task identity")
+
+    def _write_version_file(self, task_id: str, version_path: str, content: str) -> None:
+        """Write VERSION only after a final root identity revalidation."""
+        self._revalidate_effect_workspace(task_id, self.workspace)
+        with open(version_path, "w") as handle:
+            handle.write(content)
+
+    def _registered_cleanup_identity(self, worktree_path: str) -> GitWorktreeIdentity:
+        """Return the sole live receipt eligible to authorize cleanup.
+
+        Cleanup must never turn an arbitrary path into an authority.  Several
+        task ids may hand off the same immutable receipt, but there may be only
+        one distinct identity and the supplied pathname must be its exact
+        canonical root.
+        """
+        if not isinstance(worktree_path, str) or not worktree_path:
+            raise ValueError("cleanup requires an exact registered worktree path")
+        identities = {
+            identity
+            for identity in self._task_worktrees.values()
+            if identity.workspace.root == worktree_path
+        }
+        if len(identities) != 1:
+            raise ValueError("cleanup worktree is unregistered or ambiguous")
+        identity = identities.pop()
+        # This rechecks root path/device/inode and Git root/common-dir/git-dir
+        # before either Git or filesystem cleanup can be attempted.
+        validate_current_git_worktree_identity(identity)
+        return identity
 
     def _api(self, method: str, path: str, data: dict = None, timeout: Optional[int] = None) -> dict:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
@@ -588,7 +681,7 @@ class ExecutorWorker:
 
         worktree_path = None
         branch_name = None
-        execution_workspace = self.workspace
+        execution_workspace = self._validated_workspace()
         try:
             attempt_num = int(task.get("attempt_num") or metadata.get("attempt_num") or 1)
         except Exception:
@@ -602,7 +695,7 @@ class ExecutorWorker:
                 attempt_num=attempt_num,
             )
             if worktree_path:
-                execution_workspace = worktree_path
+                execution_workspace = self._validated_task_worktree(task_id, worktree_path)
                 _timing(f"worktree: created {worktree_path}")
             else:
                 reason = "worktree creation returned (None, None)"
@@ -615,8 +708,12 @@ class ExecutorWorker:
         elif task_type in ("test", "qa"):
             inherited_worktree = metadata.get("_worktree", "")
             inherited_branch = metadata.get("_branch", "")
-            if inherited_worktree and os.path.isdir(inherited_worktree):
-                execution_workspace = inherited_worktree
+            if inherited_worktree:
+                parent_task_id = metadata.get("parent_task_id", "")
+                if not parent_task_id:
+                    raise ValueError("child worktree handoff requires parent_task_id")
+                self._handoff_task_worktree(parent_task_id, task_id, inherited_worktree)
+                execution_workspace = self._validated_task_worktree(task_id, inherited_worktree)
                 worktree_path = inherited_worktree
                 branch_name = inherited_branch
                 _timing(f"worktree: reusing {inherited_worktree}")
@@ -671,6 +768,7 @@ class ExecutorWorker:
             self._lifecycle = AILifecycleManager()
 
         _t1 = _time.time()
+        execution_workspace = self._revalidate_effect_workspace(task_id, execution_workspace)
         session = self._lifecycle.create_session(
             role=role,
             prompt=enhanced_prompt,
@@ -711,6 +809,7 @@ class ExecutorWorker:
             _timing(f"git_diff: skipped ({task_type})")
         else:
             _timing("git_diff: starting")
+            execution_workspace = self._revalidate_effect_workspace(task_id, execution_workspace)
             changed_files = self._get_git_changed_files(cwd=execution_workspace)
             _timing(f"git_diff: done, {len(changed_files)} files")
 
@@ -718,6 +817,7 @@ class ExecutorWorker:
         if changed_files:
             try:
                 import subprocess
+                execution_workspace = self._revalidate_effect_workspace(task_id, execution_workspace)
                 subprocess.run(
                     ["git", "add", "--"] + changed_files,
                     cwd=execution_workspace,
@@ -877,10 +977,14 @@ class ExecutorWorker:
         import shlex
 
         # Determine execution workspace (inherit worktree from dev stage)
-        execution_workspace = self.workspace
+        execution_workspace = self._validated_workspace()
         inherited_worktree = metadata.get("_worktree", "")
-        if inherited_worktree and os.path.isdir(inherited_worktree):
-            execution_workspace = inherited_worktree
+        if inherited_worktree:
+            parent_task_id = metadata.get("parent_task_id", "")
+            if not parent_task_id:
+                return {"status": "failed", "error": "child worktree handoff requires parent_task_id"}
+            self._handoff_task_worktree(parent_task_id, task_id, inherited_worktree)
+            execution_workspace = self._validated_task_worktree(task_id, inherited_worktree)
 
         if _is_reconcile_cluster_without_tests(metadata):
             return {
@@ -966,6 +1070,7 @@ class ExecutorWorker:
         test_env = {**os.environ, "PYTHONPATH": _new_pp}
 
         try:
+            execution_workspace = self._revalidate_effect_workspace(task_id, execution_workspace)
             proc = _sp.run(
                 cmd,
                 cwd=execution_workspace,
@@ -1035,6 +1140,19 @@ class ExecutorWorker:
         merge_target_ref = reconcile_target_branch or "HEAD"
         merge_target_label = reconcile_target_branch or "main"
         self._report_progress(task_id, {"step": "merging"})
+
+        # A merge is a custody effect.  The branch/worktree pair must resolve
+        # to the live identity handed off by its producing task, never merely
+        # to a metadata pathname.
+        if branch and worktree:
+            parent_task_id = metadata.get("parent_task_id", "")
+            if not parent_task_id:
+                return {"status": "failed", "error": "merge worktree handoff requires parent_task_id"}
+            try:
+                self._handoff_task_worktree(parent_task_id, task_id, worktree)
+                worktree = self._revalidate_effect_workspace(task_id, worktree)
+            except ValueError as exc:
+                return {"status": "failed", "error": f"merge worktree identity rejected: {exc}"}
 
         # Chained merge without isolation metadata: check if changes already on main
         if metadata.get("parent_task_id") and not branch:
@@ -1118,6 +1236,7 @@ class ExecutorWorker:
                 worktree_available = bool(worktree and os.path.isdir(worktree))
                 branch_already_merged = False
                 if worktree_available:
+                    worktree = self._revalidate_effect_workspace(task_id, worktree)
                     subprocess.run(["git", "add", "-A"],
                                    cwd=worktree, capture_output=True, timeout=30)
                     status = subprocess.run(["git", "diff", "--cached", "--name-only"],
@@ -1125,6 +1244,7 @@ class ExecutorWorker:
                     staged = [f.strip() for f in status.stdout.splitlines() if f.strip()]
                     if staged:
                         msg = f"dev: {task_id}\n\nChanged files: {', '.join(staged[:10])}"
+                        worktree = self._revalidate_effect_workspace(task_id, worktree)
                         commit_proc = subprocess.run(["git", "commit", "-m", msg],
                                                      cwd=worktree, capture_output=True, text=True, timeout=30)
                         if commit_proc.returncode != 0:
@@ -1165,12 +1285,19 @@ class ExecutorWorker:
                     )
                     if not integration_worktree:
                         return {"status": "failed", "error": f"Integration worktree setup failed: {create_error[:300]}"}
+                    integration_worktree = self._register_task_worktree(
+                        f"{task_id}:integration", integration_worktree, logical_task_id=task_id
+                    )
+                    integration_worktree = self._revalidate_effect_workspace(
+                        f"{task_id}:integration", integration_worktree
+                    )
 
                     # Use chain_trailer for merge with 4-field trailer (Phase A §4.4)
                     from agent.governance.chain_trailer import write_merge_with_trailer, get_chain_state
                     chain_state = get_chain_state(cwd=integration_worktree)
                     parent_chain_sha = chain_state.get("chain_sha", "")
                     bug_id = metadata.get("bug_id", "") or metadata.get("chain_bug_id", "")
+                    self._revalidate_effect_workspace(f"{task_id}:integration", integration_worktree)
                     success, merge_commit, err = write_merge_with_trailer(
                         message=f"Auto-merge: {task_id}",
                         branch=branch,
@@ -1182,6 +1309,7 @@ class ExecutorWorker:
                         return {"status": "failed", "error": f"Merge conflict: {err[:300]}"}
 
                     if reconcile_target_branch:
+                        self._revalidate_effect_workspace(task_id, self.workspace)
                         ff_proc = subprocess.run(
                             ["git", "branch", "-f", reconcile_target_branch, merge_commit],
                             cwd=self.workspace, capture_output=True, text=True, timeout=30)
@@ -1208,9 +1336,11 @@ class ExecutorWorker:
                     # B20: Clean leaked staged/untracked files before ff-only merge
                     try:
                         # Unstage any leaked files from worktree contamination
+                        self._revalidate_effect_workspace(task_id, self.workspace)
                         subprocess.run(["git", "reset", "HEAD", "--"],
                                        cwd=self.workspace, capture_output=True, timeout=10)
                         # Remove untracked files that conflict with merge
+                        self._revalidate_effect_workspace(f"{task_id}:integration", integration_worktree)
                         merge_files = subprocess.run(
                             ["git", "diff", "--name-only", "HEAD", merge_commit],
                             cwd=integration_worktree, capture_output=True, text=True, timeout=10
@@ -1218,17 +1348,20 @@ class ExecutorWorker:
                         for f in merge_files:
                             untracked = os.path.join(self.workspace, f)
                             if os.path.exists(untracked):
+                                self._revalidate_effect_workspace(task_id, self.workspace)
                                 tracked = subprocess.run(
                                     ["git", "ls-files", f],
                                     cwd=self.workspace, capture_output=True, text=True, timeout=5
                                 ).stdout.strip()
                                 if not tracked:
+                                    self._revalidate_effect_workspace(task_id, self.workspace)
                                     os.remove(untracked)
                                     log.info("merge: removed untracked %s before ff-only", f)
                     except Exception as e:
                         log.warning("merge: pre-ff cleanup failed (non-fatal): %s", e)
 
                     # Advance real workspace main to the merge commit via ff-only
+                    self._revalidate_effect_workspace(task_id, self.workspace)
                     ff_proc = subprocess.run(
                         ["git", "merge", "--ff-only", merge_commit],
                         cwd=self.workspace, capture_output=True, text=True, timeout=30)
@@ -1268,13 +1401,16 @@ class ExecutorWorker:
 
             # Stage changed files (or all if none specified)
             if changed:
+                self._revalidate_effect_workspace(task_id, self.workspace)
                 subprocess.run(["git", "add", "--"] + changed,
                                cwd=self.workspace, capture_output=True, timeout=30)
             else:
+                self._revalidate_effect_workspace(task_id, self.workspace)
                 subprocess.run(["git", "add", "-A"],
                                cwd=self.workspace, capture_output=True, timeout=30)
 
             # Check if there's anything to commit
+            self._revalidate_effect_workspace(task_id, self.workspace)
             status = subprocess.run(["git", "diff", "--cached", "--name-only"],
                                     cwd=self.workspace, capture_output=True, text=True, timeout=10)
             staged = [f.strip() for f in status.stdout.splitlines() if f.strip()]
@@ -1288,9 +1424,11 @@ class ExecutorWorker:
             # Commit with 4-field Chain trailer (Phase A §4.4)
             msg = f"Auto-merge: {task_id}\n\nChanged files: {', '.join(staged[:10])}"
             from agent.governance.chain_trailer import write_merge_with_trailer, get_chain_state
+            self._revalidate_effect_workspace(task_id, self.workspace)
             chain_state = get_chain_state(cwd=self.workspace)
             parent_chain_sha = chain_state.get("chain_sha", "")
             bug_id = metadata.get("bug_id", "") or metadata.get("chain_bug_id", "")
+            self._revalidate_effect_workspace(task_id, self.workspace)
             success, commit_hash, err = write_merge_with_trailer(
                 message=msg, cwd=self.workspace,
                 task_id=task_id,
@@ -1312,14 +1450,16 @@ class ExecutorWorker:
                 # 1. Update VERSION file
                 ver_path = os.path.join(self.workspace, "VERSION")
                 if os.path.exists(ver_path):
+                    self._revalidate_effect_workspace(task_id, self.workspace)
                     with open(ver_path) as f:
                         content = f.read()
                     import re as _re
                     content = _re.sub(r'CHAIN_VERSION=\S+', f'CHAIN_VERSION={commit_hash}', content)
-                    with open(ver_path, 'w') as f:
-                        f.write(content)
+                    self._write_version_file(task_id, ver_path, content)
                     # Amend commit to include VERSION
+                    self._revalidate_effect_workspace(task_id, self.workspace)
                     subprocess.run(["git", "add", "VERSION"], cwd=self.workspace, capture_output=True, timeout=10)
+                    self._revalidate_effect_workspace(task_id, self.workspace)
                     subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=self.workspace, capture_output=True, timeout=10)
                     # Re-read hash after amend
                     rev2 = subprocess.run(["git", "rev-parse", "HEAD"],
@@ -1493,6 +1633,9 @@ class ExecutorWorker:
             from deploy_chain import run_deploy
 
             chat_id = int(metadata.get("chat_id", 0) or 0)
+            # Deploy consumes HEAD/workspace and can restart services; bind it
+            # to the current physical Git root immediately before invocation.
+            self._revalidate_effect_workspace(task_id, self.workspace)
             expected_head = self._resolve_deploy_expected_head(metadata)
             report = run_deploy(
                 changed,
@@ -1853,7 +1996,7 @@ class ExecutorWorker:
             if target_files:
                 parts.append(f"\n## Target Files Preview")
                 for tf in target_files[:3]:
-                    tf_path = os.path.join(self.workspace or ".", tf)
+                    tf_path = os.path.join(self.workspace, tf)
                     try:
                         with open(tf_path, "r", encoding="utf-8", errors="replace") as f:
                             lines = f.readlines()
@@ -2472,31 +2615,51 @@ class ExecutorWorker:
             )
             if proc.returncode != 0:
                 return None, None
-            return worktree_dir, branch_name
+            # The identity is captured only after git has materialized the path.
+            return self._register_task_worktree(task_id, worktree_dir), branch_name
         except Exception:
             return None, None
 
-    def _remove_worktree(self, worktree_path: str, branch_name: str, delete_branch: bool = True) -> None:
-        """Remove worktree and optionally delete its branch."""
+    def _remove_worktree(self, worktree_path: str, branch_name: str,
+                         delete_branch: bool = True) -> bool:
+        """Remove only the exact, live registered worktree; otherwise no-op.
+
+        The old fallback ``rmtree`` made a stale or unregistered pathname a
+        deletion capability.  Git owns cleanup for registered Git worktrees;
+        any missing receipt, symlink, inode change, or Git topology drift is a
+        fail-closed no-effect result.
+        """
         try:
-            if worktree_path and os.path.isdir(worktree_path):
-                subprocess.run(
-                    ["git", "worktree", "remove", worktree_path, "--force"],
-                    cwd=self.workspace,
-                    capture_output=True,
-                    timeout=30,
-                )
-            elif worktree_path and os.path.exists(worktree_path):
-                shutil.rmtree(worktree_path, ignore_errors=True)
+            identity = self._registered_cleanup_identity(worktree_path)
+            if not os.path.isdir(identity.workspace.root):
+                raise ValueError("registered cleanup worktree is not a directory")
+            subprocess.run(
+                ["git", "worktree", "remove", identity.workspace.root, "--force"],
+                cwd=self.workspace,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if os.path.exists(identity.workspace.root):
+                raise ValueError("Git did not remove registered worktree")
             if delete_branch and branch_name:
+                self._revalidate_effect_workspace("cleanup-root", self.workspace)
                 subprocess.run(
                     ["git", "branch", "-D", branch_name],
                     cwd=self.workspace,
                     capture_output=True,
                     timeout=10,
+                    check=False,
                 )
-        except Exception:
-            pass
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            log.warning("worktree cleanup refused: %s", exc)
+            return False
+
+        # Only a successful physical Git removal retires every shared handoff.
+        for task_id, registered in list(self._task_worktrees.items()):
+            if registered == identity:
+                self._task_worktrees.pop(task_id, None)
+        return True
 
     def _create_integration_worktree(self, task_id: str, base_ref: str = "HEAD"):
         """Create a clean integration worktree used only for merge verification."""
@@ -3371,13 +3534,13 @@ class WorkerPool:
 
 def main():
     parser = argparse.ArgumentParser(description="Executor Worker - polls governance for tasks")
-    parser.add_argument("--project", "-p", default=os.getenv("PROJECT_ID", "aming-claw"),
+    parser.add_argument("--project", "-p", required=True,
                         help="Project ID to poll tasks from")
     parser.add_argument("--url", default=GOVERNANCE_URL,
                         help="Governance API URL")
     parser.add_argument("--worker-id", default=WORKER_ID,
                         help="Worker identifier")
-    parser.add_argument("--workspace", default=WORKSPACE,
+    parser.add_argument("--workspace", required=True,
                         help="Working directory for task execution")
     parser.add_argument("--once", action="store_true",
                         help="Execute one task and exit (no loop)")

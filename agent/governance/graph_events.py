@@ -187,7 +187,15 @@ SEMANTIC_PROJECTION_RULE_VERSION = "semantic_projection_v3_branch_timeline"
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(GRAPH_EVENTS_SCHEMA_SQL)
+    from . import db
+
+    if db.dev_runtime_verify_only() and not db.graph_materialization_admission_active(conn):
+        db.verify_graph_materialization_schema(conn)
+        return
+    if db.graph_materialization_admission_active(conn):
+        db.execute_graph_schema_sql(conn, GRAPH_EVENTS_SCHEMA_SQL)
+    else:
+        conn.executescript(GRAPH_EVENTS_SCHEMA_SQL)
     _ensure_graph_event_columns(conn)
     _ensure_semantic_projection_columns(conn)
 

@@ -45,10 +45,15 @@ from .db import (
     AC_PROJECT_ID,
     AC_DATABASE_STABLE_RELATIVE_PATH,
     canonical_ac_database_identity,
+    classify_graph_materialization_preimage,
     DevRuntimeSchemaVerificationError,
+    admit_ac_dev_graph_materialization_schema,
+    dev_runtime_verify_only,
     get_connection,
     acquire_dev_runtime_writer_lease,
     release_dev_runtime_writer_lease,
+    validate_dev_launch_receipt,
+    dev_issuance_ancestry_anchor_commit,
     DBContext,
     independent_connection,
     sqlite_write_lock,
@@ -56,6 +61,14 @@ from .db import (
     validate_project_id_syntax,
     registered_public_safe_external_project,
     verify_existing_schema_capabilities,
+    ensure_backlog_read_schema as _db_ensure_backlog_read_schema,
+    BACKLOG_READ_SCHEMA_INDEX_SQL as _BACKLOG_READ_SCHEMA_INDEX_SQL,
+    BACKLOG_READ_SCHEMA_TABLE_DEFINITION as _BACKLOG_READ_SCHEMA_TABLE_DEFINITION,
+    BACKLOG_READ_SCHEMA_TABLE_XINFO as _BACKLOG_READ_SCHEMA_TABLE_XINFO,
+    BACKLOG_READ_SCHEMA_TABLE_SQL as _BACKLOG_READ_SCHEMA_TABLE_SQL,
+    BACKLOG_READ_SCHEMA_RESOURCE as _BACKLOG_READ_SCHEMA_RESOURCE,
+    BACKLOG_READ_SCHEMA_SEED_SQL as _BACKLOG_READ_SCHEMA_SEED_SQL,
+    BACKLOG_READ_SCHEMA_TRIGGER_SQL as _BACKLOG_READ_SCHEMA_TRIGGER_SQL,
     _dev_runtime_root,
 )
 from . import role_service
@@ -84,6 +97,9 @@ from .contracts.runtime import (
     ContractRetirementError,
     ContractRuntime,
     ContractRuntimeError,
+    CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS,
+    CANONICAL_REF_ADOPTION_QA_PAYLOAD_REQUIRED_KEYS,
+    CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
     LINE_EVIDENCE_OPTIONAL_FIELDS,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS,
@@ -138,6 +154,7 @@ from agent.mcp.schema_contract import (
     mcp_tool_schema_compatibility,
     qa_session_register_http_fallback,
 )
+from agent.runtime_plane import graph_activation_policy
 
 import os
 import errno
@@ -755,11 +772,19 @@ def _runtime_plane_identity() -> dict[str, Any]:
     )
     violations: list[str] = []
     database_identity: dict[str, object] = {}
+    dev_issuance_anchor = ""
     if plane in {"stable", "dev"}:
         try:
             database_identity = canonical_ac_database_identity()
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             violations.append("database_identity_invalid")
+    if plane == "dev":
+        try:
+            dev_issuance_anchor = dev_issuance_ancestry_anchor_commit(
+                os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", "")
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            violations.append("dev_issuance_ancestry_anchor_invalid")
     if plane not in {"generic", "stable", "dev"}:
         violations.append("runtime_plane_unsupported")
     elif plane == "dev":
@@ -791,7 +816,13 @@ def _runtime_plane_identity() -> dict[str, Any]:
             violations.append("stable_anchor_mismatch")
     elif git_identity["branch"] == AC_DEV_BRANCH:
         violations.append("ac_dev_checkout_requires_explicit_dev_plane")
-    return {
+    try:
+        activation_policy = graph_activation_policy(plane)
+    except ValueError:
+        # Unsupported/generic planes are already reported in ``violations``;
+        # never advertise authority to activate graph truth from them.
+        activation_policy = {"active_graph_activation_allowed": False}
+    identity = {
         "schema_version": "ac_runtime_plane_identity.v1",
         "plane": plane,
         "port": PORT,
@@ -811,13 +842,18 @@ def _runtime_plane_identity() -> dict[str, Any]:
         "stable_database_identity": database_identity if plane == "stable" else {},
         "project_allowlist": ["aming-claw"] if plane == "dev" else [],
         "schema_policy": "source_bootstrap_then_verify_only" if plane == "dev" else "managed",
-        "active_graph_activation_allowed": True,
+        "active_graph_activation_allowed": bool(
+            activation_policy["active_graph_activation_allowed"]
+        ),
         "stable_deploy_allowed": plane != "dev",
         "background_workers_enabled": plane != "dev",
         "background_worker_policy": "dedicated_dev_world_only" if plane == "dev" else "stable_multi_project",
         "status": "ready" if not violations else "invalid",
         "violations": violations,
     }
+    if plane == "dev":
+        identity["dev_issuance_ancestry_anchor_commit"] = dev_issuance_anchor
+    return identity
 
 
 def _validate_runtime_plane_startup() -> dict[str, Any]:
@@ -854,25 +890,28 @@ def _validate_runtime_plane_startup() -> dict[str, Any]:
     runtime_home = Path(runtime_home_raw).expanduser().resolve()
     if runtime_home == root or root in runtime_home.parents:
         raise GovernanceSingletonError("ac_dev_runtime_home_must_be_outside_worktree")
+    issuance_anchor = str(
+        identity.get("dev_issuance_ancestry_anchor_commit") or ""
+    ).strip().lower()
     try:
-        ancestry = subprocess.run(
-            [
-                "git",
-                "merge-base",
-                "--is-ancestor",
-                current_stable_commit,
-                str(identity["commit"]),
-            ],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        stable_ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", issuance_anchor,
+             current_stable_commit], cwd=root, capture_output=True, text=True,
+            timeout=5, check=False,
+        )
+        dev_ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", issuance_anchor,
+             str(identity["commit"])], cwd=root, capture_output=True, text=True,
+            timeout=5, check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise GovernanceSingletonError("ac_dev_stable_anchor_unverifiable") from exc
-    if ancestry.returncode != 0:
-        raise GovernanceSingletonError("ac_dev_stable_anchor_not_ancestor")
+        raise GovernanceSingletonError("ac_dev_issuance_anchor_unverifiable") from exc
+    if stable_ancestry.returncode != 0:
+        raise GovernanceSingletonError(
+            "ac_dev_issuance_anchor_not_live_stable_ancestor"
+        )
+    if dev_ancestry.returncode != 0:
+        raise GovernanceSingletonError("ac_dev_issuance_anchor_not_dev_ancestor")
     try:
         conn = get_connection("aming-claw")
     except Exception as exc:
@@ -3690,6 +3729,7 @@ def _dev_write_path_allowed(path: str) -> bool:
         "/api/projects/aming-claw/onboard-route-guide/capsule",
         "/api/projects/aming-claw/observer/route-context/issue",
         "/api/projects/aming-claw/observer/route-context/renew",
+        "/api/projects/aming-claw/observer-sessions/register",
         "/api/graph-governance/aming-claw/query",
         "/api/graph-governance/aming-claw/query-traces/start",
         "/api/graph-governance/aming-claw/reconcile/full",
@@ -3929,8 +3969,10 @@ def _guard_dev_runtime_request(
 ) -> str | None:
     """Enforce the dev plane before a handler opens a DB or mutates state."""
 
-    if _runtime_plane() != "dev":
+    runtime_plane = _runtime_plane()
+    if runtime_plane != "dev":
         return None
+    activation_policy = graph_activation_policy(runtime_plane)
     external_route = _dev_external_discovery_request(
         method=method,
         path=path,
@@ -3967,12 +4009,46 @@ def _guard_dev_runtime_request(
             ),
         )
 
+    if path == "/api/projects/aming-claw/observer-sessions/register":
+        required = {"project_id", "route_token_ref", "backlog_id", "task_id", "cex_id"}
+        self_claims = {
+            "capabilities", "allowed_actions", "observer_kind", "pid", "cwd",
+            "session_id", "route_id", "route_context_hash", "prompt_contract_id",
+        }
+        missing = sorted(key for key in required if not str(body.get(key) or "").strip())
+        claimed = sorted(key for key in self_claims if key in body)
+        unknown = sorted(set(body) - required - {"session_label"})
+        if missing or claimed or unknown:
+            raise _dev_runtime_zero_write_rejection(
+                code="ac_dev_observer_session_registration_shape_rejected",
+                path=path,
+                detail=(
+                    "dev observer registration requires exact route-bound identity "
+                    f"(missing={missing}, self_claims={claimed}, unknown={unknown})"
+                ),
+            )
+
     if path == "/api/projects/aming-claw/observer/route-context/issue":
-        _ac_dev_direct_route_issue_precheck_from_request(
-            project_id="aming-claw",
-            body=body,
-            query={},
-        )
+        # Canonical adoption has a separate closed authority parser in the
+        # handler.  Do not run the Direct guide-copy precheck in front of it:
+        # that would make a valid canonical request unreachable on 40008.
+        # Shape errors deliberately continue to the handler's zero-write
+        # rejection instead of being reinterpreted as Direct bootstrap.
+        try:
+            request_kind = _observer_route_context_issue_request_kind(body)
+        except ValueError:
+            request_kind = "canonical_rejection"
+        if request_kind == "completed_source_free_system_operation":
+            _ac_dev_completed_source_free_route_issue_precheck_from_request(
+                project_id="aming-claw",
+                body=body,
+            )
+        elif request_kind == "direct_bootstrap":
+            _ac_dev_direct_route_issue_precheck_from_request(
+                project_id="aming-claw",
+                body=body,
+                query={},
+            )
     if path == "/api/projects/aming-claw/observer/route-context/renew":
         _ac_dev_direct_route_renew_precheck_from_request(
             project_id="aming-claw",
@@ -4016,7 +4092,10 @@ def _guard_dev_runtime_request(
         "/reconcile/backfill-escape",
         "/finalize",
     )
-    if any(marker in path for marker in always_activate_paths):
+    if (
+        any(marker in path for marker in always_activate_paths)
+        and activation_policy["active_graph_activation_allowed"] is not True
+    ):
         raise _dev_runtime_zero_write_rejection(
             code="ac_dev_active_graph_mutation_forbidden",
             path=path,
@@ -4027,7 +4106,10 @@ def _guard_dev_runtime_request(
         activate_requested = body.get("activate", True) is not False
     elif path.endswith("/reconcile/pending-scope/catch-up"):
         activate_requested = body.get("activate", True) is not False
-    if activate_requested:
+    if (
+        activate_requested
+        and activation_policy["active_graph_activation_allowed"] is not True
+    ):
         raise _dev_runtime_zero_write_rejection(
             code="ac_dev_active_graph_mutation_forbidden",
             path=path,
@@ -4364,7 +4446,9 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
         "stable_anchor_commit": expected_anchor,
         "project_allowlist": [],
         "schema_policy": "managed",
-        "active_graph_activation_allowed": True,
+        "active_graph_activation_allowed": graph_activation_policy("stable")[
+            "active_graph_activation_allowed"
+        ],
         "stable_deploy_allowed": True,
         "background_workers_enabled": True,
         "status": "ready",
@@ -7000,22 +7084,51 @@ def _observer_error(exc: Exception):
 
 @route("POST", "/api/projects/{project_id}/observer-sessions/register")
 def handle_observer_session_register(ctx: RequestContext):
+    from . import observer_route_context
+
     project_id = ctx.get_project_id()
     conn = get_connection(project_id)
     try:
         with sqlite_write_lock():
+            capabilities = None
+            observer_kind = str(ctx.body.get("observer_kind") or "codex")
+            pid = int(ctx.body.get("pid") or 0)
+            cwd = str(ctx.body.get("cwd") or "")
+            session_id = str(ctx.body.get("session_id") or "") or None
+            if _runtime_plane() == "dev":
+                capabilities = observer_route_context.resolve_observer_session_registration_route(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
+                    route_token_ref=str(ctx.body.get("route_token_ref") or ""),
+                    backlog_id=str(ctx.body.get("backlog_id") or ""),
+                    task_id=str(ctx.body.get("task_id") or ""),
+                    cex_id=str(ctx.body.get("cex_id") or ""),
+                )
+                observer_kind = "codex"
+                pid = 0
+                cwd = ""
+                session_id = None
             result = observer_session.register_session(
                 conn,
                 project_id=project_id,
-                observer_kind=str(ctx.body.get("observer_kind") or "codex"),
+                observer_kind=observer_kind,
                 session_label=str(ctx.body.get("session_label") or ""),
-                pid=int(ctx.body.get("pid") or 0),
-                cwd=str(ctx.body.get("cwd") or ""),
-                capabilities=ctx.body.get("capabilities")
-                if isinstance(ctx.body.get("capabilities"), (dict, list))
-                else None,
-                session_id=str(ctx.body.get("session_id") or "") or None,
+                pid=pid,
+                cwd=cwd,
+                capabilities=(capabilities if capabilities is not None else (
+                    ctx.body.get("capabilities")
+                    if isinstance(ctx.body.get("capabilities"), (dict, list))
+                    else None
+                )),
+                session_id=session_id,
             )
+    except observer_route_context.RouteTokenRefError as exc:
+        return 403, {
+            "ok": False,
+            "error": str(getattr(exc, "code", "observer_registration_route_rejected")),
+            "message": "observer registration route authority rejected",
+        }
     except Exception as exc:
         return _observer_error(exc)
     return 201, {"project_id": project_id, **result}
@@ -7678,6 +7791,631 @@ _OBSERVER_ROUTE_CONTEXT_GRAPH_FIRST_ENTRY_ACTIONS = {
     "mf_parallel_enter",
     "mf_batch_parallel_enter",
 }
+
+_CANONICAL_REF_ADOPTION_ACTION = "canonical_ref_adoption"
+_CANONICAL_REF_ADOPTION_SCHEMA = "canonical_ref_adoption_route_bound.v1"
+
+# These flags are an authority contract for the persisted QA Fact, rather than
+# optional diagnostics.  Keep the list source-owned and deliberately local to
+# canonical adoption: accepting a missing field (or an almost-identical field)
+# would silently turn an older/caller-shaped projection into authority.
+def _canonical_ref_adoption_qa_payload_is_exact(value: Any) -> bool:
+    """Validate the closed, ContractRuntime-owned QA adoption projection.
+
+    This is intentionally a new compact payload, not a fuzzy scan of an
+    arbitrary QA evidence object.  It is overwritten by ContractRuntime on an
+    authenticated independent-QA write, has no extension namespace, and is
+    recursively closed so typo/case/confusable/nested-key variants cannot be
+    interpreted as authority at the adoption boundary.
+    """
+    if type(value) is not dict or set(value) != CANONICAL_REF_ADOPTION_QA_PAYLOAD_REQUIRED_KEYS:
+        return False
+    if value.get("schema_version") != CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION:
+        return False
+    if not all(
+        type(value.get(key)) is str
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value[key])
+        for key in ("candidate_commit_sha", "candidate_tree")
+    ):
+        return False
+    flags = value.get("authority_flags")
+    return bool(
+        type(flags) is dict
+        and set(flags) == set(CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS)
+        and all(
+            type(flags.get(key)) is bool and flags[key] is expected
+            for key, expected in CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS.items()
+        )
+    )
+
+
+def _canonical_ref_adoption_active_qa_fact(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    expected_commit: str,
+    expected_tree: str,
+    completed_lines: Sequence[Any],
+) -> Mapping[str, Any] | None:
+    """Return one *currently* authorized independent-QA Fact.
+
+    A ContractRuntime projection records that a QA bearer was authenticated at
+    write time; it is deliberately not a transferable bearer.  Canonical
+    adoption therefore re-reads the persistent QA session and exact scope at
+    issue time.  This makes expiry, revocation, supersession and a later scope
+    reduction fail before the route registry's first write, while allowing the
+    observer (who has its own authenticated bearer) to use the durable QA
+    deposit without re-presenting a QA credential.
+    """
+    expected_scope = {
+        f"backlog:{backlog_id}",
+        f"task:{contract_execution_id}",
+        f"commit:{expected_commit}",
+        _qa_scope_binding_ref(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            commit_sha=expected_commit,
+        ),
+    }
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    for candidate in reversed(completed_lines):
+        if not isinstance(candidate, Mapping):
+            continue
+        payload = (
+            candidate.get("payload")
+            if isinstance(candidate.get("payload"), Mapping)
+            else {}
+        )
+        adoption_qa_payload = payload.get("canonical_ref_adoption_qa_payload")
+        provenance = (
+            candidate.get("qa_evidence_provenance")
+            if isinstance(candidate.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+        binding = (
+            provenance.get("authenticated_qa_binding")
+            if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+            else {}
+        )
+        candidate_commit = str(
+            adoption_qa_payload.get("candidate_commit_sha")
+            if isinstance(adoption_qa_payload, Mapping) else ""
+        ).strip().lower()
+        candidate_tree = str(
+            adoption_qa_payload.get("candidate_tree")
+            if isinstance(adoption_qa_payload, Mapping) else ""
+        ).strip().lower()
+        qa_session_id = str(binding.get("qa_session_id") or "").strip()
+        principal_id = str(binding.get("qa_principal") or "").strip()
+        if not (
+            _canonical_ref_adoption_qa_payload_is_exact(adoption_qa_payload)
+            and
+            str(candidate.get("line_id") or "").strip()
+            == "qa_independent_verification"
+            and str(candidate.get("actor_role") or "").strip() == "qa"
+            and str(candidate.get("evidence_kind") or "").strip()
+            == "independent_verification"
+            # role == qa is the persistent Role-service capability required for
+            # this verification transition; no caller-shaped capability claim
+            # is accepted here.
+            and _contract_runtime_authenticated_qa_provenance(candidate)
+            and binding.get("independent_verification_session_matched") is True
+            and str(binding.get("qa_scope_binding_ref") or "").strip()
+            == _qa_scope_binding_ref(
+                project_id=project_id, backlog_id=backlog_id,
+                task_id=contract_execution_id, commit_sha=expected_commit,
+            )
+            and candidate_commit == expected_commit
+            and candidate_tree == expected_tree
+            and str(candidate.get("commit_sha") or "").strip().lower()
+            == candidate_commit
+            and str(payload.get("candidate_commit_sha") or "").strip().lower()
+            == candidate_commit
+            and str(payload.get("candidate_tree") or "").strip().lower()
+            == candidate_tree
+            and qa_session_id and principal_id
+        ):
+            continue
+        session_row = conn.execute(
+            "SELECT principal_id, project_id, role, scope_json, status, expires_at "
+            "FROM sessions WHERE session_id=?",
+            (qa_session_id,),
+        ).fetchone()
+        if session_row is None or not (
+            str(session_row["principal_id"] or "").strip() == principal_id
+            and str(session_row["project_id"] or "").strip() == project_id
+            and str(session_row["role"] or "").strip() == "qa"
+            and str(session_row["status"] or "").strip() == "active"
+        ):
+            continue
+        # Session expiry is an authority boundary, not an advisory field.  Be
+        # canonical about UTC so malformed or offset timestamps cannot slip
+        # through lexicographic comparisons.
+        expires_at = str(session_row["expires_at"] or "").strip()
+        try:
+            expiry = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        if expiry <= now:
+            continue
+        try:
+            scope = json.loads(session_row["scope_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(scope, list) or not expected_scope.issubset(
+            {str(item or "").strip() for item in scope}
+        ):
+            continue
+        return candidate
+    return None
+
+
+def _canonical_ref_adoption_issue_intent(
+    value: Any, *, project_id: str, backlog_id: str, task_id: str, allowed_actions: Any
+) -> dict[str, Any] | None:
+    """Validate the narrow, durable adoption payload before route issuance.
+
+    The payload is subsequently persisted inside the already-digest-bound route
+    lineage.  It is intentionally not a new authority table or a JB rule.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("canonical_ref_adoption must be an object")
+    required = (
+        "project_id", "backlog_id", "action", "contract_execution_id", "generation",
+        "custody", "canonical_ref", "expected_commit", "target_commit", "target_tree",
+        "source_content_sha256", "qa_content_sha256", "issued_at", "expires_at",
+        "replay_identity",
+    )
+    intent = {key: str(value.get(key) or "").strip() for key in required}
+    if any(not intent[key] for key in required):
+        raise ValueError("canonical_ref_adoption is incomplete")
+    if (
+        value.get("schema_version") != _CANONICAL_REF_ADOPTION_SCHEMA
+        or intent["project_id"] != project_id
+        or intent["backlog_id"] != backlog_id
+        or intent["contract_execution_id"] != task_id
+        or intent["action"] != _CANONICAL_REF_ADOPTION_ACTION
+        or intent["canonical_ref"] != "refs/heads/codex/ac-dev"
+        or _CANONICAL_REF_ADOPTION_ACTION not in set(allowed_actions or [])
+    ):
+        raise ValueError("canonical_ref_adoption does not match native route scope")
+    if any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", intent[key])
+           for key in ("expected_commit", "target_commit", "target_tree")):
+        raise ValueError("canonical_ref_adoption requires exact Git identities")
+    if any(not re.fullmatch(r"sha256:[0-9a-f]{64}", intent[key])
+           for key in ("source_content_sha256", "qa_content_sha256")):
+        raise ValueError("canonical_ref_adoption requires content-addressed source and QA evidence")
+    # The source-route binding is server material only.  Preserve it verbatim
+    # through the typed issuer so it is already part of the child token before
+    # the token digest is calculated.  The writer repeats the lookup under its
+    # transaction and rejects a replacement even when its visible scope is the
+    # same.
+    source_route_binding = value.get("source_route_binding")
+    if source_route_binding is not None:
+        if not isinstance(source_route_binding, Mapping):
+            raise ValueError("canonical_ref_adoption source route binding is invalid")
+        binding_required = (
+            "schema_version", "route_token_ref", "route_id",
+            "route_context_hash", "source_token_digest", "source_token_version",
+        )
+        binding = {
+            key: str(source_route_binding.get(key) or "").strip()
+            for key in binding_required
+        }
+        if (
+            set(source_route_binding) != set(binding_required)
+            or any(not binding[key] for key in binding_required)
+            or binding["schema_version"]
+            != "canonical_ref_adoption.source_route_binding.v1"
+            or not re.fullmatch(r"[0-9a-f]{64}", binding["source_token_digest"])
+        ):
+            raise ValueError("canonical_ref_adoption source route binding is invalid")
+        intent["source_route_binding"] = binding
+    return {"schema_version": _CANONICAL_REF_ADOPTION_SCHEMA, **intent}
+
+
+def _canonical_ref_adoption_bind_issued_intent(
+    intent: Mapping[str, Any], *, issued_at: datetime, expires_at: datetime
+) -> dict[str, Any]:
+    """Bind an adoption intent to the server's exact route issue window.
+
+    Request payload timestamps and replay labels are evidence inputs, never a
+    caller-controlled authority.  The route issuer fixes both timestamps and
+    derives the replay identity from the immutable operation binding before
+    the token body is digested and persisted.
+    """
+    bound = dict(intent)
+    bound["issued_at"] = issued_at.astimezone(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    bound["expires_at"] = expires_at.astimezone(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    replay_binding = {
+        key: bound[key]
+        for key in (
+            "schema_version", "project_id", "backlog_id", "action",
+            "contract_execution_id", "generation", "custody", "canonical_ref",
+            "expected_commit", "target_commit", "target_tree",
+            "source_content_sha256", "qa_content_sha256",
+        )
+    }
+    if "source_route_binding" in bound:
+        replay_binding["source_route_binding"] = bound["source_route_binding"]
+    bound["replay_identity"] = "cra-" + hashlib.sha256(
+        json.dumps(replay_binding, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return bound
+
+
+def _canonical_ref_adoption_source_route_binding(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    route: Mapping[str, Any],
+) -> dict[str, str]:
+    """Read the immutable source-route custody identity from its registry row.
+
+    ``issued_at`` is the durable registry version for a token digest: a source
+    ref with an identical visible scope but a newly issued token cannot silently
+    become the authority for an already-derived child adoption route.
+    """
+    registry_project_id = _route_registry_storage_project_id(project_id)
+    row = conn.execute(
+        "SELECT route_token_ref, route_id, route_context_hash, token_digest, "
+        "issued_at, status FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (registry_project_id, route_token_ref),
+    ).fetchone()
+    if row is None:
+        raise ValueError("canonical_ref_adoption source route binding is missing")
+    stored = dict(row)
+    binding = {
+        "schema_version": "canonical_ref_adoption.source_route_binding.v1",
+        "route_token_ref": str(stored.get("route_token_ref") or "").strip(),
+        "route_id": str(stored.get("route_id") or "").strip(),
+        "route_context_hash": str(stored.get("route_context_hash") or "").strip(),
+        "source_token_digest": str(stored.get("token_digest") or "").strip(),
+        "source_token_version": str(stored.get("issued_at") or "").strip(),
+    }
+    if (
+        str(stored.get("status") or "").strip() != "active"
+        or any(not value for key, value in binding.items() if key != "schema_version")
+        or binding["route_token_ref"] != route_token_ref
+        or binding["route_id"] != str(route.get("route_id") or "").strip()
+        or binding["route_context_hash"]
+        != str(route.get("route_context_hash") or "").strip()
+        or not re.fullmatch(r"[0-9a-f]{64}", binding["source_token_digest"])
+    ):
+        raise ValueError("canonical_ref_adoption source route binding is invalid")
+    return binding
+
+
+def _canonical_ref_adoption_server_issue_body(
+    ctx: RequestContext, *, project_id: str, body: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Authenticate and derive the narrow adoption issue payload server-side.
+
+    The caller identifies a session, an existing scoped route and a CEX.  It
+    never supplies Git identities, custody, generation, or QA/source hashes.
+    This is intentionally a read-before-write gate: every failure happens
+    before the ordinary issuer can mint or persist a route token.
+    """
+    from . import observer_route_context, observer_session
+
+    forbidden = {
+        "caller_role", "target_files", "owned_files", "allowed_actions",
+        "evidence_refs", "generation", "custody", "canonical_ref",
+        "expected_commit", "target_commit", "target_tree",
+        "source_content_sha256", "qa_content_sha256", "issued_at", "expires_at",
+    }
+    claimed = set(body) & forbidden
+    nested = body.get("canonical_ref_adoption")
+    if not isinstance(nested, Mapping):
+        raise ValueError("canonical_ref_adoption reference is required")
+    if set(nested) - {"contract_execution_id", "action", "backlog_id"}:
+        raise ValueError("canonical_ref_adoption accepts references only")
+    if claimed:
+        raise ValueError("canonical_ref_adoption rejects caller authority claims")
+    session_id = str(body.get("observer_session_id") or "").strip()
+    route_ref = str(body.get("observer_route_token_ref") or body.get("route_token_ref") or "").strip()
+    contract_execution_id = str(nested.get("contract_execution_id") or "").strip()
+    if str(nested.get("action") or "").strip() != _CANONICAL_REF_ADOPTION_ACTION:
+        raise ValueError("canonical_ref_adoption action is invalid")
+    if not session_id or not route_ref or not contract_execution_id:
+        raise ValueError("active observer session, route ref, and CEX are required")
+    try:
+        authorization = str(ctx.handler.headers.get("Authorization", "") or "")
+    except Exception:
+        authorization = ""
+    bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    if not bearer:
+        raise ValueError("observer session bearer is required")
+    conn = get_connection(project_id)
+    try:
+        try:
+            observer_session.authenticate_session(
+                conn, project_id=project_id, session_id=session_id,
+                session_token=bearer, action=_CANONICAL_REF_ADOPTION_ACTION,
+            )
+        except observer_session.ObserverSessionError as exc:
+            raise ValueError(str(exc)) from exc
+        try:
+            route = observer_route_context.resolve_route_token_ref(
+                conn, project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
+                route_token_ref=route_ref,
+                task_id=contract_execution_id,
+            )
+        except observer_route_context.RouteTokenRefError as exc:
+            # The public handler owns typed zero-write rejection; do not leak
+            # a registry exception past it for a revoked/superseded route.
+            raise ValueError(str(exc)) from exc
+        if not isinstance(route, Mapping):
+            raise ValueError("observer route authority is missing")
+        source_route_binding = _canonical_ref_adoption_source_route_binding(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_ref,
+            route=route,
+        )
+        row = conn.execute(
+            "SELECT backlog_id, record_json FROM contract_runtime_executions "
+            "WHERE project_id=? AND contract_execution_id=?",
+            (project_id, contract_execution_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("contract runtime execution is missing")
+        backlog_id = str(row[0] or "").strip()
+        if str(nested.get("backlog_id") or backlog_id).strip() != backlog_id:
+            raise ValueError("CEX backlog scope mismatch")
+        route_scope = route.get("scope") if isinstance(route.get("scope"), Mapping) else {}
+        route_backlog_id = str(route.get("backlog_id") or route_scope.get("backlog_id") or "").strip()
+        if route_backlog_id != backlog_id:
+            raise ValueError("route backlog scope mismatch")
+        route_task_id = str(route.get("task_id") or route_scope.get("task_id") or "").strip()
+        if route_task_id != contract_execution_id:
+            raise ValueError("route CEX scope mismatch")
+        record = json.loads(str(row[1] or "{}"))
+        adoption = record.get("canonical_ref_adoption") if isinstance(record, Mapping) else None
+        if not isinstance(adoption, Mapping):
+            raise ValueError("CEX lacks canonical adoption authority")
+        required = ("generation", "custody", "canonical_ref", "expected_commit", "target_commit", "target_tree", "source_content_sha256")
+        if any(not str(adoption.get(key) or "").strip() for key in required):
+            raise ValueError("CEX adoption authority is incomplete")
+        # A timeline actor string is not QA authority.  The only acceptable
+        # fact is the already materialized ContractRuntime independent-QA
+        # projection, whose session/provenance was bound by the QA write
+        # boundary.  Re-derive every identity from that persisted projection;
+        # no client field (including headers) participates in this decision.
+        completed_lines = (
+            record.get("completed_lines")
+            if isinstance(record, Mapping)
+            and isinstance(record.get("completed_lines"), list)
+            else []
+        )
+        expected_commit = str(adoption.get("target_commit") or "").strip().lower()
+        expected_tree = str(adoption.get("target_tree") or "").strip().lower()
+        qa_line = _canonical_ref_adoption_active_qa_fact(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            expected_commit=expected_commit,
+            expected_tree=expected_tree,
+            completed_lines=completed_lines,
+        )
+        if qa_line is None:
+            raise ValueError("authenticated independent QA Fact is missing")
+        qa_hash = stable_sha256(dict(qa_line))
+        target_files = route.get("target_files") if isinstance(route.get("target_files"), list) else []
+        if not target_files or _CANONICAL_REF_ADOPTION_ACTION not in set(route.get("allowed_actions") or []):
+            raise ValueError("route lacks canonical adoption scope")
+        derived_intent = {
+            "schema_version": _CANONICAL_REF_ADOPTION_SCHEMA,
+            "project_id": project_id, "backlog_id": backlog_id,
+            "action": _CANONICAL_REF_ADOPTION_ACTION,
+            "contract_execution_id": contract_execution_id,
+            **{key: str(adoption[key]).strip() for key in required},
+            "qa_content_sha256": qa_hash,
+            # These two are overwritten by the issuer, but are required by its
+            # typed parser and are never client-controlled here.
+            "issued_at": "server-derived", "expires_at": "server-derived",
+            "replay_identity": "server-derived",
+            "source_route_binding": source_route_binding,
+        }
+        return {
+            "caller_role": "observer", "backlog_id": backlog_id,
+            "task_id": contract_execution_id, "target_files": list(target_files),
+            "owned_files": list(route.get("owned_files") or target_files),
+            "allowed_actions": [_CANONICAL_REF_ADOPTION_ACTION],
+            "evidence_refs": list(route.get("evidence_refs") or []),
+            "canonical_ref_adoption": derived_intent,
+            # This private value is created only after the first server-side
+            # authentication pass.  The handler removes it before ordinary
+            # issuance and uses it solely to repeat that authority proof in
+            # the registry writer transaction; it is never client input or a
+            # response field.
+            "__canonical_ref_adoption_final_authority__": {
+                "observer_session_id": session_id,
+                "observer_session_bearer": bearer,
+                "observer_route_token_ref": route_ref,
+                "contract_execution_id": contract_execution_id,
+            },
+        }
+    finally:
+        conn.close()
+
+
+def _observer_route_context_issue_request_kind(
+    body: Mapping[str, Any],
+) -> str:
+    """Classify the only two dev issue shapes before either can write.
+
+    This discriminator is server-owned: a caller cannot select a permissive
+    handler with a request hint. Canonical adoption has a closed reference-only
+    envelope; an envelope without its marker is the legacy guide-copy Direct
+    bootstrap input. A Direct field beside the canonical marker is never
+    silently discarded or routed as a different dev operation.
+    """
+
+    if (
+        body.get("source_free_operation") is True
+        and body.get("target_files") == []
+        and body.get("owned_files") == []
+        and body.get("allowed_actions") == list(_OPERATOR_SOURCE_FREE_ACTIONS)
+        and isinstance(body.get("task_id"), str)
+        and body.get("task_id", "").startswith("onboard-service-")
+    ):
+        return "completed_source_free_system_operation"
+    if "canonical_ref_adoption" not in body:
+        return "direct_bootstrap"
+    canonical_fields = {
+        "observer_session_id",
+        "observer_route_token_ref",
+        "route_token_ref",
+        "canonical_ref_adoption",
+    }
+    if set(body) - canonical_fields:
+        raise ValueError(
+            "canonical_ref_adoption request mixes canonical and Direct fields"
+        )
+    if "observer_route_token_ref" in body and "route_token_ref" in body:
+        raise ValueError(
+            "canonical_ref_adoption request has ambiguous route reference"
+        )
+    # The typed helper below owns nested parsing, keeping malformed nested
+    # forms on its existing closed zero-write authority path.
+    return "canonical_ref_adoption"
+
+
+def _canonical_ref_adoption_revalidate_in_writer(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    authority: Mapping[str, Any],
+    token: Mapping[str, Any],
+) -> None:
+    """Repeat canonical-adoption authority under the registry write lock.
+
+    The earlier handler pass establishes availability and builds the token.  It
+    cannot authorize a later commit: a QA or observer session can be revoked,
+    narrowed or expired, and the source route can be superseded in between.
+    This function is invoked by ``persist_route_token_ref`` after its single
+    ``BEGIN IMMEDIATE`` and before its first registry mutation.  It therefore
+    uses one SQLite snapshot/lock for final authority and the digest-bound row.
+    """
+    from . import observer_route_context, observer_session
+
+    session_id = str(authority.get("observer_session_id") or "").strip()
+    bearer = str(authority.get("observer_session_bearer") or "").strip()
+    route_ref = str(authority.get("observer_route_token_ref") or "").strip()
+    contract_execution_id = str(authority.get("contract_execution_id") or "").strip()
+    if not session_id or not bearer or not route_ref or not contract_execution_id:
+        raise ValueError("canonical_ref_adoption final authority context is incomplete")
+    try:
+        observer_session.authenticate_session(
+            conn,
+            project_id=project_id,
+            session_id=session_id,
+            session_token=bearer,
+            action=_CANONICAL_REF_ADOPTION_ACTION,
+        )
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=route_ref,
+            task_id=contract_execution_id,
+        )
+    except (observer_session.ObserverSessionError,
+            observer_route_context.RouteTokenRefError) as exc:
+        raise ValueError(str(exc)) from exc
+    if not isinstance(route, Mapping):
+        raise ValueError("canonical_ref_adoption observer route authority is missing")
+
+    row = conn.execute(
+        "SELECT backlog_id, record_json FROM contract_runtime_executions "
+        "WHERE project_id=? AND contract_execution_id=?",
+        (project_id, contract_execution_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("contract runtime execution is missing")
+    backlog_id = str(row[0] or "").strip()
+    route_scope = route.get("scope") if isinstance(route.get("scope"), Mapping) else {}
+    if (
+        str(route.get("backlog_id") or route_scope.get("backlog_id") or "").strip()
+        != backlog_id
+        or str(route.get("task_id") or route_scope.get("task_id") or "").strip()
+        != contract_execution_id
+        or _CANONICAL_REF_ADOPTION_ACTION not in set(route.get("allowed_actions") or [])
+        or not isinstance(route.get("target_files"), list)
+        or not route.get("target_files")
+    ):
+        raise ValueError("canonical_ref_adoption observer route scope is no longer active")
+    try:
+        record = json.loads(str(row[1] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("contract runtime execution is invalid") from exc
+    adoption = record.get("canonical_ref_adoption") if isinstance(record, Mapping) else None
+    required = (
+        "generation", "custody", "canonical_ref", "expected_commit",
+        "target_commit", "target_tree", "source_content_sha256",
+    )
+    if not isinstance(adoption, Mapping) or any(
+        not str(adoption.get(key) or "").strip() for key in required
+    ):
+        raise ValueError("CEX adoption authority is incomplete")
+    expected_commit = str(adoption["target_commit"] or "").strip().lower()
+    expected_tree = str(adoption["target_tree"] or "").strip().lower()
+    completed_lines = record.get("completed_lines") if isinstance(record.get("completed_lines"), list) else []
+    qa_line = _canonical_ref_adoption_active_qa_fact(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        expected_commit=expected_commit,
+        expected_tree=expected_tree,
+        completed_lines=completed_lines,
+    )
+    if qa_line is None:
+        raise ValueError("authenticated independent QA Fact is missing")
+
+    lineage = token.get("route_lineage") if isinstance(token.get("route_lineage"), Mapping) else {}
+    bound = lineage.get("canonical_ref_adoption") if isinstance(lineage.get("canonical_ref_adoption"), Mapping) else {}
+    if not bound:
+        raise ValueError("canonical_ref_adoption token binding is missing")
+    # Bind every mutable CEX/QA identity that the token digest will cover.  The
+    # typed parser in the registry separately enforces canonical issue expiry.
+    expected = {
+        "schema_version": _CANONICAL_REF_ADOPTION_SCHEMA,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "action": _CANONICAL_REF_ADOPTION_ACTION,
+        "contract_execution_id": contract_execution_id,
+        **{key: str(adoption[key]).strip() for key in required},
+        "qa_content_sha256": stable_sha256(dict(qa_line)),
+    }
+    if any(str(bound.get(key) or "").strip() != value for key, value in expected.items()):
+        raise ValueError("canonical_ref_adoption token no longer matches final authority")
+    source_route_binding = _canonical_ref_adoption_source_route_binding(
+        conn,
+        project_id=project_id,
+        route_token_ref=route_ref,
+        route=route,
+    )
+    if bound.get("source_route_binding") != source_route_binding:
+        raise ValueError("canonical_ref_adoption source route binding changed")
 
 
 def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
@@ -8523,13 +9261,59 @@ def handle_observer_route_context_issue(ctx: RequestContext):
 
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
-
-    if _runtime_plane() == "dev":
-        return _handle_ac_dev_direct_route_context_issue(
-            ctx,
+    canonical_final_authority: Mapping[str, Any] | None = None
+    try:
+        request_kind = _observer_route_context_issue_request_kind(body)
+    except ValueError as exc:
+        return _observer_route_context_issue_rejection(
+            status=400,
             project_id=project_id,
             body=body,
+            error=str(exc),
+            field="request_kind",
+            expected="one closed canonical-adoption or Direct-bootstrap request shape",
+            actual={"canonical_ref_adoption_present": "canonical_ref_adoption" in body},
+            source_gate="request_kind_discriminator",
         )
+
+    # Canonical-ref adoption is the one route kind whose authority may not be
+    # self-declared in the request.  Convert its three references into the
+    # normal issuer shape only after session/CEX/QA/route verification.
+    if request_kind == "canonical_ref_adoption":
+        try:
+            body = _canonical_ref_adoption_server_issue_body(
+                ctx, project_id=project_id, body=body,
+            )
+            candidate_final_authority = body.pop(
+                "__canonical_ref_adoption_final_authority__", None
+            )
+            if not isinstance(candidate_final_authority, Mapping):
+                raise ValueError("canonical_ref_adoption final authority is missing")
+            canonical_final_authority = dict(candidate_final_authority)
+        except (ValueError, PermissionError) as exc:
+            return _observer_route_context_issue_rejection(
+                status=403, project_id=project_id, body=body,
+                error=str(exc), field="canonical_ref_adoption",
+                expected="authenticated session + route + CEX + QA Fact references",
+                actual={"present": True}, source_gate="canonical_ref_adoption_authority",
+            )
+
+    # Canonical adoption has already crossed its strict authority gate above.
+    # Keep the ordinary dev bootstrap behaviour for every other issue shape,
+    # but never permit that shortcut to preempt canonical QA validation.
+    if _runtime_plane() == "dev":
+        if request_kind == "completed_source_free_system_operation":
+            return _handle_ac_dev_completed_source_free_route_context_issue(
+                ctx,
+                project_id=project_id,
+                body=body,
+            )
+        if request_kind == "direct_bootstrap":
+            return _handle_ac_dev_direct_route_context_issue(
+                ctx,
+                project_id=project_id,
+                body=body,
+            )
 
     # Authorization: this endpoint mints a WRITE-authorizing route token, so the
     # caller must declare the observer role. The shared operator gate does not
@@ -8660,6 +9444,27 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             source_gate="allowed_actions_type",
         )
     allowed_actions = _observer_route_context_issue_allowed_actions(allowed_actions)
+    try:
+        canonical_ref_adoption = _canonical_ref_adoption_issue_intent(
+            body.get("canonical_ref_adoption"),
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            allowed_actions=allowed_actions,
+        )
+    except ValueError as exc:
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error=str(exc),
+            field="canonical_ref_adoption",
+            expected="server-validated canonical_ref_adoption_route_bound.v1",
+            actual=_observer_route_context_issue_safe_actual(body.get("canonical_ref_adoption")),
+            source_gate="canonical_ref_adoption_scope",
+        )
+    # A pre-issue lookup is diagnostic only.  The complete typed token claims
+    # its replay identity in the registry's single BEGIN IMMEDIATE transaction.
     evidence_refs = body.get("evidence_refs")
     if evidence_refs is not None and not isinstance(evidence_refs, list):
         return _observer_route_context_issue_rejection(
@@ -8752,6 +9557,14 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             correction_overrides={"ttl_hours": 24},
         )
 
+    issue_now = datetime.now(timezone.utc).replace(microsecond=0)
+    if canonical_ref_adoption is not None:
+        canonical_ref_adoption = _canonical_ref_adoption_bind_issued_intent(
+            canonical_ref_adoption,
+            issued_at=issue_now,
+            expires_at=issue_now + timedelta(hours=ttl_hours),
+        )
+
     try:
         from . import observer_route_context
 
@@ -8768,9 +9581,11 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             target_files=target_files,
             allowed_actions=allowed_actions,
             ttl_hours=ttl_hours,
+            now=issue_now,
             evidence_refs=evidence_refs,
             project_root=project_root,
             parent_route_identity=parent_route_identity,
+            canonical_ref_adoption=canonical_ref_adoption,
             **parent_identity_args,
         )
         issued_token = issued.get("route_token")
@@ -8862,16 +9677,49 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     try:
         conn = get_connection(project_id)
         try:
+            final_revalidator = None
+            if canonical_ref_adoption is not None:
+                if canonical_final_authority is None:
+                    raise ValueError("canonical_ref_adoption final authority is missing")
+
+                def final_revalidator(
+                    writer_conn: sqlite3.Connection,
+                    writer_token: Mapping[str, Any],
+                ) -> None:
+                    _canonical_ref_adoption_revalidate_in_writer(
+                        writer_conn,
+                        project_id=project_id,
+                        authority=canonical_final_authority,
+                        token=writer_token,
+                    )
+
             observer_route_context.persist_route_token_ref(
                 conn,
                 project_id=project_id,
                 storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=issued["route_token_ref"],
                 token=issued["route_token"],
+                canonical_adoption_authority_revalidator=final_revalidator,
             )
         finally:
             conn.close()
     except Exception as exc:  # pragma: no cover - defensive
+        if canonical_ref_adoption is not None:
+            # Unlike ordinary advisory ref registration, this registry write is
+            # the adoption route's unique issuance claim.  Returning a token
+            # after it loses that claim would create an unverifiable route.
+            return _observer_route_context_issue_rejection(
+                status=409,
+                project_id=project_id,
+                body=body,
+                error=f"canonical_ref_adoption route persistence failed: {exc}",
+                field="canonical_ref_adoption",
+                expected="one durable server-issued canonical_ref_adoption lifecycle",
+                actual=_observer_route_context_issue_safe_actual(
+                    body.get("canonical_ref_adoption")
+                ),
+                source_gate="canonical_ref_adoption_atomic_persist",
+            )
         ref_persist_warning = f"route_token_ref persist failed (ref-resolution disabled): {exc}"
 
     route_token = issued["route_token"]
@@ -8914,6 +9762,12 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             ),
         },
     }
+    if canonical_ref_adoption is not None:
+        response["canonical_ref_adoption_intent"] = {
+            "schema_version": _CANONICAL_REF_ADOPTION_SCHEMA,
+            "route_token_ref": issued["route_token_ref"],
+            "canonical_ref_adoption": dict(canonical_ref_adoption),
+        }
     for key, value in route_identity.items():
         response.setdefault(key, value)
     for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
@@ -12049,6 +12903,9 @@ def _require_current_full_reconcile_auth(
         "route_token_ref": route_token_ref,
         "route_token_scope": expected_scope,
         "route_token_allowed_actions": normalized_allowed,
+        "route_token_source_free_operation": bool(
+            resolved.get("source_free_operation") is True
+        ),
     }
 
 
@@ -19549,6 +20406,98 @@ def handle_graph_governance_events_stream(ctx: RequestContext):
     return STREAMED_RESPONSE
 
 
+_DEV_GRAPH_ZERO_WRITE_EMPTY_TABLES = (
+    "graph_snapshot_refs",
+    "graph_snapshots",
+    "pending_scope_reconcile",
+    "reconcile_run_metrics",
+    "graph_nodes_index",
+    "graph_edges_index",
+)
+
+
+def _dev_graph_zero_write_readiness_projection(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+) -> dict[str, Any] | None:
+    """Project an admitted, not-yet-materialized dev graph without DDL.
+
+    Graph schema creation remains owned by the authorized full/current-full
+    reconcile path.  Readiness GETs may recognize only source-derived owner
+    states; altered or unknown partial schemas remain a typed 409.
+    """
+
+    if _runtime_plane() != "dev" or project_id != AC_PROJECT_ID:
+        return None
+    before_changes = conn.total_changes
+    try:
+        classification = classify_graph_materialization_preimage(conn)
+    except ValueError as exc:
+        raise GovernanceError(
+            "ac_dev_graph_readiness_preimage_incompatible",
+            "AC dev graph readiness preimage is not source-admissible",
+            409,
+            {
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "materialization_required": False,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "pass_synthesized": False,
+            },
+        ) from exc
+    if conn.total_changes != before_changes:
+        raise GovernanceError(
+            "ac_dev_graph_readiness_projection_wrote_state",
+            "AC dev graph readiness classification must be zero-write",
+            500,
+            {
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "zero_write_rejection": True,
+                "writes_performed": True,
+                "pass_synthesized": False,
+            },
+        )
+    owner_states = dict(classification.get("owner_states") or {})
+    if owner_states and all(state == "exact" for state in owner_states.values()):
+        return None
+    row_counts = {
+        table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        for table in _DEV_GRAPH_ZERO_WRITE_EMPTY_TABLES
+    }
+    if any(row_counts.values()):
+        raise GovernanceError(
+            "ac_dev_graph_readiness_preimage_incompatible",
+            "AC dev graph readiness preimage contains materialized graph data",
+            409,
+            {
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "materialization_required": False,
+                "graph_row_counts": row_counts,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "pass_synthesized": False,
+            },
+        )
+    return {
+        "schema_version": "ac_dev_graph_zero_write_readiness.v1",
+        "runtime_plane": "dev",
+        "project_id": project_id,
+        "materialization_required": True,
+        "materialization_entrypoint": "graph_current_full_reconcile",
+        "active_graph_activation_allowed": False,
+        "owner_states": owner_states,
+        "planned_objects": list(classification.get("planned_objects") or []),
+        "graph_row_counts": row_counts,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "pass_synthesized": False,
+    }
+
+
 @route("GET", "/api/graph-governance/{project_id}/status")
 def handle_graph_governance_status(ctx: RequestContext):
     """Return active graph snapshot, scan baseline, and pending scope status."""
@@ -19557,6 +20506,30 @@ def handle_graph_governance_status(ctx: RequestContext):
 
     conn = get_connection(project_id)
     try:
+        readiness = _dev_graph_zero_write_readiness_projection(
+            conn,
+            project_id=project_id,
+        )
+        if readiness is not None:
+            return {
+                "ok": True,
+                **readiness,
+                "active_snapshot_id": "",
+                "graph_snapshot_commit": "",
+                "materialized_graph_baseline_commit": "",
+                "active_snapshot_materialization": {},
+                "active_snapshot_warnings": [],
+                "active_snapshot_rule_fingerprint": {},
+                "active_snapshot_rule_fingerprint_id": "",
+                "scan_baseline_commit": "",
+                "scan_baseline_id": None,
+                "pending_scope_reconcile_count": 0,
+                "pending_scope_reconcile": [],
+                "current_state": {
+                    "state": "materialization_required",
+                    "snapshot_id": "",
+                },
+            }
         status = store.graph_governance_status(conn, project_id)
         status["current_state"] = _dashboard_current_state(
             conn,
@@ -88125,6 +89098,28 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.operations.queue")
+        readiness = _dev_graph_zero_write_readiness_projection(
+            conn,
+            project_id=project_id,
+        )
+        if readiness is not None:
+            return {
+                "ok": True,
+                **readiness,
+                "snapshot_id": "",
+                "active_snapshot_id": "",
+                "count": 0,
+                "operations": [],
+                "summary": {
+                    "by_type": {},
+                    "by_status": {},
+                    "pending_scope_reconcile_count": 0,
+                    "current_state": {
+                        "state": "materialization_required",
+                        "snapshot_id": "",
+                    },
+                },
+            }
         status = store.graph_governance_status(conn, project_id)
         selected_active_snapshot_id = str(
             ctx.query.get("snapshot_id")
@@ -94124,6 +95119,7 @@ def _current_full_reconcile_runtime_context_scope(
     auth: Mapping[str, Any],
     target_commit_sha: str,
     candidate_only: bool = False,
+    source_free_reconcile_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve current-full runtime provenance from persisted branch identity.
 
@@ -94266,6 +95262,25 @@ def _current_full_reconcile_runtime_context_scope(
                         str(trusted_merge.get("task_id") or "").strip(),
                     )
     if context is None:
+        if (
+            isinstance(source_free_reconcile_authority, Mapping)
+            and source_free_reconcile_authority.get("accepted") is True
+        ):
+            # A completed source-free system operation is intentionally
+            # contextless.  Its exact persisted backlog/CE/R/session/request
+            # binding is established by the handler before any graph DDL.
+            return {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "source": "completed_source_free_reconcile_authority",
+                "server_derived": True,
+                "runtime_context_required": False,
+                "source_free_operation": True,
+                "authority_hash": str(
+                    source_free_reconcile_authority.get("authority_hash") or ""
+                ),
+            }
         # An incomplete-fanin batch parent is the one route-bound current-full
         # authority that intentionally has no child BranchTaskRuntimeContext.
         # Accept it only from the canonical observer route mode and only when
@@ -94642,6 +95657,122 @@ def _current_full_reconcile_runtime_context_scope(
     return result
 
 
+def _current_full_reconcile_request_category(
+    conn,
+    *,
+    request_context: RequestContext,
+    project_id: str,
+    body: Mapping[str, Any],
+    auth: Mapping[str, Any],
+    target_commit_sha: str,
+) -> dict[str, Any]:
+    """Select one closed reconcile category before graph schema admission.
+
+    A source-free backlog is never allowed to fall through to ordinary or
+    direct-main handling.  Its completed authority must reproduce the exact
+    active route/session, target HEAD, and copy-safe request body.
+    """
+
+    route_scope = (
+        auth.get("route_token_scope")
+        if isinstance(auth.get("route_token_scope"), Mapping)
+        else {}
+    )
+    backlog_id = str(
+        route_scope.get("backlog_id") or body.get("backlog_id") or ""
+    ).strip()
+    route_token_ref = str(
+        auth.get("route_token_ref")
+        or body.get("observer_route_token_ref")
+        or body.get("route_token_ref")
+        or ""
+    ).strip()
+    raw_allowed_actions = [
+        str(action or "").strip()
+        for action in auth.get("route_token_allowed_actions") or []
+        if str(action or "").strip()
+    ]
+    source_free_route_claim = bool(
+        auth.get("route_token_source_free_operation") is True
+        or raw_allowed_actions == list(_OPERATOR_SOURCE_FREE_ACTIONS)
+    )
+    source_free = (
+        _backlog_source_free_operation_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        if backlog_id
+        else {}
+    )
+    if source_free or source_free_route_claim:
+        completed = _completed_source_free_reconcile_authority(
+            conn,
+            request_context=request_context,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+            source_free_authority=source_free,
+        )
+        expected_body = (
+            completed.get("copy_safe_body")
+            if isinstance(completed.get("copy_safe_body"), Mapping)
+            else {}
+        )
+        exact_body = bool(expected_body and dict(body) == dict(expected_body))
+        exact_target = bool(
+            str(completed.get("target_commit") or "").strip().lower()
+            == str(target_commit_sha or "").strip().lower()
+        )
+        if not (
+            completed.get("accepted") is True
+            and exact_body
+            and exact_target
+        ):
+            raise GovernanceError(
+                "current_full_reconcile_source_free_authority_required",
+                "source-free reconcile requires one exact completed persisted authority",
+                409,
+                {
+                    "schema_version": (
+                        "graph_current_full_reconcile."
+                        "source_free_category_diagnostics.v1"
+                    ),
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "category": "source_free_system_operation",
+                    "completed_authority_count": (
+                        1 if completed.get("accepted") is True else 0
+                    ),
+                    "request_body_exact": exact_body,
+                    "target_head_exact": exact_target,
+                    "fail_closed": True,
+                    "fallback_allowed": False,
+                    "source": (
+                        "server._current_full_reconcile_request_category."
+                        "pre_admission_gate.v1"
+                    ),
+                },
+            )
+        return {
+            "category": "source_free_system_operation",
+            "source_free_reconcile_authority": dict(completed),
+        }
+
+    allowed_actions = {
+        str(action or "").strip().lower().replace("-", "_").replace(".", "_")
+        for action in raw_allowed_actions
+    }
+    direct = bool(
+        "observer_direct_mutation_exception" in allowed_actions
+        and "graph_current_full_reconcile" in allowed_actions
+    )
+    return {
+        "category": "operator_supervised_direct_main" if direct else "ordinary",
+        "source_free_reconcile_authority": {},
+    }
+
+
 def _record_pending_scope_reconcile_contract_event(
     conn,
     *,
@@ -94938,6 +96069,10 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.full")
+        if dev_runtime_verify_only():
+            admit_ac_dev_graph_materialization_schema(
+                conn, project_id=project_id
+            )
         try:
             result = run_state_only_full_reconcile(
                 conn,
@@ -96353,6 +97488,17 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "target_commit_sha": target_commit,
             }
         activate_requested = bool(body.get("activate", True))
+        request_category = _current_full_reconcile_request_category(
+            conn,
+            request_context=ctx,
+            project_id=project_id,
+            body=body,
+            auth=current_full_auth,
+            target_commit_sha=target_commit,
+        )
+        source_free_reconcile_authority = request_category.get(
+            "source_free_reconcile_authority"
+        )
         direct_main_qa_preflight_authority = (
             _operator_supervised_direct_main_reconcile_qa_preflight_authority(
                 conn,
@@ -96408,6 +97554,11 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             auth=current_full_auth,
             target_commit_sha=target_commit,
             candidate_only=not activate_requested,
+            source_free_reconcile_authority=(
+                source_free_reconcile_authority
+                if isinstance(source_free_reconcile_authority, Mapping)
+                else {}
+            ),
         )
         merge_queue_id = str(
             runtime_context_scope.get("merge_queue_id")
@@ -96424,6 +97575,13 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 head_commit=head_commit,
             )
         )
+        # All category, target/HEAD, Direct-QA, and runtime-scope decisions are
+        # read-only and must complete before graph materialization can create
+        # or alter schema.
+        if dev_runtime_verify_only():
+            admit_ac_dev_graph_materialization_schema(
+                conn, project_id=project_id
+            )
         queue_item_id = str(body.get("queue_item_id") or "").strip()
         run_id = str(body.get("run_id") or "").strip() or (
             f"current-full-{target_commit[:7]}"
@@ -143504,6 +144662,7 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "task_timeline_append",
 )
 _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
+    "observer_session_register",
     "graph_query",
     "observer_direct_mutation_exception",
     "task_timeline_append",
@@ -143512,6 +144671,14 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
     "graph_current_full_reconcile",
     "backlog_close",
     "merge",
+)
+_OPERATOR_SOURCE_FREE_ACTIONS = (
+    "observer_session_register",
+    "observer_session_heartbeat",
+    "graph_query",
+    "task_timeline_append",
+    "graph_current_full_reconcile",
+    "backlog_close",
 )
 # Historical Direct Main routes could also authorize the read-only preflight
 # surface.  Keep that compatibility out of newly issued full-round routes, but
@@ -144381,6 +145548,428 @@ def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
         seen.add(text)
         deduped.append(text)
     return deduped
+
+
+def _source_free_operation_topology_facts(value: object) -> dict[str, bool]:
+    """Match only canonical persisted JB source-free topology spellings."""
+
+    topology = value if isinstance(value, str) else ""
+    real_operation_shape = topology == (
+        "reuse_the_existing_unique_ac_observer."
+        "_source_free_system_operation_only;"
+        "_zero_implementation_workers;"
+        "_one_fresh_observer_route/session;"
+        "_exactly_one_full_reconcile."
+    )
+    explicit_legacy_shape = topology == (
+        "existing_unique_ac_observer;"
+        "_source_mutation_forbidden;"
+        "_no_implementation_worker;"
+        "_source_free_operation_only"
+    )
+    revision_legacy_shape = topology in (
+        "existing_unique_ac_observer;"
+        "_no_implementation_worker_because_r2_is_source_free;"
+        "_role_distinct_qa_only_if_a_new_mutation_is_introduced",
+        "existing_unique_ac_observer;"
+        "_no_implementation_worker_because_r3_is_source_free;"
+        "_role_distinct_qa_only_if_a_new_mutation_is_introduced",
+    )
+    accepted = bool(
+        real_operation_shape or explicit_legacy_shape or revision_legacy_shape
+    )
+    return {
+        "accepted": accepted,
+        "unique_observer": accepted,
+        "source_free_operation_only": accepted,
+        "zero_implementation_workers": accepted,
+        "fresh_observer_route_session": accepted,
+        "single_full_reconcile": accepted,
+    }
+
+
+def _backlog_source_free_operation_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Project a narrow operation-only authority from a durable JB handoff.
+
+    The handoff is the typed authority.  Human prose, ``mf_type`` aliases, and
+    caller-supplied source-free flags are deliberately not inputs.
+    """
+
+    if project_id != "aming-claw" or not backlog_id:
+        return {}
+    row = conn.execute(
+        """
+        SELECT status, target_files, test_files, chain_trigger_json
+        FROM backlog_bugs WHERE bug_id = ?
+        """,
+        (backlog_id,),
+    ).fetchone()
+    if row is None or str(_row_get(row, "status", "")).strip() != "OPEN":
+        return {}
+    row_files = sorted(
+        {
+            *_string_list_field(_row_get(row, "target_files", "")),
+            *_string_list_field(_row_get(row, "test_files", "")),
+        }
+    )
+    trigger = backlog_runtime.parse_json_object(
+        _row_get(row, "chain_trigger_json", "{}")
+    )
+    handoff = (
+        trigger.get("subsystem_backlog_handoff")
+        if isinstance(trigger.get("subsystem_backlog_handoff"), Mapping)
+        else {}
+    )
+    precheck = (
+        trigger.get("judgment_plan_precheck")
+        if isinstance(trigger.get("judgment_plan_precheck"), Mapping)
+        else {}
+    )
+    subject = (
+        precheck.get("subject")
+        if isinstance(precheck.get("subject"), Mapping)
+        else {}
+    )
+    evidence = (
+        precheck.get("evidence")
+        if isinstance(precheck.get("evidence"), Mapping)
+        else {}
+    )
+    evidence_route = (
+        evidence.get("route_context")
+        if isinstance(evidence.get("route_context"), Mapping)
+        else {}
+    )
+
+    allowed = _string_list_field(handoff.get("allowed_actions"))
+    blocked = _string_list_field(handoff.get("blocked_actions"))
+    allowed_action_semantics = {
+        "fresh_onboard_route_guide": "bootstrap",
+        "fresh_route_issue": "bootstrap",
+        "observer_session_register": "observer_session_register",
+        "observer_session_heartbeat": "observer_session_heartbeat",
+        "single_full_reconcile": "graph_current_full_reconcile",
+        "graph_current_full_reconcile": "graph_current_full_reconcile",
+        "readback": "graph_query",
+        "graph_query": "graph_query",
+        "timeline_precheck": "task_timeline_append",
+        "task_timeline_append": "task_timeline_append",
+        "honest_archive_or_close": "backlog_close",
+        "honest_close_or_archive": "backlog_close",
+        "close_r2_if_authorized": "backlog_close",
+        "close_r3_if_authorized": "backlog_close",
+        "backlog_close_if_authorized": "backlog_close",
+    }
+    allowed_semantics = {
+        allowed_action_semantics[action]
+        for action in allowed
+        if action in allowed_action_semantics
+    }
+    expected_semantics = {"bootstrap", *_OPERATOR_SOURCE_FREE_ACTIONS}
+    allowed_actions_closed = bool(allowed) and all(
+        action in allowed_action_semantics for action in allowed
+    ) and len(allowed) == len(set(allowed))
+
+    blocked_semantic_aliases = {
+        "source_mutation": {"source_edit", "source_mutation"},
+        "source_artifact_mutation": {"empty_commit", "file_edit"},
+        "old_graph_input": {"old_graph_input"},
+        "reconcile_bypass": {"bypass_reconcile"},
+        "stable_mutation": {"stable_40000_mutation"},
+        "second_authority": {"second_authority_runtime"},
+        "synthesized_pass": {"synthesized_pass"},
+    }
+    blocked_set = set(blocked)
+    blocked_actions_closed = all(
+        aliases & blocked_set for aliases in blocked_semantic_aliases.values()
+    )
+
+    subject_topology = subject.get("normalized_topology")
+    evidence_topology = evidence_route.get("normalized_proposed_topology")
+    topology_facts = _source_free_operation_topology_facts(subject_topology)
+    required_contract_facts = {
+        "empty_file_scope": not row_files,
+        "typed_handoff": handoff.get("schema_version")
+        == "judgment_subsystem_backlog_handoff.v1",
+        "observer_owned": handoff.get("execution_owner")
+        == "selected_subsystem_observer",
+        "selected_gate_authoritative": handoff.get(
+            "selected_subsystem_gate_remains_authoritative"
+        )
+        is True,
+        "operation_actions_closed": allowed_actions_closed
+        and allowed_semantics == expected_semantics,
+        "source_mutation_blocked": blocked_actions_closed,
+        "no_worker_topology": topology_facts["zero_implementation_workers"],
+        "source_free_operation_topology": topology_facts[
+            "source_free_operation_only"
+        ],
+        "fresh_observer_route_session_topology": topology_facts[
+            "fresh_observer_route_session"
+        ],
+        "single_full_reconcile_topology": topology_facts[
+            "single_full_reconcile"
+        ],
+        "topology_independently_bound": subject_topology == evidence_topology,
+    }
+    if not all(required_contract_facts.values()):
+        return {}
+    authority = {
+        "schema_version": "backlog.source_free_operation_authority.v1",
+        "accepted": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "source_free_operation": True,
+        "source_mutation_forbidden": True,
+        "target_files": [],
+        "owned_files": [],
+        "allowed_actions": list(_OPERATOR_SOURCE_FREE_ACTIONS),
+        "contract_facts": required_contract_facts,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _source_free_reconcile_unique_active_session(
+    conn,
+    *,
+    project_id: str,
+    session_id: str,
+    route_token_ref: str,
+    route_id: str,
+    route_context_hash: str,
+    backlog_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Return the body-bound session iff route provenance has cardinality one."""
+
+    matching_active_sessions: list[dict[str, Any]] = []
+    try:
+        session_rows = conn.execute(
+            "SELECT * FROM observer_sessions WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        session_rows = []
+    for session_row in session_rows:
+        if (
+            observer_session.computed_session_status(session_row)
+            != observer_session.SESSION_STATUS_ACTIVE
+        ):
+            continue
+        capabilities_value = _row_get(session_row, "capabilities_json", "{}")
+        try:
+            candidate_capabilities = json.loads(str(capabilities_value or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        candidate_provenance = (
+            candidate_capabilities.get("route_provenance")
+            if isinstance(candidate_capabilities, Mapping)
+            and isinstance(candidate_capabilities.get("route_provenance"), Mapping)
+            else {}
+        )
+        if all(
+            str(candidate_provenance.get(field) or "") == expected
+            for field, expected in (
+                ("route_token_ref", route_token_ref),
+                ("route_id", route_id),
+                ("route_context_hash", route_context_hash),
+                ("backlog_id", backlog_id),
+                ("task_id", task_id),
+                ("cex_id", task_id),
+            )
+        ):
+            matching_active_sessions.append(
+                {
+                    "session_id": str(
+                        _row_get(session_row, "session_id", "")
+                    ),
+                    "capabilities": candidate_capabilities,
+                }
+            )
+    if (
+        len(matching_active_sessions) != 1
+        or matching_active_sessions[0]["session_id"] != session_id
+    ):
+        return {}
+    return matching_active_sessions[0]
+
+
+def _completed_source_free_reconcile_authority(
+    conn,
+    *,
+    request_context: RequestContext | None,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+    source_free_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove one active route-bound observer may run the sole R6 reconcile."""
+
+    if (
+        request_context is None
+        or project_id != "aming-claw"
+        or source_free_authority.get("accepted") is not True
+        or not route_token_ref
+    ):
+        return {}
+    task_id = _onboard_service_execution_id(project_id, backlog_id)
+    body = (
+        request_context.body
+        if isinstance(request_context.body, Mapping)
+        else {}
+    )
+    session_id = str(body.get("observer_session_id") or "").strip()
+    if not session_id:
+        return {}
+    projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    resume = _onboard_runtime_resume_from_current_projection(projection)
+    if (
+        not _onboard_runtime_resume_is_complete(resume)
+        or str(resume.get("current_contract_execution_id") or "") != task_id
+        or str(resume.get("root_contract_execution_id") or "") != task_id
+    ):
+        return {}
+    storage_project_id = _route_registry_storage_project_id(project_id)
+    rows = conn.execute(
+        "SELECT route_token_ref, status FROM observer_route_token_refs "
+        "WHERE project_id=? AND backlog_id=? AND task_id=?",
+        (storage_project_id, backlog_id, task_id),
+    ).fetchall()
+    if (
+        len(rows) != 1
+        or str(_row_get(rows[0], "route_token_ref", "")) != route_token_ref
+        or str(_row_get(rows[0], "status", "")) != "active"
+    ):
+        return {}
+    try:
+        proof = _resolve_contract_runtime_observer_proof(
+            request_context,
+            conn,
+            project_id=project_id,
+            action="graph_current_full_reconcile",
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+        )
+    except (PermissionDeniedError, ValueError):
+        return {}
+    if not isinstance(proof, Mapping):
+        return {}
+    from . import observer_route_context
+
+    try:
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=storage_project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    route_id = str(route.get("route_id") or "") if isinstance(route, Mapping) else ""
+    route_context_hash = (
+        str(route.get("route_context_hash") or "")
+        if isinstance(route, Mapping)
+        else ""
+    )
+    unique_session = _source_free_reconcile_unique_active_session(
+        conn,
+        project_id=project_id,
+        session_id=session_id,
+        route_token_ref=route_token_ref,
+        route_id=route_id,
+        route_context_hash=route_context_hash,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if not unique_session:
+        return {}
+    session = observer_session.get_session(
+        conn, project_id=project_id, session_id=session_id
+    )
+    capabilities = (
+        session.get("capabilities")
+        if isinstance(session, Mapping)
+        and isinstance(session.get("capabilities"), Mapping)
+        else {}
+    )
+    provenance = (
+        capabilities.get("route_provenance")
+        if isinstance(capabilities.get("route_provenance"), Mapping)
+        else {}
+    )
+    exact_route = bool(
+        isinstance(route, Mapping)
+        and route.get("source_free_operation") is True
+        and list(route.get("target_files") or []) == []
+        and list(route.get("owned_files") or []) == []
+        and list(route.get("allowed_actions") or [])
+        == list(_OPERATOR_SOURCE_FREE_ACTIONS)
+        and str(provenance.get("route_token_ref") or "") == route_token_ref
+        and str(provenance.get("route_id") or "") == route_id
+        and str(provenance.get("route_context_hash") or "")
+        == route_context_hash
+        and str(provenance.get("backlog_id") or "") == backlog_id
+        and str(provenance.get("task_id") or "") == task_id
+        and str(provenance.get("cex_id") or "") == task_id
+    )
+    world = _operator_supervised_direct_main_dev_world_authority()
+    target_commit = str(world.get("loaded_runtime_commit") or "").strip().lower()
+    if (
+        not exact_route
+        or world.get("accepted") is not True
+        or world.get("runtime_stale") is not False
+        or list(world.get("violations") or [])
+        or target_commit != str(world.get("target_head_commit") or "").strip().lower()
+        or not re.fullmatch(r"[0-9a-f]{40}", target_commit)
+    ):
+        return {}
+    copy_safe_body = {
+        "project_id": project_id,
+        "target_commit_sha": target_commit,
+        "activate": True,
+        "require_clean": True,
+        "semantic_use_ai": False,
+        "semantic_enrich": False,
+        "enqueue_stale": False,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "contract_execution_id": task_id,
+        "observer_session_id": session_id,
+        "observer_route_token_ref": route_token_ref,
+        "response_view": "compact",
+    }
+    authority = {
+        "accepted": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "route_token_ref": route_token_ref,
+        "observer_session_id": session_id,
+        "target_commit": target_commit,
+        "copy_safe_body": copy_safe_body,
+        "single_call_policy": True,
+        "old_graph_input_allowed": False,
+        "zero_write_projection": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
 
 
 _ACCEPTANCE_SCOPE_REPORT_UNSET = object()
@@ -147808,6 +149397,7 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
     row_files: Sequence[str],
     route: Mapping[str, Any] | None,
     route_error: str = "",
+    source_free_operation: bool = False,
 ) -> dict[str, Any]:
     """Validate one resolved or freshly server-minted exact Direct route."""
 
@@ -147824,7 +149414,9 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
         }
     )
     expected_actions = sorted(
-        _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        _OPERATOR_SOURCE_FREE_ACTIONS
+        if source_free_operation
+        else _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
     )
     target_files = sorted(
         {
@@ -147855,9 +149447,11 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
         route
         and str(route.get("caller_role") or "").strip() == "observer"
         and allowed_actions == expected_actions
-        and row_files
+        and (not row_files if source_free_operation else bool(row_files))
         and target_files == row_files
         and owned_files == row_files
+        and bool(route.get("source_free_operation")) is source_free_operation
+        and bool(route.get("source_mutation_forbidden")) is source_free_operation
         and all(route_identity.values())
     )
     authority = {
@@ -147881,6 +149475,8 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
         "route_resolution_error": route_error,
         "zero_write_on_failure": True,
         "historical_backfill_allowed": False,
+        "source_free_operation": source_free_operation,
+        "source_mutation_forbidden": source_free_operation,
     }
     authority["authority_hash"] = stable_sha256(authority)
     return authority
@@ -147900,6 +149496,13 @@ def _operator_supervised_direct_main_route_authority(
 
     route_token_ref = str(route_token_ref or "").strip()
     row_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    source_free_operation = bool(
+        _backlog_source_free_operation_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        ).get("accepted")
+    )
     try:
         route = observer_route_context.resolve_route_token_ref(
             conn,
@@ -147921,6 +149524,7 @@ def _operator_supervised_direct_main_route_authority(
         row_files=row_files,
         route=route,
         route_error=route_error,
+        source_free_operation=source_free_operation,
     )
 
 
@@ -148864,6 +150468,14 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             selector_authority=selector_authority,
         )
     target_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    source_free_authority = _backlog_source_free_operation_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    source_free_operation = bool(
+        source_free_authority.get("accepted") is True and not target_files
+    )
     persisted_ref = (
         str(strict_records[0].get("route_token_ref") or "").strip()
         if strict_records
@@ -148972,7 +150584,9 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "target_files": target_files,
         "owned_files": target_files,
         "allowed_actions": list(
-            _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            _OPERATOR_SOURCE_FREE_ACTIONS
+            if source_free_operation
+            else _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
         ),
         "evidence_refs": [
             f"backlog:{backlog_id}",
@@ -148988,6 +150602,11 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             ),
         ],
     }
+    if source_free_operation:
+        # This fact is projected from the durable row/CEX authority.  The dev
+        # issuer accepts only the byte-for-byte guide body, so a caller cannot
+        # turn an ordinary route into an empty-fence route by adding this flag.
+        route_issue_body["source_free_operation"] = True
     if route_ready:
         graph_guidance = _onboard_parentless_direct_main_graph_query_guidance(
             project_id=project_id,
@@ -149041,11 +150660,18 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             "requires_role": "observer",
             "action_input": dict(route_issue_body),
             "copy_safe_body": dict(route_issue_body),
-            "action_input_ready": bool(target_files),
-            "action_input_missing_fields": [] if target_files else ["target_files"],
+            "action_input_ready": bool(target_files or source_free_operation),
+            "action_input_missing_fields": (
+                [] if target_files or source_free_operation else ["target_files"]
+            ),
             "source_of_authority": (
                 "operator_supervised_direct_main.v1."
-                f"{selected_revision}+backlog_file_fence"
+                f"{selected_revision}+"
+                + (
+                    "backlog_source_free_operation_authority"
+                    if source_free_operation
+                    else "backlog_file_fence"
+                )
             ),
         }
 
@@ -149188,6 +150814,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "source_backed_contract_selected": True,
         "onboard_service_proxy_selected": False,
         "target_files": target_files,
+        "source_free_operation_authority": dict(source_free_authority),
         "route_authority": dict(route_authority),
         "observer_route_context_issue": {
             "required": not route_ready,
@@ -149338,6 +150965,217 @@ def _ac_dev_direct_route_issue_precheck(
         "selected_revision": str(guide.get("contract_revision") or "").strip(),
         "zero_write_projection": True,
     }
+
+
+def _ac_dev_completed_source_free_route_issue_precheck(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebuild one completed-parent operation route without Direct authority."""
+
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    authority = _backlog_source_free_operation_authority(
+        conn, project_id=project_id, backlog_id=backlog_id
+    )
+    expected_task_id = _onboard_service_execution_id(project_id, backlog_id)
+    projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    resume = _onboard_runtime_resume_from_current_projection(projection)
+    action = _onboard_route_guide_completed_next_action(
+        role="observer",
+        work_type="system_operation",
+        runtime_resume=resume,
+        backlog_row_status="OPEN",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref="",
+        target_files=(),
+        source_free_operation_authority=authority,
+    )
+    expected_body = (
+        dict(action.get("copy_safe_body") or {})
+        if isinstance(action.get("copy_safe_body"), Mapping)
+        else {}
+    )
+    accepted = bool(
+        _runtime_plane() == "dev"
+        and project_id == "aming-claw"
+        and authority.get("accepted") is True
+        and _onboard_runtime_resume_is_complete(resume)
+        and task_id == expected_task_id
+        and str(resume.get("current_contract_execution_id") or "")
+        == expected_task_id
+        and str(resume.get("root_contract_execution_id") or "")
+        == expected_task_id
+        and action.get("id") == "completed_system_operation_route_issue"
+        and expected_body
+        and dict(body) == expected_body
+    )
+    if not accepted:
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_completed_source_free_route_not_guide_bound",
+            message=(
+                "completed source-free route issuance requires the exact current "
+                "guide copy-safe body and completed onboard-service parent"
+            ),
+            body=body,
+            expected_body=expected_body,
+            extra={"contract_runtime_mutated": False},
+        )
+    world = _operator_supervised_direct_main_dev_world_authority()
+    if not world or world.get("accepted") is not True:
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_completed_source_free_route_world_invalid",
+            message="completed source-free route requires the loaded AC dev world",
+            body=body,
+            expected_body=expected_body,
+        )
+    return {
+        "accepted": True,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "expected_body": expected_body,
+        "world_authority": dict(world),
+    }
+
+
+def _ac_dev_completed_source_free_route_issue_precheck_from_request(
+    *, project_id: str, body: Mapping[str, Any]
+) -> dict[str, Any]:
+    conn = get_connection(project_id)
+    try:
+        return _ac_dev_completed_source_free_route_issue_precheck(
+            conn, project_id=project_id, body=body
+        )
+    finally:
+        conn.close()
+
+
+def _handle_ac_dev_completed_source_free_route_context_issue(
+    ctx: RequestContext,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Atomically persist only the completed-parent operation route."""
+
+    from . import observer_route_context
+
+    conn = get_connection(project_id)
+    try:
+        _ac_dev_completed_source_free_route_issue_precheck(
+            conn, project_id=project_id, body=body
+        )
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                precheck = _ac_dev_completed_source_free_route_issue_precheck(
+                    conn, project_id=project_id, body=body
+                )
+                backlog_id = str(precheck["backlog_id"])
+                task_id = str(precheck["task_id"])
+                expected_body = dict(precheck["expected_body"])
+                storage_project_id = _route_registry_storage_project_id(project_id)
+                rows = conn.execute(
+                    "SELECT route_token_ref FROM observer_route_token_refs "
+                    "WHERE project_id=? AND backlog_id=? AND task_id=?",
+                    (storage_project_id, backlog_id, task_id),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise _ac_dev_direct_route_issue_rejection(
+                        code="ac_dev_completed_source_free_route_ambiguous",
+                        message="completed source-free operation route is not unique",
+                        body=body,
+                    )
+                if rows:
+                    route_token_ref = str(_row_get(rows[0], "route_token_ref", ""))
+                    token = observer_route_context.resolve_route_token_ref(
+                        conn,
+                        project_id=project_id,
+                        storage_project_id=storage_project_id,
+                        route_token_ref=route_token_ref,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                    )
+                    if (
+                        not isinstance(token, Mapping)
+                        or list(token.get("target_files") or []) != []
+                        or list(token.get("owned_files") or []) != []
+                        or list(token.get("allowed_actions") or [])
+                        != list(_OPERATOR_SOURCE_FREE_ACTIONS)
+                        or not set(expected_body.get("evidence_refs") or []).issubset(
+                            set(token.get("evidence_refs") or [])
+                        )
+                        or token.get("source_free_operation") is not True
+                    ):
+                        raise _ac_dev_direct_route_issue_rejection(
+                            code="ac_dev_completed_source_free_route_replay_mismatch",
+                            message="existing operation route does not match current guide",
+                            body=body,
+                            expected_body=expected_body,
+                        )
+                    issued = {
+                        "route_token": dict(token),
+                        "route_token_ref": route_token_ref,
+                        "merge_queue_id": observer_route_context.derive_merge_queue_id(token),
+                        "provider": {},
+                    }
+                    conn.rollback()
+                    response = _ac_dev_direct_route_issue_response(
+                        project_id=project_id,
+                        issued=issued,
+                        idempotent_replay=True,
+                        contract_execution_id=task_id,
+                    )
+                    response["atomic_route_and_contract_materialization"] = False
+                    response["contract_runtime_mutated"] = False
+                    return response
+                world = dict(precheck["world_authority"])
+                issued = observer_route_context.issue_observer_write_route_context(
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                    target_files=[],
+                    allowed_actions=list(_OPERATOR_SOURCE_FREE_ACTIONS),
+                    evidence_refs=list(expected_body.get("evidence_refs") or []),
+                    project_root=Path(str(world.get("target_project_root") or "")),
+                    source_free_operation=True,
+                )
+                token = dict(issued.get("route_token") or {})
+                token["owned_files"] = []
+                route_token_ref = str(issued.get("route_token_ref") or "").strip()
+                observer_route_context.persist_route_token_ref(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=storage_project_id,
+                    route_token_ref=route_token_ref,
+                    token=token,
+                )
+                if conn.in_transaction:
+                    conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        issued = {**dict(issued), "route_token": token}
+        response = _ac_dev_direct_route_issue_response(
+            project_id=project_id,
+            issued=issued,
+            idempotent_replay=False,
+            contract_execution_id=task_id,
+        )
+        response["atomic_route_and_contract_materialization"] = False
+        response["contract_runtime_mutated"] = False
+        return response
+    finally:
+        conn.close()
 
 
 def _ac_dev_direct_route_issue_precheck_from_request(
@@ -149556,6 +151394,9 @@ def _handle_ac_dev_direct_route_context_issue(
                     project_root=Path(
                         str(world.get("target_project_root") or "")
                     ),
+                    source_free_operation=bool(
+                        expected_body.get("source_free_operation") is True
+                    ),
                 )
                 token = (
                     issued.get("route_token")
@@ -149578,6 +151419,9 @@ def _handle_ac_dev_direct_route_context_issue(
                         route_token_ref=route_token_ref,
                         row_files=list(expected_body.get("target_files") or []),
                         route=resolved_route,
+                        source_free_operation=bool(
+                            expected_body.get("source_free_operation") is True
+                        ),
                     )
                 )
                 if route_authority.get("accepted") is not True:
@@ -158696,6 +160540,8 @@ def _onboard_route_guide_completed_next_action(
     request_body: Mapping[str, Any] | None = None,
     onboard_service_continuation_authority: Mapping[str, Any] | None = None,
     mf_parallel_entry_authority: Mapping[str, Any] | None = None,
+    source_free_operation_authority: Mapping[str, Any] | None = None,
+    completed_source_free_reconcile_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -158740,6 +160586,127 @@ def _onboard_route_guide_completed_next_action(
             "next_step": (
                 "backlog row is terminal and contract runtime is complete; do not "
                 "issue a successor-enter route or current runtime write requirement."
+            ),
+        }
+    reconcile_authority = (
+        completed_source_free_reconcile_authority
+        if isinstance(completed_source_free_reconcile_authority, Mapping)
+        else {}
+    )
+    if reconcile_authority.get("accepted") is True:
+        reconcile_body = dict(reconcile_authority.get("copy_safe_body") or {})
+        return {
+            **base,
+            "id": "completed_system_operation_current_full_reconcile",
+            "action": "graph_current_full_reconcile",
+            "interface": "graph_current_full_reconcile",
+            "mcp_tool": "graph_current_full_reconcile",
+            "owner_role": "observer",
+            "requires_role": "observer",
+            "action_input": dict(reconcile_body),
+            "copy_safe_body": dict(reconcile_body),
+            "action_input_copy_safe": True,
+            "action_input_ready": True,
+            "action_input_missing_fields": [],
+            "server_derived_authority": dict(reconcile_authority),
+            "route_reissue_allowed": False,
+            "single_call_policy": True,
+            "old_graph_input_allowed": False,
+            "source_of_authority": (
+                "completed_onboard_service+active_operation_route+"
+                "active_route_bound_observer_session"
+            ),
+            "next_step": (
+                "call graph_current_full_reconcile exactly once with this body; "
+                "do not import, attach, or reuse old graph input"
+            ),
+        }
+    operation_authority = (
+        source_free_operation_authority
+        if isinstance(source_free_operation_authority, Mapping)
+        else {}
+    )
+    operation_authority_payload = dict(operation_authority)
+    operation_authority_hash = str(
+        operation_authority_payload.pop("authority_hash", "") or ""
+    ).strip()
+    expected_service_execution_id = _onboard_service_execution_id(
+        project_id, backlog_id
+    )
+    current_execution_id = str(
+        resume.get("current_contract_execution_id") or ""
+    ).strip()
+    root_execution_id = str(
+        resume.get("root_contract_execution_id") or ""
+    ).strip()
+    operation_route_ready = bool(
+        selected_role == "observer"
+        and selected_work_type == "system_operation"
+        and normalized_backlog_status == "OPEN"
+        and operation_authority.get("accepted") is True
+        and operation_authority.get("server_derived") is True
+        and operation_authority.get("caller_claims_trusted") is False
+        and bool(operation_authority_hash)
+        and operation_authority_hash
+        == stable_sha256(operation_authority_payload)
+        and operation_authority.get("project_id") == project_id
+        and operation_authority.get("backlog_id") == backlog_id
+        and operation_authority.get("source_free_operation") is True
+        and operation_authority.get("source_mutation_forbidden") is True
+        and list(operation_authority.get("target_files") or []) == []
+        and list(operation_authority.get("owned_files") or []) == []
+        and list(operation_authority.get("allowed_actions") or [])
+        == list(_OPERATOR_SOURCE_FREE_ACTIONS)
+        and not str(route_token_ref or "").strip()
+        and bool(expected_service_execution_id)
+        and current_execution_id == expected_service_execution_id
+        and root_execution_id == expected_service_execution_id
+    )
+    if operation_route_ready:
+        route_body = {
+            "project_id": project_id,
+            "caller_role": "observer",
+            "backlog_id": backlog_id,
+            "task_id": expected_service_execution_id,
+            "target_files": [],
+            "owned_files": [],
+            "allowed_actions": list(_OPERATOR_SOURCE_FREE_ACTIONS),
+            "source_free_operation": True,
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{expected_service_execution_id}",
+                "authority:backlog.source_free_operation_authority.v1",
+            ],
+        }
+        return {
+            **base,
+            "id": "completed_system_operation_route_issue",
+            "action": "observer_route_context_issue",
+            "interface": "observer_route_context_issue",
+            "mcp_tool": "observer_route_context_issue",
+            "owner_role": "observer",
+            "requires_role": "observer",
+            "requires_active_observer_session": True,
+            "requires_route_token_ref": False,
+            "action_input": dict(route_body),
+            "copy_safe_body": dict(route_body),
+            "action_input_copy_safe": True,
+            "action_input_ready": True,
+            "action_input_missing_fields": [],
+            "source_free_operation": True,
+            "source_mutation_forbidden": True,
+            "allowed_actions": list(_OPERATOR_SOURCE_FREE_ACTIONS),
+            "server_derived_authority": dict(operation_authority),
+            "source_of_authority": (
+                "completed_onboard_service+"
+                "backlog.source_free_operation_authority.v1"
+            ),
+            "old_evidence_carry_forward": False,
+            "parent_contract_execution_id": expected_service_execution_id,
+            "next_step": (
+                "register or heartbeat an active observer session, issue this "
+                "fresh operation-only route, then refresh onboard guidance; "
+                "do not reopen the completed service parent"
             ),
         }
     continuation_authority = (
@@ -168198,6 +170165,38 @@ def _onboard_route_guide_service_response(
                 target_files=target_files,
             )
         )
+    source_free_operation_authority = (
+        _backlog_source_free_operation_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        if str(role or "").strip() == "observer"
+        and str(work_type or "").strip() == "system_operation"
+        else {}
+    )
+    source_free_requested_route_ref = str(
+        (request_body or {}).get("route_token_ref")
+        or (request_body or {}).get("observer_route_token_ref")
+        or ""
+    ).strip()
+    completed_route_token_ref = (
+        source_free_requested_route_ref
+        if source_free_operation_authority
+        else route_token_ref
+    )
+    completed_source_free_reconcile_authority = (
+        _completed_source_free_reconcile_authority(
+            conn,
+            request_context=request_context,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=completed_route_token_ref,
+            source_free_authority=source_free_operation_authority,
+        )
+        if source_free_operation_authority and completed_route_token_ref
+        else {}
+    )
     next_action = _onboard_route_guide_service_next_action(
         role=role,
         work_type=work_type,
@@ -168212,13 +170211,19 @@ def _onboard_route_guide_service_response(
                 backlog_row_status=backlog_row_status,
                 project_id=project_id,
                 backlog_id=backlog_id,
-                route_token_ref=route_token_ref,
+                route_token_ref=completed_route_token_ref,
                 target_files=target_files,
                 request_body=batch_action_request_body,
                 onboard_service_continuation_authority=(
                     onboard_service_continuation_authority
                 ),
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
+                source_free_operation_authority=(
+                    source_free_operation_authority
+                ),
+                completed_source_free_reconcile_authority=(
+                    completed_source_free_reconcile_authority
+                ),
             )
         elif runtime_resume.get("scheduler_eligible") is False:
             next_action = {}
@@ -168232,13 +170237,19 @@ def _onboard_route_guide_service_response(
                 backlog_row_status=backlog_row_status,
                 project_id=project_id,
                 backlog_id=backlog_id,
-                route_token_ref=route_token_ref,
+                route_token_ref=completed_route_token_ref,
                 target_files=target_files,
                 request_body=batch_action_request_body,
                 onboard_service_continuation_authority=(
                     onboard_service_continuation_authority
                 ),
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
+                source_free_operation_authority=(
+                    source_free_operation_authority
+                ),
+                completed_source_free_reconcile_authority=(
+                    completed_source_free_reconcile_authority
+                ),
             )
     if wrong_family_contract_update_supersession:
         supersession_authority = dict(
@@ -168275,13 +170286,17 @@ def _onboard_route_guide_service_response(
             backlog_row_status=backlog_row_status,
             project_id=project_id,
             backlog_id=backlog_id,
-            route_token_ref=route_token_ref,
+            route_token_ref=completed_route_token_ref,
             target_files=target_files,
             request_body=batch_action_request_body,
             onboard_service_continuation_authority=(
                 onboard_service_continuation_authority
             ),
             mf_parallel_entry_authority=mf_parallel_entry_authority,
+            source_free_operation_authority=source_free_operation_authority,
+            completed_source_free_reconcile_authority=(
+                completed_source_free_reconcile_authority
+            ),
         )
         if str(fresh_action.get("action") or "") == "no_runtime_action":
             next_action = terminal_action
@@ -205619,7 +207634,9 @@ def _branch_service_exact_dev_health_matches(
         "stable_database_identity": dict(stable_database_identity),
         "project_allowlist": ["aming-claw"],
         "schema_policy": "verify_only_no_auto_migration",
-        "active_graph_activation_allowed": False,
+        "active_graph_activation_allowed": graph_activation_policy("dev")[
+            "active_graph_activation_allowed"
+        ],
         "stable_deploy_allowed": False,
         "background_workers_enabled": False,
         "status": "ready",
@@ -205900,7 +207917,6 @@ def handle_branch_service_validate(ctx: RequestContext):
             _STABLE_ANCHOR_ENV: stable_anchor,
             "AMING_CLAW_ALLOWED_PROJECT_IDS": "aming-claw",
             "AMING_CLAW_DB_MIGRATION_POLICY": "verify-only",
-            "AMING_CLAW_ACTIVE_GRAPH_MUTATION": "deny",
             "AMING_CLAW_STABLE_DEPLOYMENT": "deny",
             "PYTHONPATH": (
                 str(worktree)
@@ -206675,7 +208691,15 @@ def handle_version_check(ctx: RequestContext):
         else:
             target_root = self_root
             root_source = "governance_fallback"
-    live_target_authoritative = root_source in {"explicit_project", "registered_project"}
+    dev_self_root_authoritative = bool(
+        _runtime_plane() == "dev"
+        and pid == AC_PROJECT_ID
+        and target_root == _dev_exact_source_root()
+    )
+    live_target_authoritative = bool(
+        root_source in {"explicit_project", "registered_project"}
+        or dev_self_root_authoritative
+    )
 
     def _prefix_match(left: str, right: str) -> bool:
         return bool(left and right and (left.startswith(right) or right.startswith(left)))
@@ -206739,14 +208763,22 @@ def handle_version_check(ctx: RequestContext):
         git_synced = row["git_synced_at"] or ""
 
     target_chain_version = (
-        (target_state or {}).get("chain_sha")
-        or (target_state or {}).get("version")
-        or (target_head_short if live_target_authoritative else "")
-        or ""
+        target_head
+        if dev_self_root_authoritative
+        else (
+            (target_state or {}).get("chain_sha")
+            or (target_state or {}).get("version")
+            or (target_head_short if live_target_authoritative else "")
+            or ""
+        )
     )
     trailer_source = (target_state or {}).get("source") or ""
     if live_target_authoritative:
-        source = trailer_source or ("git" if target_head else "none")
+        source = (
+            "server_derived_dev_git_head"
+            if dev_self_root_authoritative and target_head
+            else trailer_source or ("git" if target_head else "none")
+        )
         dirty_files = filter_dirty_files((target_state or {}).get("dirty_files") or [])
         if target_state is None:
             dirty_files = filter_dirty_files(
@@ -206789,7 +208821,11 @@ def handle_version_check(ctx: RequestContext):
         ok = False
         parts.append(f"{len(dirty_files)} uncommitted files")
     if not row:
-        parts.append("Project version row is not initialized")
+        parts.append(
+            "Project version row is not initialized (legacy advisory)"
+            if dev_self_root_authoritative
+            else "Project version row is not initialized"
+        )
     elif not synced_head:
         parts.append("Executor has not synced git status yet")
     elif synced_head and not target_synced_with_governance:
@@ -206863,6 +208899,8 @@ def handle_version_check(ctx: RequestContext):
         "runtime_scope": "governance",
         "runtime_match": runtime_match,
         "governance_runtime": governance_runtime,
+        "server_derived_dev_head_authority": dev_self_root_authoritative,
+        "project_version_row_required": not dev_self_root_authoritative,
     }
 
 
@@ -208422,18 +210460,6 @@ def _append_backlog_filters(sql: str, params: list[Any], ctx: RequestContext) ->
     return sql, params
 
 
-_BACKLOG_READ_SCHEMA_INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_backlog_bugs_dashboard_keyset
-    ON backlog_bugs(updated_at DESC, created_at DESC, bug_id DESC)
-"""
-_BACKLOG_READ_SCHEMA_TABLE_DEFINITION = (
-    (("resource", "TEXT", 0, None, 1), "resource TEXT PRIMARY KEY"),
-    (("generation", "INTEGER", 1, "1", 0), "generation INTEGER NOT NULL DEFAULT 1"),
-    (("updated_at", "TEXT", 1, "''", 0), "updated_at TEXT NOT NULL DEFAULT ''"),
-)
-_BACKLOG_READ_SCHEMA_TABLE_XINFO = tuple(
-    (*metadata, 0) for metadata, _sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION
-)
 # Exact direct-read subset bound from observer_session.SCHEMA_SQL's canonical
 # observer_command_queue definition. Recovery-only columns and indexes are not
 # part of the optimized backlog projection contract.
@@ -208448,32 +210474,6 @@ _BACKLOG_READ_OBSERVER_COMMAND_COLUMNS = {
     "created_at": ("TEXT", 1, None, 0),
     "result_json": ("TEXT", 1, "'{}'", 0),
 }
-_BACKLOG_READ_SCHEMA_TABLE_SQL = (
-    "CREATE TABLE IF NOT EXISTS dashboard_backlog_cache_generation (\n    "
-    + ",\n    ".join(sql for _metadata, sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION)
-    + "\n)"
-)
-_BACKLOG_READ_SCHEMA_RESOURCE = "backlog"
-_BACKLOG_READ_SCHEMA_SEED_SQL = f"""
-INSERT OR IGNORE INTO dashboard_backlog_cache_generation
-    (resource, generation, updated_at)
-VALUES ('{_BACKLOG_READ_SCHEMA_RESOURCE}', 1, CURRENT_TIMESTAMP)
-"""
-_BACKLOG_READ_SCHEMA_TRIGGER_SQL = {
-    event: f"""
-CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_{event.lower()}
-AFTER {event} ON backlog_bugs
-BEGIN
-    UPDATE dashboard_backlog_cache_generation
-       SET generation = generation + 1,
-           updated_at = CURRENT_TIMESTAMP
-     WHERE resource = '{_BACKLOG_READ_SCHEMA_RESOURCE}';
-END
-"""
-    for event in ("INSERT", "UPDATE", "DELETE")
-}
-
-
 def _backlog_read_schema_normalized_sql(value: Any) -> str:
     normalized = re.sub(
         r"\s+",
@@ -208486,19 +210486,7 @@ def _backlog_read_schema_normalized_sql(value: Any) -> str:
 
 def _ensure_backlog_read_schema(conn: sqlite3.Connection) -> None:
     """Stable-owned indexed keyset and mutation-generation initialization."""
-
-    conn.executescript(
-        ";\n".join(
-            (
-                _BACKLOG_READ_SCHEMA_INDEX_SQL,
-                _BACKLOG_READ_SCHEMA_TABLE_SQL,
-                _BACKLOG_READ_SCHEMA_SEED_SQL,
-                *_BACKLOG_READ_SCHEMA_TRIGGER_SQL.values(),
-            )
-        )
-        + ";"
-    )
-    conn.commit()
+    _db_ensure_backlog_read_schema(conn)
 
 
 def _ac_dev_backlog_read_schema_incompatible(
@@ -217097,6 +219085,34 @@ def handle_integration_epoch_worldref_seal_linear_unlock(ctx: RequestContext):
 def handle_project_release_operator_head_queue(ctx: RequestContext):
     """Read or mutate the bounded release-operator queue."""
     project_id = ctx.get_project_id()
+    if _runtime_plane() == "dev" and project_id == AC_PROJECT_ID:
+        capability = {
+            "schema_version": "release_operator_head_queue.dev_capability.v1",
+            "runtime_plane": "dev",
+            "project_id": project_id,
+            "available": False,
+            "state": "not_available_in_dev_world",
+            "items": [],
+            "selection": {
+                "selected_backlog_id": "",
+                "selection_source": "explicit_backlog_required",
+            },
+            "schema_materialized": False,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "pass_synthesized": False,
+        }
+        if ctx.method == "GET":
+            return {
+                "ok": True,
+                "release_operator_head_queue": capability,
+            }
+        raise GovernanceError(
+            "release_operator_head_queue_not_available_in_dev_world",
+            "AC dev requires an explicit backlog and does not own release queue state",
+            409,
+            capability,
+        )
     with DBContext(project_id) as conn:
         if ctx.method == "GET":
             return {
@@ -217697,6 +219713,27 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
         or _first_query_value(ctx.query, "bug_id")
         or ""
     ).strip()
+    if (
+        _runtime_plane() == "dev"
+        and project_id == AC_PROJECT_ID
+        and not backlog_id
+    ):
+        raise GovernanceError(
+            "explicit_backlog_required",
+            "AC dev Onboard requires an explicit backlog_id or bug_id",
+            409,
+            {
+                "schema_version": "onboard_route_guide.dev_explicit_backlog.v1",
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "required_fields": ["backlog_id"],
+                "release_operator_head_queue_available": False,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "pass_synthesized": False,
+            },
+        )
     route_token_ref = _contract_runtime_ref_value(
         ctx, "route_token_ref", "observer_route_token_ref"
     )
@@ -221964,6 +224001,13 @@ def main():
         dev_storage_root = os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
         if not dev_storage_root:
             raise GovernanceSingletonError("ac_dev_storage_root_required")
+        from .db import _verified_stable_binding
+        _verified_stable_binding()
+        loaded_source = governance_loaded_runtime_identity().get("loaded_source_sha256")
+        try:
+            validate_dev_launch_receipt(dev_storage_root, source_sha256=str(loaded_source or ""))
+        except (OSError, ValueError) as exc:
+            raise GovernanceSingletonError("ac_dev_launch_receipt_invalid") from exc
         acquire_dev_runtime_writer_lease(dev_storage_root)
     try:
         startup_identity = _validate_runtime_plane_startup()

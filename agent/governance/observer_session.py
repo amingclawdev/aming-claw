@@ -1282,6 +1282,113 @@ def _contains_terminal_dispatch_blocker(value: Any) -> bool:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    # The AC dev database is admitted out of band.  Runtime access is
+    # verification-only: a missing or drifting table/index must fail before a
+    # session read or write rather than being repaired by lazy DDL.
+    from .db import DevRuntimeSchemaVerificationError, dev_runtime_verify_only
+
+    if dev_runtime_verify_only():
+        expected_columns = {
+            "observer_sessions": (
+                "session_id", "project_id", "observer_kind", "session_label",
+                "pid", "cwd", "capabilities_json", "token_hash", "status",
+                "registered_at", "last_seen_at", "closed_at", "revoked_at",
+            ),
+            "observer_command_queue": (
+                "command_id", "project_id", "command_type", "payload_json",
+                "status", "target_session_id", "claimed_by_session_id",
+                "created_by", "created_at", "notified_at", "claimed_at",
+                "completed_at", "result_json", "error",
+            ),
+        }
+        expected_indexes = {
+            "idx_observer_sessions_project_status",
+            "idx_observer_sessions_last_seen",
+            "idx_observer_commands_project_status",
+            "idx_observer_commands_target",
+            "idx_observer_commands_claimed_by",
+        }
+        expected_index_sql = {
+            "idx_observer_sessions_project_status": "CREATE INDEX idx_observer_sessions_project_status ON observer_sessions(project_id,status)",
+            "idx_observer_sessions_last_seen": "CREATE INDEX idx_observer_sessions_last_seen ON observer_sessions(project_id,last_seen_at)",
+            "idx_observer_commands_project_status": "CREATE INDEX idx_observer_commands_project_status ON observer_command_queue(project_id,status,created_at)",
+            "idx_observer_commands_target": "CREATE INDEX idx_observer_commands_target ON observer_command_queue(project_id,target_session_id,status,created_at)",
+            "idx_observer_commands_claimed_by": "CREATE INDEX idx_observer_commands_claimed_by ON observer_command_queue(project_id,claimed_by_session_id,status)",
+        }
+        missing_tables = []
+        missing_columns = {}
+        invalid_columns = {}
+        for table, columns in expected_columns.items():
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if row is None:
+                missing_tables.append(table)
+                continue
+            info_rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            actual = tuple(str(row["name"] if isinstance(row, sqlite3.Row) else row[1]) for row in info_rows)
+            if actual != columns:
+                missing_columns[table] = sorted(set(columns) - set(actual)) or [
+                    "__exact_column_order_or_extra_column_mismatch__"
+                ]
+            for row in info_rows:
+                name = str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+                actual_meta = (
+                    str(row["type"] if isinstance(row, sqlite3.Row) else row[2]).upper(),
+                    int(row["notnull"] if isinstance(row, sqlite3.Row) else row[3]),
+                    int(row["pk"] if isinstance(row, sqlite3.Row) else row[5]),
+                )
+                expected_meta = (
+                    "INTEGER" if table == "observer_sessions" and name == "pid" else "TEXT",
+                    0 if name in {"session_id", "command_id"} else 1,
+                    1 if name in {"session_id", "command_id"} else 0,
+                )
+                if actual_meta != expected_meta:
+                    invalid_columns.setdefault(table, {})[name] = {
+                        "expected": repr(expected_meta), "actual": repr(actual_meta)
+                    }
+        index_rows = conn.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+        present_indexes = {
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[0])
+            for row in index_rows
+        }
+        missing_indexes = sorted(expected_indexes - present_indexes)
+        def normalize_sql(value: Any) -> str:
+            return "".join(str(value or "").lower().split())
+        invalid_indexes = {}
+        for row in index_rows:
+            name = str(row["name"] if isinstance(row, sqlite3.Row) else row[0])
+            if name not in expected_index_sql:
+                continue
+            sql = str(row["sql"] if isinstance(row, sqlite3.Row) else row[1])
+            if normalize_sql(sql) != normalize_sql(expected_index_sql[name]):
+                invalid_indexes[name] = {"expected_sql": expected_index_sql[name], "actual_sql": sql}
+        token_hash_unique = any(
+            int(row["unique"] if isinstance(row, sqlite3.Row) else row[2])
+            and tuple(
+                str(item["name"] if isinstance(item, sqlite3.Row) else item[2])
+                for item in conn.execute(
+                    f'PRAGMA index_info("{str(row["name"] if isinstance(row, sqlite3.Row) else row[1])}")'
+                ).fetchall()
+            ) == ("token_hash",)
+            for row in conn.execute('PRAGMA index_list("observer_sessions")').fetchall()
+        ) if "observer_sessions" not in missing_tables else False
+        if missing_tables or missing_columns or invalid_columns or missing_indexes or invalid_indexes or not token_hash_unique:
+            raise DevRuntimeSchemaVerificationError(
+                "observer_session.runtime",
+                missing_tables=missing_tables,
+                missing_columns=missing_columns,
+                invalid_columns=invalid_columns,
+                missing_indexes=missing_indexes,
+                invalid_indexes=invalid_indexes,
+                missing_unique_constraints=(
+                    {"observer_sessions": (("token_hash",),)}
+                    if not token_hash_unique else {}
+                ),
+            )
+        return
     conn.executescript(SCHEMA_SQL)
 
 

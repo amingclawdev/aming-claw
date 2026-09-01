@@ -44,9 +44,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import threading
-from typing import Any
+from typing import Any, Callable
 
 # Import the gate's CANONICAL action normalizer so the mint-time sanitizer and
 # the downstream gate (``mf_subagent_contract.validate_route_token_mutation_gate``
@@ -111,6 +112,20 @@ BLOCKED_ACTIONS: tuple[str, ...] = (
     "close_without_worker_or_subagent_evidence",
 )
 
+# The only actions that may be carried by a route with no source-file fence.
+# This is intentionally a closed set of observer-owned operational facades;
+# none allocates a source worker, edits a file, or merges source.  The server
+# must separately prove the source-free contract authority before passing
+# ``source_free_operation=True`` to the mint.
+SOURCE_FREE_OPERATION_ALLOWED_ACTIONS: tuple[str, ...] = (
+    "observer_session_register",
+    "observer_session_heartbeat",
+    "graph_query",
+    "task_timeline_append",
+    "graph_current_full_reconcile",
+    "backlog_close",
+)
+
 REQUIRED_LANES: tuple[dict[str, str], ...] = (
     {
         "id": "observer_intent_capture",
@@ -155,6 +170,8 @@ ROUTE_ACTION_SCOPE_SCHEMA_VERSION = "observer_route_action_scope.v2"
 # observer work and must not advertise that a fresh mf_sub implementation lane
 # exists or is legally required.
 OBSERVER_ADMIN_CLOSE_EVIDENCE_ACTIONS: tuple[str, ...] = (
+    "observer_session_register",
+    "observer_session_heartbeat",
     "backlog_upsert",
     "backlog_close",
     "task_timeline_append",
@@ -561,6 +578,7 @@ def build_observer_write_route_token(
     parent_prompt_contract_hash: str = "",
     parent_visible_injection_manifest_hash: str = "",
     parent_route_token_ref: str = "",
+    source_free_operation: bool = False,
 ) -> dict[str, Any]:
     """Mint an Aming-owned, write-authorizing observer route token.
 
@@ -584,10 +602,25 @@ def build_observer_write_route_token(
         raise ValueError("task_id is required")
 
     target_files_list = sorted(_dedupe(_string_list(target_files)))
-    if not target_files_list:
+    if not target_files_list and not source_free_operation:
         raise ValueError("target_files must be a non-empty list of file paths")
 
     actions_list = _sanitize_allowed_actions(allowed_actions)
+    source_free_actions = {
+        _gate_normalized_action(action)
+        for action in SOURCE_FREE_OPERATION_ALLOWED_ACTIONS
+    }
+    if source_free_operation:
+        if target_files_list:
+            raise ValueError(
+                "source_free_operation requires an empty target_files fence"
+            )
+        outside_source_free_scope = sorted(set(actions_list) - source_free_actions)
+        if outside_source_free_scope:
+            raise ValueError(
+                "source_free_operation allowed_actions must be operation-only: "
+                + ", ".join(outside_source_free_scope)
+            )
     lane_requirements = _route_lane_requirements_for_actions(actions_list)
     required_lanes = lane_requirements["required_lanes"]
     required_evidence = lane_requirements["required_evidence"]
@@ -641,6 +674,9 @@ def build_observer_write_route_token(
         "date": date_str,
         "provider_hash": provider_evidence.get("hash", ""),
     }
+    if source_free_operation:
+        identity_base["source_free_operation"] = True
+        identity_base["source_mutation_forbidden"] = True
     digest = _stable_digest(identity_base, length=16)
     route_id = f"route-{date_str}-{digest}"
     route_context_hash = _sha256(identity_base)
@@ -690,11 +726,22 @@ def build_observer_write_route_token(
             "project_id": project_id,
             "backlog_id": backlog_id,
             "task_id": task_id,
+            **(
+                {
+                    "source_free_operation": True,
+                    "source_mutation_forbidden": True,
+                }
+                if source_free_operation
+                else {}
+            ),
         },
         "target_files": target_files_list,
         "provider": provider_evidence,
         "issued_at": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if source_free_operation:
+        token["source_free_operation"] = True
+        token["source_mutation_forbidden"] = True
     if parent_lineage:
         token["parent_route_lineage"] = parent_lineage
     return token
@@ -1090,6 +1137,8 @@ def issue_observer_write_route_context(
     parent_prompt_contract_hash: str = "",
     parent_visible_injection_manifest_hash: str = "",
     parent_route_token_ref: str = "",
+    canonical_ref_adoption: Mapping[str, Any] | None = None,
+    source_free_operation: bool = False,
 ) -> dict[str, Any]:
     """Native Aming-owned issuance entrypoint for an observer session.
 
@@ -1125,6 +1174,7 @@ def issue_observer_write_route_context(
         parent_prompt_contract_hash=parent_prompt_contract_hash,
         parent_visible_injection_manifest_hash=parent_visible_injection_manifest_hash,
         parent_route_token_ref=parent_route_token_ref,
+        source_free_operation=source_free_operation,
     )
     route_token_ref = derive_route_token_ref(token)
     merge_queue_id = derive_merge_queue_id(token)
@@ -1133,6 +1183,26 @@ def issue_observer_write_route_context(
         route_token_ref=route_token_ref,
         merge_queue_id=merge_queue_id,
     )
+    # This narrow, server-validated extension is deliberately attached before
+    # the token reaches the registry.  ``persist_route_token_ref`` salts and
+    # digests the complete token body, so attaching it afterwards would leave
+    # the executable adoption binding outside the verifier's custody.
+    if canonical_ref_adoption is not None:
+        lineage = token.get("route_lineage")
+        if lineage is None:
+            lineage = {
+                "schema_version": ROUTE_LINEAGE_SCHEMA_VERSION,
+                "status": "direct_bound",
+                "raw_route_token_persisted": False,
+                "raw_session_token_persisted": False,
+            }
+            token["route_lineage"] = lineage
+        elif isinstance(lineage, Mapping) and not isinstance(lineage, dict):
+            lineage = dict(lineage)
+            token["route_lineage"] = lineage
+        if not isinstance(lineage, dict):
+            raise ValueError("issued route lineage is invalid")
+        lineage["canonical_ref_adoption"] = dict(canonical_ref_adoption)
     execute_payload = build_execute_backlog_row_payload(
         token,
         route_token_ref=route_token_ref,
@@ -1197,6 +1267,247 @@ ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS = 15 * 60
 REF_STATUS_ACTIVE = "active"
 REF_STATUS_SUPERSEDED = "superseded"
 REF_STATUS_EXPIRED = "expired"
+
+# This is deliberately a *nested* lifecycle inside the immutable public route
+# lineage.  It is not a second route authority, nor is it consulted by the
+# ordinary route-token resolver (which remains active-only).
+CANONICAL_REF_ADOPTION_STATE_SCHEMA = "canonical_ref_adoption_state.v1"
+CANONICAL_REF_ADOPTION_INTENT_SCHEMA = "canonical_ref_adoption_route_bound.v1"
+CANONICAL_REF_ADOPTION_ACTION = "canonical_ref_adoption"
+_CANONICAL_REF_ADOPTION_PHASES = ("reserved", "detached", "cas", "attached")
+
+
+def _canonical_ref_adoption_intent(value: Any, *, now: datetime | None = None) -> dict[str, str]:
+    """Validate the typed adoption intent stored by the issuing server."""
+    if not isinstance(value, Mapping):
+        raise RouteTokenRefError("canonical_ref_adoption intent is missing")
+    required = (
+        "project_id", "backlog_id", "action", "contract_execution_id", "generation",
+        "custody", "canonical_ref", "expected_commit", "target_commit", "target_tree",
+        "source_content_sha256", "qa_content_sha256", "issued_at", "expires_at",
+        "replay_identity",
+    )
+    intent = {key: _string(value.get(key)) for key in required}
+    if any(not value for value in intent.values()):
+        raise RouteTokenRefError("canonical_ref_adoption intent is incomplete")
+    if (
+        _string(value.get("schema_version")) != CANONICAL_REF_ADOPTION_INTENT_SCHEMA
+        or intent["project_id"] != "aming-claw"
+        or intent["action"] != CANONICAL_REF_ADOPTION_ACTION
+        or intent["canonical_ref"] != "refs/heads/codex/ac-dev"
+    ):
+        raise RouteTokenRefError("canonical_ref_adoption intent is malformed")
+    if any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", intent[key])
+           for key in ("expected_commit", "target_commit", "target_tree")):
+        raise RouteTokenRefError("canonical_ref_adoption intent lacks exact Git identities")
+    if any(not re.fullmatch(r"sha256:[0-9a-f]{64}", intent[key])
+           for key in ("source_content_sha256", "qa_content_sha256")):
+        raise RouteTokenRefError("canonical_ref_adoption intent lacks content digests")
+    try:
+        issued = datetime.fromisoformat(intent["issued_at"].replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(intent["expires_at"].replace("Z", "+00:00"))
+        if issued.tzinfo is None or expires.tzinfo is None:
+            raise ValueError("timezone required")
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if issued.astimezone(timezone.utc) > current or current >= expires.astimezone(timezone.utc):
+            raise ValueError("outside issuance window")
+    except (TypeError, ValueError):
+        raise RouteTokenRefError("canonical_ref_adoption intent is expired or has invalid timestamps") from None
+    return {"schema_version": CANONICAL_REF_ADOPTION_INTENT_SCHEMA, **intent}
+
+
+def _canonical_ref_adoption_state(lineage: Mapping[str, Any]) -> dict[str, Any]:
+    state = lineage.get("canonical_ref_adoption_state")
+    return dict(state) if isinstance(state, Mapping) else {}
+
+
+def canonical_ref_adoption_issuance_available(
+    conn: sqlite3.Connection, *, project_id: str, intent: Mapping[str, Any], now: datetime | None = None
+) -> None:
+    """Read-only diagnostic only; persistence is the sole issuance authority.
+
+    Callers may use this to explain an already durable lifecycle, but must not
+    treat this scan as a reservation.  The actual unique claim happens under
+    the registry's ``BEGIN IMMEDIATE`` transaction in
+    :func:`persist_route_token_ref`.
+    """
+    typed = _canonical_ref_adoption_intent(intent, now=now)
+    _ensure_ref_registry_schema(conn)
+    for row in conn.execute(
+        "SELECT route_lineage_json FROM observer_route_token_refs WHERE project_id=?", (_string(project_id),)
+    ).fetchall():
+        lineage = _json_loads_public_mapping(row["route_lineage_json"])
+        stored = lineage.get("canonical_ref_adoption")
+        state = _canonical_ref_adoption_state(lineage)
+        if isinstance(stored, Mapping) and _string(stored.get("replay_identity")) == typed["replay_identity"]:
+            raise RouteTokenRefError("canonical_ref_adoption already has a server-issued lifecycle")
+
+
+def _canonical_ref_adoption_row(
+    conn: sqlite3.Connection, *, project_id: str, route_token_ref: str, token: Mapping[str, Any], now: datetime | None
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    binding = verify_route_token_binding(
+        conn, project_id=project_id, token=token, route_token_ref=route_token_ref, now=now
+    )
+    if CANONICAL_REF_ADOPTION_ACTION not in set(binding.get("allowed_actions") or []):
+        raise RouteTokenRefError("canonical_ref_adoption action is not authorized")
+    row = conn.execute(
+        "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+        (_string(project_id), _string(route_token_ref)),
+    ).fetchone()
+    if row is None:
+        raise RouteTokenRefError("canonical_ref_adoption route ref is unavailable")
+    row_dict = dict(row)
+    lineage = _json_loads_public_mapping(row_dict.get("route_lineage_json"))
+    typed = _canonical_ref_adoption_intent(lineage.get("canonical_ref_adoption"), now=now)
+    if typed["backlog_id"] != _string(row_dict.get("backlog_id")) or typed["contract_execution_id"] != _string(row_dict.get("task_id")):
+        raise RouteTokenRefError("canonical_ref_adoption intent does not match route scope")
+    return row_dict, lineage, typed
+
+
+def canonical_ref_adoption_reserve(
+    conn: sqlite3.Connection, *, project_id: str, route_token_ref: str, token: Mapping[str, Any],
+    replay_identity: str, initial_receipt_sha256: str, now: datetime | None = None,
+) -> dict[str, Any]:
+    """Atomically reserve a single adoption lifecycle winner on an active ref."""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", _string(initial_receipt_sha256)):
+        raise RouteTokenRefError("canonical_ref_adoption initial receipt hash is invalid")
+    with _REF_REGISTRY_LOCK:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row, lineage, intent = _canonical_ref_adoption_row(
+                conn, project_id=project_id, route_token_ref=route_token_ref, token=token, now=now
+            )
+            digest = _sha256(intent)
+            existing = _canonical_ref_adoption_state(lineage)
+            if existing:
+                if (
+                    existing.get("intent_sha256") == digest
+                    and existing.get("replay_identity") == _string(replay_identity)
+                    and existing.get("initial_receipt_sha256") == _string(initial_receipt_sha256)
+                ):
+                    conn.commit()
+                    return dict(existing)
+                raise RouteTokenRefError("canonical_ref_adoption lifecycle is already reserved")
+            state = {
+                "schema_version": CANONICAL_REF_ADOPTION_STATE_SCHEMA,
+                "intent_sha256": digest,
+                "replay_identity": _string(replay_identity),
+                "initial_receipt_sha256": _string(initial_receipt_sha256),
+                "phase": "reserved",
+                "previous_receipt_sha256": _string(initial_receipt_sha256),
+            }
+            if not state["replay_identity"]:
+                raise RouteTokenRefError("canonical_ref_adoption replay identity is required")
+            next_lineage = dict(lineage)
+            next_lineage["canonical_ref_adoption_state"] = state
+            old_json = _json_dumps_public_mapping(lineage)
+            changed = conn.execute(
+                "UPDATE observer_route_token_refs SET route_lineage_json=? "
+                "WHERE project_id=? AND route_token_ref=? AND status=? AND route_lineage_json=?",
+                (_json_dumps_public_mapping(next_lineage), _string(project_id), _string(route_token_ref), REF_STATUS_ACTIVE, old_json),
+            ).rowcount
+            if changed != 1:
+                raise RouteTokenRefError("canonical_ref_adoption reserve lost compare-and-swap")
+            conn.commit()
+            return state
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def canonical_ref_adoption_advance(
+    conn: sqlite3.Connection, *, project_id: str, route_token_ref: str, token: Mapping[str, Any],
+    replay_identity: str, previous_receipt_sha256: str, next_phase: str, receipt_sha256: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Advance only the exact reserved receipt chain; attached consumes the ref."""
+    if next_phase not in _CANONICAL_REF_ADOPTION_PHASES[1:]:
+        raise RouteTokenRefError("canonical_ref_adoption next phase is invalid")
+    if any(not re.fullmatch(r"sha256:[0-9a-f]{64}", _string(value))
+           for value in (previous_receipt_sha256, receipt_sha256)):
+        raise RouteTokenRefError("canonical_ref_adoption receipt hash is invalid")
+    predecessor = {"detached": "reserved", "cas": "detached", "attached": "cas"}[next_phase]
+    with _REF_REGISTRY_LOCK:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Attached is terminal and generic binding is intentionally inactive;
+            # resume verification is therefore a dedicated exact-chain path.
+            row = conn.execute(
+                "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+                (_string(project_id), _string(route_token_ref)),
+            ).fetchone()
+            if row is None:
+                raise RouteTokenRefError("canonical_ref_adoption route ref is unavailable")
+            row_dict = dict(row)
+            lineage = _json_loads_public_mapping(row_dict.get("route_lineage_json"))
+            intent = _canonical_ref_adoption_intent(lineage.get("canonical_ref_adoption"), now=now)
+            state = _canonical_ref_adoption_state(lineage)
+            if not state or state.get("intent_sha256") != _sha256(intent):
+                raise RouteTokenRefError("canonical_ref_adoption state is missing or tampered")
+            if state.get("replay_identity") != _string(replay_identity) or state.get("phase") != predecessor:
+                raise RouteTokenRefError("canonical_ref_adoption replay identity or phase mismatch")
+            if state.get("previous_receipt_sha256") != _string(previous_receipt_sha256):
+                raise RouteTokenRefError("canonical_ref_adoption prior receipt mismatch")
+            # Every advance still proves the exact active token/ref before an
+            # attached terminal transition makes ordinary resolution inactive.
+            _canonical_ref_adoption_row(
+                conn, project_id=project_id, route_token_ref=route_token_ref, token=token, now=now
+            )
+            state = dict(state)
+            state["phase"] = next_phase
+            state["previous_receipt_sha256"] = _string(receipt_sha256)
+            next_lineage = dict(lineage)
+            next_lineage["canonical_ref_adoption_state"] = state
+            old_json = _json_dumps_public_mapping(lineage)
+            changed = conn.execute(
+                "UPDATE observer_route_token_refs SET route_lineage_json=?, status=? "
+                "WHERE project_id=? AND route_token_ref=? AND status=? AND route_lineage_json=?",
+                (_json_dumps_public_mapping(next_lineage), REF_STATUS_SUPERSEDED if next_phase == "attached" else REF_STATUS_ACTIVE,
+                 _string(project_id), _string(route_token_ref), REF_STATUS_ACTIVE, old_json),
+            ).rowcount
+            if changed != 1:
+                raise RouteTokenRefError("canonical_ref_adoption advance lost compare-and-swap")
+            conn.commit()
+            return state
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def canonical_ref_adoption_resume(
+    conn: sqlite3.Connection, *, project_id: str, route_token_ref: str, token: Mapping[str, Any],
+    replay_identity: str, previous_receipt_sha256: str, expected_phase: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Verify an exact interrupted chain without relaxing generic ref resolution."""
+    if expected_phase not in _CANONICAL_REF_ADOPTION_PHASES:
+        raise RouteTokenRefError("canonical_ref_adoption resume phase is invalid")
+    row = conn.execute(
+        "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+        (_string(project_id), _string(route_token_ref)),
+    ).fetchone()
+    if row is None:
+        raise RouteTokenRefError("canonical_ref_adoption route ref is unavailable")
+    row_dict = dict(row)
+    lineage = _json_loads_public_mapping(row_dict.get("route_lineage_json"))
+    intent = _canonical_ref_adoption_intent(lineage.get("canonical_ref_adoption"), now=now)
+    state = _canonical_ref_adoption_state(lineage)
+    if (
+        not state
+        or state.get("intent_sha256") != _sha256(intent)
+        or state.get("replay_identity") != _string(replay_identity)
+        or state.get("phase") != expected_phase
+        or state.get("previous_receipt_sha256") != _string(previous_receipt_sha256)
+    ):
+        raise RouteTokenRefError("canonical_ref_adoption resume chain mismatch")
+    if expected_phase != "attached":
+        _canonical_ref_adoption_row(
+            conn, project_id=project_id, route_token_ref=route_token_ref, token=token, now=now
+        )
+    elif _string(row_dict.get("status")) != REF_STATUS_SUPERSEDED:
+        raise RouteTokenRefError("canonical_ref_adoption terminal resume status mismatch")
+    return dict(state)
 
 
 def _route_registry_storage_project_id(
@@ -1776,6 +2087,11 @@ def _registry_public_payload(
         "status": _string(row_dict.get("status")),
         "resolved_from_ref": True,
     }
+    if scope.get("source_free_operation") is True:
+        payload["source_free_operation"] = True
+        payload["source_mutation_forbidden"] = bool(
+            scope.get("source_mutation_forbidden") is True
+        )
     if expiry_status:
         payload["expiry_status"] = dict(expiry_status)
     return _with_registry_lineages(payload, row_dict)
@@ -1896,6 +2212,32 @@ def _ensure_ref_registry_schema(conn: sqlite3.Connection) -> None:
             )
 
 
+def authority_route_registry_schema_statements() -> tuple[str, ...]:
+    """Return the exact route-registry DDL without executing it.
+
+    Offline admission is deliberately the only dev-plane writer for this
+    namespace.  Keeping the SQL beside its runtime owner prevents a second,
+    drifting copy in the CLI or migration code.
+    """
+    return (
+        "CREATE TABLE observer_route_token_refs ("
+        "project_id TEXT NOT NULL, route_token_ref TEXT NOT NULL, "
+        "token_digest TEXT NOT NULL, salt TEXT NOT NULL, route_id TEXT NOT NULL DEFAULT '', "
+        "route_context_hash TEXT NOT NULL DEFAULT '', prompt_contract_id TEXT NOT NULL DEFAULT '', "
+        "prompt_contract_hash TEXT NOT NULL DEFAULT '', visible_injection_manifest_hash TEXT NOT NULL DEFAULT '', "
+        "backlog_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '', caller_role TEXT NOT NULL DEFAULT '', "
+        "allowed_actions_json TEXT NOT NULL DEFAULT '[]', expires_at TEXT NOT NULL DEFAULT '', "
+        "evidence_refs_json TEXT NOT NULL DEFAULT '[]', scope_json TEXT NOT NULL DEFAULT '{}', "
+        "target_files_json TEXT NOT NULL DEFAULT '[]', owned_files_json TEXT NOT NULL DEFAULT '[]', "
+        "parent_route_lineage_json TEXT NOT NULL DEFAULT '{}', child_route_lineage_json TEXT NOT NULL DEFAULT '{}', "
+        "route_lineage_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'active', "
+        "issued_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, "
+        "PRIMARY KEY (project_id, route_token_ref))",
+        "CREATE INDEX idx_route_token_refs_status ON observer_route_token_refs "
+        "(project_id, status, route_token_ref)",
+    )
+
+
 def persist_route_token_ref(
     conn: sqlite3.Connection,
     *,
@@ -1904,6 +2246,9 @@ def persist_route_token_ref(
     route_token_ref: str,
     token: Mapping[str, Any],
     commit: bool = True,
+    canonical_adoption_authority_revalidator: Callable[
+        [sqlite3.Connection, Mapping[str, Any]], None
+    ] | None = None,
 ) -> None:
     """Persist a minted token into the ref registry.
 
@@ -1912,7 +2257,10 @@ def persist_route_token_ref(
     compared; a mismatch raises ValueError (collision / tampering).  An identical
     re-issue is silently accepted (idempotent).
 
-    Thread-safe: holds ``_REF_REGISTRY_LOCK`` around the upsert.
+    Thread-safe: holds ``_REF_REGISTRY_LOCK`` around the upsert.  A canonical
+    adoption may additionally provide a server-owned revalidator.  It runs
+    after ``BEGIN IMMEDIATE`` and immediately before the registry mutation, so
+    a pre-issue read can never stand in for final authority at commit time.
     """
     project_id = _string(project_id)
     registry_project_id = _route_registry_storage_project_id(
@@ -1944,66 +2292,122 @@ def persist_route_token_ref(
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     _ensure_ref_registry_schema(conn)
-    with _REF_REGISTRY_LOCK:
-        # Check for existing entry
-        row = conn.execute(
-            "SELECT * FROM observer_route_token_refs "
-            "WHERE project_id=? AND route_token_ref=?",
-            (registry_project_id, route_token_ref),
-        ).fetchone()
-        if row is not None:
-            existing_digest = _token_digest(token, row["salt"])
-            if existing_digest != row["token_digest"]:
-                raise ValueError(
-                    "route_token_ref collision: a different token body is already "
-                    f"registered under ref {route_token_ref!r}"
-                )
-            missing_lineage_columns = [
-                column
-                for public_key, column in _REF_LINEAGE_COLUMNS.items()
-                if lineage_payloads[public_key]
-                and not _json_loads_public_mapping(dict(row).get(column))
-            ]
-            row_dict = dict(row)
-            missing_scope_columns = [
-                column
-                for value, column in (
-                    (target_files, "target_files_json"),
-                    (owned_files, "owned_files_json"),
-                )
-                if value and not _json_loads_string_list(row_dict.get(column))
-            ]
-            if missing_lineage_columns or missing_scope_columns:
-                conn.execute(
-                    """
-                    UPDATE observer_route_token_refs
-                    SET parent_route_lineage_json=?,
-                        child_route_lineage_json=?,
-                        route_lineage_json=?,
-                        target_files_json=?,
-                        owned_files_json=?
-                    WHERE project_id=? AND route_token_ref=?
-                    """,
-                    (
-                        _json_dumps_public_mapping(
-                            lineage_payloads["parent_route_lineage"]
-                        ),
-                        _json_dumps_public_mapping(
-                            lineage_payloads["child_route_lineage"]
-                        ),
-                        _json_dumps_public_mapping(lineage_payloads["route_lineage"]),
-                        _json_dumps_string_list(target_files),
-                        _json_dumps_string_list(owned_files),
-                        registry_project_id,
-                        route_token_ref,
-                    ),
-                )
-                if commit:
-                    conn.commit()
-            # Idempotent re-issue: same token, already registered.
-            return
+    adoption_intent = _public_mapping(
+        _public_mapping(token.get("route_lineage")).get(
+            "canonical_ref_adoption"
+        )
+    )
+    is_canonical_adoption = bool(adoption_intent)
+    if is_canonical_adoption:
+        # Validate the binding before claiming a lifecycle.  The operation and
+        # replay identity are then claimed while the registry write lock is
+        # held, rather than by a racy pre-issuance availability scan.
+        typed_adoption_intent = _canonical_ref_adoption_intent(adoption_intent)
+    else:
+        typed_adoption_intent = {}
 
-        conn.execute(
+    with _REF_REGISTRY_LOCK:
+        began = False
+        if is_canonical_adoption and not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            began = True
+        try:
+            if is_canonical_adoption:
+                if canonical_adoption_authority_revalidator is None:
+                    raise RouteTokenRefError(
+                        "canonical_ref_adoption requires final authority revalidation"
+                    )
+                # The callback is supplied only by the server issue boundary.
+                # It re-resolves mutable authority (sessions, route status and
+                # CEX/QA projection) using *this exact writer connection* and
+                # checks it against this exact token before any registry row is
+                # inserted or updated.
+                canonical_adoption_authority_revalidator(conn, token)
+                # This is the authority check.  It covers every durable route
+                # state (active, reserved, consumed/superseded, and expired),
+                # so an operation cannot obtain a second route through a race
+                # or a later state transition.
+                for candidate in conn.execute(
+                    "SELECT route_lineage_json FROM observer_route_token_refs "
+                    "WHERE project_id=?",
+                    (registry_project_id,),
+                ).fetchall():
+                    stored = _public_mapping(
+                        _json_loads_public_mapping(
+                            candidate["route_lineage_json"]
+                        ).get("canonical_ref_adoption")
+                    )
+                    if (
+                        _string(stored.get("action"))
+                        == CANONICAL_REF_ADOPTION_ACTION
+                        and _string(stored.get("replay_identity"))
+                        == typed_adoption_intent["replay_identity"]
+                    ):
+                        raise RouteTokenRefError(
+                            "canonical_ref_adoption already has a server-issued lifecycle"
+                        )
+
+            # Check for existing entry
+            row = conn.execute(
+                "SELECT * FROM observer_route_token_refs "
+                "WHERE project_id=? AND route_token_ref=?",
+                (registry_project_id, route_token_ref),
+            ).fetchone()
+            if row is not None:
+                existing_digest = _token_digest(token, row["salt"])
+                if existing_digest != row["token_digest"]:
+                    raise ValueError(
+                        "route_token_ref collision: a different token body is already "
+                        f"registered under ref {route_token_ref!r}"
+                    )
+                missing_lineage_columns = [
+                    column
+                    for public_key, column in _REF_LINEAGE_COLUMNS.items()
+                    if lineage_payloads[public_key]
+                    and not _json_loads_public_mapping(dict(row).get(column))
+                ]
+                row_dict = dict(row)
+                missing_scope_columns = [
+                    column
+                    for value, column in (
+                        (target_files, "target_files_json"),
+                        (owned_files, "owned_files_json"),
+                    )
+                    if value and not _json_loads_string_list(row_dict.get(column))
+                ]
+                if missing_lineage_columns or missing_scope_columns:
+                    conn.execute(
+                        """
+                        UPDATE observer_route_token_refs
+                        SET parent_route_lineage_json=?,
+                            child_route_lineage_json=?,
+                            route_lineage_json=?,
+                            target_files_json=?,
+                            owned_files_json=?
+                        WHERE project_id=? AND route_token_ref=?
+                        """,
+                        (
+                            _json_dumps_public_mapping(
+                                lineage_payloads["parent_route_lineage"]
+                            ),
+                            _json_dumps_public_mapping(
+                                lineage_payloads["child_route_lineage"]
+                            ),
+                            _json_dumps_public_mapping(lineage_payloads["route_lineage"]),
+                            _json_dumps_string_list(target_files),
+                            _json_dumps_string_list(owned_files),
+                            registry_project_id,
+                            route_token_ref,
+                        ),
+                    )
+                    if commit:
+                        conn.commit()
+                if began and conn.in_transaction:
+                    conn.commit()
+                # Idempotent re-issue: same non-adoption token, already registered.
+                return
+
+            conn.execute(
             """
             INSERT INTO observer_route_token_refs
                 (project_id, route_token_ref, token_digest, salt,
@@ -2042,9 +2446,13 @@ def persist_route_token_ref(
                 _string(token.get("issued_at")) or now_str,
                 now_str,
             ),
-        )
-        if commit:
-            conn.commit()
+            )
+            if commit or began:
+                conn.commit()
+        except Exception:
+            if began and conn.in_transaction:
+                conn.rollback()
+            raise
 
 
 def persist_route_token_ref_lineage(
@@ -2358,6 +2766,74 @@ def resolve_route_token_ref(
         route_token_ref=route_token_ref,
         expiry_status=expiry_status,
     )
+
+
+def resolve_observer_session_registration_route(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    storage_project_id: str = "",
+    route_token_ref: str,
+    backlog_id: str,
+    task_id: str,
+    cex_id: str,
+) -> dict[str, Any]:
+    """Resolve the one persisted route that may create a dev observer session.
+
+    This deliberately returns server-owned capability/provenance data.  The
+    registration caller supplies only opaque/scoped identity selectors and
+    cannot mint its own privileges.
+    """
+    resolved = resolve_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=storage_project_id,
+        route_token_ref=route_token_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if resolved is None:
+        raise RouteTokenRefError(
+            "observer session registration route_token_ref is unknown",
+            code="route_token_ref_unknown",
+        )
+    if _string(resolved.get("caller_role")) != "observer":
+        raise RouteTokenRefError(
+            "observer session registration requires an observer route",
+            code="route_token_ref_not_observer",
+        )
+    allowed = set(_normalized_action_list(resolved.get("allowed_actions")))
+    if "observer_session_register" not in allowed:
+        raise RouteTokenRefError(
+            "route_token_ref does not allow observer_session_register",
+            code="route_token_ref_action_not_allowed",
+        )
+    evidence_refs = {_string(item) for item in resolved.get("evidence_refs") or []}
+    if not cex_id or not {
+        _string(cex_id), f"contract_runtime:{_string(cex_id)}"
+    }.intersection(evidence_refs):
+        raise RouteTokenRefError(
+            "route_token_ref does not carry the exact Direct CEX",
+            code="route_token_ref_cex_mismatch",
+        )
+    return {
+        "actions": list(observer_action for observer_action in (
+            "observer_session_heartbeat", "observer_session_close",
+            "observer_session_revoke", "observer_command_claim",
+            "observer_command_takeover", "observer_command_complete",
+            "observer_command_fail",
+        )),
+        "command_types": [],
+        "route_provenance": {
+            "route_token_ref": _string(resolved.get("route_token_ref")),
+            "route_id": _string(resolved.get("route_id")),
+            "route_context_hash": _string(resolved.get("route_context_hash")),
+            "prompt_contract_id": _string(resolved.get("prompt_contract_id")),
+            "backlog_id": _string(backlog_id),
+            "task_id": _string(task_id),
+            "cex_id": _string(cex_id),
+        },
+    }
 
 
 def resolve_route_token_ref_renewal_descendant(

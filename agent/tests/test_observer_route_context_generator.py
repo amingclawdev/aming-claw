@@ -869,6 +869,38 @@ def test_empty_scope_inputs_rejected_at_mint():
         _token(target_files=[])
 
 
+def test_source_free_empty_fence_requires_closed_operation_actions():
+    actions = list(observer_route_context.SOURCE_FREE_OPERATION_ALLOWED_ACTIONS)
+    token = _token(
+        target_files=[],
+        allowed_actions=actions,
+        source_free_operation=True,
+    )
+    assert token["target_files"] == []
+    assert token["source_free_operation"] is True
+    assert token["source_mutation_forbidden"] is True
+    assert token["allowed_actions"] == actions
+    assert token["route_action_scope"]["classification"] == (
+        "observer_admin_close_evidence_only"
+    )
+    assert token["requires_mf_sub_implementation_lane"] is False
+
+    for forbidden in ("edit_file", "merge", "mf_parallel_enter", "*"):
+        with pytest.raises(ValueError):
+            _token(
+                target_files=[],
+                allowed_actions=[*actions, forbidden],
+                source_free_operation=True,
+            )
+
+
+def test_source_free_flag_cannot_widen_nonempty_or_default_route():
+    with pytest.raises(ValueError):
+        _token(source_free_operation=True)
+    with pytest.raises(ValueError):
+        _token(target_files=[], allowed_actions=["task_timeline_append"])
+
+
 # --- DOGFOOD: the previous failure mode (empty route_token_ref) is gone ------
 
 

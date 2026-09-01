@@ -217,19 +217,20 @@ class TestRestartLocalGovernance:
 class TestRestartExecutorWritesSignal:
     """R2: restart_executor writes valid signal file and logs."""
 
-    @patch("agent.deploy_chain._state_dir")
-    def test_restart_executor_writes_signal(self, mock_state_dir, tmp_path, caplog):
+    def test_restart_executor_writes_signal(self, tmp_path, caplog, monkeypatch):
         """AC3+AC4: signal file has correct keys and log line emitted."""
         from agent.deploy_chain import restart_executor
 
-        mock_state_dir.return_value = tmp_path
+        from agent import manager_http_server
+        (tmp_path / "shared-volume").mkdir()
+        monkeypatch.setattr(manager_http_server, "_project_root", lambda: tmp_path)
 
         with caplog.at_level(logging.INFO, logger="agent.deploy_chain"):
-            result = restart_executor()
+            result = restart_executor("proj")
 
         assert result is True
 
-        signal_file = tmp_path / "manager_signal.json"
+        signal_file = tmp_path / "shared-volume" / "codex-tasks" / "state" / "manager_signal.json"
         assert signal_file.exists()
 
         data = json.loads(signal_file.read_text())

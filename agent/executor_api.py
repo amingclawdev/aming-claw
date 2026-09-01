@@ -18,7 +18,9 @@ import time
 import uuid as _uuid
 from datetime import datetime, timezone as _tz
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from agent.runtime_plane import bind_workspace_identity, resolve_runtime_plane
 
 log = logging.getLogger(__name__)
 
@@ -115,7 +117,7 @@ class ObserverManager:
         cls.generate_report(task_id, {"task_id": task_id, "status": "accepted"})
         return session_id
 
-PORT = int(os.getenv("EXECUTOR_API_PORT", "40100"))
+PORT = int(os.getenv("EXECUTOR_API_PORT", "0"))
 
 # References to shared state (set by executor.py on startup)
 _ai_manager = None
@@ -142,6 +144,30 @@ def set_validator_result(result):
 
 class ExecutorAPIHandler(BaseHTTPRequestHandler):
     """HTTP handler for executor monitoring and intervention."""
+
+    def _executor_identity(self) -> dict:
+        identity = getattr(self.server, "executor_identity", None)
+        if not isinstance(identity, dict):
+            raise RuntimeError("executor API has no immutable launch identity")
+        return identity
+
+    def _tasks_root(self) -> Path:
+        return Path(self._executor_identity()["storage_root"]) / "codex-tasks"
+
+    def _workspace_identity(self):
+        identity = getattr(self.server, "executor_identity", None)
+        workspace = identity.get("workspace") if isinstance(identity, dict) else None
+        if workspace is None:
+            raise RuntimeError("executor file routes require explicit workspace identity")
+        return workspace
+
+    def _require_body_project(self, body: dict) -> bool:
+        """Reject every mutating request not addressed to this exact process."""
+        expected = self._executor_identity()["project_id"]
+        if not isinstance(body, dict) or body.get("project_id") != expected:
+            self._json_response(400, {"error": "project_id must exactly match executor identity"})
+            return False
+        return True
 
     def log_message(self, format, *args):
         log.info("API %s", format % args)
@@ -240,6 +266,10 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         body = self._read_body()
+        # A bound executor is not a multiplexer.  Check this before selecting a
+        # handler so even a rejected request cannot create files or subprocesses.
+        if not self._require_body_project(body):
+            return
 
         # ── Intervention (L18.3) ──
 
@@ -319,9 +349,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         import socket
         from pathlib import Path
 
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         pending = len(list((tasks_root / "pending").glob("*.json"))) if (tasks_root / "pending").exists() else 0
         processing = len(list((tasks_root / "processing").glob("*.json"))) if (tasks_root / "processing").exists() else 0
@@ -347,12 +375,12 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_tasks(self, qs):
         """GET /tasks — List tasks from governance."""
-        project_id = qs.get("project_id", ["amingClaw"])[0]
+        project_id = self._executor_identity()["project_id"]
         status = qs.get("status", [""])[0]
         limit = int(qs.get("limit", ["20"])[0])
 
         token = os.getenv("GOV_COORDINATOR_TOKEN", "")
-        gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+        gov_url = self._executor_identity()["governance_url"]
 
         try:
             import requests
@@ -366,10 +394,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_task_detail(self, task_id):
         """GET /task/{id} — Single task detail."""
-        from pathlib import Path
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         # Search in all stages
         for stage in ["pending", "processing", "results"]:
@@ -386,10 +411,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_trace(self, trace_id):
         """GET /trace/{id} — Full trace chain from filesystem (processing + results)."""
-        from pathlib import Path
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         for stage in ["processing", "results"]:
             stage_dir = tasks_root / stage
@@ -416,10 +438,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_traces(self, qs):
         """GET /traces — List trace summaries from filesystem (processing + results)."""
-        from pathlib import Path
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         project_id_filter = qs.get("project_id", [None])[0]
         limit = min(int(qs.get("limit", ["20"])[0]), 100)
@@ -464,10 +483,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_task_cancel(self, task_id):
         """POST /task/{id}/cancel — Cancel a task."""
-        from pathlib import Path
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         # Remove from pending
         pending = tasks_root / "pending" / f"{task_id}.json"
@@ -493,9 +509,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         """POST /task/{id}/retry — Retry a failed task."""
         from pathlib import Path
         import shutil
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         # Move from results back to pending
         for stage in ["results", "processing"]:
@@ -519,9 +533,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         from pathlib import Path
         import shutil
         max_age_min = int(body.get("max_age_min", 10))
-        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_dir = self._tasks_root()
         processing_dir = tasks_dir / "processing"
         dead_letter_dir = tasks_dir / "dead_letter"
         dead_letter_dir.mkdir(parents=True, exist_ok=True)
@@ -561,9 +573,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         import shutil
         reason = body.get("reason", "")
         operator = body.get("operator", "observer")
-        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_dir = self._tasks_root()
 
         killed_session = None
         if _ai_manager:
@@ -617,9 +627,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             return
 
         fix_id = f"fix-{bug_id}-{_uuid.uuid4().hex[:8]}"
-        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_dir = self._tasks_root()
 
         cancelled_tasks = []
         for stage in ["pending", "processing"]:
@@ -669,10 +677,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_observer_manual_fix_complete(self, fix_id, body):
         """POST /observer/manual-fix/{fix_id}/complete — Record manual fix completion."""
-        from pathlib import Path
-        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_dir = self._tasks_root()
         fix_path = tasks_dir / "observer_fixes" / f"{fix_id}.json"
 
         if not fix_path.exists():
@@ -802,14 +807,14 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         Called by orchestrator after governance DB insert to ensure the pending
         file is created by the executor process (correct SHARED_VOLUME_PATH).
         """
-        from utils import tasks_root, save_json, utc_iso
+        from utils import save_json, utc_iso
 
         task_id = body.get("task_id", "")
         if not task_id:
             from utils import new_task_id
             task_id = new_task_id()
 
-        root = tasks_root()
+        root = self._tasks_root()
         pending_file = root / "pending" / f"{task_id}.json"
         results_file = root / "results" / f"{task_id}.json"
         processing_file = root / "processing" / f"{task_id}.json"
@@ -942,9 +947,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             return
 
         # Probe filesystem stage
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         fs_stage = None
         for stage in ("pending", "processing", "results"):
@@ -1010,9 +1013,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         if status.get("active") and status.get("session"):
             task_id = status["session"].get("task_id", "")
             if task_id:
-                tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-                    os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-                ) / "codex-tasks"
+                tasks_root = self._tasks_root()
                 for stage in ("pending", "processing", "results"):
                     fp = tasks_root / stage / f"{task_id}.json"
                     if fp.exists():
@@ -1037,9 +1038,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         report = ObserverManager.get_report(task_id)
         if report is None:
             # Try to generate from filesystem data on demand
-            tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-                os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-            ) / "codex-tasks"
+            tasks_root = self._tasks_root()
             task_data = None
             for stage in ("pending", "processing", "results", "archive"):
                 fp = tasks_root / stage / f"{task_id}.json"
@@ -1279,10 +1278,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         """
         from pathlib import Path
 
-        tasks_root = Path(os.getenv(
-            "SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"),
-        )) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         total = 0
         first_pass_count = 0          # retry_count == 0
@@ -1361,41 +1357,13 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
           2. realpath is within worktree_root (not main workspace)
           3. Not in .git, system dirs, or sensitive paths
         """
-        import pathlib
-
         if not path:
             return False, "", "empty path"
 
-        # Get worktree root for this task
-        worktree_root = _active_worktree_roots.get(task_id, "")
-        if not worktree_root:
-            # Fallback: use main workspace (for coordinator tasks without worktree)
-            worktree_root = os.getenv("CODEX_WORKSPACE",
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-        # Resolve to absolute path within worktree
-        if not os.path.isabs(path):
-            path = os.path.join(worktree_root, path)
-
-        # Resolve symlinks and normalize
-        try:
-            resolved = str(pathlib.Path(path).resolve())
-        except Exception as e:
-            return False, "", f"path resolution failed: {e}"
-
-        # Must be within worktree root
-        worktree_resolved = str(pathlib.Path(worktree_root).resolve())
-        if not resolved.startswith(worktree_resolved):
-            return False, "", f"path {resolved} is outside worktree {worktree_resolved}"
-
-        # Block sensitive paths
-        rel = os.path.relpath(resolved, worktree_resolved)
-        blocked = [".git", ".env", "node_modules", "__pycache__"]
-        for b in blocked:
-            if rel == b or rel.startswith(b + os.sep):
-                return False, "", f"blocked path: {rel}"
-
-        return True, resolved, ""
+        # There is no in-process worker→API custody handoff.  A global registry
+        # would fabricate one across processes, so all file/worktree routes fail
+        # closed until a real local binding exists.
+        return False, "", "no validated local task worktree identity"
 
     def _handle_file_write(self, body: dict):
         """POST /file/write — Write entire file (new or overwrite).
@@ -1514,8 +1482,10 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         import subprocess
         task_id = body.get("task_id", "")
         test_cmd = body.get("command", "python -m pytest -q")
-        worktree = _active_worktree_roots.get(task_id, "")
-        cwd = worktree or os.getenv("CODEX_WORKSPACE", os.getcwd())
+        ok, cwd, err = self._validate_file_path(".", task_id)
+        if not ok:
+            self._json_response(403, {"error": f"task worktree rejected: {err}"})
+            return
 
         # Whitelist test commands
         allowed_prefixes = ["python -m pytest", "python -m unittest", "npm test", "npm run test"]
@@ -1543,8 +1513,10 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         task_id = body.get("task_id", "")
         lint_cmd = body.get("command", "python -m py_compile")
         target = body.get("target", "")
-        worktree = _active_worktree_roots.get(task_id, "")
-        cwd = worktree or os.getenv("CODEX_WORKSPACE", os.getcwd())
+        ok, cwd, err = self._validate_file_path(".", task_id)
+        if not ok:
+            self._json_response(403, {"error": f"task worktree rejected: {err}"})
+            return
 
         allowed_prefixes = ["python -m py_compile", "python -m flake8", "npx eslint"]
         if not any(lint_cmd.startswith(p) for p in allowed_prefixes):
@@ -1568,24 +1540,20 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             self._json_response(500, {"error": str(e)})
 
 
-# Active worktree roots per task (set by Executor when creating dev sessions)
-_active_worktree_roots: dict[str, str] = {}
-
-
-def register_worktree(task_id: str, worktree_root: str) -> None:
-    """Register a worktree root for a task (called by Executor)."""
-    _active_worktree_roots[task_id] = worktree_root
-
-
-def unregister_worktree(task_id: str) -> None:
-    """Unregister worktree when task completes."""
-    _active_worktree_roots.pop(task_id, None)
-
-
-def start_api_server():
+def start_api_server(project_id: str, workspace_root: str = ""):
     """Start the Executor API server in a background thread."""
-    server = HTTPServer(("0.0.0.0", PORT), ExecutorAPIHandler)
+    plane = resolve_runtime_plane(project_id)
+    from agent.manager_http_server import _canonical_storage_root, plane_bound_manager_identity
+    root = _canonical_storage_root(plane.name)
+    identity = plane_bound_manager_identity(project_id, plane.governance_url, str(root))
+    workspace = bind_workspace_identity(workspace_root) if workspace_root else None
+    port = urlparse(plane.executor_url).port
+    if PORT and PORT != port:
+        raise ValueError("EXECUTOR_API_PORT crosses the project runtime plane")
+    server = HTTPServer(("0.0.0.0", port), ExecutorAPIHandler)
+    server.executor_identity = identity
+    server.executor_identity["workspace"] = workspace
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    log.info("Executor API server started on port %d", PORT)
+    log.info("Executor API server started on port %d", port)
     return server

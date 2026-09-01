@@ -44,6 +44,7 @@ from agent.governance import graph_events
 from agent.governance import graph_query_trace
 from agent.governance import observer_route_context
 from agent.governance import observer_session
+from agent.governance import role_service
 from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store as store
 from agent.governance import graph_query_trace
@@ -78,6 +79,970 @@ from agent.governance.contract_runtime_visualization import (
     build_contract_runtime_visualization,
 )
 from agent.governance.db import _ensure_schema
+
+
+def test_canonical_ref_adoption_intent_is_exactly_route_scoped():
+    """The new intent is data, but it cannot widen an issued observer route."""
+
+    commit = "a" * 40
+    intent = {
+        "schema_version": "canonical_ref_adoption_route_bound.v1",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
+        "action": "canonical_ref_adoption",
+        "contract_execution_id": "cex-adoption-r2",
+        "generation": "gen-r2",
+        "custody": "custody-r2",
+        "canonical_ref": "refs/heads/codex/ac-dev",
+        "expected_commit": commit,
+        "target_commit": "b" * 40,
+        "target_tree": "c" * 40,
+        "source_content_sha256": "sha256:" + "d" * 64,
+        "qa_content_sha256": "sha256:" + "e" * 64,
+        "issued_at": "2026-08-31T00:00:00Z",
+        "expires_at": "2026-08-31T01:00:00Z",
+        "replay_identity": "adoption-r2-once",
+    }
+    accepted = server._canonical_ref_adoption_issue_intent(
+        intent,
+        project_id="aming-claw",
+        backlog_id=intent["backlog_id"],
+        task_id="cex-adoption-r2",
+        allowed_actions=["canonical_ref_adoption"],
+    )
+    assert accepted and accepted["target_commit"] == "b" * 40
+    forged = dict(intent, backlog_id="other")
+    with pytest.raises(ValueError, match="native route scope"):
+        server._canonical_ref_adoption_issue_intent(
+            forged,
+            project_id="aming-claw",
+            backlog_id=intent["backlog_id"],
+            task_id="cex-adoption-r2",
+            allowed_actions=["canonical_ref_adoption"],
+        )
+
+
+def _route_bound_adoption_fixture(conn):
+    now = datetime.now(timezone.utc)
+    intent = {
+        "schema_version": "canonical_ref_adoption_route_bound.v1",
+        "project_id": "aming-claw", "backlog_id": "AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
+        "action": "canonical_ref_adoption", "contract_execution_id": "cex-adoption-r2",
+        "generation": "gen-r2", "custody": "custody-r2", "canonical_ref": "refs/heads/codex/ac-dev",
+        "expected_commit": "a" * 40, "target_commit": "b" * 40, "target_tree": "c" * 40,
+        "source_content_sha256": "sha256:" + "d" * 64, "qa_content_sha256": "sha256:" + "e" * 64,
+        "issued_at": (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "replay_identity": "adoption-r2-once",
+    }
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw",
+        backlog_id="AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
+        task_id="cex-adoption-r2",
+        target_files=["agent/cli.py"],
+        allowed_actions=["canonical_ref_adoption"],
+        ttl_hours=1,
+        canonical_ref_adoption=intent,
+    )
+    token = issued["route_token"]
+    observer_route_context.persist_route_token_ref(
+        conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=token,
+        # This fixture exercises lifecycle storage below the server authority
+        # boundary.  Handler tests provide the real final revalidator.
+        canonical_adoption_authority_revalidator=lambda _conn, _token: None,
+    )
+    return issued["route_token_ref"], token, intent
+
+
+def test_canonical_ref_adoption_lifecycle_cas_and_terminal_resume(tmp_path):
+    database = tmp_path / "route.db"
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    ref, token, intent = _route_bound_adoption_fixture(conn)
+    initial = "sha256:" + "1" * 64
+    reserved = observer_route_context.canonical_ref_adoption_reserve(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], initial_receipt_sha256=initial,
+    )
+    assert reserved["phase"] == "reserved"
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="already reserved"):
+        observer_route_context.canonical_ref_adoption_reserve(
+            conn, project_id="aming-claw", route_token_ref=ref, token=token,
+            replay_identity="other", initial_receipt_sha256=initial,
+        )
+    detached = "sha256:" + "2" * 64
+    observer_route_context.canonical_ref_adoption_advance(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], previous_receipt_sha256=initial,
+        next_phase="detached", receipt_sha256=detached,
+    )
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="prior receipt"):
+        observer_route_context.canonical_ref_adoption_advance(
+            conn, project_id="aming-claw", route_token_ref=ref, token=token,
+            replay_identity=intent["replay_identity"], previous_receipt_sha256=initial,
+            next_phase="cas", receipt_sha256="sha256:" + "3" * 64,
+        )
+    cas = "sha256:" + "3" * 64
+    observer_route_context.canonical_ref_adoption_advance(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], previous_receipt_sha256=detached,
+        next_phase="cas", receipt_sha256=cas,
+    )
+    attached = "sha256:" + "4" * 64
+    observer_route_context.canonical_ref_adoption_advance(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], previous_receipt_sha256=cas,
+        next_phase="attached", receipt_sha256=attached,
+    )
+    with pytest.raises(observer_route_context.RouteTokenRefError):
+        observer_route_context.resolve_route_token_ref(conn, project_id="aming-claw", route_token_ref=ref)
+    resumed = observer_route_context.canonical_ref_adoption_resume(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], previous_receipt_sha256=attached,
+        expected_phase="attached",
+    )
+    assert resumed["phase"] == "attached"
+    conn.close()
+
+
+def test_canonical_ref_adoption_rejects_expiry_and_lineage_tamper(tmp_path):
+    conn = sqlite3.connect(tmp_path / "route.db")
+    conn.row_factory = sqlite3.Row
+    ref, token, intent = _route_bound_adoption_fixture(conn)
+    intent["expires_at"] = "2020-01-01T00:00:00Z"
+    # Persisted lineage, not caller intent, is authoritative; tamper is caught
+    # by both the immutable token digest and typed lifecycle validator.
+    row = conn.execute("SELECT route_lineage_json FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?", ("aming-claw", ref)).fetchone()
+    lineage = json.loads(row[0]); lineage["canonical_ref_adoption"]["expires_at"] = intent["expires_at"]
+    conn.execute("UPDATE observer_route_token_refs SET route_lineage_json=? WHERE project_id=? AND route_token_ref=?", (json.dumps(lineage, sort_keys=True, separators=(",", ":")), "aming-claw", ref)); conn.commit()
+    with pytest.raises(observer_route_context.RouteTokenRefError):
+        observer_route_context.canonical_ref_adoption_reserve(
+            conn, project_id="aming-claw", route_token_ref=ref, token=token,
+            replay_identity=intent["replay_identity"], initial_receipt_sha256="sha256:" + "1" * 64,
+        )
+
+
+def test_canonical_ref_adoption_concurrent_reserve_has_one_winner(tmp_path):
+    database = tmp_path / "route.db"
+    setup = sqlite3.connect(database); setup.row_factory = sqlite3.Row
+    ref, token, intent = _route_bound_adoption_fixture(setup); setup.close()
+
+    def reserve(replay):
+        conn = sqlite3.connect(database, timeout=2); conn.row_factory = sqlite3.Row
+        try:
+            return observer_route_context.canonical_ref_adoption_reserve(
+                conn, project_id="aming-claw", route_token_ref=ref, token=token,
+                replay_identity=replay, initial_receipt_sha256="sha256:" + "1" * 64,
+            )["replay_identity"]
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(reserve, identity) for identity in (intent["replay_identity"], "rival")]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except observer_route_context.RouteTokenRefError:
+                outcomes.append("rejected")
+    assert outcomes.count("rejected") == 1
+    assert set(outcomes) & {intent["replay_identity"], "rival"}
+
+
+def test_canonical_ref_adoption_issuance_rejects_boundary_expiry_and_reissue(tmp_path):
+    conn = sqlite3.connect(tmp_path / "route.db"); conn.row_factory = sqlite3.Row
+    ref, token, intent = _route_bound_adoption_fixture(conn)
+    expires = datetime.fromisoformat(intent["expires_at"].replace("Z", "+00:00"))
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="expired"):
+        observer_route_context.canonical_ref_adoption_issuance_available(
+            conn, project_id="aming-claw", intent=intent, now=expires,
+        )
+    observer_route_context.canonical_ref_adoption_reserve(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], initial_receipt_sha256="sha256:" + "1" * 64,
+    )
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="lifecycle"):
+        observer_route_context.canonical_ref_adoption_issuance_available(
+            conn, project_id="aming-claw", intent=intent,
+        )
+    conn.close()
+
+
+@pytest.mark.parametrize("runtime_plane", ("stable", "dev"))
+def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(
+    tmp_path, monkeypatch, runtime_plane,
+):
+    """Only one complete server issue can claim a typed adoption operation."""
+    database = tmp_path / "canonical-adoption-issue.db"
+    setup = sqlite3.connect(database)
+    setup.row_factory = sqlite3.Row
+    _ensure_schema(setup)
+    setup.commit()
+    setup.close()
+
+    def connection_for_test(_project_id):
+        conn = sqlite3.connect(database, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(server, "get_connection", connection_for_test)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: runtime_plane)
+    monkeypatch.setattr(server, "_route_registry_storage_project_id", lambda project_id: project_id)
+    if runtime_plane == "dev":
+        def direct_bootstrap_must_not_run(*_args, **_kwargs):
+            raise AssertionError("canonical adoption was dispatched to Direct bootstrap")
+
+        monkeypatch.setattr(
+            server,
+            "_handle_ac_dev_direct_route_context_issue",
+            direct_bootstrap_must_not_run,
+        )
+    conn = connection_for_test("aming-claw")
+    session = observer_session.register_session(
+        conn, project_id="aming-claw", capabilities=["canonical_ref_adoption"],
+    )
+    backlog_id = "ADOPTION-ATOMIC-ISSUE"
+    execution_id = "cex-adoption-atomic-issue"
+    _persist_contract_runtime_observer_route_ref(
+        conn, backlog_id=backlog_id, contract_execution_id=execution_id,
+        route_token_ref="rr-adoption-authority",
+        allowed_actions=["canonical_ref_adoption"], target_files=["agent/cli.py"],
+    )
+    # The shared helper's default PID is graph-api-test; this isolated route is
+    # deliberately re-scoped to the handler's project under test.
+    conn.execute(
+        "UPDATE observer_route_token_refs SET project_id=?, scope_json=replace(scope_json, ?, ?) "
+        "WHERE route_token_ref=?",
+        ("aming-claw", PID, "aming-claw", "rr-adoption-authority"),
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}", f"task:{execution_id}", f"commit:{'b' * 40}",
+        server._qa_scope_binding_ref(
+            project_id="aming-claw", backlog_id=backlog_id,
+            task_id=execution_id, commit_sha="b" * 40,
+        ),
+    ]
+    qa_session = role_service.register(
+        conn, principal_id="qa-adoption", project_id="aming-claw",
+        role="qa", scope=qa_scope,
+    )
+    qa_provenance = {
+        "schema_version": "qa_evidence_provenance.v1", "server_derived": True,
+        "authorization_source": "qa_session_token_ref", "evidence_owner_role": "qa",
+        "evidence_owner_actor": "qa-adoption", "evidence_owner_session": qa_session["session_id"],
+        "submitter_principal": "qa-adoption", "submitter_session": qa_session["session_id"],
+        "observer_impersonation": False, "parent_materialization_authorized": False,
+        "authenticated_qa_binding": {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "server_derived": True, "qa_principal": "qa-adoption",
+            "qa_session_id": qa_session["session_id"],
+            "independent_verification_session_matched": True,
+            "qa_scope_binding_ref": server._qa_scope_binding_ref(
+                project_id="aming-claw", backlog_id=backlog_id,
+                task_id=execution_id, commit_sha="b" * 40,
+            ),
+        },
+    }
+    SQLiteContractExecutionStore(conn).create({
+        "contract_execution_id": execution_id, "project_id": "aming-claw",
+        "backlog_id": backlog_id, "contract_id": "adoption", "version": "1",
+        "revision": "1", "execution_state_revision": 1,
+        "canonical_ref_adoption": {
+            "generation": "gen-atomic", "custody": "custody-atomic",
+            "canonical_ref": "refs/heads/codex/ac-dev", "expected_commit": "a" * 40,
+            "target_commit": "b" * 40, "target_tree": "c" * 40,
+            "source_content_sha256": "sha256:" + "d" * 64,
+        },
+        # This is the ContractRuntime's server-authenticated projection, not a
+        # caller-inserted timeline row.  The issue handler rechecks the QA
+        # session and its exact persisted scope before it uses this fact.
+        "completed_lines": [{
+            "stage_id": "qa", "line_id": "qa_independent_verification",
+            "actor_role": "qa", "evidence_kind": "independent_verification",
+            "commit_sha": "b" * 40, "authoritative_pass_synthesized": False,
+            "authorization_source": "qa_session_token_ref",
+            "observer_impersonation": False,
+            "qa_evidence_provenance": qa_provenance,
+            "payload": {
+                "candidate_commit_sha": "b" * 40, "candidate_tree": "c" * 40,
+                "authoritative_pass_synthesized": False,
+                "pass_synthesized": False,
+                "canonical_ref_adoption_qa_payload": {
+                    "schema_version": server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
+                    "candidate_commit_sha": "b" * 40,
+                    "candidate_tree": "c" * 40,
+                    "authority_flags": dict(server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS),
+                },
+            },
+        }],
+    })
+    conn.commit(); conn.close()
+    conn = connection_for_test("aming-claw")
+    try:
+        source_route_row = dict(conn.execute(
+            "SELECT route_id, route_context_hash, token_digest, issued_at "
+            "FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+            ("aming-claw", "rr-adoption-authority"),
+        ).fetchone())
+    finally:
+        conn.close()
+    body = {
+        "observer_session_id": session["observer_session_id"],
+        "observer_route_token_ref": "rr-adoption-authority",
+        "canonical_ref_adoption": {
+            "action": "canonical_ref_adoption",
+            "contract_execution_id": execution_id,
+        },
+    }
+
+    def issue_once():
+        request = _ctx({"project_id": "aming-claw"}, method="POST", body=copy.deepcopy(body))
+        request.handler = SimpleNamespace(headers={"Authorization": f"Bearer {session['session_token']}"})
+        if runtime_plane == "dev":
+            server._guard_dev_runtime_request(
+                method="POST",
+                path="/api/projects/aming-claw/observer/route-context/issue",
+                path_params={"project_id": "aming-claw"},
+                body=request.body,
+            )
+        return server.handle_observer_route_context_issue(request)
+
+    # A durable QA Fact is not permanent authority: canonical issue must
+    # re-check the authoritative session before the registry writer starts.
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE sessions SET expires_at=? WHERE session_id=?",
+            ("2000-01-01T00:00:00Z", qa_session["session_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, expired = issue_once()
+    assert status == 403
+    assert expired["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+            ("aming-claw",),
+        ).fetchone()[0] == 1
+        conn.execute(
+            "UPDATE sessions SET expires_at=? WHERE session_id=?",
+            (qa_session["expires_at"], qa_session["session_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Revocation and a later scope reduction are also current-state failures;
+    # neither may reserve a second registry row.
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE sessions SET status='revoked' WHERE session_id=?",
+            (qa_session["session_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, revoked = issue_once()
+    assert status == 403
+    assert revoked["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE sessions SET status='active', scope_json=? WHERE session_id=?",
+            (json.dumps([f"backlog:{backlog_id}"]), qa_session["session_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, narrowed = issue_once()
+    assert status == 403
+    assert narrowed["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+            ("aming-claw",),
+        ).fetchone()[0] == 1
+        conn.execute(
+            "UPDATE sessions SET scope_json=? WHERE session_id=?",
+            (json.dumps(qa_scope), qa_session["session_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The observer route is also a live authority dependency.  A superseded
+    # route cannot be used to consume a still-valid QA deposit.
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='superseded' WHERE route_token_ref=?",
+            ("rr-adoption-authority",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, superseded_route = issue_once()
+    assert status == 403
+    assert superseded_route["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='active' WHERE route_token_ref=?",
+            ("rr-adoption-authority",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Exercise the actual handler-to-writer gap deterministically.  Each
+    # mutation is committed *after* the successful availability precheck but
+    # immediately before the real registry writer enters BEGIN IMMEDIATE.  A
+    # final authority check outside that writer transaction would mint a row;
+    # the writer-owned recheck must instead reject with no adoption registry
+    # write.  Restore each durable input before the next independently issued
+    # attempt.
+    real_persist = observer_route_context.persist_route_token_ref
+    writer_gap_mutations = (
+        (
+            "qa-revoked",
+            lambda changed: changed.execute(
+                "UPDATE sessions SET status='revoked' WHERE session_id=?",
+                (qa_session["session_id"],),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE sessions SET status='active' WHERE session_id=?",
+                (qa_session["session_id"],),
+            ),
+        ),
+        (
+            "qa-expired",
+            lambda changed: changed.execute(
+                "UPDATE sessions SET expires_at=? WHERE session_id=?",
+                ("2000-01-01T00:00:00Z", qa_session["session_id"]),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE sessions SET expires_at=? WHERE session_id=?",
+                (qa_session["expires_at"], qa_session["session_id"]),
+            ),
+        ),
+        (
+            "qa-scope-narrowed",
+            lambda changed: changed.execute(
+                "UPDATE sessions SET scope_json=? WHERE session_id=?",
+                (json.dumps([f"backlog:{backlog_id}"]), qa_session["session_id"]),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE sessions SET scope_json=? WHERE session_id=?",
+                (json.dumps(qa_scope), qa_session["session_id"]),
+            ),
+        ),
+        (
+            "source-route-superseded",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET status='superseded' "
+                "WHERE route_token_ref=?",
+                ("rr-adoption-authority",),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET status='active' "
+                "WHERE route_token_ref=?",
+                ("rr-adoption-authority",),
+            ),
+        ),
+        (
+            "source-route-id-rebound",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET route_id=? WHERE route_token_ref=?",
+                ("route-adoption-rebound", "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET route_id=? WHERE route_token_ref=?",
+                (source_route_row["route_id"], "rr-adoption-authority"),
+            ),
+        ),
+        (
+            "source-route-context-rebound",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET route_context_hash=? WHERE route_token_ref=?",
+                ("sha256:" + "9" * 64, "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET route_context_hash=? WHERE route_token_ref=?",
+                (source_route_row["route_context_hash"], "rr-adoption-authority"),
+            ),
+        ),
+        (
+            "source-token-digest-rebound",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET token_digest=? WHERE route_token_ref=?",
+                ("0" * 64, "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET token_digest=? WHERE route_token_ref=?",
+                (source_route_row["token_digest"], "rr-adoption-authority"),
+            ),
+        ),
+        (
+            "source-token-version-rebound",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET issued_at=? WHERE route_token_ref=?",
+                ("2099-01-01T00:00:00Z", "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET issued_at=? WHERE route_token_ref=?",
+                (source_route_row["issued_at"], "rr-adoption-authority"),
+            ),
+        ),
+        (
+            "source-route-ref-replaced",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET route_token_ref=? WHERE route_token_ref=?",
+                ("rr-adoption-authority-replaced", "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET route_token_ref=? WHERE route_token_ref=?",
+                ("rr-adoption-authority", "rr-adoption-authority-replaced"),
+            ),
+        ),
+    )
+    for name, mutate, restore in writer_gap_mutations:
+        def mutate_then_enter_writer(*args, _mutate=mutate, **kwargs):
+            changed = connection_for_test("aming-claw")
+            try:
+                _mutate(changed)
+                changed.commit()
+            finally:
+                changed.close()
+            return real_persist(*args, **kwargs)
+
+        monkeypatch.setattr(
+            observer_route_context, "persist_route_token_ref", mutate_then_enter_writer,
+        )
+        status, rejected_at_writer = issue_once()
+        assert status == 409, name
+        assert rejected_at_writer["writes_performed"] is False, name
+        conn = connection_for_test("aming-claw")
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+                ("aming-claw",),
+            ).fetchone()[0] == 1, name
+            restore(conn)
+            conn.commit()
+        finally:
+            conn.close()
+    monkeypatch.setattr(observer_route_context, "persist_route_token_ref", real_persist)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result() for future in (pool.submit(issue_once), pool.submit(issue_once))]
+    successful = [item for item in results if isinstance(item, dict) and item.get("ok")]
+    rejected = [item for item in results if isinstance(item, tuple) and item[0] == 409]
+    assert len(successful) == 1
+    assert len(rejected) == 1
+
+    issued = successful[0]
+    token = issued["route_token"]
+    typed = token["route_lineage"]["canonical_ref_adoption"]
+    assert typed["issued_at"] == token["issued_at"]
+    assert typed["expires_at"] == token["expires_at"]
+    assert typed["target_commit"] == "b" * 40
+    assert typed["source_route_binding"] == {
+        "schema_version": "canonical_ref_adoption.source_route_binding.v1",
+        "route_token_ref": "rr-adoption-authority",
+        "route_id": source_route_row["route_id"],
+        "route_context_hash": source_route_row["route_context_hash"],
+        "source_token_digest": source_route_row["token_digest"],
+        "source_token_version": source_route_row["issued_at"],
+    }
+    conn = connection_for_test("aming-claw")
+    try:
+        stored = conn.execute(
+            "SELECT route_lineage_json FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            ("aming-claw", issued["route_token_ref"]),
+        ).fetchone()
+        stored_lineage = json.loads(stored["route_lineage_json"])
+        assert stored_lineage["canonical_ref_adoption"] == typed
+        # A process can die after durable issue but before the CLI reserve;
+        # issuance itself never synthesizes a reservation state.
+        assert "canonical_ref_adoption_state" not in stored_lineage
+        assert observer_route_context.verify_route_token_binding(
+            conn,
+            project_id="aming-claw",
+            route_token_ref=issued["route_token_ref"],
+            token=token,
+        )["route_token_ref"] == issued["route_token_ref"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+            ("aming-claw",),
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_canonical_ref_adoption_qa_fact_flags_are_independent_fail_closed(
+    tmp_path, monkeypatch,
+):
+    """Every QA-Fact authority flag is independently exact and pre-write."""
+
+    missing = object()
+    invalid_false = (missing, None, True, "false", 0, [], {})
+    invalid_text = (missing, None, False, "true", 1, [], {})
+    cases = [
+        ("projection.schema_version", invalid_text),
+        ("projection.candidate_commit_sha", invalid_text),
+        ("projection.candidate_tree", invalid_text),
+        ("projection.authority_flags.authoritative_pass_synthesized", invalid_false),
+        ("projection.authority_flags.pass_synthesized", invalid_false),
+        # Authority-looking spellings are not forward-compatible extension
+        # points.  They can otherwise conceal a misspelt required assertion.
+        ("extra.projection.random", (False,)),
+        ("extra.projection.Authority_Flags", (False,)),
+        ("extra.projection.authority_flags.nested", ({},)),
+        ("extra.projection.authority_fⅼags", (False,)),
+    ]
+
+    def set_field(line, field, value):
+        container = line["payload"]["canonical_ref_adoption_qa_payload"]
+        path = field.split(".")[1:]
+        for key in path[:-1]:
+            container = container[key]
+        key = path[-1]
+        if value is missing:
+            container.pop(key, None)
+        else:
+            container[key] = value
+
+    for case_index, (field, values) in enumerate(cases):
+        for value_index, value in enumerate(values):
+            database = tmp_path / f"canonical-adoption-flags-{case_index}-{value_index}.db"
+            setup = sqlite3.connect(database)
+            setup.row_factory = sqlite3.Row
+            _ensure_schema(setup)
+            setup.commit()
+            setup.close()
+
+            def connection_for_test(_project_id):
+                conn = sqlite3.connect(database, timeout=5)
+                conn.row_factory = sqlite3.Row
+                return conn
+
+            monkeypatch.setattr(server, "get_connection", connection_for_test)
+            monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+            monkeypatch.setattr(
+                server, "_route_registry_storage_project_id", lambda project_id: project_id,
+            )
+            conn = connection_for_test("aming-claw")
+            observer = observer_session.register_session(
+                conn, project_id="aming-claw", capabilities=["canonical_ref_adoption"],
+            )
+            backlog_id = f"ADOPTION-FLAGS-{case_index}-{value_index}"
+            execution_id = f"cex-adoption-flags-{case_index}-{value_index}"
+            _persist_contract_runtime_observer_route_ref(
+                conn, backlog_id=backlog_id, contract_execution_id=execution_id,
+                route_token_ref="rr-adoption-flags",
+                allowed_actions=["canonical_ref_adoption"], target_files=["agent/cli.py"],
+            )
+            conn.execute(
+                "UPDATE observer_route_token_refs SET project_id=?, scope_json=replace(scope_json, ?, ?) "
+                "WHERE route_token_ref=?",
+                ("aming-claw", PID, "aming-claw", "rr-adoption-flags"),
+            )
+            qa_scope = [
+                f"backlog:{backlog_id}", f"task:{execution_id}", f"commit:{'b' * 40}",
+                server._qa_scope_binding_ref(
+                    project_id="aming-claw", backlog_id=backlog_id,
+                    task_id=execution_id, commit_sha="b" * 40,
+                ),
+            ]
+            qa_session = role_service.register(
+                conn, principal_id="qa-adoption-flags", project_id="aming-claw",
+                role="qa", scope=qa_scope,
+            )
+            binding = {
+                "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+                "server_derived": True, "qa_principal": "qa-adoption-flags",
+                "qa_session_id": qa_session["session_id"],
+                "independent_verification_session_matched": True,
+                "qa_scope_binding_ref": server._qa_scope_binding_ref(
+                    project_id="aming-claw", backlog_id=backlog_id,
+                    task_id=execution_id, commit_sha="b" * 40,
+                ),
+            }
+            provenance = {
+                "schema_version": "qa_evidence_provenance.v1", "server_derived": True,
+                "authorization_source": "qa_session_token_ref", "evidence_owner_role": "qa",
+                "evidence_owner_actor": "qa-adoption-flags",
+                "evidence_owner_session": qa_session["session_id"],
+                "submitter_principal": "qa-adoption-flags",
+                "submitter_session": qa_session["session_id"],
+                "observer_impersonation": False,
+                "parent_materialization_authorized": False,
+                "authenticated_qa_binding": binding,
+            }
+            line = {
+                "stage_id": "qa", "line_id": "qa_independent_verification",
+                "actor_role": "qa", "evidence_kind": "independent_verification",
+                "commit_sha": "b" * 40, "authoritative_pass_synthesized": False,
+                "authorization_source": "qa_session_token_ref",
+                "observer_impersonation": False, "qa_evidence_provenance": provenance,
+                "payload": {
+                    "candidate_commit_sha": "b" * 40, "candidate_tree": "c" * 40,
+                    "authoritative_pass_synthesized": False,
+                    "pass_synthesized": False,
+                    "canonical_ref_adoption_qa_payload": {
+                        "schema_version": server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
+                        "candidate_commit_sha": "b" * 40,
+                        "candidate_tree": "c" * 40,
+                        "authority_flags": dict(server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS),
+                    },
+                },
+            }
+            if field.startswith("extra."):
+                _, _, *path = field.split(".")
+                container = line["payload"]["canonical_ref_adoption_qa_payload"]
+                for key in path[:-1]:
+                    container = container[key]
+                container[path[-1]] = value
+            else:
+                set_field(line, field, value)
+            SQLiteContractExecutionStore(conn).create({
+                "contract_execution_id": execution_id, "project_id": "aming-claw",
+                "backlog_id": backlog_id, "contract_id": "adoption", "version": "1",
+                "revision": "1", "execution_state_revision": 1,
+                "canonical_ref_adoption": {
+                    "generation": "gen-flags", "custody": "custody-flags",
+                    "canonical_ref": "refs/heads/codex/ac-dev", "expected_commit": "a" * 40,
+                    "target_commit": "b" * 40, "target_tree": "c" * 40,
+                    "source_content_sha256": "sha256:" + "d" * 64,
+                },
+                "completed_lines": [line],
+            })
+            conn.commit()
+            conn.close()
+            request = _ctx(
+                {"project_id": "aming-claw"}, method="POST",
+                body={
+                    "observer_session_id": observer["observer_session_id"],
+                    "observer_route_token_ref": "rr-adoption-flags",
+                    "canonical_ref_adoption": {
+                        "action": "canonical_ref_adoption",
+                        "contract_execution_id": execution_id,
+                    },
+                },
+            )
+            request.handler = SimpleNamespace(
+                headers={"Authorization": f"Bearer {observer['session_token']}"}
+            )
+            status, response = server.handle_observer_route_context_issue(request)
+            assert status == 403, (field, value)
+            assert response["writes_performed"] is False, (field, value)
+            conn = connection_for_test("aming-claw")
+            try:
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+                    ("aming-claw",),
+                ).fetchone()[0] == 1, (field, value)
+            finally:
+                conn.close()
+
+
+def test_contract_runtime_replaces_canonical_adoption_qa_payload_projection():
+    """The exact adoption payload is emitted by ContractRuntime, not callers."""
+    write = {
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "commit_sha": "b" * 40,
+        "payload": {
+            "candidate_commit_sha": "b" * 40,
+            "candidate_tree": "c" * 40,
+            "canonical_ref_adoption_qa_payload": {
+                "schema_version": "caller.version",
+                "unexpected": {"nested": True},
+            },
+        },
+    }
+    contract_runtime._enrich_qa_evidence_provenance(write, "qa")
+    projection = write["payload"]["canonical_ref_adoption_qa_payload"]
+    assert projection == {
+        "schema_version": server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
+        "candidate_commit_sha": "b" * 40,
+        "candidate_tree": "c" * 40,
+        "authority_flags": dict(server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS),
+    }
+
+
+def test_canonical_ref_adoption_rejects_before_dev_bootstrap_on_missing_qa_fact(
+    tmp_path, monkeypatch,
+):
+    """The dev shortcut cannot bypass the canonical QA authority gate."""
+    database = tmp_path / "canonical-adoption-dev-gate.db"
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    conn.close()
+
+    def connection_for_test(_project_id):
+        opened = sqlite3.connect(database)
+        opened.row_factory = sqlite3.Row
+        return opened
+
+    def dev_bootstrap_must_not_run(*_args, **_kwargs):
+        raise AssertionError("canonical authority rejection reached dev bootstrap")
+
+    monkeypatch.setattr(server, "get_connection", connection_for_test)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_handle_ac_dev_direct_route_context_issue",
+        dev_bootstrap_must_not_run,
+    )
+    request = _ctx(
+        {"project_id": "aming-claw"}, method="POST",
+        body={
+            "observer_session_id": "missing-observer",
+            "observer_route_token_ref": "missing-route",
+            "canonical_ref_adoption": {
+                "action": "canonical_ref_adoption",
+                "contract_execution_id": "missing-cex",
+            },
+        },
+    )
+    request.handler = SimpleNamespace(headers={"Authorization": "Bearer absent"})
+    status, rejected = server.handle_observer_route_context_issue(request)
+    assert status == 403
+    assert rejected["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='observer_route_token_refs'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"caller_role": "observer"},
+        {"unexpected_canonical_claim": "nope"},
+        {"route_token_ref": "also-present"},
+    ),
+)
+def test_dev_canonical_request_discriminator_rejects_mixed_or_ambiguous_zero_write(
+    tmp_path, monkeypatch, extra,
+):
+    """Canonical and Direct envelopes cannot be blended on the dev plane."""
+    database = tmp_path / "canonical-adoption-dev-discriminator.db"
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    before = tuple(conn.iterdump())
+    conn.close()
+
+    def connection_for_test(_project_id):
+        opened = sqlite3.connect(database)
+        opened.row_factory = sqlite3.Row
+        return opened
+
+    def direct_bootstrap_must_not_run(*_args, **_kwargs):
+        raise AssertionError("mixed canonical envelope reached Direct bootstrap")
+
+    monkeypatch.setattr(server, "get_connection", connection_for_test)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_handle_ac_dev_direct_route_context_issue",
+        direct_bootstrap_must_not_run,
+    )
+    body = {
+        "observer_session_id": "observer-discriminator",
+        "observer_route_token_ref": "route-discriminator",
+        "canonical_ref_adoption": {
+            "action": "canonical_ref_adoption",
+            "contract_execution_id": "cex-discriminator",
+        },
+        **extra,
+    }
+    status, rejected = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert status == 400
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert rejected["source"].endswith("request_kind_discriminator")
+    conn = connection_for_test("aming-claw")
+    try:
+        assert tuple(conn.iterdump()) == before
+    finally:
+        conn.close()
+
+
+def test_canonical_ref_adoption_reissue_stays_rejected_after_expiry(tmp_path):
+    """Expiry changes route availability, never operation replay custody."""
+    conn = sqlite3.connect(tmp_path / "expired-adoption.db")
+    conn.row_factory = sqlite3.Row
+    now = datetime.now(timezone.utc)
+    intent = {
+        "schema_version": "canonical_ref_adoption_route_bound.v1",
+        "project_id": "aming-claw", "backlog_id": "expired-adoption",
+        "action": "canonical_ref_adoption", "contract_execution_id": "cex-expired",
+        "generation": "gen-expired", "custody": "custody-expired",
+        "canonical_ref": "refs/heads/codex/ac-dev",
+        "expected_commit": "a" * 40, "target_commit": "b" * 40,
+        "target_tree": "c" * 40,
+        "source_content_sha256": "sha256:" + "d" * 64,
+        "qa_content_sha256": "sha256:" + "e" * 64,
+        "issued_at": (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "replay_identity": "replay-expired",
+    }
+    first = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw", backlog_id="expired-adoption", task_id="cex-expired",
+        target_files=["agent/cli.py"], allowed_actions=["canonical_ref_adoption"],
+        now=now - timedelta(seconds=1), canonical_ref_adoption=intent,
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id="aming-claw", route_token_ref=first["route_token_ref"], token=first["route_token"],
+        canonical_adoption_authority_revalidator=lambda _conn, _token: None,
+    )
+    conn.execute("UPDATE observer_route_token_refs SET status='expired'")
+    conn.commit()
+    second = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw", backlog_id="expired-adoption", task_id="cex-expired",
+        target_files=["agent/cli.py"], allowed_actions=["canonical_ref_adoption"],
+        now=now, canonical_ref_adoption=intent,
+    )
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="already has"):
+        observer_route_context.persist_route_token_ref(
+            conn, project_id="aming-claw", route_token_ref=second["route_token_ref"], token=second["route_token"],
+            canonical_adoption_authority_revalidator=lambda _conn, _token: None,
+        )
+    assert conn.execute("SELECT COUNT(*) FROM observer_route_token_refs").fetchone()[0] == 1
+    conn.close()
+
+
+def test_generic_route_issue_remains_idempotent_without_adoption(tmp_path):
+    """The atomic adoption claim does not change ordinary registry behavior."""
+    conn = sqlite3.connect(tmp_path / "ordinary-route.db")
+    conn.row_factory = sqlite3.Row
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw", backlog_id="ordinary", task_id="ordinary-task",
+        target_files=["agent/cli.py"], allowed_actions=["task_timeline_append"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=issued["route_token"]
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=issued["route_token"]
+    )
+    assert conn.execute("SELECT COUNT(*) FROM observer_route_token_refs").fetchone()[0] == 1
+    conn.close()
 from agent.governance.errors import (
     AuthError,
     GovernanceError,
@@ -12641,6 +13606,16 @@ def conn(tmp_path, monkeypatch):
     c.row_factory = sqlite3.Row
     _ensure_schema(c)
     store.ensure_schema(c)
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "schema_version": "ac_graph_activation_policy.v1",
+            "runtime_plane": "stable",
+            "active_graph_activation_allowed": True,
+            "classification_reason": "test_verified_stable_connection",
+        },
+    )
     monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(c))
     monkeypatch.setattr("agent.governance.db.get_connection", lambda _project_id: _NoCloseConn(c))
     original_registry_project_config = server._registry_project_config
@@ -15056,7 +16031,6 @@ def test_ac_dev_request_guard_allows_candidate_only_and_repair_writes(monkeypatc
         "/api/branch-service/validate",
         "/api/projects/aming-claw/direct-fix/enter",
         "/api/projects/aming-claw/direct-fix/start",
-        "/api/projects/aming-claw/observer-sessions/register",
         "/api/role/assign",
     ],
 )
@@ -15073,6 +16047,360 @@ def test_ac_dev_request_guard_blocks_source_process_and_unlisted_writes(
         )
     assert "ac_dev_mutation_not_allowlisted" in str(raised.value)
     assert raised.value.details["writes_performed"] is False
+
+
+def test_ac_dev_request_guard_allows_only_exact_route_bound_observer_registration(
+    conn, monkeypatch,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    path = "/api/projects/aming-claw/observer-sessions/register"
+    exact = {
+        "project_id": "aming-claw",
+        "route_token_ref": "rtok-register",
+        "backlog_id": "AC-REGISTER",
+        "task_id": "observer-register",
+        "cex_id": "cex-direct-main-register",
+    }
+    server._guard_dev_runtime_request(
+        method="POST",
+        path=path,
+        path_params={"project_id": "aming-claw"},
+        body=exact,
+    )
+    for invalid in (
+        {**exact, "capabilities": {"actions": ["*"]}},
+        {**exact, "pid": 123},
+        {key: value for key, value in exact.items() if key != "route_token_ref"},
+    ):
+        before = conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0]
+        with pytest.raises(ValidationError) as raised:
+            server._guard_dev_runtime_request(
+                method="POST",
+                path=path,
+                path_params={"project_id": "aming-claw"},
+                body=invalid,
+            )
+        assert raised.value.details["writes_performed"] is False
+        assert conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0] == before
+
+
+def test_ac_dev_observer_registration_handler_derives_authority_server_side(
+    conn, monkeypatch
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    derived = {
+        "actions": ["observer_session_heartbeat"],
+        "command_types": [],
+        "route_provenance": {"route_token_ref": "rtok-register"},
+    }
+    seen = {}
+    from agent.governance import observer_route_context
+
+    def resolve(_conn, **kwargs):
+        seen.update(kwargs)
+        return derived
+
+    monkeypatch.setattr(
+        observer_route_context,
+        "resolve_observer_session_registration_route",
+        resolve,
+    )
+    result = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "project_id": PID,
+                "route_token_ref": "rtok-register",
+                "backlog_id": "AC-REGISTER",
+                "task_id": "observer-register",
+                "cex_id": "cex-direct-main-register",
+            },
+        )
+    )
+    assert result[0] == 201
+    assert seen["route_token_ref"] == "rtok-register"
+    stored = conn.execute(
+        "SELECT observer_kind,pid,cwd,capabilities_json FROM observer_sessions "
+        "WHERE session_id=?",
+        (result[1]["observer_session_id"],),
+    ).fetchone()
+    assert (stored["observer_kind"], stored["pid"], stored["cwd"]) == ("codex", 0, "")
+    assert json.loads(stored["capabilities_json"]) == derived
+
+
+def _persist_dev_observer_registration_route(
+    conn,
+    *,
+    backlog_id="AC-REGISTER-PERSISTED",
+    task_id="observer-register-persisted",
+    cex_id="cex-direct-main-register-persisted",
+    allowed_actions=None,
+    now=None,
+):
+    actions = list(
+        allowed_actions
+        or ["observer_session_register", "graph_current_full_reconcile"]
+    )
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=actions,
+        evidence_refs=[cex_id],
+        ttl_hours=1,
+        now=now,
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id="aming-claw",
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    return {
+        "project_id": "aming-claw",
+        "route_token_ref": issued["route_token_ref"],
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "cex_id": cex_id,
+    }
+
+
+def test_dev_persisted_route_register_heartbeat_then_current_full_auth(
+    conn, monkeypatch
+):
+    body = _persist_dev_observer_registration_route(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(
+        server, "_route_registry_storage_project_id", lambda project_id: project_id
+    )
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/observer-sessions/register",
+        path_params={"project_id": "aming-claw"},
+        body=body,
+    )
+    status, registered = server.handle_observer_session_register(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert status == 201
+    session_id = registered["observer_session_id"]
+    heartbeat = server.handle_observer_session_heartbeat(
+        _ctx(
+            {"project_id": "aming-claw", "session_id": session_id},
+            method="POST",
+            body={"session_token": registered["session_token"]},
+        )
+    )
+    assert heartbeat["session"]["computed_status"] == "active"
+
+    downstream_calls = []
+
+    def stubbed_downstream_graph_admission(ctx):
+        auth = server._require_current_full_reconcile_auth(
+            ctx, conn, "graph-governance.reconcile.current-full"
+        )
+        downstream_calls.append(auth)
+        return {"admitted": True, "auth": auth}
+
+    current_full_body = {
+        "observer_session_id": session_id,
+        "route_token_ref": body["route_token_ref"],
+        "backlog_id": body["backlog_id"],
+        "task_id": body["task_id"],
+    }
+    downstream = stubbed_downstream_graph_admission(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=current_full_body)
+    )
+    assert downstream["admitted"] is True
+    assert downstream_calls[0]["role_source"] == "observer_session_route_token_ref"
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "missing", "wrong_backlog", "wrong_task", "wrong_cex", "wrong_action",
+        "expired", "revoked", "superseded",
+    ],
+)
+def test_dev_persisted_registration_route_rejections_are_pre_session_dml(
+    conn, monkeypatch, failure_mode
+):
+    now = None
+    allowed = None
+    if failure_mode == "expired":
+        now = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    if failure_mode == "wrong_action":
+        allowed = ["graph_query"]
+    body = _persist_dev_observer_registration_route(
+        conn,
+        backlog_id=f"AC-REGISTER-{failure_mode.upper()}",
+        task_id=f"observer-register-{failure_mode}",
+        cex_id=f"cex-direct-main-register-{failure_mode}",
+        allowed_actions=allowed,
+        now=now,
+    )
+    if failure_mode == "missing":
+        body["route_token_ref"] = "rtok-missing-registration"
+    elif failure_mode == "wrong_backlog":
+        body["backlog_id"] = "AC-REGISTER-WRONG-SCOPE"
+    elif failure_mode == "wrong_task":
+        body["task_id"] = "observer-register-wrong-scope"
+    elif failure_mode == "wrong_cex":
+        body["cex_id"] = "cex-direct-main-register-wrong"
+    elif failure_mode in {"revoked", "superseded"}:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (failure_mode, "aming-claw", body["route_token_ref"]),
+        )
+        conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(
+        server, "_route_registry_storage_project_id", lambda project_id: project_id
+    )
+    before = conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0]
+    status, result = server.handle_observer_session_register(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert status == 403
+    assert result["error"].startswith("route_token_ref_")
+    assert conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0] == before
+
+
+def test_dev_session_get_auth_and_current_full_route_auth_issue_zero_ddl(
+    conn, monkeypatch
+):
+    body = _persist_dev_observer_registration_route(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(
+        server, "_route_registry_storage_project_id", lambda project_id: project_id
+    )
+    status, registered = server.handle_observer_session_register(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert status == 201
+    denied_schema_actions = []
+
+    def authorizer(action, *args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_schema_actions.append(action)
+        return governance_db._dev_schema_authorizer(action, *args)
+
+    conn.set_authorizer(authorizer)
+    try:
+        fetched = observer_session.get_session(
+            conn,
+            project_id="aming-claw",
+            session_id=registered["observer_session_id"],
+        )
+        authenticated = observer_session.authenticate_session(
+            conn,
+            project_id="aming-claw",
+            session_id=registered["observer_session_id"],
+            session_token=registered["session_token"],
+            action=observer_session.ACTION_SESSION_HEARTBEAT,
+        )
+        route_auth = server._require_current_full_reconcile_auth(
+            _ctx(
+                {"project_id": "aming-claw"},
+                method="POST",
+                body={
+                    "observer_session_id": registered["observer_session_id"],
+                    "route_token_ref": body["route_token_ref"],
+                    "backlog_id": body["backlog_id"],
+                    "task_id": body["task_id"],
+                },
+            ),
+            conn,
+            "graph-governance.reconcile.current-full",
+        )
+    finally:
+        conn.set_authorizer(None)
+    assert fetched["computed_status"] == "active"
+    assert authenticated["computed_status"] == "active"
+    assert route_auth["role_source"] == "observer_session_route_token_ref"
+    assert denied_schema_actions == []
+
+
+def test_dev_registration_guard_rejects_foreign_project_before_database(
+    monkeypatch,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    with pytest.raises(ValidationError) as raised:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path="/api/projects/foreign/observer-sessions/register",
+            path_params={"project_id": "foreign"},
+            body={
+                "project_id": "foreign",
+                "route_token_ref": "rtok-foreign",
+                "backlog_id": "AC-FOREIGN",
+                "task_id": "foreign-register",
+                "cex_id": "cex-direct-main-foreign",
+            },
+        )
+    assert raised.value.details["zero_write_rejection"] is True
+    assert raised.value.details["writes_performed"] is False
+
+
+def test_observer_registration_route_requires_exact_action_scope_and_cex(
+    conn, monkeypatch
+):
+    from agent.governance import observer_route_context
+
+    resolved = {
+        "route_token_ref": "rtok-register",
+        "route_id": "route-register",
+        "route_context_hash": "sha256:route-register",
+        "prompt_contract_id": "rprompt-register",
+        "caller_role": "observer",
+        "allowed_actions": ["observer_session_register"],
+        "evidence_refs": ["cex-direct-main-register"],
+    }
+    monkeypatch.setattr(
+        observer_route_context,
+        "resolve_route_token_ref",
+        lambda *_args, **_kwargs: dict(resolved),
+    )
+    authority = observer_route_context.resolve_observer_session_registration_route(
+        conn,
+        project_id=PID,
+        route_token_ref="rtok-register",
+        backlog_id="AC-REGISTER",
+        task_id="observer-register",
+        cex_id="cex-direct-main-register",
+    )
+    assert authority["route_provenance"]["route_id"] == "route-register"
+    assert authority["actions"][0] == "observer_session_heartbeat"
+
+    for field, value in (
+        ("allowed_actions", ["graph_query"]),
+        ("evidence_refs", ["cex-direct-main-other"]),
+        ("caller_role", "worker"),
+    ):
+        monkeypatch.setattr(
+            observer_route_context,
+            "resolve_route_token_ref",
+            lambda *_args, _field=field, _value=value, **_kwargs: {
+                **resolved,
+                _field: _value,
+            },
+        )
+        with pytest.raises(observer_route_context.RouteTokenRefError):
+            observer_route_context.resolve_observer_session_registration_route(
+                conn,
+                project_id=PID,
+                route_token_ref="rtok-register",
+                backlog_id="AC-REGISTER",
+                task_id="observer-register",
+                cex_id="cex-direct-main-register",
+            )
 
 
 def test_ac_dev_candidate_graph_rejects_external_or_implicit_source_root(
@@ -15145,6 +16473,72 @@ def test_stable_runtime_requires_exact_port_branch_commit_and_anchor(monkeypatch
     assert identity["branch"] == server.AC_STABLE_BRANCH
     assert identity["commit"] == commit
     assert identity["stable_anchor_commit"] == commit
+
+
+@pytest.mark.parametrize(
+    "rejected_descendant,expected_error",
+    [
+        ("none", ""),
+        ("live", "ac_dev_issuance_anchor_not_live_stable_ancestor"),
+        ("dev", "ac_dev_issuance_anchor_not_dev_ancestor"),
+    ],
+)
+def test_dev_startup_requires_receipt_anchor_ancestor_of_both_worlds(
+    monkeypatch, tmp_path, rejected_descendant, expected_error
+):
+    issuance = "8" * 40
+    live_stable = "9" * 40
+    candidate = "a" * 40
+    database_identity = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw",
+        "device": 1, "inode": 2,
+        "relative_path_sha256": "sha256:" + "1" * 64,
+        "genesis_sha256": "sha256:" + "2" * 64,
+    }
+    identity = {
+        "status": "ready", "violations": [], "plane": "dev",
+        "worktree_root": str(tmp_path), "commit": candidate,
+        "stable_anchor_commit": live_stable,
+        "dev_issuance_ancestry_anchor_commit": issuance,
+        "database_identity": database_identity,
+    }
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(server, "_bind_dev_runtime_artifact_environment", lambda: None)
+    monkeypatch.setattr(server, "_runtime_plane_identity", lambda: dict(identity))
+    monkeypatch.setattr(
+        server, "governance_loaded_runtime_identity",
+        lambda _commit: {"loaded_source_sha256": "sha256:" + "3" * 64},
+    )
+    monkeypatch.setattr(
+        server, "_branch_service_git_output", lambda _root, _args: live_stable,
+    )
+    monkeypatch.setenv("AMING_CLAW_HOME", str(tmp_path.parent / "runtime-home"))
+    connection = sqlite3.connect(":memory:")
+    monkeypatch.setattr(server, "get_connection", lambda _project: connection)
+    monkeypatch.setattr(
+        server, "canonical_ac_database_identity", lambda _conn=None: database_identity,
+    )
+
+    calls = []
+    def ancestry(command, **_kwargs):
+        calls.append(command)
+        descendant = command[-1]
+        rejected = (
+            rejected_descendant == "live" and descendant == live_stable
+        ) or (rejected_descendant == "dev" and descendant == candidate)
+        return SimpleNamespace(returncode=1 if rejected else 0, stdout="", stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", ancestry)
+    if rejected_descendant == "none":
+        result = server._validate_runtime_plane_startup()
+        assert result["dev_issuance_ancestry_anchor_commit"] == issuance
+    else:
+        with pytest.raises(server.GovernanceSingletonError, match=expected_error):
+            server._validate_runtime_plane_startup()
+    assert [call[-2:] for call in calls] == [
+        [issuance, live_stable], [issuance, candidate]
+    ]
 
 
 def _generic_stable_health_fixture(root: Path, commit: str) -> dict[str, Any]:
@@ -15338,6 +16732,7 @@ def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path
     # It now proves the stable commit is a source-only ancestry anchor while
     # runtime state comes from a fresh, dedicated dev-world genesis.
     stable = "c" * 40
+    issuance = "b" * 40
     candidate = "d" * 40
     storage_root = tmp_path / "dev-world"
     receipt = governance_db.bootstrap_dev_governance_store(
@@ -15356,6 +16751,9 @@ def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path
     monkeypatch.setenv("AMING_CLAW_HOME", str(tmp_path / "runtime-home"))
     monkeypatch.delenv("SHARED_VOLUME_PATH", raising=False)
     monkeypatch.setattr(server, "PORT", server.AC_DEV_SERVICE_PORT)
+    monkeypatch.setattr(
+        server, "dev_issuance_ancestry_anchor_commit", lambda _root: issuance,
+    )
     monkeypatch.setattr(
         server,
         "_git_identity",
@@ -15396,6 +16794,7 @@ def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path
 
     assert identity["status"] == "ready"
     assert identity["stable_anchor_commit"] == stable
+    assert identity["dev_issuance_ancestry_anchor_commit"] == issuance
     assert identity["database_identity"] == receipt["database_identity"]
     assert identity["database_identity"]["world_id"] == "ac-dev"
     assert Path(receipt["database_path"]).is_relative_to(storage_root)
@@ -17450,7 +18849,7 @@ def test_branch_service_launches_guarded_module_with_dev_env(
     ]
     assert launched["env"]["AMING_CLAW_RUNTIME_PLANE"] == "dev"
     assert launched["env"]["GOVERNANCE_PORT"] == "40008"
-    assert launched["env"]["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "deny"
+    assert "AMING_CLAW_ACTIVE_GRAPH_MUTATION" not in launched["env"]
     assert "start_governance.py" not in launched["command"]
     if keep_running:
         assert launched["stdin"] is subprocess.DEVNULL
@@ -17932,6 +19331,136 @@ def test_lower_full_reconcile_strips_reserved_current_full_marker(
     )
     assert status == 201
     assert calls[0]["notes_extra"] == {"caller_note": "preserved"}
+
+
+@pytest.mark.parametrize(
+    "handler,auth_name,next_name",
+    [
+        (
+            server.handle_graph_governance_full_reconcile,
+            "_require_graph_governance_operator",
+            "run_state_only_full_reconcile",
+        ),
+        (
+            server.handle_graph_governance_current_full_reconcile,
+            "_require_current_full_reconcile_auth",
+            "_git_head_commit",
+        ),
+    ],
+)
+def test_dev_reconcile_handlers_admission_order_respects_current_full_prechecks(
+    conn, monkeypatch, tmp_path, handler, auth_name, next_name
+):
+    calls: list[str] = []
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(server, "dev_runtime_verify_only", lambda: True)
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
+    )
+    monkeypatch.setattr(
+        server,
+        auth_name,
+        lambda *_args, **_kwargs: calls.append("auth") or {},
+    )
+    monkeypatch.setattr(
+        server,
+        "admit_ac_dev_graph_materialization_schema",
+        lambda *_args, **_kwargs: calls.append("admission") or {},
+    )
+
+    class StopAtNextBoundary(RuntimeError):
+        pass
+
+    if next_name == "run_state_only_full_reconcile":
+        monkeypatch.setattr(
+            state_reconcile,
+            next_name,
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAtNextBoundary()),
+        )
+    else:
+        monkeypatch.setattr(
+            server,
+            next_name,
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAtNextBoundary()),
+        )
+    with pytest.raises(StopAtNextBoundary):
+        handler(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={"activate": False},
+            )
+        )
+    assert calls == (
+        ["auth", "admission"]
+        if next_name == "run_state_only_full_reconcile"
+        else ["auth"]
+    )
+
+
+def test_current_full_cow_identity_admission_failure_follows_read_only_prechecks(
+    conn, monkeypatch, tmp_path,
+):
+    calls: list[str] = []
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(server, "dev_runtime_verify_only", lambda: True)
+    monkeypatch.setattr(
+        server, "_graph_governance_project_root", lambda _project_id, _body: tmp_path,
+    )
+    monkeypatch.setattr(
+        server, "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: calls.append("auth") or {},
+    )
+
+    def reject_identity(*_args, **_kwargs):
+        calls.append("identity-rejected")
+        raise ValueError("AC dev graph materialization database identity is not admitted")
+
+    monkeypatch.setattr(server, "admit_ac_dev_graph_materialization_schema", reject_identity)
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda *_args: calls.append("head-precheck") or "a" * 40,
+    )
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_request_category",
+        lambda *_args, **_kwargs: calls.append("category-precheck")
+        or {"category": "ordinary", "source_free_reconcile_authority": {}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_reconcile_qa_preflight_authority",
+        lambda *_args, **_kwargs: calls.append("qa-precheck") or {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_runtime_context_scope",
+        lambda *_args, **_kwargs: calls.append("runtime-precheck") or {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_verify_incomplete_fanin_reconcile_target",
+        lambda *_args, **_kwargs: False,
+    )
+    with pytest.raises(ValueError, match="identity is not admitted"):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID}, "coordinator", method="POST",
+                body={"activate": False},
+            )
+        )
+    assert calls == [
+        "auth",
+        "head-precheck",
+        "category-precheck",
+        "qa-precheck",
+        "runtime-precheck",
+        "identity-rejected",
+    ]
 
 
 def test_current_full_state_rejects_notes_only_and_premerge_provenance(conn):
@@ -19224,6 +20753,287 @@ def test_current_full_reconcile_narrow_direct_main_route_reports_zero_write_corr
         for table in zero_write_tables
     } == counts_before
     assert conn.total_changes == total_changes_before
+
+
+def test_current_full_source_free_category_requires_exact_completed_body_zero_write(
+    conn,
+    monkeypatch,
+):
+    body = {
+        "project_id": PID,
+        "target_commit_sha": "a" * 40,
+        "activate": True,
+        "require_clean": True,
+        "semantic_use_ai": False,
+        "semantic_enrich": False,
+        "enqueue_stale": False,
+        "backlog_id": "AC-SOURCE-FREE-CATEGORY",
+        "task_id": "onboard-service-source-free",
+        "contract_execution_id": "onboard-service-source-free",
+        "observer_session_id": "obs-source-free",
+        "observer_route_token_ref": "rtok-source-free",
+        "response_view": "compact",
+    }
+    monkeypatch.setattr(
+        server,
+        "_backlog_source_free_operation_authority",
+        lambda *_args, **_kwargs: {"accepted": True},
+    )
+    monkeypatch.setattr(
+        server,
+        "_completed_source_free_reconcile_authority",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "target_commit": "a" * 40,
+            "copy_safe_body": dict(body),
+            "authority_hash": "authority-source-free",
+        },
+    )
+    auth = {
+        "route_token_scope": {
+            "backlog_id": body["backlog_id"],
+            "task_id": body["task_id"],
+        },
+        "route_token_ref": body["observer_route_token_ref"],
+        "route_token_allowed_actions": list(server._OPERATOR_SOURCE_FREE_ACTIONS),
+    }
+    ctx = _ctx({"project_id": PID}, method="POST", body=body)
+    total_changes_before = conn.total_changes
+    schema_before = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+
+    category = server._current_full_reconcile_request_category(
+        conn,
+        request_context=ctx,
+        project_id=PID,
+        body=body,
+        auth=auth,
+        target_commit_sha="a" * 40,
+    )
+    assert category["category"] == "source_free_system_operation"
+
+    mismatched = {**body, "semantic_enrich": True}
+    with pytest.raises(GovernanceError) as exc:
+        server._current_full_reconcile_request_category(
+            conn,
+            request_context=_ctx(
+                {"project_id": PID}, method="POST", body=mismatched
+            ),
+            project_id=PID,
+            body=mismatched,
+            auth=auth,
+            target_commit_sha="a" * 40,
+        )
+    assert exc.value.code == "current_full_reconcile_source_free_authority_required"
+    assert exc.value.details["fallback_allowed"] is False
+    assert "zero_write_rejection" not in exc.value.details
+    assert conn.total_changes == total_changes_before
+    assert conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == schema_before
+
+
+def test_current_full_source_free_category_precedes_admission_and_bypasses_direct_gate(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-SOURCE-FREE-PRE-ADMISSION"
+    session_id = _insert_active_observer_session_ref(
+        conn, session_id="obs-source-free-pre-admission"
+    )
+    route_ref = "rtok-source-free-pre-admission"
+    record = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_ref,
+    )
+    task_id = record["contract_execution_id"]
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=route_ref,
+        allowed_actions=list(server._OPERATOR_SOURCE_FREE_ACTIONS),
+    )
+    authority = {"accepted": True, "authority_hash": "source-free-exact"}
+    ordering = []
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_request_category",
+        lambda *_args, **_kwargs: (
+            ordering.append("category")
+            or {
+                "category": "source_free_system_operation",
+                "source_free_reconcile_authority": authority,
+            }
+        ),
+    )
+    monkeypatch.setattr(server, "dev_runtime_verify_only", lambda: True)
+    monkeypatch.setattr(
+        server,
+        "admit_ac_dev_graph_materialization_schema",
+        lambda *_args, **_kwargs: ordering.append("admission"),
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": False,
+                "semantic_enrich": False,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": session_id,
+                "observer_route_token_ref": route_ref,
+            },
+        )
+    )
+
+    assert status == 201
+    assert result["current_full_reconcile"] is True
+    assert ordering == ["category", "admission"]
+    assert [call["activate"] for call in calls] == [False]
+
+
+def _insert_source_free_route_provenance_session(
+    conn,
+    *,
+    session_id,
+    token_hash,
+    last_seen_at,
+    provenance,
+):
+    observer_session.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO observer_sessions (
+          session_id,project_id,observer_kind,session_label,pid,cwd,
+          capabilities_json,token_hash,status,registered_at,last_seen_at,
+          closed_at,revoked_at
+        ) VALUES (?,?, 'codex','source-free-cardinality',0,'',?,?,?, ?,?,'','')
+        """,
+        (
+            session_id,
+            PID,
+            json.dumps({"route_provenance": provenance}),
+            token_hash,
+            observer_session.SESSION_STATUS_ACTIVE,
+            "2026-08-31T00:00:00Z",
+            last_seen_at,
+        ),
+    )
+
+
+@pytest.mark.parametrize("reverse_registration", [False, True])
+def test_source_free_reconcile_rejects_multiple_exact_active_sessions_order_independent(
+    conn,
+    reverse_registration,
+):
+    route_ref = f"rtok-source-free-cardinality-{int(reverse_registration)}"
+    task_id = f"cex-source-free-cardinality-{int(reverse_registration)}"
+    backlog_id = f"AC-SOURCE-FREE-CARDINALITY-{int(reverse_registration)}"
+    provenance = {
+        "route_token_ref": route_ref,
+        "route_id": f"route-{route_ref}",
+        "route_context_hash": _fake_sha(f"{route_ref}:context"),
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "cex_id": task_id,
+    }
+    sessions = [
+        ("obs-source-free-cardinality-a", "token-cardinality-a", "2999-01-01T00:00:00Z"),
+        ("obs-source-free-cardinality-b", "token-cardinality-b", "2998-12-31T23:59:58Z"),
+    ]
+    if reverse_registration:
+        sessions.reverse()
+    for session_id, token_hash, last_seen_at in sessions:
+        _insert_source_free_route_provenance_session(
+            conn,
+            session_id=session_id,
+            token_hash=f"{token_hash}-{int(reverse_registration)}",
+            last_seen_at=last_seen_at,
+            provenance=provenance,
+        )
+    conn.commit()
+    total_changes_before = conn.total_changes
+    schema_before = server.stable_sha256(
+        [tuple(row) for row in conn.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()]
+    )
+
+    for body_session_id in (
+        "obs-source-free-cardinality-a",
+        "obs-source-free-cardinality-b",
+    ):
+        assert server._source_free_reconcile_unique_active_session(
+            conn,
+            project_id=PID,
+            session_id=body_session_id,
+            route_token_ref=route_ref,
+            route_id=f"route-{route_ref}",
+            route_context_hash=_fake_sha(f"{route_ref}:context"),
+            backlog_id=backlog_id,
+            task_id=task_id,
+        ) == {}
+    assert conn.total_changes == total_changes_before
+    assert server.stable_sha256(
+        [tuple(row) for row in conn.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()]
+    ) == schema_before
+
+
+def test_source_free_reconcile_accepts_only_body_bound_unique_active_session(conn):
+    route_ref = "rtok-source-free-unique-session"
+    task_id = "cex-source-free-unique-session"
+    backlog_id = "AC-SOURCE-FREE-UNIQUE-SESSION"
+    session_id = "obs-source-free-unique-session"
+    provenance = {
+        "route_token_ref": route_ref,
+        "route_id": f"route-{route_ref}",
+        "route_context_hash": _fake_sha(f"{route_ref}:context"),
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "cex_id": task_id,
+    }
+    _insert_source_free_route_provenance_session(
+        conn,
+        session_id=session_id,
+        token_hash="token-source-free-unique-session",
+        last_seen_at="2999-01-01T00:00:00Z",
+        provenance=provenance,
+    )
+    conn.commit()
+
+    accepted = server._source_free_reconcile_unique_active_session(
+        conn,
+        project_id=PID,
+        session_id=session_id,
+        route_token_ref=route_ref,
+        route_id=f"route-{route_ref}",
+        route_context_hash=_fake_sha(f"{route_ref}:context"),
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    assert accepted["session_id"] == session_id
+    assert accepted["capabilities"]["route_provenance"] == provenance
+    assert server._source_free_reconcile_unique_active_session(
+        conn,
+        project_id=PID,
+        session_id="obs-foreign-body-session",
+        route_token_ref=route_ref,
+        route_id=f"route-{route_ref}",
+        route_context_hash=_fake_sha(f"{route_ref}:context"),
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) == {}
 
 
 def test_current_full_reconcile_custom_run_ref_uses_graph_status_active_authority(
@@ -197500,18 +199310,87 @@ def _prepare_ac_dev_direct_route_bootstrap(
     tmp_path,
     *,
     backlog_id: str,
+    source_free: bool = False,
 ):
     project_id = "aming-claw"
     _initialize_ac_dev_guide_schema(conn)
     _insert_simple_mf_close_backlog(conn, backlog_id)
-    conn.execute(
-        "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
-        (
-            json.dumps(["agent/governance/server.py"]),
-            json.dumps(["agent/tests/test_graph_governance_api.py"]),
-            backlog_id,
-        ),
-    )
+    if source_free:
+        source_free_actions = [
+            "fresh_onboard_route_guide",
+            "fresh_route_issue",
+            "observer_session_register",
+            "observer_session_heartbeat",
+            "single_full_reconcile",
+            "readback",
+            "timeline_precheck",
+            "honest_archive_or_close",
+            "close_r3_if_authorized",
+        ]
+        source_free_blocked_actions = [
+            "source_edit",
+            "empty_commit",
+            "old_graph_input",
+            "old_graph_migration",
+            "retry_prior_request",
+            "reuse_prior_session_or_route",
+            "bypass_reconcile",
+            "stable_40000_mutation",
+            "second_authority_runtime",
+            "synthesized_pass",
+        ]
+        topology = (
+            "existing_unique_ac_observer;"
+            "_no_implementation_worker_because_r3_is_source_free;"
+            "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+        )
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+            SET status='OPEN', target_files='[]', test_files='[]',
+                acceptance_criteria=?, details_md=?, chain_trigger_json=?
+            WHERE bug_id=?
+            """,
+            (
+                json.dumps(
+                    [
+                        "The exact observer session operation is authorized.",
+                        "HEAD remains exact and clean, with no source or empty commit.",
+                        "Exactly one full reconcile runs and close remains evidence-bound.",
+                    ]
+                ),
+                "Do not edit source, create an empty commit, or merge source.",
+                json.dumps(
+                    {
+                        "subsystem_backlog_handoff": {
+                            "schema_version": "judgment_subsystem_backlog_handoff.v1",
+                            "execution_owner": "selected_subsystem_observer",
+                            "selected_subsystem_gate_remains_authoritative": True,
+                            "allowed_actions": source_free_actions,
+                            "blocked_actions": source_free_blocked_actions,
+                        },
+                        "judgment_plan_precheck": {
+                            "subject": {"normalized_topology": topology},
+                            "evidence": {
+                                "route_context": {
+                                    "normalized_proposed_topology": topology
+                                }
+                            },
+                        },
+                    }
+                ),
+                backlog_id,
+            ),
+        )
+    else:
+        conn.execute(
+            "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
+            (
+                json.dumps(["agent/governance/server.py"]),
+                json.dumps(["agent/tests/test_graph_governance_api.py"]),
+                backlog_id,
+            ),
+        )
     conn.commit()
     root = tmp_path / "ac-dev-route-bootstrap"
     root.mkdir()
@@ -197568,6 +199447,993 @@ def _prepare_ac_dev_direct_route_bootstrap(
             guide["next_legal_action"]["copy_safe_body"]
         ),
     }
+
+
+def test_ac_dev_source_free_guide_issues_exact_empty_fence_route(
+    conn, monkeypatch, tmp_path
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-SOURCE-FREE-ROUTE",
+        source_free=True,
+    )
+    body = prepared["issue_body"]
+    assert body["target_files"] == []
+    assert body["owned_files"] == []
+    assert body["source_free_operation"] is True
+    assert body["allowed_actions"] == list(server._OPERATOR_SOURCE_FREE_ACTIONS)
+
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert issued["route_token"]["target_files"] == []
+    assert issued["route_token"]["source_free_operation"] is True
+    assert issued["route_token"]["source_mutation_forbidden"] is True
+
+
+def test_ac_dev_source_free_structured_projection_is_wording_independent(
+    conn, monkeypatch, tmp_path
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-SOURCE-FREE-R2-WORDING",
+        source_free=True,
+    )
+    row = conn.execute(
+        "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id=?",
+        ("AC-DEV-SOURCE-FREE-R2-WORDING",),
+    ).fetchone()
+    trigger = json.loads(row["chain_trigger_json"])
+    handoff = trigger["subsystem_backlog_handoff"]
+    handoff["allowed_actions"][-2:] = [
+        "honest_close_or_archive",
+        "close_r2_if_authorized",
+    ]
+    topology = (
+        "existing_unique_ac_observer;"
+        "_no_implementation_worker_because_r2_is_source_free;"
+        "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+    )
+    trigger["judgment_plan_precheck"]["subject"]["normalized_topology"] = topology
+    trigger["judgment_plan_precheck"]["evidence"]["route_context"][
+        "normalized_proposed_topology"
+    ] = topology
+    conn.execute(
+        "UPDATE backlog_bugs SET acceptance_criteria=?, details_md=?, "
+        "chain_trigger_json=? WHERE bug_id=?",
+        (
+            json.dumps(["Completely different human wording."]),
+            "No magic phrase is present here.",
+            json.dumps(trigger),
+            "AC-DEV-SOURCE-FREE-R2-WORDING",
+        ),
+    )
+    conn.commit()
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": "AC-DEV-SOURCE-FREE-R2-WORDING",
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "target_project_root": str(prepared["root"]),
+                "target_head_commit": prepared["commit"],
+                "target_ref": server.AC_DEV_BRANCH,
+            },
+        )
+    )
+    assert guide["next_legal_action"]["copy_safe_body"]["allowed_actions"] == list(
+        server._OPERATOR_SOURCE_FREE_ACTIONS
+    )
+
+
+def test_ac_dev_source_free_projects_real_r4_durable_handoff_shape(conn):
+    backlog_id = "AC-DEV-SOURCE-FREE-R4-DURABLE-SHAPE"
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    topology = (
+        "existing_unique_ac_observer;"
+        "_source_mutation_forbidden;"
+        "_no_implementation_worker;"
+        "_source_free_operation_only"
+    )
+    trigger = {
+        "subsystem_backlog_handoff": {
+            "schema_version": "judgment_subsystem_backlog_handoff.v1",
+            "execution_owner": "selected_subsystem_observer",
+            "selected_subsystem_gate_remains_authoritative": True,
+            "allowed_actions": [
+                "fresh_onboard_route_guide",
+                "fresh_route_issue",
+                "observer_session_register",
+                "observer_session_heartbeat",
+                "graph_query",
+                "task_timeline_append",
+                "single_full_reconcile",
+                "readback",
+                "honest_archive_or_close",
+                "backlog_close_if_authorized",
+            ],
+            "blocked_actions": [
+                "implementation_worker",
+                "source_mutation",
+                "file_edit",
+                "run_tests",
+                "git_diff",
+                "merge",
+                "old_graph_input",
+                "retry_r2_or_r3",
+                "reuse_old_session_or_route",
+                "bypass_reconcile",
+                "stable_40000_mutation",
+                "second_authority_runtime",
+                "synthesized_pass",
+            ],
+        },
+        "judgment_plan_precheck": {
+            "subject": {"normalized_topology": topology},
+            "evidence": {
+                "route_context": {"normalized_proposed_topology": topology}
+            },
+        },
+    }
+    conn.execute(
+        "UPDATE backlog_bugs SET status='OPEN', target_files='[]', test_files='[]', "
+        "chain_trigger_json=? WHERE bug_id=?",
+        (json.dumps(trigger), backlog_id),
+    )
+    conn.commit()
+
+    authority = server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    )
+    assert authority["accepted"] is True
+    assert authority["allowed_actions"] == list(server._OPERATOR_SOURCE_FREE_ACTIONS)
+    assert authority["target_files"] == []
+    assert authority["source_mutation_forbidden"] is True
+
+
+def _set_source_free_topology(conn, backlog_id, topology):
+    row = conn.execute(
+        "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id=?",
+        (backlog_id,),
+    ).fetchone()
+    trigger = json.loads(row["chain_trigger_json"])
+    trigger["judgment_plan_precheck"]["subject"]["normalized_topology"] = topology
+    trigger["judgment_plan_precheck"]["evidence"]["route_context"][
+        "normalized_proposed_topology"
+    ] = topology
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json=? WHERE bug_id=?",
+        (json.dumps(trigger), backlog_id),
+    )
+    conn.commit()
+
+
+def test_ac_dev_source_free_projects_exact_real_r6_topology_to_empty_route(conn):
+    backlog_id = "AC-DEV-SOURCE-FREE-REAL-R6-TOPOLOGY"
+    _completed_source_free_system_operation_case(conn, backlog_id)
+    topology = (
+        "reuse_the_existing_unique_ac_observer."
+        "_source_free_system_operation_only;"
+        "_zero_implementation_workers;"
+        "_one_fresh_observer_route/session;"
+        "_exactly_one_full_reconcile."
+    )
+    _set_source_free_topology(conn, backlog_id, topology)
+
+    authority = server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    )
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+            },
+        )
+    )
+
+    assert authority["accepted"] is True
+    assert all(authority["contract_facts"].values())
+    assert result["next_legal_action"]["id"] == (
+        "completed_system_operation_route_issue"
+    )
+    assert result["next_legal_action"]["copy_safe_body"]["target_files"] == []
+    assert result["next_legal_action"]["copy_safe_body"]["owned_files"] == []
+
+
+def test_ac_dev_completed_source_free_public_route_issue_persists_no_direct_cex(
+    conn, monkeypatch, tmp_path
+):
+    backlog_id = "AC-DEV-SOURCE-FREE-REAL-R6-PUBLIC-ISSUE"
+    _completed_source_free_system_operation_case(conn, backlog_id)
+    topology = (
+        "reuse_the_existing_unique_ac_observer."
+        "_source_free_system_operation_only;"
+        "_zero_implementation_workers;"
+        "_one_fresh_observer_route/session;"
+        "_exactly_one_full_reconcile."
+    )
+    _set_source_free_topology(conn, backlog_id, topology)
+    root = tmp_path / "completed-operation-world"
+    root.mkdir()
+    world = _fixed_ac_dev_direct_world(root, "a" * 40)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+            },
+        )
+    )
+    body = guide["next_legal_action"]["copy_safe_body"]
+    runtime_before = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0]
+    assert server._observer_route_context_issue_request_kind(body) == (
+        "completed_source_free_system_operation"
+    )
+    assert server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/observer/route-context/issue",
+        path_params={"project_id": "aming-claw"},
+        body=body,
+        query={},
+    ) is None
+
+    first = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    no_session = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"}, method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+                "route_token_ref": first["route_token_ref"],
+            },
+        )
+    )
+    assert no_session["next_legal_action"]["action"] == "no_runtime_action"
+    register_status, registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": "aming-claw"}, method="POST",
+            body={
+                "project_id": "aming-claw",
+                "route_token_ref": first["route_token_ref"],
+                "backlog_id": backlog_id,
+                "task_id": body["task_id"],
+                "cex_id": body["task_id"],
+            },
+        )
+    )
+    assert register_status == 201
+    heartbeat = server.handle_observer_session_heartbeat(
+        _ctx(
+            {
+                "project_id": "aming-claw",
+                "session_id": registered["observer_session_id"],
+            },
+            method="POST",
+            body={"session_token": registered["session_token"]},
+        )
+    )
+    assert heartbeat["ok"] is True
+    post_route = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"}, method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+                "route_token_ref": first["route_token_ref"],
+                "observer_session_id": registered["observer_session_id"],
+            },
+        )
+    )
+    replay = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+
+    assert first["route_token"]["target_files"] == []
+    assert first["route_token"]["owned_files"] == []
+    assert first["route_token"]["allowed_actions"] == list(
+        server._OPERATOR_SOURCE_FREE_ACTIONS
+    )
+    assert first["contract_runtime_mutated"] is False
+    assert replay["route_token_ref"] == first["route_token_ref"]
+    assert replay["idempotent_replay"] is True
+    reconcile = post_route["next_legal_action"]
+    assert reconcile["id"] == "completed_system_operation_current_full_reconcile"
+    assert reconcile["route_reissue_allowed"] is False
+    assert reconcile["single_call_policy"] is True
+    assert reconcile["old_graph_input_allowed"] is False
+    assert reconcile["copy_safe_body"]["observer_session_id"] == registered[
+        "observer_session_id"
+    ]
+    assert reconcile["copy_safe_body"]["observer_route_token_ref"] == first[
+        "route_token_ref"
+    ]
+    assert reconcile["copy_safe_body"]["target_commit_sha"] == "a" * 40
+    guide_request = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "system_operation",
+        "route_token_ref": first["route_token_ref"],
+        "observer_session_id": registered["observer_session_id"],
+    }
+    conn.execute(
+        "UPDATE observer_sessions SET status='revoked', revoked_at=? "
+        "WHERE session_id=?",
+        ("2026-08-31T12:00:00Z", registered["observer_session_id"]),
+    )
+    conn.commit()
+    revoked_session = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=guide_request)
+    )
+    assert revoked_session["next_legal_action"]["action"] == "no_runtime_action"
+    conn.execute(
+        "UPDATE observer_sessions SET status='active', revoked_at='', "
+        "capabilities_json=? WHERE session_id=?",
+        (
+            json.dumps({"route_provenance": {"route_token_ref": "rtok-foreign"}}),
+            registered["observer_session_id"],
+        ),
+    )
+    conn.commit()
+    mismatched_session = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=guide_request)
+    )
+    assert mismatched_session["next_legal_action"]["action"] == "no_runtime_action"
+    conn.execute(
+        "UPDATE observer_sessions SET capabilities_json=? WHERE session_id=?",
+        (
+            json.dumps(registered["session"]["capabilities"]),
+            registered["observer_session_id"],
+        ),
+    )
+    conn.execute(
+        "UPDATE observer_route_token_refs SET status='revoked' "
+        "WHERE route_token_ref=?",
+        (first["route_token_ref"],),
+    )
+    conn.commit()
+    revoked_route = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=guide_request)
+    )
+    assert revoked_route["next_legal_action"]["action"] == "no_runtime_action"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0] == runtime_before
+
+
+@pytest.mark.parametrize("mutation", ["wrong_task", "mixed_action", "nonempty"])
+def test_ac_dev_completed_source_free_public_route_issue_rejects_tampering_zero_write(
+    conn, monkeypatch, tmp_path, mutation
+):
+    backlog_id = f"AC-DEV-SOURCE-FREE-PUBLIC-REJECT-{mutation}"
+    _completed_source_free_system_operation_case(conn, backlog_id)
+    topology = (
+        "reuse_the_existing_unique_ac_observer."
+        "_source_free_system_operation_only;"
+        "_zero_implementation_workers;"
+        "_one_fresh_observer_route/session;"
+        "_exactly_one_full_reconcile."
+    )
+    _set_source_free_topology(conn, backlog_id, topology)
+    root = tmp_path / f"operation-reject-{mutation}"
+    root.mkdir()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: _fixed_ac_dev_direct_world(root, "b" * 40),
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"}, method="POST",
+            body={"backlog_id": backlog_id, "role": "observer", "work_type": "system_operation"},
+        )
+    )
+    body = copy.deepcopy(guide["next_legal_action"]["copy_safe_body"])
+    if mutation == "wrong_task":
+        body["task_id"] = "onboard-service-wrong"
+    elif mutation == "mixed_action":
+        body["allowed_actions"].append("merge")
+    else:
+        body["target_files"] = ["agent/governance/server.py"]
+        body["owned_files"] = ["agent/governance/server.py"]
+    before_changes = conn.total_changes
+    before_routes = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0]
+
+    with pytest.raises(GovernanceError):
+        server.handle_observer_route_context_issue(
+            _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+        )
+
+    assert conn.total_changes == before_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0] == before_routes
+
+
+@pytest.mark.parametrize(
+    "topology",
+    [
+        "",
+        123,
+        (
+            " reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile. "
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer;"
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile;"
+        ),
+        (
+            "_reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer. "
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "Reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer:"
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_one_implementation_worker;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_two_full_reconciles."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_zero_implementation_workers;"
+            "_source_free_system_operation_only;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile;"
+            "_extra_fact."
+        ),
+        (
+            "existing_unique_ac_observer;"
+            "_no_implementation_worker_because_r0_is_source_free;"
+            "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+        ),
+        (
+            "existing_unique_ac_observer;"
+            "_no_implementation_worker_because_r999_is_source_free;"
+            "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+        ),
+        (
+            "existing_unique_ac_observer;"
+            "_no_implementation_worker_because_r4_is_source_free;"
+            "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+        ),
+    ],
+)
+def test_ac_dev_real_r6_topology_missing_or_altered_fact_rejects(conn, topology):
+    backlog_id = "AC-DEV-SOURCE-FREE-REAL-R6-ALTERED"
+    _completed_source_free_system_operation_case(conn, backlog_id)
+    _set_source_free_topology(conn, backlog_id, topology)
+
+    assert server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    ) == {}
+
+
+def _completed_source_free_system_operation_case(conn, backlog_id):
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    topology = (
+        "existing_unique_ac_observer;"
+        "_source_mutation_forbidden;"
+        "_no_implementation_worker;"
+        "_source_free_operation_only"
+    )
+    trigger = {
+        "subsystem_backlog_handoff": {
+            "schema_version": "judgment_subsystem_backlog_handoff.v1",
+            "execution_owner": "selected_subsystem_observer",
+            "selected_subsystem_gate_remains_authoritative": True,
+            "allowed_actions": [
+                "fresh_onboard_route_guide",
+                "fresh_route_issue",
+                "observer_session_register",
+                "observer_session_heartbeat",
+                "graph_query",
+                "task_timeline_append",
+                "single_full_reconcile",
+                "readback",
+                "honest_archive_or_close",
+                "backlog_close_if_authorized",
+            ],
+            "blocked_actions": [
+                "source_mutation",
+                "file_edit",
+                "old_graph_input",
+                "bypass_reconcile",
+                "stable_40000_mutation",
+                "second_authority_runtime",
+                "synthesized_pass",
+            ],
+        },
+        "judgment_plan_precheck": {
+            "subject": {"normalized_topology": topology},
+            "evidence": {
+                "route_context": {
+                    "normalized_proposed_topology": topology
+                }
+            },
+        },
+    }
+    conn.execute(
+        "UPDATE backlog_bugs SET status='OPEN', target_files='[]', "
+        "test_files='[]', chain_trigger_json=? WHERE bug_id=?",
+        (json.dumps(trigger), backlog_id),
+    )
+    conn.commit()
+    execution_id = server._onboard_service_execution_id("aming-claw", backlog_id)
+    authority = server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    )
+    resume = {
+        "status": "contract_complete",
+        "readiness_state": "contract_complete",
+        "current_contract_execution_id": execution_id,
+        "root_contract_execution_id": execution_id,
+        "next_legal_action": {},
+    }
+    return authority, resume, execution_id
+
+
+def test_completed_onboard_service_projects_fresh_source_free_system_operation_route(
+    conn,
+):
+    backlog_id = "AC-DEV-COMPLETED-SYSTEM-OPERATION-R2"
+    authority, resume, execution_id = _completed_source_free_system_operation_case(
+        conn, backlog_id
+    )
+
+    action = server._onboard_route_guide_completed_next_action(
+        role="observer",
+        work_type="system_operation",
+        runtime_resume=resume,
+        backlog_row_status="OPEN",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        target_files=[],
+        source_free_operation_authority=authority,
+    )
+
+    assert action["id"] == "completed_system_operation_route_issue"
+    assert action["action"] == "observer_route_context_issue"
+    assert action["action_input_ready"] is True
+    assert action["copy_safe_body"] == action["action_input"]
+    assert action["copy_safe_body"]["task_id"] == execution_id
+    assert action["copy_safe_body"]["target_files"] == []
+    assert action["copy_safe_body"]["owned_files"] == []
+    assert action["copy_safe_body"]["allowed_actions"] == list(
+        server._OPERATOR_SOURCE_FREE_ACTIONS
+    )
+    assert action["source_mutation_forbidden"] is True
+    assert action["old_evidence_carry_forward"] is False
+
+
+def test_onboard_route_guide_completed_source_free_system_operation_uses_durable_authority(
+    conn,
+):
+    backlog_id = "AC-DEV-COMPLETED-SYSTEM-OPERATION-HANDLER-R2"
+    _authority, _resume, execution_id = _completed_source_free_system_operation_case(
+        conn, backlog_id
+    )
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+            },
+        )
+    )
+
+    action = result["next_legal_action"]
+    assert result["runtime_resume"]["readiness_state"] == "contract_complete"
+    assert action["id"] == "completed_system_operation_route_issue"
+    assert action["copy_safe_body"]["task_id"] == execution_id
+    assert action["server_derived_authority"]["accepted"] is True
+    assert action["server_derived_authority"]["caller_claims_trusted"] is False
+    assert action["copy_safe_body"]["allowed_actions"] == list(
+        server._OPERATOR_SOURCE_FREE_ACTIONS
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_role",
+        "wrong_work_type",
+        "closed",
+        "stale_route",
+        "nonempty_fence",
+        "wrong_parent",
+        "incomplete_authority",
+        "mixed_action",
+    ],
+)
+def test_completed_source_free_system_operation_selector_fails_closed(
+    conn, mutation
+):
+    backlog_id = f"AC-DEV-COMPLETED-SYSTEM-OPERATION-{mutation}"
+    authority, resume, _execution_id = _completed_source_free_system_operation_case(
+        conn, backlog_id
+    )
+    kwargs = {
+        "role": "observer",
+        "work_type": "system_operation",
+        "runtime_resume": resume,
+        "backlog_row_status": "OPEN",
+        "project_id": "aming-claw",
+        "backlog_id": backlog_id,
+        "route_token_ref": "",
+        "target_files": [],
+        "source_free_operation_authority": authority,
+    }
+    if mutation == "wrong_role":
+        kwargs["role"] = "qa"
+    elif mutation == "wrong_work_type":
+        kwargs["work_type"] = "continue_contract_chain"
+    elif mutation == "closed":
+        kwargs["backlog_row_status"] = "FIXED"
+    elif mutation == "stale_route":
+        kwargs["route_token_ref"] = "rtok-stale"
+    elif mutation == "nonempty_fence":
+        kwargs["source_free_operation_authority"] = {
+            **authority,
+            "target_files": ["agent/governance/server.py"],
+        }
+    elif mutation == "wrong_parent":
+        kwargs["runtime_resume"] = {**resume, "current_contract_execution_id": "foreign"}
+    elif mutation == "incomplete_authority":
+        kwargs["source_free_operation_authority"] = {
+            **authority,
+            "accepted": False,
+        }
+    else:
+        kwargs["source_free_operation_authority"] = {
+            **authority,
+            "allowed_actions": [*authority["allowed_actions"], "merge"],
+        }
+
+    action = server._onboard_route_guide_completed_next_action(**kwargs)
+    assert action["action"] == "no_runtime_action"
+    assert action["id"] == "contract_complete_no_runtime_action"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_handoff_schema",
+        "missing_operation",
+        "mixed_action",
+        "missing_source_block",
+        "missing_worker_topology",
+        "topology_mismatch",
+        "closed",
+        "nonempty_scope",
+    ],
+)
+def test_ac_dev_source_free_structured_fact_mutations_fail_closed(
+    conn, mutation
+):
+    backlog_id = f"AC-DEV-SOURCE-FREE-FACT-{mutation}"
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    topology = (
+        "existing_unique_ac_observer;"
+        "_no_implementation_worker_because_r3_is_source_free;"
+        "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+    )
+    trigger = {
+        "subsystem_backlog_handoff": {
+            "schema_version": "judgment_subsystem_backlog_handoff.v1",
+            "execution_owner": "selected_subsystem_observer",
+            "selected_subsystem_gate_remains_authoritative": True,
+            "allowed_actions": [
+                "fresh_onboard_route_guide",
+                "fresh_route_issue",
+                "observer_session_register",
+                "observer_session_heartbeat",
+                "single_full_reconcile",
+                "readback",
+                "timeline_precheck",
+                "honest_archive_or_close",
+                "close_r3_if_authorized",
+            ],
+            "blocked_actions": [
+                "source_edit",
+                "empty_commit",
+                "old_graph_input",
+                "old_graph_migration",
+                "bypass_reconcile",
+                "stable_40000_mutation",
+                "second_authority_runtime",
+                "synthesized_pass",
+            ],
+        },
+        "judgment_plan_precheck": {
+            "subject": {"normalized_topology": topology},
+            "evidence": {
+                "route_context": {"normalized_proposed_topology": topology}
+            },
+        },
+    }
+    status = "OPEN"
+    target_files = "[]"
+    if mutation == "missing_handoff_schema":
+        trigger["subsystem_backlog_handoff"].pop("schema_version")
+    elif mutation == "missing_operation":
+        trigger["subsystem_backlog_handoff"]["allowed_actions"].remove("readback")
+    elif mutation == "mixed_action":
+        trigger["subsystem_backlog_handoff"]["allowed_actions"].append("merge")
+    elif mutation == "missing_source_block":
+        trigger["subsystem_backlog_handoff"]["blocked_actions"].remove("source_edit")
+    elif mutation == "missing_worker_topology":
+        trigger["judgment_plan_precheck"]["subject"]["normalized_topology"] = ""
+    elif mutation == "topology_mismatch":
+        trigger["judgment_plan_precheck"]["evidence"]["route_context"][
+            "normalized_proposed_topology"
+        ] = topology.replace("r3", "r2")
+    elif mutation == "closed":
+        status = "FIXED"
+    else:
+        target_files = json.dumps(["agent/governance/server.py"])
+    conn.execute(
+        "UPDATE backlog_bugs SET status=?, target_files=?, test_files='[]', "
+        "chain_trigger_json=?, acceptance_criteria=?, details_md=?, mf_type=? "
+        "WHERE bug_id=?",
+        (
+            status,
+            target_files,
+            json.dumps(trigger),
+            json.dumps(["no source or empty commit", "observer session reconcile close"]),
+            "Do not edit source",
+            "source_free_operation",
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    assert server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["forged_source_free", "mixed_source_action", "missing_authority"],
+)
+def test_ac_dev_source_free_empty_fence_rejects_forgery_before_persistence(
+    conn, monkeypatch, tmp_path, mutation
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=f"AC-DEV-SOURCE-FREE-REJECT-{mutation}",
+        source_free=mutation != "missing_authority",
+    )
+    body = copy.deepcopy(prepared["issue_body"])
+    if mutation == "forged_source_free":
+        body["source_free_operation"] = False
+    elif mutation == "mixed_source_action":
+        body["allowed_actions"].append("merge")
+    else:
+        body["target_files"] = []
+        body["owned_files"] = []
+        body["source_free_operation"] = True
+    before_changes = conn.total_changes
+    before_routes = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0]
+    before_schema = tuple(
+        conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_observer_route_context_issue(
+            _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+        )
+    assert rejected.value.code == "ac_dev_direct_route_bootstrap_not_guide_bound"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0] == before_routes
+    assert tuple(
+        conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    ) == before_schema
+
+
+def test_ac_dev_public_guide_route_issue_register_and_heartbeat_exact_chain(
+    conn, monkeypatch, tmp_path
+):
+    backlog_id = "AC-DEV-GUIDE-ROUTE-SESSION-BOOTSTRAP"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn, monkeypatch, tmp_path, backlog_id=backlog_id
+    )
+    issue_body = prepared["issue_body"]
+    assert "observer_session_register" in issue_body["allowed_actions"]
+    assert issue_body["allowed_actions"] == list(
+        server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body=issue_body,
+        )
+    )
+    storage_project_id = server.direct_main_dev_storage_project_id(
+        "aming-claw", prepared["world"]["namespace_hash"]
+    )
+    persisted = conn.execute(
+        "SELECT allowed_actions_json FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (storage_project_id, issued["route_token_ref"]),
+    ).fetchone()
+    assert json.loads(persisted["allowed_actions_json"]) == issue_body["allowed_actions"]
+
+    registration_body = {
+        "project_id": "aming-claw",
+        "route_token_ref": issued["route_token_ref"],
+        "backlog_id": backlog_id,
+        "task_id": prepared["task_id"],
+        "cex_id": prepared["task_id"],
+    }
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/observer-sessions/register",
+        path_params={"project_id": "aming-claw"},
+        body=registration_body,
+    )
+    status, registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body=registration_body,
+        )
+    )
+    assert status == 201
+    heartbeat = server.handle_observer_session_heartbeat(
+        _ctx(
+            {
+                "project_id": "aming-claw",
+                "session_id": registered["observer_session_id"],
+            },
+            method="POST",
+            body={"session_token": registered["session_token"]},
+        )
+    )
+    assert heartbeat["session"]["computed_status"] == "active"
+
+
+@pytest.mark.parametrize("mutation", ["manual_action", "wrong_scope"])
+def test_ac_dev_public_guide_route_issue_rejects_manual_action_or_scope_zero_write(
+    conn, monkeypatch, tmp_path, mutation
+):
+    backlog_id = f"AC-DEV-GUIDE-ROUTE-REJECT-{mutation.upper()}"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn, monkeypatch, tmp_path, backlog_id=backlog_id
+    )
+    body = copy.deepcopy(prepared["issue_body"])
+    if mutation == "manual_action":
+        body["allowed_actions"].append("manually_claimed_action")
+    else:
+        body["task_id"] = "cex-direct-main-wrong-scope"
+    route_rows_before = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0]
+    session_rows_before = conn.execute(
+        "SELECT COUNT(*) FROM observer_sessions"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": "aming-claw"},
+                method="POST",
+                body=body,
+            )
+        )
+    assert rejected.value.code in {
+        "ac_dev_direct_route_bootstrap_not_guide_bound",
+        "ac_direct_main_runtime_candidate_identity_mismatch",
+    }
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.execute("SELECT COUNT(*) FROM observer_route_token_refs").fetchone()[0] == route_rows_before
+    assert conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0] == session_rows_before
 
 
 def _insert_ac_dev_active_observer_session(
@@ -197679,6 +200545,12 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
     task_id = prepared["task_id"]
     project_id = prepared["project_id"]
     body = prepared["issue_body"]
+    # Stable and dev are distinct worlds.  Keep the preserved stable fixture
+    # in its own DB/registry custody so it cannot become a same-backlog Direct
+    # lineage candidate while this test exercises the dev bootstrap.
+    stable_conn = sqlite3.connect(tmp_path / "stable-preserved.db")
+    stable_conn.row_factory = sqlite3.Row
+    conn.backup(stable_conn)
     stable_task_id = "cex-direct-main-stable-preserved"
     stable_record = {
         "project_id": project_id,
@@ -197696,7 +200568,7 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
             }
         },
     }
-    conn.execute(
+    stable_conn.execute(
         """
         INSERT INTO contract_runtime_executions (
             contract_execution_id, project_id, backlog_id, contract_id,
@@ -197724,26 +200596,26 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
         target_files=["agent/stable_preserved.py"],
     )
     observer_route_context.persist_route_token_ref(
-        conn,
+        stable_conn,
         project_id=project_id,
         route_token_ref=stable_issued["route_token_ref"],
         token=stable_issued["route_token"],
     )
     stable_contract_before = tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM contract_runtime_executions WHERE project_id=? "
             "ORDER BY contract_execution_id",
             (project_id,),
         ).fetchall()
     )
     stable_route_before = tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
             (stable_issued["route_token_ref"],),
         ).fetchall()
     )
     stable_projection_before = tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM backlog_contract_chain_current WHERE project_id=? "
             "ORDER BY backlog_id",
             (project_id,),
@@ -197812,27 +200684,22 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
         task_id,
         "active",
     )
-    assert conn.execute(
-        "SELECT 1 FROM observer_route_token_refs "
-        "WHERE project_id=? AND route_token_ref=?",
-        (project_id, route_ref),
-    ).fetchone() is None
     assert first["route_token"]["scope"]["project_id"] == project_id
     assert tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM contract_runtime_executions WHERE project_id=? "
             "ORDER BY contract_execution_id",
             (project_id,),
         ).fetchall()
     ) == stable_contract_before
     assert tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
             (stable_issued["route_token_ref"],),
         ).fetchall()
     ) == stable_route_before
     assert tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM backlog_contract_chain_current WHERE project_id=? "
             "ORDER BY backlog_id",
             (project_id,),
@@ -197904,8 +200771,8 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
     )
     assert dev_gate["decision"] == "route_token_ref_resolved"
 
-    # Frozen a258 and a promoted/new stable default both select the canonical
-    # physical project id.  They must not resolve or authorize the dev ref.
+    # Stable owns a separate registry custody.  It must not resolve or
+    # authorize a ref materialized only in the dev fixture DB.
     with monkeypatch.context() as stable_runtime:
         stable_runtime.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
         frozen_routes = _load_frozen_a258_module(
@@ -197916,9 +200783,9 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
             "agent/governance/mf_subagent_contract.py",
             "mf_subagent_contract",
         )
-        stable_before = tuple(conn.iterdump())
+        stable_before = tuple(stable_conn.iterdump())
         assert frozen_routes.resolve_route_token_ref(
-            conn,
+            stable_conn,
             project_id=project_id,
             route_token_ref=route_ref,
             backlog_id=backlog_id,
@@ -197934,25 +200801,31 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
                 require_server_binding=True,
                 server_binding=None,
             )
-        assert server._resolve_route_token_ref_server_side(
-            {"route_token_ref": route_ref},
-            pid=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-        ) is None
-        with pytest.raises(GovernanceError, match="route_token"):
-            server._require_route_token_mutation_gate(
-                _ctx(
-                    {"project_id": project_id},
-                    method="POST",
-                    body={"route_token_ref": route_ref},
-                ),
-                action="task_timeline_append",
-                project_id=project_id,
-                backlog_id=backlog_id,
-                task_id=task_id,
+        with monkeypatch.context() as stable_storage:
+            stable_storage.setattr(
+                server, "get_connection", lambda _project_id: _NoCloseConn(stable_conn)
             )
-        assert tuple(conn.iterdump()) == stable_before
+            with pytest.raises(ValueError, match="stable world cannot persist AC"):
+                server._resolve_route_token_ref_server_side(
+                    {"route_token_ref": route_ref},
+                    pid=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                )
+            with pytest.raises(ValueError, match="stable world cannot persist AC"):
+                server._require_route_token_mutation_gate(
+                    _ctx(
+                        {"project_id": project_id},
+                        method="POST",
+                        body={"route_token_ref": route_ref},
+                    ),
+                    action="task_timeline_append",
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                )
+    assert tuple(stable_conn.iterdump()) == stable_before
+    stable_conn.close()
 
 
 def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
@@ -197973,6 +200846,9 @@ def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
         project_id,
         prepared["world"]["namespace_hash"],
     )
+    wrong_conn = sqlite3.connect(tmp_path / "other-dev-world.db")
+    wrong_conn.row_factory = sqlite3.Row
+    conn.backup(wrong_conn)
     fixed_now = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
     issued = observer_route_context.issue_observer_write_route_context(
         project_id=project_id,
@@ -197991,43 +200867,38 @@ def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
         route_token_ref=old_ref,
         token=issued["route_token"],
     )
-    stable_before = tuple(
-        conn.execute(
-            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
-            (project_id,),
-        ).fetchall()
-    )
-    wrong_storage_project_id = server.direct_main_dev_storage_project_id(
-        project_id,
-        "sha256:" + ("f" * 64),
-    )
-    wrong_namespace_before = tuple(conn.iterdump())
+    # The worlds are physically isolated DBs, not project-id namespaces in one
+    # DB.  Exercise the same public ref against an independent dev custody.
+    wrong_namespace_before = tuple(wrong_conn.iterdump())
     assert observer_route_context.resolve_route_token_ref(
-        conn,
+        wrong_conn,
         project_id=project_id,
-        storage_project_id=wrong_storage_project_id,
+        storage_project_id=project_id,
         route_token_ref=old_ref,
+        now=fixed_now,
     ) is None
     with pytest.raises(
         observer_route_context.RouteTokenRefError,
         match="unknown; renewal refused",
     ):
         observer_route_context.renew_route_token_ref(
-            conn,
+            wrong_conn,
             project_id=project_id,
-            storage_project_id=wrong_storage_project_id,
+            storage_project_id=project_id,
             route_token_ref=old_ref,
             backlog_id=backlog_id,
             task_id=task_id,
             now=fixed_now + timedelta(minutes=50),
         )
-    assert tuple(conn.iterdump()) == wrong_namespace_before
+    assert tuple(wrong_conn.iterdump()) == wrong_namespace_before
+    wrong_conn.close()
 
     assert observer_route_context.resolve_route_token_ref(
         conn,
         project_id=project_id,
         route_token_ref=old_ref,
-    ) is None
+        now=fixed_now,
+    )["route_token_ref"] == old_ref
     resolved = observer_route_context.resolve_route_token_ref(
         conn,
         project_id=project_id,
@@ -198103,12 +200974,6 @@ def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
         "WHERE project_id=? AND route_token_ref=?",
         (storage_project_id, new_ref),
     ).fetchone()["status"] == "superseded"
-    assert tuple(
-        conn.execute(
-            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
-            (project_id,),
-        ).fetchall()
-    ) == stable_before
 
 
 def test_ac_dev_route_consumers_reject_malformed_physical_scope_zero_write(
@@ -205692,3 +208557,351 @@ def test_executor_session_auth_guards_real_claim_progress_complete_zero_write(
         (task["task_id"],),
     ).fetchone()
     assert tuple(row) == ("executor-worker", "succeeded")
+
+
+def _dev_readiness_predecessor(conn):
+    conn.execute("DROP INDEX idx_pending_scope_branch")
+    conn.execute("DROP INDEX idx_pending_scope_status")
+    conn.commit()
+
+
+def _sqlite_inventory(conn):
+    return conn.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "WHERE type IN ('table','index','trigger','view') "
+        "ORDER BY type,name,tbl_name"
+    ).fetchall()
+
+
+def test_dev_graph_readiness_gets_are_zero_write_for_exact_predecessor(
+    conn, monkeypatch,
+):
+    _dev_readiness_predecessor(conn)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_require_graph_governance_operator", lambda *_args, **_kwargs: {},
+    )
+    before_inventory = _sqlite_inventory(conn)
+    before_changes = conn.total_changes
+
+    status = server.handle_graph_governance_status(
+        _ctx({"project_id": "aming-claw"})
+    )
+    queue = server.handle_graph_governance_operations_queue(
+        _ctx({"project_id": "aming-claw"})
+    )
+
+    expected_states = {
+        "graph_snapshot_store": "pending_scope_index_predecessor",
+        "graph_events": "absent",
+        "graph_correction_patches": "absent",
+        "asset_projection": "exact",
+        "asset_impact": "exact",
+    }
+    for result in (status, queue):
+        assert result["ok"] is True
+        assert result["materialization_required"] is True
+        assert result["owner_states"] == expected_states
+        assert set(result["planned_objects"]) == {
+            "idx_pending_scope_branch",
+            "idx_pending_scope_status",
+        }
+        assert result["graph_row_counts"] == {
+            "graph_snapshot_refs": 0,
+            "graph_snapshots": 0,
+            "pending_scope_reconcile": 0,
+            "reconcile_run_metrics": 0,
+            "graph_nodes_index": 0,
+            "graph_edges_index": 0,
+        }
+        assert result["writes_performed"] is False
+    assert status["active_snapshot_id"] == ""
+    assert queue["operations"] == []
+    assert conn.total_changes == before_changes
+    assert _sqlite_inventory(conn) == before_inventory
+
+
+def test_dev_graph_readiness_rejects_unknown_partial_without_write(
+    conn, monkeypatch,
+):
+    _dev_readiness_predecessor(conn)
+    conn.execute("CREATE TABLE graph_unknown_authority(id TEXT)")
+    conn.commit()
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    before_inventory = _sqlite_inventory(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_status(
+            _ctx({"project_id": "aming-claw"})
+        )
+
+    assert rejected.value.code == "ac_dev_graph_readiness_preimage_incompatible"
+    assert rejected.value.status == 409
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert _sqlite_inventory(conn) == before_inventory
+
+
+def test_dev_graph_readiness_rejects_materialized_rows_without_write(
+    conn, monkeypatch,
+):
+    _dev_readiness_predecessor(conn)
+    conn.execute(
+        "INSERT INTO graph_nodes_index(project_id,snapshot_id,node_id) "
+        "VALUES('aming-claw','candidate','node')"
+    )
+    conn.commit()
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_status(
+            _ctx({"project_id": "aming-claw"})
+        )
+
+    assert rejected.value.code == "ac_dev_graph_readiness_preimage_incompatible"
+    assert rejected.value.status == 409
+    assert rejected.value.details["graph_row_counts"]["graph_nodes_index"] == 1
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+
+
+def test_dev_graph_readiness_becomes_normal_after_authorized_admission(
+    conn, monkeypatch,
+):
+    _dev_readiness_predecessor(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        governance_db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    assert server._dev_graph_zero_write_readiness_projection(
+        conn, project_id="aming-claw",
+    )["materialization_required"] is True
+
+    governance_db.admit_ac_dev_graph_materialization_schema(
+        conn, project_id="aming-claw",
+    )
+
+    assert server._dev_graph_zero_write_readiness_projection(
+        conn, project_id="aming-claw",
+    ) is None
+    normal = server.handle_graph_governance_status(
+        _ctx({"project_id": "aming-claw"})
+    )
+    assert normal["ok"] is True
+    assert normal["active_snapshot_id"] == ""
+    assert "materialization_required" not in normal
+
+
+def test_dev_onboard_requires_explicit_backlog_before_db_or_queue(
+    monkeypatch,
+):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    for name in (
+        "DBContext",
+        "_contract_runtime_require_canonical_authority_registry_complete",
+        "_release_operator_head_queue_view",
+    ):
+        monkeypatch.setattr(
+            server,
+            name,
+            lambda *_args, _name=name, **_kwargs: pytest.fail(
+                f"no-backlog dev guide reached {_name}"
+            ),
+        )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": "aming-claw"},
+                method="POST",
+                body={"role": "observer", "work_type": "operator_supervised_direct_main"},
+            )
+        )
+
+    assert rejected.value.code == "explicit_backlog_required"
+    assert rejected.value.status == 409
+    assert rejected.value.details["writes_performed"] is False
+
+
+def test_dev_explicit_backlog_guide_skips_release_queue_schema(
+    conn, monkeypatch,
+):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_ac_promotion_successor_activation_preguard", lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        server, "_contract_runtime_require_canonical_authority_registry_complete",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        server, "_require_onboard_route_guide_work_type", lambda _value: None,
+    )
+    monkeypatch.setattr(
+        server, "_require_onboard_dev_selector_endpoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        server, "_require_onboard_route_guide_backlog_exists",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime, "get_active_integration_epoch", lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        server, "_onboard_route_guide_service_response",
+        lambda *_args, **_kwargs: {"ok": True, "selected": "explicit"},
+    )
+    before = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'release_operator_head_queue%'"
+    ).fetchall()
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": "AC-EXPLICIT-ROW",
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+            },
+        )
+    )
+
+    assert result == {"ok": True, "selected": "explicit"}
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'release_operator_head_queue%'"
+    ).fetchall() == before == []
+
+
+def test_dev_release_queue_is_capability_only_and_post_is_rejected(monkeypatch):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "DBContext", lambda *_args, **_kwargs: pytest.fail("queue opened DB"),
+    )
+    read = server.handle_project_release_operator_head_queue(
+        _ctx({"project_id": "aming-claw"})
+    )
+    assert read["release_operator_head_queue"]["state"] == (
+        "not_available_in_dev_world"
+    )
+    assert read["release_operator_head_queue"]["schema_materialized"] is False
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": "aming-claw"},
+                method="POST",
+                body={"action": "insert", "backlog_id": "AC-NO-QUEUE"},
+            )
+        )
+    assert rejected.value.code == (
+        "release_operator_head_queue_not_available_in_dev_world"
+    )
+    assert rejected.value.details["writes_performed"] is False
+
+
+def _version_git_repo(root: Path) -> str:
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "codex/ac-dev"], cwd=root,
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=root, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "AC Test"], cwd=root, check=True,
+    )
+    (root / "tracked.txt").write_text("exact\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "exact"], cwd=root,
+        check=True, capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_dev_exact_self_root_version_uses_full_live_head_without_seed(
+    conn, monkeypatch, tmp_path,
+):
+    root = tmp_path / "dev-source"
+    head = _version_git_repo(root)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(server, "_dev_exact_source_root", lambda: root.resolve())
+    monkeypatch.setattr(server, "get_server_version", lambda: head)
+    monkeypatch.setattr(
+        server, "get_governance_runtime_version", lambda default="": head,
+    )
+    before = conn.execute(
+        "SELECT COUNT(*) FROM project_version WHERE project_id='aming-claw'"
+    ).fetchone()[0]
+
+    result = server.handle_version_check(
+        _ctx(
+            {"project_id": "aming-claw"},
+            body={"project_root": str(root)},
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["head"] == head
+    assert result["chain_version"] == head
+    assert result["source"] == "server_derived_dev_git_head"
+    assert result["server_derived_dev_head_authority"] is True
+    assert result["project_version_row_required"] is False
+    assert "legacy advisory" in result["message"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM project_version WHERE project_id='aming-claw'"
+    ).fetchone()[0] == before == 0
+
+
+def test_version_special_authority_is_not_granted_to_stable_or_foreign_root(
+    conn, monkeypatch, tmp_path,
+):
+    exact = tmp_path / "exact-dev"
+    foreign = tmp_path / "foreign"
+    _version_git_repo(exact)
+    _version_git_repo(foreign)
+    monkeypatch.setattr(server, "_dev_exact_source_root", lambda: exact.resolve())
+
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    stable = server.handle_version_check(
+        _ctx(
+            {"project_id": "aming-claw"},
+            body={"project_root": str(exact)},
+        )
+    )
+    assert stable["server_derived_dev_head_authority"] is False
+
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    foreign_result = server.handle_version_check(
+        _ctx(
+            {"project_id": "aming-claw"},
+            body={"project_root": str(foreign)},
+        )
+    )
+    assert foreign_result["server_derived_dev_head_authority"] is False

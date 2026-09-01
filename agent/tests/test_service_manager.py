@@ -21,6 +21,7 @@ from service_manager import (  # noqa: E402
     ServiceManager,
     get_manager,
     _install_signal_handlers,
+    _plane_bound_manager_identity,
     _world_bound_governance_url,
 )
 
@@ -54,7 +55,7 @@ class TestStartStop(unittest.TestCase):
     def setUp(self):
         self.mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo", "hello"],
         )
 
@@ -136,7 +137,7 @@ class TestStatus(unittest.TestCase):
     def _make_mgr(self, active=0, queued=0):
         mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo"],
         )
         mgr._get_task_counts = MagicMock(return_value=(active, queued))
@@ -208,7 +209,7 @@ class TestReload(unittest.TestCase):
         """
         mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo"],
             reload_timeout=10,
             poll_interval=0.05,
@@ -259,7 +260,7 @@ class TestReload(unittest.TestCase):
 
         mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo"],
             reload_timeout=1,       # very short timeout
             poll_interval=0.05,
@@ -333,7 +334,7 @@ class TestGetTaskCounts(unittest.TestCase):
     def _mgr(self):
         return ServiceManager(
             project_id="proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo"],
         )
 
@@ -404,7 +405,7 @@ class TestHostDefaults(unittest.TestCase):
         import service_manager as sm
         cmd = sm._default_executor_cmd(
             "aming-claw",
-            "http://localhost:40000",
+            "http://127.0.0.1:40000",
             "C:/workspace/aming_claw",
         )
         self.assertEqual(
@@ -415,7 +416,7 @@ class TestHostDefaults(unittest.TestCase):
                 "--project",
                 "aming-claw",
                 "--url",
-                "http://localhost:40000",
+                "http://127.0.0.1:40000",
                 "--workspace",
                 "C:/workspace/aming_claw",
             ],
@@ -425,7 +426,7 @@ class TestHostDefaults(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "GOVERNANCE_URL": "http://localhost:40000",
+                "GOVERNANCE_URL": "http://127.0.0.1:40000",
                 "PROJECT_ID": "runtime-project",
                 "CODEX_WORKSPACE": "C:/runtime/workspace",
             },
@@ -433,8 +434,8 @@ class TestHostDefaults(unittest.TestCase):
         ):
             mgr = ServiceManager()
         self.assertEqual(mgr.project_id, "runtime-project")
-        self.assertEqual(mgr.governance_url, "http://localhost:40000")
-        self.assertEqual(mgr.workspace, "C:/runtime/workspace")
+        self.assertEqual(mgr.governance_url, "http://127.0.0.1:40000")
+        self.assertEqual(mgr.workspace, "")
         self.assertEqual(
             mgr._executor_cmd,
             [
@@ -443,9 +444,9 @@ class TestHostDefaults(unittest.TestCase):
                 "--project",
                 "runtime-project",
                 "--url",
-                "http://localhost:40000",
+                "http://127.0.0.1:40000",
                 "--workspace",
-                "C:/runtime/workspace",
+                "",
             ],
         )
 
@@ -467,7 +468,7 @@ class TestCheckRestartSignal(unittest.TestCase):
 
         self.mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo", "hello"],
         )
 
@@ -477,7 +478,7 @@ class TestCheckRestartSignal(unittest.TestCase):
 
     def _patch_signal_path(self):
         """Return a patch that makes _signal_file_path() return our temp path."""
-        return patch("service_manager._signal_file_path", return_value=self.signal_file)
+        return patch("service_manager._identity_signal_file_path", return_value=self.signal_file)
 
     @patch("service_manager.subprocess.Popen")
     def test_restart_signal_stops_and_starts_executor(self, mock_popen):
@@ -655,6 +656,45 @@ def test_ac_service_manager_is_world_bound_to_dev_40008(monkeypatch, tmp_path):
         _world_bound_governance_url("content-sys", "http://127.0.0.1:40008")
 
 
+@pytest.mark.parametrize("project_id", ["", " aming-claw", "aming-claw ", "amingClaw", "aming_claw"])
+def test_manager_plane_identity_rejects_raw_noncanonical_project_ids(project_id):
+    with pytest.raises(ValueError):
+        _world_bound_governance_url(project_id, "")
+    with pytest.raises(ValueError):
+        _plane_bound_manager_identity(project_id, "")
+    with pytest.raises(ValueError):
+        ServiceManager(project_id=project_id, executor_cmd=["must-not-spawn"])
+
+
+def test_manager_identity_keeps_ac_dev_sidecar_and_storage_disjoint(monkeypatch, tmp_path):
+    dev_root = tmp_path / "dev-world"
+    (dev_root / "runtime").mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
+    dev = _plane_bound_manager_identity("aming-claw", "http://127.0.0.1:40008")
+    stable = _plane_bound_manager_identity("proj", "http://127.0.0.1:40000")
+    assert (dev["plane"], dev["sidecar_port"], dev["storage_root"]) == ("dev", 40109, str((dev_root / "runtime").absolute()))
+    assert (stable["plane"], stable["sidecar_port"]) == ("stable", 40101)
+    assert dev["storage_root"] != stable["storage_root"]
+
+
+@pytest.mark.parametrize(
+    ("project_id", "governance_url"),
+    [(" aming-claw", "http://127.0.0.1:40008"), ("proj", "http://127.0.0.1:40008")],
+)
+def test_main_rejects_before_log_path_or_manager_effects(monkeypatch, project_id, governance_url):
+    import service_manager as sm
+
+    monkeypatch.setattr(
+        sys, "argv", ["service_manager.py", "--project", project_id,
+                        "--governance-url", governance_url, "--status-only"],
+    )
+    log_path = MagicMock()
+    monkeypatch.setattr(sm, "_identity_log_dir", log_path)
+    with pytest.raises(ValueError):
+        sm.main()
+    log_path.assert_not_called()
+
+
 def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
     monkeypatch,
     tmp_path,
@@ -662,9 +702,10 @@ def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
     import service_manager as sm
 
     token = "gov-service-manager-worker-token"
-    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    dev_root = tmp_path / "dev-world"
+    (dev_root / "runtime").mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
     monkeypatch.setenv("AMING_EXECUTOR_SESSION_TOKEN", token)
-    monkeypatch.setattr(sm, "_shared_log_dir", lambda _project="": tmp_path / "logs")
 
     response = MagicMock()
     response.raise_for_status.return_value = None
@@ -682,6 +723,7 @@ def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
     manager = ServiceManager(
         project_id="aming-claw",
         governance_url="http://127.0.0.1:40008",
+        workspace=str(tmp_path),
     )
     assert manager.start() is True
     call = popen.call_args
@@ -697,13 +739,14 @@ def test_managed_service_manager_rejects_missing_invalid_or_wrong_project_token(
 ):
     import service_manager as sm
 
-    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
-    monkeypatch.setattr(sm, "_shared_log_dir", lambda _project="": tmp_path / "logs")
+    dev_root = tmp_path / "dev-world"
+    (dev_root / "runtime").mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
     popen = MagicMock()
     monkeypatch.setattr(sm.subprocess, "Popen", popen)
 
     monkeypatch.delenv("AMING_EXECUTOR_SESSION_TOKEN", raising=False)
-    missing = ServiceManager(project_id="aming-claw")
+    missing = ServiceManager(project_id="aming-claw", workspace=str(tmp_path))
     with pytest.raises(RuntimeError, match="session credential"):
         missing.start()
     popen.assert_not_called()
@@ -717,7 +760,7 @@ def test_managed_service_manager_rejects_missing_invalid_or_wrong_project_token(
         response.raise_for_status.return_value = None
         response.json.return_value = payload
         monkeypatch.setattr(sm.requests, "get", MagicMock(return_value=response))
-        manager = ServiceManager(project_id="aming-claw")
+        manager = ServiceManager(project_id="aming-claw", workspace=str(tmp_path))
         with pytest.raises(RuntimeError, match="session credential"):
             manager.start()
     popen.assert_not_called()

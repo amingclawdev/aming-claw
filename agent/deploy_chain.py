@@ -17,14 +17,20 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
+_STABLE_GOVERNANCE_URL = "http://127.0.0.1:40000"
+_STABLE_MANAGER_URL = "http://localhost:40101"
+_AC_DEV_GOVERNANCE_URL = "http://127.0.0.1:40008"
+_AC_DEV_MANAGER_URL = "http://127.0.0.1:40109"
 
 # ---------------------------------------------------------------------------
 # Path bootstrap so we can import utils regardless of CWD
@@ -34,6 +40,7 @@ if str(_agent_dir) not in sys.path:
     sys.path.insert(0, str(_agent_dir))
 
 from utils import save_json, tasks_root, utc_iso  # noqa: E402
+from runtime_plane import resolve_runtime_plane  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -46,15 +53,28 @@ def _state_dir() -> Path:
     return d
 
 
+def _plane_bound_endpoints(project_id: str) -> tuple[str, str]:
+    """Return the governance and manager endpoints for one project plane.
+
+    AC is the only dev-world project.  It must never fall through to the
+    stable manager sidecar, because that sidecar has different DB and process
+    custody.
+    """
+    plane = resolve_runtime_plane(project_id)
+    return plane.governance_url, plane.manager_url
+
+
 def _matches_any(path: str, patterns: list[str]) -> bool:
     """Return True if *path* matches at least one glob pattern."""
     normalized = path.replace("\\", "/")
     return any(fnmatch.fnmatch(normalized, p) for p in patterns)
 
 
-def _executor_health_from_state() -> bool:
+def _executor_health_from_state(project_id: str) -> bool:
     """Fallback executor health check when the HTTP status port is unavailable."""
     try:
+        if resolve_runtime_plane(project_id).name == "dev":
+            return False
         status_path = _state_dir() / "manager_status.json"
         if not status_path.exists():
             return False
@@ -136,13 +156,25 @@ def detect_affected_services(changed_files: list[str], project_id: str = "") -> 
 # 2. restart_executor
 # ---------------------------------------------------------------------------
 
-def restart_executor() -> bool:
+def restart_executor(project_id: str) -> bool:
     """Write state/manager_signal.json with action='restart'.
 
     Returns True on success, False if an exception occurred.
     """
+    from agent.manager_http_server import _canonical_storage_root, plane_bound_manager_identity
+
+    plane = resolve_runtime_plane(project_id)
+    root = _canonical_storage_root(plane.name)
+    identity = plane_bound_manager_identity(
+        project_id, plane.governance_url, str(root),
+    )
+    signal_path = (
+        Path(identity["storage_root"]) / "manager_signal.json"
+        if identity["plane"] == "dev"
+        else Path(identity["storage_root"]) / "codex-tasks" / "state" / "manager_signal.json"
+    )
     try:
-        signal_path = _state_dir() / "manager_signal.json"
+        signal_path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
             "action": "restart",
             "requested_at": utc_iso(),
@@ -172,16 +204,30 @@ def _is_host_runtime_mode() -> bool:
     return not compose_file.exists()
 
 
-def rebuild_governance() -> tuple[bool, str]:
+def rebuild_governance(project_id: str) -> tuple[bool, str]:
     """Rebuild + restart governance Docker container, then health-check.
 
     Uses docker compose build + up directly (Windows-compatible).
     In host-runtime mode (no Docker), falls directly to restart_local_governance.
     Returns (success, output_summary).
     """
+    plane = resolve_runtime_plane(project_id)
+    governance_url = plane.governance_url
+    governance_port = urlparse(governance_url).port
+    # Docker compose owns only the stable world.  AC's dev listener is host
+    # managed and must not be rebuilt through the stable compose project.
+    if str(project_id or "").strip() == "aming-claw" and not _is_host_runtime_mode():
+        return False, "AC dev governance cannot be rebuilt through stable Docker"
+    if str(project_id or "").strip() == "aming-claw":
+        try:
+            from agent.governance.db import _verified_stable_binding
+            _verified_stable_binding()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return False, "AC dev stable authority is invalid: " + str(exc)
+
     # R4: detect host-runtime mode and skip Docker
     if _is_host_runtime_mode():
-        return restart_local_governance(port=40000)
+        return restart_local_governance(port=governance_port or 40000)
 
     repo_root = Path(__file__).resolve().parent.parent
     compose_file = repo_root / "docker-compose.governance.yml"
@@ -230,7 +276,7 @@ def rebuild_governance() -> tuple[bool, str]:
             if attempt > 0:
                 _time.sleep(5)
             try:
-                resp = requests.get("http://localhost:40000/api/health", timeout=10)
+                resp = requests.get(f"{governance_url}/api/health", timeout=10)
                 if resp.status_code == 200:
                     output_lines.append("[health] governance OK")
                     return True, "\n".join(output_lines)
@@ -291,6 +337,11 @@ def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
     - R5: stderr log content included in failure summary
     - R6: log.warning on restart failure
     """
+    # This legacy background launcher has no canonical stable-volume binding
+    # and therefore cannot mint the required foreground AC dev receipt.
+    # AC must enter through ``aming-claw start --runtime-plane dev``.
+    if port == 40008:
+        return False, "AC dev restart requires the canonical foreground CLI launcher"
     import tempfile
     import time as _time
     output_lines: list[str] = []
@@ -444,12 +495,15 @@ def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
 # 4. restart_gateway
 # ---------------------------------------------------------------------------
 
-def restart_gateway() -> tuple[bool, str]:
+def restart_gateway(project_id: str) -> tuple[bool, str]:
     """Rebuild + restart telegram-gateway Docker container, then verify via logs.
 
     Uses build + up (not just restart) to ensure latest code is deployed.
     Returns (success, output_summary).
     """
+    _plane_bound_endpoints(project_id)
+    if project_id == "aming-claw":
+        return False, "AC dev gateway cannot use stable Docker"
     compose_file = (
         Path(__file__).resolve().parent.parent / "docker-compose.governance.yml"
     )
@@ -531,7 +585,7 @@ def restart_gateway() -> tuple[bool, str]:
 # 5. smoke_test
 # ---------------------------------------------------------------------------
 
-def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
+def smoke_test(affected_services: list[str] | None, project_id: str) -> dict[str, Any]:
     """Quick health check for executor, governance, and gateway.
 
     Parameters
@@ -553,6 +607,7 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
     all_services = ["executor", "governance", "gateway"]
     results: dict[str, Any] = {svc: False for svc in all_services}
     results["all_pass"] = False
+    governance_url, _manager_url = _plane_bound_endpoints(project_id)
 
     import time as _time
     _time.sleep(5)  # Brief pause to let services stabilize after restarts
@@ -567,16 +622,16 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
     if results["executor"] != "not_applicable":
         try:
             import requests
-            resp = requests.get("http://localhost:40100/status", timeout=5)
+            resp = requests.get(f"{resolve_runtime_plane(project_id).executor_url}/status", timeout=5)
             results["executor"] = resp.status_code == 200
         except Exception:  # noqa: BLE001
-            results["executor"] = _executor_health_from_state()
+            results["executor"] = _executor_health_from_state(project_id)
 
     # --- governance ---
     if results["governance"] != "not_applicable":
         try:
             import requests
-            resp = requests.get("http://localhost:40000/api/health", timeout=5)
+            resp = requests.get(f"{governance_url}/api/health", timeout=5)
             results["governance"] = resp.status_code == 200
         except Exception:  # noqa: BLE001
             results["governance"] = False
@@ -603,7 +658,7 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
 # 6. run_deploy
 # ---------------------------------------------------------------------------
 
-def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
+def _post_redeploy(target: str, project_id: str, task_id: str = "", expected_head: str = "",
                    drain_grace_seconds: int = 5) -> dict[str, Any]:
     """POST to the governance redeploy endpoint for a target service.
 
@@ -612,7 +667,8 @@ def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
     import urllib.request
     import urllib.error
 
-    url = f"http://localhost:40000/api/governance/redeploy/{target}"
+    governance_url, _manager_url = _plane_bound_endpoints(project_id)
+    url = f"{governance_url}/api/governance/redeploy/{target}"
     payload = json.dumps({
         "task_id": task_id,
         "expected_head": expected_head,
@@ -637,13 +693,16 @@ def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
         return {"ok": False, "error": str(exc)}
 
 
-def _post_manager_redeploy_governance(task_id: str = "", expected_head: str = "",
+def _post_manager_redeploy_governance(project_id: str, task_id: str = "", expected_head: str = "",
                                       drain_grace_seconds: int = 5) -> dict[str, Any]:
     """POST to /api/manager/redeploy/governance (PR-1 service_manager endpoint)."""
     import urllib.request
     import urllib.error
 
-    url = "http://localhost:40101/api/manager/redeploy/governance"
+    # Stable sidecar remains localhost:40101; AC selects its separate :40109
+    # sidecar through the project-plane resolver.
+    _governance_url, manager_url = _plane_bound_endpoints(project_id)
+    url = f"{manager_url}/api/manager/redeploy/governance"
     # observer-hotfix: manager_http_server reads body.get("chain_version") not "expected_head".
     # Send both names for compat; manager picks chain_version, future PR3 can rename.
     payload = json.dumps({
@@ -671,7 +730,7 @@ def _post_manager_redeploy_governance(task_id: str = "", expected_head: str = ""
         return {"ok": False, "error": str(exc)}
 
 
-def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
+def run_deploy(changed_files: list[str], project_id: str, chat_id: int = 0,
                skip_services: list[str] = None,
                task_id: str = "", expected_head: str = "") -> dict[str, Any]:
     """Full deploy orchestration with double-write (legacy + redeploy).
@@ -689,6 +748,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
 
     Returns a full report dict.
     """
+    _plane_bound_endpoints(project_id)
     started_at = utc_iso()
     report: dict[str, Any] = {
         "started_at": started_at,
@@ -736,12 +796,12 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
 
         # R7: Event-driven governance restart — executor orchestrates 3 POSTs
         if "governance" in affected:
-            _pid = project_id or "aming-claw"
+            _pid = project_id
             _cv = expected_head or ""
             _hdr = {"Content-Type": "application/json"}
             _payload = json.dumps({"task_id": task_id, "chain_version": _cv}).encode()
-            gov_url = f"http://localhost:40000/api/governance/redeploy-after-merge/{_pid}"
-            sm_url = "http://localhost:40101"
+            plane_governance_url, sm_url = _plane_bound_endpoints(_pid)
+            gov_url = f"{plane_governance_url}/api/governance/redeploy-after-merge/{_pid}"
             ok = True
             summary_parts: list[str] = []
             for label, url in [("gov-ack", gov_url),
@@ -765,7 +825,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         if "executor" in affected:
             # [redeploy] POST to redeploy endpoint
             redeploy_result = _post_redeploy(
-                "executor", task_id=task_id,
+                "executor", project_id=project_id, task_id=task_id,
                 expected_head=expected_head,
             )
             log.info("[redeploy] executor: %s", redeploy_result)
@@ -795,13 +855,13 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         if "gateway" in affected:
             # [redeploy] POST to redeploy endpoint
             redeploy_result = _post_redeploy(
-                "gateway", task_id=task_id,
+                "gateway", project_id=project_id, task_id=task_id,
                 expected_head=expected_head,
             )
             log.info("[redeploy] gateway: %s", redeploy_result)
 
             # [legacy] existing restart path
-            ok, summary = restart_gateway()
+            ok, summary = restart_gateway(project_id)
             log.info("[legacy] gateway: success=%s", ok)
 
             steps["gateway"] = {
@@ -814,7 +874,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         # R9: For service_manager, governance performs restart via redeploy endpoint
         if "service_manager" in affected:
             redeploy_result = _post_redeploy(
-                "service_manager", task_id=task_id,
+                "service_manager", project_id=project_id, task_id=task_id,
                 expected_head=expected_head,
             )
             log.info("[redeploy] service_manager: %s", redeploy_result)
@@ -826,7 +886,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         report["steps"] = steps
 
         # 3. Smoke test — only check affected services (R5)
-        smoke = smoke_test(affected_services=affected)
+        smoke = smoke_test(affected_services=affected, project_id=project_id)
         report["smoke_test"] = smoke
 
         # R2: Single derivation — success = all steps OK AND smoke_test.all_pass
@@ -859,7 +919,8 @@ def _mark_task_succeeded_pre_kill(task_id: str, project_id: str) -> None:
     import urllib.request
     import urllib.error
 
-    url = f"http://localhost:40000/api/task/{project_id or 'aming-claw'}/complete"
+    governance_url, _manager_url = _plane_bound_endpoints(project_id)
+    url = f"{governance_url}/api/task/{project_id}/complete"
     payload = json.dumps({
         "task_id": task_id,
         "status": "succeeded",

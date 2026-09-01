@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import textwrap
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -23,6 +24,77 @@ def test_port_40101_present_in_deploy_chain():
     src = Path(__file__).resolve().parent.parent / "deploy_chain.py"
     text = src.read_text(encoding="utf-8")
     assert "localhost:40101" in text, "Expected localhost:40101 in deploy_chain.py"
+
+
+def test_plane_bound_endpoint_selection_keeps_ac_off_stable_sidecar():
+    from agent.deploy_chain import _plane_bound_endpoints
+
+    assert _plane_bound_endpoints("proj") == (
+        "http://127.0.0.1:40000", "http://127.0.0.1:40101"
+    )
+    assert _plane_bound_endpoints("aming-claw") == (
+        "http://127.0.0.1:40008", "http://127.0.0.1:40109"
+    )
+
+
+def test_smoke_test_uses_ac_dev_health_not_healthy_stable(monkeypatch):
+    import agent.deploy_chain as deploy
+
+    class Response:
+        status_code = 200
+
+    called = []
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(deploy, "_executor_health_from_state", lambda: True)
+    monkeypatch.setitem(__import__("sys").modules, "requests", type("Requests", (), {
+        "get": staticmethod(lambda url, timeout: called.append(url) or Response())
+    }))
+    result = deploy.smoke_test(["governance"], project_id="aming-claw")
+    assert result["governance"] is True
+    assert called == ["http://127.0.0.1:40008/api/health"]
+
+
+def test_ac_rebuild_refuses_stable_docker_path(monkeypatch):
+    import agent.deploy_chain as deploy
+
+    monkeypatch.setattr(deploy, "_is_host_runtime_mode", lambda: False)
+    ok, detail = deploy.rebuild_governance(project_id="aming-claw")
+    assert ok is False
+    assert "stable Docker" in detail
+
+
+def test_noncanonical_ac_project_fails_closed_instead_of_selecting_stable():
+    from agent.deploy_chain import _plane_bound_endpoints
+
+    with pytest.raises(ValueError, match="exact canonical"):
+        _plane_bound_endpoints("aming_claw")
+
+
+@pytest.mark.parametrize("project_id", ["", " ", " aming-claw", "aming-claw ", "amingClaw", "aming_claw"])
+def test_invalid_project_id_is_rejected_before_deploy_effects(monkeypatch, project_id):
+    import agent.deploy_chain as deploy
+
+    touched = []
+    monkeypatch.setattr(deploy, "detect_affected_services", lambda *_args, **_kwargs: touched.append("detect"))
+    monkeypatch.setattr(deploy, "_save_report", lambda *_args, **_kwargs: touched.append("write"))
+    with pytest.raises(ValueError):
+        deploy.run_deploy(["agent/governance/server.py"], project_id=project_id)
+    assert touched == []
+
+
+def test_exact_ac_and_non_ac_ids_select_only_their_own_plane():
+    from agent.deploy_chain import _plane_bound_endpoints
+
+    assert _plane_bound_endpoints("proj")[0].endswith(":40000")
+    assert _plane_bound_endpoints("aming-claw")[0].endswith(":40008")
+
+
+def test_ac_restart_requires_dev_storage_before_writing(monkeypatch):
+    import agent.deploy_chain as deploy
+
+    monkeypatch.delenv("AMING_CLAW_DEV_STORAGE_ROOT", raising=False)
+    with pytest.raises(RuntimeError, match="explicit AMING_CLAW_DEV_STORAGE_ROOT"):
+        deploy.restart_executor("aming-claw")
 
 
 def test_port_40200_absent_in_deploy_chain():
@@ -69,6 +141,7 @@ def test_governance_before_executor_ordering(
     from agent.deploy_chain import run_deploy
     report = run_deploy(
         changed_files=["agent/governance/server.py", "agent/executor.py"],
+        project_id="proj",
         task_id="test-task",
         expected_head="abc123",
     )
@@ -82,7 +155,7 @@ def test_governance_before_executor_ordering(
 
     # Executor redeploy must have been called
     mock_post_redeploy.assert_called_once_with(
-        "executor", task_id="test-task", expected_head="abc123",
+        "executor", project_id="proj", task_id="test-task", expected_head="abc123",
     )
 
     # The URL list above verifies the governance event-driven order; executor
@@ -125,6 +198,7 @@ def test_governance_before_executor_call_order(
     from agent.deploy_chain import run_deploy
     run_deploy(
         changed_files=["agent/governance/server.py", "agent/executor.py"],
+        project_id="proj",
         task_id="test-task",
         expected_head="abc123",
     )
