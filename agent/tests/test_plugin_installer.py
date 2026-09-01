@@ -730,6 +730,35 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
         assert codex_server["env_vars"] == list(CODEX_WORKER_MCP_ENV_VARS)
 
 
+def test_install_codex_plugin_cache_preserves_absolute_venv_python_symlink(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    real_python = tmp_path / "base-python"
+    real_python.write_text("", encoding="utf-8")
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    try:
+        venv_python.symlink_to(real_python)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    supplied = str(venv_python.absolute())
+
+    target = install_codex_plugin_cache(
+        tmp_path,
+        codex_home=tmp_path / "codex-home",
+        python_executable=supplied,
+    )
+
+    generated_mcp = json.loads((target / ".mcp.json").read_text(encoding="utf-8"))
+    generated_toml = _load_toml_text(
+        (target / ".codex" / "config.toml").read_text(encoding="utf-8")
+    )
+    assert venv_python.is_symlink()
+    assert str(venv_python.resolve()) != supplied
+    for server_name in CODEX_MCP_TRANSPORTS:
+        assert generated_mcp["mcpServers"][server_name]["command"] == supplied
+        assert generated_toml["mcp_servers"][server_name]["command"] == supplied
+
+
 def test_install_codex_plugin_cache_never_materializes_worker_auth_values(tmp_path, monkeypatch):
     _write_plugin_fixture(tmp_path)
     session_value = "session-secret-must-not-be-persisted"

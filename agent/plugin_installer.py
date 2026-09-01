@@ -545,16 +545,21 @@ def _cache_runtime_mcp_config(plugin_root: Path, *, python_executable: Optional[
     ).strip()
     command_path = Path(source_command).expanduser()
     if command_path.is_absolute():
-        absolute_command = str(command_path.resolve())
+        # The selected interpreter path is authority, not just a way to find
+        # an executable. Preserve an explicit venv symlink instead of
+        # collapsing it to the base interpreter behind that environment.
+        absolute_command = str(command_path)
     elif os.sep in source_command or (os.altsep and os.altsep in source_command):
-        absolute_command = str((plugin_root.expanduser().resolve() / command_path).resolve())
+        absolute_command = os.path.abspath(
+            plugin_root.expanduser().resolve() / command_path
+        )
     else:
         discovered_command = shutil.which(source_command)
         if not discovered_command:
             raise PluginInstallError(
                 f"cannot resolve MCP Python command to an absolute path: {source_command}"
             )
-        absolute_command = str(Path(discovered_command).expanduser().resolve())
+        absolute_command = os.path.abspath(Path(discovered_command).expanduser())
 
     generated_servers = dict(servers)
     for server_name, transport in CODEX_MCP_TRANSPORTS.items():
