@@ -18,8 +18,10 @@ def graph_activation_policy(runtime_plane: str) -> dict[str, object]:
 
     This is deliberately a pure mapping: callers may report the policy, but
     they cannot use a request parameter or an environment variable to nominate
-    the plane of a database effect.  The graph store binds effects to its
-    already-open SQLite connection separately.
+    the plane of a database effect.  Dev therefore stays denied here.  The
+    graph store may admit only the narrower world-local exception re-derived
+    by the opened-connection classifier from COW, inode, source, listener, and
+    writer-custody evidence.
     """
     plane = str(runtime_plane or "").strip().lower()
     if plane not in {"stable", "dev", "unknown"}:

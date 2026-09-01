@@ -434,10 +434,11 @@ def classify_graph_activation_connection(
     """Classify an opened graph DB without accepting caller/environment plane claims.
 
     Active graph truth is allowed only when this *opened connection* is the
-    exact live stable database.  A dev connection is recognized from the
-    canonical external root, receipt, and genesis invariants and is denied.
-    Everything else is ``unknown`` and denied before a graph ref, event, or
-    projection can be written.
+    exact live stable database or the exact live AC-dev COW successor.  Dev
+    activation additionally requires current listener/writer custody; a
+    genesis-only connection remains candidate-only.  Everything else is
+    ``unknown`` and denied before a graph ref, event, or projection can be
+    written.
     """
     from agent.runtime_plane import graph_activation_policy, resolve_ac_dev_storage_root
 
@@ -482,35 +483,8 @@ def classify_graph_activation_connection(
         root_meta = root.stat(follow_symlinks=False)
         if root.is_symlink() or root.resolve(strict=True) != root:
             return _unknown_graph_activation_connection("dev_storage_root_identity_invalid")
-        receipt_path = root / AC_DEV_LAUNCH_RECEIPT_NAME
-        if receipt_path.is_symlink() or not receipt_path.is_file():
-            return _unknown_graph_activation_connection("dev_launch_receipt_missing")
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        stable_meta = stable.stat(follow_symlinks=False)
-        stable_parent_meta = stable.parent.stat(follow_symlinks=False)
         server_source = Path(__file__).with_name("server.py")
         source_sha256 = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
-        required_receipt = {
-            "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
-            "world_id": AC_DEV_WORLD_ID,
-            "project_id": AC_PROJECT_ID,
-            "runtime_plane": DEV_RUNTIME_PLANE,
-            "port": 40008,
-            "background": False,
-            "storage_root": str(root),
-            "storage_device": int(root_meta.st_dev),
-            "storage_inode": int(root_meta.st_ino),
-            "stable_shared_volume": str(stable),
-            "stable_shared_volume_device": int(stable_meta.st_dev),
-            "stable_shared_volume_inode": int(stable_meta.st_ino),
-            "stable_parent_device": int(stable_parent_meta.st_dev),
-            "stable_parent_inode": int(stable_parent_meta.st_ino),
-            "source_sha256": source_sha256,
-        }
-        if not isinstance(receipt, Mapping) or any(
-            receipt.get(key) != value for key, value in required_receipt.items()
-        ):
-            return _unknown_graph_activation_connection("dev_launch_receipt_mismatch")
         meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
         genesis = json.loads(str(meta.get("governance_world_genesis_json") or ""))
         genesis_hash = str(meta.get("governance_world_genesis_sha256") or "")
@@ -592,13 +566,42 @@ def classify_graph_activation_connection(
             != (int(before.st_dev), int(before.st_ino))
         ):
             return _unknown_graph_activation_connection("dev_database_identity_changed")
-        return {
+        policy = {
             **graph_activation_policy("dev"),
             "classification_reason": (
                 "verified_dev_cow_successor_receipt_history"
                 if cow_successor_verified
                 else "verified_dev_root_receipt_genesis"
             ),
+            "world_id": AC_DEV_WORLD_ID,
+            "project_id": AC_PROJECT_ID,
+            "port": 40008,
+            "cow_successor_verified": bool(cow_successor_verified),
+            "source_checkout_verified": bool(cow_successor_verified),
+            "live_runtime_custody_verified": False,
+        }
+        if not cow_successor_verified:
+            validate_dev_launch_receipt(root, source_sha256=source_sha256)
+            return policy
+        runtime_custody = _require_ac_dev_graph_materialization_runtime_custody(
+            conn
+        )
+        if not (
+            runtime_custody.get("runtime_plane") == DEV_RUNTIME_PLANE
+            and runtime_custody.get("world_id") == AC_DEV_WORLD_ID
+            and runtime_custody.get("project_id") == AC_PROJECT_ID
+            and runtime_custody.get("port") == 40008
+            and runtime_custody.get("pid") == os.getpid()
+            and runtime_custody.get("database_device") == int(before.st_dev)
+            and runtime_custody.get("database_inode") == int(before.st_ino)
+        ):
+            return _unknown_graph_activation_connection(
+                "dev_live_runtime_custody_mismatch"
+            )
+        return {
+            **policy,
+            "active_graph_activation_allowed": True,
+            "live_runtime_custody_verified": True,
         }
     except (json.JSONDecodeError, KeyError, OSError, RuntimeError, ValueError, sqlite3.Error):
         return _unknown_graph_activation_connection("dev_database_binding_unverified")
@@ -788,6 +791,9 @@ class DevRuntimeSchemaVerificationError(RuntimeError):
         invalid_indexes: Mapping[str, Mapping[str, str]] | None = None,
         invalid_columns: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
         missing_unique_constraints: Mapping[str, Sequence[Sequence[str]]] | None = None,
+        owner_states: Mapping[str, str] | None = None,
+        planned_objects: Sequence[str] = (),
+        component_diagnostics: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         self.details = {
             "schema_version": "ac_dev_verify_only_schema_capability.v1",
@@ -826,6 +832,24 @@ class DevRuntimeSchemaVerificationError(RuntimeError):
                     (missing_unique_constraints or {}).items()
                 )
                 if constraints
+            },
+            "owner_states": {
+                str(component): str(state)
+                for component, state in sorted((owner_states or {}).items())
+            },
+            "planned_objects": sorted(
+                {str(item) for item in planned_objects if str(item)}
+            ),
+            "component_diagnostics": {
+                str(component): {
+                    str(key): value
+                    for key, value in sorted(details.items())
+                    if isinstance(value, (bool, int, float, str, list, dict))
+                }
+                for component, details in sorted(
+                    (component_diagnostics or {}).items()
+                )
+                if isinstance(details, Mapping)
             },
             "verify_only": True,
             "ddl_attempted": False,
@@ -1079,6 +1103,12 @@ def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
     except ValueError as exc:
         raise DevRuntimeSchemaVerificationError(
             "graph_materialization",
+            component_diagnostics={
+                "graph_materialization": {
+                    "status": "preimage_incompatible",
+                    "public_safe": True,
+                }
+            },
         ) from exc
     required = {
         "graph_snapshot_store",
@@ -1087,7 +1117,25 @@ def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
     }
     owner_states = classification["owner_states"]
     if any(owner_states[owner] != "exact" for owner in required):
-        raise DevRuntimeSchemaVerificationError("graph_materialization")
+        planned_objects = list(classification.get("planned_objects") or [])
+        raise DevRuntimeSchemaVerificationError(
+            "graph_materialization",
+            owner_states=owner_states,
+            planned_objects=planned_objects,
+            component_diagnostics={
+                owner: {
+                    "status": "exact" if owner_states[owner] == "exact" else "incompatible",
+                    "owner_state": owner_states[owner],
+                    "planned_objects": (
+                        planned_objects
+                        if owner == "graph_snapshot_store"
+                        else []
+                    ),
+                    "public_safe": True,
+                }
+                for owner in sorted(required)
+            },
+        )
 
 
 def admit_ac_dev_graph_materialization_schema(
@@ -1118,7 +1166,6 @@ def admit_ac_dev_graph_materialization_schema(
             "verified_dev_root_receipt_genesis",
             "verified_dev_cow_successor_receipt_history",
         }
-        or policy.get("active_graph_activation_allowed") is not False
     ):
         raise ValueError("AC dev graph materialization database identity is not admitted")
 
@@ -1167,7 +1214,9 @@ def admit_ac_dev_graph_materialization_schema(
         "runtime_plane": DEV_RUNTIME_PLANE,
         "world_id": AC_DEV_WORLD_ID,
         "object_count": len(canonical),
-        "active_graph_activation_allowed": False,
+        "active_graph_activation_allowed": bool(
+            policy.get("active_graph_activation_allowed") is True
+        ),
         "runtime_custody": runtime_custody,
     }
 

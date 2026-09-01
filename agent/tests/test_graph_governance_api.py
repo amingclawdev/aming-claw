@@ -15953,7 +15953,6 @@ def test_ac_dev_request_guard_rejects_nested_or_empty_project_claims(
     [
         ("/api/governance/redeploy-after-merge/aming-claw", {}),
         ("/api/version-sync/aming-claw", {}),
-        ("/api/graph-governance/aming-claw/reconcile/current-full", {}),
         (
             "/api/graph-governance/aming-claw/reconcile/full",
             {"activate": True},
@@ -15987,6 +15986,16 @@ def test_ac_dev_request_guard_allows_candidate_only_and_repair_writes(monkeypatc
         path_params={"project_id": "aming-claw"},
         body={
             "activate": False,
+            "project_root": str(server._dev_exact_source_root()),
+        },
+    )
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/graph-governance/aming-claw/reconcile/current-full",
+        path_params={"project_id": "aming-claw"},
+        body={
+            "activate": True,
+            "require_clean": True,
             "project_root": str(server._dev_exact_source_root()),
         },
     )
@@ -202555,6 +202564,16 @@ def test_ac_dev_schema_failure_is_public_typed_zero_write_http(monkeypatch):
     failure = governance_db.DevRuntimeSchemaVerificationError(
         "task_timeline",
         missing_tables=("task_timeline_events",),
+        owner_states={"graph_snapshot_store": "pending_scope_index_predecessor"},
+        planned_objects=("idx_pending_scope_branch",),
+        component_diagnostics={
+            "graph_snapshot_store": {
+                "status": "incompatible",
+                "owner_state": "pending_scope_index_predecessor",
+                "planned_objects": ["idx_pending_scope_branch"],
+                "public_safe": True,
+            }
+        },
     )
     handler = _bare_handler()
     handler.path = f"/api/projects/{PID}/onboard-route-guide"
@@ -202579,6 +202598,15 @@ def test_ac_dev_schema_failure_is_public_typed_zero_write_http(monkeypatch):
     assert captured["body"]["details"]["ddl_attempted"] is False
     assert captured["body"]["details"]["writes_performed"] is False
     assert captured["body"]["details"]["public_safe"] is True
+    assert captured["body"]["details"]["owner_states"] == {
+        "graph_snapshot_store": "pending_scope_index_predecessor"
+    }
+    assert captured["body"]["details"]["planned_objects"] == [
+        "idx_pending_scope_branch"
+    ]
+    assert captured["body"]["details"]["component_diagnostics"][
+        "graph_snapshot_store"
+    ]["public_safe"] is True
 
 
 def test_stable_direct_guide_rejects_all_dev_authority_aliases_zero_write(
@@ -207615,6 +207643,340 @@ def test_dev_graph_readiness_becomes_normal_after_authorized_admission(
     assert normal["ok"] is True
     assert normal["active_snapshot_id"] == ""
     assert "materialization_required" not in normal
+
+
+def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-DIRECT-GRAPH-BOOTSTRAP-GUIDE",
+    )
+    bypassed = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {
+                "project_id": case["project_id"],
+                "contract_execution_id": case["execution_id"],
+            },
+            method="POST",
+            body=case["body"],
+        )
+    )
+    assert bypassed["next_legal_action"]["line_id"] == "observer_graph_context"
+    _dev_readiness_predecessor(conn)
+    exact_policy = {
+        "runtime_plane": "dev",
+        "active_graph_activation_allowed": True,
+        "classification_reason": "verified_dev_cow_successor_receipt_history",
+        "world_id": "ac-dev",
+        "project_id": "aming-claw",
+        "port": 40008,
+        "cow_successor_verified": True,
+        "source_checkout_verified": True,
+        "live_runtime_custody_verified": True,
+    }
+    monkeypatch.setattr(
+        server,
+        "classify_graph_activation_connection",
+        lambda _conn: dict(exact_policy),
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda _root: case["commit"],
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_clean_worktree_verified",
+        lambda _root: True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: case["root"],
+    )
+    before_revision = server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )["execution_state_revision"]
+    before_timeline = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE project_id=? "
+        "AND backlog_id=? AND task_id=?",
+        (case["project_id"], case["guide"]["backlog_id"], case["execution_id"]),
+    ).fetchone()[0]
+    request_body = {
+        "backlog_id": case["guide"]["backlog_id"],
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+        "route_token_ref": case["route_token_ref"],
+        "observer_session_id": case["session_id"],
+        "task_id": case["execution_id"],
+        "target_project_root": str(case["root"]),
+        "target_head_commit": case["commit"],
+        "target_ref": server.AC_DEV_BRANCH,
+    }
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+
+    bootstrap = guide["dev_local_graph_bootstrap"]
+    assert bootstrap["state"] == "materialization_required_no_local_active"
+    assert bootstrap["graph_query_ready"] is False
+    assert bootstrap["current_full_reconcile_ready"] is True
+    assert bootstrap["contract_runtime_first_missing_line"] == (
+        "observer_graph_context"
+    )
+    action = guide["next_legal_action"]
+    assert action["mcp_tool"] == "graph_current_full_reconcile"
+    assert action["graph_query_deferred"] is True
+    assert action["query_ready"] is False
+    assert action["copy_safe_body"] == {
+        "project_id": "aming-claw",
+        "backlog_id": case["guide"]["backlog_id"],
+        "task_id": case["execution_id"],
+        "observer_session_id": case["session_id"],
+        "observer_route_token_ref": case["route_token_ref"],
+        "target_commit_sha": case["commit"],
+        "run_id": "current-full-" + case["commit"][:7],
+        "activate": True,
+        "require_clean": True,
+        "semantic_use_ai": False,
+    }
+    assert action["authorizes_write"] is False
+    assert action["synthesizes_qa"] is False
+    assert action["synthesizes_pass"] is False
+    assert bootstrap["bootstrap_authority"]["eligible"] is True
+    assert bootstrap["bootstrap_authority"]["accepted"] is False
+    assert bootstrap["bootstrap_authority"]["request_body_exact"] is False
+    assert server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )["execution_state_revision"] == before_revision
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE project_id=? "
+        "AND backlog_id=? AND task_id=?",
+        (case["project_id"], case["guide"]["backlog_id"], case["execution_id"]),
+    ).fetchone()[0] == before_timeline
+
+    adapted_http_body = dict(action["copy_safe_body"])
+    adapted_http_body.pop("project_id")
+    assert adapted_http_body == bootstrap["bootstrap_authority"][
+        "expected_http_body"
+    ]
+    wrong_body = {**adapted_http_body, "actor": "caller-shaped"}
+    changes_before_wrong_body = conn.total_changes
+    wrong_status, wrong = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=wrong_body,
+            )
+        )
+    )
+    assert wrong_status == 409
+    assert wrong["error"] == (
+        "operator_supervised_direct_main_qa_before_reconcile_required"
+    )
+    assert wrong["snapshot_materialized"] is False
+    assert conn.total_changes == changes_before_wrong_body
+
+    class BootstrapAdmissionReached(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        server,
+        "admit_ac_dev_graph_materialization_schema",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            BootstrapAdmissionReached()
+        ),
+    )
+    with pytest.raises(BootstrapAdmissionReached):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=copy.deepcopy(adapted_http_body),
+            )
+        )
+
+    with monkeypatch.context() as incompatible:
+        incompatible.setattr(
+            server,
+            "_dev_graph_zero_write_readiness_projection",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                GovernanceError(
+                    "ac_dev_graph_readiness_preimage_incompatible",
+                    "incompatible",
+                    409,
+                    {
+                        "owner_states": {"graph_snapshot_store": "altered"},
+                        "planned_objects": [],
+                        "writes_performed": False,
+                    },
+                )
+            ),
+        )
+        blocked = server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=request_body,
+            )
+        )
+    assert blocked["dev_local_graph_bootstrap"]["state"] == "incompatible"
+    assert blocked["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
+    assert blocked["next_legal_action"]["query_ready"] is False
+
+    monkeypatch.setattr(
+        governance_db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "host": "127.0.0.1",
+            "port": 40008,
+        },
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: dict(exact_policy),
+    )
+    governance_db.admit_ac_dev_graph_materialization_schema(
+        conn,
+        project_id="aming-claw",
+    )
+    candidate = store.create_graph_snapshot(
+        conn,
+        "aming-claw",
+        snapshot_id="dev-onboard-active",
+        commit_sha=case["commit"],
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(
+        conn,
+        "aming-claw",
+        candidate["snapshot_id"],
+        auto_rebuild_projection=False,
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        store,
+        "_current_full_snapshot_provenance_binding",
+        lambda *_args, **_kwargs: {"verified": True},
+    )
+
+    active = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+    assert active["dev_local_graph_bootstrap"]["state"] == "exact_active"
+    assert active["dev_local_graph_bootstrap"]["graph_query_ready"] is True
+    assert active["next_legal_action"].get("graph_query_deferred") is not True
+
+
+def test_dev_direct_onboard_preserves_later_contract_runtime_action(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-DIRECT-GRAPH-LATER-LINE",
+    )
+    server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {
+                "project_id": case["project_id"],
+                "contract_execution_id": case["execution_id"],
+            },
+            method="POST",
+            body=case["body"],
+        )
+    )
+    record = server._contract_runtime(conn).current_record(
+        case["execution_id"],
+        actor_role="observer",
+    )
+    bypass_guide = server._contract_runtime_guide_for_response(
+        record,
+        actor_role="observer",
+    )
+    graph_bypass_body = copy.deepcopy(
+        bypass_guide["line_bypass_guidance"][
+            "inherited_bypass_copy_safe_body"
+        ]
+    )
+    for key in (
+        "classification",
+        "reason",
+        "decision",
+        "evidence_refs",
+        "task_id",
+        "observer_session_id",
+        "observer_route_token_ref",
+    ):
+        graph_bypass_body[key] = copy.deepcopy(case["body"][key])
+    advanced = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {
+                "project_id": case["project_id"],
+                "contract_execution_id": case["execution_id"],
+            },
+            method="POST",
+            body=graph_bypass_body,
+        )
+    )
+    assert advanced["next_legal_action"]["line_id"] != (
+        "observer_graph_context"
+    )
+    monkeypatch.setattr(
+        server,
+        "_dev_graph_zero_write_readiness_projection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "later ContractRuntime position reached graph bootstrap"
+        ),
+    )
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body={
+                "backlog_id": case["guide"]["backlog_id"],
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": case["route_token_ref"],
+                "observer_session_id": case["session_id"],
+                "task_id": case["execution_id"],
+                "target_project_root": str(case["root"]),
+                "target_head_commit": case["commit"],
+                "target_ref": server.AC_DEV_BRANCH,
+            },
+        )
+    )
+
+    assert "dev_local_graph_bootstrap" not in guide
+    assert guide["next_legal_action"]["line_id"] == advanced[
+        "next_legal_action"
+    ]["line_id"]
 
 
 def test_dev_onboard_requires_explicit_backlog_before_db_or_queue(

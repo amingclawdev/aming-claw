@@ -146,6 +146,90 @@ def test_active_graph_effects_bind_to_durable_database_world_not_environment(
     assert store.get_graph_snapshot(conn, PID, candidate["snapshot_id"])["status"] == "candidate"
 
 
+def test_verified_dev_world_can_activate_only_its_local_project(conn, monkeypatch):
+    project_id = "aming-claw"
+    store.ensure_schema(conn)
+    candidate = store.create_graph_snapshot(
+        conn,
+        project_id,
+        snapshot_id="dev-world-local-candidate",
+        commit_sha="dev-world-local-commit",
+        snapshot_kind="full",
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "active_graph_activation_allowed": True,
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "world_id": "ac-dev",
+            "project_id": project_id,
+            "port": 40008,
+            "cow_successor_verified": True,
+            "source_checkout_verified": True,
+            "live_runtime_custody_verified": True,
+        },
+    )
+
+    activated = store.activate_graph_snapshot(
+        conn,
+        project_id,
+        candidate["snapshot_id"],
+        auto_rebuild_projection=False,
+    )
+
+    assert activated["snapshot_id"] == candidate["snapshot_id"]
+    assert store.get_active_graph_snapshot(conn, project_id)["snapshot_id"] == (
+        candidate["snapshot_id"]
+    )
+
+    foreign = store.create_graph_snapshot(
+        conn,
+        "other-project",
+        snapshot_id="foreign-project-candidate",
+        commit_sha="foreign-project-commit",
+        snapshot_kind="full",
+    )
+    with pytest.raises(ValueError, match="classified AC-dev world"):
+        store.activate_graph_snapshot(
+            conn,
+            "other-project",
+            foreign["snapshot_id"],
+            auto_rebuild_projection=False,
+        )
+    assert store.get_active_graph_snapshot(conn, "other-project") is None
+
+
+def test_dev_process_rejects_stable_classified_database_cross_world(
+    conn,
+    monkeypatch,
+):
+    store.ensure_schema(conn)
+    candidate = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="stable-cross-world-candidate",
+        commit_sha="stable-cross-world-commit",
+        snapshot_kind="full",
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+
+    with pytest.raises(ValueError, match="across runtime worlds"):
+        store.activate_graph_snapshot(
+            conn,
+            PID,
+            candidate["snapshot_id"],
+            auto_rebuild_projection=False,
+            schema_ready=True,
+        )
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_snapshot_refs WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == 0
+
+
 def test_active_graph_effects_reject_missing_or_unknown_database_world_before_refs(
     conn,
     monkeypatch,

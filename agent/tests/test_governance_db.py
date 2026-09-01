@@ -108,7 +108,7 @@ def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(mo
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
     )
     monkeypatch.setattr(
         db,
@@ -283,7 +283,7 @@ def test_ac_dev_graph_materialization_admission_rolls_back_partial_schema(monkey
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
     )
     monkeypatch.setattr(
         db,
@@ -324,7 +324,7 @@ def test_ac_dev_graph_materialization_admission_denies_wrong_world_without_write
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
     )
     monkeypatch.setattr(
         db,
@@ -466,7 +466,7 @@ def test_graph_materialization_runtime_rejects_before_schema_begin(monkeypatch):
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: (_ for _ in ()).throw(
+        lambda _conn, *_args: (_ for _ in ()).throw(
             ValueError("AC dev graph materialization listener custody mismatch")
         ),
     )
@@ -1222,6 +1222,11 @@ def _cow_graph_identity_fixture(tmp_path, monkeypatch):
         "source_sha256": "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest(),
     }
     (root / db.AC_DEV_LAUNCH_RECEIPT_NAME).write_text(json.dumps(launch))
+    monkeypatch.setattr(
+        db,
+        "validate_dev_launch_receipt",
+        lambda *_args, **_kwargs: dict(launch),
+    )
     binding = {
         "shared_volume_path": str(stable), "database_path": str(stable_db),
         "stable_database_identity": {
@@ -1246,13 +1251,110 @@ def test_graph_activation_classifies_exact_validated_cow_successor(tmp_path, mon
     monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
     monkeypatch.setattr(db, "_verify_dev_world_schema_inventory", lambda _conn: None)
     monkeypatch.setattr(db, "_verify_current_cow_successor_source", lambda *_args, **_kwargs: None)
+    identity = Path(conn.execute("PRAGMA database_list").fetchone()[2]).stat()
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn, *_args: {
+            "runtime_plane": "dev",
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "port": 40008,
+            "pid": os.getpid(),
+            "database_device": identity.st_dev,
+            "database_inode": identity.st_ino,
+        },
+    )
     try:
         policy = db.classify_graph_activation_connection(conn)
     finally:
         conn.close()
     assert policy["runtime_plane"] == "dev"
-    assert policy["active_graph_activation_allowed"] is False
+    assert policy["active_graph_activation_allowed"] is True
     assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
+    assert policy["world_id"] == "ac-dev"
+    assert policy["project_id"] == "aming-claw"
+    assert policy["port"] == 40008
+    assert policy["cow_successor_verified"] is True
+    assert policy["source_checkout_verified"] is True
+    assert policy["live_runtime_custody_verified"] is True
+
+
+@pytest.mark.parametrize("custody_failure", ["listener", "writer_lease"])
+def test_graph_activation_denies_cow_without_live_runtime_custody(
+    tmp_path, monkeypatch, custody_failure,
+):
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    monkeypatch.setattr(
+        db, "_verify_current_cow_successor_source", lambda *_args, **_kwargs: None
+    )
+
+    def reject_custody(_conn, *_args):
+        raise ValueError(f"AC dev graph materialization {custody_failure} custody mismatch")
+
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        reject_custody,
+    )
+    try:
+        policy = db.classify_graph_activation_connection(conn)
+    finally:
+        conn.close()
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["active_graph_activation_allowed"] is False
+
+
+def test_graph_activation_denies_cow_with_dirty_or_mismatched_source(
+    tmp_path, monkeypatch,
+):
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+
+    def reject_source(*_args, **_kwargs):
+        raise ValueError("AC dev source checkout is dirty or mismatched")
+
+    monkeypatch.setattr(db, "_verify_current_cow_successor_source", reject_source)
+    try:
+        policy = db.classify_graph_activation_connection(conn)
+    finally:
+        conn.close()
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["active_graph_activation_allowed"] is False
+
+
+def test_graph_materialization_verification_exposes_public_component_diagnostics():
+    from agent.governance import db, graph_snapshot_store
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_graph_owner_for_preimage_test(db, conn, graph_snapshot_store.ensure_schema)
+    conn.execute("DROP INDEX idx_pending_scope_branch")
+    conn.execute("DROP INDEX idx_pending_scope_status")
+
+    with pytest.raises(db.DevRuntimeSchemaVerificationError) as rejected:
+        db.verify_graph_materialization_schema(conn)
+
+    details = rejected.value.details
+    assert details["owner_states"]["graph_snapshot_store"] == (
+        "pending_scope_index_predecessor"
+    )
+    assert set(details["planned_objects"]) == {
+        "idx_pending_scope_branch",
+        "idx_pending_scope_status",
+    }
+    assert details["component_diagnostics"]["graph_snapshot_store"] == {
+        "owner_state": "pending_scope_index_predecessor",
+        "planned_objects": [
+            "idx_pending_scope_branch",
+            "idx_pending_scope_status",
+        ],
+        "public_safe": True,
+        "status": "incompatible",
+    }
+    assert details["writes_performed"] is False
+    conn.close()
 
 
 @pytest.mark.parametrize("row_factory", [None, sqlite3.Row])
@@ -1374,7 +1476,20 @@ def test_graph_materialization_admits_valid_cow_without_parallel_runtime_invento
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {
+            "runtime_plane": "dev",
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "host": "127.0.0.1",
+            "port": 40008,
+            "pid": os.getpid(),
+            "database_device": Path(
+                _conn.execute("PRAGMA database_list").fetchone()[2]
+            ).stat().st_dev,
+            "database_inode": Path(
+                _conn.execute("PRAGMA database_list").fetchone()[2]
+            ).stat().st_ino,
+        },
     )
     monkeypatch.setattr(
         db,
@@ -1402,7 +1517,7 @@ def test_graph_materialization_rejects_unverified_cow_before_write(
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
         db, "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
     )
     monkeypatch.setattr(
         db, "canonical_ac_database_identity",
@@ -2185,10 +2300,10 @@ def test_current_cow_source_requires_clean_strict_same_root_descendant(
     conn.close()
 
 
-def test_real_cow_clone_classifies_with_dev_plane_and_distinct_source_producers(
+def test_real_cow_clone_without_live_custody_remains_denied(
     tmp_path, monkeypatch,
 ):
-    """Replay the full receipt/history and live schema path without gate mocks."""
+    """A real COW/source chain alone cannot replace listener/writer custody."""
     from agent import runtime_plane
     from agent.governance import db
 
@@ -2259,8 +2374,8 @@ def test_real_cow_clone_classifies_with_dev_plane_and_distinct_source_producers(
         policy = db.classify_graph_activation_connection(connection)
     finally:
         connection.close()
-    assert policy["runtime_plane"] == "dev"
-    assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["active_graph_activation_allowed"] is False
 
 
 def _real_cow_successor_cli_fixture(
