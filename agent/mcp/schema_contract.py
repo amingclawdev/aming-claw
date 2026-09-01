@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 
 MCP_TOOL_SCHEMA_VERSION = "2026-09-01.1"
 MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION = MCP_TOOL_SCHEMA_VERSION
 _LOADED_TOOL_SCHEMA_FINGERPRINT = ""
+_TOOL_SCHEMA_FINGERPRINT_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def mcp_tool_schema_fingerprint(tools: list[dict[str, Any]]) -> str:
@@ -37,6 +39,62 @@ def register_loaded_tool_schema(tools: list[dict[str, Any]]) -> str:
     global _LOADED_TOOL_SCHEMA_FINGERPRINT
     _LOADED_TOOL_SCHEMA_FINGERPRINT = mcp_tool_schema_fingerprint(tools)
     return _LOADED_TOOL_SCHEMA_FINGERPRINT
+
+
+def resolve_server_tool_schema_fingerprint(
+    *,
+    nested_value: Any,
+    nested_present: bool,
+    top_level_value: Any,
+    top_level_present: bool,
+) -> dict[str, Any]:
+    """Resolve two server fingerprint signals without source precedence."""
+
+    nested_text = nested_value if isinstance(nested_value, str) else ""
+    top_level_text = top_level_value if isinstance(top_level_value, str) else ""
+    nested_valid = bool(
+        nested_present and _TOOL_SCHEMA_FINGERPRINT_PATTERN.fullmatch(nested_text)
+    )
+    top_level_valid = bool(
+        top_level_present
+        and _TOOL_SCHEMA_FINGERPRINT_PATTERN.fullmatch(top_level_text)
+    )
+    both_present = nested_present and top_level_present
+    conflict = bool(
+        both_present
+        and nested_valid
+        and top_level_valid
+        and nested_text != top_level_text
+    )
+    if not nested_present and not top_level_present:
+        status = "absent"
+        resolved = ""
+    elif both_present:
+        if nested_valid and top_level_valid and not conflict:
+            status = "resolved_both_exact"
+            resolved = nested_text
+        else:
+            status = "conflict" if conflict else "invalid"
+            resolved = ""
+    elif nested_present:
+        status = "resolved_nested" if nested_valid else "invalid"
+        resolved = nested_text if nested_valid else ""
+    else:
+        status = "resolved_top_level" if top_level_valid else "invalid"
+        resolved = top_level_text if top_level_valid else ""
+    return {
+        "nested_present": nested_present,
+        "nested_valid": nested_valid,
+        "nested_value": nested_text,
+        "nested_value_type": type(nested_value).__name__,
+        "top_level_present": top_level_present,
+        "top_level_valid": top_level_valid,
+        "top_level_value": top_level_text,
+        "top_level_value_type": type(top_level_value).__name__,
+        "conflict": conflict,
+        "status": status,
+        "resolved_fingerprint": resolved,
+    }
 
 
 def mcp_loaded_tool_schema_metadata() -> dict[str, Any]:
@@ -103,8 +161,8 @@ def mcp_tool_schema_compatibility(
     server_fingerprint = str(server_schema_fingerprint or "").strip()
     version_fresh = loaded == server if loaded else None
     fingerprint_fresh = bool(
-        loaded_fingerprint
-        and server_fingerprint
+        _TOOL_SCHEMA_FINGERPRINT_PATTERN.fullmatch(loaded_fingerprint)
+        and _TOOL_SCHEMA_FINGERPRINT_PATTERN.fullmatch(server_fingerprint)
         and loaded_fingerprint == server_fingerprint
     )
     fresh = bool(version_fresh and fingerprint_fresh)

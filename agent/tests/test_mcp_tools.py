@@ -7233,16 +7233,59 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
     assert "restart_or_refresh_mcp_session" in status["recommended_actions"]
 
 
-@pytest.mark.parametrize("server_fingerprint", ["", "sha256:" + "0" * 64])
-def test_mcp_runtime_status_same_version_unregistered_or_mismatched_fingerprint_is_stale(
-    server_fingerprint,
+@pytest.mark.parametrize(
+    (
+        "nested_present",
+        "nested_value",
+        "top_present",
+        "top_value",
+        "expected_current",
+        "resolution_status",
+    ),
+    [
+        (False, None, False, None, False, "absent"),
+        (True, "current", False, None, True, "resolved_nested"),
+        (False, None, True, "current", True, "resolved_top_level"),
+        (True, "current", True, "current", True, "resolved_both_exact"),
+        (True, "current", True, "forged", False, "conflict"),
+        (True, "forged", True, "current", False, "conflict"),
+        (True, "not-a-digest", False, None, False, "invalid"),
+        (True, "", False, None, False, "invalid"),
+        (True, 42, False, None, False, "invalid"),
+        (False, None, True, "", False, "invalid"),
+        (False, None, True, {"digest": "current"}, False, "invalid"),
+    ],
+)
+def test_mcp_runtime_status_server_fingerprint_sources_are_closed_and_fail_closed(
+    nested_present,
+    nested_value,
+    top_present,
+    top_value,
+    expected_current,
+    resolution_status,
 ):
+    current = mcp_tool_schema_fingerprint(TOOLS)
+    forged = "sha256:" + "0" * 64
+
+    def materialize(value):
+        if value == "current":
+            return current
+        if value == "forged":
+            return forged
+        return value
+
     class FingerprintDriftGovernance(_RuntimeGovRecorder):
         def api(self, method: str, path: str, data: dict | None = None) -> dict:
             result = super().api(method, path, data)
             if path == "/api/health":
                 result = dict(result)
-                result["mcp_tool_schema_fingerprint"] = server_fingerprint
+                result.pop("mcp_tool_schema_fingerprint", None)
+                if top_present:
+                    result["mcp_tool_schema_fingerprint"] = materialize(top_value)
+                if nested_present:
+                    result["mcp_tool_schema"] = {
+                        "server_tool_schema_fingerprint": materialize(nested_value)
+                    }
             return result
 
     status = _dispatcher(FingerprintDriftGovernance(), _Recorder()).dispatch(
@@ -7251,13 +7294,19 @@ def test_mcp_runtime_status_same_version_unregistered_or_mismatched_fingerprint_
     )
 
     schema = status["mcp_tool_schema"]
-    assert schema["status"] == "stale_client"
-    assert schema["client_schema_fresh"] is False
-    assert schema["client_schema_fingerprint_fresh"] is False
+    assert schema["status"] == ("current" if expected_current else "stale_client")
+    assert schema["client_schema_fresh"] is expected_current
+    assert schema["client_schema_fingerprint_fresh"] is expected_current
     assert schema["loaded_client_tool_schema_fingerprint"] == (
         mcp_tool_schema_fingerprint(TOOLS)
     )
-    assert schema["server_tool_schema_fingerprint"] == server_fingerprint
+    resolution = schema["server_fingerprint_resolution"]
+    assert resolution["status"] == resolution_status
+    assert resolution["nested_present"] is nested_present
+    assert resolution["top_level_present"] is top_present
+    assert schema["server_tool_schema_fingerprint"] == (
+        current if expected_current else ""
+    )
 
 
 def test_current_mcp_schema_bump_marks_pre_current_full_view_client_stale():

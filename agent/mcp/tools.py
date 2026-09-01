@@ -30,6 +30,7 @@ from .schema_contract import (
     mcp_tool_schema_fingerprint,
     mcp_tool_schema_compatibility,
     register_loaded_tool_schema,
+    resolve_server_tool_schema_fingerprint,
 )
 
 log = logging.getLogger(__name__)
@@ -9543,11 +9544,15 @@ class ToolDispatcher:
                 or MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION
             ).strip()
             loaded_schema_fingerprint = mcp_tool_schema_fingerprint(TOOLS)
-            server_schema_fingerprint = str(
-                server_schema.get("server_tool_schema_fingerprint")
-                or governance.get("mcp_tool_schema_fingerprint")
-                or ""
-            ).strip()
+            server_fingerprint_resolution = resolve_server_tool_schema_fingerprint(
+                nested_value=server_schema.get("server_tool_schema_fingerprint"),
+                nested_present="server_tool_schema_fingerprint" in server_schema,
+                top_level_value=governance.get("mcp_tool_schema_fingerprint"),
+                top_level_present="mcp_tool_schema_fingerprint" in governance,
+            )
+            server_schema_fingerprint = server_fingerprint_resolution[
+                "resolved_fingerprint"
+            ]
             schema_status = mcp_tool_schema_compatibility(
                 loaded_schema_version=MCP_TOOL_SCHEMA_VERSION,
                 server_schema_version=(
@@ -9559,6 +9564,9 @@ class ToolDispatcher:
             )
             schema_status["server_version_observable"] = bool(
                 server_schema_version
+            )
+            schema_status["server_fingerprint_resolution"] = (
+                server_fingerprint_resolution
             )
             if not server_schema_version:
                 schema_status["client_schema_fresh"] = None
