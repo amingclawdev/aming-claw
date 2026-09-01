@@ -311,6 +311,8 @@ LOADED_RUNTIME_IDENTITY: dict[str, Any] = {
         if _immutable_build_commit()
         else "git_head_at_import"
     ),
+    "stable_database_identity": {},
+    "stable_shared_volume_path": "",
 }
 
 # Re-hash the module source only when stat() says it changed; this file is large
@@ -146838,12 +146840,28 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
         and _ac_stable_database_identity_valid(database_identity)
     ):
         return False
+    loaded_database_identity = (
+        LOADED_RUNTIME_IDENTITY.get("stable_database_identity")
+        if isinstance(
+            LOADED_RUNTIME_IDENTITY.get("stable_database_identity"), Mapping
+        )
+        else {}
+    )
+    loaded_shared_raw = str(
+        LOADED_RUNTIME_IDENTITY.get("stable_shared_volume_path") or ""
+    ).strip()
+    if not (
+        _ac_stable_database_identity_valid(loaded_database_identity)
+        and dict(database_identity) == dict(loaded_database_identity)
+        and loaded_shared_raw
+    ):
+        return False
     try:
         canonical_project_id = validate_project_id_syntax(
             project_id, require_exact=True
         )
         shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
-        if not shared_raw:
+        if not shared_raw or shared_raw != loaded_shared_raw:
             return False
         shared_input = Path(shared_raw).expanduser().absolute()
         shared_root = shared_input.resolve(strict=True)
@@ -146854,6 +146872,32 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
         and shared_input == shared_root
         and not shared_input.is_symlink()
         and shared_root.is_dir()
+    ):
+        return False
+    control_relative = Path(AC_DATABASE_STABLE_RELATIVE_PATH).relative_to(
+        "shared-volume"
+    )
+    control_database = (shared_root / control_relative).absolute()
+    expected_relative_hash = "sha256:" + hashlib.sha256(
+        AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+    ).hexdigest()
+    try:
+        control_metadata = control_database.stat(follow_symlinks=False)
+        control_realpath = control_database.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not (
+        control_realpath == control_database
+        and not control_database.is_symlink()
+        and stat.S_ISREG(control_metadata.st_mode)
+        and int(control_metadata.st_nlink) == 1
+        and int(control_metadata.st_size) > 0
+        and int(control_metadata.st_dev)
+        == int(loaded_database_identity.get("device") or -1)
+        and int(control_metadata.st_ino)
+        == int(loaded_database_identity.get("inode") or -1)
+        and loaded_database_identity.get("stable_relative_path_sha256")
+        == expected_relative_hash
     ):
         return False
     expected_database = (
@@ -221862,7 +221906,27 @@ def main():
             raise GovernanceSingletonError("ac_dev_storage_root_required")
         acquire_dev_runtime_writer_lease(dev_storage_root)
     try:
-        _validate_runtime_plane_startup()
+        startup_identity = _validate_runtime_plane_startup()
+        if startup_identity.get("plane") == "stable":
+            stable_database_identity = startup_identity.get(
+                "stable_database_identity"
+            )
+            shared_volume_path = os.environ.get(
+                "SHARED_VOLUME_PATH", ""
+            ).strip()
+            if not (
+                _ac_stable_database_identity_valid(stable_database_identity)
+                and shared_volume_path
+            ):
+                raise GovernanceSingletonError(
+                    "stable_loaded_database_identity_invalid"
+                )
+            LOADED_RUNTIME_IDENTITY["stable_database_identity"] = dict(
+                stable_database_identity
+            )
+            LOADED_RUNTIME_IDENTITY["stable_shared_volume_path"] = str(
+                Path(shared_volume_path).expanduser().resolve(strict=True)
+            )
         lease = _establish_governance_manager_generation()
         try:
             _run_governance_service()

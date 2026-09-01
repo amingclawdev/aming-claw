@@ -200056,24 +200056,46 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
         "inode": 12,
         "stable_relative_path_sha256": "sha256:" + "6" * 64,
     }
-    monkeypatch.setattr(
-        server,
-        "_runtime_plane_identity",
-        lambda: {
-            "status": "ready",
-            "plane": "stable",
-            "port": server.AC_STABLE_SERVICE_PORT,
-            "world_id": "ac-stable",
-            "stable_database_identity": database_identity,
-        },
-    )
+    runtime_identity = {
+        "status": "ready",
+        "plane": "stable",
+        "port": server.AC_STABLE_SERVICE_PORT,
+        "world_id": "ac-stable",
+        "stable_database_identity": database_identity,
+    }
+    monkeypatch.setattr(server, "_runtime_plane_identity", lambda: runtime_identity)
     database = (
         tmp_path / "shared-volume" / "codex-tasks" / "state"
         / "governance" / project_id / "governance.db"
     )
     database.parent.mkdir(parents=True)
     database.touch()
+    control_database = (
+        tmp_path / server.AC_DATABASE_STABLE_RELATIVE_PATH
+    )
+    control_database.parent.mkdir(parents=True, exist_ok=True)
+    control_database.write_bytes(b"stable-control-db")
+    control_stat = control_database.stat()
+    database_identity.update(
+        device=int(control_stat.st_dev),
+        inode=int(control_stat.st_ino),
+        stable_relative_path_sha256=(
+            "sha256:" + hashlib.sha256(
+                server.AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+            ).hexdigest()
+        ),
+    )
     monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path / "shared-volume"))
+    monkeypatch.setitem(
+        server.LOADED_RUNTIME_IDENTITY,
+        "stable_database_identity",
+        copy.deepcopy(database_identity),
+    )
+    monkeypatch.setitem(
+        server.LOADED_RUNTIME_IDENTITY,
+        "stable_shared_volume_path",
+        str((tmp_path / "shared-volume").resolve()),
+    )
     monkeypatch.setattr(
         server,
         "_operator_supervised_direct_main_connection_database_path",
@@ -200188,6 +200210,43 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
         server._operator_supervised_direct_main_closed_json_object(
             [("runtime_world_authority", {}), ("runtime_world_authority", {})]
         )
+    loaded_identity = copy.deepcopy(database_identity)
+    for field, forged_value in (
+        ("device", int(database_identity["device"]) + 1),
+        ("inode", int(database_identity["inode"]) + 1),
+        ("stable_relative_path_sha256", "sha256:" + "f" * 64),
+    ):
+        forged = copy.deepcopy(loaded_identity)
+        forged[field] = forged_value
+        monkeypatch.setitem(
+            server.LOADED_RUNTIME_IDENTITY,
+            "stable_database_identity",
+            forged,
+        )
+        assert not server._operator_supervised_direct_main_legacy_empty_stable_world_valid(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            execution_id=execution_id,
+            binding=binding,
+        )
+    monkeypatch.setitem(
+        server.LOADED_RUNTIME_IDENTITY,
+        "stable_database_identity",
+        loaded_identity,
+    )
+    runtime_identity["stable_database_identity"] = {
+        **database_identity,
+        "inode": int(database_identity["inode"]) + 1,
+    }
+    assert not server._operator_supervised_direct_main_legacy_empty_stable_world_valid(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        execution_id=execution_id,
+        binding=binding,
+    )
+    runtime_identity["stable_database_identity"] = database_identity
     assert conn.total_changes == before
     assert tuple(conn.iterdump()) == before_rows
 
@@ -200257,6 +200316,18 @@ def test_legacy_empty_world_requires_exact_stable_physical_binding(
     )
     database.parent.mkdir(parents=True)
     database.touch()
+    control_database = tmp_path / server.AC_DATABASE_STABLE_RELATIVE_PATH
+    control_database.parent.mkdir(parents=True, exist_ok=True)
+    control_database.write_bytes(b"stable-control-db")
+    control_stat = control_database.stat()
+    stable_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(control_stat.st_dev),
+        "inode": int(control_stat.st_ino),
+        "stable_relative_path_sha256": "sha256:" + hashlib.sha256(
+            server.AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
     actual_database = database
     if case == "wrong_database":
         actual_database = (
@@ -200277,13 +200348,18 @@ def test_legacy_empty_world_requires_exact_stable_physical_binding(
             "plane": "stable",
             "port": server.AC_STABLE_SERVICE_PORT,
             "world_id": "ac-stable",
-            "stable_database_identity": {
-                "schema_version": "ac_stable_database_identity.v1",
-                "device": 11,
-                "inode": 12,
-                "stable_relative_path_sha256": "sha256:" + "6" * 64,
-            },
+            "stable_database_identity": stable_identity,
         },
+    )
+    monkeypatch.setitem(
+        server.LOADED_RUNTIME_IDENTITY,
+        "stable_database_identity",
+        copy.deepcopy(stable_identity),
+    )
+    monkeypatch.setitem(
+        server.LOADED_RUNTIME_IDENTITY,
+        "stable_shared_volume_path",
+        str((tmp_path / "shared-volume").resolve()),
     )
     monkeypatch.setattr(
         server,
