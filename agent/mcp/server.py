@@ -346,6 +346,7 @@ def _mcp_path_project_claims(path: str) -> list[str]:
     patterns = (
         r"^/api/backlog/([^/]+)",
         r"^/api/task/([^/]+)",
+        r"^/api/version-check/([^/]+)",
         r"^/api/(?:graph-governance|wf|reconcile|context|ai-output)/([^/]+)",
         r"^/api/projects/([^/]+)",
     )
@@ -369,7 +370,8 @@ class AmingClawMCP:
         )
         self.manager_url = manager_url.rstrip("/")
         self._workspace = workspace
-        if self.project_id == _AC_PROJECT_ID:
+        owns_runtime_artifacts = max_workers > 0 or autostart_executor
+        if self.project_id == _AC_PROJECT_ID and owns_runtime_artifacts:
             from agent.governance.db import _dev_runtime_root
 
             self.artifact_root = _dev_runtime_root(create=True)
@@ -380,6 +382,11 @@ class AmingClawMCP:
             ):
                 raise ValueError("AC MCP shared artifact root cannot contain a symlink")
             os.environ["SHARED_VOLUME_PATH"] = str(shared)
+        elif self.project_id == _AC_PROJECT_ID:
+            # Control-only stdio transports do not own workers, executors, or
+            # local artifacts. They must be able to expose tools and route
+            # HTTP calls while the isolated dev service/storage is offline.
+            self.artifact_root = None
         else:
             self.artifact_root = Path(workspace).expanduser().resolve() / "shared-volume"
         self._autostart_executor = autostart_executor
@@ -843,8 +850,7 @@ class AmingClawMCP:
     # HTTP helper (governance API)
     # -----------------------------------------------------------------------
 
-    def _http(self, method: str, path: str, data: dict = None) -> dict:
-        claims = _mcp_path_project_claims(path) + _mcp_project_claims(data or {})
+    def _world_scope_error(self, claims: list[str]) -> dict | None:
         normalized = {claim for claim in claims if claim}
         invalid_claim = any(
             not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", claim)
@@ -855,18 +861,30 @@ class AmingClawMCP:
                 claim != _AC_PROJECT_ID for claim in normalized
             )
         else:
-            # Stable transports supported role-bound cross-project graph
-            # operations; it must reject AC, but must not collapse governance
-            # and target project identities into one value.
+            # Stable transports support role-bound cross-project graph
+            # operations, but AC remains an isolated dev-world identity.
             world_mismatch = any(
                 claim == _AC_PROJECT_ID for claim in normalized
             )
-        if invalid_claim or world_mismatch:
-            return {
-                "error": "mcp_world_project_scope_mismatch",
-                "writes_performed": False,
-                "mutation_performed": False,
-            }
+        if not invalid_claim and not world_mismatch:
+            return None
+        return {
+            "error": "mcp_world_project_scope_mismatch",
+            "writes_performed": False,
+            "mutation_performed": False,
+        }
+
+    def _dispatch_tool_call(self, tool_name: str, tool_args: dict) -> dict:
+        scope_error = self._world_scope_error(_mcp_project_claims(tool_args))
+        if scope_error is not None:
+            return scope_error
+        return self.dispatcher.dispatch(tool_name, tool_args)
+
+    def _http(self, method: str, path: str, data: dict = None) -> dict:
+        claims = _mcp_path_project_claims(path) + _mcp_project_claims(data or {})
+        scope_error = self._world_scope_error(claims)
+        if scope_error is not None:
+            return scope_error
         url = f"{self.gov_url}{path}"
         return self._request_json(method, url, data, timeout=15)
 
@@ -981,7 +999,7 @@ class AmingClawMCP:
             tool_name = params.get("name", "")
             tool_args = params.get("arguments") or {}
             try:
-                result = self.dispatcher.dispatch(tool_name, tool_args)
+                result = self._dispatch_tool_call(tool_name, tool_args)
                 compact_worker_guide = tool_name == "runtime_context_worker_guide"
                 result_text = json.dumps(
                     result,
