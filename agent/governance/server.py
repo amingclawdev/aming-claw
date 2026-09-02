@@ -128519,6 +128519,9 @@ def _contract_runtime_strict_no_pass_bypass_audit(
     runtime_context_id: str,
     task_id: str,
     line_instance_id: str,
+    expected_actor_roles: set[str] | None = None,
+    expected_blocked_owner_role: str = "mf_sub",
+    line_instance_required: bool = True,
 ) -> dict[str, Any]:
     """Revalidate one exact no-PASS line, OPEN diagnostic, and audit pair."""
 
@@ -128550,6 +128553,14 @@ def _contract_runtime_strict_no_pass_bypass_audit(
         bypass_revision = int(payload.get("execution_state_revision") or 0)
     except (TypeError, ValueError):
         return {}
+    accepted_actor_roles = (
+        set(expected_actor_roles)
+        if expected_actor_roles is not None
+        else {"observer", "qa"}
+    )
+    expected_line_instance_claims = (
+        {line_instance_id} if line_instance_id else set()
+    )
     if not (
         execution_id
         and backlog_id
@@ -128557,9 +128568,10 @@ def _contract_runtime_strict_no_pass_bypass_audit(
         and bypass_identity
         and classification
         and bypass_revision > 0
-        and line_instance_claims == {line_instance_id}
+        and (not line_instance_required or bool(line_instance_id))
+        and line_instance_claims == expected_line_instance_claims
         and (not execution_claims or execution_claims == {execution_id})
-        and actor_role in {"observer", "qa"}
+        and actor_role in accepted_actor_roles
         and str(line.get("stage_id") or "").strip()
         == str(expected_stage_id or expected_line_id).strip()
         and str(line.get("line_id") or "").strip() == expected_line_id
@@ -128572,7 +128584,7 @@ def _contract_runtime_strict_no_pass_bypass_audit(
         and str(payload.get("source_backlog_id") or "").strip()
         == backlog_id
         and str(payload.get("blocked_owner_role") or "").strip()
-        == "mf_sub"
+        == str(expected_blocked_owner_role or "").strip()
         and str(payload.get("blocked_evidence_kind") or "").strip()
         == expected_blocked_evidence_kind
         and str(payload.get("disposition") or "").strip()
@@ -149018,12 +149030,13 @@ def _operator_supervised_direct_main_strict_records(
     *,
     project_id: str,
     backlog_id: str,
+    world_authority: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     runtime = _contract_runtime(conn)
     world_authority = (
+        dict(world_authority) if isinstance(world_authority, Mapping) else
         _operator_supervised_direct_main_dev_world_authority()
-        if _runtime_plane() == "dev"
-        else {}
+        if _runtime_plane() == "dev" else {}
     )
     records = runtime.store.list_by_backlog(
         project_id=project_id,
@@ -149070,6 +149083,167 @@ def _operator_supervised_direct_main_strict_records(
         )
     return strict
 
+def _operator_supervised_direct_main_operational_terminal_selection(
+    conn, *, project_id: str, backlog_id: str,
+    caller_contract_execution_id: str = "", caller_route_token_ref: str = "",
+) -> dict[str, Any]:
+    """Classify one Direct predecessor without accepting caller custody."""
+    def result(state: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "schema_version": "operator_supervised_direct_main."
+            "operational_terminal_selection.v1",
+            "state": state, "server_derived": True,
+            "caller_claims_trusted": False, "read_only": True, **extra,
+        }
+    def blocked(reason: str) -> dict[str, Any]:
+        return result("blocked", reason=reason)
+    def caller_matches(execution_id: str, route_ref: str) -> bool:
+        return not (
+            (caller_contract_execution_id
+             and caller_contract_execution_id != execution_id)
+            or (caller_route_token_ref and caller_route_token_ref != route_ref)
+        )
+    if _runtime_plane() != "dev":
+        return blocked("runtime_plane")
+    if project_id != "aming-claw":
+        return blocked("project_scope")
+    try:
+        world = _operator_supervised_direct_main_dev_world_authority()
+        if not isinstance(world, Mapping) or world.get("accepted") is not True:
+            return blocked("runtime_world")
+        world = dict(world)
+        row = conn.execute(
+            "SELECT status FROM backlog_bugs WHERE bug_id=?", (backlog_id,)
+        ).fetchone()
+        records = _operator_supervised_direct_main_strict_records(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            world_authority=world,
+        )
+    except (ContractRuntimeError, GovernanceError, sqlite3.Error, TypeError):
+        return blocked("authority_read_failed")
+    if not row:
+        return blocked("backlog_missing")
+    if not records:
+        return (
+            blocked("caller_claim_without_family")
+            if caller_contract_execution_id or caller_route_token_ref
+            else result("ordinary", contract_execution_ids=[])
+        )
+    if len(records) != 1:
+        return blocked("direct_family_cardinality")
+    execution_id = str(records[0].get("contract_execution_id") or "").strip()
+    try:
+        current = _contract_runtime(conn).current_record(
+            execution_id, actor_role="observer"
+        )
+        route_ref = str(current.get("route_token_ref") or "").strip()
+        route_authority = _operator_supervised_direct_main_route_authority(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            contract_execution_id=execution_id, route_token_ref=route_ref,
+        )
+    except (ContractRuntimeError, KeyError, sqlite3.Error):
+        return blocked("current_record_unavailable")
+    metadata = current.get("metadata")
+    binding = metadata.get(
+        "operator_supervised_direct_main_runtime_binding"
+    ) if isinstance(metadata, Mapping) else {}
+    binding = binding if isinstance(binding, Mapping) else {}
+    if not (
+        execution_id
+        and current.get("project_id") == project_id
+        and current.get("backlog_id") == backlog_id
+        and current.get("contract_id") == "operator_supervised_direct_main"
+        and current.get("contract_execution_id") == execution_id
+        and _operator_supervised_direct_main_record_matches_dev_world(
+            current, world
+        )
+    ):
+        return blocked("current_record_identity")
+    if not (
+        route_ref
+        and route_authority.get("accepted") is True
+        and route_authority.get("route_token_ref") == route_ref
+        and route_authority.get("contract_execution_id") == execution_id
+        and dict(binding.get("route_identity") or {})
+        == dict(route_authority.get("route_identity") or {})
+    ):
+        return blocked("route_authority")
+    completed = [
+        line for line in current.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    if not any(
+        str(line.get("evidence_kind") or "") == "contract_line_bypass"
+        for line in completed
+    ):
+        return (
+            result("ordinary", contract_execution_ids=[execution_id])
+            if caller_matches(execution_id, route_ref)
+            else blocked("caller_identity_mismatch")
+        )
+    if len(completed) != 2:
+        return blocked("terminal_prefix_shape")
+    expected = (
+        ("route_gate", "observer_bind_direct_scope", "contract_binding"),
+        ("graph_first", "observer_graph_context", "graph_trace"),
+    )
+    for line, (stage_id, line_id, evidence_kind) in zip(completed, expected):
+        if not _contract_runtime_strict_no_pass_bypass_audit(
+            conn, project_id=project_id, record=current, line=line,
+            expected_stage_id=stage_id, expected_line_id=line_id,
+            expected_blocked_evidence_kind=evidence_kind,
+            expected_event_task_ids={execution_id}, runtime_context_id="",
+            task_id=execution_id, line_instance_id="",
+            expected_actor_roles={"observer"},
+            expected_blocked_owner_role="observer",
+            line_instance_required=False,
+        ):
+            return blocked("terminal_prefix_audit")
+    generation = _contract_runtime_no_pass_generation(current)
+    second_payload = completed[1].get("payload")
+    second_payload = second_payload if isinstance(second_payload, Mapping) else {}
+    inherited = second_payload.get("no_pass_generation")
+    inherited = inherited if isinstance(inherited, Mapping) else {}
+    next_line = _contract_runtime_next_line(current)
+    exact_generation = (
+        str(row["status"] or "").upper() == "OPEN"
+        and generation.get("root_generation_persisted") is True
+        and generation.get("root_completed_line_index") == 0
+        and generation.get("inherited_gate_count") == 1
+        and generation.get("no_pass_claim") is True
+        and generation.get("authoritative_pass_synthesized") is False
+        and str(inherited.get("role") or "") == "inherited_gate"
+        and inherited.get("generation_id") == generation.get("generation_id")
+        and inherited.get("root_diagnostic_backlog_id")
+        == generation.get("root_diagnostic_backlog_id")
+        and str(next_line.get("stage_id") or "") == "pre_mutation"
+        and str(next_line.get("line_id") or "")
+        == "observer_direct_implementation_exception"
+    )
+    if not exact_generation:
+        return blocked("terminal_generation_or_position")
+    if not caller_matches(execution_id, route_ref):
+        return blocked("caller_identity_mismatch")
+    revision = str(current.get("revision") or "").strip()
+    state_revision = int(current.get("execution_state_revision") or 0)
+    chain_id = str(current.get("contract_chain_id") or "").strip()
+    namespace_hash = str(world.get("namespace_hash") or "").strip()
+    generation_id = str(generation.get("generation_id") or "").strip()
+    diagnostic_id = str(generation.get("root_diagnostic_backlog_id") or "").strip()
+    if not all((revision, state_revision, chain_id, namespace_hash,
+                generation_id, diagnostic_id)):
+        return blocked("successor_identity_incomplete")
+    successor_id = _contract_runtime_stable_id(
+        "cex-direct-main-successor", project_id, backlog_id, execution_id,
+        revision, state_revision, chain_id, namespace_hash,
+        generation_id, diagnostic_id,
+    )
+    return result(
+        "exact_terminal_predecessor",
+        predecessor_contract_execution_id=execution_id,
+        expected_successor_contract_execution_id=successor_id,
+        no_pass_generation_id=generation_id,
+    )
 
 def _operator_supervised_direct_main_selected_execution_identity(
     conn,

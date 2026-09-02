@@ -199587,10 +199587,36 @@ def _prepare_ac_dev_direct_route_bootstrap(
     *,
     backlog_id: str,
     source_free: bool = False,
+    public_open_backlog: bool = False,
 ):
     project_id = "aming-claw"
     _initialize_ac_dev_guide_schema(conn)
-    _insert_simple_mf_close_backlog(conn, backlog_id)
+    if public_open_backlog:
+        monkeypatch.setattr(
+            server,
+            "get_connection",
+            lambda _project_id: _NoCloseConn(conn),
+        )
+        filed = server.handle_backlog_upsert(
+            _ctx(
+                {"project_id": project_id, "bug_id": backlog_id},
+                method="POST",
+                body={
+                    "title": "AC dev Direct operational terminal predecessor",
+                    "status": "OPEN",
+                    "priority": "P0",
+                    "target_files": ["agent/governance/server.py"],
+                    "test_files": ["agent/tests/test_graph_governance_api.py"],
+                    "mf_type": "chain_rescue",
+                    "bypass_policy": {"mf_type": "chain_rescue"},
+                    "force_admit": True,
+                },
+            )
+        )
+        assert filed["ok"] is True
+        assert filed["action"] == "upserted"
+    else:
+        _insert_simple_mf_close_backlog(conn, backlog_id)
     if source_free:
         source_free_actions = [
             "fresh_onboard_route_guide",
@@ -199658,7 +199684,7 @@ def _prepare_ac_dev_direct_route_bootstrap(
                 backlog_id,
             ),
         )
-    else:
+    elif not public_open_backlog:
         conn.execute(
             "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
             (
@@ -205712,10 +205738,19 @@ def test_promotion_rollback_route_rejects_missing_stale_and_overbroad_authority(
 
 
 def _prepare_ac_dev_cross_plane_line_bypass(
-    conn, monkeypatch, tmp_path, *, backlog_id: str
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    backlog_id: str,
+    public_open_backlog: bool = False,
 ):
     prepared = _prepare_ac_dev_direct_route_bootstrap(
-        conn, monkeypatch, tmp_path, backlog_id=backlog_id
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+        public_open_backlog=public_open_backlog,
     )
     project_id = prepared["project_id"]
     issued = server.handle_observer_route_context_issue(
@@ -208930,3 +208965,192 @@ def test_version_special_authority_is_not_granted_to_stable_or_foreign_root(
         )
     )
     assert foreign_result["server_derived_dev_head_authority"] is False
+
+
+def test_ac_dev_direct_operational_terminal_selection_is_exact_and_read_only(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-DIRECT-OPERATIONAL-TERMINAL-SELECTION",
+        public_open_backlog=True,
+    )
+    first = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {
+                "project_id": case["project_id"],
+                "contract_execution_id": case["execution_id"],
+            },
+            method="POST",
+            body=case["body"],
+        )
+    )
+    assert first["written_line"]["actor_role"] == "observer"
+    assert first["written_line"].get("line_instance_id") in (None, "")
+
+    record = server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )
+    guide = server._contract_runtime_guide_for_response(
+        record, actor_role="observer"
+    )
+    second_body = copy.deepcopy(
+        guide["line_bypass_guidance"]["inherited_bypass_copy_safe_body"]
+    )
+    for key in (
+        "classification",
+        "reason",
+        "decision",
+        "evidence_refs",
+        "task_id",
+        "observer_session_id",
+        "observer_route_token_ref",
+    ):
+        second_body[key] = copy.deepcopy(case["body"][key])
+    second = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {
+                "project_id": case["project_id"],
+                "contract_execution_id": case["execution_id"],
+            },
+            method="POST",
+            body=second_body,
+        )
+    )
+    assert second["written_line"]["actor_role"] == "observer"
+    assert second["written_line"].get("line_instance_id") in (None, "")
+    assert conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id=?",
+        (case["guide"]["backlog_id"],),
+    ).fetchone()[0] == "OPEN"
+    ordinary_id = "AC-DEV-DIRECT-OPERATIONAL-ORDINARY"
+    _insert_simple_mf_close_backlog(conn, ordinary_id)
+
+    def select(backlog_id=case["guide"]["backlog_id"], **claims):
+        return server._operator_supervised_direct_main_operational_terminal_selection(
+            conn,
+            project_id=case["project_id"],
+            backlog_id=backlog_id,
+            **claims,
+        )
+
+    storage_before = tuple(conn.iterdump())
+    changes_before = conn.total_changes
+    ordinary = select(ordinary_id)
+    exact = select(
+        caller_contract_execution_id=case["execution_id"],
+        caller_route_token_ref=case["route_token_ref"],
+    )
+    repeat = select()
+    wrong_task = select(caller_contract_execution_id="cex-caller-laundering")
+    wrong_route = select(caller_route_token_ref="rtok-caller-laundering")
+    assert ordinary["state"] == "ordinary"
+    assert exact["state"] == "exact_terminal_predecessor", json.dumps(exact)
+    assert exact["expected_successor_contract_execution_id"] == repeat[
+        "expected_successor_contract_execution_id"
+    ]
+    assert exact["expected_successor_contract_execution_id"].startswith(
+        "cex-direct-main-successor-"
+    )
+    assert wrong_task == {
+        **{key: exact[key] for key in (
+            "schema_version", "server_derived", "caller_claims_trusted", "read_only"
+        )},
+        "state": "blocked",
+        "reason": "caller_identity_mismatch",
+    }
+    assert wrong_route["state"] == "blocked"
+
+    def unexpected_authority_read(*_args, **_kwargs):
+        raise AssertionError("guard must reject before family/audit reads")
+
+    with monkeypatch.context() as stable_guard:
+        stable_guard.setattr(server, "_runtime_plane", lambda: "stable")
+        stable_guard.setattr(
+            server,
+            "_operator_supervised_direct_main_strict_records",
+            unexpected_authority_read,
+        )
+        stable_guard.setattr(
+            server,
+            "_contract_runtime_strict_no_pass_bypass_audit",
+            unexpected_authority_read,
+        )
+        stable = select()
+    with monkeypatch.context() as foreign_guard:
+        foreign_guard.setattr(
+            server,
+            "_operator_supervised_direct_main_dev_world_authority",
+            unexpected_authority_read,
+        )
+        foreign_guard.setattr(
+            server,
+            "_operator_supervised_direct_main_strict_records",
+            unexpected_authority_read,
+        )
+        foreign = server._operator_supervised_direct_main_operational_terminal_selection(
+            conn, project_id="foreign-project",
+            backlog_id=case["guide"]["backlog_id"],
+        )
+    assert stable["reason"] == "runtime_plane"
+    assert foreign["reason"] == "project_scope"
+
+    persisted_route = server._operator_supervised_direct_main_route_authority(
+        conn, project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        contract_execution_id=case["execution_id"],
+        route_token_ref=case["route_token_ref"],
+    )
+    with monkeypatch.context() as missing_route:
+        missing_route.setattr(
+            server, "_operator_supervised_direct_main_route_authority",
+            lambda *_args, **_kwargs: {"accepted": False},
+        )
+        route_missing = select()
+    mismatched_route = copy.deepcopy(persisted_route)
+    mismatched_route["route_identity"]["route_id"] = "route-mismatch"
+    with monkeypatch.context() as route_mismatch:
+        route_mismatch.setattr(
+            server, "_operator_supervised_direct_main_route_authority",
+            lambda *_args, **_kwargs: copy.deepcopy(mismatched_route),
+        )
+        route_identity_mismatch = select()
+    assert route_missing["reason"] == "route_authority"
+    assert route_identity_mismatch["reason"] == "route_authority"
+
+    current = server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )
+    divergent_current = copy.deepcopy(current)
+    divergent_current["completed_lines"] = divergent_current[
+        "completed_lines"
+    ][:1]
+
+    class DivergentRuntime:
+        def current_record(self, *_args, **_kwargs):
+            return copy.deepcopy(divergent_current)
+
+    with monkeypatch.context() as divergent:
+        divergent.setattr(
+            server, "_operator_supervised_direct_main_strict_records",
+            lambda *_args, **_kwargs: [copy.deepcopy(current)],
+        )
+        divergent.setattr(
+            server, "_contract_runtime", lambda *_args, **_kwargs: DivergentRuntime()
+        )
+        no_composite = select()
+    assert no_composite["reason"] == "terminal_prefix_shape"
+
+    with monkeypatch.context() as sibling:
+        sibling.setattr(
+            server,
+            "_operator_supervised_direct_main_strict_records",
+            lambda *_args, **_kwargs: [record, copy.deepcopy(record)],
+        )
+        duplicate = select()
+    assert duplicate["state"] == "blocked"
+    assert duplicate["reason"] == "direct_family_cardinality"
+    assert tuple(conn.iterdump()) == storage_before
+    assert conn.total_changes == changes_before
