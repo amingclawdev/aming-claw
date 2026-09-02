@@ -205975,6 +205975,132 @@ def test_ac_dev_cross_plane_line_bypass_accepts_real_ancestor_runtime_upgrade(
     ] is False
 
 
+def test_ac_dev_cross_plane_line_bypass_accepts_exact_renewed_route(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-CROSS-PLANE-RENEWED-ROUTE",
+    )
+    renewed = observer_route_context.renew_route_token_ref(
+        conn, project_id=case["project_id"],
+        storage_project_id=server._route_registry_storage_project_id(
+            case["project_id"]),
+        route_token_ref=case["route_token_ref"],
+        backlog_id=case["guide"]["backlog_id"],
+        task_id=case["execution_id"], caller_role="observer",
+        project_root=tmp_path,
+    )
+    body = {
+        **case["body"],
+        "observer_route_token_ref": renewed["route_token_ref"],
+    }
+    record = server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )
+    before = tuple(conn.iterdump())
+    with monkeypatch.context() as stable:
+        stable.setattr(server, "_runtime_plane", lambda: "stable")
+        assert server._contract_runtime_dev_direct_line_bypass_derived_authority(
+            _ctx({}, method="POST", body=body), conn,
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            contract_execution_id=case["execution_id"],
+            route_token_ref=renewed["route_token_ref"], record=record,
+        ) is False
+    assert tuple(conn.iterdump()) == before
+    accepted = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {"project_id": case["project_id"],
+             "contract_execution_id": case["execution_id"]},
+            method="POST", body=body,
+        )
+    )
+    assert accepted["written_line"]["status"] == "waived"
+    assert accepted["written_line"]["no_pass_claim"] is True
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "unknown", "forged", "cross_scope", "required_action",
+        "target_files", "owned_files", "route_context_hash",
+    ],
+)
+def test_ac_dev_cross_plane_line_bypass_rejects_unproven_renewed_route(
+    conn, monkeypatch, tmp_path, tamper,
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id=f"AC-DEV-CROSS-PLANE-RENEWED-{tamper.upper()}",
+    )
+    storage_project = server._route_registry_storage_project_id(
+        case["project_id"]
+    )
+    renewed = observer_route_context.renew_route_token_ref(
+        conn, project_id=case["project_id"],
+        storage_project_id=storage_project,
+        route_token_ref=case["route_token_ref"],
+        backlog_id=case["guide"]["backlog_id"],
+        task_id=case["execution_id"], caller_role="observer",
+        project_root=tmp_path,
+    )
+    route_ref = renewed["route_token_ref"]
+    if tamper == "unknown":
+        route_ref = "rtok-renewed-unknown"
+    elif tamper == "forged":
+        forged = observer_route_context.issue_observer_write_route_context(
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            task_id=case["execution_id"],
+            target_files=["agent/governance/server.py"],
+            allowed_actions=list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+        )
+        route_ref = forged["route_token_ref"]
+        observer_route_context.persist_route_token_ref(
+            conn, project_id=case["project_id"],
+            storage_project_id=storage_project,
+            route_token_ref=route_ref, token=forged["route_token"],
+        )
+    else:
+        column, value = {
+            "cross_scope": (
+                "scope_json",
+                json.dumps({
+                    "project_id": case["project_id"],
+                    "backlog_id": "AC-WRONG", "task_id": case["execution_id"],
+                }),
+            ),
+            "required_action": ("allowed_actions_json", json.dumps(["graph_query"])),
+            "target_files": ("target_files_json", json.dumps(["wrong.py"])),
+            "owned_files": ("owned_files_json", json.dumps(["wrong.py"])),
+            "route_context_hash": ("route_context_hash", _fake_sha("wrong-route")),
+        }[tamper]
+        conn.execute(
+            f"UPDATE observer_route_token_refs SET {column}=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (value, storage_project, route_ref),
+        )
+        conn.commit()
+    body = {
+        **case["body"], "observer_route_token_ref": route_ref,
+    }
+    record = server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )
+    before = tuple(conn.iterdump())
+    assert server._contract_runtime_dev_direct_line_bypass_derived_authority(
+        _ctx({}, method="POST", body=body), conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        contract_execution_id=case["execution_id"],
+        route_token_ref=route_ref, record=record,
+    ) is False
+    assert tuple(conn.iterdump()) == before
+
+
 def test_ac_dev_cross_plane_rejects_mixed_stored_target_and_loaded_commits(
     conn, monkeypatch, tmp_path
 ):

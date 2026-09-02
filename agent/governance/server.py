@@ -125375,6 +125375,28 @@ def _contract_runtime_dev_direct_line_bypass_derived_authority(
     )
     metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
     stored_route = metadata.get("operator_supervised_direct_main_route_authority", {})
+    if not isinstance(stored_route, Mapping):
+        return False
+    stored_route_ref = str(stored_route.get("route_token_ref") or "")
+    active_route = {}
+    if stored_route_ref != route_token_ref:
+        binding = metadata.get("operator_supervised_direct_main_runtime_binding")
+        binding = binding if isinstance(binding, Mapping) else {}
+        immutable_identity = binding.get("route_identity") or {}
+        if (
+            isinstance(immutable_identity, Mapping)
+            and stored_route.get("route_identity") == immutable_identity
+            and stored_route_ref
+            == str(immutable_identity.get("route_token_ref") or "")
+        ):
+            active_route = _operator_supervised_direct_main_active_route_authority(
+                conn, project_id=project_id, backlog_id=backlog_id,
+                task_id=contract_execution_id,
+                immutable_route_identity=immutable_identity,
+                active_route_token_ref=route_token_ref,
+                expected_files=binding.get("owned_files") or [],
+                required_action="observer_direct_mutation_exception",
+            )
     if not (
         root_route.get("accepted") is True
         and isinstance(stored_route, Mapping)
@@ -125382,7 +125404,15 @@ def _contract_runtime_dev_direct_line_bypass_derived_authority(
         and str(stored_route.get("project_id") or "") == project_id
         and str(stored_route.get("backlog_id") or "") == backlog_id
         and stored_route.get("contract_execution_id") == contract_execution_id
-        and str(stored_route.get("route_token_ref") or "") == route_token_ref
+        and (
+            stored_route_ref == route_token_ref
+            or (
+                active_route.get("passed") is True
+                and active_route.get("route_token_ref_chain")
+                == [stored_route_ref, route_token_ref]
+                and active_route.get("edge_types") == ["renewal"]
+            )
+        )
     ):
         return False
     current = _contract_runtime(conn).current_record(
