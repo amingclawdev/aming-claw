@@ -208103,6 +208103,9 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
                 body=request_body,
             )
         )
+    assert blocked["dev_local_graph_bootstrap"][
+        "current_full_reconcile_ready"
+    ] is False
     assert blocked["dev_local_graph_bootstrap"]["state"] == "incompatible"
     assert blocked["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
     assert blocked["next_legal_action"]["query_ready"] is False
@@ -208171,37 +208174,252 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
                 )
             )
 
-    stale_candidate = store.create_graph_snapshot(
+    predecessor_commit = "6606f0d4e4b49e10c422c04d993895c458e702b9"
+    predecessor_candidate = store.create_graph_snapshot(
         conn,
         "aming-claw",
-        snapshot_id="dev-onboard-stale-active",
-        commit_sha="f" * 40,
+        snapshot_id="dev-onboard-active-6606",
+        commit_sha=predecessor_commit,
         snapshot_kind="full",
     )
     store.activate_graph_snapshot(
         conn,
         "aming-claw",
-        stale_candidate["snapshot_id"],
+        predecessor_candidate["snapshot_id"],
         auto_rebuild_projection=False,
     )
-    conn.commit()
-    monkeypatch.setattr(
-        store,
-        "_current_full_snapshot_provenance_binding",
-        lambda *_args, **_kwargs: {"verified": True},
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id="aming-claw",
+        snapshot_id=predecessor_candidate["snapshot_id"],
+        target_commit_sha=predecessor_commit,
+        request_id="req-dev-onboard-active-6606",
+        request_started_at="2026-09-01T12:00:00Z",
+        route_evidence={
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "authenticated_role": "observer",
+            "authentication_source": "observer_session_route_token_ref",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+        reconcile_event_id=6606,
+        reconcile_event_created_at="2026-09-01T12:01:00Z",
+        marker_created_at="2026-09-01T12:01:01Z",
     )
-    stale_active = server.handle_project_onboard_route_guide(
+    conn.commit()
+    ancestor_calls = []
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda root, old, new: ancestor_calls.append(
+            (root, old, new)
+        )
+        or (old == predecessor_commit and new == case["commit"]),
+    )
+    protected_before = tuple(conn.iterdump())
+    changes_before = conn.total_changes
+    descendant = server.handle_project_onboard_route_guide(
         _ctx(
             {"project_id": case["project_id"]},
             method="POST",
             body=request_body,
         )
     )
-    assert stale_active["dev_local_graph_bootstrap"]["state"] == "incompatible"
-    assert stale_active["dev_local_graph_bootstrap"][
-        "local_active_graph_present"
+    descendant_bootstrap = descendant["dev_local_graph_bootstrap"]
+    descendant_action = descendant["next_legal_action"]
+    assert descendant_bootstrap["state"] == (
+        "same_wip_descendant_active_predecessor"
+    )
+    assert descendant_bootstrap["local_active_graph_present"] is True
+    assert descendant_bootstrap[
+        "same_wip_descendant_active_predecessor"
     ] is True
+    assert descendant_bootstrap["graph_query_ready"] is False
+    assert descendant_bootstrap["current_full_reconcile_ready"] is True
+    assert descendant_action["mcp_tool"] == "graph_current_full_reconcile"
+    assert descendant_action["copy_safe_body"][
+        "expected_old_snapshot_id"
+    ] == predecessor_candidate["snapshot_id"]
+    assert descendant_action["copy_safe_body"]["run_id"] == (
+        "current-full-" + case["commit"][:7]
+    )
+    assert "snapshot_id" not in descendant_action["copy_safe_body"]
+    assert ancestor_calls == [
+        (case["root"], predecessor_commit, case["commit"])
+    ]
+    assert tuple(conn.iterdump()) == protected_before
+    assert conn.total_changes == changes_before
+
+    descendant_http_body = dict(descendant_action["copy_safe_body"])
+    descendant_http_body.pop("project_id")
+    assert descendant_http_body == descendant_bootstrap[
+        "bootstrap_authority"
+    ]["expected_http_body"]
+    with monkeypatch.context() as descendant_request:
+        descendant_request.setattr(
+            server,
+            "admit_ac_dev_graph_materialization_schema",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                BootstrapAdmissionReached()
+            ),
+        )
+        with pytest.raises(BootstrapAdmissionReached):
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx(
+                    {"project_id": case["project_id"]},
+                    method="POST",
+                    body=copy.deepcopy(descendant_http_body),
+                )
+            )
+    assert tuple(conn.iterdump()) == protected_before
+    assert conn.total_changes == changes_before
+
+    with monkeypatch.context() as non_descendant:
+        non_descendant.setattr(
+            server,
+            "_git_commit_is_ancestor",
+            lambda *_args: False,
+        )
+        blocked = server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=request_body,
+            )
+        )
+    assert blocked["dev_local_graph_bootstrap"]["state"] == "incompatible"
+    assert blocked["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
+    assert tuple(conn.iterdump()) == protected_before
+    assert conn.total_changes == changes_before
+
+    with monkeypatch.context() as dirty:
+        dirty.setattr(server, "_git_clean_worktree_verified", lambda _root: False)
+        blocked = server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=request_body,
+            )
+        )
+    assert blocked["dev_local_graph_bootstrap"]["state"] == "incompatible"
+    assert blocked["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
+    assert tuple(conn.iterdump()) == protected_before
+    assert conn.total_changes == changes_before
+
+    with monkeypatch.context() as bad_provenance:
+        bad_provenance.setattr(
+            store,
+            "_current_full_snapshot_provenance_binding",
+            lambda *_args, **_kwargs: {"verified": False},
+        )
+        stale_active = server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=request_body,
+            )
+        )
+    assert stale_active["dev_local_graph_bootstrap"]["state"] == "incompatible"
     assert stale_active["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
+    assert tuple(conn.iterdump()) == protected_before
+    assert conn.total_changes == changes_before
+
+    def assert_temporary_uniqueness_denial(
+        *,
+        statement: str,
+        params: tuple[Any, ...],
+        cleanup: tuple[str, tuple[Any, ...]],
+        gate: str,
+    ) -> None:
+        conn.execute(statement, params)
+        conn.commit()
+        try:
+            mutated_before = tuple(conn.iterdump())
+            mutated_changes = conn.total_changes
+            blocked_guide = server.handle_project_onboard_route_guide(
+                _ctx(
+                    {"project_id": case["project_id"]},
+                    method="POST",
+                    body=request_body,
+                )
+            )
+            blocked_projection = blocked_guide["dev_local_graph_bootstrap"]
+            assert blocked_projection["state"] == "incompatible"
+            assert blocked_projection["current_full_reconcile_ready"] is False
+            assert blocked_projection["bootstrap_authority"][gate] is False
+            assert blocked_guide["next_legal_action"]["mcp_tool"] == (
+                "onboard_route_guide"
+            )
+            assert tuple(conn.iterdump()) == mutated_before
+            assert conn.total_changes == mutated_changes
+        finally:
+            conn.execute(cleanup[0], cleanup[1])
+            conn.commit()
+        assert tuple(conn.iterdump()) == protected_before
+
+    snapshot_columns = [
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(graph_snapshots)").fetchall()
+    ]
+    predecessor_row = dict(
+        conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            ("aming-claw", predecessor_candidate["snapshot_id"]),
+        ).fetchone()
+    )
+    duplicate_active = dict(predecessor_row)
+    duplicate_active["snapshot_id"] = "dev-onboard-second-active-status"
+    assert_temporary_uniqueness_denial(
+        statement=(
+            f"INSERT INTO graph_snapshots ({','.join(snapshot_columns)}) "
+            f"VALUES ({','.join('?' for _ in snapshot_columns)})"
+        ),
+        params=tuple(duplicate_active[column] for column in snapshot_columns),
+        cleanup=(
+            "DELETE FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            ("aming-claw", duplicate_active["snapshot_id"]),
+        ),
+        gate="unique_full_active_status",
+    )
+    assert_temporary_uniqueness_denial(
+        statement=(
+            "INSERT INTO graph_snapshot_refs "
+            "(project_id,ref_name,snapshot_id,commit_sha,updated_at) "
+            "VALUES (?,?,?,?,?)"
+        ),
+        params=(
+            "aming-claw",
+            "refs/heads/codex/extra-active-alias",
+            predecessor_candidate["snapshot_id"],
+            predecessor_commit,
+            "2026-09-01T12:02:00Z",
+        ),
+        cleanup=(
+            "DELETE FROM graph_snapshot_refs WHERE project_id=? AND ref_name=?",
+            ("aming-claw", "refs/heads/codex/extra-active-alias"),
+        ),
+        gate="unique_default_active_ref",
+    )
+
+    wrong_route_body = {
+        **request_body,
+        "route_token_ref": "rtok-stale-descendant-predecessor",
+    }
+    wrong_route_before = tuple(conn.iterdump())
+    wrong_route_changes = conn.total_changes
+    wrong_route_guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=wrong_route_body,
+        )
+    )
+    assert "dev_local_graph_bootstrap" not in wrong_route_guide
+    assert (
+        wrong_route_guide.get("next_legal_action") or {}
+    ).get("mcp_tool") != "graph_current_full_reconcile"
+    assert tuple(conn.iterdump()) == wrong_route_before
+    assert conn.total_changes == wrong_route_changes
 
     candidate = store.create_graph_snapshot(
         conn,

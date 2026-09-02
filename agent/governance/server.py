@@ -95896,7 +95896,81 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "require_clean": True,
         "semantic_use_ai": False,
     }
-    request_body_exact = body is not None and dict(body) == expected_body
+    target_commit = str(expected_body["target_commit_sha"] or "").lower()
+    target_root = Path(str(world.get("target_project_root") or ""))
+    target_identity = {
+        "status": "materialization_required",
+        "snapshot_id": _current_full_deterministic_snapshot_id(target_commit),
+    }
+    if readiness_compatible and readiness is None and target_commit:
+        target_identity = _current_full_requested_snapshot_identity(
+            conn,
+            project_id=project_id,
+            target_commit_sha=target_commit,
+        )
+    target_identity_missing = bool(
+        materialization_required
+        or target_identity.get("status") == "missing"
+    )
+    active_commit = str(active_snapshot.get("commit_sha") or "").lower()
+    active_snapshot_id = str(active_snapshot.get("snapshot_id") or "").strip()
+    active_ref_rows = []
+    active_status_rows = []
+    active_binding: dict[str, Any] = {}
+    if local_active_graph_present:
+        from . import graph_snapshot_store as store
+
+        active_ref_rows = conn.execute(
+            "SELECT ref_name,snapshot_id,commit_sha FROM graph_snapshot_refs "
+            "WHERE project_id=? AND (ref_name='active' OR snapshot_id=?)",
+            (project_id, active_snapshot_id),
+        ).fetchall()
+        active_status_rows = conn.execute(
+            "SELECT snapshot_id,commit_sha,snapshot_kind,status "
+            "FROM graph_snapshots WHERE project_id=? AND status='active'",
+            (project_id,),
+        ).fetchall()
+        active_binding = store._current_full_snapshot_provenance_binding(
+            conn,
+            project_id,
+            active_snapshot,
+        )
+    unique_default_active_ref = bool(
+        len(active_ref_rows) == 1
+        and str(active_ref_rows[0]["ref_name"] or "").strip() == "active"
+        and str(active_ref_rows[0]["snapshot_id"] or "").strip()
+        == active_snapshot_id
+        and str(active_ref_rows[0]["commit_sha"] or "").strip().lower()
+        == active_commit
+    )
+    unique_full_active_status = bool(
+        len(active_status_rows) == 1
+        and str(active_status_rows[0]["snapshot_id"] or "").strip()
+        == active_snapshot_id
+        and str(active_status_rows[0]["commit_sha"] or "").strip().lower()
+        == active_commit
+        and str(active_status_rows[0]["snapshot_kind"] or "").strip()
+        == "full"
+    )
+    active_provenance_exact = bool(
+        active_binding.get("verified") is True
+        and str(active_binding.get("snapshot_id") or "").strip()
+        == active_snapshot_id
+        and str(active_binding.get("snapshot_commit") or "").strip().lower()
+        == active_commit
+        and str(
+            active_binding.get("provenance_target_commit") or ""
+        ).strip().lower()
+        == active_commit
+    )
+    canonical_dev_world = bool(
+        world.get("runtime_plane") == "dev"
+        and int(world.get("runtime_port") or 0) == AC_DEV_SERVICE_PORT
+        and world.get("branch") == AC_DEV_BRANCH
+        and world.get("target_ref") == f"refs/heads/{AC_DEV_BRANCH}"
+        and str(world.get("worktree_path") or "")
+        == str(world.get("target_project_root") or "")
+    )
     worktree_clean = bool(
         world.get("target_project_root")
         and expected_body["target_commit_sha"]
@@ -95906,11 +95980,36 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
             Path(str(world["target_project_root"]))
         )
     )
+    same_wip_descendant_active_predecessor = bool(
+        readiness_compatible
+        and readiness is None
+        and local_active_graph_present
+        and unique_default_active_ref
+        and unique_full_active_status
+        and active_provenance_exact
+        and str(active_snapshot.get("ref_name") or "").strip() == ""
+        and str(active_snapshot.get("branch_ref") or "").strip() == ""
+        and canonical_dev_world
+        and worktree_clean
+        and target_identity_missing
+        and active_commit
+        and target_commit
+        and active_commit != target_commit
+        and _git_commit_is_ancestor(target_root, active_commit, target_commit)
+    )
+    if same_wip_descendant_active_predecessor:
+        expected_body["expected_old_snapshot_id"] = active_snapshot_id
+    request_body_exact = body is not None and dict(body) == expected_body
     eligibility_checks = {
         "strict_direct_graph_first_route_session": strict_direct_position,
         "compatible_graph_materialization_preimage": readiness_compatible,
         "graph_materialization_required_or_exact_schema_no_local_active": (
-            materialization_required or exact_schema_no_local_active
+            materialization_required
+            or exact_schema_no_local_active
+            or same_wip_descendant_active_predecessor
+        ),
+        "deterministic_target_snapshot_identity_missing": (
+            target_identity_missing
         ),
         "classified_dev_cow_runtime_custody": custody_verified,
         "exact_ac_dev_project_world": bool(
@@ -95937,6 +96036,21 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "materialization_required": materialization_required,
         "exact_schema_no_local_active": exact_schema_no_local_active,
         "local_active_graph_present": local_active_graph_present,
+        "same_wip_descendant_active_predecessor": (
+            same_wip_descendant_active_predecessor
+        ),
+        "active_predecessor_snapshot_id": (
+            active_snapshot_id
+            if same_wip_descendant_active_predecessor
+            else ""
+        ),
+        "active_predecessor_commit": (
+            active_commit if same_wip_descendant_active_predecessor else ""
+        ),
+        "unique_default_active_ref": unique_default_active_ref,
+        "unique_full_active_status": unique_full_active_status,
+        "active_predecessor_provenance_verified": active_provenance_exact,
+        "target_snapshot_identity": dict(target_identity),
         "contract_runtime_first_missing_line": next_line_id,
         "route_session_authority_verified": strict_direct_position,
         "runtime_custody_verified": custody_verified,
@@ -150495,7 +150609,13 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                     if graph_readiness is None
                     else {}
                 ) or {}
-                if active_snapshot:
+                if (
+                    active_snapshot
+                    and active_snapshot.get("status") == "active"
+                    and active_snapshot.get("snapshot_kind") == "full"
+                    and str(active_snapshot.get("commit_sha") or "").lower()
+                    == str(dev_world.get("target_head_commit") or "").lower()
+                ):
                     active_binding = (
                         _graph_store._current_full_snapshot_provenance_binding(
                             conn,
@@ -150525,25 +150645,6 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                             active_snapshot.get("snapshot_id") or ""
                         ),
                         "writes_performed": False,
-                    }
-                elif active_snapshot:
-                    graph_bootstrap_projection = {
-                        "schema_version": "onboard_route_guide.dev_local_graph_bootstrap.v1",
-                        "state": "incompatible",
-                        "local_active_graph_present": bool(active_snapshot),
-                        "graph_query_ready": False,
-                        "current_full_reconcile_ready": False,
-                        "error": "exact_active_current_full_required",
-                        "writes_performed": False,
-                    }
-                    next_action = {
-                        "schema_version": "onboard_route_guide.next_action.v1",
-                        "id": "dev_local_graph_active_incompatible",
-                        "action": "refresh_onboard_route_guide_after_graph_repair",
-                        "mcp_tool": "onboard_route_guide",
-                        "action_input_ready": False,
-                        "query_ready": False,
-                        "current_full_reconcile_ready": False,
                     }
                 else:
                     bootstrap_auth: dict[str, Any] = {}
@@ -150592,12 +150693,26 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         bootstrap_authority.get("eligible") is True
                         and action_input
                     )
+                    descendant_predecessor = bool(
+                        bootstrap_authority.get(
+                            "same_wip_descendant_active_predecessor"
+                        )
+                        is True
+                    )
                     graph_bootstrap_projection = {
                         "schema_version": "onboard_route_guide.dev_local_graph_bootstrap.v1",
                         "state": (
-                            "materialization_required_no_local_active"
-                            if graph_readiness is not None
-                            else "exact_schema_no_local_active"
+                            "same_wip_descendant_active_predecessor"
+                            if descendant_predecessor
+                            else (
+                                "incompatible"
+                                if active_snapshot
+                                else (
+                                    "materialization_required_no_local_active"
+                                    if graph_readiness is not None
+                                    else "exact_schema_no_local_active"
+                                )
+                            )
                         ),
                         "materialization_required": bool(
                             bootstrap_authority.get("materialization_required")
@@ -150607,7 +150722,16 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                                 "exact_schema_no_local_active"
                             )
                         ),
-                        "local_active_graph_present": False,
+                        "local_active_graph_present": bool(active_snapshot),
+                        "same_wip_descendant_active_predecessor": (
+                            descendant_predecessor
+                        ),
+                        "active_predecessor_snapshot_id": str(
+                            bootstrap_authority.get(
+                                "active_predecessor_snapshot_id"
+                            )
+                            or ""
+                        ),
                         "graph_query_ready": False,
                         "current_full_reconcile_ready": eligible,
                         "contract_runtime_first_missing_line": str(
@@ -150637,6 +150761,10 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         "writes_performed": False,
                         "contract_runtime_line_advanced": False,
                     }
+                    if active_snapshot and not descendant_predecessor:
+                        graph_bootstrap_projection["error"] = (
+                            "exact_active_current_full_required"
+                        )
                     if eligible:
                         next_action = {
                             "schema_version": "onboard_route_guide.next_action.v1",
@@ -150653,6 +150781,16 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                             "authorizes_write": False,
                             "synthesizes_qa": False,
                             "synthesizes_pass": False,
+                        }
+                    elif active_snapshot:
+                        next_action = {
+                            "schema_version": "onboard_route_guide.next_action.v1",
+                            "id": "dev_local_graph_active_incompatible",
+                            "action": "refresh_onboard_route_guide_after_graph_repair",
+                            "mcp_tool": "onboard_route_guide",
+                            "action_input_ready": False,
+                            "query_ready": False,
+                            "current_full_reconcile_ready": False,
                         }
                     else:
                         next_action = {
