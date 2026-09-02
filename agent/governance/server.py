@@ -15417,7 +15417,6 @@ def _qa_exact_candidate_comparison_authority_required(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
-            contract_execution_id=task_id,
         )
         if backlog_id
         else {}
@@ -197868,7 +197867,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                     selection_conn,
                     project_id=project_id,
                     backlog_id=backlog_id,
-                    contract_execution_id=task_id,
+                    contract_execution_id=(task_id if _operator_supervised_direct_main_strict_records(selection_conn, project_id=project_id, backlog_id=backlog_id, contract_execution_id=task_id) else ""),
                 )
             )
         finally:
@@ -198498,6 +198497,12 @@ def _handle_task_timeline_append(ctx: RequestContext):
             .replace(".", "_")
             .replace("-", "_"),
         }
+        direct_task_id = str(ctx.body.get("task_id") or "").strip()
+        strict_direct_task_id = direct_task_id if (
+            trusted_contract_runtime_actor_role in {"observer", "qa"}
+            and direct_event_tokens.intersection(_PARENTLESS_DIRECT_MAIN_GRAPH_LINEAGE_CARRIER_EVENT_KINDS | {"observer_direct_implementation_exception", "reconcile", "current_full_reconcile", "qa"})
+            and _operator_supervised_direct_main_strict_records(conn, project_id=project_id, backlog_id=str(ctx.body.get("backlog_id") or "").strip(), contract_execution_id=direct_task_id)
+        ) else ""
         if direct_event_tokens.intersection(
             {
                 "mf_observer_direct_implementation_exception",
@@ -198585,9 +198590,7 @@ def _handle_task_timeline_append(ctx: RequestContext):
                     backlog_id=str(
                         ctx.body.get("backlog_id") or ""
                     ).strip(),
-                    contract_execution_id=str(
-                        ctx.body.get("task_id") or ""
-                    ).strip(),
+                    contract_execution_id=strict_direct_task_id,
                 )
             )
             strict_direct_execution_id = str(
@@ -198600,7 +198603,7 @@ def _handle_task_timeline_append(ctx: RequestContext):
             )
             if (
                 strict_direct_selection.get("ambiguous") is True
-                and str(ctx.body.get("task_id") or "").strip()
+                and direct_task_id
                 in set(
                     strict_direct_selection.get(
                         "candidate_execution_ids"
@@ -199338,7 +199341,6 @@ def _handle_task_timeline_append(ctx: RequestContext):
                 norm_payload["runtime_deployment_authority"] = dict(
                     runtime_deployment_authority
                 )
-        direct_task_id = str(ctx.body.get("task_id") or "").strip()
         selected_direct = (
             _operator_supervised_direct_main_selected_execution_identity(
                 conn,
@@ -199346,7 +199348,7 @@ def _handle_task_timeline_append(ctx: RequestContext):
                 backlog_id=str(
                     ctx.body.get("backlog_id") or ""
                 ).strip(),
-                contract_execution_id=direct_task_id,
+                contract_execution_id=strict_direct_task_id,
             )
         )
         expected_direct_task_id = str(

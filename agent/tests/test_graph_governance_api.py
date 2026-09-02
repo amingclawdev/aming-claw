@@ -125403,7 +125403,9 @@ def test_direct_main_guide_keeps_pinned_rev2_and_rejects_mixed_revision_ambiguit
     timeline_count_before = conn.execute(
         "SELECT COUNT(*) FROM task_timeline_events"
     ).fetchone()[0]
-    for candidate_task_id in (rev2_task_id, rev3_task_id):
+    for candidate_task_id in (
+        rev2_task_id, rev3_task_id, "cex-direct-main-unknown",
+    ):
         candidate_changes_before = conn.total_changes
         with pytest.raises(GovernanceError) as timeline_blocked:
             server.handle_task_timeline_append(
@@ -184129,7 +184131,7 @@ def test_exact_candidate_direct_main_events_require_unique_strict_rev2_record(
             "task_id": strict_task_id,
             "commit_sha": "c" * 40,
         },
-    ) is True
+    ) is False
 
     assert server._qa_exact_candidate_direct_main_events(
         object(),
