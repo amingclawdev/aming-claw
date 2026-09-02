@@ -201550,6 +201550,28 @@ def test_ac_dev_live_route_renew_is_physical_idempotent_and_stable_invisible(
     ) is None
 
 
+def test_ac_dev_route_renew_http_path_body_project_mismatch_is_zero_write(
+    monkeypatch,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+
+    with pytest.raises(ValidationError) as rejected:
+        server._guard_runtime_world_request(
+            method="POST",
+            path="/api/projects/aming-claw/observer/route-context/renew",
+            path_params={"project_id": "aming-claw"},
+            body={"project_id": "content-sys"},
+            query={},
+            token="",
+        )
+
+    assert rejected.value.message == "runtime_world_project_identity_ambiguous"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["project_domain_enforced_pre_database"] is True
+
+
 @pytest.mark.parametrize(
     "attack_kind",
     [

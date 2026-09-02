@@ -2267,6 +2267,71 @@ def test_observer_route_context_issue_mcp_boundaries_strip_raw_route_token(monke
     )
 
 
+def test_observer_route_context_renew_dispatchers_forward_exact_guide_body(monkeypatch):
+    arguments = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-RENEW-ADAPTER",
+        "task_id": "cex-direct-main-renew-adapter",
+        "route_token_ref": "rtok-direct-renew-adapter",
+        "observer_session_id": "obs-direct-renew-adapter",
+    }
+    expected = {**arguments, "caller_role": "observer"}
+    result = {
+        "ok": True,
+        "route_token_ref": "rtok-direct-renew-adapter-next",
+        "raw_route_token_exposed": False,
+    }
+
+    recorder = _Recorder()
+    recorder.api = lambda method, path, data=None: (
+        recorder.calls.append((method, path, data)) or result
+    )
+    assert _dispatcher(recorder).dispatch(
+        "observer_route_context_renew", arguments
+    ) == result
+
+    stdio_calls = []
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http",
+        lambda method, path, data=None: (
+            stdio_calls.append((method, path, data)) or result
+        ),
+    )
+    assert governance_mcp_server._dispatch_tool(
+        "observer_route_context_renew", arguments
+    ) == result
+
+    expected_call = (
+        "POST",
+        "/api/projects/aming-claw/observer/route-context/renew",
+        expected,
+    )
+    assert recorder.calls == [expected_call]
+    assert stdio_calls == [expected_call]
+    body_hashes = {
+        hashlib.sha256(
+            json.dumps(call[2], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        for call in (recorder.calls[0], stdio_calls[0])
+    }
+    assert len(body_hashes) == 1
+    assert set(expected) == {
+        "project_id",
+        "caller_role",
+        "backlog_id",
+        "task_id",
+        "route_token_ref",
+        "observer_session_id",
+    }
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        schema = next(
+            item for item in registry
+            if item["name"] == "observer_route_context_renew"
+        )
+        assert "route_token" not in schema["inputSchema"]["properties"]
+
+
 def test_backlog_upsert_accepts_structured_acceptance_scope_without_breaking_strings():
     for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
         tool = next(item for item in registry if item["name"] == "backlog_upsert")

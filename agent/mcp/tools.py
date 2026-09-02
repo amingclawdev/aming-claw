@@ -8218,7 +8218,7 @@ class ToolDispatcher:
             body = {
                 key: value
                 for key, value in args.items()
-                if key != "project_id" and value is not None
+                if value is not None
             }
             body.setdefault("caller_role", "observer")
             return self._api("POST", f"/api/projects/{pid}/observer/route-context/renew", body)
