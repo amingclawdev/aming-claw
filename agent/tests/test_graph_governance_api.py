@@ -20981,13 +20981,15 @@ def test_source_free_reconcile_rejects_multiple_exact_active_sessions_order_inde
         "obs-source-free-cardinality-a",
         "obs-source-free-cardinality-b",
     ):
-        assert server._source_free_reconcile_unique_active_session(
+        assert server._unique_active_route_bound_observer_session(
             conn,
             project_id=PID,
             session_id=body_session_id,
             route_token_ref=route_ref,
-            route_id=f"route-{route_ref}",
-            route_context_hash=_fake_sha(f"{route_ref}:context"),
+            route_identity={
+                "route_id": f"route-{route_ref}",
+                "route_context_hash": _fake_sha(f"{route_ref}:context"),
+            },
             backlog_id=backlog_id,
             task_id=task_id,
         ) == {}
@@ -21021,25 +21023,38 @@ def test_source_free_reconcile_accepts_only_body_bound_unique_active_session(con
     )
     conn.commit()
 
-    accepted = server._source_free_reconcile_unique_active_session(
+    accepted = server._unique_active_route_bound_observer_session(
         conn,
         project_id=PID,
         session_id=session_id,
         route_token_ref=route_ref,
-        route_id=f"route-{route_ref}",
-        route_context_hash=_fake_sha(f"{route_ref}:context"),
+        route_identity={
+            "route_id": f"route-{route_ref}",
+            "route_context_hash": _fake_sha(f"{route_ref}:context"),
+        },
         backlog_id=backlog_id,
         task_id=task_id,
     )
     assert accepted["session_id"] == session_id
     assert accepted["capabilities"]["route_provenance"] == provenance
-    assert server._source_free_reconcile_unique_active_session(
+    assert server._unique_active_route_bound_observer_session(
         conn,
         project_id=PID,
         session_id="obs-foreign-body-session",
         route_token_ref=route_ref,
-        route_id=f"route-{route_ref}",
-        route_context_hash=_fake_sha(f"{route_ref}:context"),
+        route_identity={
+            "route_id": f"route-{route_ref}",
+            "route_context_hash": _fake_sha(f"{route_ref}:context"),
+        },
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) == {}
+    assert server._unique_active_route_bound_observer_session(
+        conn,
+        project_id=PID,
+        session_id=session_id,
+        route_token_ref=route_ref,
+        route_identity={},
         backlog_id=backlog_id,
         task_id=task_id,
     ) == {}
@@ -209456,7 +209471,25 @@ def _prepare_ac_dev_direct_terminal_predecessor(
     conn.commit()
     assert first["written_line"]["actor_role"] == "observer"
     assert second["written_line"]["actor_role"] == "observer"
-    return case
+    register_status, registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body={
+                "project_id": case["project_id"],
+                "route_token_ref": case["route_token_ref"],
+                "backlog_id": case["guide"]["backlog_id"],
+                "task_id": case["execution_id"],
+                "cex_id": case["execution_id"],
+            },
+        )
+    )
+    assert register_status == 201
+    return {
+        **case,
+        "session_id": registered["observer_session_id"],
+        "session_token": registered["session_token"],
+    }
 
 
 def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(
@@ -209471,6 +209504,7 @@ def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(
     request = {
         "task_id": case["execution_id"],
         "route_token_ref": case["route_token_ref"],
+        "observer_session_id": case["session_id"],
     }
 
     created = server._ac_dev_direct_terminal_successor_response(
@@ -209585,13 +209619,157 @@ def test_ac_dev_direct_terminal_successor_rollback_without_receipt_is_zero_write
         route_token_ref=case["route_token_ref"],
         role="observer",
         work_type="rollback_or_recover_contract",
-        request_body={"task_id": case["execution_id"]},
+        request_body={
+            "task_id": case["execution_id"],
+            "observer_session_id": case["session_id"],
+        },
         request_selector_claims=None,
     )
     assert result["state"] == "blocked"
     assert result["reason"] == "rollback_receipt_required"
     assert result["writes_performed"] is False
     assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "missing", "revoked", "foreign", "route_ref", "route_id",
+        "route_context", "backlog", "task", "cex", "duplicate",
+    ],
+)
+def test_ac_dev_direct_terminal_successor_requires_unique_active_route_session(
+    conn, monkeypatch, tmp_path, attack,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=f"AC-DEV-DIRECT-TERMINAL-SUCCESSOR-SESSION-{attack.upper()}",
+    )
+    request = {
+        "task_id": case["execution_id"],
+        "observer_session_id": case["session_id"],
+    }
+    if attack == "missing":
+        request.pop("observer_session_id")
+    elif attack == "foreign":
+        foreign_backlog = "AC-DEV-DIRECT-TERMINAL-SUCCESSOR-SESSION-FOREIGN-ROUTE"
+        foreign_task = "cex-direct-main-session-foreign-route"
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=case["project_id"],
+            backlog_id=foreign_backlog,
+            task_id=foreign_task,
+            target_files=["agent/governance/server.py"],
+            allowed_actions=["observer_session_register"],
+            evidence_refs=[foreign_task],
+            ttl_hours=1,
+        )
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=case["project_id"],
+            storage_project_id=server._route_registry_storage_project_id(
+                case["project_id"]
+            ),
+            route_token_ref=issued["route_token_ref"],
+            token=issued["route_token"],
+        )
+        status, foreign = server.handle_observer_session_register(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body={
+                    "project_id": case["project_id"],
+                    "route_token_ref": issued["route_token_ref"],
+                    "backlog_id": foreign_backlog,
+                    "task_id": foreign_task,
+                    "cex_id": foreign_task,
+                },
+            )
+        )
+        assert status == 201
+        request["observer_session_id"] = foreign["observer_session_id"]
+    elif attack == "revoked":
+        revoked = server.handle_observer_session_revoke(
+            _ctx(
+                {
+                    "project_id": case["project_id"],
+                    "session_id": case["session_id"],
+                },
+                method="POST",
+                body={"session_token": case["session_token"]},
+            )
+        )
+        assert revoked["status"] == observer_session.SESSION_STATUS_REVOKED
+    elif attack == "duplicate":
+        status, duplicate = server.handle_observer_session_register(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body={
+                    "project_id": case["project_id"],
+                    "route_token_ref": case["route_token_ref"],
+                    "backlog_id": case["guide"]["backlog_id"],
+                    "task_id": case["execution_id"],
+                    "cex_id": case["execution_id"],
+                },
+            )
+        )
+        assert status == 201
+        assert duplicate["observer_session_id"] != case["session_id"]
+    else:
+        row = conn.execute(
+            "SELECT capabilities_json FROM observer_sessions WHERE project_id=? AND session_id=?",
+            (case["project_id"], case["session_id"]),
+        ).fetchone()
+        capabilities = json.loads(row["capabilities_json"])
+        field = {
+            "route_ref": "route_token_ref",
+            "route_id": "route_id",
+            "route_context": "route_context_hash",
+            "backlog": "backlog_id",
+            "task": "task_id",
+            "cex": "cex_id",
+        }[attack]
+        capabilities["route_provenance"][field] = f"foreign-{field}"
+        conn.execute(
+            "UPDATE observer_sessions SET capabilities_json=? WHERE project_id=? AND session_id=?",
+            (json.dumps(capabilities), case["project_id"], case["session_id"]),
+        )
+        conn.commit()
+    selection = server._operator_supervised_direct_main_operational_terminal_selection(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        caller_contract_execution_id=case["execution_id"],
+        caller_route_token_ref=case["route_token_ref"],
+    )
+    successor_id = selection["expected_successor_contract_execution_id"]
+    before = tuple(conn.iterdump())
+    changes_before = conn.total_changes
+    result = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="continue_contract_chain",
+        request_body=request,
+        request_selector_claims=None,
+    )
+    assert result["reason"] == "predecessor_observer_session_authority"
+    assert result["writes_performed"] is False
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == changes_before
+    assert conn.execute(
+        "SELECT 1 FROM observer_route_token_refs WHERE task_id=? LIMIT 1",
+        (successor_id,),
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT 1 FROM task_timeline_events WHERE project_id=? AND backlog_id=? "
+        "AND event_type='contract_runtime.direct_terminal_successor' LIMIT 1",
+        (case["project_id"], case["guide"]["backlog_id"]),
+    ).fetchone() is None
 
 
 @pytest.mark.parametrize("failure_stage", ["start", "binding", "record", "audit", "oversize"])
@@ -209636,7 +209814,10 @@ def test_ac_dev_direct_terminal_successor_create_failures_are_atomic(
             route_token_ref=case["route_token_ref"],
             role="observer",
             work_type="continue_contract_chain",
-            request_body={"task_id": case["execution_id"]},
+            request_body={
+                "task_id": case["execution_id"],
+                "observer_session_id": case["session_id"],
+            },
             request_selector_claims=None,
         )
     assert tuple(conn.iterdump()) == before
@@ -209660,7 +209841,10 @@ def test_ac_dev_direct_terminal_successor_blocked_hook_never_falls_back(
         route_token_ref=case["route_token_ref"],
         role="observer",
         work_type="rollback_or_recover_contract",
-        request_body={"task_id": case["execution_id"]},
+        request_body={
+            "task_id": case["execution_id"],
+            "observer_session_id": case["session_id"],
+        },
     )
     assert result["reason"] == "rollback_receipt_required"
     assert result["writes_performed"] is False
@@ -209754,7 +209938,10 @@ def test_ac_dev_direct_terminal_successor_denials_are_zero_write(
         worlds = iter((original_world_ref, changed))
         monkeypatch.setattr(server, "_operator_supervised_direct_main_world_ref", lambda **_kwargs: next(worlds))
     before = tuple(conn.iterdump())
-    request = {"task_id": case["execution_id"]}
+    request = {
+        "task_id": case["execution_id"],
+        "observer_session_id": case["session_id"],
+    }
     route_ref = case["route_token_ref"]
     selector_claims = None
     if attack == "claims":

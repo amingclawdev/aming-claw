@@ -146073,19 +146073,20 @@ def _backlog_source_free_operation_authority(
     return authority
 
 
-def _source_free_reconcile_unique_active_session(
+def _unique_active_route_bound_observer_session(
     conn,
     *,
     project_id: str,
     session_id: str,
     route_token_ref: str,
-    route_id: str,
-    route_context_hash: str,
+    route_identity: Mapping[str, Any],
     backlog_id: str,
     task_id: str,
 ) -> dict[str, Any]:
     """Return the body-bound session iff route provenance has cardinality one."""
 
+    route_id = str(route_identity.get("route_id") or "")
+    route_context_hash = str(route_identity.get("route_context_hash") or "")
     matching_active_sessions: list[dict[str, Any]] = []
     try:
         session_rows = conn.execute(
@@ -146222,13 +146223,12 @@ def _completed_source_free_reconcile_authority(
         if isinstance(route, Mapping)
         else ""
     )
-    unique_session = _source_free_reconcile_unique_active_session(
+    unique_session = _unique_active_route_bound_observer_session(
         conn,
         project_id=project_id,
         session_id=session_id,
         route_token_ref=route_token_ref,
-        route_id=route_id,
-        route_context_hash=route_context_hash,
+        route_identity=(route if isinstance(route, Mapping) else {}),
         backlog_id=backlog_id,
         task_id=task_id,
     )
@@ -151816,7 +151816,6 @@ def _ac_dev_direct_terminal_successor_response(
         return {"schema_version": "ac_dev_direct_terminal_successor.v1", "ok": False,
                 "state": "blocked", "reason": reason, "writes_performed": False,
                 "safe_retry": False}
-    created = False
     with sqlite_write_lock():
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -151851,6 +151850,12 @@ def _ac_dev_direct_terminal_successor_response(
             )
             if predecessor_authority.get("accepted") is not True:
                 return blocked("predecessor_route_authority")
+            session_id = str(request_body.get("observer_session_id") or "").strip() \
+                if isinstance(request_body, Mapping) else ""
+            if not session_id or not _unique_active_route_bound_observer_session(
+                conn, project_id=project_id, session_id=session_id, route_token_ref=predecessor_route,
+                route_identity=predecessor_authority["route_identity"], backlog_id=backlog_id, task_id=predecessor_id):
+                return blocked("predecessor_observer_session_authority")
             child = records.get(successor_id)
             created = child is None
             if created:
@@ -151912,8 +151917,6 @@ def _ac_dev_direct_terminal_successor_response(
                            "direct_terminal_successor_receipt": {
                                "schema_version": "contract_runtime.direct_terminal_successor_receipt.v1",
                                "core": core, "receipt_hash": receipt_hash, "capsule_hash": capsule["capsule_hash"]}}
-                if _onboard_guide_capsule_serialized_bytes(payload) > _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES:
-                    return blocked("successor_receipt_oversized")
                 from . import task_timeline
                 task_timeline.record_event(
                     conn, project_id=project_id, backlog_id=backlog_id, task_id=predecessor_id,
