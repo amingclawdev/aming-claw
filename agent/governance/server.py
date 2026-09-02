@@ -18954,6 +18954,7 @@ def _observer_parentless_direct_main_graph_world_authority(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
+            contract_execution_id=task_id,
         )
         if backlog_id
         else {}
@@ -149274,13 +149275,24 @@ def _operator_supervised_direct_main_selected_execution_identity(
     *,
     project_id: str,
     backlog_id: str,
+    contract_execution_id: str = "",
 ) -> dict[str, Any]:
     """Select one pinned record, otherwise the registry-owned fresh revision."""
 
-    records = _operator_supervised_direct_main_strict_records(
+    contract_execution_id = str(contract_execution_id or "").strip()
+    family_records = _operator_supervised_direct_main_strict_records(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
+    )
+    records = (
+        [
+            record for record in family_records
+            if str(record.get("contract_execution_id") or "").strip()
+            == contract_execution_id
+        ]
+        if contract_execution_id
+        else family_records
     )
     if len(records) > 1:
         return {
@@ -149307,16 +149319,30 @@ def _operator_supervised_direct_main_selected_execution_identity(
         }
     definition = _operator_supervised_direct_main_fresh_definition()
     revision = str(definition.get("revision") or "").strip()
+    fresh_execution_id = (
+        _operator_supervised_direct_main_execution_id(
+            project_id, backlog_id, revision=revision,
+        )
+        if revision
+        else ""
+    )
+    if contract_execution_id and (
+        family_records or contract_execution_id != fresh_execution_id
+    ):
+        return {
+            "resolved": False,
+            "ambiguous": False,
+            "blocked": True,
+            "source": "exact_record_not_found",
+            "contract_execution_id": contract_execution_id,
+            "records": [],
+        }
     return {
         "resolved": bool(revision),
         "ambiguous": False,
         "source": "fresh_registry_authority",
         "contract_execution_id": (
-            _operator_supervised_direct_main_execution_id(
-                project_id,
-                backlog_id,
-                revision=revision,
-            )
+            fresh_execution_id
             if revision
             else ""
         ),

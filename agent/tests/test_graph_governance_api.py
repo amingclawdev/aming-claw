@@ -209457,13 +209457,16 @@ def test_ac_dev_direct_terminal_successor_plan_and_receipt_primitives(
             )
 
 
-def _prepare_ac_dev_direct_terminal_predecessor(
+def _prepare_ac_dev_direct_terminal_predecessor_case(
     conn, monkeypatch, tmp_path, *, backlog_id: str,
 ):
-    case = _prepare_ac_dev_cross_plane_line_bypass(
+    return _prepare_ac_dev_cross_plane_line_bypass(
         conn, monkeypatch, tmp_path,
         backlog_id=backlog_id, public_open_backlog=True,
     )
+
+
+def _complete_ac_dev_direct_terminal_predecessor(conn, case):
     first = server.handle_project_contract_runtime_line_bypass(
         _ctx(
             {"project_id": case["project_id"],
@@ -209512,6 +209515,231 @@ def _prepare_ac_dev_direct_terminal_predecessor(
         "session_id": registered["observer_session_id"],
         "session_token": registered["session_token"],
     }
+
+
+def _prepare_ac_dev_direct_terminal_predecessor(
+    conn, monkeypatch, tmp_path, *, backlog_id: str,
+):
+    return _complete_ac_dev_direct_terminal_predecessor(
+        conn,
+        _prepare_ac_dev_direct_terminal_predecessor_case(
+            conn, monkeypatch, tmp_path, backlog_id=backlog_id,
+        ),
+    )
+
+
+def test_direct_graph_selection_pins_exact_successor_and_never_falls_back(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-DIRECT-GRAPH-EXACT-SUCCESSOR-SELECTOR",
+    )
+    default_parent = (
+        server._operator_supervised_direct_main_selected_execution_identity(
+            conn,
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+        )
+    )
+    exact_parent = (
+        server._operator_supervised_direct_main_selected_execution_identity(
+            conn,
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            contract_execution_id=case["execution_id"],
+        )
+    )
+    assert exact_parent == default_parent
+
+    created = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="continue_contract_chain",
+        request_body={
+            "task_id": case["execution_id"],
+            "observer_session_id": case["session_id"],
+        },
+        request_selector_claims=None,
+    )
+    child_id = created["successor_contract_execution_id"]
+    child = server._contract_runtime(conn).current_record(
+        child_id, actor_role="observer"
+    )
+    selected_child = (
+        server._operator_supervised_direct_main_selected_execution_identity(
+            conn,
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            contract_execution_id=child_id,
+        )
+    )
+    assert selected_child["resolved"] is True
+    assert selected_child["contract_execution_id"] == child_id
+    assert server._operator_supervised_direct_main_selected_execution_identity(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+    )["ambiguous"] is True
+
+    before = tuple(conn.iterdump())
+    unknown = server._operator_supervised_direct_main_selected_execution_identity(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        contract_execution_id="cex-direct-main-foreign",
+    )
+    assert unknown == {
+        "resolved": False,
+        "ambiguous": False,
+        "blocked": True,
+        "source": "exact_record_not_found",
+        "contract_execution_id": "cex-direct-main-foreign",
+        "records": [],
+    }
+    foreign_authority = (
+        server._observer_parentless_direct_main_graph_world_authority(
+            conn,
+            project_id=case["project_id"],
+            body={
+                "query_source": "observer",
+                "query_purpose": "gate_validation",
+            },
+            route_proof={
+                "backlog_id": case["guide"]["backlog_id"],
+                "task_id": "cex-direct-main-foreign",
+                "route_token_ref": child["route_token_ref"],
+            },
+            action="graph-governance.query",
+        )
+    )
+    assert foreign_authority == {}
+    assert tuple(conn.iterdump()) == before
+
+
+def test_direct_graph_query_exact_successor_binds_current_world_before_write(
+    conn, monkeypatch, tmp_path,
+):
+    case = _advance_ac_dev_cross_plane_world(
+        conn,
+        _prepare_ac_dev_direct_terminal_predecessor_case(
+            conn, monkeypatch, tmp_path,
+            backlog_id="AC-DEV-DIRECT-GRAPH-EXACT-SUCCESSOR-WORLD",
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(case["current_world"]),
+    )
+    case = _complete_ac_dev_direct_terminal_predecessor(conn, case)
+    created = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="continue_contract_chain",
+        request_body={
+            "task_id": case["execution_id"],
+            "observer_session_id": case["session_id"],
+        },
+        request_selector_claims=None,
+    )
+    child_id = created["successor_contract_execution_id"]
+    child = server._contract_runtime(conn).current_record(
+        child_id, actor_role="observer"
+    )
+    body = {
+        "snapshot_id": "active",
+        "tool": "query_schema",
+        "args": {},
+        "query_source": "observer",
+        "query_purpose": "gate_validation",
+        "backlog_id": case["guide"]["backlog_id"],
+        "task_id": child_id,
+        "route_token_ref": child["route_token_ref"],
+    }
+    monkeypatch.setattr(
+        governance_db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "active_graph_activation_allowed": True,
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "port": 40008,
+            "cow_successor_verified": True,
+            "source_checkout_verified": True,
+            "live_runtime_custody_verified": True,
+        },
+    )
+    governance_db.admit_ac_dev_graph_materialization_schema(
+        conn, project_id=case["project_id"]
+    )
+    graph_query_trace.ensure_schema(conn)
+    _activate_basic_graph(
+        conn,
+        "full-direct-successor-stale-world",
+        project_id=case["project_id"],
+        commit_sha="f" * 40,
+    )
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": case["project_id"]},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(body),
+            )
+        )
+    assert rejected.value.code == "observer_direct_main_graph_world_mismatch"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+    _activate_basic_graph(
+        conn,
+        "full-direct-successor-current-world",
+        project_id=case["project_id"],
+        commit_sha=case["current_commit"],
+    )
+    queried = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": case["project_id"]},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(body),
+        )
+    )
+    identity = queried["graph_query_identity"]
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": case["project_id"], "trace_id": queried["trace_id"]})
+    )["trace"]
+    assert trace["task_id"] == child_id
+    assert trace["commit_sha"] == case["current_commit"]
+    assert trace["root_identity"]["query_root_head_commit"] == (
+        case["current_commit"]
+    )
+    assert trace["root_identity"]["query_root"] == str(case["root"])
+    assert identity["root_identity_hash"].startswith("sha256:")
+    assert identity["query_root_identity_hash"].startswith("sha256:")
 
 
 def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(
