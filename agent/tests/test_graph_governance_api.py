@@ -210099,6 +210099,75 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
     )
     service_result = server.handle_observer_direct_mutation_exception(service_ctx)
     assert service_result["task_id"] == child_id
+    implementation_commit = _commit_test_git_files(
+        case["root"], ["implementation.py"],
+        message="implement exact child after pre-mutation evidence",
+    )
+    implementation_world = _fixed_ac_dev_direct_world(
+        case["root"], implementation_commit,
+    )
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(implementation_world),
+    )
+    implementation_onboard_body = {
+        **onboard_body, "target_head_commit": implementation_commit,
+    }
+    implementation_before = tuple(conn.iterdump())
+    implementation_stale = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]}, method="POST",
+            body=copy.deepcopy(implementation_onboard_body),
+        )
+    )
+    implementation_action = implementation_stale["next_legal_action"]
+    assert implementation_action["mcp_tool"] == "graph_current_full_reconcile"
+    assert implementation_action["graph_query_deferred"] is True
+    assert implementation_action["copy_safe_body"] == {
+        "project_id": case["project_id"],
+        "backlog_id": case["guide"]["backlog_id"],
+        "task_id": child_id,
+        "observer_session_id": registered["observer_session_id"],
+        "observer_route_token_ref": child["route_token_ref"],
+        "target_commit_sha": implementation_commit,
+        "run_id": "current-full-" + implementation_commit[:7],
+        "activate": True, "require_clean": True, "semantic_use_ai": False,
+        "expected_old_snapshot_id": "full-direct-successor-current-world",
+    }
+    assert tuple(conn.iterdump()) == implementation_before
+    for invalid_session in (
+        case["session_id"], "obs-missing-implementation-session",
+    ):
+        denied_before = tuple(conn.iterdump())
+        denied = server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": case["project_id"]}, method="POST",
+                body={
+                    **implementation_onboard_body,
+                    "observer_session_id": invalid_session,
+                },
+            )
+        )
+        assert denied.get("next_legal_action", {}).get("mcp_tool") != (
+            "graph_current_full_reconcile"
+        )
+        assert tuple(conn.iterdump()) == denied_before
+    activate_reconciled(
+        "full-direct-successor-current-implementation",
+        implementation_commit, 8833,
+    )
+    implementation_exact = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]}, method="POST",
+            body=copy.deepcopy(implementation_onboard_body),
+        )
+    )
+    assert implementation_exact["next_legal_action"]["mcp_tool"] == (
+        "task_timeline_append"
+    )
+    assert implementation_exact["next_legal_action"]["line_id"] == (
+        "observer_implementation"
+    )
 
 
 def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(

@@ -95845,7 +95845,10 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         direct_main_qa_preflight.get("applicable") is True
         and active_route_authority.get("passed") is True
         and direct_main_qa_preflight.get("contract_runtime_next_line_id")
-        in {"observer_bind_direct_scope", "observer_graph_context"}
+        in {
+            "observer_bind_direct_scope", "observer_graph_context",
+            "observer_implementation",
+        }
         and auth.get("role_source") == "observer_session_route_token_ref"
         and route_bound_session
         and str(route_scope.get("project_id") or "").strip() == project_id
@@ -97822,7 +97825,10 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             and direct_main_qa_preflight_authority.get(
                 "contract_runtime_next_line_id"
             )
-            in {"observer_bind_direct_scope", "observer_graph_context"}
+            in {
+                "observer_bind_direct_scope", "observer_graph_context",
+                "observer_implementation",
+            }
         )
         dev_graph_bootstrap_authority = (
             _dev_direct_graph_bootstrap_reconcile_authority(
@@ -150921,7 +150927,10 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             _runtime_plane() == "dev"
             and route_ready
             and contract_runtime_first_missing_line
-            in {"observer_bind_direct_scope", "observer_graph_context"}
+            in {
+                "observer_bind_direct_scope", "observer_graph_context",
+                "observer_implementation",
+            }
         ):
             try:
                 graph_readiness = _dev_graph_zero_write_readiness_projection(
