@@ -95827,14 +95827,27 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         )
         else {}
     )
+    session_id = str(auth.get("observer_session_id") or "").strip()
+    route_token_ref = str(auth.get("route_token_ref") or "").strip()
+    route_identity = (
+        active_route_authority.get("active_route_identity")
+        if isinstance(
+            active_route_authority.get("active_route_identity"), Mapping
+        )
+        else {}
+    )
+    route_bound_session = _unique_active_route_bound_observer_session(
+        conn, project_id=project_id, session_id=session_id,
+        route_token_ref=route_token_ref, route_identity=route_identity,
+        backlog_id=backlog_id, task_id=task_id,
+    )
     strict_direct_position = bool(
         direct_main_qa_preflight.get("applicable") is True
         and active_route_authority.get("passed") is True
         and direct_main_qa_preflight.get("contract_runtime_next_line_id")
-        == "observer_graph_context"
+        in {"observer_bind_direct_scope", "observer_graph_context"}
         and auth.get("role_source") == "observer_session_route_token_ref"
-        and str(auth.get("observer_session_id") or "").strip()
-        and str(auth.get("route_token_ref") or "").strip()
+        and route_bound_session
         and str(route_scope.get("project_id") or "").strip() == project_id
         and backlog_id
         and task_id
@@ -97809,7 +97822,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             and direct_main_qa_preflight_authority.get(
                 "contract_runtime_next_line_id"
             )
-            == "observer_graph_context"
+            in {"observer_bind_direct_scope", "observer_graph_context"}
         )
         dev_graph_bootstrap_authority = (
             _dev_direct_graph_bootstrap_reconcile_authority(
@@ -150856,7 +150869,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             _runtime_plane() == "dev"
             and route_ready
             and contract_runtime_first_missing_line
-            == "observer_graph_context"
+            in {"observer_bind_direct_scope", "observer_graph_context"}
         ):
             try:
                 graph_readiness = _dev_graph_zero_write_readiness_projection(
