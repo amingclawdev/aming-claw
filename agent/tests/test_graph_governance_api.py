@@ -210737,6 +210737,49 @@ def test_ac_dev_direct_terminal_successor_bad_route_guide_renew_and_replay(
     assert replay["route_token_ref"] == renewed["route_token_ref"]
     assert tuple(conn.iterdump()) == after_renew
 
+    child_before = server._contract_runtime(conn).current_record(
+        child_id, actor_role="observer"
+    )
+    start_before = tuple(conn.iterdump())
+    started = server._operator_supervised_direct_main_start_runtime(
+        conn, project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"], task_id=child_id,
+        route_token_ref=renewed["route_token_ref"],
+        world_ref=server._operator_supervised_direct_main_world_ref(
+            project_id=case["project_id"]),
+    )
+    assert started == child_before
+    assert tuple(conn.iterdump()) == start_before
+    with monkeypatch.context() as mismatched:
+        mismatched.setattr(
+            server, "_operator_supervised_direct_main_active_route_authority",
+            lambda *_args, **_kwargs: {
+                "passed": True, "active_route_identity": {"route_id": "wrong"},
+            },
+        )
+        with pytest.raises(GovernanceError) as rejected:
+            server._operator_supervised_direct_main_start_runtime(
+                conn, project_id=case["project_id"],
+                backlog_id=case["guide"]["backlog_id"], task_id=child_id,
+                route_token_ref=renewed["route_token_ref"], world_ref={},
+            )
+    assert rejected.value.code == (
+        "operator_supervised_direct_main_execution_binding_changed"
+    )
+    assert tuple(conn.iterdump()) == start_before
+    with monkeypatch.context() as stable:
+        stable.setattr(server, "_runtime_plane", lambda: "stable")
+        with pytest.raises(GovernanceError) as rejected:
+            server._operator_supervised_direct_main_start_runtime(
+                conn, project_id=case["project_id"],
+                backlog_id=case["guide"]["backlog_id"], task_id=child_id,
+                route_token_ref=renewed["route_token_ref"], world_ref={},
+            )
+    assert rejected.value.code == (
+        "operator_supervised_direct_main_execution_binding_changed"
+    )
+    assert tuple(conn.iterdump()) == start_before
+
 
 def test_ac_dev_direct_guide_does_not_recover_registration_capable_blocked_route(
     conn, monkeypatch, tmp_path,

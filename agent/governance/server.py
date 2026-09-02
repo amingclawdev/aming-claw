@@ -149855,11 +149855,33 @@ def _operator_supervised_direct_main_start_runtime(
         binding = metadata.get(
             "operator_supervised_direct_main_runtime_binding"
         ) or {}
-        if (
-            str(record.get("contract_execution_id") or "") != execution_id
-            or str(record.get("route_token_ref") or "") != route_token_ref
-            or dict(binding.get("route_identity") or {})
-            != dict(route_authority.get("route_identity") or {})
+        binding_identity = dict(binding.get("route_identity") or {})
+        same_route_binding = bool(
+            str(record.get("contract_execution_id") or "") == execution_id
+            and str(record.get("route_token_ref") or "") == route_token_ref
+            and binding_identity
+            == dict(route_authority.get("route_identity") or {})
+        )
+        active_route_authority = {}
+        if not same_route_binding and (
+            _runtime_plane() == "dev"
+            and project_id == "aming-claw"
+            and dev_world.get("accepted") is True
+        ):
+            active_route_authority = (
+                _operator_supervised_direct_main_active_route_authority(
+                    conn, project_id=project_id, backlog_id=backlog_id,
+                    task_id=execution_id,
+                    immutable_route_identity=binding_identity,
+                    active_route_token_ref=route_token_ref,
+                    expected_files=binding.get("owned_files") or [],
+                    required_action="observer_direct_mutation_exception",
+                )
+            )
+        if not same_route_binding and not (
+            active_route_authority.get("passed") is True
+            and active_route_authority.get("active_route_identity")
+            == route_authority.get("route_identity")
         ):
             raise GovernanceError(
                 "operator_supervised_direct_main_execution_binding_changed",
