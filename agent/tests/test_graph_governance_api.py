@@ -210052,20 +210052,51 @@ def test_ac_dev_direct_terminal_successor_bad_route_recovery_recognizer(
         conn, project_id=case["project_id"],
         backlog_id=case["guide"]["backlog_id"])
     world = server._operator_supervised_direct_main_dev_world_authority()
-    recognize = lambda route, replay=False: (
-        server._ac_dev_direct_route_renew_terminal_successor_authority(
+    def recognize(
+        route, replay=False, *, selected_family=family,
+        selected_session=case["session_id"], selected_world=world,
+    ):
+        return server._ac_dev_direct_route_renew_terminal_successor_authority(
             conn, project_id=case["project_id"],
-            backlog_id=case["guide"]["backlog_id"], family=family,
-            child_id=child_id, session_id=case["session_id"], world=world,
-            route=route, replay=replay))
+            backlog_id=case["guide"]["backlog_id"], family=selected_family,
+            child_id=child_id, session_id=selected_session, world=selected_world,
+            route=route, replay=replay)
+
     assert recognize(bad_route) == {
         "recovery_candidate": True, "recovery_authorized": False}
+    assert recognize(bad_route, selected_family=family[:1]) == {}
+    assert recognize(bad_route, selected_session="") == {}
+    assert recognize(
+        bad_route,
+        selected_world={**world, "namespace_hash": "sha256:" + "f" * 64},
+    ) == {}
     tampered = {**bad_route, "evidence_refs": ["contract_runtime:forged"]}
     assert recognize(tampered) == {}
+    before = tuple(conn.iterdump())
+    with monkeypatch.context() as drift:
+        drift.setattr(server, "_contract_chain_current_projection", lambda *a, **k: {})
+        assert recognize(bad_route) == {}
+    with monkeypatch.context() as drift:
+        plan = server._ac_dev_direct_terminal_successor_plan
+
+        def altered_plan(*args, **kwargs):
+            result = plan(*args, **kwargs)
+            result["immutable_child_projection"] = {
+                **result["immutable_child_projection"], "revision": "tampered"}
+            return result
+
+        drift.setattr(server, "_ac_dev_direct_terminal_successor_plan", altered_plan)
+        assert recognize(bad_route) == {}
+    assert tuple(conn.iterdump()) == before
 
     conn.execute("BEGIN IMMEDIATE")
     assert recognize(bad_route) == {
         "recovery_candidate": True, "recovery_authorized": True}
+    with monkeypatch.context() as drift:
+        drift.setattr(
+            server, "_ac_dev_direct_terminal_successor_receipt_audit",
+            lambda *a, **k: {"ok": False})
+        assert recognize(bad_route) == {}
     conn.rollback()
     renewed = observer_route_context.renew_route_token_ref(
         conn, project_id=case["project_id"], storage_project_id=storage_project,
@@ -210085,6 +210116,215 @@ def test_ac_dev_direct_terminal_successor_bad_route_recovery_recognizer(
         "evidence_refs": [f"contract_runtime:{child_id}"],
     }
     assert recognize(replay_tampered, replay=True) == {}
+    observer_route_context.renew_route_token_ref(
+        conn, project_id=case["project_id"], storage_project_id=storage_project,
+        route_token_ref=renewed["route_token_ref"],
+        backlog_id=case["guide"]["backlog_id"], task_id=child_id,
+        caller_role="observer", evidence_refs=[f"contract_runtime:{child_id}"],
+        project_root=tmp_path,
+    )
+    multi_hop = observer_route_context.resolve_route_token_ref_renewal_descendant(
+        conn, project_id=case["project_id"], storage_project_id=storage_project,
+        route_token_ref=bad_ref)
+    assert recognize(multi_hop, replay=True) == {}
+    progressed = server._contract_runtime(conn).store.get(child_id)
+    progressed["execution_state_revision"] = 2
+    server._contract_runtime(conn).store.update(
+        child_id, progressed, expected_revision=1)
+    conn.commit()
+    after_progress = tuple(conn.iterdump())
+    assert recognize(bad_route) == {}
+    assert tuple(conn.iterdump()) == after_progress
+
+
+def test_ac_dev_direct_terminal_successor_bad_route_guide_renew_and_replay(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-DIRECT-TERMINAL-SUCCESSOR-BAD-ROUTE-GUIDE",
+    )
+    mint = server._ac_dev_direct_mint_route_authority_persist
+
+    def mint_legacy_bad_route(*args, **kwargs):
+        expected = dict(kwargs["expected_body"])
+        expected["evidence_refs"] = []
+        return mint(*args, **{**kwargs, "expected_body": expected})
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            server, "_ac_dev_direct_mint_route_authority_persist",
+            mint_legacy_bad_route,
+        )
+        created = server._ac_dev_direct_terminal_successor_response(
+            conn, project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            route_token_ref=case["route_token_ref"], role="observer",
+            work_type="continue_contract_chain",
+            request_body={"task_id": case["execution_id"],
+                          "observer_session_id": case["session_id"]},
+            request_selector_claims=None,
+        )
+    child_id = created["successor_contract_execution_id"]
+    child = server._contract_runtime(conn).current_record(
+        child_id, actor_role="observer")
+    bad_ref = child["route_token_ref"]
+    canonical_body = {
+        "project_id": case["project_id"], "caller_role": "observer",
+        "backlog_id": case["guide"]["backlog_id"], "task_id": child_id,
+        "route_token_ref": bad_ref, "observer_session_id": case["session_id"],
+    }
+    guide = server._onboard_operator_supervised_direct_main_runtime_response(
+        conn, project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"], route_token_ref=bad_ref,
+        role="observer", work_type="operator_supervised_direct_main",
+        response_view="full", request_context=_ctx({"project_id": case["project_id"]}),
+        request_body={"task_id": child_id, "observer_session_id": case["session_id"]},
+    )
+    action = guide["next_legal_action"]
+    assert action["semantic_next_action"] == "observer_route_context_renew"
+    assert action["action_input"] == canonical_body
+    assert action["copy_safe_body"] == canonical_body
+    assert action["action_input_ready"] is True
+
+    without_session = server._onboard_operator_supervised_direct_main_runtime_response(
+        conn, project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"], route_token_ref=bad_ref,
+        role="observer", work_type="operator_supervised_direct_main",
+        response_view="full", request_context=_ctx({"project_id": case["project_id"]}),
+        request_body={"task_id": child_id},
+    )
+    assert without_session["ok"] is False
+    assert "next_legal_action" not in without_session
+    assert case["session_id"] not in json.dumps(without_session, sort_keys=True)
+
+    for shaped_body, shaped_query in (
+        ({**canonical_body, "evidence_refs": ["caller:forged"]}, {}),
+        (canonical_body, {"evidence_refs": ["caller:forged"]}),
+    ):
+        before = tuple(conn.iterdump())
+        with pytest.raises(GovernanceError) as rejected:
+            server.handle_observer_route_context_renew(
+                _ctx({"project_id": case["project_id"]}, method="POST",
+                     query=shaped_query, body=shaped_body)
+            )
+        assert rejected.value.code == "ac_dev_direct_route_renew_options_invalid"
+        assert tuple(conn.iterdump()) == before
+
+    renewed = server.handle_observer_route_context_renew(
+        _ctx({"project_id": case["project_id"]}, method="POST", body=canonical_body)
+    )
+    assert renewed["writes_performed"] is True
+    assert renewed["previous_route_token_ref"] == bad_ref
+    storage_project = server._route_registry_storage_project_id(case["project_id"])
+    assert conn.execute(
+        "SELECT status FROM observer_route_token_refs WHERE project_id=? "
+        "AND route_token_ref=?", (storage_project, bad_ref),
+    ).fetchone()["status"] == "superseded"
+    descendant = observer_route_context.resolve_route_token_ref_renewal_descendant(
+        conn, project_id=case["project_id"], storage_project_id=storage_project,
+        route_token_ref=bad_ref)
+    renewal = descendant["renewal_resolution"]
+    assert renewal["route_token_ref_chain"] == [bad_ref, renewed["route_token_ref"]]
+    assert renewal["edge_types"] == ["renewal"]
+    renewed_route = observer_route_context.resolve_route_token_ref(
+        conn, project_id=case["project_id"], storage_project_id=storage_project,
+        route_token_ref=renewed["route_token_ref"],
+        backlog_id=case["guide"]["backlog_id"], task_id=child_id)
+    old_route_id = child["metadata"][
+        "operator_supervised_direct_main_route_authority"]["route_identity"]["route_id"]
+    assert set(renewed_route["evidence_refs"]) == {
+        f"route:{old_route_id}", f"route:{renewed_route['route_id']}",
+        f"contract_runtime:{child_id}", f"renewed_from:{bad_ref}",
+    }
+    register_status, _registered = server.handle_observer_session_register(
+        _ctx({"project_id": case["project_id"]}, method="POST", body={
+            "project_id": case["project_id"],
+            "route_token_ref": renewed["route_token_ref"],
+            "backlog_id": case["guide"]["backlog_id"],
+            "task_id": child_id, "cex_id": child_id,
+        }))
+    assert register_status == 201
+    after_renew = tuple(conn.iterdump())
+    replay = server.handle_observer_route_context_renew(
+        _ctx({"project_id": case["project_id"]}, method="POST", body=canonical_body)
+    )
+    assert replay["writes_performed"] is False
+    assert replay["idempotent_replay"] is True
+    assert replay["route_token_ref"] == renewed["route_token_ref"]
+    assert tuple(conn.iterdump()) == after_renew
+
+
+def test_ac_dev_direct_guide_does_not_recover_registration_capable_blocked_route(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-DIRECT-REGISTRATION-CAPABLE-ROUTE-BLOCKED",
+    )
+    created = server._ac_dev_direct_terminal_successor_response(
+        conn, project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"], role="observer",
+        work_type="continue_contract_chain",
+        request_body={"task_id": case["execution_id"],
+                      "observer_session_id": case["session_id"]},
+        request_selector_claims=None,
+    )
+    child_id = created["successor_contract_execution_id"]
+    child_ref = created["route_token_ref"]
+    assert observer_route_context.resolve_observer_session_registration_route(
+        conn, project_id=case["project_id"],
+        storage_project_id=server._route_registry_storage_project_id(
+            case["project_id"]),
+        route_token_ref=child_ref, backlog_id=case["guide"]["backlog_id"],
+        task_id=child_id, cex_id=child_id,
+    )["route_provenance"]["cex_id"] == child_id
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_active_route_authority",
+        lambda *a, **k: {"passed": False, "status": "failed"})
+    guide = server._onboard_operator_supervised_direct_main_runtime_response(
+        conn, project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"], route_token_ref=child_ref,
+        role="observer", work_type="operator_supervised_direct_main",
+        response_view="full", request_context=_ctx({"project_id": case["project_id"]}),
+        request_body={"task_id": child_id,
+                      "observer_session_id": case["session_id"]},
+    )
+    assert guide["ok"] is False
+    assert guide["error"] == "operator_supervised_direct_main_route_binding_changed"
+    assert "next_legal_action" not in guide
+
+
+@pytest.mark.parametrize(
+    ("project_id", "runtime_plane"),
+    [("aming-claw", "stable"), ("other-project", "dev")],
+)
+def test_direct_guide_recovery_probe_is_ac_dev_only(
+    conn, monkeypatch, project_id, runtime_plane,
+):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: runtime_plane)
+    if runtime_plane == "dev":
+        monkeypatch.setattr(
+            server, "_operator_supervised_direct_main_dev_world_authority",
+            lambda: {
+                "accepted": True,
+                "namespace_hash": "sha256:" + "a" * 64,
+                "world_hash": "sha256:" + "b" * 64,
+            },
+        )
+    monkeypatch.setattr(
+        server, "_ac_dev_direct_route_renew_precheck",
+        lambda *a, **k: pytest.fail("recovery precheck escaped AC-dev guard"))
+    result = server._onboard_operator_supervised_direct_main_runtime_response(
+        conn, project_id=project_id, backlog_id="NO-DIRECT-RECORD",
+        route_token_ref="rtok-no-direct-record", role="observer",
+        work_type="operator_supervised_direct_main", response_view="full",
+        request_context=_ctx({"project_id": project_id}),
+        request_body={"observer_session_id": "obs-caller"},
+    )
+    assert result.get("next_legal_action", {}).get("semantic_next_action") \
+        != "observer_route_context_renew"
 
 
 def test_ac_dev_direct_exact_cex_filter_preserves_unpinned_family(

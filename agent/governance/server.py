@@ -150523,26 +150523,63 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         if strict_records and requested_ref
         else {}
     )
-    if (
-        strict_records
-        and requested_ref
+    route_blocked = bool(
+        strict_records and requested_ref
         and active_route_authority.get("passed") is not True
+    )
+    recovery_action: dict[str, Any] = {}
+    if (
+        project_id == "aming-claw" and dev_world.get("accepted") is True
+        and strict_records and requested_ref
     ):
+        session_id = str((request_body or {}).get("observer_session_id") or "").strip()
+        renew_body = {
+            "project_id": project_id, "caller_role": "observer",
+            "backlog_id": backlog_id, "task_id": execution_id,
+            "route_token_ref": requested_ref, "observer_session_id": session_id,
+        }
+        try:
+            recovery = _ac_dev_direct_route_renew_precheck(
+                conn, project_id=project_id, body=renew_body,
+                query=(request_context.query if request_context else {}))
+        except GovernanceError:
+            recovery = {}
+        if recovery.get("recovery_candidate") is True:
+            recovery_action = _observer_route_context_renewal_guidance(
+                project_id=project_id, backlog_id=backlog_id,
+                task_id=execution_id, route_token_ref=requested_ref,
+                observer_session_id=session_id,
+                reason="direct_terminal_successor_route_evidence_repair")
+            recovery_action.update({"action_input": renew_body,
+                                    "copy_safe_body": renew_body,
+                                    "action_input_ready": True})
+        if not recovery_action and not route_blocked:
+            from . import observer_route_context
+
+            try:
+                observer_route_context.resolve_observer_session_registration_route(
+                    conn, project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
+                    route_token_ref=requested_ref, backlog_id=backlog_id,
+                    task_id=execution_id, cex_id=execution_id)
+            except observer_route_context.RouteTokenRefError:
+                route_blocked = True
+    if route_blocked and not recovery_action:
         return {
-            "schema_version": (
-                "onboard_route_guide.operator_supervised_direct_main.v2"
-            ),
-            "ok": False,
-            "status": "blocked",
-            "error": "operator_supervised_direct_main_route_binding_changed",
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "contract_execution_id": execution_id,
-            "expected_route_token_ref": persisted_ref,
-            "requested_route_token_ref": requested_ref,
-            "active_route_authority": active_route_authority,
-            "writes_performed": False,
-            "zero_write_rejection": True,
+                    "schema_version": (
+                        "onboard_route_guide.operator_supervised_direct_main.v2"
+                    ),
+                    "ok": False,
+                    "status": "blocked",
+                    "error": "operator_supervised_direct_main_route_binding_changed",
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": execution_id,
+                    "expected_route_token_ref": persisted_ref,
+                    "requested_route_token_ref": requested_ref,
+                    "active_route_authority": active_route_authority,
+                    "writes_performed": False,
+                    "zero_write_rejection": True,
         }
     effective_ref = (
         requested_ref
@@ -151024,6 +151061,9 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                             "query_ready": False,
                             "current_full_reconcile_ready": False,
                         }
+
+    if recovery_action:
+        next_action = recovery_action
 
     public_current_record = (
         _operator_supervised_direct_main_public_runtime_record(current_record)
@@ -152575,7 +152615,14 @@ def _ac_dev_direct_route_renew_precheck(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
+        world_authority=world,
     )
+    recovery_family = list(records)
+    if len(records) == 2:
+        records = _operator_supervised_direct_main_strict_records(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            contract_execution_id=task_claim, world_authority=world,
+        )
     if len(records) != 1:
         raise _ac_dev_direct_route_renew_rejection(
             code="ac_dev_direct_route_renew_execution_invalid",
@@ -152729,6 +152776,19 @@ def _ac_dev_direct_route_renew_precheck(
             query=query_map,
             mismatch_fields=["route_token_ref"],
         )
+    recovery: dict[str, Any] = {}
+    if len(recovery_family) == 2:
+        recovery = _ac_dev_direct_route_renew_terminal_successor_authority(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            family=recovery_family, child_id=task_id, session_id=session_id,
+            world=world, route=(replay_route or active_route), replay=bool(replay_route))
+        if not recovery:
+            raise _ac_dev_direct_route_renew_rejection(
+                code="ac_dev_direct_route_renew_execution_invalid",
+                message="dev route renewal requires one exact Direct execution",
+                body=body, query=query_map,
+                mismatch_fields=["contract_execution_id"],
+            )
     return {
         "schema_version": "ac_dev_direct_route_renew.precheck.v1",
         "accepted": True,
@@ -152744,6 +152804,7 @@ def _ac_dev_direct_route_renew_precheck(
         "replay_route": dict(replay_route),
         "idempotent_replay": bool(replay_route),
         "zero_write_projection": True,
+        **recovery,
     }
 
 
@@ -152873,9 +152934,16 @@ def _handle_ac_dev_direct_route_context_renew(
                     body=body,
                     query=ctx.query,
                 )
+                for field in ("allowed_actions", "target_files", "owned_files", "evidence_refs"):
+                    if precheck.get("recovery_candidate") and (field in body or field in ctx.query):
+                        raise _ac_dev_direct_route_renew_rejection(
+                            code="ac_dev_direct_route_renew_options_invalid",
+                            message="successor route repair scope is server-derived",
+                            body=body, query=ctx.query, mismatch_fields=[field])
                 if precheck.get("idempotent_replay") is True:
                     conn.rollback()
                     return _ac_dev_direct_route_renew_replay_response(precheck)
+                repair = precheck.get("recovery_authorized") is True
                 renewed = observer_route_context.renew_route_token_ref(
                     conn,
                     project_id=project_id,
@@ -152884,18 +152952,19 @@ def _handle_ac_dev_direct_route_context_renew(
                     backlog_id=str(precheck["backlog_id"]),
                     task_id=str(precheck["task_id"]),
                     caller_role="observer",
-                    allowed_actions=(
+                    allowed_actions=(None if repair else (
                         _observer_route_context_issue_allowed_actions(
                             body.get("allowed_actions")
                         )
                         if body.get("allowed_actions") is not None
                         else None
-                    ),
-                    target_files=body.get("target_files"),
-                    owned_files=body.get("owned_files"),
+                    )),
+                    target_files=None if repair else body.get("target_files"),
+                    owned_files=None if repair else body.get("owned_files"),
                     ttl_hours=ttl_hours,
                     renew_within_seconds=renew_within_seconds,
-                    evidence_refs=body.get("evidence_refs"),
+                    evidence_refs=([f"contract_runtime:{precheck['task_id']}"]
+                                   if repair else body.get("evidence_refs")),
                     project_root=Path(
                         str(
                             (precheck.get("world_authority") or {}).get(
