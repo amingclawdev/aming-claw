@@ -125423,9 +125423,7 @@ def test_direct_main_guide_keeps_pinned_rev2_and_rejects_mixed_revision_ambiguit
                     },
                 )
             )
-        assert timeline_blocked.value.code == (
-            "operator_supervised_direct_main_execution_not_unique"
-        )
+        assert timeline_blocked.value.code == "route_token_required"
         assert timeline_blocked.value.details["zero_write_rejection"] is True
         assert timeline_blocked.value.details["writes_performed"] is False
         assert conn.total_changes == candidate_changes_before
@@ -184106,6 +184104,14 @@ def test_exact_candidate_direct_main_events_require_unique_strict_rev2_record(
         project_id=PID,
         backlog_id=backlog_id,
         task_id=strict_task_id,
+    ) == [event]
+
+    records.append(copy.deepcopy(records[0]))
+    assert server._qa_exact_candidate_direct_main_events(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=strict_task_id,
     ) == []
 
     records.clear()
@@ -184123,7 +184129,7 @@ def test_exact_candidate_direct_main_events_require_unique_strict_rev2_record(
             "task_id": strict_task_id,
             "commit_sha": "c" * 40,
         },
-    ) is False
+    ) is True
 
     assert server._qa_exact_candidate_direct_main_events(
         object(),

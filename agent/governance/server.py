@@ -14868,7 +14868,7 @@ def _qa_exact_candidate_direct_main_events(
         == task_id
     ]
     if matching_strict_records:
-        if len(strict_records) != 1 or len(matching_strict_records) != 1:
+        if len(matching_strict_records) != 1:
             return []
         strict_record = matching_strict_records[0]
         if not (
@@ -15051,7 +15051,7 @@ def _qa_exact_candidate_direct_main_comparison_authority(
         == task_id
     ]
     if matching_strict_records:
-        if len(strict_records) != 1 or len(matching_strict_records) != 1:
+        if len(matching_strict_records) != 1:
             return _qa_exact_candidate_direct_main_comparison_failure(
                 "exact_candidate_direct_main_runtime_binding_invalid",
                 field="strict_runtime_record_count",
@@ -15417,6 +15417,7 @@ def _qa_exact_candidate_comparison_authority_required(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
+            contract_execution_id=task_id,
         )
         if backlog_id
         else {}
@@ -197867,6 +197868,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                     selection_conn,
                     project_id=project_id,
                     backlog_id=backlog_id,
+                    contract_execution_id=task_id,
                 )
             )
         finally:
@@ -198582,6 +198584,9 @@ def _handle_task_timeline_append(ctx: RequestContext):
                     project_id=project_id,
                     backlog_id=str(
                         ctx.body.get("backlog_id") or ""
+                    ).strip(),
+                    contract_execution_id=str(
+                        ctx.body.get("task_id") or ""
                     ).strip(),
                 )
             )
@@ -199341,6 +199346,7 @@ def _handle_task_timeline_append(ctx: RequestContext):
                 backlog_id=str(
                     ctx.body.get("backlog_id") or ""
                 ).strip(),
+                contract_execution_id=direct_task_id,
             )
         )
         expected_direct_task_id = str(
