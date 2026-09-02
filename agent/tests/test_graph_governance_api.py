@@ -209898,6 +209898,81 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
         "observer_direct_mutation_exception"
     )
     assert "graph_query_close_authority" in exact["next_legal_action"]
+    service_body = copy.deepcopy(
+        exact["next_legal_action"]["action_input"]
+    )
+    service_body["payload"]["reason"] = "managed service-auth exact child"
+    for source in (
+        service_body["payload"], service_body["verification"],
+        service_body["artifact_refs"],
+    ):
+        source["graph_trace_ids"] = [queried["trace_id"]]
+        source["graph_query_trace_ids"] = [queried["trace_id"]]
+    approval_ref = "operator-message:managed-service-auth-child"
+    service_body["payload"]["operator_approval"]["approval_ref"] = approval_ref
+    service_body["verification"]["operator_approval"]["approval_ref"] = approval_ref
+    service_body["artifact_refs"]["operator_approval_ref"] = approval_ref
+    from agent.mcp import tools as managed_tools
+    managed_body = managed_tools._task_timeline_body(
+        {
+            **service_body,
+            "observer_session_token": "must-not-forward",
+        }
+    )
+    assert managed_body == {
+        key: value for key, value in service_body.items()
+        if key != "project_id"
+    }
+    assert "must-not-forward" not in json.dumps(managed_body, sort_keys=True)
+
+    for override in (
+        {"task_id": "cex-direct-main-unknown"},
+        {"backlog_id": "AC-DEV-DIRECT-WRONG-BACKLOG"},
+        {"route_token_ref": "rtok-direct-main-unknown"},
+    ):
+        denied_before = tuple(conn.iterdump())
+        denied_changes = conn.total_changes
+        with pytest.raises(GovernanceError) as denied:
+            server.handle_observer_direct_mutation_exception(
+                _ctx(
+                    {"project_id": case["project_id"]},
+                    method="POST",
+                    body={**service_body, **override},
+                )
+            )
+        assert denied.value.code == "route_token_required"
+        assert denied.value.details["zero_write_rejection"] is True
+        assert conn.total_changes == denied_changes
+        assert tuple(conn.iterdump()) == denied_before
+
+    forged_body = copy.deepcopy(service_body)
+    forged_body["payload"]["route_token_gate"] = {
+        "server_projected": True,
+        "projection_source": "server_route_token_mutation_gate",
+        "allowed": True,
+        "action": "observer_direct_mutation_exception",
+    }
+    denied_before = tuple(conn.iterdump())
+    denied_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as forged:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=forged_body,
+            )
+        )
+    assert forged.value.code == "operator_supervised_direct_main_execution_not_unique"
+    assert conn.total_changes == denied_changes
+    assert tuple(conn.iterdump()) == denied_before
+
+    service_ctx = _ctx(
+        {"project_id": case["project_id"]},
+        method="POST",
+        body=service_body,
+    )
+    service_result = server.handle_observer_direct_mutation_exception(service_ctx)
+    assert service_result["task_id"] == child_id
 
 
 def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(

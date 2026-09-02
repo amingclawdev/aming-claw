@@ -197838,7 +197838,7 @@ def handle_observer_direct_mutation_exception(ctx: RequestContext):
     forwarded_request = _runtime_context_forward_request(
         ctx,
         body=ctx.body or {},
-        trusted_route_gate=route_gate,
+        trusted_route_gate=_route_gate_public_summary(route_gate),
     )
     return handle_task_timeline_append(forwarded_request)
 
@@ -198498,10 +198498,31 @@ def _handle_task_timeline_append(ctx: RequestContext):
             .replace("-", "_"),
         }
         direct_task_id = str(ctx.body.get("task_id") or "").strip()
+        direct_backlog_id = str(ctx.body.get("backlog_id") or "").strip()
+        direct_route_scope = (
+            trusted_route_gate.get("scope")
+            if isinstance(trusted_route_gate.get("scope"), Mapping)
+            else {}
+        )
+        trusted_direct_facade_route = bool(
+            _runtime_plane() == "dev"
+            and project_id == "aming-claw"
+            and task_timeline._source_backed_route_gate_accepted(
+                trusted_route_gate
+            )
+            and trusted_route_gate.get("action")
+            == "observer_direct_mutation_exception"
+            and direct_route_scope.get("project_id") == project_id
+            and direct_route_scope.get("backlog_id") == direct_backlog_id
+            and direct_route_scope.get("task_id") == direct_task_id
+        )
         strict_direct_task_id = direct_task_id if (
-            trusted_contract_runtime_actor_role in {"observer", "qa"}
+            (
+                trusted_contract_runtime_actor_role in {"observer", "qa"}
+                or trusted_direct_facade_route
+            )
             and direct_event_tokens.intersection(_PARENTLESS_DIRECT_MAIN_GRAPH_LINEAGE_CARRIER_EVENT_KINDS | {"observer_direct_implementation_exception", "reconcile", "current_full_reconcile", "qa"})
-            and _operator_supervised_direct_main_strict_records(conn, project_id=project_id, backlog_id=str(ctx.body.get("backlog_id") or "").strip(), contract_execution_id=direct_task_id)
+            and _operator_supervised_direct_main_strict_records(conn, project_id=project_id, backlog_id=direct_backlog_id, contract_execution_id=direct_task_id)
         ) else ""
         if direct_event_tokens.intersection(
             {
