@@ -209154,3 +209154,187 @@ def test_ac_dev_direct_operational_terminal_selection_is_exact_and_read_only(
     assert duplicate["reason"] == "direct_family_cardinality"
     assert tuple(conn.iterdump()) == storage_before
     assert conn.total_changes == changes_before
+
+
+def test_ac_dev_direct_exact_cex_filter_preserves_unpinned_family(
+    conn, monkeypatch, tmp_path,
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-DIRECT-EXACT-CEX-FILTER",
+    )
+    server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": prepared["project_id"]}, method="POST",
+            body=prepared["issue_body"],
+        )
+    )
+    runtime = server._contract_runtime(conn)
+    parent = runtime.current_record(
+        prepared["task_id"], actor_role="observer"
+    )
+    child_id = "cex-direct-main-exact-filter-child"
+    child = copy.deepcopy(parent)
+    child.update(
+        contract_execution_id=child_id,
+        parent_contract_execution_id=prepared["task_id"],
+        root_contract_execution_id=prepared["task_id"],
+        completed_lines=[],
+        execution_state_revision=1,
+    )
+    runtime.store.create(child)
+    generic = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=prepared["project_id"],
+        backlog_id=prepared["guide"]["backlog_id"],
+    )
+    conn.commit()
+    before = tuple(conn.iterdump())
+    kwargs = {
+        "project_id": prepared["project_id"],
+        "backlog_id": prepared["guide"]["backlog_id"],
+    }
+
+    family = server._operator_supervised_direct_main_strict_records(
+        conn, **kwargs,
+    )
+    parent_only = server._operator_supervised_direct_main_strict_records(
+        conn, **kwargs, contract_execution_id=prepared["task_id"],
+    )
+    child_only = server._operator_supervised_direct_main_strict_records(
+        conn, **kwargs, contract_execution_id=child_id,
+    )
+    unknown = server._operator_supervised_direct_main_strict_records(
+        conn, **kwargs, contract_execution_id="cex-direct-main-foreign",
+    )
+    selected = server._contract_runtime_parentless_direct_main_selected_scope(
+        conn, **kwargs, contract_execution_id=child_id,
+        rebuild_if_missing=False,
+    )
+    unclaimed_selected = (
+        server._contract_runtime_parentless_direct_main_selected_scope(
+            conn, **kwargs, rebuild_if_missing=False,
+        )
+    )
+    foreign_selected = (
+        server._contract_runtime_parentless_direct_main_selected_scope(
+            conn, **kwargs, contract_execution_id="cex-direct-main-foreign",
+            rebuild_if_missing=False,
+        )
+    )
+    body = {
+        "backlog_id": kwargs["backlog_id"],
+        "task_id": "cex-direct-main-foreign",
+        "route_token_ref": "rtok-foreign",
+    }
+    close_gate = (
+        server._contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
+            conn, project_id=kwargs["project_id"], body=body,
+            event_kind="close_ready", normalized_status="passed",
+            normalized_payload={},
+        )
+    )
+    implementation_gate = (
+        server._contract_runtime_parentless_direct_main_implementation_prewrite_gate(
+            conn, project_id=kwargs["project_id"], body=body,
+            event_kind="implementation", normalized_status="passed",
+            normalized_payload={},
+        )
+    )
+    graph_gate = (
+        server._contract_runtime_parentless_direct_main_append_graph_trace_gate(
+            conn, project_id=kwargs["project_id"],
+            backlog_id=kwargs["backlog_id"],
+            caller_task_id=body["task_id"], route_gate={},
+            route_identity={}, event={},
+        )
+    )
+    qa_gate = server._contract_runtime_parentless_direct_main_qa_prewrite_gate(
+        conn, project_id=kwargs["project_id"], body=body,
+        event_kind="independent_verification", normalized_status="passed",
+        normalized_payload={},
+    )
+
+    assert {record["contract_execution_id"] for record in family} == {
+        prepared["task_id"], child_id,
+    }
+    assert [record["contract_execution_id"] for record in parent_only] == [
+        prepared["task_id"]
+    ]
+    assert [record["contract_execution_id"] for record in child_only] == [
+        child_id
+    ]
+    assert unknown == []
+    assert selected["resolved"] is True
+    assert selected["contract_execution_id"] == child_id
+    assert unclaimed_selected["schema_version"] == (
+        "parentless_direct_main_selected_scope.v2"
+    )
+    assert unclaimed_selected["resolved"] is False
+    assert set(unclaimed_selected["candidate_execution_ids"]) == {
+        prepared["task_id"], child_id,
+    }
+    assert generic["contract_execution_id"].startswith("onboard-service-")
+    assert foreign_selected["schema_version"] == (
+        "parentless_direct_main_selected_scope.v2"
+    )
+    assert foreign_selected["resolved"] is False
+    assert foreign_selected["onboard_service_proxy_authority"] is False
+    assert close_gate == {}
+    assert implementation_gate == {}
+    assert graph_gate["passed"] is False
+    assert "parentless_direct_main_contract_runtime_scope" in (
+        graph_gate["missing_requirement_ids"]
+    )
+    assert qa_gate == {}
+    assert tuple(conn.iterdump()) == before
+
+
+def test_parentless_direct_main_four_gates_pin_claimed_exact_cex(
+    conn, monkeypatch,
+):
+    child_id = "cex-direct-main-gate-selected-child"
+    calls = []
+
+    def unresolved_scope(*_args, **kwargs):
+        calls.append(kwargs.get("contract_execution_id"))
+        return {"resolved": False, "contract_execution_id": ""}
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_selected_scope",
+        unresolved_scope,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_graph_trace_db_evidence",
+        lambda *_args, **_kwargs: {},
+    )
+    body = {
+        "backlog_id": "AC-DEV-DIRECT-GATE-EXACT-CEX",
+        "task_id": child_id,
+        "route_token_ref": "rtok-exact-cex",
+    }
+    before = tuple(conn.iterdump())
+    server._contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
+        conn, project_id="aming-claw", body=body,
+        event_kind="close_ready", normalized_status="passed",
+        normalized_payload={},
+    )
+    server._contract_runtime_parentless_direct_main_implementation_prewrite_gate(
+        conn, project_id="aming-claw", body=body,
+        event_kind="implementation", normalized_status="passed",
+        normalized_payload={},
+    )
+    server._contract_runtime_parentless_direct_main_append_graph_trace_gate(
+        conn, project_id="aming-claw", backlog_id=body["backlog_id"],
+        caller_task_id=child_id, route_gate={}, route_identity={}, event={},
+    )
+    server._contract_runtime_parentless_direct_main_qa_prewrite_gate(
+        conn, project_id="aming-claw", body=body,
+        event_kind="independent_verification", normalized_status="passed",
+        normalized_payload={},
+    )
+
+    assert calls == [child_id, child_id, child_id, child_id]
+    assert tuple(conn.iterdump()) == before

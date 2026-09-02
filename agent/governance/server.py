@@ -148820,19 +148820,22 @@ def _require_onboard_dev_selector_endpoint(
             _operator_supervised_direct_main_dev_world_authority()
         )
         execution_id = ""
-        task_claimed = any(
-            str(value or "").strip()
-            for field in ("task_id", "contract_execution_id")
-            for value in _operator_supervised_direct_main_request_claim_values(
-                request_body,
-                field,
-            )
+        task_claims = _runtime_context_service_dedupe(
+            [
+                str(value or "").strip()
+                for field in ("task_id", "contract_execution_id")
+                for value in _operator_supervised_direct_main_request_claim_values(
+                    request_body, field,
+                )
+                if str(value or "").strip()
+            ]
         )
-        if task_claimed and backlog_id:
+        if len(task_claims) == 1 and backlog_id:
             records = _operator_supervised_direct_main_strict_records(
                 conn,
                 project_id=project_id,
                 backlog_id=backlog_id,
+                contract_execution_id=task_claims[0],
             )
             if len(records) == 1:
                 execution_id = str(
@@ -149031,6 +149034,7 @@ def _operator_supervised_direct_main_strict_records(
     project_id: str,
     backlog_id: str,
     world_authority: Mapping[str, Any] | None = None,
+    contract_execution_id: str = "",
 ) -> list[dict[str, Any]]:
     runtime = _contract_runtime(conn)
     world_authority = (
@@ -149046,7 +149050,7 @@ def _operator_supervised_direct_main_strict_records(
             str(world_authority.get("storage_contract_id") or "") or None
         ),
     )
-    strict = [
+    world_valid_records = [
         dict(record)
         for record in records
         if str(record.get("revision") or "").strip()
@@ -149063,7 +149067,7 @@ def _operator_supervised_direct_main_strict_records(
             world_authority,
         )
     ]
-    if world_authority and records and not strict:
+    if world_authority and records and not world_valid_records:
         raise GovernanceError(
             "ac_dev_direct_main_runtime_world_lineage_invalid",
             (
@@ -149081,7 +149085,12 @@ def _operator_supervised_direct_main_strict_records(
                 "writes_performed": False,
             },
         )
-    return strict
+    return [
+        record for record in world_valid_records
+        if not contract_execution_id
+        or str(record.get("contract_execution_id") or "").strip()
+        == contract_execution_id
+    ]
 
 def _operator_supervised_direct_main_operational_terminal_selection(
     conn, *, project_id: str, backlog_id: str,
@@ -149118,14 +149127,25 @@ def _operator_supervised_direct_main_operational_terminal_selection(
         records = _operator_supervised_direct_main_strict_records(
             conn, project_id=project_id, backlog_id=backlog_id,
             world_authority=world,
+            contract_execution_id=caller_contract_execution_id,
         )
     except (ContractRuntimeError, GovernanceError, sqlite3.Error, TypeError):
         return blocked("authority_read_failed")
     if not row:
         return blocked("backlog_missing")
     if not records:
+        family_exists = bool(
+            caller_contract_execution_id
+            and _operator_supervised_direct_main_strict_records(
+                conn, project_id=project_id, backlog_id=backlog_id,
+                world_authority=world,
+            )
+        )
         return (
-            blocked("caller_claim_without_family")
+            blocked(
+                "caller_identity_mismatch"
+                if family_exists else "caller_claim_without_family"
+            )
             if caller_contract_execution_id or caller_route_token_ref
             else result("ordinary", contract_execution_ids=[])
         )
@@ -149704,6 +149724,7 @@ def _operator_supervised_direct_main_start_runtime(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
+        contract_execution_id=task_id,
     )
     if len(strict_records) > 1:
         raise GovernanceError(
@@ -150350,10 +150371,26 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         if _runtime_plane() == "dev"
         else {}
     )
+    selector_request = (
+        request_selector_claims
+        if isinstance(request_selector_claims, Mapping)
+        else request_body
+    )
+    execution_claims = _runtime_context_service_dedupe(
+        [
+            value for field in ("task_id", "contract_execution_id")
+            for value in _operator_supervised_direct_main_request_claim_values(
+                selector_request, field
+            )
+        ]
+    )
     strict_records = _operator_supervised_direct_main_strict_records(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
+        contract_execution_id=(
+            execution_claims[0] if len(execution_claims) == 1 else ""
+        ),
     )
     historical_events = _onboard_parentless_direct_main_timeline_events(
         conn,
@@ -150409,11 +150446,6 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
-    )
-    selector_request = (
-        request_selector_claims
-        if isinstance(request_selector_claims, Mapping)
-        else request_body
     )
     claim_mismatches = _operator_supervised_direct_main_request_mismatches(
         selector_request,
@@ -151502,6 +151534,69 @@ def _ac_dev_direct_route_issue_replay(
     )
 
 
+def _ac_dev_direct_materialize_fresh_route_execution(
+    conn, *, project_id: str, backlog_id: str, execution_id: str,
+    selected_revision: str, request_body: Mapping[str, Any],
+    expected_body: Mapping[str, Any],
+    world_authority: Mapping[str, Any], route_storage_project_id: str,
+) -> dict[str, Any]:
+    """Materialize one prechecked Direct route+CEX inside the caller transaction."""
+
+    from . import observer_route_context
+
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id, backlog_id=backlog_id, task_id=execution_id,
+        target_files=list(expected_body.get("target_files") or []),
+        allowed_actions=list(expected_body.get("allowed_actions") or []),
+        evidence_refs=list(expected_body.get("evidence_refs") or []),
+        project_root=Path(str(world_authority.get("target_project_root") or "")),
+        source_free_operation=bool(
+            expected_body.get("source_free_operation") is True
+        ),
+    )
+    token = (
+        issued.get("route_token")
+        if isinstance(issued.get("route_token"), dict)
+        else {}
+    )
+    token.setdefault("owned_files", list(expected_body.get("owned_files") or []))
+    route_token_ref = str(issued.get("route_token_ref") or "").strip()
+    route_authority = _operator_supervised_direct_main_route_authority_from_resolved(
+        project_id=project_id, backlog_id=backlog_id,
+        contract_execution_id=execution_id, route_token_ref=route_token_ref,
+        row_files=list(expected_body.get("target_files") or []),
+        route={**token, "route_token_ref": route_token_ref},
+        source_free_operation=bool(
+            expected_body.get("source_free_operation") is True
+        ),
+    )
+    if route_authority.get("accepted") is not True:
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_direct_route_bootstrap_route_invalid",
+            message="server-minted dev Direct route failed exact scope",
+            body=request_body,
+            expected_body=expected_body,
+        )
+    record = _operator_supervised_direct_main_create_fresh_runtime(
+        conn, _contract_runtime(conn), project_id=project_id,
+        backlog_id=backlog_id, selected_revision=selected_revision,
+        execution_id=execution_id, route_token_ref=route_token_ref,
+        route_authority=route_authority,
+        world_ref=_operator_supervised_direct_main_world_ref(
+            project_id=project_id
+        ),
+        dev_world=world_authority,
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id=project_id,
+        storage_project_id=route_storage_project_id,
+        route_token_ref=route_token_ref, token=token,
+    )
+    return {
+        "issued": issued, "route_token_ref": route_token_ref, "record": record,
+    }
+
+
 def _handle_ac_dev_direct_route_context_issue(
     ctx: RequestContext,
     *,
@@ -151575,78 +151670,16 @@ def _handle_ac_dev_direct_route_context_issue(
                     )
                 expected_body = dict(precheck["expected_body"])
                 world = dict(precheck["world_authority"])
-                issued = observer_route_context.issue_observer_write_route_context(
-                    project_id=project_id,
-                    backlog_id=backlog_id,
-                    task_id=task_id,
-                    target_files=list(expected_body.get("target_files") or []),
-                    allowed_actions=list(
-                        expected_body.get("allowed_actions") or []
-                    ),
-                    evidence_refs=list(expected_body.get("evidence_refs") or []),
-                    project_root=Path(
-                        str(world.get("target_project_root") or "")
-                    ),
-                    source_free_operation=bool(
-                        expected_body.get("source_free_operation") is True
-                    ),
-                )
-                token = (
-                    issued.get("route_token")
-                    if isinstance(issued.get("route_token"), dict)
-                    else {}
-                )
-                token.setdefault(
-                    "owned_files",
-                    list(expected_body.get("owned_files") or []),
-                )
-                route_token_ref = str(
-                    issued.get("route_token_ref") or ""
-                ).strip()
-                resolved_route = {**dict(token), "route_token_ref": route_token_ref}
-                route_authority = (
-                    _operator_supervised_direct_main_route_authority_from_resolved(
-                        project_id=project_id,
-                        backlog_id=backlog_id,
-                        contract_execution_id=task_id,
-                        route_token_ref=route_token_ref,
-                        row_files=list(expected_body.get("target_files") or []),
-                        route=resolved_route,
-                        source_free_operation=bool(
-                            expected_body.get("source_free_operation") is True
-                        ),
-                    )
-                )
-                if route_authority.get("accepted") is not True:
-                    raise _ac_dev_direct_route_issue_rejection(
-                        code="ac_dev_direct_route_bootstrap_route_invalid",
-                        message="server-minted dev Direct route failed exact scope",
-                        body=body,
-                        expected_body=expected_body,
-                    )
-                runtime = _contract_runtime(conn)
-                world_ref = _operator_supervised_direct_main_world_ref(
-                    project_id=project_id,
-                )
-                _operator_supervised_direct_main_create_fresh_runtime(
-                    conn,
-                    runtime,
-                    project_id=project_id,
-                    backlog_id=backlog_id,
-                    selected_revision=str(precheck["selected_revision"]),
+                materialized = _ac_dev_direct_materialize_fresh_route_execution(
+                    conn, project_id=project_id, backlog_id=backlog_id,
                     execution_id=task_id,
-                    route_token_ref=route_token_ref,
-                    route_authority=route_authority,
-                    world_ref=world_ref,
-                    dev_world=world,
+                    selected_revision=str(precheck["selected_revision"]),
+                    request_body=body, expected_body=expected_body,
+                    world_authority=world,
+                    route_storage_project_id=route_storage_project_id,
                 )
-                observer_route_context.persist_route_token_ref(
-                    conn,
-                    project_id=project_id,
-                    storage_project_id=route_storage_project_id,
-                    route_token_ref=route_token_ref,
-                    token=token,
-                )
+                issued = materialized["issued"]
+                route_token_ref = str(materialized["route_token_ref"])
                 if conn.in_transaction:
                     conn.commit()
             except Exception:
@@ -190457,12 +190490,33 @@ def _contract_runtime_parentless_direct_main_selected_scope(
     backlog_id: str,
     route_token_ref: str = "",
     rebuild_if_missing: bool = True,
+    contract_execution_id: str = "",
 ) -> dict[str, Any]:
-    strict_records = _operator_supervised_direct_main_strict_records(
+    strict_family = _operator_supervised_direct_main_strict_records(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
     )
+    exact_execution_id = str(contract_execution_id or "").strip()
+    strict_records = [
+        record for record in strict_family
+        if not exact_execution_id
+        or str(record.get("contract_execution_id") or "").strip()
+        == exact_execution_id
+    ]
+    if strict_family and exact_execution_id and not strict_records:
+        return {
+            "schema_version": "parentless_direct_main_selected_scope.v2",
+            "resolved": False,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": "",
+            "selection_source": "exact_direct_execution_not_in_family",
+            "contract_revision": "",
+            "candidate_execution_ids": [],
+            "source_backed_contract_required": True,
+            "onboard_service_proxy_authority": False,
+        }
     if strict_records:
         execution_ids = _runtime_context_service_dedupe(
             [
@@ -190622,6 +190676,7 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
         backlog_id=backlog_id,
         route_token_ref=str(body.get("route_token_ref") or "").strip(),
         rebuild_if_missing=False,
+        contract_execution_id=task_id,
     )
     if (
         selected_scope.get("resolved") is not True
@@ -190868,6 +190923,7 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         backlog_id=backlog_id,
         route_token_ref=str(body.get("route_token_ref") or "").strip(),
         rebuild_if_missing=False,
+        contract_execution_id=task_id,
     )
     if (
         selected_scope.get("resolved") is not True
@@ -191512,6 +191568,7 @@ def _contract_runtime_parentless_direct_main_append_graph_trace_gate(
         project_id=project_id,
         backlog_id=backlog_id,
         route_token_ref=str(route_identity.get("route_token_ref") or ""),
+        contract_execution_id=caller_task_id,
     )
     expected_task_id = str(
         selected_scope.get("contract_execution_id") or ""
@@ -192387,6 +192444,7 @@ def _contract_runtime_parentless_direct_main_qa_prewrite_gate(
         backlog_id=backlog_id,
         route_token_ref=str(body.get("route_token_ref") or "").strip(),
         rebuild_if_missing=False,
+        contract_execution_id=task_id,
     )
     if (
         selected_scope.get("resolved") is not True
