@@ -202240,6 +202240,43 @@ def test_ac_dev_first_route_issue_rolls_back_contract_when_route_persist_fails(
     ).fetchone() is None
 
 
+def test_ac_dev_first_route_issue_rolls_back_route_when_runtime_create_fails(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-DIRECT-ROUTE-PERSIST-RUNTIME-ROLLBACK",
+    )
+    before = tuple(conn.iterdump())
+
+    def reject_runtime_create(*_args, **_kwargs):
+        raise RuntimeError("injected runtime creation failure")
+
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_create_fresh_runtime",
+        reject_runtime_create,
+    )
+    with pytest.raises(RuntimeError, match="injected runtime creation failure"):
+        server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": prepared["project_id"]},
+                method="POST",
+                body=prepared["issue_body"],
+            )
+        )
+
+    assert tuple(conn.iterdump()) == before
+    assert conn.execute(
+        "SELECT 1 FROM observer_route_token_refs WHERE backlog_id=?",
+        (prepared["guide"]["backlog_id"],),
+    ).fetchone() is None
+
+
 @pytest.mark.parametrize(
     "attack_kind",
     [
@@ -209154,6 +209191,233 @@ def test_ac_dev_direct_operational_terminal_selection_is_exact_and_read_only(
     assert duplicate["reason"] == "direct_family_cardinality"
     assert tuple(conn.iterdump()) == storage_before
     assert conn.total_changes == changes_before
+
+
+def test_ac_dev_direct_terminal_successor_plan_and_receipt_primitives(
+    conn, monkeypatch, tmp_path,
+):
+    project_id = "aming-claw"
+    backlog_id = "AC-DEV-DIRECT-TERMINAL-SUCCESSOR-PRIMITIVES"
+    predecessor_id = "cex-direct-main-terminal-predecessor"
+    successor_id = "cex-direct-main-successor-expected"
+    route_ref = "rtok-direct-main-successor"
+    predecessor = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": predecessor_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "definition_hash": "sha256:definition",
+        "execution_state_revision": 3,
+        "root_contract_execution_id": predecessor_id,
+        "contract_chain_id": "cchain-direct-main-terminal",
+        "role_binding": {"observer": "wrong-inherited-role"},
+    }
+    selection = {
+        "expected_successor_contract_execution_id": successor_id,
+        "no_pass_generation_id": "no-pass-generation-1",
+    }
+    world = {
+        "accepted": True,
+        "namespace_hash": "sha256:world",
+        "target_project_root": str(tmp_path),
+    }
+    world_ref = {
+        "accepted": True,
+        "target_project_root": str(tmp_path),
+        "base_commit": "a" * 40,
+    }
+    route_authority = {
+        "accepted": True,
+        "route_token_ref": route_ref,
+        "route_identity": {"route_id": "route-successor"},
+        "row_declared_files": ["agent/governance/server.py"],
+    }
+    plan = server._ac_dev_direct_terminal_successor_plan(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        predecessor_record=predecessor,
+        terminal_selection=selection,
+        route_authority=route_authority,
+        world_ref=world_ref,
+        dev_world=world,
+    )
+    assert plan["start_kwargs"]["role_binding"] == {
+        "observer": "observer",
+        "qa": "qa",
+        "binding_source": "operator_supervised_direct_main_route_authority",
+    }
+    assert plan["start_kwargs"]["role_binding"] != predecessor["role_binding"]
+    assert "actor_role" not in plan["immutable_child_projection"]
+    transition = plan["expected_receipt_core"]["transition_core"]
+    assert transition["initial_child_execution_state_revision"] == 1
+    assert transition["initial_child_completed_lines_hash"] == server.stable_sha256([])
+    assert "initial_child_execution_state_hash" not in transition
+
+    core = plan["expected_receipt_core"]
+    receipt_hash = server.stable_sha256(core)
+    preinsert = server._ac_dev_direct_terminal_successor_compact_response(
+        core,
+        receipt_hash=receipt_hash,
+    )
+    assert "receipt_ref" not in preinsert["capsule"]
+    payload = {
+        "schema_version": "contract_runtime.direct_terminal_successor_event.v1",
+        "audit_only": True,
+        "authoritative_evidence": False,
+        "pass_synthesized": False,
+        "direct_terminal_successor_receipt": {
+            "schema_version": "contract_runtime.direct_terminal_successor_receipt.v1",
+            "core": core,
+            "receipt_hash": receipt_hash,
+            "capsule_hash": preinsert["capsule_hash"],
+        },
+    }
+    assert server._onboard_guide_capsule_serialized_bytes(payload) <= (
+        server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+    )
+    conn.commit()
+    assert server._ac_dev_direct_terminal_successor_receipt_audit(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        predecessor_execution_id=predecessor_id,
+        expected_core=core,
+    )["reason"] == "transaction_required"
+    conn.execute("BEGIN IMMEDIATE")
+    assert server._ac_dev_direct_terminal_successor_receipt_audit(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        predecessor_execution_id=predecessor_id,
+        expected_core=None,
+    ) == {}
+    event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=predecessor_id,
+        event_type="contract_runtime.direct_terminal_successor",
+        phase="orchestration",
+        event_kind="contract_binding",
+        actor="observer",
+        status="accepted",
+        correlation_id=preinsert["capsule"]["correlation_id"],
+        payload=payload,
+        post_commit_hooks=False,
+    )
+    stored_payload = event["payload"]
+    assert task_timeline._latest_contract_binding([event], {}) == {}
+    assert task_timeline.is_protected_close_evidence(event) is False
+    replay = server._ac_dev_direct_terminal_successor_receipt_audit(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        predecessor_execution_id=predecessor_id,
+        expected_core=core,
+    )
+    assert replay["ok"] is True
+    assert replay["receipt_ref"] == f"timeline:{event['id']}"
+    assert replay["capsule_hash"] == preinsert["capsule_hash"]
+    assert replay["writes_performed"] is False
+    assert replay["idempotent_replay"] is True
+    assert replay["safe_retry"] is False
+
+    encoded = json.dumps(stored_payload, sort_keys=True, separators=(",", ":"))
+    for gate_field, tampered_value in (
+        ("action", "close_ready"),
+        ("role", "worker"),
+        ("allowed", False),
+        ("meta_contract_hash", "sha256:tampered"),
+    ):
+        tampered = copy.deepcopy(stored_payload)
+        tampered["meta_contract_gate"][gate_field] = tampered_value
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+            (json.dumps(tampered), event["id"]),
+        )
+        assert server._ac_dev_direct_terminal_successor_receipt_audit(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            predecessor_execution_id=predecessor_id,
+            expected_core=core,
+        )["reason"] == "receipt_audit_mismatch"
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+            (encoded, event["id"]),
+        )
+    conn.execute(
+        "UPDATE task_timeline_events SET phase='qa' WHERE id=?",
+        (event["id"],),
+    )
+    assert server._ac_dev_direct_terminal_successor_receipt_audit(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        predecessor_execution_id=predecessor_id,
+        expected_core=core,
+    )["reason"] == "receipt_audit_mismatch"
+    conn.execute(
+        "UPDATE task_timeline_events SET phase='orchestration' WHERE id=?",
+        (event["id"],),
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+        ("x" * (server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES + 1), event["id"]),
+    )
+    assert server._ac_dev_direct_terminal_successor_receipt_audit(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        predecessor_execution_id=predecessor_id,
+        expected_core=core,
+    )["reason"] == "receipt_payload_oversized"
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+        (encoded, event["id"]),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=predecessor_id,
+        event_type="contract_runtime.direct_terminal_successor",
+        phase="orchestration",
+        event_kind="contract_binding",
+        actor="observer",
+        status="accepted",
+        correlation_id=preinsert["capsule"]["correlation_id"],
+        payload=payload,
+        post_commit_hooks=False,
+    )
+    assert server._ac_dev_direct_terminal_successor_receipt_audit(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        predecessor_execution_id=predecessor_id,
+        expected_core=core,
+    )["reason"] == "receipt_missing_or_ambiguous"
+    conn.rollback()
+
+    capsule_bytes = server._onboard_guide_capsule_serialized_bytes(
+        preinsert["capsule"]
+    )
+    with monkeypatch.context() as bounded:
+        bounded.setattr(
+            server,
+            "_ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES",
+            capsule_bytes - 1,
+        )
+        with pytest.raises(
+            server.GovernanceError,
+            match="terminal successor capsule exceeded",
+        ):
+            server._ac_dev_direct_terminal_successor_compact_response(
+                core,
+                receipt_hash=receipt_hash,
+            )
 
 
 def test_ac_dev_direct_exact_cex_filter_preserves_unpinned_family(

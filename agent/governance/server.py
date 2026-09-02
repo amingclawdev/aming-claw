@@ -149095,6 +149095,7 @@ def _operator_supervised_direct_main_strict_records(
 def _operator_supervised_direct_main_operational_terminal_selection(
     conn, *, project_id: str, backlog_id: str,
     caller_contract_execution_id: str = "", caller_route_token_ref: str = "",
+    world_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Classify one Direct predecessor without accepting caller custody."""
     def result(state: str, **extra: Any) -> dict[str, Any]:
@@ -149117,7 +149118,10 @@ def _operator_supervised_direct_main_operational_terminal_selection(
     if project_id != "aming-claw":
         return blocked("project_scope")
     try:
-        world = _operator_supervised_direct_main_dev_world_authority()
+        world = (
+            dict(world_authority) if isinstance(world_authority, Mapping)
+            else _operator_supervised_direct_main_dev_world_authority()
+        )
         if not isinstance(world, Mapping) or world.get("accepted") is not True:
             return blocked("runtime_world")
         world = dict(world)
@@ -149598,6 +149602,39 @@ def _operator_supervised_direct_main_world_ref(
     return authority
 
 
+def _operator_supervised_direct_main_build_runtime_binding(
+    *, project_id: str, backlog_id: str, execution_id: str,
+    route_authority: Mapping[str, Any], world_ref: Mapping[str, Any],
+    dev_world: Mapping[str, Any],
+) -> dict[str, Any]:
+    project_root = Path(str(world_ref["target_project_root"])).resolve()
+    head_commit = str(world_ref["base_commit"])
+    binding = {
+        "schema_version": "operator_supervised_direct_main.runtime_binding.v1",
+        "strict_runtime_binding_required": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "route_identity": dict(route_authority["route_identity"]),
+        "owned_files": list(route_authority["row_declared_files"]),
+        "target_files": list(route_authority["row_declared_files"]),
+        "target_project_root": str(project_root),
+        "worktree_path": str(project_root),
+        "base_commit": head_commit,
+        "target_head_commit": head_commit,
+        "pre_mutation_world_ref": dict(world_ref),
+        "runtime_world_authority": dict(dev_world),
+        "stable_visible_chain_projection_written": not bool(dev_world),
+        "same_execution_retry_allowed": False,
+        "same_generation_retry_allowed": False,
+        "post_hoc_pass_backfill_allowed": False,
+    }
+    binding["binding_hash"] = stable_sha256(binding)
+    return binding
+
+
 def _operator_supervised_direct_main_create_fresh_runtime(
     conn,
     runtime: ContractRuntime,
@@ -149633,33 +149670,11 @@ def _operator_supervised_direct_main_create_fresh_runtime(
                 "writes_performed": False,
             },
         )
-    project_root = Path(str(world_ref["target_project_root"])).resolve()
-    head_commit = str(world_ref["base_commit"])
-    binding = {
-        "schema_version": (
-            "operator_supervised_direct_main.runtime_binding.v1"
-        ),
-        "strict_runtime_binding_required": True,
-        "server_derived": True,
-        "caller_claims_trusted": False,
-        "project_id": project_id,
-        "backlog_id": backlog_id,
-        "contract_execution_id": execution_id,
-        "route_identity": dict(route_authority["route_identity"]),
-        "owned_files": list(route_authority["row_declared_files"]),
-        "target_files": list(route_authority["row_declared_files"]),
-        "target_project_root": str(project_root),
-        "worktree_path": str(project_root),
-        "base_commit": head_commit,
-        "target_head_commit": head_commit,
-        "pre_mutation_world_ref": dict(world_ref),
-        "runtime_world_authority": dict(dev_world),
-        "stable_visible_chain_projection_written": not bool(dev_world),
-        "same_execution_retry_allowed": False,
-        "same_generation_retry_allowed": False,
-        "post_hoc_pass_backfill_allowed": False,
-    }
-    binding["binding_hash"] = stable_sha256(binding)
+    binding = _operator_supervised_direct_main_build_runtime_binding(
+        project_id=project_id, backlog_id=backlog_id, execution_id=execution_id,
+        route_authority=route_authority, world_ref=world_ref,
+        dev_world=dev_world,
+    )
     record = runtime.start_execution(
         "operator_supervised_direct_main",
         version="v1",
@@ -151534,16 +151549,12 @@ def _ac_dev_direct_route_issue_replay(
     )
 
 
-def _ac_dev_direct_materialize_fresh_route_execution(
+def _ac_dev_direct_mint_route_authority_persist(
     conn, *, project_id: str, backlog_id: str, execution_id: str,
-    selected_revision: str, request_body: Mapping[str, Any],
-    expected_body: Mapping[str, Any],
+    request_body: Mapping[str, Any], expected_body: Mapping[str, Any],
     world_authority: Mapping[str, Any], route_storage_project_id: str,
 ) -> dict[str, Any]:
-    """Materialize one prechecked Direct route+CEX inside the caller transaction."""
-
     from . import observer_route_context
-
     issued = observer_route_context.issue_observer_write_route_context(
         project_id=project_id, backlog_id=backlog_id, task_id=execution_id,
         target_files=list(expected_body.get("target_files") or []),
@@ -151577,26 +151588,210 @@ def _ac_dev_direct_materialize_fresh_route_execution(
             body=request_body,
             expected_body=expected_body,
         )
-    record = _operator_supervised_direct_main_create_fresh_runtime(
-        conn, _contract_runtime(conn), project_id=project_id,
-        backlog_id=backlog_id, selected_revision=selected_revision,
-        execution_id=execution_id, route_token_ref=route_token_ref,
-        route_authority=route_authority,
-        world_ref=_operator_supervised_direct_main_world_ref(
-            project_id=project_id
-        ),
-        dev_world=world_authority,
-    )
     observer_route_context.persist_route_token_ref(
         conn, project_id=project_id,
         storage_project_id=route_storage_project_id,
-        route_token_ref=route_token_ref, token=token,
+        route_token_ref=route_token_ref, token=token, commit=False,
     )
-    return {
-        "issued": issued, "route_token_ref": route_token_ref, "record": record,
+    return {"issued": issued, "route_token_ref": route_token_ref,
+            "route_authority": route_authority}
+
+
+def _ac_dev_direct_materialize_fresh_route_execution(
+    conn, *, project_id: str, backlog_id: str, execution_id: str,
+    selected_revision: str, request_body: Mapping[str, Any],
+    expected_body: Mapping[str, Any],
+    world_authority: Mapping[str, Any], route_storage_project_id: str,
+) -> dict[str, Any]:
+    """Materialize one prechecked Direct route+CEX inside the caller transaction."""
+
+    materialized = _ac_dev_direct_mint_route_authority_persist(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        execution_id=execution_id, request_body=request_body,
+        expected_body=expected_body, world_authority=world_authority,
+        route_storage_project_id=route_storage_project_id,
+    )
+    record = _operator_supervised_direct_main_create_fresh_runtime(
+        conn, _contract_runtime(conn), project_id=project_id,
+        backlog_id=backlog_id, selected_revision=selected_revision,
+        execution_id=execution_id,
+        route_token_ref=str(materialized["route_token_ref"]),
+        route_authority=dict(materialized["route_authority"]),
+        world_ref=_operator_supervised_direct_main_world_ref(project_id=project_id),
+        dev_world=world_authority,
+    )
+    return {**materialized, "record": record}
+
+
+def _ac_dev_direct_terminal_successor_plan(
+    *, project_id: str, backlog_id: str,
+    predecessor_record: Mapping[str, Any],
+    terminal_selection: Mapping[str, Any], route_authority: Mapping[str, Any],
+    world_ref: Mapping[str, Any], dev_world: Mapping[str, Any],
+) -> dict[str, Any]:
+    predecessor_id = str(predecessor_record["contract_execution_id"])
+    successor_id = str(terminal_selection["expected_successor_contract_execution_id"])
+    transition = {
+        "schema_version": "contract_runtime.direct_terminal_successor_transition.v1",
+        "transition_kind": "fresh_generation_after_terminal_source",
+        "predecessor_contract_execution_id": predecessor_id,
+        "successor_contract_execution_id": successor_id,
+        "source_no_pass_generation_id": terminal_selection["no_pass_generation_id"],
+        "runtime_world_identity_hash": stable_sha256(dev_world),
+        "source_contract_revision": predecessor_record["revision"],
+        "source_execution_state_revision": predecessor_record["execution_state_revision"],
+        "initial_child_execution_state_revision": 1,
+        "initial_child_completed_lines_hash": stable_sha256([]),
     }
-
-
+    transition_hash = stable_sha256(transition)
+    role_binding = {"observer": "observer", "qa": "qa", "binding_source": "operator_supervised_direct_main_route_authority"}
+    lineage = {"project_id": project_id, "backlog_id": backlog_id, "task_id": successor_id}
+    metadata = {
+        "facade": "observer_direct_mutation_exception",
+        "generic_crud_exposed": False,
+        "operator_supervised_direct_main_runtime_binding": (
+            _operator_supervised_direct_main_build_runtime_binding(
+                project_id=project_id, backlog_id=backlog_id,
+                execution_id=successor_id, route_authority=route_authority,
+                world_ref=world_ref, dev_world=dev_world,
+            )
+        ),
+        "operator_supervised_direct_main_route_authority": dict(route_authority),
+        "direct_terminal_successor_transition": {
+            "transition_core": transition, "transition_hash": transition_hash,
+        },
+    }
+    start = {
+        "version": predecessor_record["version"], "revision": predecessor_record["revision"],
+        "project_id": project_id, "backlog_id": backlog_id, "actor_role": "observer",
+        "contract_execution_id": successor_id,
+        "parent_contract_execution_id": predecessor_id,
+        "root_contract_execution_id": predecessor_record.get("root_contract_execution_id") or predecessor_id,
+        "contract_chain_id": predecessor_record["contract_chain_id"],
+        "route_token_ref": route_authority["route_token_ref"],
+        "role_binding": role_binding, "backlog_lineage": lineage, "metadata": metadata,
+    }
+    immutable = {key: value for key, value in start.items() if key != "actor_role"}
+    immutable.update({"contract_id": "operator_supervised_direct_main", "definition_hash": predecessor_record["definition_hash"]})
+    core = {
+        "schema_version": "contract_runtime.direct_terminal_successor_core.v1",
+        "project_id": project_id, "backlog_id": backlog_id,
+        "predecessor_contract_execution_id": predecessor_id,
+        "successor_contract_execution_id": successor_id,
+        "child_route_token_ref": route_authority["route_token_ref"],
+        "transition_core": transition, "transition_hash": transition_hash,
+    }
+    return {"start_kwargs": start, "immutable_child_projection": immutable,
+            "expected_receipt_core": core}
+def _ac_dev_direct_terminal_successor_compact_response(
+    core: Mapping[str, Any], *, receipt_hash: str, receipt_event_id: int = 0,
+    writes_performed: bool = False, idempotent_replay: bool = True,
+) -> dict[str, Any]:
+    correlation_id = _contract_runtime_stable_id(
+        "direct-terminal-successor-receipt", core["project_id"], core["backlog_id"],
+        core["predecessor_contract_execution_id"], core["successor_contract_execution_id"], core["transition_hash"],
+    )
+    capsule = {
+        "schema_version": "ac_dev_direct_terminal_successor.v1",
+        "ok": True, "state": "exact_successor",
+        "project_id": core["project_id"], "backlog_id": core["backlog_id"],
+        "predecessor_contract_execution_id": core["predecessor_contract_execution_id"],
+        "successor_contract_execution_id": core["successor_contract_execution_id"],
+        "route_token_ref": core["child_route_token_ref"],
+        "transition_hash": core["transition_hash"],
+        "correlation_id": correlation_id, "receipt_hash": receipt_hash,
+        "public_safe": True, "secret_safe": True,
+        "raw_route_token_exposed": False, "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+    }
+    capsule_hash = stable_sha256(capsule)
+    if _onboard_guide_capsule_serialized_bytes(capsule) > _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES:
+        raise GovernanceError("ac_dev_direct_terminal_successor_capsule_oversized", "terminal successor capsule exceeded its existing bound", 409, {"writes_performed": False, "safe_retry": False})
+    if receipt_event_id <= 0:
+        return {"capsule": capsule, "capsule_hash": capsule_hash}
+    response = {
+        **capsule, "capsule_hash": capsule_hash,
+        "receipt_ref": f"timeline:{receipt_event_id}", "writes_performed": writes_performed,
+        "idempotent_replay": idempotent_replay, "safe_retry": False,
+    }
+    if _onboard_guide_capsule_serialized_bytes(response) > _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES:
+        raise GovernanceError(
+            "ac_dev_direct_terminal_successor_response_oversized",
+            "terminal successor compact response exceeded its existing bound", 409,
+            {"writes_performed": False, "safe_retry": False},
+        )
+    return response
+def _ac_dev_direct_terminal_successor_receipt_audit(
+    conn, *, project_id: str, backlog_id: str,
+    predecessor_execution_id: str, expected_core: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    def exact(value: Any, schema: str, keys: Sequence[str]) -> bool:
+        return isinstance(value, Mapping) and set(value) == set(keys) and value.get("schema_version") == schema
+    def blocked(reason: str) -> dict[str, Any]:
+        return {"schema_version": "ac_dev_direct_terminal_successor.v1", "ok": False,
+                "state": "blocked", "reason": reason, "writes_performed": False,
+                "safe_retry": False}
+    if not conn.in_transaction:
+        return blocked("transaction_required")
+    rows = conn.execute(
+        "SELECT id,phase,event_kind,status,actor,correlation_id,payload_json,"
+        "length(CAST(payload_json AS BLOB)) payload_bytes FROM task_timeline_events "
+        "WHERE project_id=? AND backlog_id=? AND task_id=? AND "
+        "event_type='contract_runtime.direct_terminal_successor' ORDER BY id LIMIT 2",
+        (project_id, backlog_id, predecessor_execution_id)).fetchall()
+    if expected_core is None:
+        return {} if not rows else blocked("unexpected_receipt")
+    if len(rows) != 1:
+        return blocked("receipt_missing_or_ambiguous")
+    row = rows[0]
+    if int(row["payload_bytes"] or 0) > _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES:
+        return blocked("receipt_payload_oversized")
+    try:
+        payload = json.loads(str(row["payload_json"] or "{}"))
+        payload_keys = "schema_version audit_only authoritative_evidence pass_synthesized direct_terminal_successor_receipt meta_contract_gate".split()
+        if not exact(payload, "contract_runtime.direct_terminal_successor_event.v1", payload_keys):
+            return blocked("receipt_payload_schema")
+        gate = payload["meta_contract_gate"]
+        gate_keys = "schema_version meta_contract_schema_version meta_contract_id meta_contract_hash allowed status role action observer_event_validated on_behalf self_attesting observer_worker_transport forbidden_always allowed_actions".split()
+        gate_valid = exact(gate, "meta_contract_timeline_event_gate.v1", gate_keys) and all((
+            gate.get("meta_contract_schema_version") == gate.get("meta_contract_id") == "meta_contract.v1",
+            re.fullmatch(r"sha256:[0-9a-f]{64}", str(gate.get("meta_contract_hash") or "")),
+            (gate.get("allowed"), gate.get("status"), gate.get("role"), gate.get("action"), gate.get("observer_event_validated")) == (True, "passed", "observer", "contract_binding", True),
+            gate.get("on_behalf") is gate.get("self_attesting") is gate.get("observer_worker_transport") is False,
+            isinstance(gate.get("forbidden_always"), list) and isinstance(gate.get("allowed_actions"), list) and "contract_binding" in gate["allowed_actions"],
+        ))
+        receipt = payload["direct_terminal_successor_receipt"]
+        receipt_keys = "schema_version core receipt_hash capsule_hash".split()
+        if not exact(receipt, "contract_runtime.direct_terminal_successor_receipt.v1", receipt_keys):
+            return blocked("receipt_schema")
+        core = receipt["core"]
+        core_keys = "schema_version project_id backlog_id predecessor_contract_execution_id successor_contract_execution_id child_route_token_ref transition_core transition_hash".split()
+        transition_keys = "schema_version transition_kind predecessor_contract_execution_id successor_contract_execution_id source_no_pass_generation_id runtime_world_identity_hash source_contract_revision source_execution_state_revision initial_child_execution_state_revision initial_child_completed_lines_hash".split()
+        transition = core["transition_core"] if isinstance(core, Mapping) else {}
+        if not exact(core, "contract_runtime.direct_terminal_successor_core.v1", core_keys):
+            return blocked("receipt_core_schema")
+        if not exact(transition, "contract_runtime.direct_terminal_successor_transition.v1", transition_keys):
+            return blocked("receipt_transition_schema")
+        if dict(core) != dict(expected_core):
+            return blocked("receipt_core_mismatch")
+        receipt_hash = str(receipt["receipt_hash"])
+        rebuilt = _ac_dev_direct_terminal_successor_compact_response(
+            core, receipt_hash=receipt_hash, receipt_event_id=int(row["id"] or 0),
+        )
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        return blocked("receipt_unreadable")
+    valid = all((
+        int(row["id"] or 0) > 0,
+        row["phase"] == "orchestration", row["event_kind"] == "contract_binding", gate_valid,
+        row["status"] == "accepted", row["actor"] == "observer",
+        payload["audit_only"] is True, payload["authoritative_evidence"] is False,
+        payload["pass_synthesized"] is False,
+        core["transition_hash"] == stable_sha256(transition),
+        receipt_hash == stable_sha256(core),
+        receipt["capsule_hash"] == rebuilt["capsule_hash"],
+        row["correlation_id"] == rebuilt["correlation_id"],
+    ))
+    return rebuilt if valid else blocked("receipt_audit_mismatch")
 def _handle_ac_dev_direct_route_context_issue(
     ctx: RequestContext,
     *,
