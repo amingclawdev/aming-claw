@@ -151879,7 +151879,7 @@ def _ac_dev_direct_terminal_successor_response(
                     "target_files": list(predecessor_authority["row_declared_files"]),
                     "owned_files": list(predecessor_authority["row_declared_files"]),
                     "allowed_actions": list(predecessor_authority["allowed_actions"]),
-                    "evidence_refs": [], "source_free_operation": predecessor_authority["source_free_operation"],
+                    "evidence_refs": [f"contract_runtime:{successor_id}"], "source_free_operation": predecessor_authority["source_free_operation"],
                 }
                 minted = _ac_dev_direct_mint_route_authority_persist(
                     conn, project_id=project_id, backlog_id=backlog_id,
@@ -152383,6 +152383,87 @@ def _ac_dev_read_only_observer_session_authority(
         "computed_status": computed_status,
         "verify_only": True,
     }
+
+
+def _ac_dev_direct_route_renew_terminal_successor_authority(
+    conn, *, project_id: str, backlog_id: str, family: Sequence[Mapping[str, Any]],
+    child_id: str, session_id: str, world: Mapping[str, Any], route: Mapping[str, Any], replay: bool,
+) -> dict[str, Any]:
+    """Recognize the one historical successor whose route lacks its CEX ref."""
+    try:
+        runtime = _contract_runtime(conn)
+        child = runtime.current_record(child_id, actor_role="observer")
+        metadata = child["metadata"]
+        transition = metadata["direct_terminal_successor_transition"]["transition_core"]
+        parent_id = str(transition["predecessor_contract_execution_id"])
+        parent = runtime.current_record(parent_id, actor_role="observer")
+        parent_ref = str(parent["route_token_ref"])
+        parent_authority = _operator_supervised_direct_main_route_authority(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            contract_execution_id=parent_id, route_token_ref=parent_ref)
+        selection = _operator_supervised_direct_main_operational_terminal_selection(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            caller_contract_execution_id=parent_id,
+            caller_route_token_ref=parent_ref, world_authority=world)
+        child_authority = metadata["operator_supervised_direct_main_route_authority"]
+        binding = metadata["operator_supervised_direct_main_runtime_binding"]
+        plan = _ac_dev_direct_terminal_successor_plan(
+            project_id=project_id, backlog_id=backlog_id, predecessor_record=parent,
+            terminal_selection=selection, route_authority=child_authority,
+            world_ref=binding["pre_mutation_world_ref"],
+            dev_world=binding["runtime_world_authority"])
+        current_chain = _contract_chain_current_projection(conn, project_id=project_id,
+            backlog_id=backlog_id, rebuild_if_missing=False)
+        session = _unique_active_route_bound_observer_session(
+            conn, project_id=project_id, session_id=session_id, route_token_ref=parent_ref,
+            route_identity=parent_authority["route_identity"],
+            backlog_id=backlog_id, task_id=parent_id)
+        receipt_ok = not conn.in_transaction or (
+            _ac_dev_direct_terminal_successor_receipt_audit(
+                conn, project_id=project_id, backlog_id=backlog_id,
+                predecessor_execution_id=parent_id,
+                expected_core=plan["expected_receipt_core"]).get("ok") is True)
+    except (ContractRuntimeError, GovernanceError, KeyError, TypeError, sqlite3.Error):
+        return {}
+    if replay:
+        active = _operator_supervised_direct_main_active_route_authority(
+            conn, project_id=project_id, backlog_id=backlog_id, task_id=child_id,
+            immutable_route_identity=child_authority["route_identity"],
+            active_route_token_ref=str(route.get("route_token_ref") or ""),
+            expected_files=child_authority["row_declared_files"])
+        old_ref = str(child_authority["route_token_ref"])
+        route_scope = all((active.get("passed") is True,
+            active.get("route_token_ref_chain") == [old_ref, str(route.get("route_token_ref") or "")],
+            active.get("edge_types") == ["renewal"],
+            set(route.get("evidence_refs") or []) == {
+                f"route:{child_authority['route_identity']['route_id']}",
+                f"route:{route['route_id']}", f"contract_runtime:{child_id}",
+                f"renewed_from:{old_ref}"}))
+    else:
+        bad_authority = _operator_supervised_direct_main_route_authority_from_resolved(
+            project_id=project_id, backlog_id=backlog_id, contract_execution_id=child_id,
+            route_token_ref=str(route.get("route_token_ref") or ""),
+            row_files=child_authority["row_declared_files"], route=route,
+            source_free_operation=child_authority["source_free_operation"])
+        route_scope = bad_authority == child_authority and set(
+            route.get("evidence_refs") or []) == {f"route:{route['route_id']}"}
+    exact = all((
+        len(family) == 2,
+        {str(item.get("contract_execution_id") or "") for item in family} == {parent_id, child_id},
+        selection.get("state") == "exact_terminal_predecessor",
+        selection.get("expected_successor_contract_execution_id") == child_id,
+        parent_authority.get("accepted") is True,
+        _operator_supervised_direct_main_record_matches_dev_world(child, world),
+        int(child.get("execution_state_revision") or 0) == 1,
+        not child.get("completed_lines"),
+        {key: child.get(key) for key in plan["immutable_child_projection"]}
+        == plan["immutable_child_projection"],
+        current_chain.get("current_contract_execution_id") == child_id,
+        current_chain.get("contract_chain_id") == child.get("contract_chain_id"),
+        bool(session), route_scope, receipt_ok,
+    ))
+    return {"recovery_candidate": True,
+            "recovery_authorized": bool(exact and conn.in_transaction)} if exact else {}
 
 
 def _ac_dev_direct_route_renew_precheck(

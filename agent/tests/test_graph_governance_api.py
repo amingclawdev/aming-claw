@@ -209505,6 +209505,7 @@ def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(
         "task_id": case["execution_id"],
         "route_token_ref": case["route_token_ref"],
         "observer_session_id": case["session_id"],
+        "evidence_refs": ["caller:must-not-authorize-successor"],
     }
 
     created = server._ac_dev_direct_terminal_successor_response(
@@ -209540,6 +209541,32 @@ def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(
         contract_execution_id=successor_id,
         route_token_ref=child["route_token_ref"],
     )["accepted"] is True
+    child_route = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=case["project_id"],
+        storage_project_id=server._route_registry_storage_project_id(
+            case["project_id"]
+        ),
+        route_token_ref=child["route_token_ref"],
+        backlog_id=case["guide"]["backlog_id"],
+        task_id=successor_id,
+    )
+    assert f"contract_runtime:{successor_id}" in child_route["evidence_refs"]
+    assert "caller:must-not-authorize-successor" not in child_route["evidence_refs"]
+    register_status, _registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body={
+                "project_id": case["project_id"],
+                "route_token_ref": child["route_token_ref"],
+                "backlog_id": case["guide"]["backlog_id"],
+                "task_id": successor_id,
+                "cex_id": successor_id,
+            },
+        )
+    )
+    assert register_status == 201
     receipt_rows = conn.execute(
         "SELECT id,payload_json FROM task_timeline_events WHERE project_id=? "
         "AND backlog_id=? AND task_id=? AND "
@@ -209982,6 +210009,82 @@ def test_ac_dev_direct_terminal_successor_ineligible_no_family_is_unchanged(
         request_selector_claims=None,
     ) == {}
     assert tuple(conn.iterdump()) == before
+
+
+def test_ac_dev_direct_terminal_successor_bad_route_recovery_recognizer(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-DIRECT-TERMINAL-SUCCESSOR-BAD-ROUTE-RECOGNIZER",
+    )
+    mint = server._ac_dev_direct_mint_route_authority_persist
+
+    def mint_legacy_bad_route(*args, **kwargs):
+        expected = dict(kwargs["expected_body"])
+        expected["evidence_refs"] = []
+        return mint(*args, **{**kwargs, "expected_body": expected})
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            server, "_ac_dev_direct_mint_route_authority_persist",
+            mint_legacy_bad_route,
+        )
+        created = server._ac_dev_direct_terminal_successor_response(
+            conn, project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            route_token_ref=case["route_token_ref"], role="observer",
+            work_type="continue_contract_chain",
+            request_body={"task_id": case["execution_id"],
+                          "observer_session_id": case["session_id"]},
+            request_selector_claims=None,
+        )
+    child_id = created["successor_contract_execution_id"]
+    child = server._contract_runtime(conn).current_record(
+        child_id, actor_role="observer")
+    bad_ref = child["route_token_ref"]
+    storage_project = server._route_registry_storage_project_id(case["project_id"])
+    bad_route = observer_route_context.resolve_route_token_ref(
+        conn, project_id=case["project_id"],
+        storage_project_id=storage_project, route_token_ref=bad_ref,
+        backlog_id=case["guide"]["backlog_id"], task_id=child_id)
+    family = server._operator_supervised_direct_main_strict_records(
+        conn, project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"])
+    world = server._operator_supervised_direct_main_dev_world_authority()
+    recognize = lambda route, replay=False: (
+        server._ac_dev_direct_route_renew_terminal_successor_authority(
+            conn, project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"], family=family,
+            child_id=child_id, session_id=case["session_id"], world=world,
+            route=route, replay=replay))
+    assert recognize(bad_route) == {
+        "recovery_candidate": True, "recovery_authorized": False}
+    tampered = {**bad_route, "evidence_refs": ["contract_runtime:forged"]}
+    assert recognize(tampered) == {}
+
+    conn.execute("BEGIN IMMEDIATE")
+    assert recognize(bad_route) == {
+        "recovery_candidate": True, "recovery_authorized": True}
+    conn.rollback()
+    renewed = observer_route_context.renew_route_token_ref(
+        conn, project_id=case["project_id"], storage_project_id=storage_project,
+        route_token_ref=bad_ref, backlog_id=case["guide"]["backlog_id"],
+        task_id=child_id, caller_role="observer",
+        evidence_refs=[f"contract_runtime:{child_id}"],
+        project_root=tmp_path,
+    )
+    replay_route = observer_route_context.resolve_route_token_ref_renewal_descendant(
+        conn, project_id=case["project_id"], storage_project_id=storage_project,
+        route_token_ref=bad_ref)
+    assert replay_route["route_token_ref"] == renewed["route_token_ref"]
+    assert recognize(replay_route, replay=True) == {
+        "recovery_candidate": True, "recovery_authorized": False}
+    replay_tampered = {
+        **replay_route,
+        "evidence_refs": [f"contract_runtime:{child_id}"],
+    }
+    assert recognize(replay_tampered, replay=True) == {}
 
 
 def test_ac_dev_direct_exact_cex_filter_preserves_unpinned_family(
