@@ -209420,6 +209420,383 @@ def test_ac_dev_direct_terminal_successor_plan_and_receipt_primitives(
             )
 
 
+def _prepare_ac_dev_direct_terminal_predecessor(
+    conn, monkeypatch, tmp_path, *, backlog_id: str,
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id=backlog_id, public_open_backlog=True,
+    )
+    first = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {"project_id": case["project_id"],
+             "contract_execution_id": case["execution_id"]},
+            method="POST", body=case["body"],
+        )
+    )
+    record = server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )
+    guide = server._contract_runtime_guide_for_response(record, actor_role="observer")
+    second_body = copy.deepcopy(
+        guide["line_bypass_guidance"]["inherited_bypass_copy_safe_body"]
+    )
+    for key in (
+        "classification", "reason", "decision", "evidence_refs", "task_id",
+        "observer_session_id", "observer_route_token_ref",
+    ):
+        second_body[key] = copy.deepcopy(case["body"][key])
+    second = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {"project_id": case["project_id"],
+             "contract_execution_id": case["execution_id"]},
+            method="POST", body=second_body,
+        )
+    )
+    conn.commit()
+    assert first["written_line"]["actor_role"] == "observer"
+    assert second["written_line"]["actor_role"] == "observer"
+    return case
+
+
+def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-DIRECT-TERMINAL-SUCCESSOR-HAPPY",
+    )
+    runtime = server._contract_runtime(conn)
+    predecessor_before = runtime.store.get(case["execution_id"])
+    request = {
+        "task_id": case["execution_id"],
+        "route_token_ref": case["route_token_ref"],
+    }
+
+    created = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="continue_contract_chain",
+        request_body=request,
+        request_selector_claims=None,
+    )
+    assert created["ok"] is True
+    assert created["writes_performed"] is True
+    assert created["idempotent_replay"] is False
+    assert created["safe_retry"] is False
+    successor_id = created["successor_contract_execution_id"]
+    assert successor_id.startswith("cex-direct-main-successor-")
+    assert runtime.store.get(case["execution_id"]) == predecessor_before
+    child = runtime.current_record(successor_id, actor_role="observer")
+    assert child["parent_contract_execution_id"] == case["execution_id"]
+    assert child["root_contract_execution_id"] == case["execution_id"]
+    assert child["execution_state_revision"] == 1
+    assert child["completed_lines"] == []
+    assert child["role_binding"] == {
+        "observer": "observer", "qa": "qa",
+        "binding_source": "operator_supervised_direct_main_route_authority",
+    }
+    assert server._operator_supervised_direct_main_route_authority(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        contract_execution_id=successor_id,
+        route_token_ref=child["route_token_ref"],
+    )["accepted"] is True
+    receipt_rows = conn.execute(
+        "SELECT id,payload_json FROM task_timeline_events WHERE project_id=? "
+        "AND backlog_id=? AND task_id=? AND "
+        "event_type='contract_runtime.direct_terminal_successor'",
+        (case["project_id"], case["guide"]["backlog_id"], case["execution_id"]),
+    ).fetchall()
+    assert len(receipt_rows) == 1
+    assert created["receipt_ref"] == f"timeline:{receipt_rows[0]['id']}"
+    serialized = json.dumps(created, sort_keys=True)
+    assert len(serialized.encode()) <= server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+    assert created["raw_route_token_exposed"] is False
+    assert "route_token" not in created
+    private_route_id = child["metadata"][
+        "operator_supervised_direct_main_route_authority"
+    ]["route_identity"]["route_id"]
+    assert private_route_id and private_route_id not in serialized
+    assert created["route_token_ref"] == child["route_token_ref"]
+    assert '"pass": true' not in serialized.lower()
+
+    after_create = tuple(conn.iterdump())
+    replay = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="continue_contract_chain",
+        request_body=request,
+        request_selector_claims=None,
+    )
+    rollback_replay = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="rollback_or_recover_contract",
+        request_body=request,
+        request_selector_claims=None,
+    )
+    assert replay["successor_contract_execution_id"] == successor_id
+    assert replay["writes_performed"] is False
+    assert replay["idempotent_replay"] is True
+    assert rollback_replay == replay
+    assert tuple(conn.iterdump()) == after_create
+
+    progressed = runtime.store.get(successor_id)
+    progressed["execution_state_revision"] = 2
+    runtime.store.update(successor_id, progressed, expected_revision=1)
+    conn.commit()
+    later_replay = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="continue_contract_chain",
+        request_body=request,
+        request_selector_claims=None,
+    )
+    assert later_replay["successor_contract_execution_id"] == successor_id
+    assert later_replay["writes_performed"] is False
+
+
+def test_ac_dev_direct_terminal_successor_rollback_without_receipt_is_zero_write(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-DIRECT-TERMINAL-SUCCESSOR-ROLLBACK-NO-RECEIPT",
+    )
+    before = tuple(conn.iterdump())
+    result = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="rollback_or_recover_contract",
+        request_body={"task_id": case["execution_id"]},
+        request_selector_claims=None,
+    )
+    assert result["state"] == "blocked"
+    assert result["reason"] == "rollback_receipt_required"
+    assert result["writes_performed"] is False
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("failure_stage", ["start", "binding", "record", "audit", "oversize"])
+def test_ac_dev_direct_terminal_successor_create_failures_are_atomic(
+    conn, monkeypatch, tmp_path, failure_stage,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id=f"AC-DEV-DIRECT-TERMINAL-SUCCESSOR-ATOMIC-{failure_stage.upper()}",
+    )
+    before = tuple(conn.iterdump())
+    original_audit = server._ac_dev_direct_terminal_successor_receipt_audit
+    if failure_stage == "start":
+        monkeypatch.setattr(
+            server.ContractRuntime, "start_execution",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected start")),
+        )
+    elif failure_stage == "binding":
+        monkeypatch.setattr(
+            server, "upsert_contract_chain_successor_binding",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected binding")),
+        )
+    elif failure_stage == "record":
+        monkeypatch.setattr(
+            task_timeline, "record_event",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected record")),
+        )
+    elif failure_stage == "audit":
+        monkeypatch.setattr(
+            server, "_ac_dev_direct_terminal_successor_receipt_audit",
+            lambda *args, **kwargs: original_audit(*args, **kwargs)
+            if kwargs.get("expected_core") is None
+            else (_ for _ in ()).throw(RuntimeError("injected audit")),
+        )
+    else:
+        monkeypatch.setattr(server, "_ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES", 1)
+    with pytest.raises((RuntimeError, server.GovernanceError)):
+        server._ac_dev_direct_terminal_successor_response(
+            conn,
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            route_token_ref=case["route_token_ref"],
+            role="observer",
+            work_type="continue_contract_chain",
+            request_body={"task_id": case["execution_id"]},
+            request_selector_claims=None,
+        )
+    assert tuple(conn.iterdump()) == before
+
+
+def test_ac_dev_direct_terminal_successor_blocked_hook_never_falls_back(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-DIRECT-TERMINAL-SUCCESSOR-HOOK-BLOCKED",
+    )
+    monkeypatch.setattr(
+        server, "_contract_chain_current_projection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("generic fallback")),
+    )
+    result = server._onboard_route_guide_service_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=case["route_token_ref"],
+        role="observer",
+        work_type="rollback_or_recover_contract",
+        request_body={"task_id": case["execution_id"]},
+    )
+    assert result["reason"] == "rollback_receipt_required"
+    assert result["writes_performed"] is False
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ["sibling", "collision", "orphan", "receipt", "claims", "route", "initial_world", "final_world"],
+)
+def test_ac_dev_direct_terminal_successor_denials_are_zero_write(
+    conn, monkeypatch, tmp_path, attack,
+):
+    case = _prepare_ac_dev_direct_terminal_predecessor(
+        conn, monkeypatch, tmp_path,
+        backlog_id=f"AC-DEV-DIRECT-TERMINAL-SUCCESSOR-DENY-{attack.upper()}",
+    )
+    selection = server._operator_supervised_direct_main_operational_terminal_selection(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        caller_contract_execution_id=case["execution_id"],
+        caller_route_token_ref=case["route_token_ref"],
+    )
+    successor_id = selection["expected_successor_contract_execution_id"]
+    runtime = server._contract_runtime(conn)
+    if attack in {"sibling", "collision"}:
+        foreign = runtime.store.get(case["execution_id"])
+        foreign_id = "cex-direct-main-foreign-sibling" if attack == "sibling" else successor_id
+        foreign["contract_execution_id"] = foreign_id
+        foreign["root_contract_execution_id"] = foreign_id
+        if attack == "collision":
+            foreign["backlog_id"] = "AC-DEV-DIRECT-FOREIGN-BACKLOG"
+        binding = foreign["metadata"]["operator_supervised_direct_main_runtime_binding"]
+        binding["contract_execution_id"] = foreign_id
+        binding["backlog_id"] = foreign["backlog_id"]
+        binding.pop("binding_hash", None)
+        binding["binding_hash"] = server.stable_sha256(binding)
+        runtime.store.create(foreign)
+        conn.commit()
+    elif attack == "orphan":
+        predecessor_authority = server._operator_supervised_direct_main_route_authority(
+            conn,
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            contract_execution_id=case["execution_id"],
+            route_token_ref=case["route_token_ref"],
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        server._ac_dev_direct_mint_route_authority_persist(
+            conn,
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            execution_id=successor_id,
+            request_body={},
+            expected_body={
+                "target_files": predecessor_authority["row_declared_files"],
+                "owned_files": predecessor_authority["row_declared_files"],
+                "allowed_actions": predecessor_authority["allowed_actions"],
+                "evidence_refs": [],
+                "source_free_operation": False,
+            },
+            world_authority=case["world"],
+            route_storage_project_id=server.direct_main_dev_storage_project_id(
+                case["project_id"], case["world"]["namespace_hash"]
+            ),
+        )
+        conn.commit()
+    elif attack == "receipt":
+        task_timeline.record_event(
+            conn,
+            project_id=case["project_id"],
+            backlog_id=case["guide"]["backlog_id"],
+            task_id=case["execution_id"],
+            event_type="contract_runtime.direct_terminal_successor",
+            phase="orchestration",
+            event_kind="contract_binding",
+            actor="observer",
+            status="accepted",
+            payload={},
+            post_commit_hooks=False,
+        )
+        conn.commit()
+    original_world_ref = server._operator_supervised_direct_main_world_ref(
+        project_id=case["project_id"]
+    )
+    if attack == "initial_world":
+        invalid = {**original_world_ref, "accepted": False}
+        monkeypatch.setattr(server, "_operator_supervised_direct_main_world_ref", lambda **_kwargs: invalid)
+    elif attack == "final_world":
+        changed = {**original_world_ref, "base_commit": "f" * 40}
+        worlds = iter((original_world_ref, changed))
+        monkeypatch.setattr(server, "_operator_supervised_direct_main_world_ref", lambda **_kwargs: next(worlds))
+    before = tuple(conn.iterdump())
+    request = {"task_id": case["execution_id"]}
+    route_ref = case["route_token_ref"]
+    selector_claims = None
+    if attack == "claims":
+        request["task_id"] = [case["execution_id"], "cex-direct-main-foreign"]
+    elif attack == "route":
+        route_ref = ""
+        request["route_token_ref"] = "rtok-direct-main-foreign"
+    result = server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+        route_token_ref=route_ref,
+        role="observer",
+        work_type="continue_contract_chain",
+        request_body=request,
+        request_selector_claims=selector_claims,
+    )
+    assert result["state"] == "blocked"
+    assert result["writes_performed"] is False
+    assert tuple(conn.iterdump()) == before
+
+
+def test_ac_dev_direct_terminal_successor_ineligible_no_family_is_unchanged(
+    conn,
+):
+    backlog_id = "AC-DEV-DIRECT-TERMINAL-SUCCESSOR-NO-FAMILY"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.commit()
+    before = tuple(conn.iterdump())
+    assert server._ac_dev_direct_terminal_successor_response(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        route_token_ref="",
+        role="observer",
+        work_type="continue_contract_chain",
+        request_body={},
+        request_selector_claims=None,
+    ) == {}
+    assert tuple(conn.iterdump()) == before
+
+
 def test_ac_dev_direct_exact_cex_filter_preserves_unpinned_family(
     conn, monkeypatch, tmp_path,
 ):

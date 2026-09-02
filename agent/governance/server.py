@@ -151792,6 +151792,159 @@ def _ac_dev_direct_terminal_successor_receipt_audit(
         row["correlation_id"] == rebuilt["correlation_id"],
     ))
     return rebuilt if valid else blocked("receipt_audit_mismatch")
+
+
+def _ac_dev_direct_terminal_successor_response(
+    conn, *, project_id: str, backlog_id: str, route_token_ref: str,
+    role: str, work_type: str, request_body: Mapping[str, Any] | None,
+    request_selector_claims: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if _runtime_plane() != "dev" or project_id != "aming-claw" or role != "observer" or work_type not in {
+        "continue_contract_chain", "rollback_or_recover_contract",
+    }:
+        return {}
+    claims = request_selector_claims if isinstance(request_selector_claims, Mapping) else request_body
+    execution_ids = _runtime_context_service_dedupe([
+        value for field in ("task_id", "contract_execution_id")
+        for value in _operator_supervised_direct_main_request_claim_values(claims, field)
+    ])
+    route_refs = _runtime_context_service_dedupe([
+        route_token_ref, *[value for field in ("route_token_ref", "observer_route_token_ref")
+                          for value in _operator_supervised_direct_main_request_claim_values(claims, field)]
+    ])
+    def blocked(reason: str) -> dict[str, Any]:
+        return {"schema_version": "ac_dev_direct_terminal_successor.v1", "ok": False,
+                "state": "blocked", "reason": reason, "writes_performed": False,
+                "safe_retry": False}
+    created = False
+    with sqlite_write_lock():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            world_ref = _operator_supervised_direct_main_world_ref(project_id=project_id)
+            world = world_ref.get("runtime_world_authority") if isinstance(world_ref, Mapping) else {}
+            world = dict(world) if isinstance(world, Mapping) else {}
+            family = _operator_supervised_direct_main_strict_records(
+                conn, project_id=project_id, backlog_id=backlog_id,
+                world_authority=world,
+            )
+            if not family:
+                return {}
+            if world_ref.get("accepted") is not True or len(execution_ids) != 1 or len(route_refs) != 1:
+                return blocked("exact_predecessor_authority_required")
+            predecessor_id, predecessor_route = execution_ids[0], route_refs[0]
+            selection = _operator_supervised_direct_main_operational_terminal_selection(
+                conn, project_id=project_id, backlog_id=backlog_id,
+                caller_contract_execution_id=predecessor_id,
+                caller_route_token_ref=predecessor_route, world_authority=world,
+            )
+            if selection.get("state") != "exact_terminal_predecessor":
+                return blocked(str(selection.get("reason") or "terminal_predecessor_required"))
+            successor_id = str(selection["expected_successor_contract_execution_id"])
+            records = {str(item["contract_execution_id"]): item for item in family}
+            if predecessor_id not in records or set(records) - {predecessor_id, successor_id}:
+                return blocked("direct_family_sibling_or_collision")
+            runtime = _contract_runtime(conn)
+            predecessor = runtime.current_record(predecessor_id, actor_role="observer")
+            predecessor_authority = _operator_supervised_direct_main_route_authority(
+                conn, project_id=project_id, backlog_id=backlog_id,
+                contract_execution_id=predecessor_id, route_token_ref=predecessor_route,
+            )
+            if predecessor_authority.get("accepted") is not True:
+                return blocked("predecessor_route_authority")
+            child = records.get(successor_id)
+            created = child is None
+            if created:
+                if _contract_runtime_execution_record_exists(conn, successor_id):
+                    return blocked("successor_identity_collision")
+                storage_project = direct_main_dev_storage_project_id(project_id, str(world["namespace_hash"]))
+                if conn.execute(
+                    "SELECT 1 FROM observer_route_token_refs WHERE project_id=? AND backlog_id=? AND task_id=? LIMIT 1",
+                    (storage_project, backlog_id, successor_id),
+                ).fetchone():
+                    return blocked("successor_orphan_route")
+                absence = _ac_dev_direct_terminal_successor_receipt_audit(
+                    conn, project_id=project_id, backlog_id=backlog_id,
+                    predecessor_execution_id=predecessor_id, expected_core=None,
+                )
+                if absence:
+                    return absence
+                if work_type == "rollback_or_recover_contract":
+                    return blocked("rollback_receipt_required")
+                expected_body = {
+                    "target_files": list(predecessor_authority["row_declared_files"]),
+                    "owned_files": list(predecessor_authority["row_declared_files"]),
+                    "allowed_actions": list(predecessor_authority["allowed_actions"]),
+                    "evidence_refs": [], "source_free_operation": predecessor_authority["source_free_operation"],
+                }
+                minted = _ac_dev_direct_mint_route_authority_persist(
+                    conn, project_id=project_id, backlog_id=backlog_id,
+                    execution_id=successor_id, request_body={}, expected_body=expected_body,
+                    world_authority=world, route_storage_project_id=storage_project,
+                )
+                child_authority = minted["route_authority"]
+            else:
+                child = runtime.current_record(successor_id, actor_role="observer")
+                child_authority = _operator_supervised_direct_main_route_authority(
+                    conn, project_id=project_id, backlog_id=backlog_id,
+                    contract_execution_id=successor_id,
+                    route_token_ref=str(child.get("route_token_ref") or ""),
+                )
+            if child_authority.get("accepted") is not True:
+                return blocked("successor_route_authority")
+            plan = _ac_dev_direct_terminal_successor_plan(
+                project_id=project_id, backlog_id=backlog_id,
+                predecessor_record=predecessor, terminal_selection=selection,
+                route_authority=child_authority, world_ref=world_ref, dev_world=world,
+            )
+            if created:
+                child = runtime.start_execution("operator_supervised_direct_main", **plan["start_kwargs"])
+                if int(child.get("execution_state_revision") or 0) != 1 or child.get("completed_lines"):
+                    return blocked("fresh_successor_not_empty")
+                upsert_contract_chain_successor_binding(
+                    conn, parent_record=predecessor, child_record=child,
+                    edge_kind="direct_terminal_successor", binding_kind="direct_terminal_successor_current",
+                )
+                core = plan["expected_receipt_core"]
+                receipt_hash = stable_sha256(core)
+                capsule = _ac_dev_direct_terminal_successor_compact_response(core, receipt_hash=receipt_hash)
+                payload = {"schema_version": "contract_runtime.direct_terminal_successor_event.v1",
+                           "audit_only": True, "authoritative_evidence": False, "pass_synthesized": False,
+                           "direct_terminal_successor_receipt": {
+                               "schema_version": "contract_runtime.direct_terminal_successor_receipt.v1",
+                               "core": core, "receipt_hash": receipt_hash, "capsule_hash": capsule["capsule_hash"]}}
+                if _onboard_guide_capsule_serialized_bytes(payload) > _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES:
+                    return blocked("successor_receipt_oversized")
+                from . import task_timeline
+                task_timeline.record_event(
+                    conn, project_id=project_id, backlog_id=backlog_id, task_id=predecessor_id,
+                    event_type="contract_runtime.direct_terminal_successor", phase="orchestration",
+                    event_kind="contract_binding", actor="observer", status="accepted",
+                    correlation_id=capsule["capsule"]["correlation_id"], payload=payload,
+                    post_commit_hooks=False,
+                )
+            actual = {key: child.get(key) for key in plan["immutable_child_projection"]}
+            if actual != plan["immutable_child_projection"]:
+                return blocked("successor_projection")
+            response = _ac_dev_direct_terminal_successor_receipt_audit(
+                conn, project_id=project_id, backlog_id=backlog_id,
+                predecessor_execution_id=predecessor_id,
+                expected_core=plan["expected_receipt_core"],
+            )
+            if response.get("ok") is not True:
+                return response
+            if created:
+                response = {**response, "writes_performed": True, "idempotent_replay": False}
+                if _onboard_guide_capsule_serialized_bytes(response) > _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES:
+                    return blocked("successor_response_oversized")
+            final_world_ref = _operator_supervised_direct_main_world_ref(project_id=project_id)
+            if final_world_ref.get("accepted") is not True or stable_sha256(world_ref) != stable_sha256(final_world_ref):
+                return blocked("runtime_world_changed")
+            if created:
+                conn.commit()
+            return response
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
 def _handle_ac_dev_direct_route_context_issue(
     ctx: RequestContext,
     *,
@@ -170204,6 +170357,10 @@ def _onboard_route_guide_service_response(
     )
     if direct_main_response:
         return direct_main_response
+    terminal_successor = _ac_dev_direct_terminal_successor_response(
+        conn, project_id=project_id, backlog_id=backlog_id, route_token_ref=route_token_ref, role=role, work_type=work_type,
+        request_body=request_body, request_selector_claims=request_selector_claims)
+    if terminal_successor: return terminal_successor
     preexisting_projection = _contract_chain_current_projection(
         conn,
         project_id=project_id,
