@@ -147815,6 +147815,164 @@ def _onboard_selected_qa_contract_runtime_guidance(
     authority_source = str(
         action.get("authority_decision_source") or "backlog_contract_chain_current"
     ).strip()
+    selected_record = (
+        qa_runtime_record if isinstance(qa_runtime_record, Mapping) else record
+    )
+    if selected_record.get("contract_id") == "operator_supervised_direct_main":
+        # Direct has no MF dispatch.  Its immutable binding and accepted
+        # implementation are the identity source for the existing QA facade.
+        metadata = selected_record.get("metadata") or {}
+        binding = metadata.get("operator_supervised_direct_main_runtime_binding") or {}
+        identity = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+        }
+        if not (
+            selected_record.get("revision")
+            in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+            and binding.get("strict_runtime_binding_required") is True
+            and all(
+                value and selected_record.get(field) == value
+                and binding.get(field) == value
+                for field, value in identity.items()
+            )
+        ):
+            return {
+                "status": "blocked", "executable": False, "ordered_steps": [],
+                "blocker": {"id": "qa_direct_runtime_identity_unavailable"},
+            }
+        projection = _operator_supervised_direct_main_facade_action_projection(
+            None,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            route_token_ref=str(selected_record.get("route_token_ref") or ""),
+            target_files=list(binding.get("target_files") or []),
+            record=selected_record,
+            runtime_next=action,
+            active_route_identity={},
+        )
+        body = deepcopy(projection["copy_safe_body"])
+        if not (
+            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(body.get("commit_sha") or ""))
+            and binding.get("target_project_root")
+            and body.get("runtime_guide_hash")
+            and body.get("direct_runtime_binding_hash")
+        ):
+            return {
+                "status": "blocked", "executable": False, "ordered_steps": [],
+                "blocker": {"id": "qa_direct_accepted_candidate_binding_unavailable"},
+            }
+        session_arguments = {
+            **identity,
+            "task_id": execution_id,
+            "commit_sha": body["commit_sha"],
+            "principal_id": body["actor"],
+        }
+        token_transport = {
+            "source": "qa_session_register.response.token",
+            "transport": "process_local_http_header",
+            "header_name": "X-Gov-Token",
+            "raw_value_exposed": False,
+            "persisted": False,
+            "model_visible": False,
+            "scope_binding": session_arguments,
+        }
+        session_http = {
+            **qa_session_register_http_fallback(),
+            "body": {**session_arguments, "role": "qa"},
+            "auth": "existing role-assignment coordinator authorization; token-free compatibility only when the server permits it",
+            "authorization_source": "existing_role_assignment_handler",
+            "token_free_compatibility": "server_decided",
+            "on_auth_rejection": "hold_for_authorized_role_assignment",
+            "response_handling": "Keep response.token only in the QA process; inject it into X-Gov-Token, never into a request body, logs, files, or model-visible output.",
+        }
+        graph_arguments = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": execution_id,
+            "commit_sha": body["commit_sha"],
+            "repo_root": str(binding.get("target_project_root") or ""),
+            "tool": "query_schema",
+            "snapshot_id": "active",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+        }
+        http_request = {
+            "method": "POST", "path": f"/api/task/{project_id}/timeline",
+            "body": deepcopy(body), "authentication": token_transport,
+        }
+        native_transport = {
+            "runnable": False,
+            "reason": "native_task_timeline_adapter_does_not_preserve_direct_writer_binding",
+            "fallback": "http_request",
+            "transport_repair_claimed": False,
+        }
+        projected_action = {
+            **action,
+            "action": "task_timeline_append",
+            "interface": "task_timeline_append",
+            "mcp_tool": "",
+            "transport": "http",
+            "http_request": http_request,
+            "native_mcp_transport": native_transport,
+            "action_input": deepcopy(body),
+            "copy_safe_body": deepcopy(body),
+            "generic_contract_runtime_submit_line_allowed": False,
+        }
+        return {
+            "schema_version": "onboard_route_guide.selected_direct_qa.v1",
+            "role": "qa",
+            "entrypoint": "qa_session_register" if line_id == "qa_graph_context" else "reuse_same_qa_session",
+            "next_action": projected_action,
+            "contract_execution_id": execution_id,
+            "current_line_id": line_id,
+            "current_action": "task_timeline_append",
+            "source_of_authority": authority,
+            "authority_decision_source": authority_source,
+            "canonical_direct_identity": session_arguments,
+            "writer_role_safe_copy_payload": {
+                "transport": "http", "http_request": http_request,
+                "copy_payload": body,
+                "replace_before_submit": projection["replace_before_submit"],
+                "generic_contract_runtime_submit_line_allowed": False,
+            },
+            "managed_qa_session_envelope": {
+                "transport": "process_local_http_session",
+                "http_request": session_http,
+                "arguments": session_arguments,
+                "result_binding": {"X-Gov-Token": token_transport},
+                "raw_qa_session_token_exposed": False,
+                "reuse_same_session_after_graph_prefix": True,
+                "expected_session_id": projection.get("expected_qa_session_id", ""),
+                "on_session_lost": "hold_no_manual_credential_reconstruction",
+                "observer_may_submit": False,
+            },
+            "ordered_steps": [
+                {"id": "qa_session_register" if line_id == "qa_graph_context" else "reuse_same_qa_session",
+                 "http_request": session_http,
+                 "register_new_session": line_id == "qa_graph_context",
+                 "result_binding": {"X-Gov-Token": token_transport}},
+                *([{"id": "graph_query_schema", "http_request": {
+                    "method": "POST", "path": f"/api/graph-governance/{project_id}/query",
+                    "body": graph_arguments, "authentication": token_transport}}]
+                  if line_id == "qa_graph_context" else []),
+                {"id": "run_focused_exact_tests", "exact_candidate_commit": body["commit_sha"],
+                 "record_actual_outcome": True, "pass_synthesis_allowed": False},
+                {"id": "submit_one_qa_independent_verification",
+                 "http_request": http_request,
+                 "copy_all_safe_fields": True, "exactly_once": True},
+                {"id": "reread_current_direct_guide", "mcp_tool": "onboard_route_guide",
+                 "arguments": {"project_id": project_id, "backlog_id": backlog_id,
+                               "task_id": execution_id, "role": "qa",
+                               "work_type": "qa_verification"}},
+            ],
+            "redundant_graph_query_required": False,
+            "observer_may_submit": False,
+            "native_mcp_transport": native_transport,
+            "generic_contract_runtime_submit_line_allowed": False,
+        }
     from .contract_state_runtime import (
         cli_agent_qa_onboard_guidance_binding,
         cli_agent_qa_onboard_guidance_contract,
@@ -150073,6 +150231,9 @@ def _operator_supervised_direct_main_facade_action_projection(
             for line in completed_lines
             if str(line.get("line_id") or "").strip()
             == "observer_implementation"
+            and _contract_runtime_line_status_passes(line)
+            and str(line.get("evidence_kind") or "") == "implementation"
+            and str(line.get("actor_role") or "") == "observer"
             and re.fullmatch(
                 r"[0-9a-f]{40}|[0-9a-f]{64}",
                 str(line.get("commit_sha") or "").strip().lower(),
@@ -150181,8 +150342,17 @@ def _operator_supervised_direct_main_facade_action_projection(
         commit_value = implementation_commit or (
             "<replace with the exact Direct implementation commit>"
         )
-        qa_principal = "<copy the authenticated QA principal_id>"
-        qa_graph_trace = "<copy a DB-verified QA graph_query trace_id>"
+        qa_principal = f"qa:{contract_execution_id}"
+        qa_session_id = ""
+        qa_graph_traces = ["<copy a DB-verified QA graph_query trace_id>"]
+        for completed in completed_lines:
+            if completed.get("line_id") == "qa_graph_context":
+                graph_payload = completed.get("payload") or {}
+                qa_authority = graph_payload.get("qa_authority") or {}
+                qa_proof = qa_authority.get("qa_session_proof") or {}
+                qa_principal = str(qa_proof.get("principal_id") or qa_principal)
+                qa_session_id = str(qa_proof.get("qa_session_id") or "")
+                qa_graph_traces = list(graph_payload.get("graph_trace_ids") or qa_graph_traces)
         test_command = "<copy one or more exact QA commands that passed>"
         body = {
             "project_id": project_id,
@@ -150200,7 +150370,7 @@ def _operator_supervised_direct_main_facade_action_projection(
                 "live_regression": {"status": "passed"},
             },
             "payload": {
-                "graph_trace_ids": [qa_graph_trace],
+                "graph_trace_ids": qa_graph_traces,
                 "observer_impersonation": False,
             },
         }
@@ -150228,7 +150398,6 @@ def _operator_supervised_direct_main_facade_action_projection(
         ).strip()
         body.update(qa_facade_binding)
         missing = [
-            "actor",
             "verification.tests_run",
             "payload.graph_trace_ids",
         ]
@@ -150248,10 +150417,22 @@ def _operator_supervised_direct_main_facade_action_projection(
             "action_input_missing_fields": missing,
             "replace_before_submit": missing,
             "qa_session_required": True,
+            "expected_qa_session_id": qa_session_id,
             "qa_authored": True,
             "observer_may_submit": False,
             "managed_qa_session_token_required": True,
             "raw_qa_session_token_exposed": False,
+            "http_request": {
+                "method": "POST",
+                "path": f"/api/task/{project_id}/timeline",
+                "body": deepcopy(body),
+                "authentication": "same exact QA session X-Gov-Token header; see selected QA Guide",
+            },
+            "native_mcp_transport": {
+                "runnable": False,
+                "reason": "native_task_timeline_adapter_does_not_preserve_direct_writer_binding",
+                "transport_repair_claimed": False,
+            },
             "consumes_contract_runtime_lines": [
                 "qa_graph_context",
                 "qa_independent_verification",
@@ -150472,11 +150653,14 @@ def _onboard_operator_supervised_direct_main_runtime_response(
     Fact can bind to the source-backed ContractRuntime execution.
     """
 
-    if not (
+    selected_qa = str(role or "").strip() == "qa" and str(work_type or "").strip() in {
+        "qa_verification", "direct_main", "operator_supervised_direct_main", "",
+    }
+    if not (selected_qa or (
         str(role or "").strip() == "observer"
         and str(work_type or "").strip()
         in {"direct_main", "operator_supervised_direct_main"}
-    ):
+    )):
         return {}
     dev_world = (
         _operator_supervised_direct_main_dev_world_authority()
@@ -150504,6 +150688,19 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             execution_claims[0] if len(execution_claims) == 1 else ""
         ),
     )
+    if selected_qa and not strict_records:
+        # QA may consume a selected execution, never create a Direct route.
+        family = _operator_supervised_direct_main_strict_records(
+            conn, project_id=project_id, backlog_id=backlog_id,
+        )
+        if family:
+            raise GovernanceError(
+                "qa_direct_runtime_identity_mismatch",
+                "QA must select the exact current Direct execution, not an onboard-service task",
+                409,
+                {"zero_write_rejection": True, "writes_performed": False},
+            )
+        return {}
     historical_events = _onboard_parentless_direct_main_timeline_events(
         conn,
         project_id=project_id,
@@ -150833,6 +151030,11 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         contract_runtime_first_missing_line = ""
         if isinstance(runtime_next, Mapping) and runtime_next:
             line_id = str(runtime_next.get("line_id") or "").strip()
+            if line_id in {"qa_graph_context", "qa_independent_verification"}:
+                current_record = _contract_runtime(conn).current_record(
+                    execution_id, actor_role="qa",
+                )
+                runtime_next = current_record["runtime_guide"]["next_legal_action"]
             contract_runtime_first_missing_line = line_id
             facade_projection = (
                 _operator_supervised_direct_main_facade_action_projection(
@@ -150913,6 +151115,12 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                 "generic_contract_runtime_submit_line_allowed": False,
                 "generic_contract_runtime_payload_executable": False,
             }
+            if facade_projection.get("http_request"):
+                next_action.update({
+                    "mcp_tool": "", "transport": "http",
+                    "http_request": deepcopy(facade_projection["http_request"]),
+                    "native_mcp_transport": deepcopy(facade_projection["native_mcp_transport"]),
+                })
             graph_query_close_authority = facade_projection.get(
                 "graph_query_close_authority"
             )
@@ -151179,8 +151387,8 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "response_view": str(response_view or "full"),
         "project_id": project_id,
         "backlog_id": backlog_id,
-        "selected_role": "observer",
-        "selected_work_type": "operator_supervised_direct_main",
+        "selected_role": "qa" if selected_qa else "observer",
+        "selected_work_type": "qa_verification" if selected_qa else "operator_supervised_direct_main",
         "selected_backlog_source": "backlog_row",
         "contract_execution_id": execution_id,
         "contract_id": "operator_supervised_direct_main",
@@ -151207,6 +151415,16 @@ def _onboard_operator_supervised_direct_main_runtime_response(
     }
     if graph_bootstrap_projection:
         response["dev_local_graph_bootstrap"] = graph_bootstrap_projection
+    if selected_qa:
+        selected_guidance = _onboard_selected_qa_contract_runtime_guidance(
+            current_record, next_legal_action=next_action or {},
+        )
+        response["selected_role_guidance"] = selected_guidance
+        response["agent_onboard_guidance"] = {
+            "role": "qa", "selected_role_guidance": selected_guidance,
+        }
+        if selected_guidance.get("next_action"):
+            response["next_legal_action"] = selected_guidance["next_action"]
     return response
 
 
@@ -171311,7 +171529,9 @@ def _onboard_route_guide_service_response(
             and str(candidate.get("backlog_id") or "") == backlog_id
             and not _onboard_service_record(candidate)
         ):
-            qa_runtime_record = candidate
+            qa_runtime_record = _contract_runtime(conn).current_record(
+                qa_execution_id, actor_role="qa",
+            )
     if response_view == "compact":
         next_action = _onboard_worker_read_runtime_facade_projection(
             conn,
@@ -198046,6 +198266,24 @@ def _handle_task_timeline_append(ctx: RequestContext):
         trusted_contract_runtime_actor_role = (
             _trusted_contract_runtime_actor_role_from_context(ctx, conn)
         )
+        if trusted_contract_runtime_actor_role == "qa":
+            # Validate strict Direct binding even when a lossy transport omits
+            # contract_execution_id.  The task's pinned record, not a caller
+            # supplied alternate execution, selects this prewrite check.
+            direct_records = _operator_supervised_direct_main_strict_records(
+                conn, project_id=project_id,
+                backlog_id=str(ctx.body.get("backlog_id") or ""),
+                contract_execution_id=str(ctx.body.get("task_id") or ""),
+            )
+            if len(direct_records) == 1 and direct_records[0].get("contract_execution_id") == ctx.body.get("task_id"):
+                direct_record = _contract_runtime(conn).current_record(
+                    str(ctx.body["task_id"]), actor_role="qa",
+                )
+                _operator_supervised_direct_main_qa_facade_binding(
+                    direct_record, actor_role="qa",
+                    line=direct_record["runtime_guide"].get("next_legal_action") or {},
+                    body=ctx.body,
+                )
         contract_runtime_completed_projection_gate = {}
         if (
             trusted_contract_runtime_actor_role == "qa"

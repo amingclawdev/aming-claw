@@ -1952,6 +1952,8 @@ def _strict_direct_main_comparison_world(
     tmp_path,
     *,
     suffix: str,
+    revision: str = "rev3",
+    successor: bool = False,
 ) -> dict[str, Any]:
     """Create a real rev3 Direct Main round through its public facades."""
 
@@ -1963,12 +1965,31 @@ def _strict_direct_main_comparison_world(
         "resolve_project_root",
         lambda *_args, **_kwargs: project_root,
     )
+    if revision != "rev3":
+        pinned = server._CONTRACT_DEFINITION_REGISTRY.get(
+            "operator_supervised_direct_main", version="v1", revision=revision,
+        )
+        monkeypatch.setattr(server, "_operator_supervised_direct_main_fresh_definition", lambda: copy.deepcopy(pinned))
     task_id, route_token_ref, route_identity = (
         _parentless_direct_main_pre_mutation_graph_scope(
             conn,
             backlog_id=backlog_id,
         )
     )
+    if successor:
+        parent = server._onboard_service_materialize_parent_record(
+            conn, project_id=PID, backlog_id=backlog_id,
+        )
+        parent_id = parent["contract_execution_id"]
+        original_start = contract_runtime.ContractRuntime.start_execution
+
+        def start_with_parent(runtime, contract_id, **kwargs):
+            if contract_id == "operator_supervised_direct_main":
+                kwargs["parent_contract_execution_id"] = parent_id
+                kwargs["root_contract_execution_id"] = parent_id
+            return original_start(runtime, contract_id, **kwargs)
+
+        monkeypatch.setattr(contract_runtime.ContractRuntime, "start_execution", start_with_parent)
     trace_id = "gqt-20260827-" + server.stable_sha256(
         {"suffix": suffix}
     )[7:17]
@@ -2054,6 +2075,264 @@ def _strict_direct_main_comparison_world(
         "candidate_commit": candidate_commit,
         "trace_id": trace_id,
     }
+
+
+def test_direct_qa_selected_facade_has_exact_identity_and_managed_envelope(
+    conn, monkeypatch, tmp_path,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="QA-FACADE",
+    )
+    changes_before = conn.total_changes
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID}, "qa", method="POST",
+            body={"backlog_id": world["backlog_id"], "role": "qa",
+                  "work_type": "qa_verification", "response_view": "compact"},
+        )
+    )
+    assert guide["contract_execution_id"] == world["task_id"]
+    assert guide["onboard_service_proxy_selected"] is False
+    selected = guide["agent_onboard_guidance"]["selected_role_guidance"]
+    assert selected.get("status") != "blocked", selected
+    envelope = selected["managed_qa_session_envelope"]
+    assert envelope["arguments"] == {
+        "project_id": PID, "backlog_id": world["backlog_id"],
+        "contract_execution_id": world["task_id"], "task_id": world["task_id"],
+        "commit_sha": world["candidate_commit"], "principal_id": f"qa:{world['task_id']}",
+    }
+    body = selected["writer_role_safe_copy_payload"]["copy_payload"]
+    assert body == guide["next_legal_action"]["copy_safe_body"]
+    assert body["task_id"] == body["contract_execution_id"] == world["task_id"]
+    assert body["line_id"] == body["stage_id"] == "qa_graph_context"
+    assert body["commit_sha"] == world["candidate_commit"]
+    assert body["runtime_guide_hash"].startswith("sha256:")
+    assert body["direct_runtime_binding_hash"].startswith("sha256:")
+    assert selected["generic_contract_runtime_submit_line_allowed"] is False
+    assert envelope["raw_qa_session_token_exposed"] is False
+    assert guide["next_legal_action"]["transport"] == "http"
+    assert guide["next_legal_action"]["http_request"]["method"] == "POST"
+    assert guide["next_legal_action"]["http_request"]["path"] == f"/api/task/{PID}/timeline"
+    definition_path = Path(server.__file__).parent / "contract_definitions/operator_supervised_direct_main.v1.rev3.json"
+    assert hashlib.sha256(definition_path.read_bytes()).hexdigest() == "38ba51f29e3d2a1cde67cd7a34dafa4ee0018ac760f97c40a0805725fd34c2e7"
+    assert sum(len(stage["lines"]) for stage in json.loads(definition_path.read_text())["rule_layer"]["stages"]) == 8
+    assert conn.total_changes == changes_before
+
+    for selector in ("task_id", "contract_execution_id"):
+        with pytest.raises(GovernanceError):
+            server.handle_project_onboard_route_guide(
+                _ctx_with_role(
+                    {"project_id": PID}, "qa", method="POST",
+                    body={"backlog_id": world["backlog_id"], "role": "qa",
+                          "work_type": "qa_verification", selector: "onboard-service-forged"},
+                )
+            )
+        assert conn.total_changes == changes_before
+
+
+def _direct_qa_facade_http_session(conn, world):
+    """Real GovernanceHandler/router/HTTP, with QA credentials only in memory."""
+    from http.server import HTTPServer
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    def api(request, token=""):
+        with HTTPServer(("127.0.0.1", 0), server.GovernanceHandler) as httpd:
+            def client():
+                req = Request(
+                    f"http://127.0.0.1:{httpd.server_port}{request['path']}",
+                    data=json.dumps(request["body"]).encode(),
+                    method=request["method"],
+                    headers={"Content-Type": "application/json", "X-Gov-Token": token},
+                )
+                try:
+                    response = urlopen(req, timeout=20)
+                except HTTPError as exc:
+                    response = exc
+                with response:
+                    return response.status, json.loads(response.read())
+
+            # Serve on the fixture connection's owning thread; only the HTTP
+            # client runs on another thread. No handler/guard/auth is replaced.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(client)
+                httpd.handle_request()
+                status, result = future.result(timeout=20)
+        if status >= 400:
+            exc = GovernanceError(result.get("error", "http_error"), result.get("message", "HTTP rejection"), status, result.get("details") or {})
+            exc.add_note(json.dumps(result, sort_keys=True))
+            raise exc
+        return result
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID}, "qa", method="POST",
+            body={"backlog_id": world["backlog_id"], "role": "qa",
+                  "work_type": "qa_verification", "response_view": "compact"},
+        )
+    )
+    selected = guide["selected_role_guidance"]
+    registered = api(selected["managed_qa_session_envelope"]["http_request"])
+    qa_token = registered["token"]
+    _activate_basic_graph(conn, "full-direct-qa-facade", project_id=PID, commit_sha=world["candidate_commit"])
+    graph_request = copy.deepcopy(selected["ordered_steps"][1]["http_request"])
+    queried = api(graph_request, qa_token)
+    assert queried["trace_id"]
+    request = copy.deepcopy(guide["next_legal_action"]["http_request"])
+    body = request["body"]
+    body["payload"]["graph_trace_ids"] = [queried["trace_id"]]
+    body["verification"]["tests_run"] = ["pytest -q exact-direct-qa-facade"]
+
+    def append(body, *, token_override=None):
+        return api({**request, "body": body}, token_override or qa_token)
+
+    return append, body, guide
+
+
+@pytest.mark.parametrize("verdict", ["passed", "failed"])
+@pytest.mark.parametrize("graph_prefix", [False, True])
+@pytest.mark.parametrize("revision", ["rev2", "rev3"])
+@pytest.mark.parametrize("successor", [False, True])
+def test_direct_qa_http_facade_paired_transition_and_zero_write_rejections(
+    conn, monkeypatch, tmp_path, verdict, graph_prefix, revision, successor,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix=f"QA-{verdict}-{graph_prefix}",
+        revision=revision, successor=successor,
+    )
+    append, body, guide = _direct_qa_facade_http_session(conn, world)
+    body["status"] = verdict
+    if verdict == "failed":
+        body["verification"]["live_regression"]["status"] = "failed"
+    runtime = server._contract_runtime(conn)
+    stored = runtime.store.get(world["task_id"])
+    assert stored["revision"] == revision
+    assert bool(stored.get("parent_contract_execution_id")) is successor
+    if graph_prefix:
+        original_submit = server._operator_supervised_direct_main_submit_runtime_line
+
+        def crash_after_graph(*args, **kwargs):
+            if kwargs["expected_line_id"] == "qa_independent_verification":
+                raise RuntimeError("injected crash after accepted QA graph prefix")
+            result = original_submit(*args, **kwargs)
+            conn.commit()
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(server, "_operator_supervised_direct_main_submit_runtime_line", crash_after_graph)
+            with pytest.raises(GovernanceError):
+                append(copy.deepcopy(body))
+        refreshed = server.handle_project_onboard_route_guide(
+            _ctx_with_role(
+                {"project_id": PID}, "qa", method="POST",
+                body={"backlog_id": world["backlog_id"], "role": "qa",
+                      "work_type": "qa_verification", "response_view": "compact"},
+            )
+        )
+        fresh = refreshed["next_legal_action"]["copy_safe_body"]
+        assert fresh["line_id"] == "qa_independent_verification"
+        assert fresh["stage_id"] == "qa"
+        assert fresh["execution_state_revision"] == body["execution_state_revision"] + 1
+        assert fresh["runtime_guide_hash"] != body["runtime_guide_hash"]
+        assert fresh["payload"]["graph_trace_ids"] == body["payload"]["graph_trace_ids"]
+        selected = refreshed["selected_role_guidance"]
+        assert selected["entrypoint"] == "reuse_same_qa_session"
+        assert selected["managed_qa_session_envelope"]["expected_session_id"]
+        assert selected["managed_qa_session_envelope"]["on_session_lost"] == "hold_no_manual_credential_reconstruction"
+        for field in ("contract_execution_id", "direct_runtime_binding_hash", "actor", "commit_sha"):
+            assert fresh[field] == body[field]
+        stale = copy.deepcopy(body)
+        before = conn.total_changes
+        with pytest.raises(GovernanceError):
+            append(stale)
+        assert conn.total_changes == before
+        body.update({field: fresh[field] for field in (
+            "execution_state_revision", "stage_id", "line_id", "runtime_guide_hash",
+        )})
+
+    record_before = copy.deepcopy(runtime.store.get(world["task_id"]))
+    events_before = conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0]
+    mutations = [
+        ("contract_execution_id", "onboard-service-forged"),
+        ("task_id", "onboard-service-forged"),
+        ("backlog_id", "AC-CROSS-TASK"),
+        ("commit_sha", world["base_commit"]),
+        ("actor", "qa:forged"),
+        ("execution_state_revision", 1),
+        ("runtime_guide_hash", _fake_sha("stale-guide")),
+        ("direct_runtime_binding_hash", _fake_sha("wrong-binding")),
+        ("stage_id", "implementation"),
+        ("line_id", "observer_implementation"),
+        ("route_token_ref", "rtok-cross-task"),
+        ("payload", {"graph_trace_ids": ["gqt-unknown"]}),
+        ("payload", {**body["payload"], "line_id": body["line_id"]}),
+    ]
+    for field, value in mutations:
+        forged = {**copy.deepcopy(body), field: value}
+        before = conn.total_changes
+        try:
+            rejected = append(forged)
+        except GovernanceError:
+            pass
+        else:
+            assert rejected.get("ok") is False or rejected.get("error"), (field, rejected)
+        assert conn.total_changes == before, field
+        assert runtime.store.get(world["task_id"]) == record_before, field
+        assert conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0] == events_before
+
+    before = conn.total_changes
+    with pytest.raises(GovernanceError):
+        append(copy.deepcopy(body), token_override="invalid-qa-session-token")
+    assert conn.total_changes == before
+    generic = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": world["task_id"]},
+            "qa", method="POST", body=copy.deepcopy(body),
+        )
+    )
+    if isinstance(generic, tuple):
+        generic = generic[1]
+    assert generic["error"] == "operator_supervised_direct_main_generic_crud_forbidden"
+    assert conn.total_changes == before
+
+    accepted = append(body)
+    authority = accepted["payload"]["source_backed_contract_gate_authority"]
+    assert authority["qa_session_proof"]["principal_id"] == body["actor"]
+    assert authority["qa_session_proof"]["task_id"] == world["task_id"]
+    assert authority["close_satisfying"] is (verdict == "passed")
+    assert authority["audit_only"] is (verdict == "failed")
+    current = runtime.current_record(world["task_id"], actor_role="qa")
+    lines = current["completed_lines"]
+    assert [line["line_id"] for line in lines[-2:]] == [
+        "qa_graph_context", "qa_independent_verification",
+    ]
+    assert all(line["evidence_kind"] != "contract_line_bypass" for line in lines)
+    assert lines[-1]["status"] == verdict
+
+
+def test_direct_qa_native_mcp_filtering_gap_is_explicit_and_not_runnable(
+    conn, monkeypatch, tmp_path,
+):
+    """Characterize the unfixed transport; HTTP success is not MCP success."""
+    from agent.mcp.tools import _task_timeline_body
+
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="KNOWN-MCP-GAP",
+    )
+    append, body, guide = _direct_qa_facade_http_session(conn, world)
+    forged = {**body, "contract_execution_id": "onboard-service-forged"}
+    filtered = _task_timeline_body(forged)
+    assert not set(filtered).intersection({
+        "contract_execution_id", "execution_state_revision", "stage_id",
+        "line_id", "runtime_guide_hash", "direct_runtime_binding_hash",
+    })
+    assert guide["next_legal_action"]["mcp_tool"] == ""
+    assert guide["next_legal_action"]["native_mcp_transport"]["runnable"] is False
+    assert guide["next_legal_action"]["native_mcp_transport"]["transport_repair_claimed"] is False
+    before = conn.total_changes
+    with pytest.raises(GovernanceError, match="binding"):
+        append(filtered)
+    assert conn.total_changes == before
 
 
 def test_strict_direct_main_rev3_comparison_authority_persists_exact_diff(
@@ -13601,7 +13880,25 @@ def _commit_test_git_files(
 
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
-    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
+    isolated_root = tmp_path.resolve() / "state"
+
+    def isolated_governance_root():
+        # Audit imports this function by value; bind both names, and reject a
+        # symlink escape instead of ever falling through to a real world.
+        assert isolated_root.resolve().is_relative_to(tmp_path.resolve())
+        assert not isolated_root.is_symlink()
+        return isolated_root
+
+    monkeypatch.setattr("agent.governance.db._governance_root", isolated_governance_root)
+    monkeypatch.setattr(server.audit_service, "_governance_root", isolated_governance_root)
+    from agent.governance import redis_client
+
+    def reject_external_redis(_self):
+        raise AssertionError("test fixture forbids external Redis connections")
+
+    isolated_cache = redis_client.RedisClient(url="redis://test-disabled.invalid:0/0")
+    monkeypatch.setattr(redis_client, "_instance", isolated_cache)
+    monkeypatch.setattr(redis_client.RedisClient, "connect", reject_external_redis)
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     _ensure_schema(c)
@@ -30438,6 +30735,23 @@ def _append_authenticated_qa_verification(
         },
     )
     qa_timeline_ctx._session = dict(qa_graph_ctx._session)
+    strict_records = server._operator_supervised_direct_main_strict_records(
+        conn, project_id=PID, backlog_id=backlog_id, contract_execution_id=task_id,
+    )
+    if strict_records:
+        current = server._contract_runtime(conn).current_record(task_id, actor_role="qa")
+        next_line = current["runtime_guide"].get("next_legal_action") or {}
+        projection = server._operator_supervised_direct_main_facade_action_projection(
+            conn, project_id=PID, backlog_id=backlog_id,
+            contract_execution_id=task_id, route_token_ref="", target_files=[],
+            record=current, runtime_next=next_line, active_route_identity={},
+        )
+        for field in (
+            "contract_execution_id", "execution_state_revision", "stage_id",
+            "line_id", "runtime_guide_hash", "direct_runtime_binding_hash",
+        ):
+            if field in projection.get("copy_safe_body", {}):
+                qa_timeline_ctx.body[field] = projection["copy_safe_body"][field]
     return server.handle_task_timeline_append(qa_timeline_ctx)
 
 
@@ -102331,7 +102645,8 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
         "requires_role"
     ] == "qa"
     qa_action = post_implementation_guide["next_legal_action"]
-    assert qa_action["mcp_tool"] == "task_timeline_append"
+    assert qa_action["mcp_tool"] == ""
+    assert qa_action["transport"] == "http"
     assert qa_action["copy_safe_body"]["event_type"] == (
         "qa.independent_verification"
     )
@@ -104232,7 +104547,7 @@ def _parentless_direct_main_pre_mutation_graph_scope(
     else:
         parent_execution_id = guide["contract_execution_id"]
         assert guide["contract_id"] == "operator_supervised_direct_main"
-        assert guide["contract_revision"] == "rev3"
+        assert guide["contract_revision"] == server._operator_supervised_direct_main_fresh_definition()["revision"]
     route_token_ref = f"rtok-append-{backlog_id.lower()}"
     route_identity = {
         "route_id": f"route-{backlog_id.lower()}",
@@ -119199,9 +119514,10 @@ def test_direct_main_rev3_fresh_world_warranty_requires_db_verified_qa(
     )
     qa_action = qa_guide["next_legal_action"]
     assert qa_action["line_id"] == "qa_graph_context"
-    assert qa_action["mcp_tool"] == "task_timeline_append"
+    assert qa_action["mcp_tool"] == ""
+    assert qa_action["transport"] == "http"
     assert qa_action["copy_safe_body"]["task_id"] == task_id
-    assert "contract_execution_id" not in qa_action["copy_safe_body"]
+    assert qa_action["copy_safe_body"]["contract_execution_id"] == task_id
     assert qa_action["generic_contract_runtime_submit_line_allowed"] is False
 
     for current_reader_role in ("observer", "qa"):
