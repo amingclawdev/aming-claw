@@ -31,6 +31,7 @@ from . import state_service
 from . import role_service
 from . import audit_service
 from .errors import ValidationError, AuthError, PermissionDeniedError
+from .contracts.runtime import SQLiteContractExecutionStore
 
 _PROJECTS_LOCK = threading.RLock()
 
@@ -352,10 +353,33 @@ def init_project(project_id: str, password: str = "", project_name: str = "", wo
             "message": "Project already initialized",
         }
 
+    if project_id in projects["projects"]:
+        # A historical registry entry is not authority to repair its stores.
+        raise ValidationError(
+            f"Project {project_id!r} is already registered but not initialized; "
+            "explicit recovery is required"
+        )
+
     # First-time initialization
     project_dir = _governance_root() / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
 
+    conn = get_connection(project_id)
+    try:
+        # The canonical owner preserves an existing transaction. Start one
+        # explicitly so partial schema creation rolls back on failure.
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        SQLiteContractExecutionStore(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    # Publish success only after the stores are ready. A failed registry save
+    # may leave a retryable database, but never an initialized registry entry.
     entry = {
         "project_id": project_id,
         "name": project_name or project_id,
@@ -367,10 +391,6 @@ def init_project(project_id: str, password: str = "", project_name: str = "", wo
     }
     projects["projects"][project_id] = entry
     _save_projects(projects)
-
-    # Ensure DB exists
-    conn = get_connection(project_id)
-    conn.close()
 
     result = {
         "project": {

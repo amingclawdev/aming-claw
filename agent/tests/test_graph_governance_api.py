@@ -203458,6 +203458,215 @@ def test_generic_direct_claims_preserve_generic_authority_but_reject_dev_selecto
     ]
 
 
+@pytest.fixture()
+def isolated_project_init_http(tmp_path, monkeypatch):
+    """Real init/Onboard HTTP with no pre-created database or CR schema."""
+    from http.server import HTTPServer
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+    from agent.governance import redis_client
+
+    root = tmp_path.resolve() / "governance"
+
+    def isolated_root():
+        assert root.resolve().is_relative_to(tmp_path.resolve())
+        assert not root.is_symlink()
+        return root
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path / "shared"))
+    for module in (governance_db, server.project_service, server.audit_service):
+        monkeypatch.setattr(module, "_governance_root", isolated_root)
+    monkeypatch.setattr(server, "_ONBOARD_GUIDE_CAPSULE_CACHE", server.OrderedDict())
+    monkeypatch.setattr(server, "_ONBOARD_GUIDE_CAPSULE_INFLIGHT", {})
+    monkeypatch.setattr(
+        server, "_ONBOARD_GUIDE_CAPSULE_METRICS",
+        dict.fromkeys(server._ONBOARD_GUIDE_CAPSULE_METRICS, 0),
+    )
+
+    def reject_external_redis(_self):
+        raise AssertionError("project lifecycle test forbids external Redis")
+
+    monkeypatch.setattr(
+        redis_client, "_instance",
+        redis_client.RedisClient(url="redis://test-disabled.invalid:0/0"),
+    )
+    monkeypatch.setattr(redis_client.RedisClient, "connect", reject_external_redis)
+
+    def post(path, body):
+        with HTTPServer(("127.0.0.1", 0), server.GovernanceHandler) as httpd:
+            httpd.timeout = 20
+
+            def client():
+                request = Request(
+                    f"http://127.0.0.1:{httpd.server_port}{path}",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    response = urlopen(request, timeout=20)
+                except HTTPError as exc:
+                    response = exc
+                with response:
+                    return response.status, json.loads(response.read())
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(client)
+                httpd.handle_request()
+                return future.result(timeout=20)
+
+    return root, post
+
+
+def test_http_new_project_init_to_first_direct_onboard(
+    isolated_project_init_http, tmp_path,
+):
+    root, post = isolated_project_init_http
+    project_id = "new-direct-project"
+    backlog_id = "NEW-PROJECT-FIRST-DIRECT"
+    workspace = tmp_path / "new-direct-workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    for args in (
+        ["init", "-b", "main"],
+        ["add", "app.py"],
+        ["-c", "user.name=Lifecycle Test", "-c", "user.email=lifecycle@example.invalid",
+         "commit", "-m", "Isolated lifecycle fixture"],
+    ):
+        subprocess.run(["git", "-C", str(workspace), *args], check=True, capture_output=True)
+    head = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    db_path = root / project_id / "governance.db"
+    assert not db_path.exists()
+    assert not (root / "projects.json").exists()
+
+    status, initialized = post("/api/init", {
+        "project_id": project_id,
+        "project_name": "First Direct project",
+        "workspace_path": str(workspace),
+    })
+    assert status == 201, initialized
+    assert initialized["project"]["project_id"] == project_id
+    registry_before = (root / "projects.json").read_bytes()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Neither this fixture nor a helper invokes the CR owner. Only the
+        # production /api/init path may have made this empty authority ready.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM contract_runtime_executions"
+        ).fetchone()[0] == 0
+        conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, mf_type, bypass_policy_json,
+                target_files, test_files, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (backlog_id, "First normal Direct", "OPEN", "chain_rescue",
+             '{"mf_type":"chain_rescue"}', '["app.py"]', '[]',
+             "2026-09-03T00:00:00Z", "2026-09-03T00:00:00Z"),
+        )
+        conn.commit()
+        ownership = server._operator_supervised_direct_main_persisted_world_ownership(
+            conn, project_id=project_id, backlog_id=backlog_id,
+        )
+        assert ownership["contract_execution_query_succeeded"] is True
+        assert ownership["contract_execution_state"] == "fresh_unbound"
+        assert ownership["fresh_start_allowed"] is True
+        before = tuple(conn.iterdump())
+        body = {
+            "backlog_id": backlog_id,
+            "role": "observer",
+            "work_type": "operator_supervised_direct_main",
+            "target_project_root": str(workspace),
+            "target_ref": "refs/heads/main",
+            "target_head_commit": head,
+            "response_view": "compact",
+        }
+        status, first = post(f"/api/projects/{project_id}/onboard-route-guide", body)
+        assert status == 200, first
+        assert first["selected_work_type"] == "operator_supervised_direct_main"
+        assert first["next_legal_action"]["id"] == "operator_supervised_direct_main_route_issue"
+        assert first["next_legal_action"]["action_input_ready"] is True
+        assert first["contract_execution_id"] == (
+            server._operator_supervised_direct_main_execution_id(
+                project_id, backlog_id, revision=first["contract_revision"],
+            )
+        )
+        status, replay = post("/api/init", {"project_id": project_id})
+        assert status == 201, replay
+        assert replay["project"] == initialized["project"]
+        assert (root / "projects.json").read_bytes() == registry_before
+        assert tuple(conn.iterdump()) == before
+    finally:
+        conn.close()
+
+
+def test_http_failed_project_init_does_not_publish_success(isolated_project_init_http):
+    root, post = isolated_project_init_http
+    project_id = "failed-direct-project"
+    conn = governance_db.get_connection(project_id)
+    try:
+        # A real malformed owner schema causes a real initializer exception;
+        # neither the handler nor the production owner is mocked.
+        conn.execute("CREATE TABLE contract_runtime_executions (invalid_column TEXT)")
+        conn.commit()
+        before = tuple(conn.iterdump())
+        for _ in range(2):
+            status, failed = post("/api/init", {"project_id": project_id})
+            assert status == 500, failed
+            assert failed["error"] == "internal_error"
+            assert "no such column" in failed["message"]
+            assert "project" not in failed
+            assert project_id not in server.project_service._load_projects()["projects"]
+            assert not (root / "projects.json").exists()
+            assert tuple(conn.iterdump()) == before
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("schema_fault", ["missing", "malformed"])
+def test_http_init_does_not_repair_historical_direct_authority(
+    isolated_project_init_http, schema_fault,
+):
+    root, post = isolated_project_init_http
+    project_id = "historical-direct-project"
+    backlog_id = "HISTORICAL-DIRECT-AUTHORITY"
+    server.project_service._save_projects({"version": 1, "projects": {
+        project_id: {"project_id": project_id, "initialized": True, "status": "active"},
+    }})
+    conn = governance_db.get_connection(project_id)
+    try:
+        conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, mf_type, bypass_policy_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (backlog_id, "Historical missing authority", "MF_IN_PROGRESS", "chain_rescue",
+             '{"mf_type":"chain_rescue"}', "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z"),
+        )
+        if schema_fault == "malformed":
+            conn.execute("CREATE TABLE contract_runtime_executions (invalid_column TEXT)")
+        conn.commit()
+        before = tuple(conn.iterdump())
+        registry_before = (root / "projects.json").read_bytes()
+        status, replay = post("/api/init", {"project_id": project_id})
+        assert status == 201, replay
+        assert replay["message"] == "Project already initialized"
+        status, denied = post(f"/api/projects/{project_id}/onboard-route-guide", {
+            "backlog_id": backlog_id, "role": "observer",
+            "work_type": "operator_supervised_direct_main", "response_view": "compact",
+        })
+        assert status == 409, denied
+        assert denied["error"] == "ac_onboard_runtime_world_ownership_unresolved"
+        assert denied["details"]["writes_performed"] is False
+        assert "contract_execution_authority_query_failed" in denied["details"]["violations"]
+        assert tuple(conn.iterdump()) == before
+        assert (root / "projects.json").read_bytes() == registry_before
+    finally:
+        conn.close()
+
+
 def test_fresh_stable_external_direct_selectors_issue_deterministic_route(
     conn,
     monkeypatch,
