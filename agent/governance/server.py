@@ -148664,6 +148664,17 @@ def _operator_supervised_direct_main_dev_selector_authority(
             if isinstance(binding.get("runtime_world_authority"), Mapping)
             else {}
         )
+        persisted_dev_world = bool(
+            world.get("schema_version")
+            == "operator_supervised_direct_main.dev_runtime_world.v1"
+            and world.get("accepted") is True
+            and world.get("server_derived") is True
+            and world.get("caller_claims_trusted") is False
+            and str(world.get("runtime_plane") or "") == "dev"
+            and int(world.get("runtime_port") or 0) == AC_DEV_SERVICE_PORT
+            and str(world.get("world_id") or "") == "ac-dev"
+            and bool(str(world.get("namespace_hash") or "").strip())
+        )
         if (
             record.get("project_id") == project_id
             and record.get("contract_id")
@@ -148674,6 +148685,7 @@ def _operator_supervised_direct_main_dev_selector_authority(
             and physical_contract_id == "operator_supervised_direct_main"
             and execution_id
             == str(record.get("contract_execution_id") or "").strip()
+            and persisted_dev_world
         ):
             execution_ids.append(execution_id)
     core = {

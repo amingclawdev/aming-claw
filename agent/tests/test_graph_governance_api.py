@@ -199497,6 +199497,7 @@ def _fixed_ac_dev_direct_world(root: Path, commit: str) -> dict[str, Any]:
         "caller_claims_trusted": False,
         "runtime_plane": "dev",
         "runtime_port": server.AC_DEV_SERVICE_PORT,
+        "world_id": "ac-dev",
         "bind_host": server.AC_DEV_BIND_HOST,
         "target_project_root": str(root.resolve()),
         "worktree_path": str(root.resolve()),
@@ -204277,6 +204278,98 @@ def test_onboard_dev_selector_authority_is_server_derived_from_physical_namespac
     assert authority["dev_worktree_root"] == str(root.resolve())
     assert authority["dev_head_commit"] == commit
     assert authority["dev_contract_execution_ids"] == [execution_id]
+    assert conn.total_changes == before
+
+
+def test_stable_direct_task_id_is_not_reclassified_as_dev_selector(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    stable_backlog_id = "DP-STABLE-DIRECT-TASK-WORLD"
+    dev_backlog_id = "AC-DEV-DIRECT-TASK-WORLD"
+    _insert_simple_mf_close_backlog(conn, stable_backlog_id)
+    _insert_simple_mf_close_backlog(conn, dev_backlog_id)
+    dev_root = tmp_path / ".worktrees" / "ac-dev"
+    dev_root.mkdir(parents=True)
+    dev_commit = "8" * 40
+    dev_world = _fixed_ac_dev_direct_world(dev_root, dev_commit)
+    stable_execution_id = "cex-direct-main-stable-task-world"
+    dev_execution_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        dev_backlog_id,
+        revision="rev3",
+        world_authority=dev_world,
+    )
+    runtime = server._contract_runtime(conn)
+    for backlog_id, execution_id, runtime_world in (
+        (stable_backlog_id, stable_execution_id, {}),
+        (dev_backlog_id, dev_execution_id, dev_world),
+    ):
+        runtime.start_execution(
+            "operator_supervised_direct_main",
+            project_id=PID,
+            backlog_id=backlog_id,
+            actor_role="observer",
+            contract_execution_id=execution_id,
+            version="v1",
+            revision="rev3",
+            metadata={
+                "operator_supervised_direct_main_runtime_binding": {
+                    "strict_runtime_binding_required": True,
+                    "runtime_world_authority": runtime_world,
+                }
+            },
+        )
+    conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_branch_service_git_output",
+        lambda _root, args: (
+            f"worktree {dev_root}\nHEAD {dev_commit}\n"
+            f"branch refs/heads/{server.AC_DEV_BRANCH}\n"
+        )
+        if args == ["worktree", "list", "--porcelain"]
+        else "",
+    )
+    before = conn.total_changes
+
+    authority = server._operator_supervised_direct_main_dev_selector_authority(
+        conn,
+        project_id=PID,
+        backlog_id=stable_backlog_id,
+    )
+    stable_request = {"task_id": stable_execution_id}
+
+    response = server._onboard_operator_supervised_direct_main_runtime_response(
+        conn,
+        project_id=PID,
+        backlog_id=stable_backlog_id,
+        route_token_ref="",
+        role="qa",
+        work_type="qa_verification",
+        response_view="compact",
+        request_body=stable_request,
+        request_selector_claims=stable_request,
+    )
+    assert response["contract_execution_id"] == stable_execution_id
+    assert authority["dev_contract_execution_ids"] == [dev_execution_id]
+    assert not server._operator_supervised_direct_main_request_uses_dev_selector(
+        stable_request,
+        selector_authority=authority,
+    )
+    assert server._operator_supervised_direct_main_request_mismatches(
+        stable_request,
+        execution_id=stable_execution_id,
+        world_authority={},
+        selector_authority=authority,
+    ) == []
+    assert server._operator_supervised_direct_main_request_uses_dev_selector(
+        {"task_id": dev_execution_id},
+        selector_authority=authority,
+    )
     assert conn.total_changes == before
 
 
