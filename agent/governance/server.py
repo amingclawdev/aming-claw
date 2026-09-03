@@ -95844,20 +95844,6 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         route_token_ref=route_token_ref, route_identity=route_identity,
         backlog_id=backlog_id, task_id=task_id,
     )
-    strict_direct_position = bool(
-        direct_main_qa_preflight.get("applicable") is True
-        and active_route_authority.get("passed") is True
-        and direct_main_qa_preflight.get("contract_runtime_next_line_id")
-        in {
-            "observer_bind_direct_scope", "observer_graph_context",
-            "observer_implementation",
-        }
-        and auth.get("role_source") == "observer_session_route_token_ref"
-        and route_bound_session
-        and str(route_scope.get("project_id") or "").strip() == project_id
-        and backlog_id
-        and task_id
-    )
     next_line_id = str(
         direct_main_qa_preflight.get("contract_runtime_next_line_id") or ""
     ).strip()
@@ -95891,6 +95877,123 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         world = _operator_supervised_direct_main_dev_world_authority()
     except GovernanceError:
         world = {}
+    try:
+        direct_record = _contract_runtime_store(conn).get(task_id)
+    except ContractRuntimeError:
+        direct_record = {}
+    metadata = (
+        direct_record.get("metadata")
+        if isinstance(direct_record.get("metadata"), Mapping)
+        else {}
+    )
+    runtime_binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    binding_hash = str(runtime_binding.get("binding_hash") or "").strip()
+    binding_route_identity = (
+        runtime_binding.get("route_identity")
+        if isinstance(runtime_binding.get("route_identity"), Mapping)
+        else {}
+    )
+    binding_files = sorted(
+        _runtime_context_service_dedupe(
+            [str(path or "").strip() for path in runtime_binding.get("owned_files") or []]
+        )
+    )
+    binding_target_files = sorted(
+        _runtime_context_service_dedupe(
+            [str(path or "").strip() for path in runtime_binding.get("target_files") or []]
+        )
+    )
+    binding_world = (
+        runtime_binding.get("runtime_world_authority")
+        if isinstance(runtime_binding.get("runtime_world_authority"), Mapping)
+        else {}
+    )
+    pre_mutation_world = (
+        runtime_binding.get("pre_mutation_world_ref")
+        if isinstance(runtime_binding.get("pre_mutation_world_ref"), Mapping)
+        else {}
+    )
+    completed_lines = [
+        line
+        for line in direct_record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    binding_errors = operator_supervised_direct_main_runtime_binding_errors(
+        {
+            "contract_id": str(direct_record.get("contract_id") or "").strip(),
+            "revision": str(direct_record.get("revision") or "").strip(),
+        },
+        direct_record,
+        {
+            "line_id": "observer_bind_direct_scope",
+            "payload": {
+                "direct_runtime_binding_hash": binding_hash,
+                "direct_runtime_binding": dict(runtime_binding),
+            },
+        },
+    )
+    target_head = str(world.get("target_head_commit") or "").strip().lower()
+    target_root_text = str(world.get("target_project_root") or "").strip()
+    immutable_route_identity = (
+        active_route_authority.get("immutable_route_identity")
+        if isinstance(
+            active_route_authority.get("immutable_route_identity"), Mapping
+        )
+        else {}
+    )
+    preimplementation_contract_runtime = bool(
+        direct_main_qa_preflight.get("applicable") is True
+        and active_route_authority.get("passed") is True
+        and next_line_id == "observer_bind_direct_scope"
+        and completed_lines == []
+        and not binding_errors
+        and str(direct_record.get("project_id") or "").strip() == project_id
+        and str(direct_record.get("backlog_id") or "").strip() == backlog_id
+        and str(direct_record.get("contract_execution_id") or "").strip()
+        == task_id
+        and binding_files
+        and binding_files == binding_target_files
+        and binding_files
+        == sorted(active_route_authority.get("expected_files") or [])
+        and dict(binding_route_identity) == dict(immutable_route_identity)
+        and str(runtime_binding.get("target_project_root") or "").strip()
+        == target_root_text
+        and str(runtime_binding.get("worktree_path") or "").strip()
+        == target_root_text
+        and str(runtime_binding.get("base_commit") or "").strip().lower()
+        == target_head
+        and str(runtime_binding.get("target_head_commit") or "").strip().lower()
+        == target_head
+        and dict(binding_world) == dict(world)
+        and pre_mutation_world.get("accepted") is True
+        and str(pre_mutation_world.get("project_id") or "").strip()
+        == project_id
+        and str(pre_mutation_world.get("target_project_root") or "").strip()
+        == target_root_text
+        and str(pre_mutation_world.get("worktree_path") or "").strip()
+        == target_root_text
+        and str(pre_mutation_world.get("base_commit") or "").strip().lower()
+        == target_head
+        and str(pre_mutation_world.get("target_head_commit") or "")
+        .strip()
+        .lower()
+        == target_head
+    )
+    strict_direct_position = bool(
+        preimplementation_contract_runtime
+        and auth.get("role_source") == "observer_session_route_token_ref"
+        and route_bound_session
+        and str(route_scope.get("project_id") or "").strip() == project_id
+        and backlog_id
+        and task_id
+    )
     classification = classify_graph_activation_connection(conn)
     custody_verified = bool(
         classification.get("runtime_plane") == "dev"
@@ -95972,6 +96075,9 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         and str(active_status_rows[0]["snapshot_kind"] or "").strip()
         == "full"
     )
+    canonical_target_snapshot_id = _current_full_deterministic_snapshot_id(
+        target_commit
+    )
     active_provenance_exact = bool(
         active_binding.get("verified") is True
         and str(active_binding.get("snapshot_id") or "").strip()
@@ -95982,6 +96088,19 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
             active_binding.get("provenance_target_commit") or ""
         ).strip().lower()
         == active_commit
+    )
+    exact_canonical_active = bool(
+        readiness_compatible
+        and readiness is None
+        and local_active_graph_present
+        and unique_default_active_ref
+        and unique_full_active_status
+        and active_snapshot_id == canonical_target_snapshot_id
+        and active_commit == target_commit
+        and target_identity.get("status") == "existing"
+        and str(target_identity.get("snapshot_id") or "").strip()
+        == canonical_target_snapshot_id
+        and target_identity.get("legacy_identity_selected") is not True
     )
     canonical_dev_world = bool(
         world.get("runtime_plane") == "dev"
@@ -96020,9 +96139,20 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     if same_wip_descendant_active_predecessor:
         expected_body["expected_old_snapshot_id"] = active_snapshot_id
     request_body_exact = body is not None and dict(body) == expected_body
-    eligibility_checks = {
+    common_eligibility_checks = {
         "strict_direct_graph_first_route_session": strict_direct_position,
         "compatible_graph_materialization_preimage": readiness_compatible,
+        "preimplementation_contract_runtime_exact": (
+            preimplementation_contract_runtime
+        ),
+        "classified_dev_cow_runtime_custody": custody_verified,
+        "exact_ac_dev_project_world": bool(
+            world.get("accepted") is True and project_id == AC_PROJECT_ID
+        ),
+        "exact_clean_ac_dev_head": worktree_clean,
+    }
+    materialization_eligibility_checks = {
+        **common_eligibility_checks,
         "graph_materialization_required_or_exact_schema_no_local_active": (
             materialization_required
             or exact_schema_no_local_active
@@ -96031,16 +96161,23 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "deterministic_target_snapshot_identity_missing": (
             target_identity_missing
         ),
-        "classified_dev_cow_runtime_custody": custody_verified,
-        "exact_ac_dev_project_world": bool(
-            world.get("accepted") is True and project_id == AC_PROJECT_ID
-        ),
-        "exact_clean_ac_dev_head": worktree_clean,
     }
-    eligible = all(eligibility_checks.values())
+    graph_query_recognition_checks = {
+        **common_eligibility_checks,
+        "exact_canonical_active_current_full": exact_canonical_active,
+    }
+    eligible = all(materialization_eligibility_checks.values())
+    graph_query_recognition_eligible = all(
+        graph_query_recognition_checks.values()
+    )
     missing = [
         requirement
-        for requirement, passed in eligibility_checks.items()
+        for requirement, passed in materialization_eligibility_checks.items()
+        if not passed
+    ]
+    graph_query_recognition_missing = [
+        requirement
+        for requirement, passed in graph_query_recognition_checks.items()
         if not passed
     ]
     if not request_body_exact:
@@ -96059,6 +96196,11 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "same_wip_descendant_active_predecessor": (
             same_wip_descendant_active_predecessor
         ),
+        "exact_canonical_active": exact_canonical_active,
+        "graph_query_recognition_eligible": (
+            graph_query_recognition_eligible
+        ),
+        "per_wip_reconcile_provenance_required": False,
         "active_predecessor_snapshot_id": (
             active_snapshot_id
             if same_wip_descendant_active_predecessor
@@ -96072,6 +96214,11 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "active_predecessor_provenance_verified": active_provenance_exact,
         "target_snapshot_identity": dict(target_identity),
         "contract_runtime_first_missing_line": next_line_id,
+        "contract_runtime_completed_line_count": len(completed_lines),
+        "preimplementation_contract_runtime_exact": (
+            preimplementation_contract_runtime
+        ),
+        "runtime_binding_error_count": len(binding_errors),
         "route_session_authority_verified": strict_direct_position,
         "runtime_custody_verified": custody_verified,
         "worktree_clean": worktree_clean,
@@ -96079,6 +96226,9 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "expected_http_body": expected_body,
         "copy_safe_action_input": {"project_id": project_id, **expected_body},
         "missing_requirement_ids": missing,
+        "graph_query_recognition_missing_requirement_ids": (
+            graph_query_recognition_missing
+        ),
         "writes_performed": False,
         "mutation_performed": False,
         "qa_synthesized": False,
@@ -97828,10 +97978,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             and direct_main_qa_preflight_authority.get(
                 "contract_runtime_next_line_id"
             )
-            in {
-                "observer_bind_direct_scope", "observer_graph_context",
-                "observer_implementation",
-            }
+            == "observer_bind_direct_scope"
         )
         dev_graph_bootstrap_authority = (
             _dev_direct_graph_bootstrap_reconcile_authority(
@@ -151721,10 +151868,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             _runtime_plane() == "dev"
             and route_ready
             and contract_runtime_first_missing_line
-            in {
-                "observer_bind_direct_scope", "observer_graph_context",
-                "observer_implementation",
-            }
+            == "observer_bind_direct_scope"
         ):
             try:
                 graph_readiness = _dev_graph_zero_write_readiness_projection(
@@ -151761,29 +151905,50 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                     if graph_readiness is None
                     else {}
                 ) or {}
-                if (
-                    active_snapshot
-                    and active_snapshot.get("status") == "active"
-                    and active_snapshot.get("snapshot_kind") == "full"
-                    and str(active_snapshot.get("commit_sha") or "").lower()
-                    == str(dev_world.get("target_head_commit") or "").lower()
-                ):
-                    active_binding = (
-                        _graph_store._current_full_snapshot_provenance_binding(
+                bootstrap_auth: dict[str, Any] = {}
+                auth_error = ""
+                if request_context is not None:
+                    try:
+                        bootstrap_auth = _require_current_full_reconcile_auth(
+                            request_context,
                             conn,
-                            project_id,
-                            active_snapshot,
+                            "graph-governance.reconcile.current-full",
+                            accepted_route_actions=(
+                                "graph_current_full_reconcile",
+                            ),
                         )
-                    )
+                    except (GovernanceError, PermissionDeniedError) as exc:
+                        auth_error = str(
+                            getattr(exc, "code", "")
+                            or type(exc).__name__
+                        )
                 else:
-                    active_binding = {}
+                    auth_error = "request_context_unavailable"
+                bootstrap_qa_preflight = (
+                    _operator_supervised_direct_main_reconcile_qa_preflight_authority(
+                        conn,
+                        project_id=project_id,
+                        target_commit=str(
+                            dev_world.get("target_head_commit") or ""
+                        ),
+                        current_full_auth=bootstrap_auth,
+                    )
+                )
+                bootstrap_authority = (
+                    _dev_direct_graph_bootstrap_reconcile_authority(
+                        conn,
+                        project_id=project_id,
+                        auth=bootstrap_auth,
+                        direct_main_qa_preflight=(
+                            bootstrap_qa_preflight
+                        ),
+                    )
+                )
                 exact_active = bool(
-                    active_snapshot
-                    and active_snapshot.get("status") == "active"
-                    and active_snapshot.get("snapshot_kind") == "full"
-                    and str(active_snapshot.get("commit_sha") or "").lower()
-                    == str(dev_world.get("target_head_commit") or "").lower()
-                    and active_binding.get("verified") is True
+                    bootstrap_authority.get(
+                        "graph_query_recognition_eligible"
+                    )
+                    is True
                 )
                 if exact_active:
                     graph_bootstrap_projection = {
@@ -151796,48 +151961,11 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         "active_snapshot_id": str(
                             active_snapshot.get("snapshot_id") or ""
                         ),
+                        "per_wip_reconcile_provenance_required": False,
+                        "bootstrap_authority": dict(bootstrap_authority),
                         "writes_performed": False,
                     }
                 else:
-                    bootstrap_auth: dict[str, Any] = {}
-                    auth_error = ""
-                    if request_context is not None:
-                        try:
-                            bootstrap_auth = _require_current_full_reconcile_auth(
-                                request_context,
-                                conn,
-                                "graph-governance.reconcile.current-full",
-                                accepted_route_actions=(
-                                    "graph_current_full_reconcile",
-                                ),
-                            )
-                        except (GovernanceError, PermissionDeniedError) as exc:
-                            auth_error = str(
-                                getattr(exc, "code", "")
-                                or type(exc).__name__
-                            )
-                    else:
-                        auth_error = "request_context_unavailable"
-                    bootstrap_qa_preflight = (
-                        _operator_supervised_direct_main_reconcile_qa_preflight_authority(
-                            conn,
-                            project_id=project_id,
-                            target_commit=str(
-                                dev_world.get("target_head_commit") or ""
-                            ),
-                            current_full_auth=bootstrap_auth,
-                        )
-                    )
-                    bootstrap_authority = (
-                        _dev_direct_graph_bootstrap_reconcile_authority(
-                            conn,
-                            project_id=project_id,
-                            auth=bootstrap_auth,
-                            direct_main_qa_preflight=(
-                                bootstrap_qa_preflight
-                            ),
-                        )
-                    )
                     action_input = dict(
                         bootstrap_authority.get("copy_safe_action_input") or {}
                     )

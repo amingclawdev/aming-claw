@@ -210036,7 +210036,122 @@ def test_dev_graph_readiness_becomes_normal_after_authorized_admission(
     assert "materialization_required" not in normal
 
 
-def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
+def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_provenance(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-DIRECT-CANONICAL-ACTIVE-FRESH-BIND",
+    )
+    conn.execute(
+        "DELETE FROM observer_sessions WHERE session_id=?",
+        (case["session_id"],),
+    )
+    conn.commit()
+    register_status, registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body={
+                "project_id": case["project_id"],
+                "route_token_ref": case["route_token_ref"],
+                "backlog_id": case["guide"]["backlog_id"],
+                "task_id": case["execution_id"],
+                "cex_id": case["execution_id"],
+            },
+        )
+    )
+    assert register_status == 201
+    case = {**case, "session_id": registered["observer_session_id"]}
+    exact_policy = {
+        "runtime_plane": "dev",
+        "active_graph_activation_allowed": True,
+        "classification_reason": "verified_dev_cow_successor_receipt_history",
+        "world_id": "ac-dev",
+        "project_id": "aming-claw",
+        "port": 40008,
+        "cow_successor_verified": True,
+        "source_checkout_verified": True,
+        "live_runtime_custody_verified": True,
+    }
+    monkeypatch.setattr(
+        governance_db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: dict(exact_policy),
+    )
+    monkeypatch.setattr(
+        server,
+        "classify_graph_activation_connection",
+        governance_db.classify_graph_activation_connection,
+    )
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: case["commit"])
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: True)
+    governance_db.admit_ac_dev_graph_materialization_schema(
+        conn, project_id=case["project_id"]
+    )
+    snapshot_id = server._current_full_deterministic_snapshot_id(case["commit"])
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        project_id=case["project_id"],
+        commit_sha=case["commit"],
+    )
+    monkeypatch.setattr(
+        store,
+        "_current_full_snapshot_provenance_binding",
+        lambda *_args, **_kwargs: {"verified": False},
+    )
+    request_body = {
+        "backlog_id": case["guide"]["backlog_id"],
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+        "route_token_ref": case["route_token_ref"],
+        "observer_session_id": case["session_id"],
+        "task_id": case["execution_id"],
+        "target_project_root": str(case["root"]),
+        "target_head_commit": case["commit"],
+        "target_ref": server.AC_DEV_BRANCH,
+    }
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+
+    assert guide["dev_local_graph_bootstrap"]["state"] == "exact_active", json.dumps(
+        guide["dev_local_graph_bootstrap"], sort_keys=True
+    )
+    assert guide["dev_local_graph_bootstrap"]["graph_query_ready"] is True
+    assert guide["dev_local_graph_bootstrap"]["active_snapshot_id"] == snapshot_id
+    assert guide["dev_local_graph_bootstrap"][
+        "per_wip_reconcile_provenance_required"
+    ] is False
+    assert guide["next_legal_action"]["line_id"] == "observer_bind_direct_scope"
+    assert guide["next_legal_action"].get("mcp_tool") != (
+        "graph_current_full_reconcile"
+    )
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
+
+
+def test_dev_direct_onboard_fresh_bind_defers_query_until_local_graph_ready(
     conn, monkeypatch, tmp_path,
 ):
     case = _prepare_ac_dev_cross_plane_line_bypass(
@@ -210045,17 +210160,33 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
         tmp_path,
         backlog_id="AC-DEV-DIRECT-GRAPH-BOOTSTRAP-GUIDE",
     )
-    bypassed = server.handle_project_contract_runtime_line_bypass(
+    conn.execute(
+        "DELETE FROM observer_sessions WHERE session_id=?",
+        (case["session_id"],),
+    )
+    conn.commit()
+    register_status, registered = server.handle_observer_session_register(
         _ctx(
-            {
-                "project_id": case["project_id"],
-                "contract_execution_id": case["execution_id"],
-            },
+            {"project_id": case["project_id"]},
             method="POST",
-            body=case["body"],
+            body={
+                "project_id": case["project_id"],
+                "route_token_ref": case["route_token_ref"],
+                "backlog_id": case["guide"]["backlog_id"],
+                "task_id": case["execution_id"],
+                "cex_id": case["execution_id"],
+            },
         )
     )
-    assert bypassed["next_legal_action"]["line_id"] == "observer_graph_context"
+    assert register_status == 201
+    case = {**case, "session_id": registered["observer_session_id"]}
+    fresh_record = server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )
+    assert fresh_record["completed_lines"] == []
+    assert fresh_record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "observer_bind_direct_scope"
+    )
     _dev_readiness_predecessor(conn)
     exact_policy = {
         "runtime_plane": "dev",
@@ -210121,7 +210252,7 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
     assert bootstrap["graph_query_ready"] is False
     assert bootstrap["current_full_reconcile_ready"] is True
     assert bootstrap["contract_runtime_first_missing_line"] == (
-        "observer_graph_context"
+        "observer_bind_direct_scope"
     )
     action = guide["next_legal_action"]
     assert action["mcp_tool"] == "graph_current_full_reconcile"
@@ -210524,6 +210655,7 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
     wrong_route_body = {
         **request_body,
         "route_token_ref": "rtok-stale-descendant-predecessor",
+        "observer_session_id": "",
     }
     wrong_route_before = tuple(conn.iterdump())
     wrong_route_changes = conn.total_changes
@@ -210541,10 +210673,52 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
     assert tuple(conn.iterdump()) == wrong_route_before
     assert conn.total_changes == wrong_route_changes
 
+    legacy_candidate = store.create_graph_snapshot(
+        conn,
+        "aming-claw",
+        snapshot_id="dev-onboard-legacy-active",
+        commit_sha=case["commit"],
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(
+        conn,
+        "aming-claw",
+        legacy_candidate["snapshot_id"],
+        auto_rebuild_projection=False,
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        store,
+        "_current_full_snapshot_provenance_binding",
+        lambda *_args, **_kwargs: {"verified": True},
+    )
+    legacy_active = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+    assert legacy_active["dev_local_graph_bootstrap"]["state"] == "incompatible"
+    assert legacy_active["next_legal_action"]["mcp_tool"] == (
+        "onboard_route_guide"
+    )
+
+    conn.execute(
+        "DELETE FROM graph_snapshot_refs WHERE project_id=? AND snapshot_id=?",
+        (case["project_id"], legacy_candidate["snapshot_id"]),
+    )
+    conn.execute(
+        "DELETE FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (case["project_id"], legacy_candidate["snapshot_id"]),
+    )
+    canonical_snapshot_id = server._current_full_deterministic_snapshot_id(
+        case["commit"]
+    )
     candidate = store.create_graph_snapshot(
         conn,
         "aming-claw",
-        snapshot_id="dev-onboard-active",
+        snapshot_id=canonical_snapshot_id,
         commit_sha=case["commit"],
         snapshot_kind="full",
     )
@@ -210560,23 +210734,6 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
         "_current_full_snapshot_provenance_binding",
         lambda *_args, **_kwargs: {"verified": False},
     )
-    nonexact_active = server.handle_project_onboard_route_guide(
-        _ctx(
-            {"project_id": case["project_id"]},
-            method="POST",
-            body=request_body,
-        )
-    )
-    assert nonexact_active["dev_local_graph_bootstrap"]["state"] == "incompatible"
-    assert nonexact_active["next_legal_action"]["mcp_tool"] == (
-        "onboard_route_guide"
-    )
-
-    monkeypatch.setattr(
-        store,
-        "_current_full_snapshot_provenance_binding",
-        lambda *_args, **_kwargs: {"verified": True},
-    )
 
     active = server.handle_project_onboard_route_guide(
         _ctx(
@@ -210587,6 +210744,15 @@ def test_dev_direct_onboard_defers_query_until_route_bound_local_reconcile(
     )
     assert active["dev_local_graph_bootstrap"]["state"] == "exact_active"
     assert active["dev_local_graph_bootstrap"]["graph_query_ready"] is True
+    assert active["dev_local_graph_bootstrap"]["active_snapshot_id"] == (
+        canonical_snapshot_id
+    )
+    assert active["dev_local_graph_bootstrap"][
+        "per_wip_reconcile_provenance_required"
+    ] is False
+    assert active["next_legal_action"]["line_id"] == (
+        "observer_bind_direct_scope"
+    )
     assert active["next_legal_action"].get("graph_query_deferred") is not True
 
 
@@ -210679,7 +210845,7 @@ def test_dev_direct_onboard_preserves_later_contract_runtime_action(
     ]["line_id"]
 
 
-def test_dev_graph_bootstrap_new_head_identity_leaves_a348_failure_immutable(
+def test_dev_graph_bootstrap_without_cr_leaves_a348_failure_immutable(
     conn,
     monkeypatch,
     tmp_path,
@@ -210802,7 +210968,7 @@ def test_dev_graph_bootstrap_new_head_identity_leaves_a348_failure_immutable(
     preflight = {
         "applicable": True,
         "active_route_authority": {"passed": True},
-        "contract_runtime_next_line_id": "observer_graph_context",
+        "contract_runtime_next_line_id": "observer_bind_direct_scope",
     }
 
     authority = server._dev_direct_graph_bootstrap_reconcile_authority(
@@ -210818,7 +210984,11 @@ def test_dev_graph_bootstrap_new_head_identity_leaves_a348_failure_immutable(
     )
 
     assert active_reads == ["aming-claw"]
-    assert authority["eligible"] is True
+    assert authority["eligible"] is False
+    assert authority["preimplementation_contract_runtime_exact"] is False
+    assert "preimplementation_contract_runtime_exact" in authority[
+        "missing_requirement_ids"
+    ]
     assert authority["exact_schema_no_local_active"] is True
     assert authority["local_active_graph_present"] is False
     assert authority["expected_http_body"]["target_commit_sha"] == new_commit
@@ -211998,19 +212168,9 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
         )
     )
     implementation_action = implementation_stale["next_legal_action"]
-    assert implementation_action["mcp_tool"] == "graph_current_full_reconcile"
-    assert implementation_action["graph_query_deferred"] is True
-    assert implementation_action["copy_safe_body"] == {
-        "project_id": case["project_id"],
-        "backlog_id": case["guide"]["backlog_id"],
-        "task_id": child_id,
-        "observer_session_id": registered["observer_session_id"],
-        "observer_route_token_ref": child["route_token_ref"],
-        "target_commit_sha": implementation_commit,
-        "run_id": "current-full-" + implementation_commit[:7],
-        "activate": True, "require_clean": True, "semantic_use_ai": False,
-        "expected_old_snapshot_id": "full-direct-successor-current-world",
-    }
+    assert "dev_local_graph_bootstrap" not in implementation_stale
+    assert implementation_action["mcp_tool"] == "task_timeline_append"
+    assert implementation_action["line_id"] == "observer_implementation"
     assert tuple(conn.iterdump()) == implementation_before
     for invalid_session in (
         case["session_id"], "obs-missing-implementation-session",
