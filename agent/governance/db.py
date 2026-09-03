@@ -372,45 +372,131 @@ def _unknown_graph_activation_connection(reason: str) -> dict[str, object]:
     return {**graph_activation_policy("unknown"), "classification_reason": reason}
 
 
+def _current_dev_loaded_runtime_identity(
+    current_commit: str,
+) -> dict[str, object]:
+    """Reuse the server's frozen-at-import identity for the running process."""
+
+    server = sys.modules.get("agent.governance.server")
+    identity = getattr(server, "governance_loaded_runtime_identity", None)
+    if server is None or not callable(identity):
+        raise ValueError("AC dev loaded runtime identity is unavailable")
+    return dict(identity(current_commit))
+
+
+def _validate_dev_cow_historical_source_provenance(
+    *, root: Path, receipt: Mapping[str, object],
+    historical_tip: Mapping[str, object], stored_tip_sha256: str,
+    current_source: Mapping[str, object], strict_current_descendant: bool,
+) -> None:
+    """Validate one immutable adoption -> historical tip -> current chain."""
+
+    adoption_ref = dict(dict(receipt.get("history") or {}).get("adoption") or {})
+    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    anchor = dict(adoption.get("candidate_source_identity") or {})
+    if (
+        adoption_path.parent
+        != root / "archive" / "canonical-legacy-postimage-adoption"
+        or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
+        or stored_tip_sha256 != _world_source_tip_hash(historical_tip)
+        or str(anchor.get("root") or "")
+        != str(historical_tip.get("root") or "")
+        or str(anchor.get("commit") or "")
+        == str(historical_tip.get("commit") or "")
+        or (
+            strict_current_descendant
+            and str(historical_tip.get("commit") or "")
+            == str(current_source.get("commit") or "")
+        )
+    ):
+        raise ValueError("AC dev COW historical source provenance mismatch")
+    _validate_dev_source_tip_custody(
+        historical_tip,
+        stored_sha256=stored_tip_sha256,
+        candidate=current_source,
+        historical_worktree_advisory=True,
+    )
+    candidate_root = Path(str(current_source.get("root") or ""))
+    anchor_ancestry = subprocess.run(
+        [
+            "git", "merge-base", "--is-ancestor",
+            str(anchor.get("commit") or ""),
+            str(historical_tip.get("commit") or ""),
+        ],
+        cwd=candidate_root,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if anchor_ancestry.returncode != 0:
+        raise ValueError("AC dev COW adoption source is not an ancestor")
+
+
 def _verify_current_cow_successor_source(
     conn: sqlite3.Connection, root: Path, successor_receipt: Mapping[str, object],
 ) -> None:
     """Bind immutable adoption history to the clean current canonical descendant."""
 
-    adoption_ref = dict(
-        dict(successor_receipt.get("history") or {}).get("adoption") or {}
-    )
-    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
-    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
-    anchor = dict(adoption.get("candidate_source_identity") or {})
     meta = dict(conn.execute(
         "SELECT key,value FROM schema_meta WHERE key IN "
         "('governance_world_source_tip_json','governance_world_source_tip_sha256',"
         "'governance_world_source_tip_revision')"
     ))
     try:
-        current = json.loads(str(meta.get("governance_world_source_tip_json") or ""))
+        historical = json.loads(
+            str(meta.get("governance_world_source_tip_json") or "")
+        )
         revision = int(meta.get("governance_world_source_tip_revision") or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("AC dev COW current source tip is invalid") from exc
-    if not isinstance(current, Mapping):
+    if not isinstance(historical, Mapping):
         raise ValueError("AC dev COW current source tip is invalid")
+    try:
+        loaded_database_source = Path(__file__).resolve(strict=True)
+        loaded_root = loaded_database_source.parents[2]
+        current_source = _current_first_start_source(loaded_root)
+    except (IndexError, OSError, ValueError) as exc:
+        raise ValueError("AC dev COW current source checkout is invalid") from exc
+    if loaded_database_source != loaded_root / "agent" / "governance" / "db.py":
+        raise ValueError("AC dev COW loaded source path is not canonical")
+    current = {
+        "root": current_source["root"],
+        "branch": current_source["branch"],
+        "commit": current_source["commit"],
+        "source_sha256": current_source["cli_sha256"],
+    }
+    loaded_runtime = _current_dev_loaded_runtime_identity(current["commit"])
+    current_server_source = loaded_root / "agent" / "governance" / "server.py"
     if (
-        adoption_path.parent
-        != root / "archive" / "canonical-legacy-postimage-adoption"
-        or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
-        or revision < 2
-        or meta.get("governance_world_source_tip_sha256")
-        != _world_source_tip_hash(current)
-        or str(anchor.get("root") or "") != str(current.get("root") or "")
-        or str(anchor.get("commit") or "") == str(current.get("commit") or "")
+        loaded_runtime.get("loaded_pid") != os.getpid()
+        or str(loaded_runtime.get("loaded_commit") or "").lower()
+        != current["commit"]
+        or str(loaded_runtime.get("worktree_head_version") or "").lower()
+        != current["commit"]
+        or loaded_runtime.get("loaded_source_path") != str(current_server_source)
+        or loaded_runtime.get("loaded_source_sha256")
+        != current_source["server_sha256"]
+        or loaded_runtime.get("worktree_source_sha256")
+        != current_source["server_sha256"]
+        or loaded_runtime.get("runtime_stale") is not False
+        or loaded_runtime.get("runtime_stale_reasons") != []
+    ):
+        raise ValueError("AC dev COW loaded/current runtime source mismatch")
+    if (
+        revision < 2
     ):
         raise ValueError("AC dev COW current source descendant authority mismatch")
-    _validate_dev_source_tip_custody(
-        current, stored_sha256=str(meta.get("governance_world_source_tip_sha256") or ""),
-        candidate=current,
+    _validate_dev_cow_historical_source_provenance(
+        root=root,
+        receipt=successor_receipt,
+        historical_tip=historical,
+        stored_tip_sha256=str(
+            meta.get("governance_world_source_tip_sha256") or ""
+        ),
+        current_source=current,
+        strict_current_descendant=True,
     )
-    _verify_dev_source_upgrade(anchor, current)
 
 
 def _quick_check_returns_literal_ok(conn: sqlite3.Connection) -> bool:
@@ -434,10 +520,11 @@ def classify_graph_activation_connection(
     """Classify an opened graph DB without accepting caller/environment plane claims.
 
     Active graph truth is allowed only when this *opened connection* is the
-    exact live stable database.  A dev connection is recognized from the
-    canonical external root, receipt, and genesis invariants and is denied.
-    Everything else is ``unknown`` and denied before a graph ref, event, or
-    projection can be written.
+    exact live stable database or the exact live AC-dev COW successor.  Dev
+    activation additionally requires current listener/writer custody; a
+    genesis-only connection remains candidate-only.  Everything else is
+    ``unknown`` and denied before a graph ref, event, or projection can be
+    written.
     """
     from agent.runtime_plane import graph_activation_policy, resolve_ac_dev_storage_root
 
@@ -482,35 +569,8 @@ def classify_graph_activation_connection(
         root_meta = root.stat(follow_symlinks=False)
         if root.is_symlink() or root.resolve(strict=True) != root:
             return _unknown_graph_activation_connection("dev_storage_root_identity_invalid")
-        receipt_path = root / AC_DEV_LAUNCH_RECEIPT_NAME
-        if receipt_path.is_symlink() or not receipt_path.is_file():
-            return _unknown_graph_activation_connection("dev_launch_receipt_missing")
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        stable_meta = stable.stat(follow_symlinks=False)
-        stable_parent_meta = stable.parent.stat(follow_symlinks=False)
         server_source = Path(__file__).with_name("server.py")
         source_sha256 = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
-        required_receipt = {
-            "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
-            "world_id": AC_DEV_WORLD_ID,
-            "project_id": AC_PROJECT_ID,
-            "runtime_plane": DEV_RUNTIME_PLANE,
-            "port": 40008,
-            "background": False,
-            "storage_root": str(root),
-            "storage_device": int(root_meta.st_dev),
-            "storage_inode": int(root_meta.st_ino),
-            "stable_shared_volume": str(stable),
-            "stable_shared_volume_device": int(stable_meta.st_dev),
-            "stable_shared_volume_inode": int(stable_meta.st_ino),
-            "stable_parent_device": int(stable_parent_meta.st_dev),
-            "stable_parent_inode": int(stable_parent_meta.st_ino),
-            "source_sha256": source_sha256,
-        }
-        if not isinstance(receipt, Mapping) or any(
-            receipt.get(key) != value for key, value in required_receipt.items()
-        ):
-            return _unknown_graph_activation_connection("dev_launch_receipt_mismatch")
         meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
         genesis = json.loads(str(meta.get("governance_world_genesis_json") or ""))
         genesis_hash = str(meta.get("governance_world_genesis_sha256") or "")
@@ -592,13 +652,42 @@ def classify_graph_activation_connection(
             != (int(before.st_dev), int(before.st_ino))
         ):
             return _unknown_graph_activation_connection("dev_database_identity_changed")
-        return {
+        policy = {
             **graph_activation_policy("dev"),
             "classification_reason": (
                 "verified_dev_cow_successor_receipt_history"
                 if cow_successor_verified
                 else "verified_dev_root_receipt_genesis"
             ),
+            "world_id": AC_DEV_WORLD_ID,
+            "project_id": AC_PROJECT_ID,
+            "port": 40008,
+            "cow_successor_verified": bool(cow_successor_verified),
+            "source_checkout_verified": bool(cow_successor_verified),
+            "live_runtime_custody_verified": False,
+        }
+        if not cow_successor_verified:
+            validate_dev_launch_receipt(root, source_sha256=source_sha256)
+            return policy
+        runtime_custody = _require_ac_dev_graph_materialization_runtime_custody(
+            conn
+        )
+        if not (
+            runtime_custody.get("runtime_plane") == DEV_RUNTIME_PLANE
+            and runtime_custody.get("world_id") == AC_DEV_WORLD_ID
+            and runtime_custody.get("project_id") == AC_PROJECT_ID
+            and runtime_custody.get("port") == 40008
+            and runtime_custody.get("pid") == os.getpid()
+            and runtime_custody.get("database_device") == int(before.st_dev)
+            and runtime_custody.get("database_inode") == int(before.st_ino)
+        ):
+            return _unknown_graph_activation_connection(
+                "dev_live_runtime_custody_mismatch"
+            )
+        return {
+            **policy,
+            "active_graph_activation_allowed": True,
+            "live_runtime_custody_verified": True,
         }
     except (json.JSONDecodeError, KeyError, OSError, RuntimeError, ValueError, sqlite3.Error):
         return _unknown_graph_activation_connection("dev_database_binding_unverified")
@@ -788,6 +877,9 @@ class DevRuntimeSchemaVerificationError(RuntimeError):
         invalid_indexes: Mapping[str, Mapping[str, str]] | None = None,
         invalid_columns: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
         missing_unique_constraints: Mapping[str, Sequence[Sequence[str]]] | None = None,
+        owner_states: Mapping[str, str] | None = None,
+        planned_objects: Sequence[str] = (),
+        component_diagnostics: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         self.details = {
             "schema_version": "ac_dev_verify_only_schema_capability.v1",
@@ -826,6 +918,24 @@ class DevRuntimeSchemaVerificationError(RuntimeError):
                     (missing_unique_constraints or {}).items()
                 )
                 if constraints
+            },
+            "owner_states": {
+                str(component): str(state)
+                for component, state in sorted((owner_states or {}).items())
+            },
+            "planned_objects": sorted(
+                {str(item) for item in planned_objects if str(item)}
+            ),
+            "component_diagnostics": {
+                str(component): {
+                    str(key): value
+                    for key, value in sorted(details.items())
+                    if isinstance(value, (bool, int, float, str, list, dict))
+                }
+                for component, details in sorted(
+                    (component_diagnostics or {}).items()
+                )
+                if isinstance(details, Mapping)
             },
             "verify_only": True,
             "ddl_attempted": False,
@@ -916,33 +1026,11 @@ def _graph_materialization_inventory(conn: sqlite3.Connection) -> list[tuple[str
 
 
 def _graph_materialization_canonical_inventory() -> list[tuple[str, str, str, str]]:
-    from . import graph_correction_patches, graph_events, graph_snapshot_store
-
-    canonical = sqlite3.connect(":memory:")
-    try:
-        connection_ids = set(
-            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
-        )
-        connection_ids.add(id(canonical))
-        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
-        graph_snapshot_store.ensure_schema(canonical)
-        graph_events.ensure_schema(canonical)
-        graph_correction_patches.ensure_schema(canonical)
-        # ``sqlite_sequence`` is database-global SQLite bookkeeping created as
-        # an incidental consequence of AUTOINCREMENT.  It is not owned by the
-        # graph materialization namespace and may legitimately pre-exist for
-        # an unrelated governance table in an otherwise empty graph preimage.
-        return [
-            row for row in _graph_materialization_inventory(canonical)
-            if row[1] != "sqlite_sequence"
-        ]
-    finally:
-        connection_ids = set(
-            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
-        )
-        connection_ids.discard(id(canonical))
-        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
-        canonical.close()
+    return sorted(
+        row
+        for _owner, _ensure_schema, inventory in _graph_schema_owner_registry()
+        for row in inventory
+    )
 
 
 def _graph_schema_owner_inventory(
@@ -972,7 +1060,14 @@ def _graph_schema_owner_inventory(
 
 
 def _graph_schema_owner_registry(
-) -> tuple[tuple[str, list[tuple[str, str, str, str]]], ...]:
+) -> tuple[
+    tuple[
+        str,
+        Callable[[sqlite3.Connection], None],
+        list[tuple[str, str, str, str]],
+    ],
+    ...,
+]:
     """Return exact source-derived inventories for every admitted graph owner."""
 
     from . import (
@@ -984,7 +1079,7 @@ def _graph_schema_owner_registry(
     )
 
     return tuple(
-        (owner, _graph_schema_owner_inventory(ensure_schema))
+        (owner, ensure_schema, _graph_schema_owner_inventory(ensure_schema))
         for owner, ensure_schema in (
             ("graph_snapshot_store", graph_snapshot_store.ensure_schema),
             ("graph_events", graph_events.ensure_schema),
@@ -993,6 +1088,38 @@ def _graph_schema_owner_registry(
             ("asset_impact", asset_impact.ensure_schema),
         )
     )
+
+
+def _semantic_state_schema_inventory() -> list[tuple[str, str, str, str]]:
+    """Build the distinct post-structural semantic inventory from source SQL."""
+
+    from .reconcile_semantic_enrichment import SEMANTIC_STATE_SCHEMA_SQL
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        execute_graph_schema_sql(canonical, SEMANTIC_STATE_SCHEMA_SQL)
+        return [
+            row for row in _graph_materialization_inventory(canonical)
+            if row[1] != "sqlite_sequence"
+        ]
+    finally:
+        canonical.close()
+
+
+def _graph_query_trace_schema_inventory() -> list[tuple[str, str, str, str]]:
+    """Build the distinct graph-query trace inventory from source SQL."""
+
+    from .graph_query_trace import GRAPH_QUERY_TRACE_SCHEMA_SQL
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        execute_graph_schema_sql(canonical, GRAPH_QUERY_TRACE_SCHEMA_SQL)
+        return [
+            row for row in _graph_materialization_inventory(canonical)
+            if row[1] != "sqlite_sequence"
+        ]
+    finally:
+        canonical.close()
 
 
 _GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING = frozenset(
@@ -1012,11 +1139,17 @@ def classify_graph_materialization_preimage(
 
     actual = _graph_materialization_inventory(conn)
     registry = _graph_schema_owner_registry()
+    semantic = _semantic_state_schema_inventory()
+    trace = _graph_query_trace_schema_inventory()
+    semantic_names = {row[1] for row in semantic}
+    semantic_tables = {row[2] for row in semantic if row[0] == "table"}
+    trace_names = {row[1] for row in trace}
+    trace_tables = {row[2] for row in trace if row[0] == "table"}
     known_names: set[str] = set()
     known_tables: set[str] = set()
     owner_states: dict[str, str] = {}
     planned: list[tuple[str, str, str, str]] = []
-    for owner, canonical in registry:
+    for owner, _ensure_schema, canonical in registry:
         owner_names = {row[1] for row in canonical}
         owner_tables = {row[2] for row in canonical if row[0] == "table"}
         known_names.update(owner_names)
@@ -1051,6 +1184,10 @@ def classify_graph_materialization_preimage(
         if (row[1].startswith("graph_") or row[2].startswith("graph_"))
         and row[1] not in known_names
         and row[2] not in known_tables
+        and row[1] not in semantic_names
+        and row[2] not in semantic_tables
+        and row[1] not in trace_names
+        and row[2] not in trace_tables
     ]
     if unknown:
         raise ValueError("AC dev graph materialization preimage has unknown graph authority")
@@ -1071,23 +1208,176 @@ def _graph_materialization_managed_inventory(
     return [row for row in inventory if row[1] in names or row[2] in tables]
 
 
+def classify_semantic_state_schema(conn: sqlite3.Connection) -> dict[str, object]:
+    """Classify the source-owned post-structural semantic schema read-only."""
+
+    canonical = _semantic_state_schema_inventory()
+    actual = _graph_materialization_inventory(conn)
+    managed = _graph_materialization_managed_inventory(
+        actual, canonical,
+    )
+    canonical_names = {row[1] for row in canonical}
+    canonical_tables = {row[2] for row in canonical if row[0] == "table"}
+    structural = _graph_materialization_canonical_inventory()
+    structural_names = {row[1] for row in structural}
+    structural_tables = {row[2] for row in structural if row[0] == "table"}
+    unknown = [
+        row for row in actual
+        if (row[1].startswith("graph_semantic_")
+            or row[2].startswith("graph_semantic_"))
+        and row[1] not in canonical_names
+        and row[2] not in canonical_tables
+        and row[1] not in structural_names
+        and row[2] not in structural_tables
+    ]
+    if unknown:
+        raise ValueError("AC dev semantic state schema has unknown authority")
+    if not managed:
+        state = "absent"
+    elif managed == canonical:
+        state = "exact"
+    else:
+        raise ValueError("AC dev semantic state schema is not absent or exact")
+    return {
+        "schema_version": "ac_dev_semantic_state_schema_preimage.v1",
+        "owner_state": state,
+        "planned_objects": [row[1] for row in canonical] if state == "absent" else [],
+    }
+
+
+def verify_semantic_state_schema(conn: sqlite3.Connection) -> None:
+    """Require the exact semantic state owner without issuing DDL."""
+
+    try:
+        classification = classify_semantic_state_schema(conn)
+    except ValueError as exc:
+        raise DevRuntimeSchemaVerificationError(
+            "semantic_state",
+            component_diagnostics={
+                "semantic_state": {
+                    "status": "preimage_incompatible",
+                    "public_safe": True,
+                }
+            },
+        ) from exc
+    if classification["owner_state"] != "exact":
+        raise DevRuntimeSchemaVerificationError(
+            "semantic_state",
+            owner_states={"semantic_state": str(classification["owner_state"])},
+            planned_objects=list(classification["planned_objects"]),
+            component_diagnostics={
+                "semantic_state": {
+                    "status": "incompatible",
+                    "owner_state": str(classification["owner_state"]),
+                    "planned_objects": list(classification["planned_objects"]),
+                    "public_safe": True,
+                }
+            },
+        )
+
+
+def classify_graph_query_trace_schema(conn: sqlite3.Connection) -> dict[str, object]:
+    """Classify the source-owned graph-query trace schema read-only."""
+
+    canonical = _graph_query_trace_schema_inventory()
+    actual = _graph_materialization_inventory(conn)
+    managed = _graph_materialization_managed_inventory(actual, canonical)
+    canonical_names = {row[1] for row in canonical}
+    canonical_tables = {row[2] for row in canonical if row[0] == "table"}
+    unknown = [
+        row for row in actual
+        if (
+            row[1].startswith(("graph_query_", "qa_graph_basis_"))
+            or row[2].startswith(("graph_query_", "qa_graph_basis_"))
+        )
+        and row[1] not in canonical_names
+        and row[2] not in canonical_tables
+    ]
+    if unknown:
+        raise ValueError("AC dev graph-query trace schema has unknown authority")
+    if not managed:
+        state = "absent"
+    elif managed == canonical:
+        state = "exact"
+    else:
+        raise ValueError("AC dev graph-query trace schema is not absent or exact")
+    return {
+        "schema_version": "ac_dev_graph_query_trace_schema_preimage.v1",
+        "owner_state": state,
+        "planned_objects": [row[1] for row in canonical] if state == "absent" else [],
+    }
+
+
+def verify_graph_query_trace_schema(conn: sqlite3.Connection) -> None:
+    """Require the exact graph-query trace owner without issuing DDL."""
+
+    try:
+        classification = classify_graph_query_trace_schema(conn)
+    except ValueError as exc:
+        raise DevRuntimeSchemaVerificationError(
+            "graph_query_trace",
+            component_diagnostics={
+                "graph_query_trace": {
+                    "status": "preimage_incompatible",
+                    "public_safe": True,
+                }
+            },
+        ) from exc
+    if classification["owner_state"] != "exact":
+        raise DevRuntimeSchemaVerificationError(
+            "graph_query_trace",
+            owner_states={
+                "graph_query_trace": str(classification["owner_state"])
+            },
+            planned_objects=list(classification["planned_objects"]),
+            component_diagnostics={
+                "graph_query_trace": {
+                    "status": "incompatible",
+                    "owner_state": str(classification["owner_state"]),
+                    "planned_objects": list(classification["planned_objects"]),
+                    "public_safe": True,
+                }
+            },
+        )
+
+
 def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
-    """Verify the three source-owned rebuildable graph schemas without writes."""
+    """Verify every source-owned rebuildable graph schema without writes."""
 
     try:
         classification = classify_graph_materialization_preimage(conn)
     except ValueError as exc:
         raise DevRuntimeSchemaVerificationError(
             "graph_materialization",
+            component_diagnostics={
+                "graph_materialization": {
+                    "status": "preimage_incompatible",
+                    "public_safe": True,
+                }
+            },
         ) from exc
-    required = {
-        "graph_snapshot_store",
-        "graph_events",
-        "graph_correction_patches",
-    }
     owner_states = classification["owner_states"]
+    required = set(owner_states)
     if any(owner_states[owner] != "exact" for owner in required):
-        raise DevRuntimeSchemaVerificationError("graph_materialization")
+        planned_objects = list(classification.get("planned_objects") or [])
+        raise DevRuntimeSchemaVerificationError(
+            "graph_materialization",
+            owner_states=owner_states,
+            planned_objects=planned_objects,
+            component_diagnostics={
+                owner: {
+                    "status": "exact" if owner_states[owner] == "exact" else "incompatible",
+                    "owner_state": owner_states[owner],
+                    "planned_objects": (
+                        planned_objects
+                        if owner == "graph_snapshot_store"
+                        else []
+                    ),
+                    "public_safe": True,
+                }
+                for owner in sorted(required)
+            },
+        )
 
 
 def admit_ac_dev_graph_materialization_schema(
@@ -1099,8 +1389,6 @@ def admit_ac_dev_graph_materialization_schema(
     caller plane claims cannot widen it.  All owner DDL and postcondition
     verification share one ``BEGIN IMMEDIATE`` transaction.
     """
-
-    from . import graph_correction_patches, graph_events, graph_snapshot_store
 
     if project_id != AC_PROJECT_ID or not _is_dev_runtime():
         raise ValueError("AC dev graph materialization admission is dev/aming-claw only")
@@ -1118,15 +1406,19 @@ def admit_ac_dev_graph_materialization_schema(
             "verified_dev_root_receipt_genesis",
             "verified_dev_cow_successor_receipt_history",
         }
-        or policy.get("active_graph_activation_allowed") is not False
     ):
         raise ValueError("AC dev graph materialization database identity is not admitted")
 
-    canonical = _graph_materialization_canonical_inventory()
+    registry = _graph_schema_owner_registry()
+    canonical = sorted(
+        row for _owner, _ensure_schema, inventory in registry for row in inventory
+    )
     # Admission initializes absent rebuildable owners, replays exact owners,
     # or applies the one bounded snapshot predecessor.  Other partial,
     # altered, extra, or legacy layouts cannot be laundered by IF NOT EXISTS.
     classify_graph_materialization_preimage(conn)
+    classify_semantic_state_schema(conn)
+    classify_graph_query_trace_schema(conn)
     connection_ids = set(
         getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
     )
@@ -1139,20 +1431,31 @@ def admit_ac_dev_graph_materialization_schema(
             conn.set_authorizer(None)
             connection_ids.add(id(conn))
             _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
-            graph_snapshot_store.ensure_schema(conn)
-            graph_events.ensure_schema(conn)
-            graph_correction_patches.ensure_schema(conn)
+            for _owner, ensure_schema, _inventory in registry:
+                ensure_schema(conn)
             postimage = classify_graph_materialization_preimage(conn)
-            required = {
-                "graph_snapshot_store",
-                "graph_events",
-                "graph_correction_patches",
-            }
+            required = {owner for owner, _ensure_schema, _inventory in registry}
             if any(
                 postimage["owner_states"][owner] != "exact"
                 for owner in required
             ):
                 raise ValueError("AC dev graph materialization schema postcondition failed")
+            semantic_preimage = classify_semantic_state_schema(conn)
+            if semantic_preimage["owner_state"] == "absent":
+                from .reconcile_semantic_enrichment import (
+                    _ensure_semantic_state_schema,
+                )
+
+                _ensure_semantic_state_schema(conn)
+            if classify_semantic_state_schema(conn)["owner_state"] != "exact":
+                raise ValueError("AC dev semantic state schema postcondition failed")
+            trace_preimage = classify_graph_query_trace_schema(conn)
+            if trace_preimage["owner_state"] == "absent":
+                from .graph_query_trace import ensure_schema as ensure_trace_schema
+
+                ensure_trace_schema(conn)
+            if classify_graph_query_trace_schema(conn)["owner_state"] != "exact":
+                raise ValueError("AC dev graph-query trace schema postcondition failed")
             conn.commit()
     except BaseException:
         conn.rollback()
@@ -1167,7 +1470,9 @@ def admit_ac_dev_graph_materialization_schema(
         "runtime_plane": DEV_RUNTIME_PLANE,
         "world_id": AC_DEV_WORLD_ID,
         "object_count": len(canonical),
-        "active_graph_activation_allowed": False,
+        "active_graph_activation_allowed": bool(
+            policy.get("active_graph_activation_allowed") is True
+        ),
         "runtime_custody": runtime_custody,
     }
 
@@ -3631,6 +3936,100 @@ def backlog_read_schema_protected_inventory(conn: sqlite3.Connection) -> dict[st
     )
 
 
+def _completed_generation_schema_projections(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Project exact structural and semantic overlays out of generation bindings."""
+
+    authority = _authority_projection_inventory_in_managed_world(conn)
+    protected = backlog_read_schema_protected_inventory(conn)
+    classification = classify_graph_materialization_preimage(conn)
+    registry = _graph_schema_owner_registry()
+    required_owners = frozenset({
+        "graph_snapshot_store",
+        "graph_events",
+        "graph_correction_patches",
+        "asset_projection",
+        "asset_impact",
+    })
+    owner_states = dict(classification.get("owner_states") or {})
+    if (
+        {owner for owner, _ensure_schema, _inventory in registry} != required_owners
+        or set(owner_states) != required_owners
+    ):
+        raise ValueError("AC dev graph materialization owner registry mismatch")
+    semantic = classify_semantic_state_schema(conn)
+    trace = classify_graph_query_trace_schema(conn)
+    graph_exact = all(
+        owner_states[owner] == "exact" for owner in required_owners
+    )
+    semantic_exact = semantic["owner_state"] == "exact"
+    trace_exact = trace["owner_state"] == "exact"
+    if semantic_exact and not graph_exact:
+        raise ValueError(
+            "AC dev completed generation semantic schema requires exact graph owners"
+        )
+    if trace_exact and not (graph_exact and semantic_exact):
+        raise ValueError(
+            "AC dev completed generation trace schema requires exact graph and semantic owners"
+        )
+    if not graph_exact:
+        return authority, protected
+
+    overlay_rows: set[tuple[str, str, str, str]] = set()
+    if graph_exact:
+        overlay_rows.update(
+            (kind, name, table, _backlog_read_normalized_sql(sql))
+            for _owner, _ensure_schema, inventory in registry
+            for kind, name, table, sql in inventory
+        )
+    if semantic_exact:
+        overlay_rows.update(
+            (kind, name, table, _backlog_read_normalized_sql(sql))
+            for kind, name, table, sql in _semantic_state_schema_inventory()
+        )
+    if trace_exact:
+        overlay_rows.update(
+            (kind, name, table, _backlog_read_normalized_sql(sql))
+            for kind, name, table, sql in _graph_query_trace_schema_inventory()
+        )
+    canonical_authority_rows = {
+        tuple(str(value) for value in row)
+        for row in authority_projection_schema_inventory()["inventory"]
+    }
+    additive_rows = overlay_rows - canonical_authority_rows
+    authority_rows = tuple(
+        tuple(str(value) for value in row) for row in authority["inventory"]
+    )
+    protected_rows = tuple(
+        tuple(str(value) for value in row) for row in protected["inventory"]
+    )
+    protected_additive_rows = {
+        (
+            kind,
+            name,
+            table,
+            "sha256:" + hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        )
+        for kind, name, table, sql in additive_rows
+    }
+    if (
+        not additive_rows.issubset(set(authority_rows))
+        or not protected_additive_rows.issubset(set(protected_rows))
+    ):
+        raise ValueError("AC dev completed generation graph overlay mismatch")
+    return (
+        _schema_inventory_binding(
+            tuple(row for row in authority_rows if row not in additive_rows),
+            hash_sql=False,
+        ),
+        _schema_inventory_binding(
+            tuple(row for row in protected_rows if row not in protected_additive_rows),
+            hash_sql=False,
+        ),
+    )
+
+
 def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
     """Classify the bounded backlog-read plan without writing.
 
@@ -3766,9 +4165,18 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     managed_autoindex = "sqlite_autoindex_dashboard_backlog_cache_generation_1"
     graph_classification = classify_graph_materialization_preimage(conn)
     graph_registry = _graph_schema_owner_registry()
+    semantic_classification = classify_semantic_state_schema(conn)
+    semantic_inventory = _semantic_state_schema_inventory()
+    semantic_exact = semantic_classification["owner_state"] == "exact"
+    trace_classification = classify_graph_query_trace_schema(conn)
+    trace_inventory = _graph_query_trace_schema_inventory()
+    trace_exact = trace_classification["owner_state"] == "exact"
     graph_owner_states = graph_classification.get("owner_states")
     owner_state_values = (
-        [graph_owner_states.get(owner) for owner, _canonical in graph_registry]
+        [
+            graph_owner_states.get(owner)
+            for owner, _ensure_schema, _canonical in graph_registry
+        ]
         if isinstance(graph_owner_states, dict)
         else []
     )
@@ -3776,11 +4184,25 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         owner_state_values
         and all(state == "exact" for state in owner_state_values)
     )
+    if semantic_exact and not graph_overlay_exact:
+        raise ValueError(
+            "AC dev source schema inventory mismatch: "
+            "semantic state requires all graph owners SQL-exact"
+        )
+    if trace_exact and not (graph_overlay_exact and semantic_exact):
+        raise ValueError(
+            "AC dev source schema inventory mismatch: "
+            "graph-query trace requires graph and semantic owners SQL-exact"
+        )
     graph_known_names = {
-        row[1] for _owner, canonical in graph_registry for row in canonical
+        row[1]
+        for _owner, _ensure_schema, canonical in graph_registry
+        for row in canonical
     }
     graph_known_tables = {
-        row[2] for _owner, canonical in graph_registry for row in canonical
+        row[2]
+        for _owner, _ensure_schema, canonical in graph_registry
+        for row in canonical
         if row[0] == "table"
     }
     actual_graph_inventory = [
@@ -3799,7 +4221,9 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             "graph owners must equal baseline or all be SQL-exact"
         )
     graph_exact_inventory = {
-        row for _owner, canonical in graph_registry for row in canonical
+        row
+        for _owner, _ensure_schema, canonical in graph_registry
+        for row in canonical
         if graph_overlay_exact
     }
     graph_exact_objects = {
@@ -3808,6 +4232,24 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     graph_exact_tables = {
         name for kind, name, _table, _sql in graph_exact_inventory
         if kind == "table"
+    }
+    semantic_exact_objects = {
+        (kind, name, table)
+        for kind, name, table, _sql in semantic_inventory
+        if semantic_exact
+    }
+    semantic_exact_tables = {
+        name for kind, name, _table, _sql in semantic_inventory
+        if semantic_exact and kind == "table"
+    }
+    trace_exact_objects = {
+        (kind, name, table)
+        for kind, name, table, _sql in trace_inventory
+        if trace_exact
+    }
+    trace_exact_tables = {
+        name for kind, name, _table, _sql in trace_inventory
+        if trace_exact and kind == "table"
     }
     # This exception is deliberately all-or-nothing: the SQL-bearing five
     # objects must equal the source plan before *only* their exact namespace
@@ -3827,6 +4269,8 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     unknown = sorted(
         (actual - allowed)
         - graph_exact_tables
+        - semantic_exact_tables
+        - trace_exact_tables
         - ({managed_table} if managed_exact else set())
     )
     missing = sorted(required - actual)
@@ -3838,6 +4282,8 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             - source_objects
             - accepted_overlay
             - graph_exact_objects
+            - semantic_exact_objects
+            - trace_exact_objects
         )
         if not (item[0] in {"table", "index"} and item[2] in optional)
     )
@@ -5071,7 +5517,7 @@ def _validated_dev_cow_completed_generation_axis(
     _validate_dev_cow_stopped_sidecar_residue(database)
     if not _quick_check_returns_literal_ok(conn):
         raise ValueError("AC dev COW completed generation quick-check failed")
-    inventory = _authority_projection_inventory_in_managed_world(conn)
+    inventory, protected_inventory = _completed_generation_schema_projections(conn)
     issuance_schema_meta = str(
         dict(successor.get("protected_projection") or {}).get("schema_meta") or ""
     )
@@ -5094,37 +5540,20 @@ def _validated_dev_cow_completed_generation_axis(
         or meta.get("governance_world_id") != AC_DEV_WORLD_ID
         or revision < 2 or not isinstance(tip, Mapping)
         or not isinstance(process, Mapping)
-        or meta.get("governance_world_source_tip_sha256")
-        != _world_source_tip_hash(tip)
-        or len(inventory["inventory"]) != 308
+        or len(inventory["inventory"]) != AC_AUTHORITY_SCHEMA_INVENTORY_COUNT
         or inventory != authority_projection_schema_inventory()
         or backlog_read_schema_managed_inventory(conn)
         != canonical_backlog_read_schema_managed_inventory()
-        or backlog_read_schema_protected_inventory(conn)
-        != dict(successor.get("protected_inventory") or {})
+        or protected_inventory != dict(successor.get("protected_inventory") or {})
     ):
         raise ValueError("AC dev COW completed generation projection mismatch")
-    adoption_ref = dict(history.get("adoption") or {})
-    adoption_path = Path(str(adoption_ref.get("path") or "")).absolute()
-    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
-    if adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}:
-        raise ValueError("AC dev COW completed generation custody history mismatch")
-    anchor = dict(adoption.get("candidate_source_identity") or {})
-    if (str(anchor.get("root") or "") != str(tip.get("root") or "")
-            or str(anchor.get("commit") or "") == str(tip.get("commit") or "")):
-        raise ValueError("AC dev COW completed generation historical tip is not closed")
-    candidate_root = Path(str(source_identity.get("root") or ""))
-    anchor_ancestry = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", str(anchor.get("commit") or ""),
-         str(tip.get("commit") or "")],
-        cwd=candidate_root, capture_output=True,
-        timeout=10, check=False,
-    )
-    if anchor_ancestry.returncode != 0:
-        raise ValueError("AC dev COW completed generation historical tip is not an ancestor")
-    _validate_dev_source_tip_custody(
-        tip, stored_sha256=meta["governance_world_source_tip_sha256"],
-        candidate=source_identity, historical_worktree_advisory=True,
+    _validate_dev_cow_historical_source_provenance(
+        root=root,
+        receipt=receipt,
+        historical_tip=tip,
+        stored_tip_sha256=meta["governance_world_source_tip_sha256"],
+        current_source=source_identity,
+        strict_current_descendant=False,
     )
     _validate_dev_cow_completed_process_axis(
         process, root=root, source_identity=source_identity,

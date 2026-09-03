@@ -18,6 +18,110 @@ from agent.governance.db import _ensure_schema
 PID = "graph-query-trace-test"
 
 
+def test_dev_exact_trace_ensure_is_verify_only_and_preserves_outer_transaction(
+    monkeypatch,
+):
+    from agent.governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db.execute_graph_schema_sql(
+        conn, graph_query_trace.GRAPH_QUERY_TRACE_SCHEMA_SQL,
+    )
+    conn.commit()
+    statements = []
+    conn.set_trace_callback(statements.append)
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    conn.execute("BEGIN")
+    graph_query_trace.ensure_schema(conn)
+
+    assert conn.in_transaction is True
+    assert not any(
+        statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "COMMIT"))
+        for statement in statements
+    )
+    conn.execute(
+        """
+        INSERT INTO qa_graph_basis_escalations
+          (escalation_id, project_id, candidate_commit_sha,
+           exact_candidate_upgrade_trigger, candidate_change_classification,
+           created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("esc-dev-exact", PID, "abc1234", "first_query", "source", "now"),
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM qa_graph_basis_escalations"
+    ).fetchone()[0] == 1
+    conn.rollback()
+    conn.close()
+
+
+def test_dev_missing_trace_ensure_is_typed_and_zero_write(monkeypatch):
+    from agent.governance import db
+
+    conn = sqlite3.connect(":memory:")
+    before = list(conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY 1, 2"
+    ))
+    changes = conn.total_changes
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    with pytest.raises(
+        db.DevRuntimeSchemaVerificationError,
+        match="graph_query_trace",
+    ):
+        graph_query_trace.ensure_schema(conn)
+
+    assert conn.total_changes == changes
+    assert list(conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY 1, 2"
+    )) == before
+    conn.close()
+
+
+def test_stable_trace_ensure_preserves_executescript_and_legacy_alters(monkeypatch):
+    from agent.governance import db
+
+    calls = []
+
+    class _Cursor:
+        def fetchall(self):
+            return []
+
+    class _Connection:
+        def executescript(self, sql):
+            calls.append(("executescript", sql))
+
+        def execute(self, sql):
+            calls.append(("execute", sql))
+            return _Cursor()
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, "stable")
+    monkeypatch.setattr(
+        graph_query_trace.store,
+        "ensure_schema",
+        lambda conn: calls.append(("store.ensure_schema", conn)),
+    )
+    conn = _Connection()
+
+    graph_query_trace.ensure_schema(conn)
+
+    assert calls[0] == ("store.ensure_schema", conn)
+    assert calls[1] == (
+        "executescript", graph_query_trace.GRAPH_QUERY_TRACE_SCHEMA_SQL,
+    )
+    assert calls[2] == ("execute", "PRAGMA table_info(graph_query_traces)")
+    assert calls[3:] == [
+        (
+            "execute",
+            f"ALTER TABLE graph_query_traces ADD COLUMN {column} {ddl}",
+        )
+        for column, ddl in graph_query_trace._TRACE_IDENTITY_COLUMNS.items()
+    ]
+
+
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")

@@ -2267,25 +2267,252 @@ def test_observer_route_context_issue_mcp_boundaries_strip_raw_route_token(monke
         },
     )
     _assert_route_issue_result_is_copy_safe(direct)
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer/route-context/issue",
+            {
+                "project_id": "aming-claw",
+                "task_id": "copy-safe-route-issue",
+                "caller_role": "observer",
+            },
+        )
+    ]
     assert raw_result["route_token"]["token"] == "raw-write-authority"
+
+    stdio_calls = []
+
+    def fake_http(method, path, body):
+        stdio_calls.append((method, path, body))
+        return raw_result
 
     monkeypatch.setattr(
         governance_mcp_server,
         "_http",
-        lambda *args, **kwargs: raw_result,
+        fake_http,
     )
     stdio = governance_mcp_server._dispatch_tool(
         "observer_route_context_issue",
         {
             "project_id": "aming-claw",
             "task_id": "copy-safe-route-issue",
-            "caller_role": "observer",
         },
     )
     _assert_route_issue_result_is_copy_safe(stdio)
+    assert stdio_calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer/route-context/issue",
+            {
+                "project_id": "aming-claw",
+                "task_id": "copy-safe-route-issue",
+                "caller_role": "observer",
+            },
+        )
+    ]
     assert raw_result["nested"]["route_token"]["token"] == (
         "nested-raw-write-authority"
     )
+
+
+def test_observer_route_context_renew_dispatchers_forward_exact_guide_body(monkeypatch):
+    arguments = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-RENEW-ADAPTER",
+        "task_id": "cex-direct-main-renew-adapter",
+        "route_token_ref": "rtok-direct-renew-adapter",
+        "observer_session_id": "obs-direct-renew-adapter",
+    }
+    expected = {**arguments, "caller_role": "observer"}
+    result = {
+        "ok": True,
+        "route_token_ref": "rtok-direct-renew-adapter-next",
+        "raw_route_token_exposed": False,
+    }
+
+    recorder = _Recorder()
+    recorder.api = lambda method, path, data=None: (
+        recorder.calls.append((method, path, data)) or result
+    )
+    assert _dispatcher(recorder).dispatch(
+        "observer_route_context_renew", arguments
+    ) == result
+
+    stdio_calls = []
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http",
+        lambda method, path, data=None: (
+            stdio_calls.append((method, path, data)) or result
+        ),
+    )
+    assert governance_mcp_server._dispatch_tool(
+        "observer_route_context_renew", arguments
+    ) == result
+
+    expected_call = (
+        "POST",
+        "/api/projects/aming-claw/observer/route-context/renew",
+        expected,
+    )
+    assert recorder.calls == [expected_call]
+    assert stdio_calls == [expected_call]
+    body_hashes = {
+        hashlib.sha256(
+            json.dumps(call[2], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        for call in (recorder.calls[0], stdio_calls[0])
+    }
+    assert len(body_hashes) == 1
+    assert set(expected) == {
+        "project_id",
+        "caller_role",
+        "backlog_id",
+        "task_id",
+        "route_token_ref",
+        "observer_session_id",
+    }
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        schema = next(
+            item for item in registry
+            if item["name"] == "observer_route_context_renew"
+        )
+        assert "route_token" not in schema["inputSchema"]["properties"]
+
+
+def test_observer_route_context_renew_adapters_filter_to_declared_falsey_fields(
+    monkeypatch,
+):
+    arguments = {
+        "project_id": "aming-claw",
+        "caller_role": "observer",
+        "observer_session_id": "obs-allowlist",
+        "route_token_ref": "rtok-allowlist",
+        "observer_route_token_ref": "rtok-allowlist-alias",
+        "backlog_id": "AC-RENEW-ALLOWLIST",
+        "bug_id": "AC-RENEW-ALLOWLIST",
+        "task_id": "cex-renew-allowlist",
+        "contract_execution_id": "cex-renew-allowlist",
+        "allowed_actions": [],
+        "target_files": [],
+        "owned_files": False,
+        "evidence_refs": [],
+        "ttl_hours": 0,
+        "renew_within_seconds": False,
+        "route_token": "RAW_ROUTE_SENTINEL",
+        "session_token": "RAW_SESSION_SENTINEL",
+        "unknown_non_none": "UNKNOWN_SENTINEL",
+        "unknown_none": None,
+    }
+    allowed = set(arguments) - {
+        "route_token", "session_token", "unknown_non_none", "unknown_none"
+    }
+    expected = {key: arguments[key] for key in allowed}
+    calls = []
+    recorder = _Recorder()
+    recorder.api = lambda method, path, data=None: (
+        calls.append((method, path, data)) or {"ok": True}
+    )
+    _dispatcher(recorder).dispatch("observer_route_context_renew", arguments)
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http",
+        lambda method, path, data=None: (
+            calls.append((method, path, data)) or {"ok": True}
+        ),
+    )
+    governance_mcp_server._dispatch_tool(
+        "observer_route_context_renew", arguments
+    )
+
+    assert [call[2] for call in calls] == [expected, expected]
+    assert calls[0][:2] == calls[1][:2] == (
+        "POST", "/api/projects/aming-claw/observer/route-context/renew"
+    )
+    assert calls[0][2]["ttl_hours"] == 0
+    assert calls[0][2]["renew_within_seconds"] is False
+    assert calls[0][2]["owned_files"] is False
+    assert hashlib.sha256(
+        json.dumps(calls[0][2], sort_keys=True).encode()
+    ).digest() == hashlib.sha256(
+        json.dumps(calls[1][2], sort_keys=True).encode()
+    ).digest()
+
+
+def test_real_mcp_jsonrpc_route_renew_strips_undeclared_and_raw_fields(
+    monkeypatch,
+    tmp_path,
+):
+    raw_sentinel = "RAW_ROUTE_RENEW_JSONRPC_SENTINEL"
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    mcp = object.__new__(plugin_mcp_server.AmingClawMCP)
+    mcp.project_id = "aming-claw"
+    mcp.gov_url = "http://127.0.0.1:40008"
+    mcp.dispatcher = ToolDispatcher(
+        api_fn=mcp._http,
+        worker_pool=None,
+        workspace=str(tmp_path),
+    )
+    http_calls = []
+    mcp._request_json = lambda method, url, data=None, timeout=15: (
+        http_calls.append((method, url, data, timeout))
+        or {"ok": True, "raw_route_token_exposed": False}
+    )
+    messages = []
+    monkeypatch.setattr(plugin_mcp_server, "_write", messages.append)
+    arguments = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-RENEW-JSONRPC",
+        "task_id": "cex-renew-jsonrpc",
+        "route_token_ref": "rtok-renew-jsonrpc",
+        "observer_session_id": "obs-renew-jsonrpc",
+        "route_token": raw_sentinel,
+        "session_token": raw_sentinel,
+        "undeclared": {"nested": raw_sentinel},
+    }
+
+    mcp._handle(json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "observer_route_context_renew",
+            "arguments": arguments,
+        },
+    }))
+
+    assert http_calls == [(
+        "POST",
+        "http://127.0.0.1:40008/api/projects/aming-claw/observer/route-context/renew",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-RENEW-JSONRPC",
+            "task_id": "cex-renew-jsonrpc",
+            "route_token_ref": "rtok-renew-jsonrpc",
+            "observer_session_id": "obs-renew-jsonrpc",
+            "caller_role": "observer",
+        },
+        15,
+    )]
+    assert raw_sentinel not in json.dumps(http_calls)
+    assert raw_sentinel not in json.dumps(messages)
+
+    mcp._handle(json.dumps({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "observer_route_context_renew",
+            "arguments": {**arguments, "project_id": "content-sys"},
+        },
+    }))
+    assert len(http_calls) == 1
+    rejected = json.loads(messages[-1]["result"]["content"][0]["text"])
+    assert rejected == {
+        "error": "mcp_world_project_scope_mismatch",
+        "writes_performed": False,
+        "mutation_performed": False,
+    }
 
 
 def test_backlog_upsert_accepts_structured_acceptance_scope_without_breaking_strings():

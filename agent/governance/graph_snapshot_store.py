@@ -556,11 +556,36 @@ def _graph_activation_policy_for_connection(
 
 def _require_active_graph_activation_for_connection(
     conn: sqlite3.Connection,
+    *,
+    project_id: str,
 ) -> dict[str, object]:
     policy = _graph_activation_policy_for_connection(conn)
+    from .db import dev_runtime_verify_only
+
+    if (
+        dev_runtime_verify_only()
+        and policy.get("runtime_plane") != "dev"
+    ):
+        raise ValueError(
+            "active graph activation is forbidden across runtime worlds"
+        )
     if policy.get("active_graph_activation_allowed") is not True:
         raise ValueError(
             "active graph activation is forbidden for this database runtime plane"
+        )
+    if policy.get("runtime_plane") == "dev" and not (
+        policy.get("classification_reason")
+        == "verified_dev_cow_successor_receipt_history"
+        and policy.get("world_id") == "ac-dev"
+        and policy.get("project_id") == "aming-claw"
+        and policy.get("port") == 40008
+        and policy.get("cow_successor_verified") is True
+        and policy.get("source_checkout_verified") is True
+        and policy.get("live_runtime_custody_verified") is True
+        and str(project_id or "").strip() == "aming-claw"
+    ):
+        raise ValueError(
+            "active graph activation is forbidden outside the classified AC-dev world"
         )
     return policy
 
@@ -2737,7 +2762,10 @@ def activate_graph_snapshot(
     # This must precede every ref/projection/event write below.  In particular,
     # direct in-process callers cannot bypass the HTTP dev-plane guard by
     # supplying a stable-looking argument or changing an environment value.
-    _require_active_graph_activation_for_connection(conn)
+    _require_active_graph_activation_for_connection(
+        conn,
+        project_id=project_id,
+    )
     if schema_ready and auto_rebuild_projection:
         raise ValueError(
             "transaction-safe graph activation requires auto_rebuild_projection=false"

@@ -45,9 +45,50 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _verify_base_owned_schema(conn: sqlite3.Connection) -> None:
+    """Require the source-bootstrap batch schema without issuing DDL."""
+
+    from . import db
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        canonical.executescript(BATCH_MEMORY_SCHEMA_SQL)
+        expected = tuple(
+            row for row in db._sqlite_master_inventory(canonical)
+            if row[1] == "reconcile_batch_memory"
+            or row[2] == "reconcile_batch_memory"
+        )
+    finally:
+        canonical.close()
+    actual = tuple(
+        row for row in db._sqlite_master_inventory(conn)
+        if row[1] == "reconcile_batch_memory"
+        or row[2] == "reconcile_batch_memory"
+    )
+    if actual != expected:
+        state = "absent" if not actual else "incompatible"
+        raise db.DevRuntimeSchemaVerificationError(
+            "reconcile_batch_memory",
+            owner_states={"reconcile_batch_memory": state},
+            planned_objects=[row[1] for row in expected if row not in actual],
+            component_diagnostics={
+                "reconcile_batch_memory": {
+                    "status": "incompatible",
+                    "owner_state": state,
+                    "public_safe": True,
+                }
+            },
+        )
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     if conn.row_factory is None:
         conn.row_factory = sqlite3.Row
+    from . import db
+
+    if db.dev_runtime_verify_only():
+        _verify_base_owned_schema(conn)
+        return
     conn.executescript(BATCH_MEMORY_SCHEMA_SQL)
     conn.commit()
 

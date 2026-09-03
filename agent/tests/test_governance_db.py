@@ -102,13 +102,20 @@ class TestDB(unittest.TestCase):
 
 
 def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(monkeypatch):
-    from agent.governance import db, graph_events, graph_snapshot_store
+    from agent.governance import (
+        asset_impact,
+        asset_projection,
+        db,
+        graph_correction_patches,
+        graph_events,
+        graph_snapshot_store,
+    )
 
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
     )
     monkeypatch.setattr(
         db,
@@ -134,14 +141,249 @@ def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(mo
         second = db.admit_ac_dev_graph_materialization_schema(
             conn, project_id="aming-claw"
         )
+        owner_states = db.classify_graph_materialization_preimage(conn)[
+            "owner_states"
+        ]
+        assert list(owner_states) == [
+            "graph_snapshot_store",
+            "graph_events",
+            "graph_correction_patches",
+            "asset_projection",
+            "asset_impact",
+        ]
+        assert set(owner_states.values()) == {"exact"}
+        canonical_graph = db._graph_materialization_canonical_inventory()
+        assert db._graph_materialization_managed_inventory(
+            inventory, canonical_graph,
+        ) == canonical_graph
+        assert db.classify_semantic_state_schema(conn)["owner_state"] == (
+            "exact"
+        )
+        assert db.classify_graph_query_trace_schema(conn)["owner_state"] == (
+            "exact"
+        )
         changes = conn.total_changes
-        graph_snapshot_store.ensure_schema(conn)
-        graph_events.ensure_schema(conn)
+        for ensure_schema in (
+            graph_snapshot_store.ensure_schema,
+            graph_events.ensure_schema,
+            graph_correction_patches.ensure_schema,
+            asset_projection.ensure_schema,
+            asset_impact.ensure_schema,
+        ):
+            ensure_schema(conn)
         assert conn.total_changes == changes
         assert db._graph_materialization_inventory(conn) == inventory
         assert first == second
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "state", ["absent", "exact", "partial", "altered", "extra"],
+)
+def test_semantic_state_schema_classifier_and_typed_verifier_are_zero_write(state):
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    if state != "absent":
+        db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+        if state == "partial":
+            conn.execute("DROP INDEX idx_graph_semantic_nodes_status")
+        elif state == "altered":
+            conn.execute("DROP INDEX idx_graph_semantic_nodes_status")
+            conn.execute(
+                "CREATE INDEX idx_graph_semantic_nodes_status "
+                "ON graph_semantic_nodes(project_id, status)"
+            )
+        elif state == "extra":
+            conn.execute(
+                "CREATE TABLE graph_semantic_unknown_owner(value TEXT)"
+            )
+        conn.commit()
+    before = db._graph_materialization_inventory(conn)
+    changes = conn.total_changes
+
+    if state in {"absent", "exact"}:
+        classification = db.classify_semantic_state_schema(conn)
+        assert classification["owner_state"] == state
+        if state == "exact":
+            assert len([row for row in before if row[0] == "table"]) == 3
+            assert len([row for row in before if row[0] == "index"]) == 6
+            db.verify_semantic_state_schema(conn)
+        else:
+            with pytest.raises(db.DevRuntimeSchemaVerificationError):
+                db.verify_semantic_state_schema(conn)
+    else:
+        with pytest.raises(db.DevRuntimeSchemaVerificationError):
+            db.verify_semantic_state_schema(conn)
+
+    assert conn.total_changes == changes
+    assert db._graph_materialization_inventory(conn) == before
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "state", ["absent", "exact", "partial", "altered", "extra"],
+)
+def test_graph_query_trace_schema_classifier_and_typed_verifier_are_zero_write(state):
+    from agent.governance import db, graph_query_trace
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    if state != "absent":
+        db.execute_graph_schema_sql(conn, graph_query_trace.GRAPH_QUERY_TRACE_SCHEMA_SQL)
+        if state == "partial":
+            conn.execute("DROP INDEX idx_graph_query_traces_project")
+        elif state == "altered":
+            conn.execute("DROP INDEX idx_graph_query_traces_project")
+            conn.execute(
+                "CREATE INDEX idx_graph_query_traces_project "
+                "ON graph_query_traces(project_id, status)"
+            )
+        elif state == "extra":
+            conn.execute("CREATE TABLE graph_query_unknown_owner(value TEXT)")
+        conn.commit()
+    before = db._graph_materialization_inventory(conn)
+    changes = conn.total_changes
+
+    if state in {"absent", "exact"}:
+        classification = db.classify_graph_query_trace_schema(conn)
+        assert classification["owner_state"] == state
+        if state == "exact":
+            assert len([row for row in before if row[0] == "table"]) == 3
+            assert len([row for row in before if row[0] == "index"]) == 5
+            db.verify_graph_query_trace_schema(conn)
+        else:
+            with pytest.raises(db.DevRuntimeSchemaVerificationError):
+                db.verify_graph_query_trace_schema(conn)
+    else:
+        with pytest.raises(db.DevRuntimeSchemaVerificationError):
+            db.verify_graph_query_trace_schema(conn)
+
+    assert conn.total_changes == changes
+    assert db._graph_materialization_inventory(conn) == before
+    conn.close()
+
+
+def test_dev_world_rejects_semantic_exact_without_exact_graph_zero_write():
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    conn = db._migration_capable_source_schema_memory()
+    db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+    conn.commit()
+    before = db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+
+    with pytest.raises(ValueError, match="semantic state requires all graph owners"):
+        db._verify_dev_world_schema_inventory(conn)
+
+    assert conn.total_changes == changes
+    assert db._sqlite_master_inventory(conn) == before
+    conn.close()
+
+
+def test_completed_projection_rejects_semantic_exact_without_exact_graph_zero_write():
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    conn = db._migration_capable_source_schema_memory()
+    for statement in db._authority_projection_schema_statements():
+        conn.execute(statement)
+    db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+    conn.commit()
+    before = db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+
+    with pytest.raises(ValueError, match="semantic schema requires exact graph owners"):
+        db._completed_generation_schema_projections(conn)
+
+    assert conn.total_changes == changes
+    assert db._sqlite_master_inventory(conn) == before
+    conn.close()
+
+
+def _install_post_structural_profile(db, conn, profile):
+    from agent.governance import graph_query_trace
+    from agent.governance import reconcile_semantic_enrichment as semantic
+
+    if profile != "baseline_absent":
+        _install_all_graph_owners_for_inventory_test(db, conn)
+    if profile in {"graph_semantic", "all_exact"}:
+        db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+    if profile in {"all_exact", "graph_trace", "baseline_trace"}:
+        db.execute_graph_schema_sql(
+            conn, graph_query_trace.GRAPH_QUERY_TRACE_SCHEMA_SQL,
+        )
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("profile", "accepted"),
+    [
+        ("baseline_absent", True),
+        ("graph_only", True),
+        ("graph_semantic", True),
+        ("all_exact", True),
+        ("graph_trace", False),
+        ("baseline_trace", False),
+    ],
+)
+def test_dev_world_trace_owner_legal_profiles_are_zero_write(profile, accepted):
+    from agent.governance import db
+
+    conn = db._migration_capable_source_schema_memory()
+    _install_post_structural_profile(db, conn, profile)
+    before = db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+
+    if accepted:
+        db._verify_dev_world_schema_inventory(conn)
+    else:
+        with pytest.raises(ValueError, match="graph-query trace requires"):
+            db._verify_dev_world_schema_inventory(conn)
+
+    assert conn.total_changes == changes
+    assert db._sqlite_master_inventory(conn) == before
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("profile", "accepted"),
+    [
+        ("baseline_absent", True),
+        ("graph_only", True),
+        ("graph_semantic", True),
+        ("all_exact", True),
+        ("graph_trace", False),
+        ("baseline_trace", False),
+    ],
+)
+def test_completed_projection_trace_owner_legal_profiles_bind_both_hashes(
+    profile, accepted,
+):
+    from agent.governance import db
+
+    conn = db._migration_capable_source_schema_memory()
+    for statement in db._authority_projection_schema_statements():
+        conn.execute(statement)
+    conn.commit()
+    expected_authority = db._authority_projection_inventory_in_managed_world(conn)
+    expected_protected = db.backlog_read_schema_protected_inventory(conn)
+    _install_post_structural_profile(db, conn, profile)
+    before = db._sqlite_master_inventory(conn)
+    changes = conn.total_changes
+
+    if accepted:
+        authority, protected = db._completed_generation_schema_projections(conn)
+        assert authority == expected_authority
+        assert protected == expected_protected
+    else:
+        with pytest.raises(ValueError, match="trace schema requires"):
+            db._completed_generation_schema_projections(conn)
+
+    assert conn.total_changes == changes
+    assert db._sqlite_master_inventory(conn) == before
+    conn.close()
 
 
 def _install_graph_owner_for_preimage_test(db, conn, ensure_schema):
@@ -176,6 +418,187 @@ def _install_all_graph_owners_for_inventory_test(db, conn):
         asset_impact.ensure_schema,
     ):
         _install_graph_owner_for_preimage_test(db, conn, ensure_schema)
+
+
+@pytest.mark.parametrize("owner", ["asset_projection", "asset_impact"])
+def test_exact_dev_asset_owner_ensure_is_zero_write_and_preserves_outer_transaction(
+    monkeypatch,
+    owner,
+):
+    from agent.governance import asset_impact, asset_projection, db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_all_graph_owners_for_inventory_test(db, conn)
+    conn.execute("CREATE TABLE transaction_probe(value TEXT)")
+    conn.commit()
+    before_inventory = db._graph_materialization_inventory(conn)
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO transaction_probe(value) VALUES('before')")
+    ensure_schema = {
+        "asset_projection": asset_projection.ensure_schema,
+        "asset_impact": asset_impact.ensure_schema,
+    }[owner]
+    ensure_schema(conn)
+
+    assert conn.in_transaction is True
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    conn.execute("INSERT INTO transaction_probe(value) VALUES('after')")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM transaction_probe"
+    ).fetchone()[0] == 2
+    conn.rollback()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM transaction_probe"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.parametrize("drift", ["absent", "partial", "altered"])
+def test_dev_asset_owner_ensure_rejects_schema_drift_typed_and_zero_write(
+    monkeypatch,
+    drift,
+):
+    from agent.governance import asset_projection, db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    if drift != "absent":
+        _install_all_graph_owners_for_inventory_test(db, conn)
+        conn.execute("DROP INDEX idx_graph_asset_projection_path")
+        if drift == "altered":
+            conn.execute(
+                "CREATE INDEX idx_graph_asset_projection_path "
+                "ON graph_asset_projection(project_id, snapshot_id)"
+            )
+        conn.commit()
+    before_inventory = db._graph_materialization_inventory(conn)
+    before_changes = conn.total_changes
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+
+    with pytest.raises(db.DevRuntimeSchemaVerificationError):
+        asset_projection.ensure_schema(conn)
+
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    conn.close()
+
+
+def test_ac_dev_graph_admission_creates_projection_and_impact_atomically(
+    monkeypatch,
+):
+    from agent.governance import (
+        asset_impact,
+        db,
+        graph_correction_patches,
+        graph_events,
+        graph_snapshot_store,
+    )
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    for ensure_schema in (
+        graph_snapshot_store.ensure_schema,
+        graph_events.ensure_schema,
+        graph_correction_patches.ensure_schema,
+    ):
+        _install_graph_owner_for_preimage_test(db, conn, ensure_schema)
+    conn.commit()
+    before = db.classify_graph_materialization_preimage(conn)["owner_states"]
+    assert before["asset_projection"] == "absent"
+    assert before["asset_impact"] == "absent"
+
+    db.admit_ac_dev_graph_materialization_schema(conn, project_id="aming-claw")
+
+    after = db.classify_graph_materialization_preimage(conn)["owner_states"]
+    assert after["asset_projection"] == "exact"
+    assert after["asset_impact"] == "exact"
+
+    rollback_conn = sqlite3.connect(":memory:")
+    rollback_conn.row_factory = sqlite3.Row
+    for ensure_schema in (
+        graph_snapshot_store.ensure_schema,
+        graph_events.ensure_schema,
+        graph_correction_patches.ensure_schema,
+    ):
+        _install_graph_owner_for_preimage_test(db, rollback_conn, ensure_schema)
+    rollback_conn.commit()
+    original_impact_ensure = asset_impact.ensure_schema
+
+    def fail_after_impact_schema(candidate):
+        original_impact_ensure(candidate)
+        if candidate is rollback_conn:
+            raise RuntimeError("impact admission sentinel")
+
+    monkeypatch.setattr(asset_impact, "ensure_schema", fail_after_impact_schema)
+    with pytest.raises(RuntimeError, match="impact admission sentinel"):
+        db.admit_ac_dev_graph_materialization_schema(
+            rollback_conn,
+            project_id="aming-claw",
+        )
+    rolled_back = db.classify_graph_materialization_preimage(rollback_conn)[
+        "owner_states"
+    ]
+    assert rolled_back["asset_projection"] == "absent"
+    assert rolled_back["asset_impact"] == "absent"
+    conn.close()
+    rollback_conn.close()
+
+
+@pytest.mark.parametrize("owner", ["asset_projection", "asset_impact"])
+def test_stable_asset_owner_ensure_preserves_executescript_without_dev_verify(
+    monkeypatch,
+    owner,
+):
+    from agent.governance import asset_impact, asset_projection, db
+
+    module = {
+        "asset_projection": asset_projection,
+        "asset_impact": asset_impact,
+    }[owner]
+    scripts = []
+
+    class StableConnection:
+        def executescript(self, sql):
+            scripts.append(sql)
+
+    monkeypatch.setattr(db, "dev_runtime_verify_only", lambda: False)
+    monkeypatch.setattr(
+        db,
+        "verify_graph_materialization_schema",
+        lambda _conn: pytest.fail("stable ensure reached dev verification"),
+    )
+    monkeypatch.setattr(
+        db,
+        "graph_materialization_admission_active",
+        lambda _conn: False,
+    )
+
+    module.ensure_schema(StableConnection())
+
+    assert scripts == [module.SCHEMA_SQL]
 
 
 def test_graph_materialization_preimage_classifier_accepts_only_exact_predecessor_without_write():
@@ -283,7 +706,7 @@ def test_ac_dev_graph_materialization_admission_rolls_back_partial_schema(monkey
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
     )
     monkeypatch.setattr(
         db,
@@ -317,6 +740,155 @@ def test_ac_dev_graph_materialization_admission_rolls_back_partial_schema(monkey
     conn.close()
 
 
+def test_ac_dev_graph_materialization_admission_rolls_back_semantic_schema(monkeypatch):
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_root_receipt_genesis",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    original = semantic._ensure_semantic_state_schema
+
+    def fail_after_semantic_schema(candidate):
+        original(candidate)
+        raise RuntimeError("semantic admission sentinel")
+
+    monkeypatch.setattr(
+        semantic, "_ensure_semantic_state_schema", fail_after_semantic_schema,
+    )
+    with pytest.raises(RuntimeError, match="semantic admission sentinel"):
+        db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw",
+        )
+
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    conn.close()
+
+
+def test_ac_dev_graph_admission_reclassifies_semantic_race_inside_transaction(
+    monkeypatch,
+):
+    from agent.governance import db
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_root_receipt_genesis",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    original = db.classify_semantic_state_schema
+    calls = 0
+
+    def inject_partial_on_transactional_recheck(candidate):
+        nonlocal calls
+        calls += 1
+        if candidate is conn and calls == 2:
+            candidate.execute(
+                "CREATE TABLE graph_semantic_nodes(project_id TEXT)"
+            )
+        return original(candidate)
+
+    monkeypatch.setattr(
+        db,
+        "classify_semantic_state_schema",
+        inject_partial_on_transactional_recheck,
+    )
+    with pytest.raises(ValueError, match="semantic state schema"):
+        db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw",
+        )
+
+    assert calls == 2
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    conn.close()
+
+
+def test_ac_dev_graph_admission_reclassifies_trace_race_inside_transaction(
+    monkeypatch,
+):
+    from agent.governance import db
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_root_receipt_genesis",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    original = db.classify_graph_query_trace_schema
+    calls = 0
+
+    def inject_partial_on_transactional_recheck(candidate):
+        nonlocal calls
+        calls += 1
+        if candidate is conn and calls == 2:
+            candidate.execute("CREATE TABLE graph_query_traces(trace_id TEXT)")
+        return original(candidate)
+
+    monkeypatch.setattr(
+        db,
+        "classify_graph_query_trace_schema",
+        inject_partial_on_transactional_recheck,
+    )
+    with pytest.raises(ValueError, match="graph-query trace schema"):
+        db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw",
+        )
+
+    assert calls == 2
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    conn.close()
+
+
 def test_ac_dev_graph_materialization_admission_denies_wrong_world_without_write(monkeypatch):
     from agent.governance import db
 
@@ -324,7 +896,7 @@ def test_ac_dev_graph_materialization_admission_denies_wrong_world_without_write
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
     )
     monkeypatch.setattr(
         db,
@@ -466,7 +1038,7 @@ def test_graph_materialization_runtime_rejects_before_schema_begin(monkeypatch):
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: (_ for _ in ()).throw(
+        lambda _conn, *_args: (_ for _ in ()).throw(
             ValueError("AC dev graph materialization listener custody mismatch")
         ),
     )
@@ -1222,6 +1794,11 @@ def _cow_graph_identity_fixture(tmp_path, monkeypatch):
         "source_sha256": "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest(),
     }
     (root / db.AC_DEV_LAUNCH_RECEIPT_NAME).write_text(json.dumps(launch))
+    monkeypatch.setattr(
+        db,
+        "validate_dev_launch_receipt",
+        lambda *_args, **_kwargs: dict(launch),
+    )
     binding = {
         "shared_volume_path": str(stable), "database_path": str(stable_db),
         "stable_database_identity": {
@@ -1246,13 +1823,145 @@ def test_graph_activation_classifies_exact_validated_cow_successor(tmp_path, mon
     monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
     monkeypatch.setattr(db, "_verify_dev_world_schema_inventory", lambda _conn: None)
     monkeypatch.setattr(db, "_verify_current_cow_successor_source", lambda *_args, **_kwargs: None)
+    identity = Path(conn.execute("PRAGMA database_list").fetchone()[2]).stat()
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn, *_args: {
+            "runtime_plane": "dev",
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "port": 40008,
+            "pid": os.getpid(),
+            "database_device": identity.st_dev,
+            "database_inode": identity.st_ino,
+        },
+    )
     try:
         policy = db.classify_graph_activation_connection(conn)
     finally:
         conn.close()
     assert policy["runtime_plane"] == "dev"
-    assert policy["active_graph_activation_allowed"] is False
+    assert policy["active_graph_activation_allowed"] is True
     assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
+    assert policy["world_id"] == "ac-dev"
+    assert policy["project_id"] == "aming-claw"
+    assert policy["port"] == 40008
+    assert policy["cow_successor_verified"] is True
+    assert policy["source_checkout_verified"] is True
+    assert policy["live_runtime_custody_verified"] is True
+
+
+@pytest.mark.parametrize("custody_failure", ["listener", "writer_lease"])
+def test_graph_activation_denies_cow_without_live_runtime_custody(
+    tmp_path, monkeypatch, custody_failure,
+):
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    monkeypatch.setattr(
+        db, "_verify_current_cow_successor_source", lambda *_args, **_kwargs: None
+    )
+
+    def reject_custody(_conn, *_args):
+        raise ValueError(f"AC dev graph materialization {custody_failure} custody mismatch")
+
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        reject_custody,
+    )
+    try:
+        policy = db.classify_graph_activation_connection(conn)
+    finally:
+        conn.close()
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["active_graph_activation_allowed"] is False
+
+
+def test_graph_activation_denies_cow_with_dirty_or_mismatched_source(
+    tmp_path, monkeypatch,
+):
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+
+    def reject_source(*_args, **_kwargs):
+        raise ValueError("AC dev source checkout is dirty or mismatched")
+
+    monkeypatch.setattr(db, "_verify_current_cow_successor_source", reject_source)
+    try:
+        policy = db.classify_graph_activation_connection(conn)
+    finally:
+        conn.close()
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["active_graph_activation_allowed"] is False
+
+
+def test_graph_activation_denies_cross_project_cow_before_source_or_custody(
+    tmp_path, monkeypatch,
+):
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    foreign = json.loads(receipt["genesis"]["raw_json"])
+    foreign["project_id"] = "foreign-project"
+    receipt["genesis"] = {
+        "raw_json": json.dumps(
+            foreign, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ),
+        "sha256": db._world_genesis_hash(foreign),
+    }
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    monkeypatch.setattr(
+        db, "_verify_current_cow_successor_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-project world reached source authority")
+        ),
+    )
+    monkeypatch.setattr(
+        db, "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-project world reached runtime custody")
+        ),
+    )
+
+    try:
+        policy = db.classify_graph_activation_connection(conn)
+    finally:
+        conn.close()
+
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["active_graph_activation_allowed"] is False
+
+
+def test_graph_materialization_verification_exposes_public_component_diagnostics():
+    from agent.governance import db, graph_snapshot_store
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_graph_owner_for_preimage_test(db, conn, graph_snapshot_store.ensure_schema)
+    conn.execute("DROP INDEX idx_pending_scope_branch")
+    conn.execute("DROP INDEX idx_pending_scope_status")
+
+    with pytest.raises(db.DevRuntimeSchemaVerificationError) as rejected:
+        db.verify_graph_materialization_schema(conn)
+
+    details = rejected.value.details
+    assert details["owner_states"]["graph_snapshot_store"] == (
+        "pending_scope_index_predecessor"
+    )
+    assert set(details["planned_objects"]) == {
+        "idx_pending_scope_branch",
+        "idx_pending_scope_status",
+    }
+    assert details["component_diagnostics"]["graph_snapshot_store"] == {
+        "owner_state": "pending_scope_index_predecessor",
+        "planned_objects": [
+            "idx_pending_scope_branch",
+            "idx_pending_scope_status",
+        ],
+        "public_safe": True,
+        "status": "incompatible",
+    }
+    assert details["writes_performed"] is False
+    conn.close()
 
 
 @pytest.mark.parametrize("row_factory", [None, sqlite3.Row])
@@ -1374,7 +2083,20 @@ def test_graph_materialization_admits_valid_cow_without_parallel_runtime_invento
     monkeypatch.setattr(
         db,
         "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {
+            "runtime_plane": "dev",
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "host": "127.0.0.1",
+            "port": 40008,
+            "pid": os.getpid(),
+            "database_device": Path(
+                _conn.execute("PRAGMA database_list").fetchone()[2]
+            ).stat().st_dev,
+            "database_inode": Path(
+                _conn.execute("PRAGMA database_list").fetchone()[2]
+            ).stat().st_ino,
+        },
     )
     monkeypatch.setattr(
         db,
@@ -1402,7 +2124,7 @@ def test_graph_materialization_rejects_unverified_cow_before_write(
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
         db, "_require_ac_dev_graph_materialization_runtime_custody",
-        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
     )
     monkeypatch.setattr(
         db, "canonical_ac_database_identity",
@@ -2102,26 +2824,66 @@ def test_cow_bootstrap_process_custody_accepts_exact_historical_observation(tmp_
     )
 
 
-@pytest.mark.parametrize("drift", [None, "dirty", "non_descendant", "cli_hash"])
-def test_current_cow_source_requires_clean_strict_same_root_descendant(
-    tmp_path, monkeypatch, drift,
-):
+def _current_cow_historical_tip_fixture(tmp_path, monkeypatch):
     from agent.governance import db
 
-    source_root, anchor_commit = _dev_source_repo(tmp_path)
-    subprocess.run(["git", "branch", "-M", "codex/ac-dev"], cwd=source_root, check=True)
-    current_commit = _advance_dev_source(source_root, "descendant-one")
-    current_commit = _advance_dev_source(source_root, "descendant-two")
-    cli_source = source_root / "agent" / "cli.py"
-    source_sha = "sha256:" + hashlib.sha256(cli_source.read_bytes()).hexdigest()
+    source_repository = tmp_path / "source-repository"
+    source_repository.mkdir()
+    source_root, _anchor_commit = _dev_source_repo(source_repository)
+    server_source = source_root / "agent" / "governance" / "server.py"
+    database_source = source_root / "agent" / "governance" / "db.py"
+    server_source.parent.mkdir(parents=True)
+    server_source.write_text("# canonical server source\n", encoding="utf-8")
+    database_source.write_text("# canonical database source\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py", "agent/governance/db.py"],
+        cwd=source_root, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "--amend", "--no-edit"], cwd=source_root,
+        check=True, capture_output=True,
+    )
+    anchor_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    cli_sha = "sha256:" + hashlib.sha256(
+        (source_root / "agent" / "cli.py").read_bytes()
+    ).hexdigest()
     anchor = {
         "root": str(source_root.resolve()), "branch": "codex/ac-dev",
-        "commit": anchor_commit, "source_sha256": "sha256:" + "6" * 64,
+        "commit": anchor_commit, "source_sha256": cli_sha,
     }
-    current = {
+    historical_commit = _advance_dev_source(source_root, "completed-source-tip")
+    historical = {
         "root": str(source_root.resolve()), "branch": "codex/ac-dev",
-        "commit": current_commit, "source_sha256": source_sha,
+        "commit": historical_commit, "source_sha256": cli_sha,
     }
+    current = _defer_completed_source_and_open_clean_successor(
+        tmp_path, {**historical, "tree": "", "dirty": ""},
+    )
+    monkeypatch.setattr(
+        db, "__file__", str(Path(current["root"]) / "agent" / "governance" / "db.py")
+    )
+
+    def loaded_runtime_identity(current_commit):
+        loaded_root = Path(db.__file__).resolve(strict=True).parents[2]
+        server_path = loaded_root / "agent" / "governance" / "server.py"
+        server_sha = "sha256:" + hashlib.sha256(server_path.read_bytes()).hexdigest()
+        return {
+            "loaded_pid": os.getpid(),
+            "loaded_commit": current_commit,
+            "worktree_head_version": current_commit,
+            "loaded_source_path": str(server_path),
+            "loaded_source_sha256": server_sha,
+            "worktree_source_sha256": server_sha,
+            "runtime_stale": False,
+            "runtime_stale_reasons": [],
+        }
+
+    monkeypatch.setattr(
+        db, "_current_dev_loaded_runtime_identity", loaded_runtime_identity,
+    )
     storage = tmp_path / "dev-storage"
     adoption_dir = storage / "archive" / "canonical-legacy-postimage-adoption"
     adoption_dir.mkdir(parents=True)
@@ -2139,56 +2901,161 @@ def test_current_cow_source_requires_clean_strict_same_root_descendant(
     }}}
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
-    if drift == "non_descendant":
-        unrelated = subprocess.run(
-            ["git", "commit-tree", "HEAD^{tree}", "-m", "unrelated"],
-            cwd=source_root, capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        anchor["commit"] = unrelated
-        adoption_payload["candidate_source_identity"] = anchor
-        adoption_raw = json.dumps(
-            adoption_payload, sort_keys=True, separators=(",", ":")
-        ).encode()
-        adoption.unlink()
-        adoption = adoption_dir / (
-            f"adoption.{hashlib.sha256(adoption_raw).hexdigest()}.json"
-        )
-        adoption.write_bytes(adoption_raw)
-        receipt["history"]["adoption"] = {
-            "path": str(adoption),
-            "sha256": "sha256:" + hashlib.sha256(adoption_raw).hexdigest(),
-        }
     conn.executemany("INSERT INTO schema_meta VALUES (?,?)", [
-        ("governance_world_source_tip_json", json.dumps(current)),
-        ("governance_world_source_tip_sha256", db._world_source_tip_hash(current)),
+        ("governance_world_source_tip_json", json.dumps(historical)),
+        ("governance_world_source_tip_sha256", db._world_source_tip_hash(historical)),
         ("governance_world_source_tip_revision", "3"),
     ])
     conn.commit()
-    if drift == "dirty":
-        (source_root / "untracked-drift.txt").write_text("dirty\n")
-    if drift == "cli_hash":
-        current["source_sha256"] = "sha256:" + "7" * 64
-        conn.execute(
-            "UPDATE schema_meta SET value=? WHERE key='governance_world_source_tip_json'",
-            (json.dumps(current),),
-        )
-        conn.execute(
-            "UPDATE schema_meta SET value=? WHERE key='governance_world_source_tip_sha256'",
-            (db._world_source_tip_hash(current),),
-        )
-        conn.commit()
-    if drift is None:
-        db._verify_current_cow_successor_source(conn, storage, receipt)
-    else:
-        with pytest.raises(ValueError):
-            db._verify_current_cow_successor_source(conn, storage, receipt)
+    stable = tmp_path / "stable-volume"
+    stable.mkdir()
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(storage))
+    monkeypatch.setattr(
+        db, "verified_stable_database_binding",
+        lambda: {"shared_volume_path": str(stable)},
+    )
+    return db, conn, storage, receipt, historical, current
+
+
+def test_current_dev_loaded_runtime_identity_requires_preloaded_server_without_import(
+    monkeypatch,
+):
+    from agent.governance import db
+
+    monkeypatch.delitem(sys.modules, "agent.governance.server", raising=False)
+
+    with pytest.raises(ValueError, match="loaded runtime identity is unavailable"):
+        db._current_dev_loaded_runtime_identity("a" * 40)
+
+    assert "agent.governance.server" not in sys.modules
+
+
+def test_current_cow_source_accepts_clean_canonical_descendant_of_historical_tip(
+    tmp_path, monkeypatch,
+):
+    db, conn, storage, receipt, historical, current = (
+        _current_cow_historical_tip_fixture(tmp_path, monkeypatch)
+    )
+    before = conn.iterdump()
+    before = tuple(before)
+    old_root = Path(historical["root"])
+    assert subprocess.run(
+        ["git", "branch", "--show-current"], cwd=old_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == "codex/deferred-completed"
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=old_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == "M agent/cli.py"
+
+    db._verify_current_cow_successor_source(conn, storage, receipt)
+
+    assert tuple(conn.iterdump()) == before
+    assert json.loads(conn.execute(
+        "SELECT value FROM schema_meta "
+        "WHERE key='governance_world_source_tip_json'"
+    ).fetchone()[0]) == historical
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=current["root"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == current["commit"]
     conn.close()
 
 
-def test_real_cow_clone_classifies_with_dev_plane_and_distinct_source_producers(
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "dirty", "non_descendant", "current_source_hash", "historical_source_hash",
+        "stable_branch", "foreign_object_store", "loaded_path", "loaded_runtime",
+    ),
+)
+def test_current_cow_source_rejects_untrusted_live_descendant_zero_write(
+    tmp_path, monkeypatch, drift,
+):
+    db, conn, storage, receipt, historical, current = (
+        _current_cow_historical_tip_fixture(tmp_path, monkeypatch)
+    )
+    current_root = Path(current["root"])
+    if drift == "dirty":
+        (current_root / "untracked-drift.txt").write_text("dirty\n")
+    elif drift == "non_descendant":
+        unrelated = subprocess.run(
+            ["git", "commit-tree", "HEAD^{tree}", "-m", "unrelated"],
+            cwd=current_root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", "refs/heads/codex/ac-dev", unrelated,
+             current["commit"]], cwd=current_root, check=True,
+        )
+    elif drift == "current_source_hash":
+        original = db._current_first_start_source
+
+        def mismatched_current(root):
+            return {**original(root), "cli_sha256": "sha256:" + "7" * 64}
+
+        monkeypatch.setattr(db, "_current_first_start_source", mismatched_current)
+    elif drift == "historical_source_hash":
+        historical["source_sha256"] = "sha256:" + "8" * 64
+        conn.execute(
+            "UPDATE schema_meta SET value=? WHERE key='governance_world_source_tip_json'",
+            (json.dumps(historical),),
+        )
+        conn.execute(
+            "UPDATE schema_meta SET value=? WHERE key='governance_world_source_tip_sha256'",
+            (db._world_source_tip_hash(historical),),
+        )
+        conn.commit()
+    elif drift == "stable_branch":
+        subprocess.run(
+            ["git", "branch", "-m", "codex/stable"], cwd=current_root,
+            check=True, capture_output=True,
+        )
+    elif drift == "foreign_object_store":
+        foreign = tmp_path / "foreign-source"
+        subprocess.run(
+            ["git", "clone", "--no-local", str(current_root), str(foreign)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-B", "codex/ac-dev", current["commit"]],
+            cwd=foreign, check=True, capture_output=True,
+        )
+        monkeypatch.setattr(
+            db, "__file__", str(foreign / "agent" / "governance" / "db.py")
+        )
+    elif drift == "loaded_path":
+        monkeypatch.setattr(
+            db, "__file__", str(current_root / "agent" / "governance" / "server.py")
+        )
+    else:
+        monkeypatch.setattr(
+            db, "_current_dev_loaded_runtime_identity",
+            lambda commit: {
+                "loaded_pid": os.getpid(),
+                "loaded_commit": historical["commit"],
+                "worktree_head_version": commit,
+                "loaded_source_path": str(
+                    current_root / "agent" / "governance" / "server.py"
+                ),
+                "loaded_source_sha256": "sha256:" + "9" * 64,
+                "worktree_source_sha256": "sha256:" + "9" * 64,
+                "runtime_stale": True,
+                "runtime_stale_reasons": ["worktree_head_moved"],
+            },
+        )
+    before = tuple(conn.iterdump())
+
+    with pytest.raises(ValueError):
+        db._verify_current_cow_successor_source(conn, storage, receipt)
+
+    assert tuple(conn.iterdump()) == before
+    conn.close()
+
+
+def test_real_cow_clone_without_live_custody_remains_denied(
     tmp_path, monkeypatch,
 ):
-    """Replay the full receipt/history and live schema path without gate mocks."""
+    """A real COW/source chain alone cannot replace listener/writer custody."""
     from agent import runtime_plane
     from agent.governance import db
 
@@ -2259,8 +3126,8 @@ def test_real_cow_clone_classifies_with_dev_plane_and_distinct_source_producers(
         policy = db.classify_graph_activation_connection(connection)
     finally:
         connection.close()
-    assert policy["runtime_plane"] == "dev"
-    assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["active_graph_activation_allowed"] is False
 
 
 def _real_cow_successor_cli_fixture(
@@ -3685,6 +4552,101 @@ def test_cow_generation_phase_selector_is_closed_for_first_and_completed(
         root, linked_v3_receipt=linked, source_identity=completed_source,
         stable_binding=stable,
     ) is db._DevCowGenerationPhase.COMPLETED_GENERATION
+
+
+@pytest.mark.parametrize("semantic_overlay", [False, True])
+def test_cow_completed_generation_accepts_exact_graph_overlay_read_only(
+    tmp_path, monkeypatch, semantic_overlay,
+):
+    from agent.governance import db, reconcile_semantic_enrichment as semantic
+
+    root, database, linked, source, _process, receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    completed_source = _advance_cow_to_completed_generation(
+        database, root, source,
+    )
+    connection = sqlite3.connect(database)
+    _install_all_graph_owners_for_inventory_test(db, connection)
+    if semantic_overlay:
+        db.execute_graph_schema_sql(
+            connection, semantic.SEMANTIC_STATE_SCHEMA_SQL,
+        )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    changes_before = connection.total_changes
+    authority, protected = db._completed_generation_schema_projections(connection)
+    assert connection.total_changes == changes_before
+    assert authority == db.authority_projection_schema_inventory()
+    assert len(authority["inventory"]) == db.AC_AUTHORITY_SCHEMA_INVENTORY_COUNT
+    assert protected == receipt["successor"]["protected_inventory"]
+    assert db.classify_semantic_state_schema(connection)["owner_state"] == (
+        "exact" if semantic_overlay else "absent"
+    )
+    canonical_graph_rows = {
+        (kind, name, table, db._backlog_read_normalized_sql(sql))
+        for _owner, _ensure_schema, inventory in db._graph_schema_owner_registry()
+        for kind, name, table, sql in inventory
+    }
+    canonical_authority_rows = {
+        tuple(row) for row in db.authority_projection_schema_inventory()["inventory"]
+    }
+    assert len(canonical_graph_rows) == 104
+    assert len(canonical_graph_rows & canonical_authority_rows) == 86
+    assert len(canonical_graph_rows - canonical_authority_rows) == 18
+    logical_before = db._sqlite_logical_projection(connection)
+    connection.close()
+    bytes_before = database.read_bytes()
+    stable = db.verified_stable_database_binding()
+
+    assert db.validate_dev_cow_completed_generation_projection(
+        root, linked_v3_receipt=linked, source_identity=completed_source,
+        stable_binding=stable,
+    ) == receipt
+    assert db._select_dev_cow_generation_phase(
+        root, linked_v3_receipt=linked, source_identity=completed_source,
+        stable_binding=stable,
+    ) is db._DevCowGenerationPhase.COMPLETED_GENERATION
+
+    assert database.read_bytes() == bytes_before
+    connection = sqlite3.connect(database)
+    try:
+        assert db._sqlite_logical_projection(connection) == logical_before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("drift", ["partial", "altered", "unknown"])
+def test_completed_generation_graph_overlay_rejects_drift_zero_write(drift):
+    from agent.governance import db
+
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    db._ensure_schema(connection)
+    db.admit_missing_backlog_read_schema(connection)
+    _install_all_graph_owners_for_inventory_test(db, connection)
+    if drift == "partial":
+        connection.execute("DROP INDEX idx_graph_asset_projection_path")
+    elif drift == "altered":
+        connection.execute("DROP INDEX idx_graph_asset_projection_path")
+        connection.execute(
+            "CREATE INDEX idx_graph_asset_projection_path "
+            "ON graph_asset_projection(project_id, snapshot_id)"
+        )
+    else:
+        connection.execute(
+            "CREATE TABLE graph_unknown_completed_generation(value TEXT)"
+        )
+    connection.commit()
+    inventory_before = db._graph_materialization_inventory(connection)
+    changes_before = connection.total_changes
+
+    with pytest.raises(ValueError, match="graph"):
+        db._completed_generation_schema_projections(connection)
+
+    assert connection.total_changes == changes_before
+    assert db._graph_materialization_inventory(connection) == inventory_before
+    connection.close()
 
 
 def test_cow_completed_phase_selector_builds_source_reference_outside_dev_plane(
@@ -5366,18 +6328,19 @@ def test_source_reference_builder_restores_runtime_plane_after_failure(monkeypat
     assert os.environ[db.RUNTIME_PLANE_ENV] == db.DEV_RUNTIME_PLANE
 
 
-def test_dev_schema_inventory_subtracts_only_five_sql_exact_graph_owners_zero_write():
-    from governance import db
+def test_dev_schema_inventory_subtracts_exact_graph_and_semantic_owners_zero_write():
+    from governance import db, reconcile_semantic_enrichment as semantic
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     db._ensure_schema(conn)
     db.admit_missing_backlog_read_schema(conn)
     _install_all_graph_owners_for_inventory_test(db, conn)
+    db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
     conn.commit()
     registry_names = {
         row[1]
-        for _owner, canonical in db._graph_schema_owner_registry()
+        for _owner, _ensure_schema, canonical in db._graph_schema_owner_registry()
         for row in canonical
     }
     assert {
@@ -5411,7 +6374,10 @@ def test_dev_schema_inventory_rejects_nonexact_graph_owner_without_write(drift):
     db.admit_missing_backlog_read_schema(conn)
     _install_all_graph_owners_for_inventory_test(db, conn)
     if drift == "owner_absent":
-        owner_inventory = dict(db._graph_schema_owner_registry())["graph_events"]
+        owner_inventory = {
+            owner: inventory
+            for owner, _ensure_schema, inventory in db._graph_schema_owner_registry()
+        }["graph_events"]
         for kind, name, _table, _sql in owner_inventory:
             if kind in {"view", "trigger", "index"} and not name.startswith(
                 "sqlite_autoindex_"

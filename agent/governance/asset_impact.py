@@ -133,7 +133,18 @@ CREATE INDEX IF NOT EXISTS idx_graph_asset_drift_proposals_asset
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA_SQL)
+    from . import db
+
+    if (
+        db.dev_runtime_verify_only()
+        and not db.graph_materialization_admission_active(conn)
+    ):
+        db.verify_graph_materialization_schema(conn)
+        return
+    if db.graph_materialization_admission_active(conn):
+        db.execute_graph_schema_sql(conn, SCHEMA_SQL)
+    else:
+        conn.executescript(SCHEMA_SQL)
 
 
 def _utc_iso() -> str:

@@ -8216,7 +8216,7 @@ class ToolDispatcher:
             body = {
                 key: value
                 for key, value in args.items()
-                if key != "project_id" and value is not None
+                if value is not None
             }
             return _copy_safe_observer_route_context_issue_result(
                 self._api(
@@ -8228,10 +8228,16 @@ class ToolDispatcher:
 
         if name == "observer_route_context_renew":
             pid = args["project_id"]
+            allowed_keys = {
+                "project_id", "caller_role", "observer_session_id", "route_token_ref",
+                "observer_route_token_ref", "backlog_id", "bug_id", "task_id",
+                "contract_execution_id", "allowed_actions", "target_files", "owned_files",
+                "evidence_refs", "ttl_hours", "renew_within_seconds",
+            }
             body = {
                 key: value
                 for key, value in args.items()
-                if key != "project_id" and value is not None
+                if key in allowed_keys and value is not None
             }
             body.setdefault("caller_role", "observer")
             return self._api("POST", f"/api/projects/{pid}/observer/route-context/renew", body)

@@ -5654,12 +5654,17 @@ def test_mcp_observer_route_context_issue_forwards_token_request():
         },
     )
 
-    assert result == {"ok": True, "route_token_ref": "rtok-test"}
+    assert result == {
+        "ok": True,
+        "route_token_ref": "rtok-test",
+        "raw_route_token_exposed": False,
+    }
     assert calls == [
         (
             "POST",
             "/api/projects/aming-claw/observer/route-context/issue",
             {
+                "project_id": "aming-claw",
                 "caller_role": "observer",
                 "backlog_id": "BUG-ROUTE",
                 "task_id": "BUG-ROUTE",
@@ -5670,6 +5675,99 @@ def test_mcp_observer_route_context_issue_forwards_token_request():
             },
         )
     ]
+
+
+def test_mcp_observer_route_context_renew_bound_project_mismatch_is_zero_http(
+    monkeypatch,
+):
+    http_calls = []
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "content-sys")
+    monkeypatch.setattr(
+        governance_mcp_server.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: http_calls.append((args, kwargs)),
+    )
+
+    result = governance_mcp_server._dispatch_tool(
+        "observer_route_context_renew",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-DIRECT-RENEW-ADAPTER",
+            "task_id": "cex-direct-main-renew-adapter",
+            "route_token_ref": "rtok-direct-renew-adapter",
+            "observer_session_id": "obs-direct-renew-adapter",
+        },
+    )
+
+    assert result == {
+        "ok": False,
+        "error": "mcp_world_project_scope_mismatch",
+        "writes_performed": False,
+        "pass_synthesized": False,
+    }
+    assert http_calls == []
+
+
+def test_mcp_observer_route_context_renew_stable_transport_keeps_safe_body(
+    monkeypatch,
+):
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ok":true,"raw_route_token_exposed":false}'
+
+    def fake_urlopen(request, *, timeout):
+        calls.append(
+            (
+                request.full_url,
+                json.loads(request.data.decode()),
+                timeout,
+            )
+        )
+        return Response()
+
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "content-sys")
+    monkeypatch.setenv("GOVERNANCE_URL", "http://localhost:40000")
+    monkeypatch.setattr(
+        governance_mcp_server.urllib.request,
+        "urlopen",
+        fake_urlopen,
+    )
+    result = governance_mcp_server._dispatch_tool(
+        "observer_route_context_renew",
+        {
+            "project_id": "content-sys",
+            "caller_role": "observer",
+            "backlog_id": "CS-RENEW-ADAPTER",
+            "task_id": "content-task-renew-adapter",
+            "route_token_ref": "rtok-content-renew-adapter",
+            "observer_session_id": "obs-content-renew-adapter",
+        },
+    )
+
+    assert result == {"ok": True, "raw_route_token_exposed": False}
+    assert calls == [
+        (
+            "http://localhost:40000/api/projects/content-sys/observer/route-context/renew",
+            {
+                "project_id": "content-sys",
+                "caller_role": "observer",
+                "backlog_id": "CS-RENEW-ADAPTER",
+                "task_id": "content-task-renew-adapter",
+                "route_token_ref": "rtok-content-renew-adapter",
+                "observer_session_id": "obs-content-renew-adapter",
+            },
+            10,
+        )
+    ]
+    assert "route_token" not in calls[0][1]
 
 
 def test_mcp_backlog_audit_archive_forwards_payload():
