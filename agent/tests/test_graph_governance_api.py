@@ -13911,6 +13911,7 @@ def conn(tmp_path, monkeypatch):
             "runtime_plane": "stable",
             "active_graph_activation_allowed": True,
             "classification_reason": "test_verified_stable_connection",
+            "project_id": PID,
         },
     )
     monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(c))
@@ -203601,6 +203602,106 @@ def test_http_new_project_init_to_first_direct_onboard(
         assert tuple(conn.iterdump()) == before
     finally:
         conn.close()
+
+
+def test_http_new_stable_external_project_bootstrap_to_first_direct_lane(
+    isolated_project_init_http, tmp_path, monkeypatch,
+):
+    """Real new-project init -> activated bootstrap -> first Direct guide.
+
+    The HTTP bootstrap's production initializer performs registration; no DB,
+    graph, registry entry or activation policy is supplied by this fixture.
+    """
+    from agent.tests.test_governance_db import _install_fixed_stable_boundary
+
+    _unused_root, post = isolated_project_init_http
+    shared = _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    root = shared / "codex-tasks" / "state" / "governance"
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(shared))
+    for module in (governance_db, server.project_service, server.audit_service):
+        monkeypatch.setattr(module, "_governance_root", lambda: root)
+    completed = []
+    for suffix in ("one", "two"):
+        project_id = "stable-lifecycle-" + suffix
+        workspace = tmp_path / project_id
+        workspace.mkdir()
+        (workspace / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+        for args in (
+            ["init", "-b", "main"], ["add", "app.py"],
+            ["-c", "user.name=Lifecycle Test", "-c", "user.email=lifecycle@example.invalid",
+             "commit", "-m", "Isolated lifecycle fixture"],
+        ):
+            subprocess.run(["git", "-C", str(workspace), *args], check=True, capture_output=True)
+        head = subprocess.check_output(
+            ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True,
+        ).strip()
+        database = root / project_id / "governance.db"
+        assert not database.exists()
+        assert project_id not in server.project_service._load_projects()["projects"]
+        status, bootstrapped = post("/api/project/bootstrap", {
+            "project_id": project_id, "workspace_path": str(workspace),
+        })
+        assert status == 200, bootstrapped
+        assert bootstrapped["activation"]["snapshot_id"] == bootstrapped["snapshot_id"]
+        assert bootstrapped["activation"]["commit_sha"] == head
+        assert bootstrapped["route_token_gate"]["action"] == "project_bootstrap"
+        assert bootstrapped["route_token_gate"]["server_minted"] is True
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        try:
+            active = store.get_active_graph_snapshot(connection, project_id)
+            assert active["snapshot_id"] == bootstrapped["snapshot_id"]
+            assert active["commit_sha"] == head
+            events = store.list_graph_ref_events(connection, project_id, ref_name="active")
+            assert len(events) == 1
+            assert events[0]["new_snapshot_id"] == active["snapshot_id"]
+            assert events[0]["new_commit"] == head
+            assert connection.execute(
+                "SELECT COUNT(*) FROM task_timeline_events WHERE project_id=? "
+                "AND event_type='route_token_gate.project_bootstrap' AND status='accepted'",
+                (project_id,),
+            ).fetchone()[0] == 1
+            assert connection.execute(
+                "SELECT COUNT(*) FROM contract_runtime_executions"
+            ).fetchone()[0] == 0
+        finally:
+            connection.close()
+
+        backlog_id = "FIRST-DIRECT-" + suffix.upper()
+        status, backlog = post(f"/api/backlog/{project_id}/{backlog_id}", {
+            "title": "First normal Direct", "status": "OPEN", "mf_type": "chain_rescue",
+            "target_files": ["app.py"], "test_files": [],
+        })
+        assert status == 200, backlog
+        status, first = post(f"/api/projects/{project_id}/onboard-route-guide", {
+            "backlog_id": backlog_id, "role": "observer",
+            "work_type": "operator_supervised_direct_main",
+            "target_project_root": str(workspace), "target_ref": "refs/heads/main",
+            "target_head_commit": head, "response_view": "compact",
+        })
+        assert status == 200, first
+        assert first["selected_work_type"] == "operator_supervised_direct_main"
+        assert first["next_legal_action"]["id"] == "operator_supervised_direct_main_route_issue"
+        assert first["next_legal_action"]["action_input_ready"] is True
+        completed.append((project_id, database, bootstrapped["snapshot_id"]))
+
+    # Both real project DBs have their own active graph. Same stable world is
+    # not authority to change the other project through the wrong connection.
+    for project_id, database, snapshot_id in completed:
+        other_id = next(pid for pid, _path, _sid in completed if pid != project_id)
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        try:
+            before = tuple(connection.iterdump())
+            changes = connection.total_changes
+            with pytest.raises(ValueError, match="classified project"):
+                store.activate_graph_snapshot(connection, other_id, snapshot_id)
+            assert connection.total_changes == changes
+            assert tuple(connection.iterdump()) == before
+            assert store.get_active_graph_snapshot(connection, other_id) is None
+            assert store.get_active_graph_snapshot(connection, project_id)["snapshot_id"] == snapshot_id
+        finally:
+            connection.close()
 
 
 def test_http_failed_project_init_does_not_publish_success(isolated_project_init_http):

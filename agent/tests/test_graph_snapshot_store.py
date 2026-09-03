@@ -44,6 +44,7 @@ def _stable_graph_activation_connection(monkeypatch):
             "runtime_plane": "stable",
             "active_graph_activation_allowed": True,
             "classification_reason": "test_verified_stable_connection",
+            "project_id": PID,
         },
     )
 
@@ -264,6 +265,29 @@ def test_active_graph_effects_reject_missing_or_unknown_database_world_before_re
     assert conn.execute(
         "SELECT COUNT(*) FROM graph_ref_events WHERE project_id = ?", (PID,)
     ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("bound_project", [None, "other-project"])
+def test_stable_activation_requires_exact_bound_project_before_all_effects(
+    conn, monkeypatch, bound_project,
+):
+    store.ensure_schema(conn)
+    candidate = store.create_graph_snapshot(
+        conn, PID, snapshot_id="bound-project-candidate", commit_sha="a" * 40,
+        snapshot_kind="full",
+    )
+    conn.commit()
+    monkeypatch.setattr(db, "classify_graph_activation_connection", lambda _conn: {
+        "runtime_plane": "stable", "active_graph_activation_allowed": True,
+        "project_id": bound_project,
+    })
+    before = tuple(conn.iterdump())
+    changes = conn.total_changes
+    with pytest.raises(ValueError, match="classified project"):
+        store.activate_graph_snapshot(conn, PID, candidate["snapshot_id"])
+    assert conn.total_changes == changes
+    assert tuple(conn.iterdump()) == before
+    assert store.get_graph_snapshot(conn, PID, candidate["snapshot_id"])["status"] == "candidate"
 
 
 def _generation(

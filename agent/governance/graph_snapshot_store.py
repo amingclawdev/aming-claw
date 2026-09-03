@@ -543,7 +543,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 def _graph_activation_policy_for_connection(
     conn: sqlite3.Connection,
 ) -> dict[str, object]:
-    """Bind active-graph effects to the opened DB's physical world identity.
+    """Bind active-graph effects to the classified main path's world and project.
 
     No caller-supplied plane, outer HTTP guard, or ambient environment can
     promote this connection.  This is the final pre-effect fence for graph
@@ -586,6 +586,10 @@ def _require_active_graph_activation_for_connection(
     ):
         raise ValueError(
             "active graph activation is forbidden outside the classified AC-dev world"
+        )
+    if not policy.get("project_id") or str(project_id or "") != policy["project_id"]:
+        raise ValueError(
+            "active graph activation is forbidden outside the classified project"
         )
     return policy
 

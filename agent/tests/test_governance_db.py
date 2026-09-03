@@ -1693,10 +1693,10 @@ def test_stable_database_binding_revalidates_before_a_dev_effect(tmp_path, repla
     assert not forbidden.exists()
 
 
-def test_graph_activation_connection_classification_binds_opened_db_not_plane_env(
+def test_graph_activation_connection_classification_binds_main_path_not_plane_env(
     tmp_path, monkeypatch,
 ):
-    """Only the exact opened stable DB may activate; a real dev DB remains denied."""
+    """Require the canonical stable main path; a real dev DB remains denied."""
     from governance import db
 
     stable_binding = db.verified_stable_database_binding()
@@ -1744,6 +1744,114 @@ def test_graph_activation_connection_classification_binds_opened_db_not_plane_en
         unknown_conn.close()
     assert unknown_policy["runtime_plane"] == "unknown"
     assert unknown_policy["active_graph_activation_allowed"] is False
+
+
+def _initialized_stable_external_project(monkeypatch, project_id="external-one"):
+    """Use the real initializer inside the fixed private stable boundary."""
+    from agent.governance import db, project_service
+
+    binding = db.verified_stable_database_binding()
+    shared = Path(binding["shared_volume_path"])
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(shared))
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    project_service.init_project(project_id)
+    return shared / "codex-tasks" / "state" / "governance", project_id
+
+
+def test_stable_registered_external_activation_needs_no_active_graph_or_public_safe(monkeypatch):
+    from agent.governance import db
+
+    root, project_id = _initialized_stable_external_project(monkeypatch)
+    entry = json.loads((root / "projects.json").read_text())["projects"][project_id]
+    assert "active_snapshot_id" not in entry
+    assert "project_config" not in entry
+    with sqlite3.connect(root / project_id / "governance.db") as connection:
+        before = connection.total_changes
+        policy = db.classify_graph_activation_connection(connection)
+        assert policy["runtime_plane"] == "stable"
+        assert policy["classification_reason"] == "verified_stable_registered_external_project"
+        assert policy["project_id"] == project_id
+        assert policy["active_graph_activation_allowed"] is True
+        assert connection.total_changes == before
+
+
+@pytest.mark.parametrize("fault", [
+    "unregistered", "key_mismatch", "not_initialized", "inactive",
+    "noncanonical", "symlink_escape", "registry_symlink",
+    "database_replaced_during_classification", "registry_replaced_during_check",
+])
+def test_stable_external_activation_rejects_invalid_registration_or_file_identity(
+    monkeypatch, tmp_path, fault,
+):
+    from agent.governance import db, graph_snapshot_store
+
+    root, project_id = _initialized_stable_external_project(monkeypatch)
+    database = root / project_id / "governance.db"
+    prepared = sqlite3.connect(database)
+    prepared.row_factory = sqlite3.Row
+    try:
+        candidate = graph_snapshot_store.create_graph_snapshot(
+            prepared, project_id, snapshot_id="external-candidate", commit_sha="a" * 40,
+            snapshot_kind="full",
+        )
+        prepared.commit()
+    finally:
+        prepared.close()
+    registry_path = root / "projects.json"
+    registry = json.loads(registry_path.read_text())
+    if fault == "unregistered":
+        registry["projects"].clear()
+    elif fault == "key_mismatch":
+        registry["projects"][project_id]["project_id"] = "external-two"
+    elif fault == "not_initialized":
+        registry["projects"][project_id]["initialized"] = False
+    elif fault == "inactive":
+        registry["projects"][project_id]["status"] = "archived"
+    registry_path.write_text(json.dumps(registry))
+    if fault in {"noncanonical", "symlink_escape"}:
+        copied = tmp_path / "outside.db"
+        shutil.copy2(database, copied)
+        if fault == "symlink_escape":
+            database.unlink()
+            database.symlink_to(copied)
+        else:
+            database = copied
+    elif fault == "registry_symlink":
+        copied = tmp_path / "outside-registry.json"
+        shutil.copy2(registry_path, copied)
+        registry_path.unlink()
+        registry_path.symlink_to(copied)
+
+    # Replace after the first pathname/inode observation inside classification.
+    # This does not test replacement between connection open and classification,
+    # native opened-file identity, or historical inode pinning.
+    original_revalidate = db._revalidate_stable_database_binding
+    def replace_during_check(binding):
+        original_revalidate(binding)
+        target = database if fault == "database_replaced_during_classification" else registry_path
+        replacement = target.with_name("replacement-" + target.name)
+        shutil.copy2(target, replacement)
+        os.replace(replacement, target)
+
+    if fault in {"database_replaced_during_classification", "registry_replaced_during_check"}:
+        monkeypatch.setattr(db, "_revalidate_stable_database_binding", replace_during_check)
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        before = connection.total_changes
+        before_rows = tuple(connection.iterdump())
+        policy = db.classify_graph_activation_connection(connection)
+        assert policy["runtime_plane"] == "unknown", policy
+        assert policy["active_graph_activation_allowed"] is False
+        with pytest.raises(ValueError, match="forbidden"):
+            graph_snapshot_store.activate_graph_snapshot(
+                connection, project_id, candidate["snapshot_id"],
+                schema_ready=True, auto_rebuild_projection=False,
+            )
+        assert connection.total_changes == before
+        assert tuple(connection.iterdump()) == before_rows
+    finally:
+        connection.close()
 
 
 def _cow_graph_identity_fixture(tmp_path, monkeypatch):

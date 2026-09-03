@@ -337,7 +337,12 @@ def _revalidate_stable_database_binding(binding: Mapping[str, object]) -> None:
 def _connection_main_database_identity(
     conn: sqlite3.Connection,
 ) -> tuple[Path, os.stat_result] | None:
-    """Read the exact physical main SQLite file already opened by ``conn``."""
+    """Observe the current canonical file at ``conn``'s main-database path.
+
+    SQLite reports a pathname, not the native identity of its opened file.
+    Replacement after connection open but before this observation is outside
+    this check; callers can recheck identity over the classification interval.
+    """
     try:
         rows = conn.execute("PRAGMA database_list").fetchall()
         main_paths = [
@@ -519,9 +524,11 @@ def classify_graph_activation_connection(
 ) -> dict[str, object]:
     """Classify an opened graph DB without accepting caller/environment plane claims.
 
-    Active graph truth is allowed only when this *opened connection* is the
-    exact live stable database or the exact live AC-dev COW successor.  Dev
-    activation additionally requires current listener/writer custody; a
+    Active graph truth requires the connection's main-database path to pass
+    classification-time canonical-file checks for a stable project database
+    or the live AC-dev COW successor.  These checks do not identify a native
+    opened file replaced before classification begins.  Dev activation
+    additionally requires current listener/writer custody; a
     genesis-only connection remains candidate-only.  Everything else is
     ``unknown`` and denied before a graph ref, event, or projection can be
     written.
@@ -552,8 +559,66 @@ def classify_graph_activation_connection(
                 return {
                     **graph_activation_policy("stable"),
                     "classification_reason": "verified_stable_database_binding",
+                    "world_id": AC_STABLE_WORLD_ID,
+                    "project_id": AC_PROJECT_ID,
                 }
-    except (KeyError, OSError, RuntimeError, ValueError, sqlite3.Error):
+
+        # Normal first bootstrap has already registered/initialized its project,
+        # but has neither an active graph nor persisted project configuration.
+        # Resolve that existing registration under the verified stable service's
+        # shared volume, never an ambient root or the retired dev reader.
+        governance_root = (
+            Path(str(binding["shared_volume_path"]))
+            / "codex-tasks" / "state" / "governance"
+        )
+        if database.name == "governance.db" and database.parent.parent == governance_root:
+            project_id = validate_project_id_syntax(database.parent.name, require_exact=True)
+            if project_id != AC_PROJECT_ID:
+                registry_path = governance_root / "projects.json"
+                identities = {
+                    path: _external_read_path_identity(path, kind=kind)
+                    for path, kind in (
+                        (governance_root, "project directory"),
+                        (database.parent, "project directory"),
+                        (registry_path, "project registry"),
+                    )
+                }
+                registry = json.loads(registry_path.read_text(encoding="utf-8"))
+                projects = registry.get("projects") if isinstance(registry, Mapping) else None
+                entry = projects.get(project_id) if isinstance(projects, Mapping) else None
+                if not (
+                    isinstance(entry, Mapping)
+                    and entry.get("project_id") == project_id
+                    and entry.get("initialized") is True
+                    and entry.get("status") == "active"
+                ):
+                    return _unknown_graph_activation_connection("stable_external_project_not_registered")
+                _revalidate_stable_database_binding(binding)
+                # Recheck the initial pathname/inode observation and canonical
+                # paths after registry/service validation. This checks the
+                # classification interval, not native opened-file identity or
+                # historical inode pinning.
+                after = _external_read_path_identity(database, kind="governance database")
+                if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                    return _unknown_graph_activation_connection("stable_external_database_identity_changed")
+                for path, expected in identities.items():
+                    actual = _external_read_path_identity(
+                        path,
+                        kind="project registry" if path == registry_path else "project directory",
+                    )
+                    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+                        return _unknown_graph_activation_connection("stable_external_registration_identity_changed")
+                    if path == registry_path and (
+                        actual.st_mtime_ns, actual.st_size
+                    ) != (expected.st_mtime_ns, expected.st_size):
+                        return _unknown_graph_activation_connection("stable_external_registration_identity_changed")
+                return {
+                    **graph_activation_policy("stable"),
+                    "classification_reason": "verified_stable_registered_external_project",
+                    "world_id": AC_STABLE_WORLD_ID,
+                    "project_id": project_id,
+                }
+    except (KeyError, OSError, RuntimeError, ValueError, UnicodeError, sqlite3.Error):
         # A stable verification failure cannot be rescued by a claimed plane.
         pass
 
