@@ -19302,7 +19302,7 @@ def test_current_full_build_claim_is_committed_before_builder_entry(
     monkeypatch.setattr(
         server,
         "_require_current_full_reconcile_auth",
-        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+        lambda *_args, **_kwargs: {"role": "observer", "role_source": "operator_token"},
     )
     builder_observations: list[dict[str, Any]] = []
 
@@ -210398,6 +210398,325 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_pro
     assert graph_query["ok"] is True
     assert graph_query["graph_query_identity"]["snapshot_id"] == snapshot_id
     assert graph_query["graph_query_identity"]["commit_sha"] == case["commit"]
+
+
+def test_dev_direct_fresh_bind_materializes_missing_exact_active_provenance(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-DIRECT-MISSING-ACTIVE-PROVENANCE",
+    )
+    conn.execute(
+        "DELETE FROM observer_sessions WHERE session_id=?",
+        (case["session_id"],),
+    )
+    conn.commit()
+    register_status, registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body={
+                "project_id": case["project_id"],
+                "route_token_ref": case["route_token_ref"],
+                "backlog_id": case["guide"]["backlog_id"],
+                "task_id": case["execution_id"],
+                "cex_id": case["execution_id"],
+            },
+        )
+    )
+    assert register_status == 201
+    case = {**case, "session_id": registered["observer_session_id"]}
+    exact_policy = {
+        "runtime_plane": "dev",
+        "active_graph_activation_allowed": True,
+        "classification_reason": "verified_dev_cow_successor_receipt_history",
+        "world_id": "ac-dev",
+        "project_id": "aming-claw",
+        "port": 40008,
+        "cow_successor_verified": True,
+        "source_checkout_verified": True,
+        "live_runtime_custody_verified": True,
+    }
+    monkeypatch.setattr(
+        governance_db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: dict(exact_policy),
+    )
+    monkeypatch.setattr(
+        server,
+        "classify_graph_activation_connection",
+        governance_db.classify_graph_activation_connection,
+    )
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: case["commit"])
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: True)
+    monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: [])
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: case["root"],
+    )
+    governance_db.admit_ac_dev_graph_materialization_schema(
+        conn, project_id=case["project_id"]
+    )
+    snapshot_id = server._current_full_deterministic_snapshot_id(case["commit"])
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        project_id=case["project_id"],
+        commit_sha=case["commit"],
+    )
+    request_body = {
+        "backlog_id": case["guide"]["backlog_id"],
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+        "route_token_ref": case["route_token_ref"],
+        "observer_session_id": case["session_id"],
+        "task_id": case["execution_id"],
+        "target_project_root": str(case["root"]),
+        "target_head_commit": case["commit"],
+        "target_ref": server.AC_DEV_BRANCH,
+    }
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+
+    assert guide["dev_local_graph_bootstrap"]["state"] == (
+        "exact_active_provenance_materialization_required"
+    )
+    assert guide["dev_local_graph_bootstrap"]["graph_query_ready"] is False
+    assert guide["dev_local_graph_bootstrap"][
+        "current_full_reconcile_ready"
+    ] is True
+    action = guide["next_legal_action"]
+    assert action["mcp_tool"] == "graph_current_full_reconcile"
+    assert action["copy_safe_body"][
+        "bind_only_preimplementation_provenance"
+    ] is True
+    assert action["copy_safe_body"]["snapshot_id"] == snapshot_id
+    assert action["copy_safe_body"]["expected_old_snapshot_id"] == snapshot_id
+
+    http_body = dict(action["copy_safe_body"])
+    http_body.pop("project_id")
+    wrong_body = {**http_body, "target_commit_sha": "e" * 40}
+    wrong_before = tuple(conn.iterdump())
+    wrong_changes = conn.total_changes
+    wrong_status, wrong = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=wrong_body,
+        )
+    )
+    assert wrong_status == 409
+    assert wrong["error"] == (
+        "operator_supervised_direct_main_qa_before_reconcile_required"
+    )
+    assert wrong["writes_performed"] is False
+    assert tuple(conn.iterdump()) == wrong_before
+    assert conn.total_changes == wrong_changes
+
+    original_preflight = (
+        server._operator_supervised_direct_main_reconcile_qa_preflight_authority
+    )
+    preflight_calls = 0
+
+    def advance_contract_runtime_before_lock(*args, **kwargs):
+        nonlocal preflight_calls
+        preflight_calls += 1
+        value = original_preflight(*args, **kwargs)
+        if preflight_calls == 2:
+            value = {
+                **value,
+                "contract_runtime_next_line_id": "observer_implementation",
+            }
+        return value
+
+    before = tuple(conn.iterdump())
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            server,
+            "_operator_supervised_direct_main_reconcile_qa_preflight_authority",
+            advance_contract_runtime_before_lock,
+        )
+        stale_status, stale = (
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx(
+                    {"project_id": case["project_id"]},
+                    method="POST",
+                    body=copy.deepcopy(http_body),
+                )
+            )
+        )
+    assert stale_status == 409
+    assert stale["error"] == "dev_direct_bind_only_provenance_authority_changed"
+    assert tuple(conn.iterdump()) == before and conn.in_transaction is False
+
+    original_auth = server._require_current_full_reconcile_auth
+    auth_calls = 0
+
+    def stale_session_before_lock(*args, **kwargs):
+        nonlocal auth_calls
+        auth_calls += 1
+        value = original_auth(*args, **kwargs)
+        if auth_calls == 2:
+            value = {**value, "observer_session_id": "stale-session"}
+        return value
+
+    before = tuple(conn.iterdump())
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            server,
+            "_require_current_full_reconcile_auth",
+            stale_session_before_lock,
+        )
+        stale_status, stale = (
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx(
+                    {"project_id": case["project_id"]},
+                    method="POST",
+                    body=copy.deepcopy(http_body),
+                )
+            )
+        )
+    assert stale_status == 409
+    assert stale["error"] == "dev_direct_bind_only_provenance_authority_changed"
+    assert tuple(conn.iterdump()) == before
+    assert conn.in_transaction is False
+
+    failpoints = (
+        (store, "activate_graph_snapshot"),
+        (server, "_record_pending_scope_reconcile_contract_event"),
+        (store, "record_current_full_reconcile_provenance"),
+        (store, "record_reconcile_run_metric"),
+    )
+    for owner, name in failpoints:
+        before = tuple(conn.iterdump())
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                owner,
+                name,
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError(f"injected:{name}")
+                ),
+            )
+            with pytest.raises(RuntimeError, match=f"injected:{name}"):
+                server.handle_graph_governance_current_full_reconcile(
+                    _ctx(
+                        {"project_id": case["project_id"]},
+                        method="POST",
+                        body=copy.deepcopy(http_body),
+                    )
+                )
+        assert tuple(conn.iterdump()) == before
+        assert conn.in_transaction is False
+
+    bind_status, bound = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=copy.deepcopy(http_body),
+        )
+    )
+    assert bind_status == 201, json.dumps(bound, sort_keys=True)
+    assert bound["bind_only_preimplementation_provenance"] is True
+    assert bound["rebuild_started"] is False
+    assert bound["snapshot_materialized"] is False
+    assert bound["snapshot_id"] == snapshot_id
+    assert bound["writes_performed"] is True
+    assert bound["timeline_event_recorded"]["id"] > 0
+    assert bound["current_full_reconcile_provenance"]["provenance_id"]
+    assert server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )["completed_lines"] == []
+
+    terminal_counts = {
+        table: conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE project_id=?",
+            (case["project_id"],),
+        ).fetchone()[0]
+        for table in (
+            "graph_ref_events",
+            "task_timeline_events",
+            "graph_current_full_reconcile_provenance",
+            "reconcile_run_metrics",
+        )
+    }
+    replay_changes = conn.total_changes
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=copy.deepcopy(http_body),
+        )
+    )
+    assert replay_status == 200
+    assert replay["idempotent_replay"] is True
+    assert replay["writes_performed"] is False
+    assert conn.total_changes == replay_changes
+    assert terminal_counts == {
+        table: conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE project_id=?",
+            (case["project_id"],),
+        ).fetchone()[0]
+        for table in terminal_counts
+    }
+
+    ready = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=request_body,
+        )
+    )
+    assert ready["dev_local_graph_bootstrap"]["state"] == "exact_active"
+    assert ready["dev_local_graph_bootstrap"]["graph_query_ready"] is True
+    monkeypatch.setattr(
+        "agent.governance.checkout_provenance.describe_checkout",
+        lambda *_args, **_kwargs: {
+            "is_git_worktree": True,
+            "commit_sha": case["commit"],
+            "execution_root": str(case["root"].resolve()),
+            "git": {
+                "git_common_dir": str(case["root"] / ".git"),
+                "remote_url": "",
+            },
+            "canonical_project_identity": {
+                "project_id": case["project_id"],
+            },
+        },
+    )
+    graph_body = copy.deepcopy(
+        ready["next_legal_action"]["graph_query_close_authority"]
+        ["copy_safe_graph_query"]["arguments"]
+    )
+    graph_query = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": case["project_id"]},
+            "observer",
+            method="POST",
+            body=graph_body,
+        )
+    )
+    assert graph_query["ok"] is True
+    assert graph_query["graph_query_identity"]["snapshot_id"] == snapshot_id
 
 
 def test_dev_direct_onboard_fresh_bind_defers_query_until_local_graph_ready(

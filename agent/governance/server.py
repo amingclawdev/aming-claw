@@ -96233,6 +96233,7 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     active_snapshot_id = str(active_snapshot.get("snapshot_id") or "").strip()
     active_ref_rows = []
     active_status_rows = []
+    active_provenance_row_count = 0
     active_binding: dict[str, Any] = {}
     if local_active_graph_present:
         from . import graph_snapshot_store as store
@@ -96247,6 +96248,13 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
             "FROM graph_snapshots WHERE project_id=? AND status='active'",
             (project_id,),
         ).fetchall()
+        active_provenance_row_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance "
+                "WHERE project_id=? AND snapshot_id=? AND target_commit_sha=?",
+                (project_id, active_snapshot_id, active_commit),
+            ).fetchone()[0]
+        )
         active_binding = store._current_full_snapshot_provenance_binding(
             conn,
             project_id,
@@ -96296,7 +96304,7 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         if local_active_graph_present
         else {"accepted": False, "missing_requirement_ids": []}
     )
-    exact_canonical_active = bool(
+    exact_canonical_active_structure = bool(
         readiness_compatible
         and readiness is None
         and local_active_graph_present
@@ -96308,8 +96316,20 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         and str(target_identity.get("snapshot_id") or "").strip()
         == canonical_target_snapshot_id
         and target_identity.get("legacy_identity_selected") is not True
+    )
+    exact_canonical_active = bool(
+        exact_canonical_active_structure
         and active_provenance_exact
         and exact_active_provenance_authority.get("accepted") is True
+    )
+    active_provenance_absent = bool(
+        exact_canonical_active_structure
+        and active_provenance_row_count == 0
+        and not active_binding.get("marker")
+        and not str(active_binding.get("provenance_id") or "").strip()
+        and not str(active_binding.get("provenance_hash") or "").strip()
+        and int(active_binding.get("reconcile_event_id") or 0) == 0
+        and not str(active_binding.get("reconcile_event_created_at") or "").strip()
     )
     canonical_dev_world = bool(
         world.get("runtime_plane") == "dev"
@@ -96347,7 +96367,16 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     )
     if same_wip_descendant_active_predecessor:
         expected_body["expected_old_snapshot_id"] = active_snapshot_id
+    bind_scope_hash = stable_sha256([project_id, backlog_id, task_id, target_commit]).removeprefix("sha256:")[:12]
+    bind_only_expected_body = {
+        **{key: value for key, value in expected_body.items() if key != "run_id"},
+        "run_id": f"current-full-bind-{target_commit[:7]}-{bind_scope_hash}",
+        "snapshot_id": active_snapshot_id,
+        "expected_old_snapshot_id": active_snapshot_id,
+        "bind_only_preimplementation_provenance": True,
+    }
     request_body_exact = body is not None and dict(body) == expected_body
+    bind_only_request_body_exact = bool(body is not None and dict(body) == bind_only_expected_body)
     common_eligibility_checks = {
         "strict_direct_graph_first_route_session": strict_direct_position,
         "compatible_graph_materialization_preimage": readiness_compatible,
@@ -96375,7 +96404,24 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         **common_eligibility_checks,
         "exact_canonical_active_current_full": exact_canonical_active,
     }
-    eligible = all(materialization_eligibility_checks.values())
+    materialization_eligible = all(materialization_eligibility_checks.values())
+    common_eligible = all(common_eligibility_checks.values())
+    bind_only_eligible = bool(
+        common_eligible and exact_canonical_active_structure
+        and active_provenance_absent
+    )
+    bind_only_replay_eligible = bool(
+        common_eligible and exact_canonical_active
+        and exact_active_provenance_authority.get("same_wip_scope") is True
+    )
+    eligible = bool(materialization_eligible or bind_only_eligible)
+    accepted = bool(
+        (materialization_eligible and request_body_exact)
+        or (
+            (bind_only_eligible or bind_only_replay_eligible)
+            and bind_only_request_body_exact
+        )
+    )
     graph_query_recognition_eligible = all(
         graph_query_recognition_checks.values()
     )
@@ -96389,13 +96435,20 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         for requirement, passed in graph_query_recognition_checks.items()
         if not passed
     ]
-    if not request_body_exact:
+    if not (
+        request_body_exact
+        or (
+            (bind_only_eligible or bind_only_replay_eligible)
+            and bind_only_request_body_exact
+        )
+    ):
         missing.append("exact_mcp_adapted_http_body")
+    action_body = bind_only_expected_body if bind_only_eligible else expected_body
     authority = {
         "schema_version": "ac_dev.direct_graph_bootstrap_reconcile_authority.v1",
         "applicable": True,
         "eligible": eligible,
-        "accepted": bool(eligible and request_body_exact),
+        "accepted": accepted,
         "server_derived": True,
         "caller_claims_trusted": False,
         "project_id": project_id,
@@ -96406,6 +96459,11 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
             same_wip_descendant_active_predecessor
         ),
         "exact_canonical_active": exact_canonical_active,
+        "bind_only_provenance_materialization_required": bind_only_eligible,
+        "bind_only_provenance_materialization_replay": bool(
+            bind_only_replay_eligible and bind_only_request_body_exact
+        ),
+        "bind_only_request_body_exact": bind_only_request_body_exact,
         "graph_query_recognition_eligible": (
             graph_query_recognition_eligible
         ),
@@ -96435,8 +96493,8 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "runtime_custody_verified": custody_verified,
         "worktree_clean": worktree_clean,
         "request_body_exact": request_body_exact,
-        "expected_http_body": expected_body,
-        "copy_safe_action_input": {"project_id": project_id, **expected_body},
+        "expected_http_body": action_body,
+        "copy_safe_action_input": {"project_id": project_id, **action_body},
         "missing_requirement_ids": missing,
         "graph_query_recognition_missing_requirement_ids": (
             graph_query_recognition_missing
@@ -96650,6 +96708,241 @@ def _record_pending_scope_reconcile_contract_event(
         commit_sha=target_commit_sha,
         post_commit_hooks=post_commit_hooks,
     )
+
+
+def _record_current_full_atomic_evidence(
+    conn, store, *, project_id: str, body: Mapping[str, Any],
+    result: dict[str, Any], run_id: str, snapshot_id: str,
+    target_commit: str, route_evidence: Mapping[str, Any],
+    runtime_context_scope: Mapping[str, Any], request_id: str,
+    request_started_at: str, graph_delta_mode: str,
+    declared_actor_role: str, route_bound: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Deposit the canonical current-full event, provenance, and metric."""
+
+    event = _record_pending_scope_reconcile_contract_event(
+        conn, project_id=project_id, body=body, result=result,
+        target_commit_sha=target_commit,
+        runtime_context_scope=runtime_context_scope,
+        declared_actor_role=declared_actor_role, post_commit_hooks=False,
+    )
+    failure = {"run_id": run_id, "snapshot_id": snapshot_id, "fail_closed": True}
+    if route_bound and not event:
+        raise GovernanceError(
+            "current_full_reconcile_atomic_timeline_required",
+            "route-bound current-full activation requires durable reconcile evidence",
+            409, failure,
+        )
+    provenance: dict[str, Any] = {}
+    if event:
+        result["timeline_event_recorded"] = {
+            "id": event.get("id"), "ref": f"timeline:{event.get('id')}",
+            "event_kind": event.get("event_kind"), "phase": event.get("phase"),
+            "status": event.get("status"), "requirement_id": "reconcile",
+        }
+        provenance = store.record_current_full_reconcile_provenance(
+            conn, project_id=project_id, snapshot_id=snapshot_id,
+            target_commit_sha=target_commit, request_id=request_id,
+            request_started_at=request_started_at,
+            route_evidence=route_evidence,
+            runtime_context_scope=runtime_context_scope,
+            reconcile_event_id=int(event.get("id") or 0),
+            reconcile_event_created_at=str(event.get("created_at") or ""),
+            marker_created_at=_utc_now(), schema_ready=True,
+        )
+        result["current_full_reconcile_provenance"] = provenance
+    if route_bound and not provenance:
+        raise GovernanceError(
+            "current_full_reconcile_atomic_provenance_required",
+            "route-bound current-full activation requires durable provenance",
+            409, failure,
+        )
+    store.record_reconcile_run_metric(
+        conn, project_id, run_id=run_id, snapshot_id=snapshot_id,
+        commit_sha=target_commit, snapshot_kind="full",
+        strategy="current_full_reconcile", graph_delta_mode=graph_delta_mode,
+        status="complete", elapsed_ms=int(result.get("elapsed_ms") or 0),
+        evidence={
+            "phase": "atomic_finalize_complete", "activate_requested": True,
+            "idempotency_scope": _current_full_reconcile_idempotency_scope(
+                route_evidence
+            ),
+            "request_id": request_id,
+            "reconcile_event_id": int(event.get("id") or 0),
+            "provenance_id": str(provenance.get("provenance_id") or ""),
+        },
+        created_at=request_started_at, schema_ready=True,
+    )
+    return event, provenance
+
+
+def _dev_direct_bind_current_full_provenance(
+    ctx: RequestContext, conn, store, *, root: Path, project_id: str,
+    body: Mapping[str, Any], route_evidence: Mapping[str, Any],
+    runtime_context_scope: Mapping[str, Any], target_commit: str,
+    head_commit: str, request_started_at: str,
+) -> tuple[int, dict[str, Any]]:
+    """Bind one fresh Direct CEX to an exact active graph without rebuilding."""
+
+    from . import task_timeline
+    from .db import sqlite_write_lock
+
+    def fail(code: str) -> NoReturn:
+        raise GovernanceError(
+            code, code, 409,
+            {"writes_performed": False, "mutation_performed": False,
+             "fail_closed": True},
+        )
+
+    store.ensure_schema(conn)
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+    event, result = {}, {}
+    try:
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            auth = _require_current_full_reconcile_auth(
+                ctx, conn, "graph-governance.reconcile.current-full",
+                route_ref_renew_within_seconds=0,
+            )
+            qa = _operator_supervised_direct_main_reconcile_qa_preflight_authority(
+                conn, project_id=project_id, target_commit=target_commit,
+                current_full_auth=auth,
+            )
+            scope = _current_full_reconcile_runtime_context_scope(
+                conn, project_id=project_id, body=body, auth=auth,
+                target_commit_sha=target_commit, candidate_only=False,
+                source_free_reconcile_authority={},
+            )
+            authority = _dev_direct_graph_bootstrap_reconcile_authority(
+                conn, project_id=project_id, auth=auth,
+                direct_main_qa_preflight=qa, body=body,
+            )
+            run_id = str(body.get("run_id") or "").strip()
+            locked_route = _current_full_reconcile_route_evidence(
+                auth, runtime_context_scope=scope
+            )
+            locked_route.update(
+                direct_main_qa_preflight_authority=dict(qa),
+                dev_graph_bootstrap_reconcile_authority=dict(authority),
+                reconcile_run_id=run_id,
+            )
+            locked_route["idempotency_scope"] = (
+                _current_full_reconcile_idempotency_scope(locked_route)
+            )
+            if not (
+                _git_head_commit(root) == head_commit == target_commit
+                and scope == runtime_context_scope
+                and stable_sha256(locked_route) == stable_sha256(route_evidence)
+                and authority.get("accepted") is True
+                and authority.get("bind_only_request_body_exact") is True
+            ):
+                fail("dev_direct_bind_only_provenance_authority_changed")
+
+            snapshot_id = str(body.get("snapshot_id") or "").strip()
+            identity = store.current_full_run_snapshot_identity_check(
+                conn, project_id, run_id=run_id, snapshot_id=snapshot_id,
+                commit_sha=target_commit,
+                idempotency_scope=_current_full_reconcile_idempotency_scope(
+                    locked_route
+                ),
+            )
+            if identity.get("conflict"):
+                fail("current_full_run_snapshot_identity_conflict")
+            provenance = authority.get("exact_active_provenance_authority")
+            provenance = provenance if isinstance(provenance, Mapping) else {}
+            if authority.get("bind_only_provenance_materialization_replay") is True:
+                metric = conn.execute(
+                    "SELECT status FROM reconcile_run_metrics "
+                    "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+                    (project_id, run_id, snapshot_id),
+                ).fetchone()
+                if not (
+                    provenance.get("same_wip_scope") is True
+                    and metric and str(metric["status"] or "") == "complete"
+                ):
+                    fail("dev_direct_bind_only_terminal_evidence_incomplete")
+                conn.rollback()
+                return 200, {
+                    "ok": True, "project_id": project_id, "status": "complete",
+                    "snapshot_id": snapshot_id, "active_snapshot_id": snapshot_id,
+                    "target_commit_sha": target_commit,
+                    "bind_only_preimplementation_provenance": True,
+                    "idempotent_replay": True, "writes_performed": False,
+                    "mutation_performed": False,
+                }
+
+            active = store.get_active_graph_snapshot(conn, project_id) or {}
+            if not (
+                authority.get("bind_only_provenance_materialization_required")
+                is True
+                and str(active.get("snapshot_id") or "") == snapshot_id
+                and str(active.get("commit_sha") or "").lower() == target_commit
+            ):
+                fail("dev_direct_bind_only_provenance_preimage_changed")
+            activation = store.activate_graph_snapshot(
+                conn, project_id, snapshot_id,
+                expected_old_snapshot_id=snapshot_id, ref_name="active",
+                actor="codex-observer", auto_rebuild_projection=False,
+                schema_ready=True, post_commit_hooks=False,
+            )
+            active = store.get_active_graph_snapshot(conn, project_id) or {}
+            pending = int(conn.execute(
+                "SELECT COUNT(*) FROM pending_scope_reconcile "
+                "WHERE project_id=? AND status IN (?,?,?)",
+                (project_id, store.PENDING_STATUS_QUEUED,
+                 store.PENDING_STATUS_RUNNING, store.PENDING_STATUS_FAILED),
+            ).fetchone()[0])
+            if not (
+                str(active.get("snapshot_id") or "") == snapshot_id
+                and str(active.get("commit_sha") or "").lower()
+                == target_commit == head_commit
+                and pending == 0
+            ):
+                fail("dev_direct_bind_only_activation_not_verified")
+            result = {
+                "ok": True, "project_id": project_id, "status": "complete",
+                "snapshot_status": "active", "snapshot_id": snapshot_id,
+                "active_snapshot_id": snapshot_id,
+                "target_commit_sha": target_commit, "head_commit": head_commit,
+                "active_graph_commit": target_commit,
+                "current_full_reconcile": True,
+                "strategy": "current_full_reconcile",
+                "graph_delta_mode": "bind_only_existing_full",
+                "activated": True, "activation": activation,
+                "activation_verification": {
+                    "verified": True, "active_snapshot_id": snapshot_id,
+                    "active_graph_commit": target_commit,
+                },
+                "bind_only_preimplementation_provenance": True,
+                "rebuild_started": False, "snapshot_materialized": False,
+            }
+            event, _ = _record_current_full_atomic_evidence(
+                conn, store, project_id=project_id, body=body, result=result,
+                run_id=run_id, snapshot_id=snapshot_id,
+                target_commit=target_commit, route_evidence=locked_route,
+                runtime_context_scope=scope, request_id=str(ctx.request_id),
+                request_started_at=request_started_at,
+                graph_delta_mode="bind_only_existing_full",
+                declared_actor_role="observer", route_bound=True,
+            )
+            conn.commit()
+    except GovernanceError as exc:
+        conn.rollback()
+        return exc.status, {
+            **exc.to_dict(), "project_id": project_id,
+            "writes_performed": False, "mutation_performed": False,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    if event:
+        task_timeline.run_post_commit_hooks(conn, event)
+        conn.commit()
+    _emit_dashboard_changed(
+        f"/api/graph-governance/{project_id}/reconcile/current-full", "POST"
+    )
+    return 201, {**result, "writes_performed": True, "mutation_performed": True}
 
 
 @route("POST", "/api/graph-governance/{project_id}/index")
@@ -98309,6 +98602,14 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             "reconcile_run_id": run_id,
             "idempotency_scope": idempotency_scope,
         }
+        if body.get("bind_only_preimplementation_provenance") is True:
+            return _dev_direct_bind_current_full_provenance(
+                ctx, conn, store, root=root, project_id=project_id, body=body,
+                route_evidence=route_evidence,
+                runtime_context_scope=runtime_context_scope,
+                target_commit=target_commit, head_commit=head_commit,
+                request_started_at=request_started_at,
+            )
         explicit_snapshot_id = str(body.get("snapshot_id") or "").strip()
         snapshot_identity = _current_full_requested_snapshot_identity(
             conn,
@@ -99162,81 +99463,29 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 result["status"] = "complete"
                 result["active_snapshot_id"] = activation_verification.get("active_snapshot_id") or ""
                 result["active_graph_commit"] = activation_verification.get("active_graph_commit") or ""
-                timeline_event = _record_pending_scope_reconcile_contract_event(
-                    conn,
-                    project_id=project_id,
-                    body=body,
-                    result=result,
-                    target_commit_sha=target_commit,
-                    runtime_context_scope=runtime_context_scope,
-                    declared_actor_role=(
-                        "observer"
-                        if str(current_full_auth.get("role") or "").strip()
-                        == "observer"
-                        else ""
-                    ),
-                    post_commit_hooks=False,
-                )
-                if route_bound and not timeline_event:
-                    raise GovernanceError(
-                        "current_full_reconcile_atomic_timeline_required",
-                        "route-bound current-full activation requires durable reconcile timeline evidence",
-                        409,
-                        {"run_id": run_id, "snapshot_id": graph_epoch_snapshot_id, "fail_closed": True},
-                    )
-                provenance = {}
-                if timeline_event:
-                    result["timeline_event_recorded"] = {
-                        "id": timeline_event.get("id"),
-                        "ref": f"timeline:{timeline_event.get('id')}",
-                        "event_kind": timeline_event.get("event_kind"),
-                        "phase": timeline_event.get("phase"),
-                        "status": timeline_event.get("status"),
-                        "requirement_id": "reconcile",
-                    }
-                    provenance = store.record_current_full_reconcile_provenance(
+                timeline_event, provenance = (
+                    _record_current_full_atomic_evidence(
                         conn,
+                        store,
                         project_id=project_id,
+                        body=body,
+                        result=result,
+                        run_id=run_id,
                         snapshot_id=graph_epoch_snapshot_id,
-                        target_commit_sha=target_commit,
-                        request_id=str(ctx.request_id),
-                        request_started_at=request_started_at,
+                        target_commit=target_commit,
                         route_evidence=route_evidence,
                         runtime_context_scope=runtime_context_scope,
-                        reconcile_event_id=int(timeline_event.get("id") or 0),
-                        reconcile_event_created_at=str(timeline_event.get("created_at") or ""),
-                        marker_created_at=_utc_now(),
-                        schema_ready=True,
+                        request_id=str(ctx.request_id),
+                        request_started_at=request_started_at,
+                        graph_delta_mode="full_rebuild",
+                        declared_actor_role=(
+                            "observer"
+                            if str(current_full_auth.get("role") or "").strip()
+                            == "observer"
+                            else ""
+                        ),
+                        route_bound=route_bound,
                     )
-                    result["current_full_reconcile_provenance"] = provenance
-                if route_bound and not provenance:
-                    raise GovernanceError(
-                        "current_full_reconcile_atomic_provenance_required",
-                        "route-bound current-full activation requires durable reconcile provenance",
-                        409,
-                        {"run_id": run_id, "snapshot_id": graph_epoch_snapshot_id, "fail_closed": True},
-                    )
-                store.record_reconcile_run_metric(
-                    conn,
-                    project_id,
-                    run_id=run_id,
-                    snapshot_id=graph_epoch_snapshot_id,
-                    commit_sha=target_commit,
-                    snapshot_kind="full",
-                    strategy="current_full_reconcile",
-                    graph_delta_mode="full_rebuild",
-                    status="complete",
-                    elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
-                    evidence={
-                        "phase": "atomic_finalize_complete",
-                        "activate_requested": True,
-                        "idempotency_scope": idempotency_scope,
-                        "request_id": str(ctx.request_id),
-                        "reconcile_event_id": int(timeline_event.get("id") or 0) if timeline_event else 0,
-                        "provenance_id": str(provenance.get("provenance_id") or ""),
-                    },
-                    created_at=request_started_at,
-                    schema_ready=True,
                 )
                 conn.commit()
         except Exception as exc:
@@ -152191,18 +152440,27 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         )
                         is True
                     )
+                    provenance_materialization = bool(
+                        bootstrap_authority.get(
+                            "bind_only_provenance_materialization_required"
+                        ) is True
+                    )
                     graph_bootstrap_projection = {
                         "schema_version": "onboard_route_guide.dev_local_graph_bootstrap.v1",
                         "state": (
-                            "same_wip_descendant_active_predecessor"
-                            if descendant_predecessor
+                            "exact_active_provenance_materialization_required"
+                            if provenance_materialization
                             else (
-                                "incompatible"
-                                if active_snapshot
+                                "same_wip_descendant_active_predecessor"
+                                if descendant_predecessor
                                 else (
-                                    "materialization_required_no_local_active"
-                                    if graph_readiness is not None
-                                    else "exact_schema_no_local_active"
+                                    "incompatible"
+                                    if active_snapshot
+                                    else (
+                                        "materialization_required_no_local_active"
+                                        if graph_readiness is not None
+                                        else "exact_schema_no_local_active"
+                                    )
                                 )
                             )
                         ),
@@ -152253,14 +152511,22 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         "writes_performed": False,
                         "contract_runtime_line_advanced": False,
                     }
-                    if active_snapshot and not descendant_predecessor:
+                    if (
+                        active_snapshot
+                        and not descendant_predecessor
+                        and not provenance_materialization
+                    ):
                         graph_bootstrap_projection["error"] = (
                             "exact_active_current_full_required"
                         )
                     if eligible:
                         next_action = {
                             "schema_version": "onboard_route_guide.next_action.v1",
-                            "id": "dev_local_graph_current_full_reconcile",
+                            "id": (
+                                "dev_local_graph_bind_only_provenance"
+                                if provenance_materialization
+                                else "dev_local_graph_current_full_reconcile"
+                            ),
                             "action": "graph_current_full_reconcile",
                             "mcp_tool": "graph_current_full_reconcile",
                             "requires_role": "observer",
