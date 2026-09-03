@@ -210036,6 +210036,100 @@ def test_dev_graph_readiness_becomes_normal_after_authorized_admission(
     assert "materialization_required" not in normal
 
 
+def _record_source_free_current_full_provenance(
+    conn,
+    *,
+    project_id: str,
+    snapshot_id: str,
+    commit_sha: str,
+    suffix: str,
+) -> dict[str, Any]:
+    source_scope = {
+        "project_id": project_id,
+        "backlog_id": f"AC-SOURCE-FREE-GRAPH-MAINTENANCE-{suffix}",
+        "task_id": f"onboard-service-source-free-{suffix}",
+    }
+    event_scope = {
+        **source_scope,
+        "source": "parallel_branch_runtime_context",
+        "server_derived": True,
+    }
+    event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=source_scope["backlog_id"],
+        task_id=source_scope["task_id"],
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer",
+        status="passed",
+        payload={
+            "schema_version": "graph_reconcile_contract_evidence.v1",
+            "requirement_id": "reconcile",
+            "actor_role": "observer",
+            "target_commit_sha": commit_sha,
+            "snapshot_id": snapshot_id,
+            "active_snapshot_id": snapshot_id,
+            "reconcile_mode": "current_full",
+            "current_full_reconcile": True,
+            "reconciled_commit_sha": commit_sha,
+            "canonical_head_commit": commit_sha,
+            "merged_head_commit": commit_sha,
+            "active_graph_commit": commit_sha,
+            "canonical_head_verified": True,
+            "active_snapshot_verified": True,
+            "graph_reconciled": True,
+            **source_scope,
+            "runtime_context_scope": event_scope,
+        },
+        commit_sha=commit_sha,
+    )
+    route_runtime_scope = {
+        **source_scope,
+        "source": "parallel_branch_runtime_context",
+        "authority_source": "completed_source_free_reconcile_authority",
+        "server_derived": True,
+    }
+    route_evidence = {
+        "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+        "authenticated_role": "observer",
+        "authentication_source": "observer_session_route_token_ref",
+        "principal_id": f"observer-source-free-{suffix}",
+        "session_id": f"ses-source-free-{suffix}",
+        "route_token_ref": f"rtok-source-free-{suffix}",
+        "route_token_scope": dict(source_scope),
+        "raw_route_token_persisted": False,
+        "protected_action": "graph_current_full_reconcile",
+        "runtime_context_scope": route_runtime_scope,
+    }
+    provenance = store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        target_commit_sha=commit_sha,
+        request_id=f"req-source-free-{suffix}",
+        request_started_at="2026-09-03T12:00:00Z",
+        route_evidence=route_evidence,
+        runtime_context_scope={
+            **source_scope,
+            "source": "completed_source_free_reconcile_authority",
+            "server_derived": True,
+            "runtime_context_required": False,
+            "source_free_operation": True,
+        },
+        reconcile_event_id=int(event["id"]),
+        reconcile_event_created_at=str(event["created_at"]),
+        marker_created_at="2026-09-03T12:01:00Z",
+    )
+    conn.commit()
+    return {
+        "source_scope": source_scope,
+        "event": event,
+        "provenance": provenance,
+    }
+
+
 def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_provenance(
     conn, monkeypatch, tmp_path,
 ):
@@ -210108,10 +210202,12 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_pro
         project_id=case["project_id"],
         commit_sha=case["commit"],
     )
-    monkeypatch.setattr(
-        store,
-        "_current_full_snapshot_provenance_binding",
-        lambda *_args, **_kwargs: {"verified": False},
+    maintenance = _record_source_free_current_full_provenance(
+        conn,
+        project_id=case["project_id"],
+        snapshot_id=snapshot_id,
+        commit_sha=case["commit"],
+        suffix="canonical-active",
     )
     request_body = {
         "backlog_id": case["guide"]["backlog_id"],
@@ -210149,6 +210245,159 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_pro
     )
     assert tuple(conn.iterdump()) == before
     assert conn.total_changes == before_changes
+
+    provenance_id = maintenance["provenance"]["provenance_id"]
+    event_id = int(maintenance["event"]["id"])
+    snapshot_notes = conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (case["project_id"], snapshot_id),
+    ).fetchone()[0]
+    provenance_row = dict(
+        conn.execute(
+            "SELECT * FROM graph_current_full_reconcile_provenance "
+            "WHERE provenance_id=?",
+            (provenance_id,),
+        ).fetchone()
+    )
+    event_row = dict(
+        conn.execute(
+            "SELECT * FROM task_timeline_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+    )
+
+    def assert_tamper_rejected(
+        *,
+        statement: str,
+        params: tuple[Any, ...],
+        restore: tuple[str, tuple[Any, ...]],
+    ) -> None:
+        conn.execute(statement, params)
+        conn.commit()
+        tampered_before = tuple(conn.iterdump())
+        tampered_changes = conn.total_changes
+        denied = server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=request_body,
+            )
+        )
+        assert denied["dev_local_graph_bootstrap"]["state"] == "incompatible"
+        assert denied["dev_local_graph_bootstrap"]["graph_query_ready"] is False
+        assert denied["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
+        assert tuple(conn.iterdump()) == tampered_before
+        assert conn.total_changes == tampered_changes
+        conn.execute(restore[0], restore[1])
+        conn.commit()
+
+    assert_tamper_rejected(
+        statement=(
+            "UPDATE graph_snapshots SET notes='{}' "
+            "WHERE project_id=? AND snapshot_id=?"
+        ),
+        params=(case["project_id"], snapshot_id),
+        restore=(
+            "UPDATE graph_snapshots SET notes=? "
+            "WHERE project_id=? AND snapshot_id=?",
+            (snapshot_notes, case["project_id"], snapshot_id),
+        ),
+    )
+    tampered_notes = json.loads(snapshot_notes)
+    tampered_notes["current_full_reconcile"]["provenance_hash"] = _fake_sha(
+        "tampered-current-full-marker"
+    )
+    assert_tamper_rejected(
+        statement=(
+            "UPDATE graph_snapshots SET notes=? "
+            "WHERE project_id=? AND snapshot_id=?"
+        ),
+        params=(
+            json.dumps(tampered_notes, sort_keys=True),
+            case["project_id"],
+            snapshot_id,
+        ),
+        restore=(
+            "UPDATE graph_snapshots SET notes=? "
+            "WHERE project_id=? AND snapshot_id=?",
+            (snapshot_notes, case["project_id"], snapshot_id),
+        ),
+    )
+    assert_tamper_rejected(
+        statement=(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET protected_action='tampered_action' WHERE provenance_id=?"
+        ),
+        params=(provenance_id,),
+        restore=(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET protected_action=? WHERE provenance_id=?",
+            (provenance_row["protected_action"], provenance_id),
+        ),
+    )
+    assert_tamper_rejected(
+        statement=(
+            "UPDATE task_timeline_events SET status='failed' WHERE id=?"
+        ),
+        params=(event_id,),
+        restore=(
+            "UPDATE task_timeline_events SET status=? WHERE id=?",
+            (event_row["status"], event_id),
+        ),
+    )
+    assert_tamper_rejected(
+        statement="DELETE FROM task_timeline_events WHERE id=?",
+        params=(event_id,),
+        restore=(
+            "INSERT INTO task_timeline_events "
+            "(" + ",".join(event_row) + ") VALUES ("
+            + ",".join("?" for _ in event_row) + ")",
+            tuple(event_row.values()),
+        ),
+    )
+    assert_tamper_rejected(
+        statement=(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET route_evidence_json='{}' WHERE provenance_id=?"
+        ),
+        params=(provenance_id,),
+        restore=(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET route_evidence_json=? WHERE provenance_id=?",
+            (provenance_row["route_evidence_json"], provenance_id),
+        ),
+    )
+
+    graph_query_body = copy.deepcopy(
+        guide["next_legal_action"]["graph_query_close_authority"]
+        ["copy_safe_graph_query"]["arguments"]
+    )
+    monkeypatch.setattr(
+        "agent.governance.checkout_provenance.describe_checkout",
+        lambda *_args, **_kwargs: {
+            "is_git_worktree": True,
+            "commit_sha": case["commit"],
+            "execution_root": str(case["root"].resolve()),
+            "git": {
+                "git_common_dir": str(case["root"] / ".git"),
+                "remote_url": "",
+            },
+            "canonical_project_identity": {
+                "project_id": case["project_id"],
+            },
+        },
+    )
+    graph_query = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": case["project_id"]},
+            "observer",
+            method="POST",
+            body=graph_query_body,
+        )
+    )
+    assert graph_query["ok"] is True
+    assert graph_query["graph_query_identity"]["snapshot_id"] == snapshot_id
+    assert graph_query["graph_query_identity"]["commit_sha"] == case["commit"]
 
 
 def test_dev_direct_onboard_fresh_bind_defers_query_until_local_graph_ready(
@@ -210687,11 +210936,6 @@ def test_dev_direct_onboard_fresh_bind_defers_query_until_local_graph_ready(
         auto_rebuild_projection=False,
     )
     conn.commit()
-    monkeypatch.setattr(
-        store,
-        "_current_full_snapshot_provenance_binding",
-        lambda *_args, **_kwargs: {"verified": True},
-    )
     legacy_active = server.handle_project_onboard_route_guide(
         _ctx(
             {"project_id": case["project_id"]},
@@ -210728,11 +210972,12 @@ def test_dev_direct_onboard_fresh_bind_defers_query_until_local_graph_ready(
         candidate["snapshot_id"],
         auto_rebuild_projection=False,
     )
-    conn.commit()
-    monkeypatch.setattr(
-        store,
-        "_current_full_snapshot_provenance_binding",
-        lambda *_args, **_kwargs: {"verified": False},
+    _record_source_free_current_full_provenance(
+        conn,
+        project_id="aming-claw",
+        snapshot_id=candidate["snapshot_id"],
+        commit_sha=case["commit"],
+        suffix="descendant-canonical-active",
     )
 
     active = server.handle_project_onboard_route_guide(

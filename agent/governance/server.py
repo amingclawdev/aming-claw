@@ -95803,6 +95803,200 @@ def _current_full_reconcile_request_category(
     }
 
 
+def _dev_direct_exact_active_provenance_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    snapshot_id: str,
+    target_commit: str,
+    active_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify the protected activation and its bounded scope before reuse."""
+
+    marker = (
+        active_binding.get("marker")
+        if isinstance(active_binding.get("marker"), Mapping)
+        else {}
+    )
+    route_evidence = (
+        marker.get("route_evidence")
+        if isinstance(marker.get("route_evidence"), Mapping)
+        else {}
+    )
+    route_scope = (
+        route_evidence.get("route_token_scope")
+        if isinstance(route_evidence.get("route_token_scope"), Mapping)
+        else {}
+    )
+    route_runtime_scope = (
+        route_evidence.get("runtime_context_scope")
+        if isinstance(route_evidence.get("runtime_context_scope"), Mapping)
+        else {}
+    )
+    try:
+        event_id = int(active_binding.get("reconcile_event_id") or 0)
+    except (TypeError, ValueError):
+        event_id = 0
+    try:
+        event_rows = (
+            conn.execute(
+                "SELECT * FROM task_timeline_events "
+                "WHERE id=? AND project_id=? LIMIT 2",
+                (event_id, project_id),
+            ).fetchall()
+            if event_id > 0
+            else []
+        )
+    except sqlite3.Error:
+        event_rows = []
+    event = dict(event_rows[0]) if len(event_rows) == 1 else {}
+    try:
+        event_payload = json.loads(str(event.get("payload_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        event_payload = {}
+    event_payload = event_payload if isinstance(event_payload, Mapping) else {}
+    event_runtime_scope = (
+        event_payload.get("runtime_context_scope")
+        if isinstance(event_payload.get("runtime_context_scope"), Mapping)
+        else {}
+    )
+
+    scope_fields = ("project_id", "backlog_id", "task_id")
+
+    def scope_values(scope: Mapping[str, Any]) -> dict[str, str]:
+        return {
+            field: str(scope.get(field) or "").strip()
+            for field in scope_fields
+        }
+
+    current_scope = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    activation_scope = scope_values(route_scope)
+    exact_route_scope_shape = set(route_scope) == set(scope_fields)
+    same_wip_scope = bool(
+        exact_route_scope_shape
+        and activation_scope == current_scope
+        and not route_runtime_scope
+        and not event_runtime_scope
+    )
+    source_free_route_scope_shape = set(route_runtime_scope) == {
+        *scope_fields,
+        "source",
+        "authority_source",
+        "server_derived",
+    }
+    source_free_event_scope_shape = set(event_runtime_scope) == {
+        *scope_fields,
+        "source",
+        "server_derived",
+    }
+    source_free_scope = bool(
+        exact_route_scope_shape
+        and activation_scope.get("project_id") == project_id
+        and activation_scope.get("backlog_id")
+        and activation_scope.get("task_id")
+        and source_free_route_scope_shape
+        and source_free_event_scope_shape
+        and scope_values(route_runtime_scope) == activation_scope
+        and scope_values(event_runtime_scope) == activation_scope
+        and scope_values(event_payload) == activation_scope
+        and route_runtime_scope.get("source")
+        == "parallel_branch_runtime_context"
+        and route_runtime_scope.get("authority_source")
+        == "completed_source_free_reconcile_authority"
+        and route_runtime_scope.get("server_derived") is True
+        and event_runtime_scope.get("source")
+        == "parallel_branch_runtime_context"
+        and event_runtime_scope.get("server_derived") is True
+    )
+    route_evidence_integrity = bool(
+        route_evidence.get("schema_version")
+        == "graph_current_full_reconcile.route_evidence.v1"
+        and route_evidence.get("authenticated_role") == "observer"
+        and route_evidence.get("authentication_source")
+        == "observer_session_route_token_ref"
+        and str(route_evidence.get("session_id") or "").strip()
+        and str(route_evidence.get("route_token_ref") or "").strip()
+        and route_evidence.get("raw_route_token_persisted") is False
+        and route_evidence.get("protected_action")
+        == "graph_current_full_reconcile"
+    )
+    event_integrity = bool(
+        len(event_rows) == 1
+        and str(event.get("backlog_id") or "").strip()
+        == activation_scope.get("backlog_id")
+        and str(event.get("task_id") or "").strip()
+        == activation_scope.get("task_id")
+        and str(event.get("event_type") or "").strip() == "graph.reconcile"
+        and str(event.get("event_kind") or "").strip() == "reconcile"
+        and str(event.get("phase") or "").strip() == "reconcile"
+        and str(event.get("status") or "").strip() == "passed"
+        and str(event.get("commit_sha") or "").strip().lower()
+        == target_commit
+        and str(event.get("created_at") or "").strip()
+        == str(active_binding.get("reconcile_event_created_at") or "").strip()
+        and event_payload.get("schema_version")
+        == "graph_reconcile_contract_evidence.v1"
+        and event_payload.get("requirement_id") == "reconcile"
+        and event_payload.get("actor_role") == "observer"
+        and event_payload.get("current_full_reconcile") is True
+        and event_payload.get("reconcile_mode") == "current_full"
+        and str(event_payload.get("target_commit_sha") or "").strip().lower()
+        == target_commit
+        and str(event_payload.get("reconciled_commit_sha") or "")
+        .strip()
+        .lower()
+        == target_commit
+        and str(event_payload.get("canonical_head_commit") or "")
+        .strip()
+        .lower()
+        == target_commit
+        and str(event_payload.get("active_graph_commit") or "")
+        .strip()
+        .lower()
+        == target_commit
+        and str(event_payload.get("snapshot_id") or "").strip()
+        == snapshot_id
+        and str(event_payload.get("active_snapshot_id") or "").strip()
+        == snapshot_id
+        and event_payload.get("canonical_head_verified") is True
+        and event_payload.get("active_snapshot_verified") is True
+        and event_payload.get("graph_reconciled") is True
+    )
+    checks = {
+        "protected_current_full_provenance_verified": (
+            active_binding.get("verified") is True
+        ),
+        "protected_route_evidence_verified": route_evidence_integrity,
+        "durable_reconcile_event_verified": event_integrity,
+        "current_wip_or_source_free_maintenance_scope_verified": bool(
+            same_wip_scope or source_free_scope
+        ),
+    }
+    return {
+        "schema_version": (
+            "ac_dev.direct_exact_active_provenance_authority.v1"
+        ),
+        "accepted": all(checks.values()),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "same_wip_scope": same_wip_scope,
+        "source_free_maintenance_scope": source_free_scope,
+        "activation_scope": activation_scope,
+        "checks": checks,
+        "missing_requirement_ids": [
+            requirement for requirement, passed in checks.items() if not passed
+        ],
+        "reconcile_event_id": event_id,
+        "writes_performed": False,
+    }
+
+
 def _dev_direct_graph_bootstrap_reconcile_authority(
     conn,
     *,
@@ -96089,6 +96283,19 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         ).strip().lower()
         == active_commit
     )
+    exact_active_provenance_authority = (
+        _dev_direct_exact_active_provenance_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            snapshot_id=active_snapshot_id,
+            target_commit=target_commit,
+            active_binding=active_binding,
+        )
+        if local_active_graph_present
+        else {"accepted": False, "missing_requirement_ids": []}
+    )
     exact_canonical_active = bool(
         readiness_compatible
         and readiness is None
@@ -96101,6 +96308,8 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         and str(target_identity.get("snapshot_id") or "").strip()
         == canonical_target_snapshot_id
         and target_identity.get("legacy_identity_selected") is not True
+        and active_provenance_exact
+        and exact_active_provenance_authority.get("accepted") is True
     )
     canonical_dev_world = bool(
         world.get("runtime_plane") == "dev"
@@ -96212,6 +96421,9 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "unique_default_active_ref": unique_default_active_ref,
         "unique_full_active_status": unique_full_active_status,
         "active_predecessor_provenance_verified": active_provenance_exact,
+        "exact_active_provenance_authority": dict(
+            exact_active_provenance_authority
+        ),
         "target_snapshot_identity": dict(target_identity),
         "contract_runtime_first_missing_line": next_line_id,
         "contract_runtime_completed_line_count": len(completed_lines),
