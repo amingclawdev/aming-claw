@@ -96357,7 +96357,7 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     *,
     project_id: str,
     auth: Mapping[str, Any],
-    direct_main_qa_preflight: Mapping[str, Any],
+    direct_main_qa_preflight: Mapping[str, Any] | None = None,
     body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compose existing gates for the pre-implementation AC-dev bootstrap."""
@@ -96371,31 +96371,8 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     )
     backlog_id = str(route_scope.get("backlog_id") or "").strip()
     task_id = str(route_scope.get("task_id") or "").strip()
-    active_route_authority = (
-        direct_main_qa_preflight.get("active_route_authority")
-        if isinstance(
-            direct_main_qa_preflight.get("active_route_authority"),
-            Mapping,
-        )
-        else {}
-    )
     session_id = str(auth.get("observer_session_id") or "").strip()
     route_token_ref = str(auth.get("route_token_ref") or "").strip()
-    route_identity = (
-        active_route_authority.get("active_route_identity")
-        if isinstance(
-            active_route_authority.get("active_route_identity"), Mapping
-        )
-        else {}
-    )
-    route_bound_session = _unique_active_route_bound_observer_session(
-        conn, project_id=project_id, session_id=session_id,
-        route_token_ref=route_token_ref, route_identity=route_identity,
-        backlog_id=backlog_id, task_id=task_id,
-    )
-    next_line_id = str(
-        direct_main_qa_preflight.get("contract_runtime_next_line_id") or ""
-    ).strip()
     readiness = None
     readiness_compatible = True
     try:
@@ -96459,6 +96436,29 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
             [str(path or "").strip() for path in runtime_binding.get("target_files") or []]
         )
     )
+    active_route_authority = (
+        _operator_supervised_direct_main_active_route_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            immutable_route_identity=binding_route_identity,
+            active_route_token_ref=route_token_ref,
+            expected_files=binding_files,
+        )
+    )
+    route_identity = (
+        active_route_authority.get("active_route_identity")
+        if isinstance(
+            active_route_authority.get("active_route_identity"), Mapping
+        )
+        else {}
+    )
+    route_bound_session = _unique_active_route_bound_observer_session(
+        conn, project_id=project_id, session_id=session_id,
+        route_token_ref=route_token_ref, route_identity=route_identity,
+        backlog_id=backlog_id, task_id=task_id,
+    )
     binding_world = (
         runtime_binding.get("runtime_world_authority")
         if isinstance(runtime_binding.get("runtime_world_authority"), Mapping)
@@ -96474,6 +96474,13 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         for line in direct_record.get("completed_lines") or []
         if isinstance(line, Mapping)
     ]
+    runtime_position = _runtime_current_state_from_record(direct_record)
+    runtime_next = (
+        runtime_position.get("next_legal_action")
+        if isinstance(runtime_position.get("next_legal_action"), Mapping)
+        else {}
+    )
+    next_line_id = str(runtime_next.get("line_id") or "").strip()
     binding_errors = operator_supervised_direct_main_runtime_binding_errors(
         {
             "contract_id": str(direct_record.get("contract_id") or "").strip(),
@@ -96498,7 +96505,11 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         else {}
     )
     preimplementation_contract_runtime = bool(
-        direct_main_qa_preflight.get("applicable") is True
+        str(direct_record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(direct_record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        and runtime_binding.get("strict_runtime_binding_required") is True
         and active_route_authority.get("passed") is True
         and next_line_id == "observer_bind_direct_scope"
         and completed_lines == []
@@ -99023,6 +99034,20 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         source_free_reconcile_authority = request_category.get(
             "source_free_reconcile_authority"
         )
+        direct_graph_bootstrap_request = bool(
+            request_category.get("category")
+            == "operator_supervised_direct_main"
+        )
+        dev_graph_bootstrap_authority = (
+            _dev_direct_graph_bootstrap_reconcile_authority(
+                conn,
+                project_id=project_id,
+                auth=current_full_auth,
+                body=dict(body),
+            )
+            if direct_graph_bootstrap_request
+            else {"applicable": False, "eligible": False, "accepted": False}
+        )
         direct_main_qa_preflight_authority = (
             _operator_supervised_direct_main_reconcile_qa_preflight_authority(
                 conn,
@@ -99030,27 +99055,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 target_commit=target_commit,
                 current_full_auth=current_full_auth,
             )
-        )
-        direct_graph_bootstrap_request = bool(
-            request_category.get("category")
-            == "operator_supervised_direct_main"
-            and direct_main_qa_preflight_authority.get(
-                "contract_runtime_next_line_id"
-            )
-            == "observer_bind_direct_scope"
-        )
-        dev_graph_bootstrap_authority = (
-            _dev_direct_graph_bootstrap_reconcile_authority(
-                conn,
-                project_id=project_id,
-                auth=current_full_auth,
-                direct_main_qa_preflight=(
-                    direct_main_qa_preflight_authority
-                ),
-                body=dict(body),
-            )
-            if direct_graph_bootstrap_request
-            else {"applicable": False, "eligible": False, "accepted": False}
         )
         terminal_replay_authority = (
             _dev_direct_existing_candidate_terminal_replay_authority(
@@ -99827,6 +99831,14 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         "graph-governance.reconcile.current-full",
                         route_ref_renew_within_seconds=0,
                     )
+                    locked_authority = (
+                        _dev_direct_graph_bootstrap_reconcile_authority(
+                            conn,
+                            project_id=project_id,
+                            auth=locked_auth,
+                            body=dict(body),
+                        )
+                    )
                     locked_qa_preflight = (
                         _operator_supervised_direct_main_reconcile_qa_preflight_authority(
                             conn,
@@ -99849,15 +99861,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                             )
                             else {}
                         ),
-                    )
-                    locked_authority = (
-                        _dev_direct_graph_bootstrap_reconcile_authority(
-                            conn,
-                            project_id=project_id,
-                            auth=locked_auth,
-                            direct_main_qa_preflight=locked_qa_preflight,
-                            body=dict(body),
-                        )
                     )
                     locked_route_evidence = (
                         _current_full_reconcile_route_evidence(

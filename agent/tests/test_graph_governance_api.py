@@ -214266,6 +214266,122 @@ def test_direct_graph_query_exact_cex_activates_existing_candidate_before_write(
     )
 
 
+def test_direct_existing_candidate_bootstrap_precedes_postimplementation_qa_gate(
+    conn, monkeypatch, tmp_path,
+):
+    prepared = _prepare_direct_existing_candidate_activation_case(
+        conn, monkeypatch, tmp_path,
+    )
+    case = prepared["case"]
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]}, method="POST",
+            body=copy.deepcopy(prepared["onboard_body"]),
+        )
+    )
+    action = guide["next_legal_action"]
+    assert action["id"] == (
+        "dev_local_graph_existing_candidate_activation_required"
+    )
+    request_body = dict(action["copy_safe_body"])
+    request_body.pop("project_id")
+
+    original_bootstrap = server._dev_direct_graph_bootstrap_reconcile_authority
+    original_qa_preflight = (
+        server._operator_supervised_direct_main_reconcile_qa_preflight_authority
+    )
+    for predicate_failure in ("missing", "wrong"):
+        def failed_predicate(*args, **kwargs):
+            if predicate_failure == "missing":
+                return {"applicable": False, "accepted": False}
+            authority = original_bootstrap(*args, **kwargs)
+            assert authority["existing_candidate_activation_required"] is True
+            return {
+                **authority,
+                "accepted": False,
+                "existing_candidate_activation_required": False,
+            }
+
+        before = tuple(conn.iterdump())
+        before_changes = conn.total_changes
+        with monkeypatch.context() as failed:
+            failed.setattr(
+                server,
+                "_dev_direct_graph_bootstrap_reconcile_authority",
+                failed_predicate,
+            )
+            failed.setattr(
+                server,
+                "admit_ac_dev_graph_materialization_schema",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "invalid bootstrap predicate reached graph admission"
+                ),
+            )
+            status, response = (
+                server.handle_graph_governance_current_full_reconcile(
+                    _ctx(
+                        {"project_id": case["project_id"]}, method="POST",
+                        body=request_body,
+                    )
+                )
+            )
+        assert status == 409
+        assert response["error"] == (
+            "operator_supervised_direct_main_qa_before_reconcile_required"
+        )
+        assert response["writes_performed"] is False
+        assert conn.total_changes == before_changes
+        assert tuple(conn.iterdump()) == before
+
+    ordering = {"bootstrap_calls": 0, "qa_calls": 0}
+
+    def ordered_bootstrap(*args, **kwargs):
+        ordering["bootstrap_calls"] += 1
+        return original_bootstrap(*args, **kwargs)
+
+    def postimplementation_qa_preflight(*args, **kwargs):
+        assert ordering["bootstrap_calls"] > ordering["qa_calls"], (
+            "postimplementation QA gate ran before the fresh-bind graph "
+            "bootstrap authority was consumed"
+        )
+        ordering["qa_calls"] += 1
+        return original_qa_preflight(*args, **kwargs)
+
+    class BootstrapAdmissionReached(RuntimeError):
+        pass
+
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    with monkeypatch.context() as ordered:
+        ordered.setattr(
+            server,
+            "_dev_direct_graph_bootstrap_reconcile_authority",
+            ordered_bootstrap,
+        )
+        ordered.setattr(
+            server,
+            "_operator_supervised_direct_main_reconcile_qa_preflight_authority",
+            postimplementation_qa_preflight,
+        )
+        ordered.setattr(
+            server,
+            "admit_ac_dev_graph_materialization_schema",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                BootstrapAdmissionReached()
+            ),
+        )
+        with pytest.raises(BootstrapAdmissionReached):
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx(
+                    {"project_id": case["project_id"]}, method="POST",
+                    body=request_body,
+                )
+            )
+    assert ordering == {"bootstrap_calls": 1, "qa_calls": 1}
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
 def test_ac_dev_direct_terminal_successor_create_replay_and_rollback(
     conn, monkeypatch, tmp_path,
 ):
