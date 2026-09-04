@@ -148674,11 +148674,154 @@ def _direct_fix_branch_service_takeover_guidance() -> dict[str, Any]:
     }
 
 
+def _onboard_direct_qa_graph_snapshot_selection(
+    conn,
+    *,
+    project_id: str,
+    candidate_commit: str,
+    target_project_root: str,
+) -> dict[str, Any]:
+    """Select one graph that is exactly the Direct QA candidate checkout."""
+
+    candidate = str(candidate_commit or "").strip().lower()
+    target_root = str(target_project_root or "").strip()
+    blocked = {
+        "status": "blocked",
+        "accepted": False,
+        "blocker_id": "qa_direct_candidate_graph_identity_unavailable",
+        "project_id": project_id,
+        "candidate_commit_sha": candidate,
+        "target_project_root": target_root,
+        "read_only": True,
+        "writes_performed": False,
+    }
+    if (
+        conn is None
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate)
+        or not target_root
+    ):
+        return {**blocked, "reason": "candidate_graph_identity_incomplete"}
+
+    active_rows = conn.execute(
+        """
+        SELECT s.*, r.commit_sha AS active_ref_commit_sha
+        FROM graph_snapshot_refs AS r
+        JOIN graph_snapshots AS s
+          ON s.project_id = r.project_id
+         AND s.snapshot_id = r.snapshot_id
+        WHERE r.project_id = ? AND r.ref_name = 'active'
+        """,
+        (project_id,),
+    ).fetchall()
+    if len(active_rows) == 1:
+        active = dict(active_rows[0])
+        active_snapshot_commit = str(
+            active.get("commit_sha") or ""
+        ).strip().lower()
+        if (
+            str(active.get("active_ref_commit_sha") or "").strip().lower()
+            == active_snapshot_commit
+            == candidate
+            and str(active.get("snapshot_kind") or "").strip() == "full"
+            and str(active.get("status") or "").strip().lower() == "active"
+        ):
+            return {
+                "status": "selected",
+                "accepted": True,
+                "snapshot_id": "active",
+                "resolved_snapshot_id": str(active.get("snapshot_id") or ""),
+                "snapshot_commit_sha": candidate,
+                "selection_source": "active_exact_candidate_commit",
+                "project_id": project_id,
+                "target_project_root": target_root,
+                "read_only": True,
+                "writes_performed": False,
+            }
+
+    candidate_rows = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM graph_snapshots
+            WHERE project_id = ? AND commit_sha = ?
+              AND snapshot_kind = 'full' AND status = 'candidate'
+            ORDER BY created_at DESC, snapshot_id DESC
+            """,
+            (project_id, candidate),
+        ).fetchall()
+    ]
+    if len(candidate_rows) != 1:
+        return {
+            **blocked,
+            "reason": "candidate_snapshot_cardinality",
+            "candidate_snapshot_count": len(candidate_rows),
+        }
+
+    snapshot = candidate_rows[0]
+    notes = _json_loads(snapshot.get("notes"), {})
+    checkout = (
+        notes.get("checkout_provenance")
+        if isinstance(notes, Mapping)
+        and isinstance(notes.get("checkout_provenance"), Mapping)
+        else {}
+    )
+    checkout_git = (
+        checkout.get("git")
+        if isinstance(checkout.get("git"), Mapping)
+        else {}
+    )
+    project_identity = (
+        checkout.get("canonical_project_identity")
+        if isinstance(checkout.get("canonical_project_identity"), Mapping)
+        else {}
+    )
+    expected_root = str(Path(target_root).expanduser().resolve())
+
+    def resolved_root(value: Any) -> str:
+        text = str(value or "").strip()
+        return str(Path(text).expanduser().resolve()) if text else ""
+
+    identity_mismatches = [
+        field
+        for field, expected, actual in (
+            ("checkout_project_id", project_id, str(checkout.get("project_id") or "")),
+            ("project_identity_type", "git", str(project_identity.get("type") or "")),
+            ("project_identity_project_id", project_id, str(project_identity.get("project_id") or "")),
+            ("project_identity_commit", candidate, str(project_identity.get("commit_sha") or "").strip().lower()),
+            ("checkout_commit", candidate, str(checkout.get("commit_sha") or "").strip().lower()),
+            ("execution_root_role", "execution_root", str(checkout.get("execution_root_role") or "")),
+            ("execution_root", expected_root, resolved_root(checkout.get("execution_root"))),
+            ("worktree_root", expected_root, resolved_root(checkout_git.get("worktree_root"))),
+        )
+        if actual != expected
+    ]
+    if identity_mismatches:
+        return {
+            **blocked,
+            "reason": "candidate_snapshot_identity_mismatch",
+            "candidate_snapshot_count": 1,
+            "identity_mismatch_fields": identity_mismatches,
+        }
+    return {
+        "status": "selected",
+        "accepted": True,
+        "snapshot_id": str(snapshot.get("snapshot_id") or ""),
+        "resolved_snapshot_id": str(snapshot.get("snapshot_id") or ""),
+        "snapshot_commit_sha": candidate,
+        "selection_source": "unique_full_candidate_snapshot",
+        "project_id": project_id,
+        "target_project_root": expected_root,
+        "read_only": True,
+        "writes_performed": False,
+    }
+
+
 def _onboard_selected_qa_contract_runtime_guidance(
     record: Mapping[str, Any],
     *,
     next_legal_action: Mapping[str, Any],
     qa_runtime_record: Mapping[str, Any] | None = None,
+    conn=None,
 ) -> dict[str, Any]:
     """Overlay selected-QA guidance for ContractRuntime's current line."""
     action = dict(next_legal_action or {})
@@ -148770,6 +148913,28 @@ def _onboard_selected_qa_contract_runtime_guidance(
             "on_auth_rejection": "hold_for_authorized_role_assignment",
             "response_handling": "Keep response.token only in the QA process; inject it into X-Gov-Token, never into a request body, logs, files, or model-visible output.",
         }
+        graph_selection = _onboard_direct_qa_graph_snapshot_selection(
+            conn,
+            project_id=project_id,
+            candidate_commit=str(body.get("commit_sha") or ""),
+            target_project_root=str(binding.get("target_project_root") or ""),
+        )
+        if graph_selection.get("accepted") is not True:
+            return {
+                "schema_version": "onboard_route_guide.selected_direct_qa.v1",
+                "role": "qa",
+                "status": "blocked",
+                "executable": False,
+                "ordered_steps": [],
+                "contract_execution_id": execution_id,
+                "current_line_id": line_id,
+                "blocker": {
+                    "id": "qa_direct_candidate_graph_identity_unavailable",
+                    "graph_snapshot_selection": graph_selection,
+                },
+                "observer_may_submit": False,
+                "generic_contract_runtime_submit_line_allowed": False,
+            }
         graph_arguments = {
             "project_id": project_id,
             "backlog_id": backlog_id,
@@ -148777,7 +148942,7 @@ def _onboard_selected_qa_contract_runtime_guidance(
             "commit_sha": body["commit_sha"],
             "repo_root": str(binding.get("target_project_root") or ""),
             "tool": "query_schema",
-            "snapshot_id": "active",
+            "snapshot_id": graph_selection["snapshot_id"],
             "query_source": "qa",
             "query_purpose": "independent_verification",
         }
@@ -148814,6 +148979,7 @@ def _onboard_selected_qa_contract_runtime_guidance(
             "source_of_authority": authority,
             "authority_decision_source": authority_source,
             "canonical_direct_identity": session_arguments,
+            "graph_snapshot_selection": graph_selection,
             "writer_role_safe_copy_payload": {
                 "transport": "http", "http_request": http_request,
                 "copy_payload": body,
@@ -152891,7 +153057,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         response["dev_local_graph_bootstrap"] = graph_bootstrap_projection
     if selected_qa:
         selected_guidance = _onboard_selected_qa_contract_runtime_guidance(
-            current_record, next_legal_action=next_action or {},
+            current_record, next_legal_action=next_action or {}, conn=conn,
         )
         response["selected_role_guidance"] = selected_guidance
         response["agent_onboard_guidance"] = {
@@ -154860,13 +155026,14 @@ def _operator_supervised_direct_main_qa_facade_binding(
     actor_role: str,
     line: Mapping[str, Any],
     body: Mapping[str, Any],
+    qa_session_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate the copy-safe Direct QA binding before any runtime write.
 
-    The public timeline facade carries the binding at top level so MCP schema
-    validation cannot silently drop it.  The server independently rebuilds
-    every expected value from the pinned execution and current writer Guide;
-    caller values are equality proofs only and never become authority.
+    The server independently rebuilds every expected value from the pinned
+    execution and current writer Guide.  It may restore only the three lossy
+    transport fields; every supplied value remains an equality proof and
+    never becomes authority.
     """
 
     binding_fields = (
@@ -154938,6 +155105,43 @@ def _operator_supervised_direct_main_qa_facade_binding(
             },
         )
 
+    current_action = _runtime_current_state_from_record(record).get(
+        "next_legal_action"
+    )
+    current_action = (
+        current_action if isinstance(current_action, Mapping) else {}
+    )
+    current_line_identity = {
+        field: str(current_action.get(field) or "").strip()
+        for field in ("stage_id", "line_id", "evidence_kind")
+    }
+    submitted_line_identity = {
+        field: str(line.get(field) or "").strip()
+        for field in ("stage_id", "line_id", "evidence_kind")
+    }
+    if (
+        not all(current_line_identity.values())
+        or current_line_identity != submitted_line_identity
+        or str(current_action.get("owner_role") or "").strip() != "qa"
+    ):
+        raise GovernanceError(
+            "operator_supervised_direct_main_qa_current_line_ambiguous",
+            "Direct Main QA derivation requires one exact current QA writer line",
+            409,
+            {
+                "expected_current_line": current_line_identity,
+                "actual_writer_line": submitted_line_identity,
+                "expected_owner_role": "qa",
+                "actual_owner_role": str(
+                    current_action.get("owner_role") or ""
+                ).strip(),
+                "caller_claims_trusted": False,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+                "writes_performed": False,
+            },
+        )
+
     expected_write = _contract_runtime_write_from_record(
         record,
         actor_role="qa",
@@ -154958,6 +155162,63 @@ def _operator_supervised_direct_main_qa_facade_binding(
     expected["direct_runtime_binding_hash"] = str(
         runtime_binding.get("binding_hash") or ""
     ).strip()
+    derivable_missing_fields = {
+        "contract_execution_id",
+        "execution_state_revision",
+        "direct_runtime_binding_hash",
+    }
+    requested_derivations = sorted(
+        field
+        for field in derivable_missing_fields
+        if body.get(field) in (None, "")
+    )
+    proof = (
+        dict(qa_session_proof)
+        if isinstance(qa_session_proof, Mapping)
+        else {}
+    )
+    expected_proof_scope = {
+        "project_id": str(record.get("project_id") or "").strip(),
+        "backlog_id": str(record.get("backlog_id") or "").strip(),
+        "task_id": str(record.get("contract_execution_id") or "").strip(),
+        "commit_sha": str(body.get("commit_sha") or "").strip().lower(),
+    }
+    proof_mismatches = [
+        field
+        for field, expected_value in expected_proof_scope.items()
+        if str(proof.get(field) or "").strip().lower()
+        != expected_value.lower()
+    ]
+    if requested_derivations and not (
+        proof.get("schema_version") == "qa_session_scope_proof.v1"
+        and proof.get("source") == "authenticated_qa_session"
+        and proof.get("role") == "qa"
+        and proof.get("verified") is True
+        and not proof_mismatches
+    ):
+        raise GovernanceError(
+            "operator_supervised_direct_main_qa_derivation_session_required",
+            "Direct Main QA binding derivation requires exact bounded QA session authority",
+            403,
+            {
+                "requested_derivation_fields": requested_derivations,
+                "qa_session_scope_mismatch_fields": proof_mismatches,
+                "required_scope": expected_proof_scope,
+                "caller_claims_trusted": False,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+                "writes_performed": False,
+            },
+        )
+    derived_fields: list[str] = []
+    if isinstance(body, dict):
+        for field in derivable_missing_fields:
+            if body.get(field) in (None, "") and expected.get(field) not in (
+                None,
+                "",
+            ):
+                body[field] = expected[field]
+                derived_fields.append(field)
     mismatches = [
         {
             "field": field,
@@ -154985,6 +155246,10 @@ def _operator_supervised_direct_main_qa_facade_binding(
                 "required_top_level_fields": list(
                     binding_fields
                 ),
+                "derivable_missing_fields": sorted(
+                    derivable_missing_fields
+                ),
+                "server_derived_fields": sorted(derived_fields),
                 "caller_claims_trusted": False,
                 "server_derived": True,
                 "zero_contract_runtime_write": True,
@@ -154992,7 +155257,10 @@ def _operator_supervised_direct_main_qa_facade_binding(
                 "writes_performed": False,
             },
         )
-    return expected
+    return {
+        **expected,
+        "server_derived_fields": sorted(derived_fields),
+    }
 
 
 def _operator_supervised_direct_main_expected_line_evidence(
@@ -160304,6 +160572,7 @@ def _onboard_contract_route_guide(
     *,
     next_legal_action: Mapping[str, Any],
     qa_runtime_record: Mapping[str, Any] | None = None,
+    conn=None,
 ) -> dict[str, Any]:
     project_id = str(record.get("project_id") or "")
     backlog_id = str(record.get("backlog_id") or "")
@@ -160788,6 +161057,7 @@ def _onboard_contract_route_guide(
             record,
             next_legal_action=next_legal_action,
             qa_runtime_record=qa_runtime_record,
+            conn=conn,
         )
     )
     direct_main_allowed_files = _onboard_contract_route_issue_target_files_from_record(
@@ -161671,6 +161941,7 @@ def _onboard_contract_agent_guidance(
     next_legal_action: Mapping[str, Any],
     selected_role: str = "",
     qa_runtime_record: Mapping[str, Any] | None = None,
+    conn=None,
 ) -> dict[str, Any]:
     project_id = str(record.get("project_id") or "")
     backlog_id = str(record.get("backlog_id") or "")
@@ -161745,6 +162016,7 @@ def _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_legal_action,
         qa_runtime_record=qa_runtime_record,
+        conn=conn,
     )
     role_entries = (
         route_guide.get("role_entries")
@@ -162355,6 +162627,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
             record,
             next_legal_action=patched_next_action,
             qa_runtime_record=qa_runtime_record,
+            conn=conn,
         )
         for container in (guidance, route_guide):
             if isinstance(container, dict):
@@ -167735,6 +168008,7 @@ def _onboard_route_guide_compact_service_response(
     projection_degraded: bool,
     qa_runtime_record: Mapping[str, Any] | None = None,
     requested_task_id: str = "",
+    conn=None,
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -168390,6 +168664,7 @@ def _onboard_route_guide_compact_service_response(
             record,
             next_legal_action=next_action,
             qa_runtime_record=qa_runtime_record,
+            conn=conn,
         )
         if selected_role_key == "qa"
         else {}
@@ -172190,6 +172465,7 @@ def _onboard_route_guide_service_response(
                 runtime_resume=resume,
                 target_files=[],
                 projection_degraded=False,
+                conn=conn,
             )
         return {
             "schema_version": "onboard_route_guide.integration_epoch_resume.v1",
@@ -172252,6 +172528,7 @@ def _onboard_route_guide_service_response(
                 runtime_resume=entered_batch_resume,
                 target_files=target_files,
                 projection_degraded=False,
+                conn=conn,
             )
         return {
             "schema_version": "onboard_route_guide.entered_batch_resume.v1",
@@ -173035,12 +173312,14 @@ def _onboard_route_guide_service_response(
             requested_task_id=str(
                 (request_body or {}).get("task_id") or ""
             ).strip(),
+            conn=conn,
         )
     guidance = _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_action,
         selected_role=str(role or "").strip() or "observer",
         qa_runtime_record=qa_runtime_record,
+        conn=conn,
     )
     if current_projection:
         guidance["contract_chain_current"] = current_projection
@@ -199754,10 +200033,34 @@ def _handle_task_timeline_append(ctx: RequestContext):
                 direct_record = _contract_runtime(conn).current_record(
                     str(ctx.body["task_id"]), actor_role="qa",
                 )
+                qa_session_proof: dict[str, Any] = {}
+                if any(
+                    ctx.body.get(field) in (None, "")
+                    for field in (
+                        "contract_execution_id",
+                        "execution_state_revision",
+                        "direct_runtime_binding_hash",
+                    )
+                ):
+                    _session, qa_session_proof = (
+                        _require_bounded_qa_session_authority(
+                            ctx,
+                            conn,
+                            project_id=project_id,
+                            backlog_id=str(ctx.body.get("backlog_id") or ""),
+                            task_id=str(ctx.body.get("task_id") or ""),
+                            commit_sha=str(ctx.body.get("commit_sha") or ""),
+                            action=(
+                                "task_timeline_append."
+                                "direct_qa_binding_derivation"
+                            ),
+                        )
+                    )
                 _operator_supervised_direct_main_qa_facade_binding(
                     direct_record, actor_role="qa",
                     line=direct_record["runtime_guide"].get("next_legal_action") or {},
                     body=ctx.body,
+                    qa_session_proof=qa_session_proof,
                 )
         contract_runtime_completed_projection_gate = {}
         if (
@@ -222403,6 +222706,7 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
                     runtime_resume={},
                     target_files=[],
                     projection_degraded=False,
+                    conn=conn,
                 )
             if response_view == "full":
                 response["response_view"] = "full"

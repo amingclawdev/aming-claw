@@ -2065,6 +2065,39 @@ def _strict_direct_main_comparison_world(
             ),
         )
     )
+    candidate_snapshot_id = f"full-direct-qa-{suffix.lower()}"
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=candidate_snapshot_id,
+        commit_sha=candidate_commit,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        status="candidate",
+        created_by="qa-fixture",
+        notes=json.dumps(
+            {
+                "checkout_provenance": {
+                    "project_id": PID,
+                    "commit_sha": candidate_commit,
+                    "execution_root": str(project_root.resolve()),
+                    "execution_root_role": "execution_root",
+                    "canonical_project_identity": {
+                        "type": "git",
+                        "project_id": PID,
+                        "commit_sha": candidate_commit,
+                    },
+                    "git": {
+                        "worktree_root": str(project_root.resolve()),
+                        "git_common_dir": str((project_root / ".git").resolve()),
+                        "remote_url": "",
+                    },
+                }
+            },
+            sort_keys=True,
+        ),
+    )
+    conn.commit()
     return {
         "project_root": project_root,
         "backlog_id": backlog_id,
@@ -2073,6 +2106,7 @@ def _strict_direct_main_comparison_world(
         "route_identity": route_identity,
         "base_commit": base_commit,
         "candidate_commit": candidate_commit,
+        "candidate_snapshot_id": candidate_snapshot_id,
         "trace_id": trace_id,
     }
 
@@ -2128,6 +2162,139 @@ def test_direct_qa_selected_facade_has_exact_identity_and_managed_envelope(
                 )
             )
         assert conn.total_changes == changes_before
+
+
+def _direct_qa_selected_graph_request(conn, world):
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID}, "qa", method="POST",
+            body={
+                "backlog_id": world["backlog_id"],
+                "role": "qa",
+                "work_type": "qa_verification",
+                "response_view": "compact",
+            },
+        )
+    )
+    selected = guide["agent_onboard_guidance"]["selected_role_guidance"]
+    if selected.get("status") == "blocked":
+        return guide, selected, {}
+    graph_step = next(
+        step for step in selected["ordered_steps"]
+        if step["id"] == "graph_query_schema"
+    )
+    return guide, selected, graph_step["http_request"]["body"]
+
+
+def test_direct_qa_guide_selects_active_only_at_exact_candidate(
+    conn, monkeypatch, tmp_path,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="QA-GRAPH-ACTIVE",
+    )
+    _guide, selected, graph_body = _direct_qa_selected_graph_request(conn, world)
+    assert selected.get("status") != "blocked"
+    assert graph_body["snapshot_id"] == world["candidate_snapshot_id"]
+    assert graph_body["commit_sha"] == world["candidate_commit"]
+
+    _activate_basic_graph(
+        conn,
+        "full-direct-qa-stale-active",
+        commit_sha=world["base_commit"],
+    )
+    conn.execute(
+        "UPDATE graph_snapshot_refs SET commit_sha=? "
+        "WHERE project_id=? AND ref_name='active'",
+        (world["candidate_commit"], PID),
+    )
+    conn.commit()
+    _guide, selected, graph_body = _direct_qa_selected_graph_request(conn, world)
+    assert selected.get("status") != "blocked"
+    assert graph_body["snapshot_id"] == world["candidate_snapshot_id"]
+
+    store.activate_graph_snapshot(conn, PID, world["candidate_snapshot_id"])
+    conn.commit()
+    _guide, selected, graph_body = _direct_qa_selected_graph_request(conn, world)
+    assert selected.get("status") != "blocked"
+    assert graph_body["snapshot_id"] == "active"
+    assert graph_body["commit_sha"] == world["candidate_commit"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("zero", "multiple", "wrong_commit", "wrong_root", "wrong_world"),
+)
+def test_direct_qa_guide_fails_closed_without_one_exact_candidate_graph(
+    conn, monkeypatch, tmp_path, mutation,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix=f"QA-GRAPH-{mutation}",
+    )
+    snapshot_id = world["candidate_snapshot_id"]
+    if mutation == "zero":
+        conn.execute(
+            "DELETE FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, snapshot_id),
+        )
+    elif mutation == "multiple":
+        source = conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, snapshot_id),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO graph_snapshots
+              (project_id, snapshot_id, commit_sha, parent_snapshot_id,
+               snapshot_kind, ref_name, branch_ref, graph_sha256,
+               inventory_sha256, drift_sha256, status, created_at,
+               created_by, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source["project_id"], f"{snapshot_id}-duplicate",
+                source["commit_sha"], source["parent_snapshot_id"],
+                source["snapshot_kind"], source["ref_name"],
+                source["branch_ref"], source["graph_sha256"],
+                source["inventory_sha256"], source["drift_sha256"],
+                source["status"], "2099-01-01T00:00:00Z",
+                source["created_by"], source["notes"],
+            ),
+        )
+    elif mutation == "wrong_commit":
+        conn.execute(
+            "UPDATE graph_snapshots SET commit_sha=? "
+            "WHERE project_id=? AND snapshot_id=?",
+            (world["base_commit"], PID, snapshot_id),
+        )
+    else:
+        row = conn.execute(
+            "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, snapshot_id),
+        ).fetchone()
+        notes = json.loads(row["notes"])
+        checkout = notes["checkout_provenance"]
+        if mutation == "wrong_root":
+            checkout["execution_root"] = str(tmp_path / "cross-root")
+            checkout["git"]["worktree_root"] = str(tmp_path / "cross-root")
+        else:
+            checkout["project_id"] = "cross-world"
+            checkout["canonical_project_identity"]["project_id"] = "cross-world"
+        conn.execute(
+            "UPDATE graph_snapshots SET notes=? "
+            "WHERE project_id=? AND snapshot_id=?",
+            (json.dumps(notes, sort_keys=True), PID, snapshot_id),
+        )
+    conn.commit()
+
+    changes_before = conn.total_changes
+    _guide, selected, graph_body = _direct_qa_selected_graph_request(conn, world)
+    assert selected["status"] == "blocked"
+    assert selected["executable"] is False
+    assert selected["blocker"]["id"] == (
+        "qa_direct_candidate_graph_identity_unavailable"
+    )
+    assert graph_body == {}
+    assert conn.total_changes == changes_before
 
 
 def _direct_qa_facade_http_session(conn, world):
@@ -2186,6 +2353,7 @@ def _direct_qa_facade_http_session(conn, world):
     def append(body, *, token_override=None):
         return api({**request, "body": body}, token_override or qa_token)
 
+    append.qa_session_id = registered["session_id"]
     return append, body, guide
 
 
@@ -2310,29 +2478,161 @@ def test_direct_qa_http_facade_paired_transition_and_zero_write_rejections(
     assert lines[-1]["status"] == verdict
 
 
-def test_direct_qa_native_mcp_filtering_gap_is_explicit_and_not_runnable(
+def test_direct_qa_missing_lossy_binding_fields_are_server_derived(
     conn, monkeypatch, tmp_path,
 ):
-    """Characterize the unfixed transport; HTTP success is not MCP success."""
-    from agent.mcp.tools import _task_timeline_body
-
     world = _strict_direct_main_comparison_world(
-        conn, monkeypatch, tmp_path, suffix="KNOWN-MCP-GAP",
+        conn, monkeypatch, tmp_path, suffix="LOSSY-BINDING",
     )
     append, body, guide = _direct_qa_facade_http_session(conn, world)
-    forged = {**body, "contract_execution_id": "onboard-service-forged"}
-    filtered = _task_timeline_body(forged)
-    assert not set(filtered).intersection({
-        "contract_execution_id", "execution_state_revision", "stage_id",
-        "line_id", "runtime_guide_hash", "direct_runtime_binding_hash",
-    })
+    filtered = copy.deepcopy(body)
+    for field in (
+        "contract_execution_id",
+        "execution_state_revision",
+        "direct_runtime_binding_hash",
+    ):
+        filtered.pop(field)
     assert guide["next_legal_action"]["mcp_tool"] == ""
     assert guide["next_legal_action"]["native_mcp_transport"]["runnable"] is False
     assert guide["next_legal_action"]["native_mcp_transport"]["transport_repair_claimed"] is False
+    accepted = append(filtered)
+    authority = accepted["payload"]["source_backed_contract_gate_authority"]
+    assert authority["qa_session_proof"]["task_id"] == world["task_id"]
+    lines = server._contract_runtime(conn).current_record(
+        world["task_id"], actor_role="qa",
+    )["completed_lines"]
+    assert [line["line_id"] for line in lines[-2:]] == [
+        "qa_graph_context", "qa_independent_verification",
+    ]
+
+
+@pytest.mark.parametrize("session_state", ("expired", "wrong_scope"))
+def test_direct_qa_missing_binding_rejects_noncurrent_qa_session_zero_write(
+    conn, monkeypatch, tmp_path, session_state,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix=f"SESSION-{session_state}",
+    )
+    append, body, _guide = _direct_qa_facade_http_session(conn, world)
+    if session_state == "expired":
+        conn.execute(
+            "UPDATE sessions SET expires_at=? WHERE session_id=?",
+            ("2000-01-01T00:00:00Z", append.qa_session_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE sessions SET scope_json=? WHERE session_id=?",
+            (json.dumps([f"backlog:{world['backlog_id']}"]), append.qa_session_id),
+        )
+    conn.commit()
+    lossy = copy.deepcopy(body)
+    for field in (
+        "contract_execution_id",
+        "execution_state_revision",
+        "direct_runtime_binding_hash",
+    ):
+        lossy.pop(field)
+    runtime_before = server._contract_runtime(conn).store.get(world["task_id"])
+    events_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    changes_before = conn.total_changes
+    with pytest.raises(GovernanceError, match="QA session|session"):
+        append(lossy)
+    if session_state == "expired":
+        # Authentication monotonically terminalizes the expired credential;
+        # that authority-state write is not a timeline/ContractRuntime write.
+        assert conn.total_changes == changes_before + 1
+        assert conn.execute(
+            "SELECT status FROM sessions WHERE session_id=?",
+            (append.qa_session_id,),
+        ).fetchone()["status"] == "expired"
+    else:
+        assert conn.total_changes == changes_before
+    assert server._contract_runtime(conn).store.get(world["task_id"]) == runtime_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == events_before
+
+
+@pytest.mark.parametrize("field", ("stage_id", "line_id", "runtime_guide_hash"))
+def test_direct_qa_non_derivable_writer_fields_remain_required(
+    conn, monkeypatch, tmp_path, field,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix=f"REQUIRED-{field}",
+    )
+    append, body, _guide = _direct_qa_facade_http_session(conn, world)
+    rejected = copy.deepcopy(body)
+    rejected.pop(field)
     before = conn.total_changes
     with pytest.raises(GovernanceError, match="binding"):
-        append(filtered)
+        append(rejected)
     assert conn.total_changes == before
+
+
+def test_direct_qa_binding_derivation_rechecks_revision_race(
+    conn, monkeypatch, tmp_path,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="REVISION-RACE",
+    )
+    append, body, _guide = _direct_qa_facade_http_session(conn, world)
+    lossy = copy.deepcopy(body)
+    for field in (
+        "contract_execution_id",
+        "execution_state_revision",
+        "direct_runtime_binding_hash",
+    ):
+        lossy.pop(field)
+    original = server._contract_runtime_write_from_record
+    calls = 0
+
+    def revision_race(*args, **kwargs):
+        nonlocal calls
+        result = original(*args, **kwargs)
+        if kwargs.get("actor_role") == "qa" and kwargs.get("line_id") in {
+            "qa_graph_context", "qa_independent_verification",
+        }:
+            calls += 1
+            if calls > 1:
+                result["execution_state_revision"] += 1
+        return result
+
+    monkeypatch.setattr(
+        server, "_contract_runtime_write_from_record", revision_race,
+    )
+    before = conn.total_changes
+    with pytest.raises(GovernanceError, match="binding"):
+        append(lossy)
+    assert calls > 1
+    assert conn.total_changes == before
+
+
+def test_direct_qa_binding_derivation_does_not_apply_to_non_qa_line(
+    conn, monkeypatch, tmp_path,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="NO-QA-DERIVATION",
+    )
+    record = server._contract_runtime(conn).store.get(world["task_id"])
+    body = {
+        "project_id": PID,
+        "backlog_id": world["backlog_id"],
+        "task_id": world["task_id"],
+    }
+    before = copy.deepcopy(body)
+    assert server._operator_supervised_direct_main_qa_facade_binding(
+        record,
+        actor_role="observer",
+        line={
+            "stage_id": "implementation",
+            "line_id": "observer_implementation",
+            "evidence_kind": "implementation",
+        },
+        body=body,
+    ) == {}
+    assert body == before
 
 
 def test_strict_direct_main_rev3_comparison_authority_persists_exact_diff(
