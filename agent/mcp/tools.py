@@ -3383,6 +3383,117 @@ def _onboard_route_guide_body(args: dict) -> dict:
     return body
 
 
+def _onboard_route_guide_mcp_compact_result(value: Any) -> Any:
+    """Deduplicate an executable compact guide before the stdio frame.
+
+    Governance intentionally repeats the same copy-safe action in several
+    advisory paths for HTTP compatibility.  JSON-RPC string escaping can push
+    that otherwise bounded response over the MCP frame limit.  Preserve the
+    exact executable body once together with its source binding and routing
+    identity, while omitting only duplicate advisory projections.
+    """
+
+    if not isinstance(value, dict) or value.get("response_view") != "compact":
+        return value
+    serialized_bytes = len(
+        json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+    if serialized_bytes <= 128 * 1024:
+        return value
+
+    canonical = (
+        value.get("canonical_executable_action")
+        if isinstance(value.get("canonical_executable_action"), dict)
+        else {}
+    )
+    copy_safe_body = (
+        value.get("copy_safe_body")
+        if isinstance(value.get("copy_safe_body"), dict)
+        else canonical.get("copy_safe_body")
+        if isinstance(canonical.get("copy_safe_body"), dict)
+        else {}
+    )
+    next_action = (
+        value.get("next_legal_action")
+        if isinstance(value.get("next_legal_action"), dict)
+        else {}
+    )
+    identity_fields = (
+        "action",
+        "id",
+        "interface",
+        "facade",
+        "mcp_tool",
+        "stage_id",
+        "line_id",
+        "evidence_kind",
+        "owner_role",
+        "actor_role",
+        "contract_execution_id",
+        "execution_state_revision",
+        "execution_state_hash",
+        "runtime_guide_hash",
+        "route_token_ref",
+        "target_commit_sha",
+        "commit_sha",
+        "action_input_path",
+    )
+
+    compact = {
+        "schema_version": "onboard_route_guide.mcp_compact_projection.v1",
+        **{
+            key: value[key]
+            for key in (
+                "ok",
+                "status",
+                "response_view",
+                "project_id",
+                "backlog_id",
+                "selected_role",
+                "selected_work_type",
+                "selected_task_id",
+                "source_of_authority",
+                "contract_execution_id",
+                "execution_state_revision",
+                "projection_hash",
+                "facade",
+                "mcp_tool",
+                "actionable",
+                "action_input_path",
+                "guide_capsule_ref",
+                "host_precursor_required",
+                "projection_degraded",
+            )
+            if key in value
+        },
+        "next_legal_action": {
+            key: next_action[key]
+            for key in identity_fields
+            if key in next_action
+        },
+        "canonical_executable_action": {
+            key: canonical[key]
+            for key in identity_fields
+            if key in canonical
+        },
+        "copy_safe_body": copy_safe_body,
+        "source_serialized_bytes": serialized_bytes,
+        "duplicate_advisory_projections_omitted": True,
+        "exact_copy_safe_body_preserved": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "advisory_only": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+        "synthesizes_pass": False,
+    }
+    compact["serialized_bytes"] = len(
+        json.dumps(compact, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+    return compact
+
+
 def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
     properties: dict[str, Any] = {
         "project_id": {"type": "string"},
@@ -8611,11 +8722,13 @@ class ToolDispatcher:
 
         if name == "onboard_route_guide":
             pid = args["project_id"]
-            return self._governance_api_with_timeout(
-                "POST",
-                f"/api/projects/{pid}/onboard-route-guide",
-                _onboard_route_guide_body(args),
-                timeout_seconds=_contract_runtime_mcp_timeout_seconds(args),
+            return _onboard_route_guide_mcp_compact_result(
+                self._governance_api_with_timeout(
+                    "POST",
+                    f"/api/projects/{pid}/onboard-route-guide",
+                    _onboard_route_guide_body(args),
+                    timeout_seconds=_contract_runtime_mcp_timeout_seconds(args),
+                )
             )
 
         if name == "onboard_route_guide_section_fetch":

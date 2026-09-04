@@ -5816,6 +5816,73 @@ def test_managed_direct_facades_use_bounded_timeout_transport_without_forwarding
         assert schema["default"] == 120
 
 
+def test_onboard_route_guide_mcp_compaction_preserves_exact_action_once():
+    direct_body = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-COMPACT",
+        "task_id": "cex-direct-compact",
+        "event_type": "graph.reconcile",
+        "event_kind": "close_ready",
+        "contract_execution_id": "cex-direct-compact",
+        "execution_state_revision": 7,
+        "stage_id": "reconcile",
+        "line_id": "observer_reconcile",
+        "evidence_kind": "current_full_reconcile",
+        "runtime_guide_hash": "sha256:" + ("1" * 64),
+        "direct_runtime_binding_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-direct-compact",
+    }
+    duplicate = {"large_advisory": "x" * (70 * 1024)}
+    source = {
+        "schema_version": "onboard_route_guide.compact.v1",
+        "ok": True,
+        "response_view": "compact",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-COMPACT",
+        "selected_role": "observer",
+        "selected_work_type": "operator_supervised_direct_main",
+        "selected_task_id": "cex-direct-compact",
+        "contract_execution_id": "cex-direct-compact",
+        "execution_state_revision": 7,
+        "projection_hash": "sha256:" + ("3" * 64),
+        "facade": "task_timeline_append",
+        "mcp_tool": "task_timeline_append",
+        "actionable": True,
+        "guide_capsule_ref": "gcap-direct-compact",
+        "next_legal_action": {
+            "action": "record_close_ready",
+            "stage_id": "reconcile",
+            "line_id": "observer_reconcile",
+            **duplicate,
+        },
+        "canonical_executable_action": {
+            "action": "record_close_ready",
+            "facade": "task_timeline_append",
+            "mcp_tool": "task_timeline_append",
+            "copy_safe_body": direct_body,
+            **duplicate,
+        },
+        "copy_safe_body": direct_body,
+        "action_input": {"copy_safe_body": direct_body, **duplicate},
+        "role_guidance": duplicate,
+    }
+
+    compact = mcp_tools._onboard_route_guide_mcp_compact_result(source)
+
+    assert compact["schema_version"] == (
+        "onboard_route_guide.mcp_compact_projection.v1"
+    )
+    assert compact["copy_safe_body"] == direct_body
+    assert compact["canonical_executable_action"] == {
+        "action": "record_close_ready",
+        "facade": "task_timeline_append",
+        "mcp_tool": "task_timeline_append",
+    }
+    assert compact["guide_capsule_ref"] == "gcap-direct-compact"
+    assert compact["duplicate_advisory_projections_omitted"] is True
+    assert compact["serialized_bytes"] < 16 * 1024
+
+
 def test_managed_runtime_host_issuance_timeout_is_transport_only_and_stages():
     route = {
         "route_id": "route-host-issuance-timeout",
