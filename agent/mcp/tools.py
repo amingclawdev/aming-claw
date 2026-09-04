@@ -6505,6 +6505,16 @@ TOOLS: list[dict] = [
                     "description": "Graph query tool, e.g. query_schema, find_node_by_path, search_structure, function_index, function_callers, function_callees, high_function_degree, degree_summary, high_degree_nodes, search_semantic, get_node, get_neighbors, search_docs, get_file_excerpt.",
                 },
                 "args": {"type": "object"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 10,
+                    "maximum": 3600,
+                    "default": 120,
+                    "description": (
+                        "MCP-to-governance graph-query transport timeout only; "
+                        "never forwarded into audited query data."
+                    ),
+                },
                 "snapshot_id": {"type": "string"},
                 "actor": {"type": "string"},
                 "query_source": {
@@ -9178,6 +9188,7 @@ class ToolDispatcher:
             )
 
         if name == "graph_query":
+            timeout_seconds = _contract_runtime_mcp_timeout_seconds(args)
             managed_rejoin = args.pop("managed_rejoin", None)
             managed_rejoin_trigger = "explicit"
             if managed_rejoin is None:
@@ -9270,7 +9281,12 @@ class ToolDispatcher:
                 key: value
                 for key, value in request_args.items()
                 if key
-                not in {"project_id", "qa_session_token", "qa_session_token_ref"}
+                not in {
+                    "project_id",
+                    "qa_session_token",
+                    "qa_session_token_ref",
+                    "timeout_seconds",
+                }
                 and value is not None
             }
             body.setdefault("query_source", "observer")
@@ -9286,12 +9302,14 @@ class ToolDispatcher:
                     f"/api/graph-governance/{pid}/query",
                     body,
                     role_token=qa_session_token,
+                    timeout_seconds=timeout_seconds,
                 )
             else:
-                result = self._api(
+                result = self._governance_api_with_timeout(
                     "POST",
                     f"/api/graph-governance/{pid}/query",
                     body,
+                    timeout_seconds=timeout_seconds,
                 )
             return _bounded_mf_sub_graph_query_result(result, request_args)
 

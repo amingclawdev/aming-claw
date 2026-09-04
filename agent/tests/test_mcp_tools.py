@@ -6087,6 +6087,7 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
     assert "qa_session_token" in _tool_properties("qa_session_heartbeat")
     assert "qa_session_token" in _tool_properties("graph_query")
     assert "qa_session_token_ref" in _tool_properties("graph_query")
+    assert _tool_properties("graph_query")["timeout_seconds"]["default"] == 120
     assert "qa_session_token" in _tool_properties("task_timeline_append")
     qa_register = next(
         tool for tool in TOOLS if tool.get("name") == "qa_session_register"
@@ -6330,6 +6331,54 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
             },
             "gov-qa-token",
         ),
+    ]
+
+
+def test_mcp_graph_query_uses_bounded_transport_timeout_without_forwarding_it():
+    calls = []
+    dispatcher = ToolDispatcher(
+        api_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("graph query must use timeout-aware transport")
+        ),
+        worker_pool=None,
+        workspace="/repo",
+    )
+
+    def with_role(method, path, data=None, *, role_token, timeout_seconds=15):
+        calls.append((method, path, data, role_token, timeout_seconds))
+        return {"ok": True}
+
+    dispatcher._api_with_role_token = with_role
+    dispatcher.dispatch(
+        "graph_query",
+        {
+            "project_id": "aming-claw",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": "AC-QA-TIMEOUT",
+            "task_id": "cex-qa-timeout",
+            "commit_sha": "a" * 40,
+            "qa_session_token": "qa-secret",
+            "timeout_seconds": 180,
+        },
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/query",
+            {
+                "tool": "query_schema",
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "backlog_id": "AC-QA-TIMEOUT",
+                "task_id": "cex-qa-timeout",
+                "commit_sha": "a" * 40,
+            },
+            "qa-secret",
+            180,
+        )
     ]
 
 
