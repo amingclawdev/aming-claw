@@ -4,6 +4,22 @@ This runbook captures the visual supplement for the formal R5 release gate. It
 does not replace ContractRuntime, graph, tests, independent QA, or close-gate
 evidence.
 
+## Runtime-plane boundary
+
+- Port `40008` is the AC-dev control plane for `project_id=aming-claw` source
+  WIP only. Keep AC-dev at `WIP=1`; never use stable port `40000` to govern
+  Aming Claw development rows.
+- An outer no-PASS repair or WAIVE that unblocks AC-dev is diagnostic and
+  audit-only. It is never QA, PASS, FIXED, close, promotion, or stable evidence.
+- After the repaired AC-dev candidate completes ordinary verification and is
+  promoted to stable, port `40000` governs external project fixtures. Daily
+  Planner is an external probe fixture, not an AC-dev backlog replacement.
+- Only after that promotion, run the three fresh isolated Daily Planner probes
+  below. Keep the Direct Main, MF Parallel single-row, and MF Batch multi-row
+  outcomes independent from the AC-dev repair row. Record and correct retryable
+  process errors; a true probe block stops the run and returns the issue to
+  AC-dev repair before another promotion and fresh probe run.
+
 ## Release identity and scope
 
 - Open `http://127.0.0.1:40000/dashboard?project_id=aming-claw&view=demo` in the
