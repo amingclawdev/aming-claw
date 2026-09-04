@@ -5797,11 +5797,23 @@ def test_managed_direct_facades_use_bounded_timeout_transport_without_forwarding
             "timeout_seconds": 300,
         },
     )
+    closed = dispatcher.dispatch(
+        "backlog_close",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "AC-DIRECT-TIMEOUT",
+            "commit": "a" * 40,
+            "contract_execution_id": "cex-direct-timeout",
+            "route_token_ref": "rtok-direct-timeout",
+            "timeout_seconds": 750,
+        },
+    )
 
     assert timeline["ok"] is True
     assert guide["ok"] is True
     assert preflight["ok"] is True
-    assert [call[3] for call in calls] == [900, 600, 300]
+    assert closed["ok"] is True
+    assert [call[3] for call in calls] == [900, 600, 300, 750]
     assert all("timeout_seconds" not in (call[2] or {}) for call in calls)
     assert calls[2][2] is None
 
@@ -5809,6 +5821,7 @@ def test_managed_direct_facades_use_bounded_timeout_transport_without_forwarding
         "task_timeline_append",
         "onboard_route_guide",
         "preflight_check",
+        "backlog_close",
     ):
         schema = _tool_properties(tool_name)["timeout_seconds"]
         assert schema["minimum"] == 10
@@ -5881,6 +5894,52 @@ def test_onboard_route_guide_mcp_compaction_preserves_exact_action_once():
     assert compact["guide_capsule_ref"] == "gcap-direct-compact"
     assert compact["duplicate_advisory_projections_omitted"] is True
     assert compact["serialized_bytes"] < 16 * 1024
+
+    nested_source = dict(source)
+    nested_source.pop("canonical_executable_action")
+    nested_source.pop("copy_safe_body")
+    nested_source["guide_capsule_ref"] = ""
+    nested_source["guide_capsule"] = {
+        "guide_capsule_ref": "gcap-direct-nested"
+    }
+    nested_source["next_legal_action"] = {
+        **nested_source["next_legal_action"],
+        "canonical_executable_action": {
+            "action": "record_close_ready",
+            "facade": "task_timeline_append",
+            "mcp_tool": "task_timeline_append",
+            "copy_safe_body": direct_body,
+            **duplicate,
+        },
+    }
+
+    nested = mcp_tools._onboard_route_guide_mcp_compact_result(nested_source)
+
+    assert nested["copy_safe_body"] == direct_body
+    assert nested["guide_capsule_ref"] == "gcap-direct-nested"
+
+    direct_next_source = dict(source)
+    direct_next_source.pop("canonical_executable_action")
+    direct_next_source.pop("copy_safe_body")
+    direct_next_source.pop("action_input")
+    direct_next_source["next_legal_action"] = {
+        "action": "task_timeline_append",
+        "mcp_tool": "task_timeline_append",
+        "stage_id": "reconcile",
+        "line_id": "observer_reconcile",
+        "evidence_kind": "current_full_reconcile",
+        "copy_safe_body": direct_body,
+        **duplicate,
+    }
+
+    direct_next = mcp_tools._onboard_route_guide_mcp_compact_result(
+        direct_next_source
+    )
+
+    assert direct_next["copy_safe_body"] == direct_body
+    assert direct_next["canonical_executable_action"]["action"] == (
+        "task_timeline_append"
+    )
 
 
 def test_managed_runtime_host_issuance_timeout_is_transport_only_and_stages():

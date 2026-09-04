@@ -3401,21 +3401,47 @@ def _onboard_route_guide_mcp_compact_result(value: Any) -> Any:
     if serialized_bytes <= 128 * 1024:
         return value
 
-    canonical = (
-        value.get("canonical_executable_action")
-        if isinstance(value.get("canonical_executable_action"), dict)
+    next_action = (
+        value.get("next_legal_action")
+        if isinstance(value.get("next_legal_action"), dict)
         else {}
+    )
+    action_input = (
+        value.get("action_input")
+        if isinstance(value.get("action_input"), dict)
+        else {}
+    )
+    canonical = next(
+        (
+            candidate
+            for candidate in (
+                value.get("canonical_executable_action"),
+                next_action.get("canonical_executable_action"),
+                action_input.get("canonical_executable_action"),
+                next_action
+                if isinstance(next_action.get("copy_safe_body"), dict)
+                else None,
+            )
+            if isinstance(candidate, dict) and candidate
+        ),
+        {},
     )
     copy_safe_body = (
         value.get("copy_safe_body")
         if isinstance(value.get("copy_safe_body"), dict)
         else canonical.get("copy_safe_body")
         if isinstance(canonical.get("copy_safe_body"), dict)
+        else next_action.get("copy_safe_body")
+        if isinstance(next_action.get("copy_safe_body"), dict)
+        else action_input.get("copy_safe_body")
+        if isinstance(action_input.get("copy_safe_body"), dict)
+        else action_input
+        if action_input.get("project_id") and action_input.get("event_type")
         else {}
     )
-    next_action = (
-        value.get("next_legal_action")
-        if isinstance(value.get("next_legal_action"), dict)
+    guide_capsule = (
+        value.get("guide_capsule")
+        if isinstance(value.get("guide_capsule"), dict)
         else {}
     )
     identity_fields = (
@@ -3477,6 +3503,12 @@ def _onboard_route_guide_mcp_compact_result(value: Any) -> Any:
             if key in canonical
         },
         "copy_safe_body": copy_safe_body,
+        "guide_capsule_ref": str(
+            value.get("guide_capsule_ref")
+            or next_action.get("guide_capsule_ref")
+            or guide_capsule.get("guide_capsule_ref")
+            or ""
+        ),
         "source_serialized_bytes": serialized_bytes,
         "duplicate_advisory_projections_omitted": True,
         "exact_copy_safe_body_preserved": True,
@@ -5126,6 +5158,16 @@ TOOLS: list[dict] = [
                 "commit": {"type": "string"},
                 "actor": {"type": "string"},
                 "contract_execution_id": {"type": "string", "description": "Optional ContractRuntime execution id to use for backlog close authority projection."},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
+                    "maximum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS,
+                    "default": _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS,
+                    "description": (
+                        "MCP-to-governance transport timeout only; never "
+                        "forwarded in the backlog close body."
+                    ),
+                },
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected backlog close."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
@@ -8646,7 +8688,12 @@ class ToolDispatcher:
                 )
                 if args.get(key)
             }
-            return self._api("POST", f"/api/backlog/{pid}/{bug_id}/close", body)
+            return self._governance_api_with_timeout(
+                "POST",
+                f"/api/backlog/{pid}/{bug_id}/close",
+                body,
+                timeout_seconds=_contract_runtime_mcp_timeout_seconds(args),
+            )
 
         if name == "backlog_audit_archive":
             pid = args["project_id"]
