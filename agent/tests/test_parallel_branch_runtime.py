@@ -1555,6 +1555,169 @@ def _canonical_test_hash(value: object) -> str:
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def _rev10_premerge_backlog_acceptance_fixture() -> dict[str, object]:
+    workers = []
+    for index, suffix in enumerate(("source", "test"), start=1):
+        identity = {
+            "runtime_context_id": f"mfrctx-rev10-{suffix}",
+            "task_id": f"worker-rev10-{suffix}",
+            "parent_task_id": "cex-rev10-premerge",
+            "worker_id": suffix,
+            "worker_slot_id": suffix,
+            "merge_queue_id": "mq-rev10-premerge",
+            "queue_item_id": f"mqitem-rev10-{suffix}",
+        }
+        workers.append(
+            {
+                **identity,
+                "owned_files": [f"agent/rev10-{suffix}.py"],
+                "finish_gate_acceptance": {
+                    "line_id": "worker_finish_gate",
+                    "line_instance_id": (
+                        f"runtime_context:mfrctx-rev10-{suffix}"
+                    ),
+                    "completed_line_ref": (
+                        "contract_runtime:cex-rev10-premerge:completed_lines:"
+                        f"{index + 10}"
+                    ),
+                    "acceptance_ref": (
+                        "contract_runtime:cex-rev10-premerge:revision:"
+                        f"{index + 20}"
+                    ),
+                    "accepted_execution_state_revision": index + 20,
+                    "line_hash": _canonical_test_hash(
+                        {"line_id": "worker_finish_gate", "lane": suffix}
+                    ),
+                    "db_verified": True,
+                },
+            }
+        )
+    authority: dict[str, object] = {
+        "schema_version": parallel_branch_runtime.MF_PARALLEL_REV10_PREMERGE_BACKLOG_ACCEPTANCE_SCHEMA,
+        "status": "satisfied",
+        "passed": True,
+        "source": "ContractRuntime+RuntimeContext+merge_queue",
+        "server_derived": True,
+        "db_verified": True,
+        "caller_claims_trusted": False,
+        "authority_required": True,
+        "project_id": PROJECT_ID,
+        "backlog_id": "AC-REV10-PREMERGE",
+        "contract_execution_id": "cex-rev10-premerge",
+        "contract_revision": "rev10",
+        "target_ref": "refs/heads/main",
+        "observer_route_token_ref": "rtok-rev10-premerge",
+        "required_worker_count": 2,
+        "dispatch_completed_line_ref": (
+            "contract_runtime:cex-rev10-premerge:completed_lines:2"
+        ),
+        "dispatch_acceptance_ref": (
+            "contract_runtime:cex-rev10-premerge:revision:3"
+        ),
+        "dispatch_line_hash": _canonical_test_hash({"line": "dispatch"}),
+        "prefill_plan_hash": _canonical_test_hash({"plan": "frozen"}),
+        "acceptance_scope": {
+            "accepted": True,
+            "complete": True,
+            "errors": [],
+            "owned_files_union": [
+                "agent/rev10-source.py",
+                "agent/rev10-test.py",
+            ],
+            "criteria_hash": _canonical_test_hash({"criteria": "frozen"}),
+            "closure_hash": _canonical_test_hash({"closure": "frozen"}),
+            "current_closure_hash": _canonical_test_hash(
+                {"closure": "current"}
+            ),
+        },
+        "workers": workers,
+        "selected_lane": {
+            key: workers[0][key]
+            for key in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_id",
+                "worker_slot_id",
+                "merge_queue_id",
+                "queue_item_id",
+            )
+        },
+        "postmerge_qa_required": True,
+        "postmerge_qa_completed": False,
+        "semantic_pass_claimed": False,
+        "preserves_observer_merge_then_reconcile_then_qa": True,
+    }
+    authority["authority_hash"] = _canonical_test_hash(authority)
+    return authority
+
+
+def test_rev10_premerge_backlog_acceptance_requires_exact_server_authority():
+    authority = _rev10_premerge_backlog_acceptance_fixture()
+    rows, blockers, _warnings = parallel_branch_runtime._merge_gate_evidence_rows(
+        {
+            **{
+                key: {"status": "pass"}
+                for key in parallel_branch_runtime.MERGE_GATE_REQUIRED_EVIDENCE
+                if key != "backlog_acceptance"
+            },
+            "backlog_acceptance": authority,
+        }
+    )
+    acceptance_row = next(row for row in rows if row["key"] == "backlog_acceptance")
+    assert acceptance_row["passed"] is True
+    assert acceptance_row["detail"]["authority_valid"] is True
+    assert blockers == ()
+
+    for mutate in (
+        lambda value: value["selected_lane"].__setitem__("worker_slot_id", "forged-slot"),
+        lambda value: value["workers"][0]["owned_files"].append("agent/forged.py"),
+        lambda value: value.__setitem__("authority_hash", "sha256:stale"),
+        lambda value: value.pop("target_ref"),
+        lambda value: value.pop("prefill_plan_hash"),
+        lambda value: value.__setitem__("preserves_observer_merge_then_reconcile_then_qa", False),
+        lambda value: value.__setitem__("postmerge_qa_completed", True),
+    ):
+        forged = copy.deepcopy(authority)
+        mutate(forged)
+        rows, blockers, _warnings = (
+            parallel_branch_runtime._merge_gate_evidence_rows(
+                {
+                    **{
+                        key: {"status": "pass"}
+                        for key in parallel_branch_runtime.MERGE_GATE_REQUIRED_EVIDENCE
+                        if key != "backlog_acceptance"
+                    },
+                    "backlog_acceptance": forged,
+                }
+            )
+        )
+        acceptance_row = next(
+            row for row in rows if row["key"] == "backlog_acceptance"
+        )
+        assert acceptance_row["passed"] is False
+        assert acceptance_row["detail"]["authority_valid"] is False
+        assert [item["code"] for item in blockers] == [
+            "failed_evidence:backlog_acceptance"
+        ]
+
+    # Legacy/other-lane behavior remains status-based; only the exact rev10
+    # schema opts into typed authority verification.
+    rows, blockers, _warnings = parallel_branch_runtime._merge_gate_evidence_rows(
+        {
+            **{
+                key: {"status": "pass"}
+                for key in parallel_branch_runtime.MERGE_GATE_REQUIRED_EVIDENCE
+            },
+            "backlog_acceptance": {"status": "satisfied"},
+        }
+    )
+    assert next(row for row in rows if row["key"] == "backlog_acceptance")[
+        "passed"
+    ] is True
+    assert blockers == ()
+
+
 def test_post_qa_merge_conflict_rejoin_requires_typed_exact_scope_authority(
     tmp_path,
 ) -> None:

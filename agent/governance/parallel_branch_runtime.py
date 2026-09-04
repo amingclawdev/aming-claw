@@ -501,6 +501,10 @@ MERGE_GATE_PASS_STATUSES = {
 MERGE_GATE_DEFERABLE_EVIDENCE = {"semantic_projection"}
 MERGE_GATE_DEFERRED_STATUSES = {"deferred", "intentionally_deferred"}
 
+MF_PARALLEL_REV10_PREMERGE_BACKLOG_ACCEPTANCE_SCHEMA = (
+    "contract_runtime.mf_parallel_rev10_premerge_backlog_acceptance.v1"
+)
+
 TERMINAL_NON_BLOCKING_STATES = {"merged", "abandoned", "cleaned"}
 ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES = {
     STATE_ALLOCATED,
@@ -25081,6 +25085,71 @@ def _evidence_detail(raw: Any) -> dict[str, Any]:
     return {"status": raw}
 
 
+def _mf_parallel_rev10_premerge_backlog_acceptance_valid(
+    raw: Any,
+) -> bool:
+    """Verify the self-hashed server-owned rev10 pre-merge envelope."""
+    if not isinstance(raw, Mapping):
+        return False
+    authority = dict(raw)
+    authority_hash = str(authority.pop("authority_hash", "") or "").strip()
+    count, workers = authority.get("required_worker_count"), authority.get("workers")
+    selected, scope = authority.get("selected_lane"), authority.get("acceptance_scope")
+    if not (
+        authority.get("schema_version")
+        == MF_PARALLEL_REV10_PREMERGE_BACKLOG_ACCEPTANCE_SCHEMA
+        and str(authority.get("status") or "").strip().lower() == "satisfied"
+        and all(authority.get(key) is True for key in ("passed", "server_derived", "db_verified", "authority_required", "preserves_observer_merge_then_reconcile_then_qa", "postmerge_qa_required"))
+        and all(authority.get(key) is False for key in ("caller_claims_trusted", "postmerge_qa_completed", "semantic_pass_claimed"))
+        and authority.get("source") == "ContractRuntime+RuntimeContext+merge_queue" and authority.get("contract_revision") == "rev10"
+        and all(str(authority.get(key) or "").strip() for key in ("project_id", "backlog_id", "contract_execution_id", "target_ref", "observer_route_token_ref", "prefill_plan_hash", "dispatch_completed_line_ref", "dispatch_acceptance_ref", "dispatch_line_hash"))
+        and authority.get("target_ref") == _read_model_normalized_target_ref(str(authority.get("target_ref") or ""))
+        and isinstance(count, int) and count > 0
+        and isinstance(workers, list) and len(workers) == count
+        and isinstance(selected, Mapping) and isinstance(scope, Mapping)
+        and scope.get("accepted") is True and scope.get("complete") is True
+        and not list(scope.get("errors") or [])
+        and authority_hash == _stable_authority_hash(authority)
+    ):
+        return False
+
+    fields = (
+        "runtime_context_id", "task_id", "parent_task_id", "worker_id",
+        "worker_slot_id", "merge_queue_id", "queue_item_id",
+    )
+    distinct = ("runtime_context_id", "task_id", "worker_id", "worker_slot_id", "queue_item_id")
+    identity = lambda item: {field: str(item.get(field) or "").strip() for field in fields}
+    selected_identity = identity(selected)
+    identities: list[dict[str, str]] = []
+    owned_union: set[str] = set()
+    for worker in workers:
+        if not isinstance(worker, Mapping):
+            return False
+        worker_identity, owned_files = identity(worker), worker.get("owned_files")
+        finish = worker.get("finish_gate_acceptance")
+        if not (
+            all(worker_identity.values())
+            and isinstance(owned_files, list)
+            and owned_files == sorted(set(str(path) for path in owned_files)) and owned_files
+            and isinstance(finish, Mapping)
+            and finish.get("db_verified") is True
+            and str(finish.get("line_id") or "") == "worker_finish_gate"
+            and all(str(finish.get(key) or "") for key in (
+                "completed_line_ref", "acceptance_ref", "line_hash"
+            ))
+            and not owned_union.intersection(owned_files)
+        ):
+            return False
+        identities.append(worker_identity)
+        owned_union.update(owned_files)
+    return bool(
+        all(len({item[field] for item in identities}) == count for field in distinct)
+        and identities.count(selected_identity) == 1
+        and scope.get("owned_files_union") == sorted(owned_union)
+        and all(str(scope.get(key) or "") for key in ("criteria_hash", "closure_hash"))
+    )
+
+
 def _merge_gate_evidence_rows(
     evidence: dict[str, Any],
 ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
@@ -25093,6 +25162,16 @@ def _merge_gate_evidence_rows(
         status = _evidence_status(raw) or "missing"
         detail = _evidence_detail(raw)
         passed = status in MERGE_GATE_PASS_STATUSES
+        if (
+            key == "backlog_acceptance"
+            and detail.get("schema_version")
+            == MF_PARALLEL_REV10_PREMERGE_BACKLOG_ACCEPTANCE_SCHEMA
+        ):
+            authority_valid = (
+                _mf_parallel_rev10_premerge_backlog_acceptance_valid(detail)
+            )
+            detail["authority_valid"] = authority_valid
+            passed = bool(passed and authority_valid)
         deferred = key in MERGE_GATE_DEFERABLE_EVIDENCE and status in MERGE_GATE_DEFERRED_STATUSES
         row = {
             "key": key,

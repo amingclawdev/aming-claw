@@ -60654,6 +60654,363 @@ def test_parallel_branch_merge_gate_route_returns_dry_run_plan(conn):
     assert plan["evidence"][0]["key"] == "git_conflict_check"
 
 
+def _rev10_premerge_acceptance_derivation_case(conn, monkeypatch):
+    backlog_id = "AC-REV10-PREMERGE-ACCEPTANCE"
+    execution_id = "cex-rev10-premerge-acceptance"
+    queue_id = "mq-rev10-premerge-acceptance"
+    route_token_ref = "rtok-rev10-premerge-acceptance"
+    criteria = [
+        {
+            "id": "AC-REV10-PREMERGE-AC1",
+            "required_scope": {
+                "kind": "files",
+                "files": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ],
+            },
+        }
+    ]
+    frozen_closure = {"accepted": True, "criterion_ids": ["AC-REV10-PREMERGE-AC1"]}
+    workers = []
+    for index, (slot, owned_file) in enumerate(
+        (
+            ("source", "agent/governance/server.py"),
+            ("test", "agent/tests/test_graph_governance_api.py"),
+        ),
+        start=1,
+    ):
+        task_id = f"rev10-premerge-{slot}"
+        runtime_context_id = f"mfrctx-rev10-premerge-{slot}"
+        branch_ref = f"refs/heads/codex/rev10-premerge-{slot}"
+        worker = {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+            "worker_id": slot,
+            "worker_slot_id": slot,
+            "merge_queue_id": queue_id,
+            "branch_ref": branch_ref,
+            "owned_files": [owned_file],
+        }
+        workers.append(worker)
+        upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PID,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                runtime_context_id=runtime_context_id,
+                parent_task_id=execution_id,
+                worker_id=slot,
+                worker_slot_id=slot,
+                branch_ref=branch_ref,
+                owned_files=(owned_file,),
+                target_files=(owned_file,),
+                merge_queue_id=queue_id,
+                status="merge_ready",
+            ),
+            now_iso=f"2026-09-03T12:00:0{index}Z",
+        )
+        upsert_merge_queue_item(
+            conn,
+            MergeQueueItem(
+                project_id=PID,
+                backlog_id=backlog_id,
+                merge_queue_id=queue_id,
+                queue_item_id=f"mqitem-rev10-premerge-{slot}",
+                task_id=task_id,
+                branch_ref=branch_ref,
+                queue_index=index,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+            ),
+            now_iso=f"2026-09-03T12:00:0{index}Z",
+        )
+    conn.commit()
+    dispatch_line = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "actor_role": "observer",
+        "status": "passed",
+        "payload": {"bounded_workers": workers},
+    }
+    finish_lines = [
+        {
+            "stage_id": "worker_finish",
+            "line_id": "worker_finish_gate",
+            "line_instance_id": f"runtime_context:{worker['runtime_context_id']}",
+            "runtime_context_id": worker["runtime_context_id"],
+            "evidence_kind": "mf_subagent_finish_gate",
+            "actor_role": "mf_sub",
+            "status": "passed",
+            "payload": {
+                "runtime_context_id": worker["runtime_context_id"],
+                "line_instance_id": f"runtime_context:{worker['runtime_context_id']}",
+            },
+        }
+        for worker in workers
+    ]
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev10",
+        "completed_lines": [dispatch_line, *finish_lines],
+        "runtime_guide": {
+            "next_legal_action": {
+                "owner_role": "observer",
+                "stage_id": "observer_merge",
+                "line_id": "observer_merge",
+            }
+        },
+    }
+    plan = {
+        "required_worker_count": 2,
+        "row_owned_files": sorted(worker["owned_files"][0] for worker in workers),
+        "acceptance_criteria": criteria,
+        "acceptance_scope_closure": frozen_closure,
+        "parent_route_binding": {"route_token_ref": route_token_ref},
+        "lanes": [
+            {
+                "task_id": worker["task_id"],
+                "worker_id": worker["worker_id"],
+                "worker_slot_id": worker["worker_slot_id"],
+                "owned_files": worker["owned_files"],
+            }
+            for worker in workers
+        ],
+        "plan_hash": server.stable_sha256({"plan": "rev10-premerge"}),
+    }
+
+    class _Runtime:
+        def current_record(self, requested_execution_id, *, actor_role):
+            assert requested_execution_id == execution_id
+            assert actor_role == "observer"
+            return record
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: _Runtime())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_admitted_prefill_child_plan",
+        lambda _record: copy.deepcopy(plan),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 2,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda _record: {
+            "status": "selected",
+            "completed_line_index": 0,
+            "payload": {"bounded_workers": copy.deepcopy(workers)},
+        },
+    )
+    acceptance_switch = {"failed_index": None}
+
+    def completed_line_acceptance(_conn, *, completed_line_index, **_kwargs):
+        if acceptance_switch["failed_index"] == completed_line_index:
+            return {}
+        return {
+            "db_verified": True,
+            "completed_line_ref": (
+                f"contract_runtime:{execution_id}:completed_lines:"
+                f"{completed_line_index}"
+            ),
+            "acceptance_ref": (
+                f"contract_runtime:{execution_id}:revision:"
+                f"{completed_line_index + 1}"
+            ),
+            "execution_state_revision": completed_line_index + 1,
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        completed_line_acceptance,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_rev8_atomic_acceptance_gate",
+        lambda *_args, **_kwargs: (
+            copy.deepcopy(criteria),
+            {"accepted": True, "status": "passed", "errors": []},
+            [],
+        ),
+    )
+    return {
+        "backlog_id": backlog_id,
+        "execution_id": execution_id,
+        "queue_id": queue_id,
+        "route_token_ref": route_token_ref,
+        "record": record,
+        "plan": plan,
+        "workers": workers,
+        "acceptance_switch": acceptance_switch,
+    }
+
+
+def test_rev10_premerge_acceptance_is_server_derived_and_fails_closed(
+    conn, monkeypatch,
+):
+    case = _rev10_premerge_acceptance_derivation_case(conn, monkeypatch)
+    protected, authority = (
+        server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
+            conn,
+            project_id=PID,
+            merge_queue_id=case["queue_id"],
+            queue_item_id="mqitem-rev10-premerge-source",
+            task_id="rev10-premerge-source",
+            target_ref="refs/heads/main",
+            source_contract_execution_id=case["execution_id"],
+            observer_route_token_ref=case["route_token_ref"],
+        )
+    )
+    assert protected is True
+    assert authority["status"] == "satisfied"
+    assert authority["required_worker_count"] == 2
+    assert authority["selected_lane"]["worker_slot_id"] == "source"
+    assert [item["worker_slot_id"] for item in authority["workers"]] == [
+        "source",
+        "test",
+    ]
+    assert authority["postmerge_qa_required"] is True and authority["postmerge_qa_completed"] is False
+    assert authority["semantic_pass_claimed"] is False
+    assert parallel_branch_runtime._mf_parallel_rev10_premerge_backlog_acceptance_valid(
+        authority
+    ) is True
+
+    for source_execution_id, route_token_ref, requested_target, failed_index, expected_reason in (
+        ("cex-forged", case["route_token_ref"], "refs/heads/main", None, "identity_mismatch"),
+        (case["execution_id"], "rtok-forged", "refs/heads/main", None, "route_identity_mismatch"),
+        (case["execution_id"], case["route_token_ref"], "refs/heads/main", 2, "not_db_accepted"),
+        (case["execution_id"], case["route_token_ref"], "refs/heads/release", None, "target_ref_authority_mismatch"),
+    ):
+        case["acceptance_switch"]["failed_index"] = failed_index
+        protected, blocked = (
+            server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
+                conn,
+                project_id=PID,
+                merge_queue_id=case["queue_id"],
+                queue_item_id="mqitem-rev10-premerge-source",
+                task_id="rev10-premerge-source",
+                target_ref=requested_target,
+                source_contract_execution_id=source_execution_id,
+                observer_route_token_ref=route_token_ref,
+            )
+        )
+        assert protected is True
+        assert blocked["status"] == "blocked"
+        assert expected_reason in blocked["reason"]
+    case["acceptance_switch"]["failed_index"] = None
+
+    case["workers"][1]["owned_files"] = case["workers"][0]["owned_files"]
+    protected, blocked = (
+        server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
+            conn,
+            project_id=PID,
+            merge_queue_id=case["queue_id"],
+            queue_item_id="mqitem-rev10-premerge-source",
+            task_id="rev10-premerge-source",
+            target_ref="refs/heads/main",
+            source_contract_execution_id=case["execution_id"],
+            observer_route_token_ref=case["route_token_ref"],
+        )
+    )
+    assert protected is True
+    assert blocked["status"] == "blocked"
+    assert "disjoint owned_files" in blocked["reason"]
+
+    conn.execute(
+        "DELETE FROM parallel_branch_runtime_contexts WHERE project_id = ? AND task_id = ?",
+        (PID, "rev10-premerge-source"),
+    )
+    conn.commit()
+    protected, blocked = (
+        server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
+            conn,
+            project_id=PID,
+            merge_queue_id=case["queue_id"],
+            queue_item_id="mqitem-rev10-premerge-source",
+            task_id="rev10-premerge-source",
+            target_ref="refs/heads/main",
+            source_contract_execution_id=case["execution_id"],
+            observer_route_token_ref=case["route_token_ref"],
+        )
+    )
+    assert protected is True
+    assert blocked["reason"] == "rev10_source_contract_execution_identity_mismatch"
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_rev10_merge_execute_replaces_caller_acceptance_for_dry_and_live(
+    conn, monkeypatch, tmp_path, dry_run,
+):
+    authority = {
+        "schema_version": parallel_branch_runtime.MF_PARALLEL_REV10_PREMERGE_BACKLOG_ACCEPTANCE_SCHEMA,
+        "status": "satisfied",
+        "server_derived": True,
+        "authority_hash": "sha256:server-derived",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance",
+        lambda *_args, **_kwargs: (True, authority),
+    )
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_merge_repo_root_authority",
+        lambda *_args, **_kwargs: (tmp_path, "test"),
+    )
+    monkeypatch.setattr(
+        server, "_require_parallel_branch_merge_route_gate", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        server, "_parallel_branch_postmerge_recovery_apply_precheck", lambda *_args, **_kwargs: None
+    )
+    captured = {}
+
+    def execute(_conn, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "dry_run": dry_run, "executed": False}
+
+    monkeypatch.setattr(parallel_branch_runtime, "execute_merge_queue_item", execute)
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {"status": "pass"},
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied", "fabricated": True},
+    }
+    response = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": "mq-rev10-request",
+                "queue_item_id": "mqitem-rev10-request",
+                "task_id": "worker-rev10-request",
+                "target_ref": "refs/heads/main",
+                "source_contract_execution_id": "cex-rev10-request",
+                "observer_route_token_ref": "rtok-rev10-request",
+                "dry_run": dry_run,
+                "allow_target_ref_mutation": not dry_run,
+                "evidence": evidence,
+            },
+        )
+    )
+    assert response["ok"] is True
+    assert captured["evidence"]["backlog_acceptance"] == authority
+    assert "fabricated" not in captured["evidence"]["backlog_acceptance"]
+
+
 def test_parallel_branch_merge_gate_route_blocks_batch_rollback(conn):
     queue_id = "mergeq-api-gate-blocked"
     upsert_merge_queue_items(

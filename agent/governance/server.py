@@ -86201,6 +86201,252 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
         conn.close()
 
 
+def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
+    conn,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    queue_item_id: str,
+    task_id: str,
+    target_ref: str,
+    source_contract_execution_id: str,
+    observer_route_token_ref: str,
+) -> tuple[bool, dict[str, Any]]:
+    """Derive rev10 pre-merge acceptance; never trust caller evidence."""
+
+    from .parallel_branch_runtime import (
+        MF_PARALLEL_REV10_PREMERGE_BACKLOG_ACCEPTANCE_SCHEMA,
+        _read_model_normalized_target_ref,
+        get_branch_context,
+        get_merge_queue_item_for_branch_context,
+        list_merge_queue_items,
+        select_merge_queue_item,
+    )
+
+    text = lambda value: str(value or "").strip()
+    selected = select_merge_queue_item(list_merge_queue_items(
+        conn, project_id, merge_queue_id), queue_item_id=queue_item_id, task_id=task_id)
+    selected_context = get_branch_context(conn, project_id, selected.task_id)
+    execution_id = text(getattr(selected_context, "parent_task_id", "")
+                        or source_contract_execution_id)
+    if not execution_id:
+        return False, {}
+    try:
+        record = _contract_runtime(conn).current_record(execution_id, actor_role="observer")
+    except (ContractRuntimeError, sqlite3.Error):
+        return False, {}
+    if not (
+        _is_mf_parallel_record_contract_id(text(record.get("contract_id")))
+        and text(record.get("revision")) == "rev10"
+    ):
+        return False, {}
+
+    def blocked(reason: str) -> tuple[bool, dict[str, Any]]:
+        return True, {
+            "schema_version": MF_PARALLEL_REV10_PREMERGE_BACKLOG_ACCEPTANCE_SCHEMA,
+            "status": "blocked",
+            "passed": False,
+            "server_derived": True,
+            "db_verified": False,
+            "caller_claims_trusted": False,
+            "authority_required": True,
+            "reason": reason,
+        }
+
+    backlog_id = text(record.get("backlog_id"))
+    next_line = _contract_runtime_next_line(record)
+    if not (
+        execution_id == text(record.get("contract_execution_id"))
+        == text(source_contract_execution_id)
+        and text(record.get("project_id")) == project_id
+        and backlog_id and selected_context is not None
+    ):
+        return blocked("rev10_source_contract_execution_identity_mismatch")
+    canonical_target = _read_model_normalized_target_ref(target_ref)
+    if not canonical_target or {
+        canonical_target,
+        _read_model_normalized_target_ref(selected.target_ref),
+        _read_model_normalized_target_ref(selected_context.ref_name),
+    } != {canonical_target}:
+        return blocked("rev10_target_ref_authority_mismatch")
+    if not (
+        text(next_line.get("line_id")) == "observer_merge"
+        and text(next_line.get("owner_role")) == "observer"
+    ):
+        return blocked("rev10_observer_merge_not_current")
+
+    plan = _contract_runtime_mf_parallel_admitted_prefill_child_plan(record)
+    worker_count = _contract_runtime_mf_parallel_current_generation_worker_count(
+        record, conn=conn, project_id=project_id
+    )
+    route_binding = plan.get("parent_route_binding", {}) if plan else {}
+    expected_route = text(
+        route_binding.get("route_token_ref")
+        if isinstance(route_binding, Mapping)
+        else ""
+    )
+    if not plan or int(plan.get("required_worker_count") or 0) != worker_count:
+        return blocked("rev10_admitted_prefill_plan_missing_or_stale")
+    if not expected_route or expected_route != text(observer_route_token_ref):
+        return blocked("rev10_observer_route_identity_mismatch")
+
+    completed = [line for line in record.get("completed_lines") or []
+                 if isinstance(line, Mapping)]
+    dispatch = _contract_runtime_current_dispatch_authority_line(record)
+    dispatch_index = int(dispatch.get("completed_line_index", -1))
+    if dispatch.get("status") != "selected" or not 0 <= dispatch_index < len(completed):
+        return blocked("rev10_dispatch_authority_missing")
+    dispatch_line = completed[dispatch_index]
+    dispatch_acceptance = _contract_runtime_completed_line_acceptance(
+        conn, project_id=project_id, record=record,
+        completed_line_index=dispatch_index, expected_line=dispatch_line,
+    )
+    workers = _contract_runtime_mf_parallel_bounded_workers({
+        "payload": dispatch.get("payload") or {}})
+    if dispatch_acceptance.get("db_verified") is not True or len(workers) != worker_count:
+        return blocked("rev10_dispatch_not_db_accepted")
+
+    plan_lanes = {text(lane.get("task_id")): lane for lane in plan.get("lanes") or []
+                  if isinstance(lane, Mapping)}
+    errors = _contract_runtime_mf_parallel_atomic_lane_errors(
+        workers,
+        distinct_fields=("runtime_context_id", "task_id", "worker_id", "worker_slot_id"),
+    )
+    lane_authorities: list[dict[str, Any]] = []
+    lane_files: list[list[str]] = []
+    selected_identity: dict[str, str] = {}
+    identity_fields = (
+        "runtime_context_id", "task_id", "parent_task_id", "worker_id",
+        "worker_slot_id", "merge_queue_id",
+    )
+    for worker in sorted(workers, key=lambda item: text(item.get("runtime_context_id"))):
+        identity = {field: text(worker.get(field)) for field in identity_fields}
+        owned_files = _runtime_context_public_file_values(worker.get("owned_files") or [])
+        plan_lane = plan_lanes.get(identity["task_id"], {})
+        context = get_branch_context(conn, project_id, identity["task_id"])
+        item = get_merge_queue_item_for_branch_context(
+            conn, project_id, identity["task_id"],
+            merge_queue_id=identity["merge_queue_id"],
+        )
+        context_identity = (
+            {
+                field: text(getattr(context, field, ""))
+                for field in identity_fields
+            }
+            if context is not None else {}
+        )
+        context_files = _runtime_context_public_file_values(
+            list(context.owned_files or context.target_files or ())
+        ) if context is not None else []
+        if not (
+            all(identity.values()) and identity["parent_task_id"] == execution_id
+            and plan_lane
+            and identity["worker_id"] == text(plan_lane.get("worker_id"))
+            and identity["worker_slot_id"] == text(plan_lane.get("worker_slot_id"))
+            and owned_files == _runtime_context_public_file_values(
+                plan_lane.get("owned_files") or []
+            )
+            and context_identity == identity and context_files == owned_files
+            and item is not None and item.backlog_id == backlog_id
+            and item.branch_ref == text(worker.get("branch_ref"))
+        ):
+            errors.append("rev10_runtime_queue_dispatch_identity_mismatch")
+            continue
+
+        instance_id = f"runtime_context:{identity['runtime_context_id']}"
+        finish_candidates = [
+            (index, line) for index, line in enumerate(completed)
+            if index > dispatch_index and text(line.get("line_id")) == "worker_finish_gate"
+            and text(line.get("runtime_context_id") or (
+                line.get("payload", {}).get("runtime_context_id")
+                if isinstance(line.get("payload"), Mapping) else ""
+            )) == identity["runtime_context_id"]
+            and text(line.get("line_instance_id") or (
+                line.get("payload", {}).get("line_instance_id")
+                if isinstance(line.get("payload"), Mapping) else ""
+            )) == instance_id
+        ]
+        if len(finish_candidates) != 1:
+            errors.append("rev10_worker_finish_gate_not_unique")
+            continue
+        finish_index, finish_line = finish_candidates[0]
+        accepted = _contract_runtime_completed_line_acceptance(
+            conn, project_id=project_id, record=record,
+            completed_line_index=finish_index, expected_line=finish_line,
+            allow_statusless_worker_finish_gate=True,
+            expected_worker_identity=identity,
+        )
+        if accepted.get("db_verified") is not True:
+            errors.append("rev10_worker_finish_gate_not_db_accepted")
+            continue
+        lane = {
+            **identity,
+            "queue_item_id": text(item.queue_item_id),
+            "owned_files": owned_files,
+            "finish_gate_acceptance": {
+                "line_id": "worker_finish_gate",
+                "completed_line_ref": text(accepted.get("completed_line_ref")),
+                "acceptance_ref": text(accepted.get("acceptance_ref")),
+                "line_hash": stable_sha256(finish_line),
+                "db_verified": True,
+            },
+        }
+        lane_authorities.append(lane)
+        lane_files.append(owned_files)
+        if item.queue_item_id == selected.queue_item_id and item.task_id == selected.task_id:
+            selected_identity = {
+                field: text(lane.get(field))
+                for field in (*identity_fields, "queue_item_id")
+            }
+    if errors or len(lane_authorities) != worker_count or not selected_identity:
+        return blocked("; ".join(sorted(set(errors))) or "rev10_lane_incomplete")
+
+    criteria, current_closure, acceptance_errors = (
+        _contract_runtime_mf_parallel_rev8_atomic_acceptance_gate(
+            conn, project_id=project_id, record=record,
+            lane_owned_files=lane_files, acceptance_claim_source={},
+        )
+    )
+    owned_union = sorted(set().union(*(set(files) for files in lane_files)))
+    frozen_criteria = list(plan.get("acceptance_criteria") or [])
+    frozen_closure = dict(plan.get("acceptance_scope_closure") or {})
+    if not (
+        not acceptance_errors and current_closure.get("accepted") is True
+        and stable_sha256(criteria) == stable_sha256(frozen_criteria)
+        and owned_union == _runtime_context_public_file_values(plan.get("row_owned_files") or [])
+    ):
+        return blocked("rev10_frozen_backlog_acceptance_scope_not_fully_covered")
+
+    authority = {
+        "schema_version": MF_PARALLEL_REV10_PREMERGE_BACKLOG_ACCEPTANCE_SCHEMA,
+        "status": "satisfied", "passed": True,
+        "source": "ContractRuntime+RuntimeContext+merge_queue",
+        "server_derived": True, "db_verified": True,
+        "caller_claims_trusted": False, "authority_required": True,
+        "project_id": project_id, "backlog_id": backlog_id,
+        "contract_execution_id": execution_id, "contract_revision": "rev10",
+        "target_ref": canonical_target, "observer_route_token_ref": expected_route,
+        "required_worker_count": worker_count,
+        "dispatch_completed_line_ref": text(dispatch_acceptance.get("completed_line_ref")),
+        "dispatch_acceptance_ref": text(dispatch_acceptance.get("acceptance_ref")),
+        "dispatch_line_hash": stable_sha256(dispatch_line),
+        "prefill_plan_hash": text(plan.get("plan_hash")),
+        "acceptance_scope": {
+            "accepted": True, "complete": True, "errors": [],
+            "owned_files_union": owned_union,
+            "criteria_hash": stable_sha256(frozen_criteria),
+            "closure_hash": stable_sha256(frozen_closure),
+            "current_closure_hash": stable_sha256(current_closure),
+        },
+        "workers": lane_authorities, "selected_lane": selected_identity,
+        "postmerge_qa_required": True, "postmerge_qa_completed": False,
+        "semantic_pass_claimed": False,
+        "preserves_observer_merge_then_reconcile_then_qa": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return True, authority
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-execute")
 def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
     """Dry-run or explicitly execute one gated queue merge."""
@@ -86261,6 +86507,31 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
             task_id=str(ctx.body.get("task_id") or ""),
             target_ref=target_ref,
         )
+        rev10_protected, rev10_backlog_acceptance = (
+            _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
+                conn,
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=str(ctx.body.get("queue_item_id") or ""),
+                task_id=str(ctx.body.get("task_id") or ""),
+                target_ref=target_ref,
+                source_contract_execution_id=str(
+                    ctx.body.get("source_contract_execution_id")
+                    or ctx.body.get("source_contract_id")
+                    or ctx.body.get("contract_execution_id")
+                    or ctx.body.get("active_contract_execution_id")
+                    or ""
+                ),
+                observer_route_token_ref=str(
+                    ctx.body.get("observer_route_token_ref")
+                    or ctx.body.get("route_token_ref")
+                    or ""
+                ),
+            )
+        )
+        if rev10_protected:
+            evidence = dict(evidence)
+            evidence["backlog_acceptance"] = rev10_backlog_acceptance
         with sqlite_write_lock():
             result = execute_merge_queue_item(
                 conn,
