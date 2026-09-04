@@ -3376,7 +3376,8 @@ def _onboard_route_guide_body(args: dict) -> dict:
     body = {
         key: value
         for key, value in args.items()
-        if key != "project_id" and value not in (None, "", [], {})
+        if key not in {"project_id", "timeout_seconds"}
+        and value not in (None, "", [], {})
     }
     body.setdefault("response_view", "compact")
     return body
@@ -5113,6 +5114,16 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Process-local opaque QA session ref resolved to X-Gov-Token by the managed MCP dispatcher; never forwarded into timeline evidence.",
                 },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
+                    "maximum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS,
+                    "default": _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS,
+                    "description": (
+                        "MCP-to-governance transport timeout only; never "
+                        "forwarded into timeline evidence."
+                    ),
+                },
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected close-gate timeline evidence."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
@@ -5334,6 +5345,16 @@ TOOLS: list[dict] = [
                             ),
                         },
                     },
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
+                    "maximum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS,
+                    "default": _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS,
+                    "description": (
+                        "MCP-to-governance transport timeout only; never "
+                        "forwarded in the onboard request body."
+                    ),
                 },
                 "response_view": {
                     "type": "string",
@@ -7039,6 +7060,16 @@ TOOLS: list[dict] = [
             "properties": {
                 "project_id": {"type": "string"},
                 "auto_fix": {"type": "boolean", "description": "Auto-fix recoverable issues (orphan nodes, stuck tasks)", "default": False},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
+                    "maximum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS,
+                    "default": _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS,
+                    "description": (
+                        "MCP-to-governance transport timeout only; never "
+                        "forwarded in the preflight query."
+                    ),
+                },
             },
             "required": ["project_id"],
         },
@@ -8526,6 +8557,7 @@ class ToolDispatcher:
 
         if name == "task_timeline_append":
             pid = args["project_id"]
+            timeout_seconds = _contract_runtime_mcp_timeout_seconds(args)
             qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
                 args,
                 required_scope_fields=(
@@ -8545,8 +8577,14 @@ class ToolDispatcher:
                     f"/api/task/{pid}/timeline",
                     body,
                     role_token=qa_session_token,
+                    timeout_seconds=timeout_seconds,
                 )
-            return self._api("POST", f"/api/task/{pid}/timeline", body)
+            return self._governance_api_with_timeout(
+                "POST",
+                f"/api/task/{pid}/timeline",
+                body,
+                timeout_seconds=timeout_seconds,
+            )
 
         if name == "task_timeline_list":
             pid = args["project_id"]
@@ -8573,10 +8611,11 @@ class ToolDispatcher:
 
         if name == "onboard_route_guide":
             pid = args["project_id"]
-            return self._api(
+            return self._governance_api_with_timeout(
                 "POST",
                 f"/api/projects/{pid}/onboard-route-guide",
                 _onboard_route_guide_body(args),
+                timeout_seconds=_contract_runtime_mcp_timeout_seconds(args),
             )
 
         if name == "onboard_route_guide_section_fetch":
@@ -9527,7 +9566,11 @@ class ToolDispatcher:
         if name == "preflight_check":
             pid = args["project_id"]
             af = "true" if args.get("auto_fix") else "false"
-            return self._api("GET", f"/api/wf/{pid}/preflight-check?auto_fix={af}")
+            return self._governance_api_with_timeout(
+                "GET",
+                f"/api/wf/{pid}/preflight-check?auto_fix={af}",
+                timeout_seconds=_contract_runtime_mcp_timeout_seconds(args),
+            )
 
         # --- Executor tools ---
         if name == "executor_status":

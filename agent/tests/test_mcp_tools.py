@@ -5755,6 +5755,67 @@ def test_managed_mcp_contract_runtime_timeout_policy_is_bounded_and_configurable
     ) == 45
 
 
+def test_managed_direct_facades_use_bounded_timeout_transport_without_forwarding():
+    calls = []
+
+    def generic_api(*_args, **_kwargs):
+        raise AssertionError("governed long-running facades must use timeout-aware transport")
+
+    dispatcher = ToolDispatcher(generic_api, worker_pool=None)
+
+    def timeout_api(method, path, data=None, *, timeout_seconds):
+        calls.append((method, path, data, timeout_seconds))
+        return {"ok": True, "path": path}
+
+    dispatcher._governance_api_with_timeout = timeout_api
+
+    timeline = dispatcher.dispatch(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "task_id": "cex-direct-timeout",
+            "backlog_id": "AC-DIRECT-TIMEOUT",
+            "event_type": "graph.reconcile",
+            "timeout_seconds": 900,
+        },
+    )
+    guide = dispatcher.dispatch(
+        "onboard_route_guide",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-DIRECT-TIMEOUT",
+            "role": "observer",
+            "work_type": "operator_supervised_direct_main",
+            "timeout_seconds": 600,
+        },
+    )
+    preflight = dispatcher.dispatch(
+        "preflight_check",
+        {
+            "project_id": "aming-claw",
+            "auto_fix": False,
+            "timeout_seconds": 300,
+        },
+    )
+
+    assert timeline["ok"] is True
+    assert guide["ok"] is True
+    assert preflight["ok"] is True
+    assert [call[3] for call in calls] == [900, 600, 300]
+    assert all("timeout_seconds" not in (call[2] or {}) for call in calls)
+    assert calls[2][2] is None
+
+    for tool_name in (
+        "task_timeline_append",
+        "onboard_route_guide",
+        "preflight_check",
+    ):
+        schema = _tool_properties(tool_name)["timeout_seconds"]
+        assert schema["minimum"] == 10
+        assert schema["maximum"] == 60 * 60
+        assert schema["default"] == 120
+
+
 def test_managed_runtime_host_issuance_timeout_is_transport_only_and_stages():
     route = {
         "route_id": "route-host-issuance-timeout",
