@@ -200590,6 +200590,7 @@ def _prepare_ac_dev_direct_route_bootstrap(
     backlog_id: str,
     source_free: bool = False,
     public_open_backlog: bool = False,
+    real_git_world: bool = False,
 ):
     project_id = "aming-claw"
     _initialize_ac_dev_guide_schema(conn)
@@ -200697,8 +200698,15 @@ def _prepare_ac_dev_direct_route_bootstrap(
         )
     conn.commit()
     root = tmp_path / "ac-dev-route-bootstrap"
-    root.mkdir()
-    commit = "9" * 40
+    if real_git_world:
+        old_commit = _init_test_git_repo(root, filename="runtime.py")
+        commit = _commit_test_git_files(
+            root, ["repair.py"], message="prepare exact dev graph world",
+        )
+    else:
+        root.mkdir()
+        old_commit = "8" * 40
+        commit = "9" * 40
     world = _fixed_ac_dev_direct_world(root, commit)
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
@@ -200743,6 +200751,7 @@ def _prepare_ac_dev_direct_route_bootstrap(
     return {
         "project_id": project_id,
         "root": root,
+        "old_commit": old_commit,
         "commit": commit,
         "world": world,
         "guide": guide,
@@ -213026,36 +213035,36 @@ def test_direct_graph_selection_pins_exact_successor_and_never_falls_back(
     assert tuple(conn.iterdump()) == before
 
 
-def test_direct_graph_query_exact_successor_binds_current_world_before_write(
+def _prepare_direct_existing_candidate_activation_case(
     conn, monkeypatch, tmp_path,
 ):
-    case = _advance_ac_dev_cross_plane_world(
+    case = _prepare_ac_dev_direct_route_bootstrap(
         conn,
-        _prepare_ac_dev_direct_terminal_predecessor_case(
-            conn, monkeypatch, tmp_path,
-            backlog_id="AC-DEV-DIRECT-GRAPH-EXACT-SUCCESSOR-WORLD",
-        ),
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-DIRECT-GRAPH-EXISTING-CANDIDATE",
+        real_git_world=True,
     )
+    case["current_commit"] = case["commit"]
+    case["current_world"] = case["world"]
     monkeypatch.setattr(
         server,
         "_operator_supervised_direct_main_dev_world_authority",
         lambda: copy.deepcopy(case["current_world"]),
     )
-    case = _complete_ac_dev_direct_terminal_predecessor(conn, case)
-    created = server._ac_dev_direct_terminal_successor_response(
-        conn,
-        project_id=case["project_id"],
-        backlog_id=case["guide"]["backlog_id"],
-        route_token_ref=case["route_token_ref"],
-        role="observer",
-        work_type="continue_contract_chain",
-        request_body={
-            "task_id": case["execution_id"],
-            "observer_session_id": case["session_id"],
-        },
-        request_selector_claims=None,
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: case["root"],
     )
-    child_id = created["successor_contract_execution_id"]
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=copy.deepcopy(case["issue_body"]),
+        )
+    )
+    child_id = case["task_id"]
     child = server._contract_runtime(conn).current_record(
         child_id, actor_role="observer"
     )
@@ -213064,7 +213073,7 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
             {"project_id": case["project_id"]}, method="POST",
             body={
                 "project_id": case["project_id"],
-                "route_token_ref": child["route_token_ref"],
+                "route_token_ref": issued["route_token_ref"],
                 "backlog_id": case["guide"]["backlog_id"],
                 "task_id": child_id,
                 "cex_id": child_id,
@@ -213080,7 +213089,7 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
         "query_purpose": "gate_validation",
         "backlog_id": case["guide"]["backlog_id"],
         "task_id": child_id,
-        "route_token_ref": child["route_token_ref"],
+        "route_token_ref": issued["route_token_ref"],
     }
     monkeypatch.setattr(
         governance_db,
@@ -213138,6 +213147,85 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
         )
         conn.commit()
 
+    candidate_snapshot_id = server._current_full_deterministic_snapshot_id(
+        case["current_commit"]
+    )
+    candidate_build_run_id = "current-full-direct-successor-candidate-build"
+    monkeypatch.setitem(
+        server._GOVERNANCE_MANAGER_CERTIFICATES,
+        case["project_id"],
+        _test_manager_certificate(),
+    )
+    owner = server._current_full_build_manager_identity(case["project_id"])
+    claim = store.acquire_current_full_build_claim(
+        conn,
+        case["project_id"],
+        run_id=candidate_build_run_id,
+        snapshot_id=candidate_snapshot_id,
+        commit_sha=case["current_commit"],
+        manager_epoch=owner["generation_id"],
+        manager_pid=owner["manager_pid"],
+        manager_started_at=owner["manager_started_at"],
+        manager_start_identity=owner["manager_start_identity"],
+        metric_evidence={"phase": "materializing_candidate"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        case["project_id"],
+        snapshot_id=candidate_snapshot_id,
+        commit_sha=case["current_commit"],
+        snapshot_kind="full",
+        graph_json=_graph(),
+        status="candidate",
+        created_by="prior-current-full-build",
+        notes=json.dumps(
+            {
+                "run_id": candidate_build_run_id,
+                "checkout_provenance": describe_checkout(
+                    case["root"], project_id=case["project_id"],
+                ),
+            },
+            sort_keys=True,
+        ),
+    )
+    store.index_graph_snapshot(
+        conn,
+        case["project_id"],
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+    store.terminalize_current_full_build_claim(
+        conn,
+        case["project_id"],
+        claim_id=claim["claim_id"],
+        run_id=candidate_build_run_id,
+        snapshot_id=candidate_snapshot_id,
+        commit_sha=case["current_commit"],
+        terminal_status="candidate_ready",
+        manager_start_identity=owner["manager_start_identity"],
+        metric_evidence={
+            "phase": "candidate_ready",
+            "claim_id": claim["claim_id"],
+        },
+    )
+    conn.commit()
+    assert store.current_full_candidate_tuple_from_db(
+        conn,
+        project_id=case["project_id"],
+        run_id=candidate_build_run_id,
+        target_commit_sha=case["current_commit"],
+        snapshot_id=candidate_snapshot_id,
+    )["valid"] is True
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        lambda *_args, **_kwargs: pytest.fail(
+            "existing candidate activation rebuilt the graph"
+        ),
+    )
+
     onboard_body = {
         "backlog_id": case["guide"]["backlog_id"],
         "role": "observer",
@@ -213152,6 +213240,269 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
     activate_reconciled(
         "full-direct-successor-stale-world", case["old_commit"], 8831,
     )
+    ownership = server._operator_supervised_direct_main_persisted_world_ownership(
+        conn,
+        project_id=case["project_id"],
+        backlog_id=case["guide"]["backlog_id"],
+    )
+    assert ownership["complete"] is True, ownership
+    return {
+        "case": case,
+        "child_id": child_id,
+        "child": child,
+        "registered": registered,
+        "query_body": body,
+        "onboard_body": onboard_body,
+        "candidate_snapshot_id": candidate_snapshot_id,
+        "candidate_build_run_id": candidate_build_run_id,
+        "activate_reconciled": activate_reconciled,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "zero", "many", "wrong_candidate", "wrong_root", "wrong_project",
+        "wrong_commit", "wrong_kind", "wrong_status", "wrong_provenance",
+        "invalid_resume", "invalid_companion",
+    ),
+)
+def test_direct_existing_candidate_activation_guide_fails_closed(
+    conn, monkeypatch, tmp_path, failure,
+):
+    prepared = _prepare_direct_existing_candidate_activation_case(
+        conn, monkeypatch, tmp_path,
+    )
+    case = prepared["case"]
+    snapshot_id = prepared["candidate_snapshot_id"]
+    onboard_body = prepared["onboard_body"]
+    if failure == "zero":
+        monkeypatch.setattr(
+            server, "_onboard_direct_qa_graph_snapshot_selection",
+            lambda *_args, **_kwargs: {
+                "accepted": False, "selection_source": "",
+                "resolved_snapshot_id": "", "candidate_snapshot_count": 0,
+                "writes_performed": False,
+            },
+        )
+    elif failure == "many":
+        source = conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id=? "
+            "AND snapshot_id=?", (case["project_id"], snapshot_id),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO graph_snapshots
+              (project_id, snapshot_id, commit_sha, parent_snapshot_id,
+               snapshot_kind, ref_name, branch_ref, graph_sha256,
+               inventory_sha256, drift_sha256, status, created_at,
+               created_by, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source["project_id"], f"{snapshot_id}-duplicate",
+                source["commit_sha"], source["parent_snapshot_id"],
+                source["snapshot_kind"], source["ref_name"],
+                source["branch_ref"], source["graph_sha256"],
+                source["inventory_sha256"], source["drift_sha256"],
+                source["status"], "2099-01-01T00:00:00Z",
+                source["created_by"], source["notes"],
+            ),
+        )
+        conn.commit()
+    elif failure == "wrong_candidate":
+        monkeypatch.setattr(
+            server, "_current_full_deterministic_snapshot_id",
+            lambda _commit: "full-wrong-candidate-identity",
+        )
+    elif failure in {"wrong_root", "wrong_project", "wrong_provenance"}:
+        row = conn.execute(
+            "SELECT notes FROM graph_snapshots WHERE project_id=? "
+            "AND snapshot_id=?", (case["project_id"], snapshot_id),
+        ).fetchone()
+        notes = json.loads(row["notes"])
+        if failure == "wrong_provenance":
+            notes = {}
+        elif failure == "wrong_project":
+            checkout = notes["checkout_provenance"]
+            checkout["project_id"] = "wrong-project"
+            checkout["canonical_project_identity"]["project_id"] = (
+                "wrong-project"
+            )
+        else:
+            checkout = notes["checkout_provenance"]
+            checkout["execution_root"] = str(tmp_path / "wrong-root")
+            checkout["git"]["worktree_root"] = str(
+                tmp_path / "wrong-root"
+            )
+        conn.execute(
+            "UPDATE graph_snapshots SET notes=? WHERE project_id=? "
+            "AND snapshot_id=?",
+            (json.dumps(notes, sort_keys=True), case["project_id"], snapshot_id),
+        )
+        conn.commit()
+    elif failure in {"wrong_commit", "wrong_kind", "wrong_status"}:
+        column, value = {
+            "wrong_commit": ("commit_sha", case["old_commit"]),
+            "wrong_kind": ("snapshot_kind", "delta"),
+            "wrong_status": ("status", "inactive"),
+        }[failure]
+        conn.execute(
+            f"UPDATE graph_snapshots SET {column}=? WHERE project_id=? "
+            "AND snapshot_id=?", (value, case["project_id"], snapshot_id),
+        )
+        conn.commit()
+    elif failure == "invalid_resume":
+        original_tuple = store.current_full_candidate_tuple_from_db
+
+        def invalid_tuple(*args, **kwargs):
+            result = original_tuple(*args, **kwargs)
+            return {**result, "valid": False, "errors": ["forced_invalid"]}
+
+        monkeypatch.setattr(
+            store, "current_full_candidate_tuple_from_db", invalid_tuple,
+        )
+    else:
+        manifest_path = (
+            store.snapshot_companion_dir(case["project_id"], snapshot_id)
+            / "manifest.json"
+        )
+        manifest_path.write_bytes(b"not-json")
+
+    before_changes = conn.total_changes
+    before = tuple(conn.iterdump())
+    response = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]}, method="POST",
+            body=copy.deepcopy(onboard_body),
+        )
+    )
+    assert response["next_legal_action"]["id"] != (
+        "dev_local_graph_existing_candidate_activation_required"
+    )
+    authority = response["dev_local_graph_bootstrap"]["bootstrap_authority"]
+    assert authority["existing_candidate_activation_required"] is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "race", ("active_cas", "contract_runtime", "session", "candidate"),
+)
+def test_direct_existing_candidate_activation_rechecks_locked_authority(
+    conn, monkeypatch, tmp_path, race,
+):
+    prepared = _prepare_direct_existing_candidate_activation_case(
+        conn, monkeypatch, tmp_path,
+    )
+    case = prepared["case"]
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": case["project_id"]}, method="POST",
+            body=copy.deepcopy(prepared["onboard_body"]),
+        )
+    )
+    activation_body = dict(guide["next_legal_action"]["copy_safe_body"])
+    activation_body.pop("project_id")
+
+    if race == "active_cas":
+        class CasCursor:
+            def fetchone(self):
+                return {"snapshot_id": "full-concurrent-active"}
+
+        class CasDriftConnection(_NoCloseConn):
+            def execute(self, sql, parameters=()):
+                normalized = " ".join(str(sql).split())
+                if self._conn.in_transaction and normalized == (
+                    "SELECT snapshot_id FROM graph_snapshot_refs "
+                    "WHERE project_id=? AND ref_name='active'"
+                ):
+                    return CasCursor()
+                return self._conn.execute(sql, parameters)
+
+        monkeypatch.setattr(
+            server, "get_connection",
+            lambda _project_id: CasDriftConnection(conn),
+        )
+    elif race == "contract_runtime":
+        original_preflight = (
+            server._operator_supervised_direct_main_reconcile_qa_preflight_authority
+        )
+
+        def advanced_preflight(*args, **kwargs):
+            result = original_preflight(*args, **kwargs)
+            return (
+                {**result, "contract_runtime_next_line_id": "observer_implementation"}
+                if conn.in_transaction else result
+            )
+
+        monkeypatch.setattr(
+            server,
+            "_operator_supervised_direct_main_reconcile_qa_preflight_authority",
+            advanced_preflight,
+        )
+    elif race == "session":
+        original_auth = server._require_current_full_reconcile_auth
+
+        def revoked_auth(*args, **kwargs):
+            result = original_auth(*args, **kwargs)
+            return (
+                {**result, "observer_session_id": "obs-concurrently-revoked"}
+                if conn.in_transaction else result
+            )
+
+        monkeypatch.setattr(
+            server, "_require_current_full_reconcile_auth", revoked_auth,
+        )
+    else:
+        original_selector = server._onboard_direct_qa_graph_snapshot_selection
+
+        def tampered_candidate(*args, **kwargs):
+            result = original_selector(*args, **kwargs)
+            return (
+                {**result, "accepted": False, "resolved_snapshot_id": ""}
+                if conn.in_transaction else result
+            )
+
+        monkeypatch.setattr(
+            server, "_onboard_direct_qa_graph_snapshot_selection",
+            tampered_candidate,
+        )
+
+    before_changes = conn.total_changes
+    before = tuple(conn.iterdump())
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": case["project_id"]}, method="POST",
+            body=activation_body,
+        )
+    )
+    assert status == 409
+    assert result["error"] == (
+        "dev_direct_existing_candidate_activation_authority_changed"
+    )
+    assert result["writes_performed"] is False
+    assert result["rebuild_started"] is False
+    assert conn.in_transaction is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+def test_direct_graph_query_exact_cex_activates_existing_candidate_before_write(
+    conn, monkeypatch, tmp_path,
+):
+    prepared = _prepare_direct_existing_candidate_activation_case(
+        conn, monkeypatch, tmp_path,
+    )
+    case = prepared["case"]
+    child_id = prepared["child_id"]
+    child = prepared["child"]
+    registered = prepared["registered"]
+    body = prepared["query_body"]
+    onboard_body = prepared["onboard_body"]
+    candidate_snapshot_id = prepared["candidate_snapshot_id"]
+    candidate_build_run_id = prepared["candidate_build_run_id"]
+    activate_reconciled = prepared["activate_reconciled"]
     guide_before = tuple(conn.iterdump())
     ordered = server.handle_project_onboard_route_guide(
         _ctx(
@@ -213160,6 +213511,10 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
         )
     )
     action = ordered["next_legal_action"]
+    assert action["id"] == "dev_local_graph_existing_candidate_activation_required"
+    assert ordered["dev_local_graph_bootstrap"]["state"] == (
+        "existing_candidate_activation_required"
+    )
     assert action["mcp_tool"] == "graph_current_full_reconcile"
     assert action["graph_query_deferred"] is True
     assert action["copy_safe_body"] == {
@@ -213169,8 +213524,9 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
         "observer_session_id": registered["observer_session_id"],
         "observer_route_token_ref": child["route_token_ref"],
         "target_commit_sha": case["current_commit"],
-        "run_id": "current-full-" + case["current_commit"][:7],
+        "run_id": "current-full-direct-existing-" + case["current_commit"][:7],
         "activate": True, "require_clean": True, "semantic_use_ai": False,
+        "snapshot_id": candidate_snapshot_id,
         "expected_old_snapshot_id": "full-direct-successor-stale-world",
     }
     assert tuple(conn.iterdump()) == guide_before
@@ -213200,7 +213556,7 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
                 )
             )
     for override in (
-        {"observer_session_id": case["session_id"]},
+        {"observer_session_id": "obs-wrong-route-session"},
         {"observer_session_id": "obs-missing-child-route-session"},
     ):
         blocked_before = tuple(conn.iterdump())
@@ -213218,7 +213574,7 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
                 "graph_current_full_reconcile"
             )
         assert tuple(conn.iterdump()) == blocked_before
-    denied_body = {**http_body, "observer_session_id": case["session_id"]}
+    denied_body = {**http_body, "observer_session_id": "obs-wrong-route-session"}
     denied_before = tuple(conn.iterdump())
     denied_changes = conn.total_changes
     with monkeypatch.context() as denied:
@@ -213230,38 +213586,58 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
             server, "admit_ac_dev_graph_materialization_schema",
             lambda *_args, **_kwargs: pytest.fail("denial reached admission"),
         )
-        denied_status, denied_response = (
+        with pytest.raises(GovernanceError) as denied_error:
             server.handle_graph_governance_current_full_reconcile(
                 _ctx(
                     {"project_id": case["project_id"]}, method="POST",
                     body=denied_body,
                 )
             )
-        )
-    assert denied_status == 409
-    assert denied_response["error"] == "operator_supervised_direct_main_qa_before_reconcile_required"
-    assert denied_response["writes_performed"] is False
+    assert denied_error.value.code == "observer_route_token_proof_required"
+    assert denied_error.value.details["writes_performed"] is False
     assert conn.total_changes == denied_changes
     assert tuple(conn.iterdump()) == denied_before
-    before = tuple(conn.iterdump())
-    before_changes = conn.total_changes
-    with pytest.raises(GovernanceError) as rejected:
-        server.handle_graph_governance_query(
-            _ctx_with_role(
+    activation_body = dict(action["copy_safe_body"])
+    activation_body.pop("project_id")
+    activation_status, activation = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
                 {"project_id": case["project_id"]},
-                "observer",
                 method="POST",
-                body=copy.deepcopy(body),
+                body=activation_body,
             )
         )
-    assert rejected.value.code == "observer_direct_main_graph_world_mismatch"
-    assert rejected.value.details["zero_write_rejection"] is True
-    assert conn.total_changes == before_changes
-    assert tuple(conn.iterdump()) == before
-
-    activate_reconciled(
-        "full-direct-successor-current-world", case["current_commit"], 8832,
     )
+    assert activation_status == 200
+    assert activation["activated"] is True
+    assert activation["active_snapshot_id"] == candidate_snapshot_id
+    assert activation["resumed_candidate"] is True
+    assert activation["rebuild_skipped"] is True
+    assert activation["candidate_origin_run_id"] == candidate_build_run_id
+    terminal_before = tuple(conn.iterdump())
+    terminal_changes = conn.total_changes
+    retry_status, retry = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST", body=copy.deepcopy(activation_body),
+        )
+    )
+    assert retry_status == 200
+    assert retry["idempotent_replay"] is True
+    assert retry["rebuild_skipped"] is True
+    assert retry["active_snapshot_id"] == candidate_snapshot_id
+    assert retry["timeline_event_recorded"] == (
+        activation["timeline_event_recorded"]
+    )
+    for field in (
+        "provenance_id", "provenance_hash", "snapshot_id",
+        "target_commit_sha", "reconcile_event_id",
+    ):
+        assert retry["current_full_reconcile_provenance"][field] == (
+            activation["current_full_reconcile_provenance"][field]
+        )
+    assert conn.total_changes == terminal_changes
+    assert tuple(conn.iterdump()) == terminal_before
     queried = server.handle_graph_governance_query(
         _ctx_with_role(
             {"project_id": case["project_id"]},
@@ -213280,6 +213656,7 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
         case["current_commit"]
     )
     assert trace["root_identity"]["query_root"] == str(case["root"])
+    assert trace["snapshot_id"] == candidate_snapshot_id
     assert identity["root_identity_hash"].startswith("sha256:")
     assert identity["query_root_identity_hash"].startswith("sha256:")
     exact = server.handle_project_onboard_route_guide(
@@ -213288,9 +213665,34 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
             body=copy.deepcopy(onboard_body),
         )
     )
+    exact_bootstrap = exact["dev_local_graph_bootstrap"]
+    exact_authority = exact_bootstrap["bootstrap_authority"]
+    exact_active = store.get_active_graph_snapshot(
+        conn, case["project_id"]
+    )
     assert exact["next_legal_action"]["mcp_tool"] == (
         "observer_direct_mutation_exception"
-    )
+    ), {
+        "state": exact_bootstrap["state"],
+        "graph_query_recognition_missing_requirement_ids": (
+            exact_authority[
+                "graph_query_recognition_missing_requirement_ids"
+            ]
+        ),
+        "active_snapshot_id": exact_active["snapshot_id"],
+        "deterministic_snapshot_id": (
+            server._current_full_deterministic_snapshot_id(
+                case["current_commit"]
+            )
+        ),
+        "exact_active_provenance_missing_requirement_ids": (
+            exact_authority["exact_active_provenance_authority"]
+            ["missing_requirement_ids"]
+        ),
+    }
+    assert exact["next_legal_action"]["graph_query_close_authority"][
+        "copy_safe_graph_query"
+    ]["arguments"]["snapshot_id"] == "active"
     assert "graph_query_close_authority" in exact["next_legal_action"]
     service_body = copy.deepcopy(
         exact["next_legal_action"]["action_input"]
@@ -213339,27 +213741,6 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
         assert conn.total_changes == denied_changes
         assert tuple(conn.iterdump()) == denied_before
 
-    forged_body = copy.deepcopy(service_body)
-    forged_body["payload"]["route_token_gate"] = {
-        "server_projected": True,
-        "projection_source": "server_route_token_mutation_gate",
-        "allowed": True,
-        "action": "observer_direct_mutation_exception",
-    }
-    denied_before = tuple(conn.iterdump())
-    denied_changes = conn.total_changes
-    with pytest.raises(GovernanceError) as forged:
-        server.handle_task_timeline_append(
-            _ctx(
-                {"project_id": case["project_id"]},
-                method="POST",
-                body=forged_body,
-            )
-        )
-    assert forged.value.code == "operator_supervised_direct_main_execution_not_unique"
-    assert conn.total_changes == denied_changes
-    assert tuple(conn.iterdump()) == denied_before
-
     service_ctx = _ctx(
         {"project_id": case["project_id"]},
         method="POST",
@@ -213394,7 +213775,7 @@ def test_direct_graph_query_exact_successor_binds_current_world_before_write(
     assert implementation_action["line_id"] == "observer_implementation"
     assert tuple(conn.iterdump()) == implementation_before
     for invalid_session in (
-        case["session_id"], "obs-missing-implementation-session",
+        "obs-wrong-route-session", "obs-missing-implementation-session",
     ):
         denied_before = tuple(conn.iterdump())
         denied = server.handle_project_onboard_route_guide(

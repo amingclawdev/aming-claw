@@ -96646,8 +96646,48 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         "expected_old_snapshot_id": active_snapshot_id,
         "bind_only_preimplementation_provenance": True,
     }
+    existing_candidate_run_id = (
+        f"current-full-direct-existing-{target_commit[:7]}"
+    )
+    candidate_selection = _onboard_direct_qa_graph_snapshot_selection(
+        conn,
+        project_id=project_id,
+        candidate_commit=target_commit,
+        target_project_root=target_root_text,
+    )
+    candidate_snapshot_id = str(
+        candidate_selection.get("resolved_snapshot_id") or ""
+    ).strip()
+    candidate_resume_tuple: dict[str, Any] = {"valid": False}
+    if (
+        candidate_selection.get("accepted") is True
+        and candidate_selection.get("selection_source")
+        == "unique_full_candidate_snapshot"
+        and candidate_snapshot_id
+    ):
+        try:
+            from . import graph_snapshot_store as store
+
+            candidate_resume_tuple = store.current_full_candidate_tuple_from_db(
+                conn,
+                project_id=project_id,
+                run_id=existing_candidate_run_id,
+                target_commit_sha=target_commit,
+                snapshot_id=candidate_snapshot_id,
+            )
+        except (OSError, sqlite3.Error, ValueError):
+            candidate_resume_tuple = {"valid": False}
+    existing_candidate_expected_body = {
+        **{key: value for key, value in expected_body.items() if key != "run_id"},
+        "run_id": existing_candidate_run_id,
+        "snapshot_id": candidate_snapshot_id,
+        "expected_old_snapshot_id": active_snapshot_id,
+    }
     request_body_exact = body is not None and dict(body) == expected_body
     bind_only_request_body_exact = bool(body is not None and dict(body) == bind_only_expected_body)
+    existing_candidate_request_body_exact = bool(
+        body is not None and dict(body) == existing_candidate_expected_body
+    )
     common_eligibility_checks = {
         "strict_direct_graph_first_route_session": strict_direct_position,
         "compatible_graph_materialization_preimage": readiness_compatible,
@@ -96677,6 +96717,24 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     }
     materialization_eligible = all(materialization_eligibility_checks.values())
     common_eligible = all(common_eligibility_checks.values())
+    existing_candidate_activation_eligible = bool(
+        common_eligible
+        and local_active_graph_present
+        and unique_default_active_ref
+        and unique_full_active_status
+        and active_provenance_exact
+        and active_commit
+        and active_commit != target_commit
+        and candidate_snapshot_id == canonical_target_snapshot_id
+        and target_identity.get("status") == "existing"
+        and str(target_identity.get("snapshot_id") or "").strip()
+        == candidate_snapshot_id
+        and target_identity.get("legacy_identity_selected") is not True
+        and candidate_selection.get("accepted") is True
+        and candidate_selection.get("selection_source")
+        == "unique_full_candidate_snapshot"
+        and candidate_resume_tuple.get("valid") is True
+    )
     bind_only_eligible = bool(
         common_eligible and exact_canonical_active_structure
         and active_provenance_absent
@@ -96685,9 +96743,17 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         common_eligible and exact_canonical_active
         and exact_active_provenance_authority.get("same_wip_scope") is True
     )
-    eligible = bool(materialization_eligible or bind_only_eligible)
+    eligible = bool(
+        materialization_eligible
+        or bind_only_eligible
+        or existing_candidate_activation_eligible
+    )
     accepted = bool(
         (materialization_eligible and request_body_exact)
+        or (
+            existing_candidate_activation_eligible
+            and existing_candidate_request_body_exact
+        )
         or (
             (bind_only_eligible or bind_only_replay_eligible)
             and bind_only_request_body_exact
@@ -96709,12 +96775,22 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     if not (
         request_body_exact
         or (
+            existing_candidate_activation_eligible
+            and existing_candidate_request_body_exact
+        )
+        or (
             (bind_only_eligible or bind_only_replay_eligible)
             and bind_only_request_body_exact
         )
     ):
         missing.append("exact_mcp_adapted_http_body")
-    action_body = bind_only_expected_body if bind_only_eligible else expected_body
+    action_body = (
+        existing_candidate_expected_body
+        if existing_candidate_activation_eligible
+        else bind_only_expected_body
+        if bind_only_eligible
+        else expected_body
+    )
     authority = {
         "schema_version": "ac_dev.direct_graph_bootstrap_reconcile_authority.v1",
         "applicable": True,
@@ -96730,6 +96806,14 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
             same_wip_descendant_active_predecessor
         ),
         "exact_canonical_active": exact_canonical_active,
+        "existing_candidate_activation_required": (
+            existing_candidate_activation_eligible
+        ),
+        "existing_candidate_request_body_exact": (
+            existing_candidate_request_body_exact
+        ),
+        "existing_candidate_snapshot_selection": dict(candidate_selection),
+        "existing_candidate_resume_tuple": dict(candidate_resume_tuple),
         "bind_only_provenance_materialization_required": bind_only_eligible,
         "bind_only_provenance_materialization_replay": bool(
             bind_only_replay_eligible and bind_only_request_body_exact
@@ -96777,6 +96861,106 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     }
     authority["authority_hash"] = stable_sha256(authority)
     return authority
+
+
+def _dev_direct_existing_candidate_terminal_replay_authority(
+    conn,
+    store,
+    *,
+    project_id: str,
+    auth: Mapping[str, Any],
+    direct_main_qa_preflight: Mapping[str, Any],
+    current_bootstrap_authority: Mapping[str, Any],
+    body: Mapping[str, Any],
+    target_commit: str,
+) -> dict[str, Any]:
+    """Accept only the byte-exact protected replay of one R5 activation."""
+
+    def mapped(source: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+        value = source.get(key)
+        return value if isinstance(value, Mapping) else {}
+
+    active = store.get_active_graph_snapshot(conn, project_id) or {}
+    binding = (
+        store._current_full_snapshot_provenance_binding(
+            conn, project_id, active
+        )
+        if active
+        else {}
+    )
+    marker = mapped(binding, "marker")
+    route_evidence = mapped(marker, "route_evidence")
+    persisted_bootstrap = mapped(
+        route_evidence, "dev_graph_bootstrap_reconcile_authority"
+    )
+    persisted_preflight = mapped(
+        route_evidence, "direct_main_qa_preflight_authority"
+    )
+    current_provenance = mapped(
+        current_bootstrap_authority, "exact_active_provenance_authority"
+    )
+    expected_body = mapped(persisted_bootstrap, "expected_http_body")
+    route_scope = mapped(route_evidence, "route_token_scope")
+    auth_scope = mapped(auth, "route_token_scope")
+    snapshot_id = str(active.get("snapshot_id") or "").strip()
+    run_id = str(body.get("run_id") or "").strip()
+    expected_scope = _current_full_reconcile_idempotency_scope(route_evidence)
+    terminal = (
+        store.current_full_active_terminal_tuple(
+            conn,
+            project_id=project_id,
+            run_id=run_id,
+            target_commit_sha=target_commit,
+            expected_scope=expected_scope,
+            snapshot_id=snapshot_id,
+        )
+        if snapshot_id and run_id and expected_scope
+        else {"valid": False}
+    )
+    accepted = bool(
+        current_bootstrap_authority.get(
+            "graph_query_recognition_eligible"
+        )
+        is True
+        and current_bootstrap_authority.get("exact_canonical_active") is True
+        and current_provenance.get("same_wip_scope") is True
+        and binding.get("verified") is True
+        and str(active.get("snapshot_kind") or "") == "full"
+        and str(active.get("commit_sha") or "").lower() == target_commit
+        and route_evidence.get("schema_version")
+        == "graph_current_full_reconcile.route_evidence.v1"
+        and route_scope == auth_scope
+        and str(route_evidence.get("session_id") or "")
+        == str(auth.get("observer_session_id") or "")
+        and str(route_evidence.get("route_token_ref") or "")
+        == str(auth.get("route_token_ref") or "")
+        and persisted_preflight == direct_main_qa_preflight
+        and persisted_bootstrap.get("accepted") is True
+        and persisted_bootstrap.get(
+            "existing_candidate_activation_required"
+        )
+        is True
+        and persisted_bootstrap.get("existing_candidate_request_body_exact")
+        is True
+        and expected_body
+        and dict(body) == dict(expected_body)
+        and str(expected_body.get("snapshot_id") or "") == snapshot_id
+        and str(expected_body.get("target_commit_sha") or "").lower()
+        == target_commit
+        and str(route_evidence.get("reconcile_run_id") or "") == run_id
+        and route_evidence.get("idempotency_scope") == expected_scope
+        and terminal.get("valid") is True
+    )
+    return {
+        "schema_version": (
+            "ac_dev.direct_existing_candidate_terminal_replay_authority.v1"
+        ),
+        "accepted": accepted,
+        "persisted_bootstrap_authority": (
+            dict(persisted_bootstrap) if accepted else {}
+        ),
+        "writes_performed": False,
+    }
 
 
 def _record_pending_scope_reconcile_contract_event(
@@ -98769,6 +98953,35 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             if direct_graph_bootstrap_request
             else {"applicable": False, "eligible": False, "accepted": False}
         )
+        terminal_replay_authority = (
+            _dev_direct_existing_candidate_terminal_replay_authority(
+                conn,
+                store,
+                project_id=project_id,
+                auth=current_full_auth,
+                direct_main_qa_preflight=(
+                    direct_main_qa_preflight_authority
+                ),
+                current_bootstrap_authority=(
+                    dev_graph_bootstrap_authority
+                ),
+                body=body,
+                target_commit=target_commit,
+            )
+            if direct_graph_bootstrap_request
+            and dev_graph_bootstrap_authority.get(
+                "graph_query_recognition_eligible"
+            )
+            is True
+            and dev_graph_bootstrap_authority.get("accepted") is not True
+            else {"accepted": False}
+        )
+        if terminal_replay_authority.get("accepted") is True:
+            dev_graph_bootstrap_authority = dict(
+                terminal_replay_authority[
+                    "persisted_bootstrap_authority"
+                ]
+            )
         if (
             activate_requested
             and direct_main_qa_preflight_authority.get("applicable") is True
@@ -99506,6 +99719,110 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         try:
             with sqlite_write_lock():
                 conn.execute("BEGIN IMMEDIATE")
+                if dev_graph_bootstrap_authority.get(
+                    "existing_candidate_activation_required"
+                ) is True:
+                    locked_auth = _require_current_full_reconcile_auth(
+                        ctx,
+                        conn,
+                        "graph-governance.reconcile.current-full",
+                        route_ref_renew_within_seconds=0,
+                    )
+                    locked_qa_preflight = (
+                        _operator_supervised_direct_main_reconcile_qa_preflight_authority(
+                            conn,
+                            project_id=project_id,
+                            target_commit=target_commit,
+                            current_full_auth=locked_auth,
+                        )
+                    )
+                    locked_scope = _current_full_reconcile_runtime_context_scope(
+                        conn,
+                        project_id=project_id,
+                        body=body,
+                        auth=locked_auth,
+                        target_commit_sha=target_commit,
+                        candidate_only=False,
+                        source_free_reconcile_authority=(
+                            source_free_reconcile_authority
+                            if isinstance(
+                                source_free_reconcile_authority, Mapping
+                            )
+                            else {}
+                        ),
+                    )
+                    locked_authority = (
+                        _dev_direct_graph_bootstrap_reconcile_authority(
+                            conn,
+                            project_id=project_id,
+                            auth=locked_auth,
+                            direct_main_qa_preflight=locked_qa_preflight,
+                            body=dict(body),
+                        )
+                    )
+                    locked_route_evidence = (
+                        _current_full_reconcile_route_evidence(
+                            locked_auth,
+                            runtime_context_scope=locked_scope,
+                        )
+                    )
+                    locked_route_evidence[
+                        "direct_main_qa_preflight_authority"
+                    ] = dict(locked_qa_preflight)
+                    locked_route_evidence[
+                        "dev_graph_bootstrap_reconcile_authority"
+                    ] = dict(locked_authority)
+                    locked_idempotency_scope = (
+                        _current_full_reconcile_idempotency_scope(
+                            locked_route_evidence
+                        )
+                    )
+                    locked_route_evidence.update(
+                        reconcile_run_id=run_id,
+                        idempotency_scope=locked_idempotency_scope,
+                    )
+                    locked_active_ref = conn.execute(
+                        "SELECT snapshot_id FROM graph_snapshot_refs "
+                        "WHERE project_id=? AND ref_name='active'",
+                        (project_id,),
+                    ).fetchone()
+                    expected_old_snapshot_id = str(
+                        body.get("expected_old_snapshot_id") or ""
+                    ).strip()
+                    locked_authority_exact = bool(
+                        locked_authority.get("accepted") is True
+                        and locked_authority.get(
+                            "existing_candidate_activation_required"
+                        )
+                        is True
+                        and locked_authority.get(
+                            "existing_candidate_request_body_exact"
+                        )
+                        is True
+                        and locked_scope == runtime_context_scope
+                        and locked_idempotency_scope == idempotency_scope
+                        and stable_sha256(locked_route_evidence)
+                        == stable_sha256(route_evidence)
+                        and locked_active_ref
+                        and str(locked_active_ref["snapshot_id"] or "")
+                        == expected_old_snapshot_id
+                    )
+                    if not locked_authority_exact:
+                        conn.rollback()
+                        return 409, {
+                            "ok": False,
+                            "project_id": project_id,
+                            "error": (
+                                "dev_direct_existing_candidate_activation_"
+                                "authority_changed"
+                            ),
+                            "run_id": run_id,
+                            "snapshot_id": graph_epoch_snapshot_id,
+                            "rebuild_started": False,
+                            "writes_performed": False,
+                            "mutation_performed": False,
+                            "fail_closed": True,
+                        }
                 locked_run_identity = store.current_full_run_snapshot_identity_check(
                     conn,
                     project_id,
@@ -152848,6 +153165,12 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                     )
                     is True
                 )
+                existing_candidate_activation = bool(
+                    bootstrap_authority.get(
+                        "existing_candidate_activation_required"
+                    )
+                    is True
+                )
                 if exact_active:
                     graph_bootstrap_projection = {
                         "schema_version": "onboard_route_guide.dev_local_graph_bootstrap.v1",
@@ -152885,7 +153208,9 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                     graph_bootstrap_projection = {
                         "schema_version": "onboard_route_guide.dev_local_graph_bootstrap.v1",
                         "state": (
-                            "exact_active_provenance_materialization_required"
+                            "existing_candidate_activation_required"
+                            if existing_candidate_activation
+                            else "exact_active_provenance_materialization_required"
                             if provenance_materialization
                             else (
                                 "same_wip_descendant_active_predecessor"
@@ -152912,6 +153237,24 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         "local_active_graph_present": bool(active_snapshot),
                         "same_wip_descendant_active_predecessor": (
                             descendant_predecessor
+                        ),
+                        "existing_candidate_activation_required": (
+                            existing_candidate_activation
+                        ),
+                        "existing_candidate_snapshot_id": str(
+                            (
+                                bootstrap_authority.get(
+                                    "existing_candidate_snapshot_selection"
+                                )
+                                if isinstance(
+                                    bootstrap_authority.get(
+                                        "existing_candidate_snapshot_selection"
+                                    ),
+                                    Mapping,
+                                )
+                                else {}
+                            ).get("resolved_snapshot_id")
+                            or ""
                         ),
                         "active_predecessor_snapshot_id": str(
                             bootstrap_authority.get(
@@ -152960,7 +153303,9 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         next_action = {
                             "schema_version": "onboard_route_guide.next_action.v1",
                             "id": (
-                                "dev_local_graph_bind_only_provenance"
+                                "dev_local_graph_existing_candidate_activation_required"
+                                if existing_candidate_activation
+                                else "dev_local_graph_bind_only_provenance"
                                 if provenance_materialization
                                 else "dev_local_graph_current_full_reconcile"
                             ),
