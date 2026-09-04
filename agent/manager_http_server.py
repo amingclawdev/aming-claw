@@ -126,9 +126,16 @@ def _existing_non_symlink_root(path: Path, label: str) -> Path:
 def _canonical_storage_root(plane_name: str) -> Path:
     """Return the established storage authority for exactly one runtime plane."""
     if plane_name == "dev":
-        from agent.governance.db import _dev_runtime_root
-
-        return _dev_runtime_root(create=False)
+        # The fixed launcher and ServiceManager parent have already derived
+        # this exact claim from stable authority.  Rebind the sidecar to that
+        # physical directory without entering governance DB writer admission.
+        configured = str(os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT") or "").strip()
+        if not configured:
+            raise ValueError("dev manager sidecar requires explicit storage authority")
+        return _existing_non_symlink_root(
+            Path(configured).absolute() / "runtime",
+            "dev runtime root",
+        )
     return _existing_non_symlink_root(
         _project_root() / "shared-volume", "stable shared-volume root",
     )

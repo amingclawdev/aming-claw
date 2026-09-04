@@ -3862,6 +3862,64 @@ def test_mcp_managed_observer_session_ref_heartbeats_and_strips_hotfix_auth():
     assert stale["error"] == "observer_session_token_ref_unknown"
 
 
+def test_mcp_observer_session_register_exposes_and_forwards_dev_route_authority():
+    props = _tool_properties("observer_session_register")
+    assert {
+        "route_token_ref",
+        "backlog_id",
+        "task_id",
+        "cex_id",
+    }.issubset(props)
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, method, path, body=None):
+            self.calls.append((method, path, body))
+            return {
+                "ok": True,
+                "session_id": "obs-route-bound",
+                "session_token": "observer-secret",
+            }
+
+    recorder = Recorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder,
+        worker_pool=None,
+        manager_api_fn=recorder,
+        workspace="/repo",
+    )
+    result = dispatcher.dispatch(
+        "observer_session_register",
+        {
+            "project_id": "aming-claw",
+            "route_token_ref": "rtok-direct",
+            "backlog_id": "AC-DIRECT",
+            "task_id": "cex-direct",
+            "cex_id": "cex-direct",
+            "observer_kind": "codex",
+            "session_label": "fresh-route-bound-observer",
+        },
+    )
+
+    assert result["session_id"] == "obs-route-bound"
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-sessions/register",
+            {
+                "route_token_ref": "rtok-direct",
+                "backlog_id": "AC-DIRECT",
+                "task_id": "cex-direct",
+                "cex_id": "cex-direct",
+                "observer_kind": "codex",
+                "session_label": "fresh-route-bound-observer",
+            },
+        )
+    ]
+
+
 def test_mcp_managed_observer_session_ref_routes_observer_commands():
     raw_token = "observer-command-secret-must-stay-process-local"
 
@@ -5697,6 +5755,193 @@ def test_managed_mcp_contract_runtime_timeout_policy_is_bounded_and_configurable
     ) == 45
 
 
+def test_managed_direct_facades_use_bounded_timeout_transport_without_forwarding():
+    calls = []
+
+    def generic_api(*_args, **_kwargs):
+        raise AssertionError("governed long-running facades must use timeout-aware transport")
+
+    dispatcher = ToolDispatcher(generic_api, worker_pool=None)
+
+    def timeout_api(method, path, data=None, *, timeout_seconds):
+        calls.append((method, path, data, timeout_seconds))
+        return {"ok": True, "path": path}
+
+    dispatcher._governance_api_with_timeout = timeout_api
+
+    timeline = dispatcher.dispatch(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "task_id": "cex-direct-timeout",
+            "backlog_id": "AC-DIRECT-TIMEOUT",
+            "event_type": "graph.reconcile",
+            "timeout_seconds": 900,
+        },
+    )
+    guide = dispatcher.dispatch(
+        "onboard_route_guide",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-DIRECT-TIMEOUT",
+            "role": "observer",
+            "work_type": "operator_supervised_direct_main",
+            "timeout_seconds": 600,
+        },
+    )
+    preflight = dispatcher.dispatch(
+        "preflight_check",
+        {
+            "project_id": "aming-claw",
+            "auto_fix": False,
+            "timeout_seconds": 300,
+        },
+    )
+    closed = dispatcher.dispatch(
+        "backlog_close",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "AC-DIRECT-TIMEOUT",
+            "commit": "a" * 40,
+            "contract_execution_id": "cex-direct-timeout",
+            "route_token_ref": "rtok-direct-timeout",
+            "timeout_seconds": 750,
+        },
+    )
+
+    assert timeline["ok"] is True
+    assert guide["ok"] is True
+    assert preflight["ok"] is True
+    assert closed["ok"] is True
+    assert [call[3] for call in calls] == [900, 600, 300, 750]
+    assert all("timeout_seconds" not in (call[2] or {}) for call in calls)
+    assert calls[2][2] is None
+
+    for tool_name in (
+        "task_timeline_append",
+        "onboard_route_guide",
+        "preflight_check",
+        "backlog_close",
+    ):
+        schema = _tool_properties(tool_name)["timeout_seconds"]
+        assert schema["minimum"] == 10
+        assert schema["maximum"] == 60 * 60
+        assert schema["default"] == 120
+
+
+def test_onboard_route_guide_mcp_compaction_preserves_exact_action_once():
+    direct_body = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-COMPACT",
+        "task_id": "cex-direct-compact",
+        "event_type": "graph.reconcile",
+        "event_kind": "close_ready",
+        "contract_execution_id": "cex-direct-compact",
+        "execution_state_revision": 7,
+        "stage_id": "reconcile",
+        "line_id": "observer_reconcile",
+        "evidence_kind": "current_full_reconcile",
+        "runtime_guide_hash": "sha256:" + ("1" * 64),
+        "direct_runtime_binding_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-direct-compact",
+    }
+    duplicate = {"large_advisory": "x" * (70 * 1024)}
+    source = {
+        "schema_version": "onboard_route_guide.compact.v1",
+        "ok": True,
+        "response_view": "compact",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-COMPACT",
+        "selected_role": "observer",
+        "selected_work_type": "operator_supervised_direct_main",
+        "selected_task_id": "cex-direct-compact",
+        "contract_execution_id": "cex-direct-compact",
+        "execution_state_revision": 7,
+        "projection_hash": "sha256:" + ("3" * 64),
+        "facade": "task_timeline_append",
+        "mcp_tool": "task_timeline_append",
+        "actionable": True,
+        "guide_capsule_ref": "gcap-direct-compact",
+        "next_legal_action": {
+            "action": "record_close_ready",
+            "stage_id": "reconcile",
+            "line_id": "observer_reconcile",
+            **duplicate,
+        },
+        "canonical_executable_action": {
+            "action": "record_close_ready",
+            "facade": "task_timeline_append",
+            "mcp_tool": "task_timeline_append",
+            "copy_safe_body": direct_body,
+            **duplicate,
+        },
+        "copy_safe_body": direct_body,
+        "action_input": {"copy_safe_body": direct_body, **duplicate},
+        "role_guidance": duplicate,
+    }
+
+    compact = mcp_tools._onboard_route_guide_mcp_compact_result(source)
+
+    assert compact["schema_version"] == (
+        "onboard_route_guide.mcp_compact_projection.v1"
+    )
+    assert compact["copy_safe_body"] == direct_body
+    assert compact["canonical_executable_action"] == {
+        "action": "record_close_ready",
+        "facade": "task_timeline_append",
+        "mcp_tool": "task_timeline_append",
+    }
+    assert compact["guide_capsule_ref"] == "gcap-direct-compact"
+    assert compact["duplicate_advisory_projections_omitted"] is True
+    assert compact["serialized_bytes"] < 16 * 1024
+
+    nested_source = dict(source)
+    nested_source.pop("canonical_executable_action")
+    nested_source.pop("copy_safe_body")
+    nested_source["guide_capsule_ref"] = ""
+    nested_source["guide_capsule"] = {
+        "guide_capsule_ref": "gcap-direct-nested"
+    }
+    nested_source["next_legal_action"] = {
+        **nested_source["next_legal_action"],
+        "canonical_executable_action": {
+            "action": "record_close_ready",
+            "facade": "task_timeline_append",
+            "mcp_tool": "task_timeline_append",
+            "copy_safe_body": direct_body,
+            **duplicate,
+        },
+    }
+
+    nested = mcp_tools._onboard_route_guide_mcp_compact_result(nested_source)
+
+    assert nested["copy_safe_body"] == direct_body
+    assert nested["guide_capsule_ref"] == "gcap-direct-nested"
+
+    direct_next_source = dict(source)
+    direct_next_source.pop("canonical_executable_action")
+    direct_next_source.pop("copy_safe_body")
+    direct_next_source.pop("action_input")
+    direct_next_source["next_legal_action"] = {
+        "action": "task_timeline_append",
+        "mcp_tool": "task_timeline_append",
+        "stage_id": "reconcile",
+        "line_id": "observer_reconcile",
+        "evidence_kind": "current_full_reconcile",
+        "copy_safe_body": direct_body,
+        **duplicate,
+    }
+
+    direct_next = mcp_tools._onboard_route_guide_mcp_compact_result(
+        direct_next_source
+    )
+
+    assert direct_next["copy_safe_body"] == direct_body
+    assert direct_next["canonical_executable_action"]["action"] == (
+        "task_timeline_append"
+    )
+
+
 def test_managed_runtime_host_issuance_timeout_is_transport_only_and_stages():
     route = {
         "route_id": "route-host-issuance-timeout",
@@ -6029,6 +6274,7 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
     assert "qa_session_token" in _tool_properties("qa_session_heartbeat")
     assert "qa_session_token" in _tool_properties("graph_query")
     assert "qa_session_token_ref" in _tool_properties("graph_query")
+    assert _tool_properties("graph_query")["timeout_seconds"]["default"] == 120
     assert "qa_session_token" in _tool_properties("task_timeline_append")
     qa_register = next(
         tool for tool in TOOLS if tool.get("name") == "qa_session_register"
@@ -6272,6 +6518,54 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
             },
             "gov-qa-token",
         ),
+    ]
+
+
+def test_mcp_graph_query_uses_bounded_transport_timeout_without_forwarding_it():
+    calls = []
+    dispatcher = ToolDispatcher(
+        api_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("graph query must use timeout-aware transport")
+        ),
+        worker_pool=None,
+        workspace="/repo",
+    )
+
+    def with_role(method, path, data=None, *, role_token, timeout_seconds=15):
+        calls.append((method, path, data, role_token, timeout_seconds))
+        return {"ok": True}
+
+    dispatcher._api_with_role_token = with_role
+    dispatcher.dispatch(
+        "graph_query",
+        {
+            "project_id": "aming-claw",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": "AC-QA-TIMEOUT",
+            "task_id": "cex-qa-timeout",
+            "commit_sha": "a" * 40,
+            "qa_session_token": "qa-secret",
+            "timeout_seconds": 180,
+        },
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/query",
+            {
+                "tool": "query_schema",
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "backlog_id": "AC-QA-TIMEOUT",
+                "task_id": "cex-qa-timeout",
+                "commit_sha": "a" * 40,
+            },
+            "qa-secret",
+            180,
+        )
     ]
 
 
@@ -7826,6 +8120,45 @@ def test_mcp_manager_start_refuses_takeover_from_mcp():
     assert result["error"] == "takeover_not_supported_from_mcp"
 
 
+def test_mcp_manager_start_schema_accepts_project_binding():
+    properties = _tool_properties("manager_start")
+
+    assert properties["project_id"] == {
+        "type": "string",
+        "description": "Intended project binding. Defaults to the project bound to this MCP dispatcher.",
+    }
+    assert "ServiceManager HTTP health" in properties["health_wait_seconds"]["description"]
+
+
+def test_mcp_manager_start_healthy_manager_succeeds_without_executor():
+    governance = _Recorder()
+    manager = _Recorder()
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager.api,
+        workspace="/repo",
+        project_id="ac-dev",
+    )
+
+    result = dispatcher.dispatch("manager_start", {})
+
+    assert result == {
+        "ok": True,
+        "action": "already_running",
+        "project_id": "ac-dev",
+        "manager": {
+            "ok": True,
+            "method": "GET",
+            "path": "/api/manager/health",
+            "data": None,
+        },
+        "executor_state": "waived_or_degraded",
+    }
+    assert manager.calls == [("GET", "/api/manager/health", None)]
+
+
 def test_mcp_manager_start_uses_posix_script_on_macos(monkeypatch):
     governance = _Recorder()
     manager = _Recorder()
@@ -7848,24 +8181,166 @@ def test_mcp_manager_start_uses_posix_script_on_macos(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return SimpleNamespace(returncode=0, stdout="Manager healthy.", stderr="")
+        return SimpleNamespace(
+            returncode=1,
+            stdout="Manager healthy.\n  executor_state: waived_or_degraded\n",
+            stderr="",
+        )
 
     monkeypatch.setattr(mcp_tools.subprocess, "run", fake_run)
 
-    result = dispatcher.dispatch("manager_start", {"health_wait_seconds": 7})
+    result = dispatcher.dispatch(
+        "manager_start",
+        {"project_id": "ac-dev", "health_wait_seconds": 7},
+    )
 
     assert result["ok"] is True
+    assert result["project_id"] == "ac-dev"
     assert result["script"] == "start-manager.sh"
     assert result["platform"] == "darwin"
+    assert result["executor_state"] == "waived_or_degraded"
+    assert result["launcher_degraded"] is True
     assert calls[0][0] == [
         "bash",
         "/repo/scripts/start-manager.sh",
+        "--project",
+        "ac-dev",
         "--health-wait-seconds",
         "7",
     ]
     assert manager.calls == [
         ("GET", "/api/manager/health", None),
         ("GET", "/api/manager/health", None),
+    ]
+
+
+def test_mcp_manager_start_uses_dispatcher_bound_project_when_omitted(monkeypatch):
+    class _BoundGovernance(_Recorder):
+        project_id = "ac-dev"
+
+    governance = _BoundGovernance()
+    manager = _Recorder()
+
+    def manager_api(method: str, path: str, data: dict | None = None) -> dict:
+        manager.calls.append((method, path, data))
+        return {"ok": len(manager.calls) > 1}
+
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager_api,
+        workspace="/repo",
+    )
+    calls = []
+    monkeypatch.setattr(mcp_tools.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        mcp_tools.os.path,
+        "exists",
+        lambda path: path == "/repo/scripts/start-manager.sh",
+    )
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Manager healthy.\n  executor_state: waived_or_degraded\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(mcp_tools.subprocess, "run", fake_run)
+
+    result = dispatcher.dispatch("manager_start", {"health_wait_seconds": 5})
+
+    assert result["ok"] is True
+    assert result["project_id"] == "ac-dev"
+    assert calls[0][2:4] == ["--project", "ac-dev"]
+
+
+def test_mcp_manager_start_reports_manager_health_failure(monkeypatch):
+    governance = _Recorder()
+    manager = _Recorder()
+
+    def manager_api(method: str, path: str, data: dict | None = None) -> dict:
+        manager.calls.append((method, path, data))
+        return {"ok": False, "error": "connection refused"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager_api,
+        workspace="/repo",
+        project_id="ac-dev",
+    )
+    monkeypatch.setattr(mcp_tools.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        mcp_tools.os.path,
+        "exists",
+        lambda path: path == "/repo/scripts/start-manager.sh",
+    )
+    monkeypatch.setattr(
+        mcp_tools.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="ServiceManager health did not become healthy",
+        ),
+    )
+
+    result = dispatcher.dispatch("manager_start", {})
+
+    assert result["ok"] is False
+    assert result["error"] == "manager_health_unavailable_after_start"
+    assert "ServiceManager HTTP health" in result["message"]
+    assert "worker" not in result["message"].lower()
+
+
+def test_mcp_manager_start_uses_powershell_project_argument(monkeypatch):
+    governance = _Recorder()
+    manager = _Recorder()
+
+    def manager_api(method: str, path: str, data: dict | None = None) -> dict:
+        manager.calls.append((method, path, data))
+        return {"ok": len(manager.calls) > 1}
+
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager_api,
+        workspace=r"C:\repo",
+        project_id="aming-claw",
+    )
+    calls = []
+    monkeypatch.setattr(mcp_tools.sys, "platform", "win32")
+    monkeypatch.setattr(mcp_tools.os.path, "exists", lambda path: True)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Manager healthy.\n  executor_state: waived_or_degraded\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(mcp_tools.subprocess, "run", fake_run)
+
+    result = dispatcher.dispatch("manager_start", {"project_id": "ac-dev"})
+
+    assert result["ok"] is True
+    assert calls[0] == [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        r"C:\repo/scripts/start-manager.ps1",
+        "-Project",
+        "ac-dev",
+        "-HealthWaitSeconds",
+        "90",
     ]
 
 
