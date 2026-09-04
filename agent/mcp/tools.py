@@ -4281,6 +4281,28 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
+                "route_token_ref": {
+                    "type": "string",
+                    "description": (
+                        "Copy-safe persisted observer route authority required "
+                        "for dev-plane session registration."
+                    ),
+                },
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Exact backlog scope bound to route_token_ref.",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Exact task scope bound to route_token_ref.",
+                },
+                "cex_id": {
+                    "type": "string",
+                    "description": (
+                        "Exact ContractRuntime execution referenced by the "
+                        "persisted observer route."
+                    ),
+                },
                 "observer_kind": {"type": "string"},
                 "session_label": {"type": "string"},
                 "pid": {"type": "integer"},
@@ -8151,7 +8173,17 @@ class ToolDispatcher:
             pid = args["project_id"]
             body = {
                 key: args[key]
-                for key in ("observer_kind", "session_label", "pid", "cwd", "capabilities")
+                for key in (
+                    "route_token_ref",
+                    "backlog_id",
+                    "task_id",
+                    "cex_id",
+                    "observer_kind",
+                    "session_label",
+                    "pid",
+                    "cwd",
+                    "capabilities",
+                )
                 if key in args and args[key] is not None
             }
             return self._register_observer_session_ref(

@@ -3862,6 +3862,64 @@ def test_mcp_managed_observer_session_ref_heartbeats_and_strips_hotfix_auth():
     assert stale["error"] == "observer_session_token_ref_unknown"
 
 
+def test_mcp_observer_session_register_exposes_and_forwards_dev_route_authority():
+    props = _tool_properties("observer_session_register")
+    assert {
+        "route_token_ref",
+        "backlog_id",
+        "task_id",
+        "cex_id",
+    }.issubset(props)
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, method, path, body=None):
+            self.calls.append((method, path, body))
+            return {
+                "ok": True,
+                "session_id": "obs-route-bound",
+                "session_token": "observer-secret",
+            }
+
+    recorder = Recorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder,
+        worker_pool=None,
+        manager_api_fn=recorder,
+        workspace="/repo",
+    )
+    result = dispatcher.dispatch(
+        "observer_session_register",
+        {
+            "project_id": "aming-claw",
+            "route_token_ref": "rtok-direct",
+            "backlog_id": "AC-DIRECT",
+            "task_id": "cex-direct",
+            "cex_id": "cex-direct",
+            "observer_kind": "codex",
+            "session_label": "fresh-route-bound-observer",
+        },
+    )
+
+    assert result["session_id"] == "obs-route-bound"
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-sessions/register",
+            {
+                "route_token_ref": "rtok-direct",
+                "backlog_id": "AC-DIRECT",
+                "task_id": "cex-direct",
+                "cex_id": "cex-direct",
+                "observer_kind": "codex",
+                "session_label": "fresh-route-bound-observer",
+            },
+        )
+    ]
+
+
 def test_mcp_managed_observer_session_ref_routes_observer_commands():
     raw_token = "observer-command-secret-must-stay-process-local"
 
