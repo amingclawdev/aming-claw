@@ -56,16 +56,6 @@ STATE_DIR="$SHARED_VOLUME_PATH/codex-tasks/state"
 LOG_DIR="$SHARED_VOLUME_PATH/codex-tasks/logs"
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
-LOCK_DIR="$STATE_DIR/manager-start.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "Manager launcher lock is already held. Exit."
-  exit 0
-fi
-cleanup() {
-  rmdir "$LOCK_DIR" 2>/dev/null || true
-}
-trap cleanup EXIT
-
 check_manager_health() {
   "$PYTHON" - "$MANAGER_URL/api/manager/health" <<'PY'
 import json
@@ -90,25 +80,58 @@ find_worker_pid() {
   pgrep -f "agent/executor_worker.py.*--project[[:space:]]+$PROJECT" 2>/dev/null | head -n 1 || true
 }
 
-if check_manager_health; then
-  DEADLINE=$((SECONDS + HEALTH_WAIT_SECONDS))
-  while (( SECONDS < DEADLINE )); do
-    MANAGER_PID="$(find_manager_pid)"
-    WORKER_PID="$(find_worker_pid)"
-    if [[ -n "$MANAGER_PID" && -n "$WORKER_PID" ]]; then
-      echo "Manager already healthy."
-      echo "  manager: $MANAGER_PID"
-      echo "  worker:  $WORKER_PID"
-      exit 0
+report_healthy_manager() {
+  local message="$1"
+  local launcher_pid="${2:-}"
+  local manager_pid
+  local worker_pid
+  manager_pid="$(find_manager_pid)"
+  worker_pid="$(find_worker_pid)"
+
+  echo "$message"
+  echo "  manager:       ${manager_pid:-not_observed}"
+  if [[ -n "$worker_pid" ]]; then
+    echo "  executor_state: optional_present"
+    echo "  worker:        $worker_pid"
+  else
+    echo "  executor_state: waived_or_degraded"
+    echo "  worker:        not_observed (optional)"
+  fi
+  if [[ -n "$launcher_pid" ]]; then
+    echo "  launcher:      $launcher_pid"
+  fi
+}
+
+wait_for_manager_health() {
+  local deadline=$((SECONDS + HEALTH_WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if check_manager_health; then
+      return 0
     fi
     sleep 1
   done
-  echo "Manager sidecar is healthy but executor worker did not appear within $HEALTH_WAIT_SECONDS seconds." >&2
-  echo "  manager: $(find_manager_pid)" >&2
-  echo "  worker:  $(find_worker_pid)" >&2
-  echo "Stop the stale manager host process and run this script again." >&2
+  return 1
+}
+
+if check_manager_health; then
+  report_healthy_manager "Manager already healthy."
+  exit 0
+fi
+
+LOCK_DIR="$STATE_DIR/manager-start.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "Manager launcher lock is already held; waiting for ServiceManager health."
+  if wait_for_manager_health; then
+    report_healthy_manager "Manager became healthy while another launcher held the lock."
+    exit 0
+  fi
+  echo "ServiceManager health did not become healthy within $HEALTH_WAIT_SECONDS seconds while the launcher lock was held." >&2
   exit 1
 fi
+cleanup() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 if ! "$PYTHON" -c "import requests" >/dev/null 2>&1; then
   echo "Installing agent dependencies..."
@@ -163,21 +186,12 @@ finally:
 print(proc.pid)
 PY
 )"
-DEADLINE=$((SECONDS + HEALTH_WAIT_SECONDS))
-while (( SECONDS < DEADLINE )); do
-  MANAGER_PID="$(find_manager_pid)"
-  WORKER_PID="$(find_worker_pid)"
-  if [[ -n "$MANAGER_PID" && -n "$WORKER_PID" ]] && check_manager_health; then
-    echo "Manager healthy."
-    echo "  manager:  $MANAGER_PID"
-    echo "  worker:   $WORKER_PID"
-    echo "  launcher: $LAUNCHER_PID"
-    exit 0
-  fi
-  sleep 1
-done
+if wait_for_manager_health; then
+  report_healthy_manager "Manager healthy." "$LAUNCHER_PID"
+  exit 0
+fi
 
-echo "Managed executor worker did not appear within $HEALTH_WAIT_SECONDS seconds." >&2
+echo "ServiceManager health did not become healthy within $HEALTH_WAIT_SECONDS seconds after launch." >&2
 echo "  launcher: $LAUNCHER_PID" >&2
 echo "  stdout:   $STDOUT_LOG" >&2
 echo "  stderr:   $STDERR_LOG" >&2

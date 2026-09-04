@@ -7826,6 +7826,45 @@ def test_mcp_manager_start_refuses_takeover_from_mcp():
     assert result["error"] == "takeover_not_supported_from_mcp"
 
 
+def test_mcp_manager_start_schema_accepts_project_binding():
+    properties = _tool_properties("manager_start")
+
+    assert properties["project_id"] == {
+        "type": "string",
+        "description": "Intended project binding. Defaults to the project bound to this MCP dispatcher.",
+    }
+    assert "ServiceManager HTTP health" in properties["health_wait_seconds"]["description"]
+
+
+def test_mcp_manager_start_healthy_manager_succeeds_without_executor():
+    governance = _Recorder()
+    manager = _Recorder()
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager.api,
+        workspace="/repo",
+        project_id="ac-dev",
+    )
+
+    result = dispatcher.dispatch("manager_start", {})
+
+    assert result == {
+        "ok": True,
+        "action": "already_running",
+        "project_id": "ac-dev",
+        "manager": {
+            "ok": True,
+            "method": "GET",
+            "path": "/api/manager/health",
+            "data": None,
+        },
+        "executor_state": "waived_or_degraded",
+    }
+    assert manager.calls == [("GET", "/api/manager/health", None)]
+
+
 def test_mcp_manager_start_uses_posix_script_on_macos(monkeypatch):
     governance = _Recorder()
     manager = _Recorder()
@@ -7848,24 +7887,166 @@ def test_mcp_manager_start_uses_posix_script_on_macos(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return SimpleNamespace(returncode=0, stdout="Manager healthy.", stderr="")
+        return SimpleNamespace(
+            returncode=1,
+            stdout="Manager healthy.\n  executor_state: waived_or_degraded\n",
+            stderr="",
+        )
 
     monkeypatch.setattr(mcp_tools.subprocess, "run", fake_run)
 
-    result = dispatcher.dispatch("manager_start", {"health_wait_seconds": 7})
+    result = dispatcher.dispatch(
+        "manager_start",
+        {"project_id": "ac-dev", "health_wait_seconds": 7},
+    )
 
     assert result["ok"] is True
+    assert result["project_id"] == "ac-dev"
     assert result["script"] == "start-manager.sh"
     assert result["platform"] == "darwin"
+    assert result["executor_state"] == "waived_or_degraded"
+    assert result["launcher_degraded"] is True
     assert calls[0][0] == [
         "bash",
         "/repo/scripts/start-manager.sh",
+        "--project",
+        "ac-dev",
         "--health-wait-seconds",
         "7",
     ]
     assert manager.calls == [
         ("GET", "/api/manager/health", None),
         ("GET", "/api/manager/health", None),
+    ]
+
+
+def test_mcp_manager_start_uses_dispatcher_bound_project_when_omitted(monkeypatch):
+    class _BoundGovernance(_Recorder):
+        project_id = "ac-dev"
+
+    governance = _BoundGovernance()
+    manager = _Recorder()
+
+    def manager_api(method: str, path: str, data: dict | None = None) -> dict:
+        manager.calls.append((method, path, data))
+        return {"ok": len(manager.calls) > 1}
+
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager_api,
+        workspace="/repo",
+    )
+    calls = []
+    monkeypatch.setattr(mcp_tools.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        mcp_tools.os.path,
+        "exists",
+        lambda path: path == "/repo/scripts/start-manager.sh",
+    )
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Manager healthy.\n  executor_state: waived_or_degraded\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(mcp_tools.subprocess, "run", fake_run)
+
+    result = dispatcher.dispatch("manager_start", {"health_wait_seconds": 5})
+
+    assert result["ok"] is True
+    assert result["project_id"] == "ac-dev"
+    assert calls[0][2:4] == ["--project", "ac-dev"]
+
+
+def test_mcp_manager_start_reports_manager_health_failure(monkeypatch):
+    governance = _Recorder()
+    manager = _Recorder()
+
+    def manager_api(method: str, path: str, data: dict | None = None) -> dict:
+        manager.calls.append((method, path, data))
+        return {"ok": False, "error": "connection refused"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager_api,
+        workspace="/repo",
+        project_id="ac-dev",
+    )
+    monkeypatch.setattr(mcp_tools.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        mcp_tools.os.path,
+        "exists",
+        lambda path: path == "/repo/scripts/start-manager.sh",
+    )
+    monkeypatch.setattr(
+        mcp_tools.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="ServiceManager health did not become healthy",
+        ),
+    )
+
+    result = dispatcher.dispatch("manager_start", {})
+
+    assert result["ok"] is False
+    assert result["error"] == "manager_health_unavailable_after_start"
+    assert "ServiceManager HTTP health" in result["message"]
+    assert "worker" not in result["message"].lower()
+
+
+def test_mcp_manager_start_uses_powershell_project_argument(monkeypatch):
+    governance = _Recorder()
+    manager = _Recorder()
+
+    def manager_api(method: str, path: str, data: dict | None = None) -> dict:
+        manager.calls.append((method, path, data))
+        return {"ok": len(manager.calls) > 1}
+
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager_api,
+        workspace=r"C:\repo",
+        project_id="aming-claw",
+    )
+    calls = []
+    monkeypatch.setattr(mcp_tools.sys, "platform", "win32")
+    monkeypatch.setattr(mcp_tools.os.path, "exists", lambda path: True)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Manager healthy.\n  executor_state: waived_or_degraded\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(mcp_tools.subprocess, "run", fake_run)
+
+    result = dispatcher.dispatch("manager_start", {"project_id": "ac-dev"})
+
+    assert result["ok"] is True
+    assert calls[0] == [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        r"C:\repo/scripts/start-manager.ps1",
+        "-Project",
+        "ac-dev",
+        "-HealthWaitSeconds",
+        "90",
     ]
 
 

@@ -7036,13 +7036,17 @@ TOOLS: list[dict] = [
     },
     {
         "name": "manager_start",
-        "description": "Bootstrap ServiceManager via the fixed host script when the manager sidecar is unavailable. Does not expose arbitrary shell execution.",
+        "description": "Bootstrap ServiceManager for the intended project via the fixed host script when the manager sidecar is unavailable. Does not expose arbitrary shell execution.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Intended project binding. Defaults to the project bound to this MCP dispatcher.",
+                },
                 "health_wait_seconds": {
                     "type": "integer",
-                    "description": "Maximum seconds for scripts/start-manager.{ps1,sh} to wait for the managed worker.",
+                    "description": "Maximum seconds for scripts/start-manager.{ps1,sh} to wait for ServiceManager HTTP health.",
                     "default": 90,
                     "minimum": 5,
                     "maximum": 300,
@@ -7708,6 +7712,7 @@ class ToolDispatcher:
         service_mgr=None,
         manager_api_fn=None,
         workspace: str | None = None,
+        project_id: str | None = None,
     ):
         """
         Args:
@@ -7716,6 +7721,7 @@ class ToolDispatcher:
             service_mgr: ServiceManager for executor subprocess lifecycle
             manager_api_fn: Callable(method, path, data) → dict (HTTP to manager sidecar)
             workspace: Host workspace used for fixed bootstrap scripts and git status
+            project_id: Project binding for host operations that omit an explicit project
         """
         self._api = api_fn
         self._pool = worker_pool
@@ -7725,6 +7731,10 @@ class ToolDispatcher:
             "CODEX_WORKSPACE",
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         )
+        api_owner = getattr(api_fn, "__self__", None)
+        self._project_id = str(
+            project_id or getattr(api_owner, "project_id", "") or ""
+        ).strip()
         self._qa_session_refs: dict[str, dict[str, Any]] = {}
         self._qa_session_refs_lock = threading.Lock()
         self._observer_session_refs: dict[str, dict[str, str]] = {}
@@ -9508,12 +9518,25 @@ class ToolDispatcher:
                     "error": "takeover_not_supported_from_mcp",
                     "message": "scripts/start-manager.ps1 -Takeover can terminate MCP server processes; run takeover from an external ops shell.",
                 }
+            project_id = str(args.get("project_id") or self._project_id or "").strip()
+            if not project_id:
+                return {
+                    "ok": False,
+                    "error": "manager_start_project_binding_missing",
+                    "message": "manager_start requires project_id when this MCP dispatcher has no bound project.",
+                }
             health = self._manager_api("GET", "/api/manager/health")
             if health.get("ok"):
-                return {"ok": True, "action": "already_running", "manager": health}
+                return {
+                    "ok": True,
+                    "action": "already_running",
+                    "project_id": project_id,
+                    "manager": health,
+                    "executor_state": "waived_or_degraded",
+                }
             wait_seconds = int(args.get("health_wait_seconds") or 90)
             wait_seconds = max(5, min(wait_seconds, 300))
-            started = self._start_manager(wait_seconds)
+            started = self._start_manager(wait_seconds, project_id)
             started["previous_health"] = health
             return started
 
@@ -10012,7 +10035,15 @@ class ToolDispatcher:
             return []
         return [line for line in dirty.splitlines() if line.strip()]
 
-    def _start_manager(self, health_wait_seconds: int) -> dict:
+    @staticmethod
+    def _executor_state_from_launcher_output(stdout: str) -> str:
+        if "executor_state: optional_present" in stdout:
+            return "optional_present"
+        if "executor_state: waived_or_degraded" in stdout:
+            return "waived_or_degraded"
+        return "not_observed"
+
+    def _start_manager(self, health_wait_seconds: int, project_id: str) -> dict:
         if sys.platform == "win32":
             script_name = "start-manager.ps1"
             script = os.path.join(self._workspace, "scripts", script_name)
@@ -10023,6 +10054,8 @@ class ToolDispatcher:
                 "Bypass",
                 "-File",
                 script,
+                "-Project",
+                project_id,
                 "-HealthWaitSeconds",
                 str(health_wait_seconds),
             ]
@@ -10033,12 +10066,20 @@ class ToolDispatcher:
             cmd = [
                 "bash",
                 script,
+                "--project",
+                project_id,
                 "--health-wait-seconds",
                 str(health_wait_seconds),
             ]
             missing_error = "start_manager_posix_script_missing"
         if not os.path.exists(script):
-            return {"ok": False, "error": missing_error, "script": script, "platform": sys.platform}
+            return {
+                "ok": False,
+                "error": missing_error,
+                "project_id": project_id,
+                "script": script,
+                "platform": sys.platform,
+            }
         try:
             proc = subprocess.run(
                 cmd,
@@ -10051,29 +10092,63 @@ class ToolDispatcher:
             return {
                 "ok": False,
                 "error": "manager_start_launcher_not_found",
+                "project_id": project_id,
                 "detail": str(exc),
                 "command": cmd[:1],
                 "platform": sys.platform,
             }
         except subprocess.TimeoutExpired as exc:
+            health = self._manager_api("GET", "/api/manager/health")
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
             return {
-                "ok": False,
-                "error": "manager_start_timeout",
-                "stdout": (exc.stdout or "")[-2000:],
-                "stderr": (exc.stderr or "")[-2000:],
+                "ok": bool(health.get("ok")),
+                **(
+                    {}
+                    if health.get("ok")
+                    else {
+                        "error": "manager_health_timeout_after_start",
+                        "message": "ServiceManager HTTP health did not become healthy before the fixed launcher timed out.",
+                    }
+                ),
+                "action": "manager_start",
+                "project_id": project_id,
+                "script": script_name,
+                "platform": sys.platform,
+                "stdout": stdout[-2000:],
+                "stderr": stderr[-2000:],
+                "manager": health,
+                "executor_state": self._executor_state_from_launcher_output(stdout),
             }
 
         health = self._manager_api("GET", "/api/manager/health")
-        return {
-            "ok": bool(proc.returncode == 0 and health.get("ok")),
+        stdout = proc.stdout or ""
+        result = {
+            "ok": bool(health.get("ok")),
             "action": "manager_start",
+            "project_id": project_id,
             "script": script_name,
             "platform": sys.platform,
             "returncode": proc.returncode,
-            "stdout": (proc.stdout or "")[-4000:],
+            "stdout": stdout[-4000:],
             "stderr": (proc.stderr or "")[-4000:],
             "manager": health,
+            "executor_state": self._executor_state_from_launcher_output(stdout),
         }
+        if not health.get("ok"):
+            result.update(
+                {
+                    "error": "manager_health_unavailable_after_start",
+                    "message": "ServiceManager HTTP health was still unavailable after the fixed launcher returned.",
+                }
+            )
+        elif proc.returncode != 0:
+            result["launcher_degraded"] = True
+        return result
 
     def _send_telegram(self, chat_id: str, text: str) -> dict:
         """Send message directly via Telegram Bot API."""
