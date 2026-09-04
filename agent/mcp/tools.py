@@ -3069,10 +3069,13 @@ def _task_timeline_body(args: dict) -> dict:
         "artifact_refs",
         "trace_id",
         "commit_sha",
+        "contract_execution_id",
+        "execution_state_revision",
         "stage_id",
         "line_id",
         "evidence_kind",
         "runtime_guide_hash",
+        "direct_runtime_binding_hash",
         "route_token",
         "route_token_ref",
         "route_waiver",
@@ -5055,10 +5058,31 @@ TOOLS: list[dict] = [
                 "artifact_refs": {"type": "object", "description": "Copy-safe artifact references and hashes only; nested raw credential fields are removed."},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
+                "contract_execution_id": {
+                    "type": "string",
+                    "description": (
+                        "Exact ContractRuntime execution selected by the "
+                        "Direct Main Guide."
+                    ),
+                },
+                "execution_state_revision": {
+                    "type": "integer",
+                    "description": (
+                        "Exact server-projected ContractRuntime revision for "
+                        "the Direct Main QA line."
+                    ),
+                },
                 "stage_id": {"type": "string"},
                 "line_id": {"type": "string"},
                 "evidence_kind": {"type": "string"},
                 "runtime_guide_hash": {"type": "string"},
+                "direct_runtime_binding_hash": {
+                    "type": "string",
+                    "description": (
+                        "Exact immutable Direct Main runtime-binding hash; "
+                        "the timeline server validates and re-projects it."
+                    ),
+                },
                 "qa_session_token": {
                     "type": "string",
                     "description": "Raw QA role token used only as X-Gov-Token; never forwarded into timeline evidence.",
@@ -8457,6 +8481,7 @@ class ToolDispatcher:
                     "backlog_id",
                     "task_id",
                     "commit_sha",
+                    "contract_execution_id",
                 ),
             )
             if qa_ref_error:

@@ -2798,9 +2798,15 @@ def test_plugin_declares_two_runnable_world_isolated_mcp_processes(tmp_path):
         response = json.loads(proc.stdout.strip())
         tools = {tool["name"]: tool for tool in response["result"]["tools"]}
         timeline_fields = tools["task_timeline_append"]["inputSchema"]["properties"]
-        assert {"stage_id", "line_id", "evidence_kind", "runtime_guide_hash"}.issubset(
-            timeline_fields
-        )
+        assert {
+            "contract_execution_id",
+            "execution_state_revision",
+            "direct_runtime_binding_hash",
+            "stage_id",
+            "line_id",
+            "evidence_kind",
+            "runtime_guide_hash",
+        }.issubset(timeline_fields)
         assert server["env"]["AMING_CLAW_MCP_PROJECT_ID"] == transport["project_id"]
         assert server["env"]["GOVERNANCE_URL"] == transport["governance_url"]
 
@@ -7139,6 +7145,17 @@ def test_managed_mcp_task_timeline_append_resolves_qa_ref_header_only_and_fails_
     commit_sha = "a" * 40
     api_calls = []
     auth_calls = []
+    durable_writes = []
+    contract_runtime_cas = []
+    expected_binding = {
+        "contract_execution_id": "cex-qa-managed-timeline",
+        "execution_state_revision": 17,
+        "direct_runtime_binding_hash": "sha256:" + ("b" * 64),
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "runtime_guide_hash": "sha256:" + ("c" * 64),
+    }
 
     def fake_api(method: str, path: str, data: dict | None = None):
         api_calls.append((method, path, data))
@@ -7161,7 +7178,17 @@ def test_managed_mcp_task_timeline_append_resolves_qa_ref_header_only_and_fails_
         role_token: str,
     ):
         auth_calls.append((method, path, data, role_token))
-        return {"ok": True}
+        body = data or {}
+        replayed = bool(durable_writes)
+        if not replayed:
+            durable_writes.append(dict(body))
+            contract_runtime_cas.append(expected_binding["execution_state_revision"])
+        return {
+            "ok": True,
+            "replayed": replayed,
+            "writes_performed": not replayed,
+            "contract_runtime_cas_performed": not replayed,
+        }
 
     dispatcher = ToolDispatcher(
         api_fn=fake_api,
@@ -7194,28 +7221,40 @@ def test_managed_mcp_task_timeline_append_resolves_qa_ref_header_only_and_fails_
         "actor": "qa:managed-timeline",
         "status": "passed",
         "payload": {"graph_trace_ids": ["gqt-qa-managed-timeline"]},
+        "route_token_ref": "rtok-qa-managed-timeline",
         "qa_session_token_ref": token_ref,
+        **expected_binding,
     }
 
-    assert dispatcher.dispatch("task_timeline_append", timeline_args) == {
-        "ok": True
+    first = dispatcher.dispatch("task_timeline_append", timeline_args)
+    replay = dispatcher.dispatch("task_timeline_append", timeline_args)
+    assert first == {
+        "ok": True,
+        "replayed": False,
+        "writes_performed": True,
+        "contract_runtime_cas_performed": True,
     }
-    assert auth_calls == [
-        (
-            "POST",
-            "/api/task/aming-claw/timeline",
-            {
-                key: value
-                for key, value in timeline_args.items()
-                if key not in {"project_id", "qa_session_token_ref"}
-            },
-            raw_token,
-        )
-    ]
+    assert replay == {
+        "ok": True,
+        "replayed": True,
+        "writes_performed": False,
+        "contract_runtime_cas_performed": False,
+    }
+    assert len(auth_calls) == 2
+    assert len(durable_writes) == 1
+    assert contract_runtime_cas == [17]
+    assert auth_calls[0] == auth_calls[1]
     forwarded_body = auth_calls[0][2]
+    assert forwarded_body == {
+        key: value
+        for key, value in timeline_args.items()
+        if key not in {"project_id", "qa_session_token_ref"}
+    }
+    assert {key: forwarded_body[key] for key in expected_binding} == expected_binding
     assert "qa_session_token_ref" not in forwarded_body
     assert "qa_session_token" not in forwarded_body
     assert raw_token not in json.dumps(forwarded_body, sort_keys=True)
+    assert all(key not in forwarded_body["payload"] for key in expected_binding)
 
     unknown = dispatcher.dispatch(
         "task_timeline_append",
@@ -7236,12 +7275,19 @@ def test_managed_mcp_task_timeline_append_resolves_qa_ref_header_only_and_fails_
     assert cross_scope["error"] == "qa_session_token_ref_scope_mismatch"
     assert "backlog_id" in cross_scope["mismatched_fields"]
 
+    wrong_contract = dispatcher.dispatch(
+        "task_timeline_append",
+        {**timeline_args, "contract_execution_id": "cex-other"},
+    )
+    assert wrong_contract["error"] == "qa_session_token_ref_scope_mismatch"
+    assert "contract_execution_id" in wrong_contract["mismatched_fields"]
+
     ambiguous = dispatcher.dispatch(
         "task_timeline_append",
         {**timeline_args, "qa_session_token": "other-raw-token"},
     )
     assert ambiguous["error"] == "qa_session_auth_ambiguous"
-    assert len(auth_calls) == 1
+    assert len(auth_calls) == 2
     assert api_calls == [
         (
             "POST",

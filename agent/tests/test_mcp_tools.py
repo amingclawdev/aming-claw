@@ -1576,8 +1576,17 @@ def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
 
 def test_managed_task_timeline_append_exposes_exact_runtime_binding_fields():
     properties = _tool_properties("task_timeline_append")
-    for key in ("stage_id", "line_id", "evidence_kind", "runtime_guide_hash"):
-        assert properties[key] == {"type": "string"}
+    string_fields = (
+        "contract_execution_id",
+        "direct_runtime_binding_hash",
+        "stage_id",
+        "line_id",
+        "evidence_kind",
+        "runtime_guide_hash",
+    )
+    for key in string_fields:
+        assert properties[key]["type"] == "string"
+    assert properties["execution_state_revision"]["type"] == "integer"
 
 
 def test_managed_task_timeline_append_preserves_runtime_binding_fields(monkeypatch):
@@ -1593,6 +1602,9 @@ def test_managed_task_timeline_append_preserves_runtime_binding_fields(monkeypat
         lambda *args, **kwargs: ("", None),
     )
     binding = {
+        "contract_execution_id": "cex-direct-managed-qa",
+        "execution_state_revision": 7,
+        "direct_runtime_binding_hash": "sha256:" + "b" * 64,
         "stage_id": "qa_graph_context",
         "line_id": "qa_graph_context",
         "evidence_kind": "verification",
