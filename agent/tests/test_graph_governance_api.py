@@ -200762,6 +200762,309 @@ def _prepare_ac_dev_direct_route_bootstrap(
     }
 
 
+def _prepare_ac_dev_mf_parallel_route_precursor(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    backlog_id: str,
+):
+    project_id = "aming-claw"
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    target_files = [
+        "docs/dev/ac-dev-promotion-handoff.md",
+        "docs/dev/stable-external-probe-intake.md",
+    ]
+    conn.execute(
+        "UPDATE backlog_bugs SET status='OPEN', target_files=?, test_files='[]' "
+        "WHERE bug_id=?",
+        (json.dumps(target_files), backlog_id),
+    )
+    conn.commit()
+    root = tmp_path / "ac-dev-mf-parallel-route"
+    root.mkdir()
+    commit = "7" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: {
+            "dev_refs": [
+                server.AC_DEV_BRANCH,
+                f"refs/heads/{server.AC_DEV_BRANCH}",
+            ],
+            "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+            "dev_worktree_root": str(root.resolve()),
+            "dev_head_commit": commit,
+            "dev_contract_execution_ids": [],
+            "server_derived": True,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+    body = copy.deepcopy(guide["host_precursor_action"]["copy_safe_body"])
+    parent_execution_id = server._onboard_service_execution_id(
+        project_id, backlog_id
+    )
+    return {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "target_files": target_files,
+        "world": world,
+        "body": body,
+        "parent_execution_id": parent_execution_id,
+        "parent": server._contract_runtime_store(conn).get(parent_execution_id),
+    }
+
+
+def test_ac_dev_mf_parallel_onboard_route_precursor_uses_ordinary_issuer(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    """A persisted row-first MF parent is not a Direct bootstrap candidate."""
+
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-MF-PARALLEL-ROUTE-PRECURSOR",
+    )
+    project_id = case["project_id"]
+    backlog_id = case["backlog_id"]
+    target_files = case["target_files"]
+    body = case["body"]
+    parent_execution_id = case["parent_execution_id"]
+    before_direct = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE project_id=? AND backlog_id=? AND contract_id=?",
+        (project_id, backlog_id, "operator_supervised_direct_main"),
+    ).fetchone()[0]
+
+    assert server._onboard_service_record(case["parent"])
+    assert body == server._onboard_route_guide_completed_mf_parallel_action_input(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        target_files=target_files,
+    )
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": project_id}, method="POST", body=body)
+    )
+
+    assert issued["ok"] is True
+    assert issued["route_token"]["scope"] == {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": parent_execution_id,
+    }
+    assert issued["route_token"]["target_files"] == target_files
+    assert issued["route_token"]["allowed_actions"] == [
+        "onboard_route_guide",
+        "mf_parallel_enter",
+        "graph_query",
+    ]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE project_id=? AND backlog_id=? AND contract_id=?",
+        (project_id, backlog_id, "operator_supervised_direct_main"),
+    ).fetchone()[0] == before_direct
+
+
+@pytest.mark.parametrize(
+    "attack_kind",
+    [
+        "wrong_project",
+        "wrong_task",
+        "wrong_file",
+        "wrong_actions",
+        "wrong_evidence",
+        "cross_world_claim",
+        "stale_world",
+        "closed_row",
+        "already_issued",
+    ],
+)
+def test_ac_dev_mf_parallel_onboard_route_precursor_spoofs_are_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    attack_kind,
+):
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=f"AC-DEV-MF-PARALLEL-ROUTE-REJECT-{attack_kind.upper()}",
+    )
+    body = copy.deepcopy(case["body"])
+    if attack_kind == "wrong_project":
+        body["project_id"] = "graph-api-test"
+    elif attack_kind == "wrong_task":
+        body["task_id"] = "onboard-service-" + "f" * 20
+    elif attack_kind == "wrong_file":
+        body["target_files"] = ["docs/dev/out-of-scope.md"]
+    elif attack_kind == "wrong_actions":
+        body["allowed_actions"].append("task_timeline_append")
+    elif attack_kind == "wrong_evidence":
+        body["evidence_refs"] = ["backlog:caller-only"]
+    elif attack_kind == "cross_world_claim":
+        body["target_head_commit"] = "f" * 40
+    elif attack_kind == "stale_world":
+        case["world"]["runtime_stale"] = True
+    elif attack_kind == "closed_row":
+        conn.execute(
+            "UPDATE backlog_bugs SET status='FIXED' WHERE bug_id=?",
+            (case["backlog_id"],),
+        )
+        conn.commit()
+    else:
+        first = server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=body,
+            )
+        )
+        assert first["ok"] is True
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert rejected.value.code == (
+        "ac_dev_mf_parallel_onboard_route_precursor_rejected"
+    )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["secret_safe"] is True
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "race_kind",
+    ["closed_row", "changed_parent", "duplicate_route"],
+)
+def test_ac_dev_mf_parallel_route_precursor_revalidates_in_writer_transaction(
+    conn,
+    monkeypatch,
+    tmp_path,
+    race_kind,
+):
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=f"AC-DEV-MF-PARALLEL-ROUTE-WRITER-{race_kind.upper()}",
+    )
+    initial_precheck = server._ac_dev_mf_parallel_onboard_route_issue_precheck
+    raced: dict[str, Any] = {}
+
+    def precheck_then_race(**kwargs):
+        expected = initial_precheck(**kwargs)
+        if raced:
+            return expected
+        if race_kind == "closed_row":
+            conn.execute(
+                "UPDATE backlog_bugs SET status='FIXED' WHERE bug_id=?",
+                (case["backlog_id"],),
+            )
+            conn.commit()
+        elif race_kind == "changed_parent":
+            parent = server._contract_runtime_store(conn).get(
+                case["parent_execution_id"]
+            )
+            revision = int(parent["execution_state_revision"])
+            changed = server._onboard_service_refresh_execution_state(
+                parent,
+                completed_lines=parent["completed_lines"],
+                route_token_ref="rtok-raced-parent",
+                revision=revision + 1,
+            )
+            server._contract_runtime_store(conn).update(
+                case["parent_execution_id"],
+                changed,
+                expected_revision=revision,
+            )
+            conn.commit()
+        else:
+            issued = observer_route_context.issue_observer_write_route_context(
+                project_id=case["project_id"],
+                backlog_id=case["backlog_id"],
+                task_id=case["parent_execution_id"],
+                target_files=case["target_files"],
+                allowed_actions=case["body"]["allowed_actions"],
+                evidence_refs=case["body"]["evidence_refs"],
+            )
+            observer_route_context.persist_route_token_ref(
+                conn,
+                project_id=case["project_id"],
+                route_token_ref=issued["route_token_ref"],
+                token=issued["route_token"],
+            )
+        raced["registry"] = tuple(
+            conn.execute(
+                "SELECT route_token_ref, token_digest, status "
+                "FROM observer_route_token_refs ORDER BY route_token_ref"
+            ).fetchall()
+        )
+        return expected
+
+    monkeypatch.setattr(
+        server,
+        "_ac_dev_mf_parallel_onboard_route_issue_precheck",
+        precheck_then_race,
+    )
+    result = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": case["project_id"]},
+            method="POST",
+            body=copy.deepcopy(case["body"]),
+        )
+    )
+
+    assert result[0] == 409
+    assert result[1]["zero_write_rejection"] is True
+    assert result[1]["writes_performed"] is False
+    assert tuple(
+        conn.execute(
+            "SELECT route_token_ref, token_digest, status "
+            "FROM observer_route_token_refs ORDER BY route_token_ref"
+        ).fetchall()
+    ) == raced["registry"]
+
+
 def test_ac_dev_source_free_guide_issues_exact_empty_fence_route(
     conn, monkeypatch, tmp_path
 ):

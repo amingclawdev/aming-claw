@@ -8265,13 +8265,16 @@ def _canonical_ref_adoption_server_issue_body(
 def _observer_route_context_issue_request_kind(
     body: Mapping[str, Any],
 ) -> str:
-    """Classify the only two dev issue shapes before either can write.
+    """Classify the closed dev issue shapes before any of them can write.
 
     This discriminator is server-owned: a caller cannot select a permissive
     handler with a request hint. Canonical adoption has a closed reference-only
-    envelope; an envelope without its marker is the legacy guide-copy Direct
-    bootstrap input. A Direct field beside the canonical marker is never
-    silently discarded or routed as a different dev operation.
+    envelope. A row-first MF Parallel precursor is only a candidate here; the
+    handler re-derives its complete authority from the persisted Onboard parent
+    and backlog row before it can reach the ordinary issuer. Every other
+    unmarked envelope remains the legacy guide-copy Direct bootstrap input. A
+    Direct field beside the canonical marker is never silently discarded or
+    routed as a different dev operation.
     """
 
     if (
@@ -8283,6 +8286,15 @@ def _observer_route_context_issue_request_kind(
         and body.get("task_id", "").startswith("onboard-service-")
     ):
         return "completed_source_free_system_operation"
+    task_id = body.get("task_id")
+    allowed_actions = body.get("allowed_actions")
+    if (
+        isinstance(task_id, str)
+        and task_id.startswith("onboard-service-")
+        and isinstance(allowed_actions, list)
+        and "mf_parallel_enter" in allowed_actions
+    ):
+        return "mf_parallel_onboard_precursor"
     if "canonical_ref_adoption" not in body:
         return "direct_bootstrap"
     canonical_fields = {
@@ -9267,6 +9279,7 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
     canonical_final_authority: Mapping[str, Any] | None = None
+    mf_parallel_final_body: Mapping[str, Any] | None = None
     try:
         request_kind = _observer_route_context_issue_request_kind(body)
     except ValueError as exc:
@@ -9313,6 +9326,13 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 project_id=project_id,
                 body=body,
             )
+        if request_kind == "mf_parallel_onboard_precursor":
+            body = _ac_dev_mf_parallel_onboard_route_issue_precheck(
+                project_id=project_id,
+                body=body,
+                query=ctx.query,
+            )
+            mf_parallel_final_body = dict(body)
         if request_kind == "direct_bootstrap":
             return _handle_ac_dev_direct_route_context_issue(
                 ctx,
@@ -9698,14 +9718,39 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                         token=writer_token,
                     )
 
-            observer_route_context.persist_route_token_ref(
-                conn,
-                project_id=project_id,
-                storage_project_id=_route_registry_storage_project_id(project_id),
-                route_token_ref=issued["route_token_ref"],
-                token=issued["route_token"],
-                canonical_adoption_authority_revalidator=final_revalidator,
-            )
+            if mf_parallel_final_body is not None:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _ac_dev_mf_parallel_onboard_route_issue_revalidate(
+                        conn,
+                        project_id=project_id,
+                        body=mf_parallel_final_body,
+                        token=issued["route_token"],
+                    )
+                    observer_route_context.persist_route_token_ref(
+                        conn,
+                        project_id=project_id,
+                        storage_project_id=(
+                            _route_registry_storage_project_id(project_id)
+                        ),
+                        route_token_ref=issued["route_token_ref"],
+                        token=issued["route_token"],
+                        commit=False,
+                    )
+                    conn.commit()
+                except Exception:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    raise
+            else:
+                observer_route_context.persist_route_token_ref(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
+                    route_token_ref=issued["route_token_ref"],
+                    token=issued["route_token"],
+                    canonical_adoption_authority_revalidator=final_revalidator,
+                )
         finally:
             conn.close()
     except Exception as exc:  # pragma: no cover - defensive
@@ -9725,6 +9770,21 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 ),
                 source_gate="canonical_ref_adoption_atomic_persist",
             )
+        if mf_parallel_final_body is not None:
+            rejection = (
+                exc
+                if isinstance(exc, GovernanceError)
+                else _ac_dev_mf_parallel_onboard_route_issue_rejection(
+                    reason="writer_revalidation_failed",
+                    body=mf_parallel_final_body,
+                )
+            )
+            return 409, {
+                "ok": False,
+                "error": rejection.code,
+                "message": str(rejection),
+                **dict(rejection.details or {}),
+            }
         ref_persist_warning = f"route_token_ref persist failed (ref-resolution disabled): {exc}"
 
     route_token = issued["route_token"]
@@ -153479,6 +153539,213 @@ def _ac_dev_direct_route_issue_rejection(
     }
     details.update(dict(extra or {}))
     return GovernanceError(code, message, 409, details)
+
+
+def _ac_dev_mf_parallel_onboard_route_issue_rejection(
+    *,
+    reason: str,
+    body: Mapping[str, Any] | None = None,
+    expected_body: Mapping[str, Any] | None = None,
+) -> GovernanceError:
+    """Build one public, physical-zero-write MF precursor rejection."""
+
+    return GovernanceError(
+        "ac_dev_mf_parallel_onboard_route_precursor_rejected",
+        "MF Parallel route issuance requires one fresh persisted Onboard scope",
+        409,
+        {
+            "schema_version": (
+                "ac_dev_mf_parallel_onboard_route_precursor.rejection.v1"
+            ),
+            "reason": reason,
+            "runtime_plane": "dev",
+            "required_endpoint": "http://127.0.0.1:40008",
+            "request_body_hash": stable_sha256(dict(body or {})),
+            "expected_body_hash": stable_sha256(dict(expected_body or {})),
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "contract_runtime_mutated": False,
+            "route_registry_mutated": False,
+            "caller_claims_trusted": False,
+            "public_safe": True,
+            "secret_safe": True,
+            "raw_route_token_exposed": False,
+        },
+    )
+
+
+def _ac_dev_mf_parallel_onboard_route_issue_precheck(
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Re-derive one fresh row-first MF route precursor from durable state."""
+
+    if _runtime_plane() != "dev" or project_id != "aming-claw":
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+            reason="wrong_runtime",
+            body=body,
+        )
+    if query:
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+            reason="query_claims_forbidden",
+            body=body,
+        )
+    conn = get_connection(project_id)
+    try:
+        return _ac_dev_mf_parallel_onboard_route_issue_revalidate(
+            conn,
+            project_id=project_id,
+            body=body,
+        )
+    finally:
+        conn.close()
+
+
+def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    token: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Revalidate MF precursor authority on the caller's DB snapshot/lock."""
+
+    def reject(
+        reason: str,
+        expected_body: Mapping[str, Any] | None = None,
+    ) -> NoReturn:
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+            reason=reason,
+            body=body,
+            expected_body=expected_body,
+        )
+
+    world = _operator_supervised_direct_main_dev_world_authority()
+    world_ready = bool(
+        world.get("accepted") is True
+        and world.get("server_derived") is True
+        and world.get("caller_claims_trusted") is False
+        and str(world.get("runtime_plane") or "") == "dev"
+        and int(world.get("runtime_port") or 0) == AC_DEV_SERVICE_PORT
+        and str(world.get("world_id") or "") == "ac-dev"
+        and world.get("runtime_stale") is False
+        and str(world.get("loaded_runtime_commit") or "").strip().lower()
+        == str(world.get("target_head_commit") or "").strip().lower()
+        and str(world.get("target_project_root") or "").strip()
+        == str(world.get("worktree_path") or "").strip()
+    )
+    if not world_ready:
+        reject("dev_world_not_current")
+
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    if not backlog_id or not task_id:
+        reject("identity_incomplete")
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id=?",
+        (backlog_id,),
+    ).fetchone()
+    if row is None or str(_row_get(row, "status", "")).strip() != "OPEN":
+        reject("backlog_not_open")
+    target_files = _backlog_declared_direct_file_scope(conn, backlog_id)
+    expected_body = _onboard_route_guide_completed_mf_parallel_action_input(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        target_files=target_files,
+    )
+    expected_task_id = _onboard_service_execution_id(project_id, backlog_id)
+    try:
+        parent = _contract_runtime_store(conn).get(expected_task_id)
+    except ContractRuntimeError:
+        reject("persisted_onboard_parent_missing", expected_body)
+    parent_ready = bool(
+        _onboard_service_record(parent)
+        and str(parent.get("project_id") or "").strip() == project_id
+        and str(parent.get("backlog_id") or "").strip() == backlog_id
+        and str(parent.get("contract_execution_id") or "").strip()
+        == expected_task_id
+        and str(parent.get("root_contract_execution_id") or "").strip()
+        == expected_task_id
+        and not str(parent.get("parent_contract_execution_id") or "").strip()
+        and not str(parent.get("route_token_ref") or "").strip()
+        and int(parent.get("execution_state_revision") or 0) >= 1
+    )
+    if not parent_ready:
+        reject("persisted_onboard_parent_stale_or_ambiguous", expected_body)
+    current = conn.execute(
+        "SELECT root_contract_execution_id, current_contract_execution_id, "
+        "current_contract_id, active_child_contract_execution_id, "
+        "active_chain_json FROM backlog_contract_chain_current "
+        "WHERE project_id=? AND backlog_id=?",
+        (project_id, backlog_id),
+    ).fetchone()
+    try:
+        active_chain = json.loads(_row_get(current, "active_chain_json", "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        active_chain = {}
+    current_ready = bool(
+        current is not None
+        and str(_row_get(current, "root_contract_execution_id", ""))
+        == expected_task_id
+        and str(_row_get(current, "current_contract_execution_id", ""))
+        == expected_task_id
+        and str(_row_get(current, "current_contract_id", ""))
+        == ONBOARD_ROUTE_GUIDE_SERVICE_ID
+        and not str(_row_get(current, "active_child_contract_execution_id", ""))
+        and isinstance(active_chain, Mapping)
+        and list(active_chain.get("execution_ids") or []) == [expected_task_id]
+    )
+    if not current_ready:
+        reject("persisted_onboard_current_changed", expected_body)
+    route_count = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs "
+        "WHERE project_id=? AND backlog_id=? AND task_id=?",
+        (
+            _route_registry_storage_project_id(project_id),
+            backlog_id,
+            expected_task_id,
+        ),
+    ).fetchone()[0]
+    if int(route_count or 0) != 0:
+        reject("onboard_route_already_issued", expected_body)
+    if task_id != expected_task_id or dict(body) != expected_body:
+        reject("not_current_guide_exact", expected_body)
+    if token is not None:
+        token_scope = token.get("scope") if isinstance(token.get("scope"), Mapping) else {}
+        expected_evidence_refs = [
+            f"route:{str(token.get('route_id') or '').strip()}",
+            *expected_body["evidence_refs"],
+        ]
+        token_ready = bool(
+            dict(token_scope)
+            == {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": expected_task_id,
+            }
+            and str(token.get("caller_role") or "").strip() == "observer"
+            and list(token.get("target_files") or []) == sorted(target_files)
+            and list(token.get("owned_files") or []) == sorted(target_files)
+            and list(token.get("allowed_actions") or [])
+            == expected_body["allowed_actions"]
+            and list(token.get("evidence_refs") or []) == expected_evidence_refs
+            and not bool(token.get("source_free_operation"))
+            and str(token.get("route_id") or "").startswith("route-")
+            and all(
+                re.fullmatch(r"sha256:[0-9a-f]{64}", str(token.get(field) or ""))
+                for field in (
+                    "route_context_hash",
+                    "prompt_contract_hash",
+                    "visible_injection_manifest_hash",
+                )
+            )
+        )
+        if not token_ready:
+            reject("issued_token_identity_mismatch", expected_body)
+    return expected_body
 
 
 def _ac_dev_direct_route_issue_precheck(
