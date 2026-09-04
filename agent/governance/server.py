@@ -18964,7 +18964,6 @@ def _observer_parentless_direct_main_graph_world_authority(
     )
     if not (
         str(action or "").strip() == "graph-governance.query"
-        and not str(body.get("trace_id") or "").strip()
         and query_source == "observer"
         and query_purpose == "gate_validation"
         and backlog_id
@@ -18973,6 +18972,19 @@ def _observer_parentless_direct_main_graph_world_authority(
         == str(selected_direct.get("contract_execution_id") or "").strip()
     ):
         return {}
+    if str(body.get("trace_id") or "").strip():
+        raise GovernanceError(
+            "observer_direct_main_graph_trace_id_forbidden",
+            "Direct graph-first work must create a fresh current-WIP trace",
+            409,
+            {
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "caller_trace_reuse_allowed": False,
+            },
+        )
 
     route_authority = _operator_supervised_direct_main_route_authority(
         conn,
@@ -96155,6 +96167,17 @@ def _dev_direct_exact_active_provenance_authority(
         and not route_runtime_scope
         and not event_runtime_scope
     )
+    ordinary_activation_scope = bool(
+        exact_route_scope_shape
+        and activation_scope.get("project_id") == project_id
+        and activation_scope.get("backlog_id")
+        and activation_scope.get("task_id")
+        and not route_runtime_scope
+        and not event_runtime_scope
+    )
+    same_world_prior_wip_scope = bool(
+        ordinary_activation_scope and activation_scope != current_scope
+    )
     source_free_route_scope_shape = set(route_runtime_scope) == {
         *scope_fields,
         "source",
@@ -96245,8 +96268,8 @@ def _dev_direct_exact_active_provenance_authority(
         ),
         "protected_route_evidence_verified": route_evidence_integrity,
         "durable_reconcile_event_verified": event_integrity,
-        "current_wip_or_source_free_maintenance_scope_verified": bool(
-            same_wip_scope or source_free_scope
+        "protected_activation_scope_verified": bool(
+            same_wip_scope or same_world_prior_wip_scope or source_free_scope
         ),
     }
     return {
@@ -96257,6 +96280,7 @@ def _dev_direct_exact_active_provenance_authority(
         "server_derived": True,
         "caller_claims_trusted": False,
         "same_wip_scope": same_wip_scope,
+        "same_world_prior_wip_scope": same_world_prior_wip_scope,
         "source_free_maintenance_scope": source_free_scope,
         "activation_scope": activation_scope,
         "checks": checks,
@@ -96504,6 +96528,7 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     active_snapshot_id = str(active_snapshot.get("snapshot_id") or "").strip()
     active_ref_rows = []
     active_status_rows = []
+    active_pending_reconcile_count = -1
     active_provenance_row_count = 0
     active_binding: dict[str, Any] = {}
     if local_active_graph_present:
@@ -96519,6 +96544,18 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
             "FROM graph_snapshots WHERE project_id=? AND status='active'",
             (project_id,),
         ).fetchall()
+        active_pending_reconcile_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM pending_scope_reconcile "
+                "WHERE project_id=? AND status IN (?,?,?)",
+                (
+                    project_id,
+                    store.PENDING_STATUS_QUEUED,
+                    store.PENDING_STATUS_RUNNING,
+                    store.PENDING_STATUS_FAILED,
+                ),
+            ).fetchone()[0]
+        )
         active_provenance_row_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance "
@@ -96581,6 +96618,7 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         and local_active_graph_present
         and unique_default_active_ref
         and unique_full_active_status
+        and active_pending_reconcile_count == 0
         and active_snapshot_id == canonical_target_snapshot_id
         and active_commit == target_commit
         and target_identity.get("status") == "existing"
@@ -96833,6 +96871,7 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         ),
         "unique_default_active_ref": unique_default_active_ref,
         "unique_full_active_status": unique_full_active_status,
+        "active_pending_reconcile_count": active_pending_reconcile_count,
         "active_predecessor_provenance_verified": active_provenance_exact,
         "exact_active_provenance_authority": dict(
             exact_active_provenance_authority

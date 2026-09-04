@@ -210796,8 +210796,85 @@ def _record_source_free_current_full_provenance(
     }
 
 
-def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_provenance(
+def _record_prior_direct_current_full_provenance(
+    conn,
+    *,
+    project_id: str,
+    snapshot_id: str,
+    commit_sha: str,
+    suffix: str,
+) -> dict[str, Any]:
+    prior_scope = {
+        "project_id": project_id,
+        "backlog_id": f"AC-PRIOR-DIRECT-CURRENT-FULL-{suffix}",
+        "task_id": f"cex-prior-direct-current-full-{suffix}",
+    }
+    event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=prior_scope["backlog_id"],
+        task_id=prior_scope["task_id"],
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer",
+        status="passed",
+        payload={
+            "schema_version": "graph_reconcile_contract_evidence.v1",
+            "requirement_id": "reconcile",
+            "actor_role": "observer",
+            "target_commit_sha": commit_sha,
+            "snapshot_id": snapshot_id,
+            "active_snapshot_id": snapshot_id,
+            "reconcile_mode": "current_full",
+            "current_full_reconcile": True,
+            "reconciled_commit_sha": commit_sha,
+            "canonical_head_commit": commit_sha,
+            "merged_head_commit": commit_sha,
+            "active_graph_commit": commit_sha,
+            "canonical_head_verified": True,
+            "active_snapshot_verified": True,
+            "graph_reconciled": True,
+            **prior_scope,
+        },
+        commit_sha=commit_sha,
+    )
+    route_evidence = {
+        "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+        "authenticated_role": "observer",
+        "authentication_source": "observer_session_route_token_ref",
+        "principal_id": f"observer-prior-direct-{suffix}",
+        "session_id": f"ses-prior-direct-{suffix}",
+        "route_token_ref": f"rtok-prior-direct-{suffix}",
+        "route_token_scope": dict(prior_scope),
+        "raw_route_token_persisted": False,
+        "protected_action": "graph_current_full_reconcile",
+    }
+    provenance = store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        target_commit_sha=commit_sha,
+        request_id=f"req-prior-direct-{suffix}",
+        request_started_at="2026-09-04T01:00:00Z",
+        route_evidence=route_evidence,
+        runtime_context_scope={},
+        reconcile_event_id=int(event["id"]),
+        reconcile_event_created_at=str(event["created_at"]),
+        marker_created_at="2026-09-04T01:01:00Z",
+    )
+    conn.commit()
+    return {
+        "prior_scope": prior_scope,
+        "event": event,
+        "provenance": provenance,
+    }
+
+
+@pytest.mark.parametrize("prior_activation_kind", ("source_free", "direct_wip"))
+def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_across_wip(
     conn, monkeypatch, tmp_path,
+    prior_activation_kind,
 ):
     case = _prepare_ac_dev_cross_plane_line_bypass(
         conn,
@@ -210868,13 +210945,22 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_pro
         project_id=case["project_id"],
         commit_sha=case["commit"],
     )
-    maintenance = _record_source_free_current_full_provenance(
-        conn,
-        project_id=case["project_id"],
-        snapshot_id=snapshot_id,
-        commit_sha=case["commit"],
-        suffix="canonical-active",
-    )
+    if prior_activation_kind == "source_free":
+        maintenance = _record_source_free_current_full_provenance(
+            conn,
+            project_id=case["project_id"],
+            snapshot_id=snapshot_id,
+            commit_sha=case["commit"],
+            suffix="canonical-active",
+        )
+    else:
+        maintenance = _record_prior_direct_current_full_provenance(
+            conn,
+            project_id=case["project_id"],
+            snapshot_id=snapshot_id,
+            commit_sha=case["commit"],
+            suffix="canonical-active",
+        )
     request_body = {
         "backlog_id": case["guide"]["backlog_id"],
         "role": "observer",
@@ -211033,6 +211119,36 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_pro
             (provenance_row["route_evidence_json"], provenance_id),
         ),
     )
+    assert_tamper_rejected(
+        statement=(
+            "INSERT INTO pending_scope_reconcile "
+            "(project_id,ref_name,branch_ref,worktree_id,worktree_path,"
+            "commit_sha,parent_commit_sha,queued_at,status) "
+            "VALUES (?,?,?,?,?,?,?,?,?)"
+        ),
+        params=(
+            case["project_id"],
+            "active",
+            "",
+            "cross-wip-pending",
+            str(case["root"]),
+            case["commit"],
+            "",
+            "2026-09-04T01:02:00Z",
+            store.PENDING_STATUS_QUEUED,
+        ),
+        restore=(
+            "DELETE FROM pending_scope_reconcile "
+            "WHERE project_id=? AND ref_name=? AND worktree_id=? "
+            "AND commit_sha=?",
+            (
+                case["project_id"],
+                "active",
+                "cross-wip-pending",
+                case["commit"],
+            ),
+        ),
+    )
 
     graph_query_body = copy.deepcopy(
         guide["next_legal_action"]["graph_query_close_authority"]
@@ -211053,6 +211169,30 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_pro
             },
         },
     )
+    for override, expected_code in (
+        (
+            {"snapshot_id": "caller-supplied-old-snapshot"},
+            "observer_direct_main_graph_world_mismatch",
+        ),
+        (
+            {"trace_id": "gqt-caller-supplied-old-trace"},
+            "observer_direct_main_graph_trace_id_forbidden",
+        ),
+    ):
+        before_denial = tuple(conn.iterdump())
+        before_denial_changes = conn.total_changes
+        with pytest.raises(GovernanceError) as denied:
+            server.handle_graph_governance_query(
+                _ctx_with_role(
+                    {"project_id": case["project_id"]},
+                    "observer",
+                    method="POST",
+                    body={**copy.deepcopy(graph_query_body), **override},
+                )
+            )
+        assert denied.value.code == expected_code
+        assert conn.total_changes == before_denial_changes
+        assert tuple(conn.iterdump()) == before_denial
     graph_query = server.handle_graph_governance_query(
         _ctx_with_role(
             {"project_id": case["project_id"]},
@@ -211064,6 +211204,20 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_without_wip_pro
     assert graph_query["ok"] is True
     assert graph_query["graph_query_identity"]["snapshot_id"] == snapshot_id
     assert graph_query["graph_query_identity"]["commit_sha"] == case["commit"]
+    persisted_trace = server.handle_graph_governance_query_trace_get(
+        _ctx(
+            {
+                "project_id": case["project_id"],
+                "trace_id": graph_query["trace_id"],
+            }
+        )
+    )["trace"]
+    assert persisted_trace["backlog_id"] == case["guide"]["backlog_id"]
+    assert persisted_trace["task_id"] == case["execution_id"]
+    assert persisted_trace["route_token_ref"] == case["route_token_ref"]
+    assert persisted_trace["trace_id"] != str(
+        maintenance["provenance"].get("provenance_id") or ""
+    )
 
 
 def test_dev_direct_fresh_bind_materializes_missing_exact_active_provenance(
