@@ -10,6 +10,7 @@ import textwrap
 REPO_ROOT = Path(__file__).resolve().parents[2]
 START_MANAGER = REPO_ROOT / "scripts" / "start-manager.ps1"
 START_MANAGER_SH = REPO_ROOT / "scripts" / "start-manager.sh"
+MCP_CONFIG = REPO_ROOT / ".mcp.json"
 
 
 def _script_text() -> str:
@@ -51,7 +52,8 @@ def test_start_manager_posix_script_bootstraps_service_manager_without_takeover(
     script = START_MANAGER_SH.read_text(encoding="utf-8")
 
     assert START_MANAGER_SH.exists()
-    assert "agent/service_manager.py" in script
+    assert '"agent.service_manager"' in script
+    assert '[\n            python,\n            "-m",\n            module,' in script
     assert "--health-wait-seconds" in script
     assert "Takeover is not supported" in script
     assert "subprocess.Popen" in script
@@ -65,7 +67,13 @@ def test_start_manager_posix_script_bootstraps_service_manager_without_takeover(
     assert "MANAGER_URL" in script
 
 
-def _run_posix_start_manager(tmp_path: Path, *, mode: str, lock_held: bool = False):
+def _run_posix_start_manager(
+    tmp_path: Path,
+    *,
+    mode: str,
+    lock_held: bool = False,
+    extra_env: dict[str, str] | None = None,
+):
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
     agent = repo / "agent"
@@ -106,6 +114,8 @@ def _run_posix_start_manager(tmp_path: Path, *, mode: str, lock_held: bool = Fal
                 )
                 raise SystemExit(0 if healthy else 1)
             if args and args[0] == "-c":
+                if "resolve_runtime_plane" in args[1]:
+                    print("http://127.0.0.1:40000\\thttp://manager.test\\tstable")
                 raise SystemExit(0)
             if args and args[0] == "-":
                 argv_path.write_text(json.dumps(args[1:]))
@@ -139,6 +149,7 @@ def _run_posix_start_manager(tmp_path: Path, *, mode: str, lock_held: bool = Fal
         "MANAGER_URL": "http://manager.test",
         "CODEX_WORKSPACE": str(repo),
     }
+    env.update(extra_env or {})
     result = subprocess.run(
         [
             "bash",
@@ -173,7 +184,21 @@ def test_start_manager_posix_launch_health_succeeds_without_worker_and_keeps_pro
     assert result.returncode == 0
     assert "Manager healthy." in result.stdout
     assert "executor_state: waived_or_degraded" in result.stdout
-    assert "ac-dev" in json.loads(launch_argv.read_text(encoding="utf-8"))
+    launch_args = json.loads(launch_argv.read_text(encoding="utf-8"))
+    assert "agent.service_manager" in launch_args
+    assert not any(arg.endswith("agent/service_manager.py") for arg in launch_args)
+    assert "ac-dev" in launch_args
+
+
+def test_start_manager_posix_rejects_cross_plane_manager_url(tmp_path):
+    result, _ = _run_posix_start_manager(
+        tmp_path,
+        mode="unhealthy",
+        extra_env={"MANAGER_URL": "http://127.0.0.1:40109"},
+    )
+
+    assert result.returncode == 2
+    assert "crosses the ac-dev runtime plane" in result.stderr
 
 
 def test_start_manager_posix_manager_health_failure_is_manager_specific(tmp_path):
@@ -209,3 +234,18 @@ def test_start_manager_powershell_static_parity_contract_uses_manager_health():
     assert "Wait-ManagedWorker" not in script
     assert "Managed executor worker did not appear" not in script
     assert '"--project", $Project' in script
+    assert '"-m", "agent.service_manager"' in script
+    assert "resolve_runtime_plane" in script
+    assert '"name": p.name' in script
+    assert '$env:PROJECT_ID = $Project' in script
+    assert '$env:EXECUTOR_PROJECT_ID = $Project' in script
+    assert '"http://127.0.0.1:40101"' not in script
+
+
+def test_dev_mcp_manager_url_matches_runtime_plane():
+    config = json.loads(MCP_CONFIG.read_text(encoding="utf-8"))
+
+    assert (
+        config["mcpServers"]["aming-claw-dev"]["env"]["MANAGER_URL"]
+        == "http://127.0.0.1:40109"
+    )

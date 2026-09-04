@@ -132,15 +132,6 @@ function Wait-ManagerHealth {
     return $null
 }
 
-$MANAGER_URL = if ($env:MANAGER_URL) { $env:MANAGER_URL } else { "http://127.0.0.1:40101" }
-$initialHealth = Get-ManagerHealth -ManagerUrl $MANAGER_URL
-if ($null -ne $initialHealth -and [bool]$initialHealth.ok) {
-    Write-HealthyManagerEvidence `
-        -Message "Manager already healthy." `
-        -Evidence (Get-ManagerEvidence)
-    return
-}
-
 if (-not (Test-Path ".\.env")) {
     throw ".env not found. Create it from .env.example first."
 }
@@ -153,11 +144,45 @@ Get-Content .\.env | ForEach-Object {
         [System.Environment]::SetEnvironmentVariable($pair[0], $pair[1], "Process")
     }
 }
-$MANAGER_URL = if ($env:MANAGER_URL) { $env:MANAGER_URL } else { "http://127.0.0.1:40101" }
-
 # 使用内嵌 Python（优先）或系统 Python
 $PYTHON = & (Join-Path $PSScriptRoot "_get_python.ps1")
 Write-Host "Using Python: $PYTHON"
+
+$planeJson = & $PYTHON -c 'import json, sys; from agent.runtime_plane import resolve_runtime_plane; p = resolve_runtime_plane(sys.argv[1]); print(json.dumps({"governance_url": p.governance_url, "manager_url": p.manager_url, "name": p.name}))' $Project
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not resolve the runtime plane for project $Project."
+}
+$plane = $planeJson | ConvertFrom-Json
+if ($env:GOVERNANCE_URL -and $env:GOVERNANCE_URL -ne $plane.governance_url) {
+    throw "Configured GOVERNANCE_URL crosses the $Project runtime plane."
+}
+if ($env:MANAGER_URL -and $env:MANAGER_URL -ne $plane.manager_url) {
+    throw "Configured MANAGER_URL crosses the $Project runtime plane."
+}
+$env:GOVERNANCE_URL = $plane.governance_url
+$env:MANAGER_URL = $plane.manager_url
+$env:PROJECT_ID = $Project
+$env:EXECUTOR_PROJECT_ID = $Project
+$MANAGER_URL = $plane.manager_url
+if ($plane.name -eq "dev") {
+    $devBindingJson = & $PYTHON -c 'import json; from pathlib import Path; from agent.governance.db import verified_stable_database_binding; from agent.runtime_plane import resolve_ac_dev_storage_root; binding = verified_stable_database_binding(); stable = Path(str(binding["shared_volume_path"])); dev = resolve_ac_dev_storage_root(stable); print(json.dumps({"stable_shared_volume": str(stable), "dev_storage_root": str(dev), "shared_volume_path": str(dev / "runtime")}))'
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not resolve the canonical AC dev storage binding."
+    }
+    $devBinding = $devBindingJson | ConvertFrom-Json
+    if ($env:AMING_CLAW_SHARED_VOLUME -and $env:AMING_CLAW_SHARED_VOLUME -ne $devBinding.stable_shared_volume) {
+        throw "Configured AMING_CLAW_SHARED_VOLUME crosses the $Project runtime plane."
+    }
+    if ($env:AMING_CLAW_DEV_STORAGE_ROOT -and $env:AMING_CLAW_DEV_STORAGE_ROOT -ne $devBinding.dev_storage_root) {
+        throw "Configured AMING_CLAW_DEV_STORAGE_ROOT crosses the $Project runtime plane."
+    }
+    if ($env:SHARED_VOLUME_PATH -and $env:SHARED_VOLUME_PATH -ne $devBinding.shared_volume_path) {
+        throw "Configured SHARED_VOLUME_PATH crosses the $Project runtime plane."
+    }
+    $env:AMING_CLAW_SHARED_VOLUME = $devBinding.stable_shared_volume
+    $env:AMING_CLAW_DEV_STORAGE_ROOT = $devBinding.dev_storage_root
+    $env:SHARED_VOLUME_PATH = $devBinding.shared_volume_path
+}
 
 $depsReady = $false
 try {
@@ -249,10 +274,6 @@ try {
     }
     New-Item -ItemType Directory -Force -Path $env:SHARED_VOLUME_PATH | Out-Null
 
-    if (-not $env:GOVERNANCE_URL) {
-        $env:GOVERNANCE_URL = "http://localhost:40000"
-    }
-
     if (-not $env:CODEX_WORKSPACE) {
         $env:CODEX_WORKSPACE = (Get-Location).Path
     }
@@ -264,7 +285,7 @@ try {
     Write-Host "  workspace: $($env:CODEX_WORKSPACE)"
     $proc = Start-Process -FilePath $PYTHON `
         -ArgumentList @(
-            ".\agent\service_manager.py",
+            "-m", "agent.service_manager",
             "--project", $Project,
             "--governance-url", $env:GOVERNANCE_URL,
             "--workspace", $env:CODEX_WORKSPACE

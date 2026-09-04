@@ -47,9 +47,47 @@ else
   exit 127
 fi
 
-export SHARED_VOLUME_PATH="${SHARED_VOLUME_PATH:-$REPO_ROOT/shared-volume}"
-export GOVERNANCE_URL="${GOVERNANCE_URL:-http://localhost:40000}"
-export MANAGER_URL="${MANAGER_URL:-http://127.0.0.1:40101}"
+PLANE_ENDPOINTS="$(
+  "$PYTHON" -c 'from agent.runtime_plane import resolve_runtime_plane; import sys; plane = resolve_runtime_plane(sys.argv[1]); print(f"{plane.governance_url}\t{plane.manager_url}\t{plane.name}")' "$PROJECT"
+)"
+IFS=$'\t' read -r DEFAULT_GOVERNANCE_URL DEFAULT_MANAGER_URL RUNTIME_PLANE <<< "$PLANE_ENDPOINTS"
+if [[ -n "${GOVERNANCE_URL:-}" && "$GOVERNANCE_URL" != "$DEFAULT_GOVERNANCE_URL" ]]; then
+  echo "Configured GOVERNANCE_URL crosses the $PROJECT runtime plane." >&2
+  exit 2
+fi
+if [[ -n "${MANAGER_URL:-}" && "$MANAGER_URL" != "$DEFAULT_MANAGER_URL" ]]; then
+  echo "Configured MANAGER_URL crosses the $PROJECT runtime plane." >&2
+  exit 2
+fi
+
+if [[ "$RUNTIME_PLANE" == "dev" ]]; then
+  DEV_BINDING="$(
+    "$PYTHON" -c 'from agent.governance.db import verified_stable_database_binding; from agent.runtime_plane import resolve_ac_dev_storage_root; from pathlib import Path; binding = verified_stable_database_binding(); stable = Path(str(binding["shared_volume_path"])); dev = resolve_ac_dev_storage_root(stable); runtime = dev / "runtime"; print(f"{stable}\t{dev}\t{runtime}")'
+  )"
+  IFS=$'\t' read -r DEFAULT_STABLE_SHARED_VOLUME DEFAULT_DEV_STORAGE_ROOT DEFAULT_SHARED_VOLUME_PATH <<< "$DEV_BINDING"
+  if [[ -n "${AMING_CLAW_SHARED_VOLUME:-}" && "$AMING_CLAW_SHARED_VOLUME" != "$DEFAULT_STABLE_SHARED_VOLUME" ]]; then
+    echo "Configured AMING_CLAW_SHARED_VOLUME crosses the $PROJECT runtime plane." >&2
+    exit 2
+  fi
+  if [[ -n "${AMING_CLAW_DEV_STORAGE_ROOT:-}" && "$AMING_CLAW_DEV_STORAGE_ROOT" != "$DEFAULT_DEV_STORAGE_ROOT" ]]; then
+    echo "Configured AMING_CLAW_DEV_STORAGE_ROOT crosses the $PROJECT runtime plane." >&2
+    exit 2
+  fi
+  if [[ -n "${SHARED_VOLUME_PATH:-}" && "$SHARED_VOLUME_PATH" != "$DEFAULT_SHARED_VOLUME_PATH" ]]; then
+    echo "Configured SHARED_VOLUME_PATH crosses the $PROJECT runtime plane." >&2
+    exit 2
+  fi
+  export AMING_CLAW_SHARED_VOLUME="$DEFAULT_STABLE_SHARED_VOLUME"
+  export AMING_CLAW_DEV_STORAGE_ROOT="$DEFAULT_DEV_STORAGE_ROOT"
+else
+  DEFAULT_SHARED_VOLUME_PATH="${SHARED_VOLUME_PATH:-$REPO_ROOT/shared-volume}"
+fi
+
+export SHARED_VOLUME_PATH="$DEFAULT_SHARED_VOLUME_PATH"
+export GOVERNANCE_URL="$DEFAULT_GOVERNANCE_URL"
+export MANAGER_URL="$DEFAULT_MANAGER_URL"
+export PROJECT_ID="$PROJECT"
+export EXECUTOR_PROJECT_ID="$PROJECT"
 export CODEX_WORKSPACE="${CODEX_WORKSPACE:-$REPO_ROOT}"
 
 STATE_DIR="$SHARED_VOLUME_PATH/codex-tasks/state"
@@ -73,7 +111,7 @@ PY
 }
 
 find_manager_pid() {
-  pgrep -f "agent/service_manager.py" 2>/dev/null | head -n 1 || true
+  pgrep -f "agent/service_manager.py|-m agent.service_manager" 2>/dev/null | head -n 1 || true
 }
 
 find_worker_pid() {
@@ -152,19 +190,20 @@ echo "  stdout:     $STDOUT_LOG"
 echo "  stderr:     $STDERR_LOG"
 
 LAUNCHER_PID="$(
-  "$PYTHON" - "$PYTHON" "$REPO_ROOT/agent/service_manager.py" "$PROJECT" "$GOVERNANCE_URL" "$CODEX_WORKSPACE" "$STDOUT_LOG" "$STDERR_LOG" <<'PY'
+  "$PYTHON" - "$PYTHON" "agent.service_manager" "$REPO_ROOT" "$PROJECT" "$GOVERNANCE_URL" "$CODEX_WORKSPACE" "$STDOUT_LOG" "$STDERR_LOG" <<'PY'
 import os
 import subprocess
 import sys
 
-python, script, project, governance_url, workspace, stdout_log, stderr_log = sys.argv[1:]
+python, module, repo_root, project, governance_url, workspace, stdout_log, stderr_log = sys.argv[1:]
 stdout_handle = open(stdout_log, "ab")
 stderr_handle = open(stderr_log, "ab")
 try:
     proc = subprocess.Popen(
         [
             python,
-            script,
+            "-m",
+            module,
             "--project",
             project,
             "--governance-url",
@@ -172,7 +211,7 @@ try:
             "--workspace",
             workspace,
         ],
-        cwd=os.path.dirname(os.path.dirname(script)),
+        cwd=repo_root,
         stdin=subprocess.DEVNULL,
         stdout=stdout_handle,
         stderr=stderr_handle,

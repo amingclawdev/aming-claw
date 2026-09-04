@@ -30,7 +30,7 @@
         "PYTHONUNBUFFERED": "1",
         "AMING_CLAW_MCP_PROJECT_ID": "aming-claw",
         "GOVERNANCE_URL": "http://127.0.0.1:40008",
-        "MANAGER_URL": "http://127.0.0.1:40101",
+        "MANAGER_URL": "http://127.0.0.1:40109",
         "MEMORY_BACKEND": "docker"
       }
     }
