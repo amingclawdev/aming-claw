@@ -667,14 +667,66 @@ def test_manager_plane_identity_rejects_raw_noncanonical_project_ids(project_id)
 
 
 def test_manager_identity_keeps_ac_dev_sidecar_and_storage_disjoint(monkeypatch, tmp_path):
+    from agent.governance import db
+    from agent import runtime_plane
+
     dev_root = tmp_path / "dev-world"
     (dev_root / "runtime").mkdir(parents=True)
+    stable_root = tmp_path / "stable"
+    stable_root.mkdir()
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
+    monkeypatch.setattr(
+        db,
+        "verified_stable_database_binding",
+        lambda: {"shared_volume_path": str(stable_root)},
+    )
+    monkeypatch.setattr(
+        runtime_plane,
+        "resolve_ac_dev_storage_root",
+        lambda stable: dev_root,
+    )
+    monkeypatch.setattr(
+        db,
+        "_dev_runtime_root",
+        lambda **_kwargs: pytest.fail("manager identity must not enter DB writer admission"),
+    )
     dev = _plane_bound_manager_identity("aming-claw", "http://127.0.0.1:40008")
     stable = _plane_bound_manager_identity("proj", "http://127.0.0.1:40000")
     assert (dev["plane"], dev["sidecar_port"], dev["storage_root"]) == ("dev", 40109, str((dev_root / "runtime").absolute()))
     assert (stable["plane"], stable["sidecar_port"]) == ("stable", 40101)
     assert dev["storage_root"] != stable["storage_root"]
+
+
+def test_manager_identity_rejects_noncanonical_dev_storage_claim(monkeypatch, tmp_path):
+    from agent.governance import db
+    from agent import runtime_plane
+
+    stable_root = tmp_path / "stable"
+    stable_root.mkdir()
+    canonical = tmp_path / "canonical-dev"
+    (canonical / "runtime").mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "other-dev"))
+    monkeypatch.setattr(
+        db,
+        "verified_stable_database_binding",
+        lambda: {"shared_volume_path": str(stable_root)},
+    )
+    monkeypatch.setattr(
+        runtime_plane,
+        "resolve_ac_dev_storage_root",
+        lambda stable: canonical,
+    )
+
+    with pytest.raises(ValueError, match="crosses canonical runtime identity"):
+        _plane_bound_manager_identity("aming-claw", "http://127.0.0.1:40008")
+
+
+def test_executor_supervision_is_waived_only_for_ac_dev():
+    dev = ServiceManager(project_id="aming-claw", executor_cmd=["must-not-spawn"])
+    stable = ServiceManager(project_id="proj", executor_cmd=["must-not-spawn"])
+
+    assert dev.executor_supervision_waived() is True
+    assert stable.executor_supervision_waived() is False
 
 
 @pytest.mark.parametrize(
@@ -700,12 +752,26 @@ def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
     tmp_path,
 ):
     import service_manager as sm
+    from agent.governance import db
+    from agent import runtime_plane
 
     token = "gov-service-manager-worker-token"
     dev_root = tmp_path / "dev-world"
     (dev_root / "runtime").mkdir(parents=True)
+    stable_root = tmp_path / "stable"
+    stable_root.mkdir()
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
     monkeypatch.setenv("AMING_EXECUTOR_SESSION_TOKEN", token)
+    monkeypatch.setattr(
+        db,
+        "verified_stable_database_binding",
+        lambda: {"shared_volume_path": str(stable_root)},
+    )
+    monkeypatch.setattr(
+        runtime_plane,
+        "resolve_ac_dev_storage_root",
+        lambda stable: dev_root,
+    )
 
     response = MagicMock()
     response.raise_for_status.return_value = None
@@ -738,10 +804,24 @@ def test_managed_service_manager_rejects_missing_invalid_or_wrong_project_token(
     tmp_path,
 ):
     import service_manager as sm
+    from agent.governance import db
+    from agent import runtime_plane
 
     dev_root = tmp_path / "dev-world"
     (dev_root / "runtime").mkdir(parents=True)
+    stable_root = tmp_path / "stable"
+    stable_root.mkdir()
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
+    monkeypatch.setattr(
+        db,
+        "verified_stable_database_binding",
+        lambda: {"shared_volume_path": str(stable_root)},
+    )
+    monkeypatch.setattr(
+        runtime_plane,
+        "resolve_ac_dev_storage_root",
+        lambda stable: dev_root,
+    )
     popen = MagicMock()
     monkeypatch.setattr(sm.subprocess, "Popen", popen)
 

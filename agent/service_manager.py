@@ -127,9 +127,23 @@ def _plane_bound_manager_identity(
     url = _world_bound_governance_url(project, governance_url)
     if storage_root is None:
         if project == "aming-claw":
-            from agent.governance.db import _dev_runtime_root
+            # The manager is a sidecar consumer of the dev runtime directory,
+            # not a governance database writer.  Derive the canonical path
+            # from stable authority without entering the DB writer-admission
+            # path, which correctly rejects a second process while 40008 is
+            # already live.
+            from agent.governance.db import verified_stable_database_binding
+            from agent.runtime_plane import resolve_ac_dev_storage_root
 
-            storage_root = str(_dev_runtime_root(create=False))
+            stable = verified_stable_database_binding()
+            stable_shared = Path(str(stable["shared_volume_path"])).absolute()
+            dev_root = resolve_ac_dev_storage_root(stable_shared)
+            configured = str(os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT") or "").strip()
+            if configured and Path(configured).absolute() != dev_root:
+                raise ValueError(
+                    "ServiceManager dev storage claim crosses canonical runtime identity"
+                )
+            storage_root = str((dev_root / "runtime").absolute())
         else:
             storage_root = str(_repo_root() / "shared-volume")
     return plane_bound_manager_identity(project, url, storage_root)
@@ -242,6 +256,16 @@ class ServiceManager:
             )
             self.sidecar_port = int(self.manager_identity["sidecar_port"])
         return self.manager_identity
+
+    def executor_supervision_waived(self) -> bool:
+        """Return whether this manager plane intentionally has no executor.
+
+        AC dev governance is started with background workers disabled.  Its
+        ServiceManager remains useful as the bounded host sidecar, but must not
+        require or synthesize an executor credential merely to stay healthy.
+        """
+
+        return resolve_runtime_plane(self.project_id).name == "dev"
 
     def start(self) -> bool:
         """Spawn the executor subprocess if it is not already running.
@@ -513,7 +537,10 @@ class ServiceManager:
             daemon=True,
         )
         self._sidecar_thread.start()
-        log.info("ServiceManager: sidecar thread started (manager_http_server on port 40101)")
+        log.info(
+            "ServiceManager: sidecar thread started (manager_http_server on port %d)",
+            self.sidecar_port,
+        )
 
     # ------------------------------------------------------------------
     # Monitor loop
@@ -973,7 +1000,14 @@ def main() -> None:
     # R4: Start sidecar HTTP server before executor
     manager._start_sidecar()
 
-    manager.start()
+    if manager.executor_supervision_waived():
+        log.info(
+            "ServiceManager executor supervision WAIVED for %s; "
+            "bounded manager sidecar remains active",
+            args.project,
+        )
+    else:
+        manager.start()
     log.info(
         "ServiceManager host loop started (project=%s, governance=%s, workspace=%s)",
         args.project,
