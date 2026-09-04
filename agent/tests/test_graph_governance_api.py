@@ -177080,6 +177080,94 @@ def test_mf_batch_guide_entry_replay_survives_timeline_window_and_active_epoch(
     assert durable_counts() == before_replay
 
 
+def test_entered_batch_resume_accepts_authenticated_demo_control_marker(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    repo = _git_repo(demo_root)
+    baseline_commit = batch_jobs.git_commit(repo)
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=f"full-{baseline_commit[:12]}-{'2' * 12}",
+        commit_sha=baseline_commit,
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    prepared = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix="AUTHENTICATED-DEMO-MARKER",
+        required_worker_count=2,
+        target_head_commit=baseline_commit,
+        graph_snapshot_id=snapshot["snapshot_id"],
+    )
+    entered = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=prepared["action_input"],
+        )
+    )
+    assert entered["writes_performed"] is True
+    assert [row["backlog_id"] for row in entered["per_row_successors"]] == (
+        prepared["child_ids"]
+    )
+    assert len(entered["per_row_successors"]) == 2
+    environment = {
+        "id": "demo-entered-batch-resume",
+        "template_id": "daily-planner-lite",
+        "project_id": PID,
+        "fixture_root": str(repo),
+        "created_at": "2026-09-03T00:00:00Z",
+    }
+    server._write_demo_environment_marker(environment, PID)
+    server._write_demo_environment_registry(PID, [environment])
+    monkeypatch.setattr(
+        server.project_service,
+        "project_exists",
+        lambda project_id: project_id == PID,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repo,
+    )
+    marker = repo / server.DEMO_ENVIRONMENT_MARKER
+    marker_bytes = marker.read_bytes()
+    assert server._git_clean_worktree_verified(repo) is False
+    before_changes = conn.total_changes
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": prepared["backlog_id"],
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+            },
+        )
+    )
+
+    action = guide["next_legal_action"]
+    assert action["id"] == "resume_entered_batch_successor"
+    assert action["action"] == "mf_parallel_enter"
+    successor = action["successor_action_input"]["static_body"]
+    assert successor["backlog_id"] == prepared["child_ids"][0]
+    assert successor["target_head_commit"] == baseline_commit
+    assert successor["graph_snapshot_id"] == snapshot["snapshot_id"]
+    assert successor["merge_queue_item"]["base_commit"] == baseline_commit
+    assert action["server_derived_authority"][
+        "batch_parent_contract_execution_id"
+    ] == entered["parent_contract_execution_id"]
+    assert conn.total_changes == before_changes
+    assert marker.read_bytes() == marker_bytes
+    assert server._git_clean_worktree_verified(repo) is False
+
+
 def test_entered_batch_without_epoch_projects_current_successor_read_only(
     conn,
     tmp_path,

@@ -135326,7 +135326,22 @@ def _entered_batch_successor_resume_projection(
     if project_root is None:
         return blocked("entered_batch_current_project_root_unavailable")
     canonical_root = Path(project_root).resolve()
-    if not _git_clean_worktree_verified(canonical_root):
+    try:
+        status = _qa_git_bytes(
+            canonical_root,
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            timeout=10,
+        )
+    except _QACandidateOverlayError:
+        return blocked("entered_batch_current_worktree_not_clean")
+    if status.returncode != 0:
+        return blocked("entered_batch_current_worktree_not_clean")
+    dirty_entries, _ = _qa_filter_authenticated_demo_control_metadata_entries(
+        canonical_root,
+        project_id=project_id,
+        dirty_entries=[item for item in status.stdout.split(b"\0") if item],
+    )
+    if dirty_entries:
         return blocked("entered_batch_current_worktree_not_clean")
     current_head = str(_git_head_commit(canonical_root) or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", current_head):
