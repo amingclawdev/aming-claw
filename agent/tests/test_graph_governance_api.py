@@ -200972,6 +200972,7 @@ def test_ac_dev_mf_parallel_onboard_route_precursor_uses_ordinary_issuer(
     assert issued["route_token"]["allowed_actions"] == [
         "onboard_route_guide",
         "mf_parallel_enter",
+        "observer_session_register",
         "graph_query",
     ]
     assert conn.execute(
@@ -200979,6 +200980,247 @@ def test_ac_dev_mf_parallel_onboard_route_precursor_uses_ordinary_issuer(
         "WHERE project_id=? AND backlog_id=? AND contract_id=?",
         (project_id, backlog_id, "operator_supervised_direct_main"),
     ).fetchone()[0] == before_direct
+
+
+@pytest.mark.parametrize(
+    "registration_action_present",
+    [False, True],
+    ids=["normal_precursor", "trusted_cex_join"],
+)
+def test_ac_dev_mf_parallel_precursor_registers_and_enters_from_public_guide(
+    conn, monkeypatch, tmp_path, registration_action_present, record_property,
+):
+    """Exercise both registration gates through the persisted service route."""
+
+    if registration_action_present:
+        original_action_input = (
+            server._onboard_route_guide_completed_mf_parallel_action_input
+        )
+
+        def action_present_precursor(**kwargs):
+            # Reach the independent CEX evidence check even on a producer that
+            # omits registration. Issuance and registration validators stay real.
+            body = original_action_input(**kwargs)
+            if "observer_session_register" not in body["allowed_actions"]:
+                body["allowed_actions"].append("observer_session_register")
+            return body
+
+        monkeypatch.setattr(
+            server, "_onboard_route_guide_completed_mf_parallel_action_input",
+            action_present_precursor,
+        )
+
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-PARALLEL-REGISTRATION-CHAIN",
+    )
+    project_id = case["project_id"]
+    backlog_id = case["backlog_id"]
+    fixture_registry = server._registry_project_config
+
+    def isolated_project_config(selected_project_id):
+        # Reuse the in-memory fixture's registered testing configuration for the
+        # dev project; do not consult any on-disk live governance registry.
+        if selected_project_id == project_id:
+            config, source = fixture_registry(PID)
+            return {**config, "project_id": project_id}, source
+        return fixture_registry(selected_project_id)
+
+    monkeypatch.setattr(server, "_registry_project_config", isolated_project_config)
+    parent_id = case["parent"]["contract_execution_id"]
+    assert parent_id == case["body"]["task_id"]
+    assert server._onboard_service_record(case["parent"])
+    assert case["parent"]["contract_id"] != "operator_supervised_direct_main"
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": project_id}, method="POST", body=case["body"])
+    )
+    assert issued["ok"] is True
+    registration_body = {
+        "project_id": project_id,
+        "route_token_ref": issued["route_token_ref"],
+        "backlog_id": backlog_id,
+        "task_id": parent_id,
+        "cex_id": parent_id,
+    }
+    server._guard_dev_runtime_request(
+        method="POST",
+        path=f"/api/projects/{project_id}/observer-sessions/register",
+        path_params={"project_id": project_id},
+        body=registration_body,
+    )
+    status, registered = server.handle_observer_session_register(
+        _ctx({"project_id": project_id}, method="POST", body=registration_body)
+    )
+    assert status == 201, registered
+    resolved = observer_route_context.resolve_route_token_ref(
+        conn, project_id=project_id,
+        storage_project_id=server._route_registry_storage_project_id(project_id),
+        route_token_ref=issued["route_token_ref"],
+        backlog_id=backlog_id, task_id=parent_id,
+    )
+    assert resolved["target_files"] == case["target_files"]
+    assert "observer_session_register" in resolved["allowed_actions"]
+    assert f"contract_runtime:{parent_id}" in resolved["evidence_refs"]
+    stored_session = conn.execute(
+        "SELECT capabilities_json FROM observer_sessions WHERE session_id=?",
+        (registered["session_id"],),
+    ).fetchone()
+    capabilities = json.loads(stored_session["capabilities_json"])
+    assert capabilities["route_provenance"]["cex_id"] == parent_id
+    assert capabilities["route_provenance"]["task_id"] == parent_id
+    assert capabilities["route_provenance"]["backlog_id"] == backlog_id
+    assert capabilities["route_provenance"]["route_token_ref"] == issued[
+        "route_token_ref"
+    ]
+    heartbeat = server.handle_observer_session_heartbeat(
+        _ctx(
+            {"project_id": project_id, "session_id": registered["session_id"]},
+            method="POST", body={"session_token": registered["session_token"]},
+        )
+    )
+    assert heartbeat["session"]["computed_status"] == "active"
+
+    lane_intents = [
+        {
+            "task_id": f"parallel-registration-lane-{index}",
+            "worker_id": f"worker-{index}",
+            "worker_slot_id": f"slot-{index}",
+            "owned_files": [target_file],
+        }
+        for index, target_file in enumerate(case["target_files"], start=1)
+    ]
+    refresh_body = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "mf_parallel",
+        "response_view": "compact",
+        "route_token_ref": issued["route_token_ref"],
+        "observer_session_id": registered["session_id"],
+        "reason": "Enter the exact service-selected Parallel scope.",
+    }
+    refreshed = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": project_id}, method="POST", body=refresh_body)
+    )
+    assert refreshed["host_precursor_required"] is False
+    successor = refreshed["next_legal_action"]["successor_action_input"]
+    assert successor["action_input_missing_fields"] == [
+        "task_id", "metadata.required_worker_count", "metadata.lane_intents",
+    ]
+    assert successor["dynamic_fields"]["task_id"]["source"] == (
+        "caller_selected_bounded_worker_task_id"
+    )
+    assert successor["dynamic_fields"]["metadata.lane_intents"]["source"] == (
+        "authenticated_observer_child_plan"
+    )
+    assert successor["static_body"] == {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "onboard_service_waiver": True,
+        "target_files": case["target_files"],
+        "owned_files": case["target_files"],
+    }
+    # The guide's dev task selector refers to a current execution. Supply the
+    # new Parallel worker task to the entry endpoint via its dynamic-field map.
+    enter_body = {
+        **successor["static_body"],
+        "task_id": "parallel-registration-worker",
+        "reason": refresh_body["reason"],
+        "observer_session_id": registered["session_id"],
+        "observer_route_token_ref": issued["route_token_ref"],
+        "metadata": {"required_worker_count": 2, "lane_intents": lane_intents},
+    }
+    assert "contract_execution_id" not in enter_body
+    try:
+        entered = server.handle_project_mf_parallel_enter(
+            _ctx({"project_id": project_id}, method="POST", body=enter_body)
+        )
+    except ValidationError as exc:
+        pytest.fail(f"Parallel entry rejected: {exc.details}")
+    assert entered["ok"] is True
+    assert entered["parent_contract_execution_id"] == parent_id
+    assert entered["root_contract_execution_id"] == parent_id
+    assert entered["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+    record = server._contract_runtime_store(conn).get(
+        entered["contract_execution_id"]
+    )
+    plan = record["metadata"]["observer_prefill_child_plan"]
+    assert plan["parent_route_binding"]["route_token_ref"] == issued[
+        "route_token_ref"
+    ]
+    assert plan["parent_route_binding"]["source"] == (
+        "authenticated_observer_mf_parallel_enter"
+    )
+    assert [lane["owned_files"] for lane in plan["lanes"]] == [
+        [target_file] for target_file in case["target_files"]
+    ]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE project_id=? AND backlog_id=? AND contract_id=?",
+        (project_id, backlog_id, "operator_supervised_direct_main"),
+    ).fetchone()[0] == 0
+    record_property(
+        "parallel_entry_chain",
+        json.dumps({
+            "persisted_service_parent": {
+                field: case["parent"].get(field)
+                for field in (
+                    "project_id", "backlog_id", "contract_id",
+                    "contract_execution_id", "root_contract_execution_id",
+                    "parent_contract_execution_id", "execution_state_revision",
+                )
+            },
+            "precursor": case["body"],
+            "successor_input": successor,
+            "entered": {
+                field: entered[field]
+                for field in (
+                    "contract_execution_id", "parent_contract_execution_id",
+                    "root_contract_execution_id",
+                )
+            },
+            "parent_route_binding": plan["parent_route_binding"],
+            "plan_hash": plan["plan_hash"],
+            "lane_files": [lane["owned_files"] for lane in plan["lanes"]],
+        }, sort_keys=True),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("route_token_ref", "rtok-unknown", "route_token_ref_unknown"),
+        ("backlog_id", "AC-WRONG-SCOPE", "route_token_ref_error"),
+        ("task_id", "onboard-service-wrong", "route_token_ref_error"),
+        ("cex_id", "cex-direct-main-caller", "route_token_ref_cex_mismatch"),
+    ],
+)
+def test_ac_dev_mf_parallel_precursor_registration_rejects_scope_before_session_dml(
+    conn, monkeypatch, tmp_path, field, value, error,
+):
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-PARALLEL-REGISTRATION-SCOPE",
+    )
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": case["project_id"]}, method="POST", body=case["body"])
+    )
+    body = {
+        "project_id": case["project_id"],
+        "route_token_ref": issued["route_token_ref"],
+        "backlog_id": case["backlog_id"],
+        "task_id": case["parent_execution_id"],
+        "cex_id": case["parent_execution_id"],
+        field: value,
+    }
+    before = tuple(conn.iterdump())
+    changes_before = conn.total_changes
+    status, rejected = server.handle_observer_session_register(
+        _ctx({"project_id": case["project_id"]}, method="POST", body=body)
+    )
+    assert status == 403
+    assert rejected["error"] == error
+    assert conn.total_changes == changes_before
+    assert tuple(conn.iterdump()) == before
 
 
 @pytest.mark.parametrize(

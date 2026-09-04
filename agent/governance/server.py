@@ -163377,6 +163377,17 @@ def _onboard_route_guide_completed_mf_parallel_action_input(
 
     onboard_service_task_id = _onboard_service_execution_id(project_id, backlog_id)
     scoped_target_files = _runtime_context_public_file_values(target_files)
+    allowed_actions = ["onboard_route_guide", "mf_parallel_enter"]
+    evidence_refs = [
+        f"onboard_service:{onboard_service_task_id}",
+        f"backlog:{backlog_id}",
+    ]
+    if _runtime_plane() == "dev" and project_id == "aming-claw":
+        # The dev issuer revalidates this exact persisted current service parent
+        # and file scope before saving the precursor. Registration consumes that
+        # same CEX evidence; it does not require a synthetic Direct execution.
+        allowed_actions.append("observer_session_register")
+        evidence_refs.append(f"contract_runtime:{onboard_service_task_id}")
     return {
         "project_id": project_id,
         "caller_role": "observer",
@@ -163384,12 +163395,9 @@ def _onboard_route_guide_completed_mf_parallel_action_input(
         "task_id": onboard_service_task_id,
         "target_files": scoped_target_files,
         "allowed_actions": _observer_route_context_issue_allowed_actions(
-            ["onboard_route_guide", "mf_parallel_enter"]
+            allowed_actions
         ),
-        "evidence_refs": [
-            f"onboard_service:{onboard_service_task_id}",
-            f"backlog:{backlog_id}",
-        ],
+        "evidence_refs": evidence_refs,
     }
 
 
