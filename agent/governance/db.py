@@ -3586,21 +3586,9 @@ def _validate_existing_adoption_receipt(root: Path) -> None:
         raise ValueError("existing AC dev launch receipt source hash is invalid")
 
 
-def _recover_verified_existing_dev_sqlite(
-    root: Path,
-    database: Path,
-    *,
-    _after_checkpoint_for_test=None,
-) -> None:
-    """Bounded source-owned recovery for a stopped, verified dev world.
+def _validate_existing_dev_wal_layout(database: Path) -> None:
+    """Share the existing adoption WAL layout check with read-only preflight."""
 
-    No unlink is performed.  SQLite owns any WAL/SHM changes through a fully
-    completed TRUNCATE checkpoint; errors leave source-tip/receipt state alone.
-    """
-
-    before = _sqlite_adoption_snapshot(root, database)
-    if before["companions"].get("-journal") is not None:
-        raise ValueError("AC dev SQLite adoption rejects rollback journal state")
     wal = Path(str(database) + "-wal")
     if wal.exists():
         wal_size = wal.stat(follow_symlinks=False).st_size
@@ -3617,6 +3605,24 @@ def _recover_verified_existing_dev_sqlite(
                 raise ValueError("AC dev SQLite adoption WAL page size is malformed")
             if (wal_size - 32) % (page_size + 24):
                 raise ValueError("AC dev SQLite adoption WAL frame layout is malformed")
+
+
+def _recover_verified_existing_dev_sqlite(
+    root: Path,
+    database: Path,
+    *,
+    _after_checkpoint_for_test=None,
+) -> None:
+    """Bounded source-owned recovery for a stopped, verified dev world.
+
+    No unlink is performed.  SQLite owns any WAL/SHM changes through a fully
+    completed TRUNCATE checkpoint; errors leave source-tip/receipt state alone.
+    """
+
+    before = _sqlite_adoption_snapshot(root, database)
+    if before["companions"].get("-journal") is not None:
+        raise ValueError("AC dev SQLite adoption rejects rollback journal state")
+    _validate_existing_dev_wal_layout(database)
     _assert_no_external_sqlite_holders(database)
     conn: sqlite3.Connection | None = None
     try:
@@ -4377,10 +4383,21 @@ def _durable_database_sha256(database: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _sqlite_committed_readonly_uri(database: Path) -> str:
+    """Read committed WAL when present; keep inert preflight free of sidecars."""
+
+    wal = Path(str(database) + "-wal")
+    query = "?mode=ro"
+    if not wal.exists() or wal.stat(follow_symlinks=False).st_size == 0:
+        query += "&immutable=1"
+    return "file:" + urllib.parse.quote(str(database)) + query
+
+
 def _database_logical_sha256(database: Path) -> str:
-    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    uri = _sqlite_committed_readonly_uri(database)
     connection = sqlite3.connect(uri, uri=True)
     try:
+        connection.execute("BEGIN")
         projection = _sqlite_logical_projection(connection)
     finally:
         connection.close()
@@ -5513,7 +5530,7 @@ def _validate_sqlite_empty_wal_index_residue(
 
 
 def _validate_dev_cow_stopped_sidecar_residue(database: Path) -> None:
-    """Accept only SQLite's inert stopped residue without changing its bytes."""
+    """Accept stopped SQLite residue, including WAL for normal lease recovery."""
 
     listener = _default_cutover_listener_probe(40008)
     if (
@@ -5546,7 +5563,10 @@ def _validate_dev_cow_stopped_sidecar_residue(database: Path) -> None:
     wal_stat = regular_single_link(wal)
     shm_stat = regular_single_link(shm)
     if wal_stat is not None and int(wal_stat.st_size) != 0:
-        raise ValueError("AC dev COW completed generation WAL is not empty")
+        # Reuse adoption's layout boundary.  SQLite reads the committed
+        # snapshot and owns recovery; a nonempty WAL is normal stopped state.
+        _validate_existing_dev_wal_layout(database)
+        return
     if shm_stat is not None:
         if wal_stat is None or int(shm_stat.st_size) != 32768:
             raise ValueError("AC dev COW completed generation SHM residue is invalid")
@@ -5642,9 +5662,11 @@ def _select_dev_cow_generation_phase(
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", issuance_schema_meta):
         raise ValueError("AC dev COW generation issuance anchor is invalid")
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
-    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    _validate_dev_cow_stopped_sidecar_residue(database)
+    uri = _sqlite_committed_readonly_uri(database)
     conn = sqlite3.connect(uri, uri=True)
     try:
+        conn.execute("BEGIN")
         _verify_existing_schema(conn)
         _verify_dev_world_schema_inventory(conn)
         current_schema_meta = _sqlite_logical_projection(conn).get("schema_meta")
@@ -5680,9 +5702,11 @@ def validate_dev_cow_completed_generation_projection(
     root = Path(storage_root).expanduser().absolute()
     receipt = validate_dev_cow_successor_receipt(root)
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
-    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    _validate_dev_cow_stopped_sidecar_residue(database)
+    uri = _sqlite_committed_readonly_uri(database)
     conn = sqlite3.connect(uri, uri=True)
     try:
+        conn.execute("BEGIN")
         _verify_existing_schema(conn)
         _verify_dev_world_schema_inventory(conn)
         _validated_dev_cow_completed_generation_axis(
@@ -5800,6 +5824,7 @@ def _validate_dev_cow_completed_basic_restart(
 
     root = Path(storage_root).expanduser().absolute()
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    _validate_dev_cow_stopped_sidecar_residue(database)
     database_before = _durable_database_sha256(database)
     logical_before = _database_logical_sha256(database)
     receipt = validate_dev_cow_successor_receipt(root)
@@ -5816,9 +5841,10 @@ def _validate_dev_cow_completed_basic_restart(
     )
     if phase is not _DevCowGenerationPhase.COMPLETED_GENERATION:
         raise ValueError("AC dev COW postimage requires live first-start custody")
-    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    uri = _sqlite_committed_readonly_uri(database)
     conn = sqlite3.connect(uri, uri=True)
     try:
+        conn.execute("BEGIN")
         _verify_existing_schema(conn)
         _verify_dev_world_schema_inventory(conn)
         axis = _validated_dev_cow_completed_generation_axis(
@@ -6405,12 +6431,10 @@ def bootstrap_dev_governance_store(
             # The completed-generation classifier has already verified the
             # schema, inventory, world/genesis, historical custody, clean
             # descendant source, stopped listener/process, receipt chain and
-            # inert sidecars through immutable reads.  Opening a normal SQLite
-            # connection here would both repeat the obsolete live-handoff
-            # source rule and allow SQLite to delete stopped WAL/SHM residue.
-            # Revalidate only raw physical bytes after taking the writer lease,
-            # bind that lease to the exact DB inode, and preserve historical
-            # process/source-tip provenance for the server's basic receipt.
+            # committed SQLite snapshot.  Revalidate its physical artifacts
+            # before recovery under the writer lease.  The historical
+            # process/source-tip remains custody provenance; normal WAL
+            # recovery must not enter the obsolete live-handoff source rule.
             current_artifacts = _dev_cow_basic_restart_artifact_snapshot(database)
             if (
                 current_artifacts != basic_cow_restart.get("artifacts")
@@ -6517,6 +6541,13 @@ def bootstrap_dev_governance_store(
                 "source_upgraded": False,
             }
             _validate_dev_cow_basic_restart_writer_lease(database)
+            if int(dict(current_artifacts.get("wal") or {}).get("size") or 0):
+                _recover_verified_existing_dev_sqlite(root, database)
+                if _database_logical_sha256(database) != basic_cow_restart["logical_sha256"]:
+                    raise ValueError(
+                        "AC dev COW completed basic restart changed committed data"
+                    )
+                _validate_dev_cow_basic_restart_writer_lease(database)
             return result
         conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row

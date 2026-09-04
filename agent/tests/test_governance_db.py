@@ -4316,6 +4316,198 @@ def test_completed_cow_basic_restart_preserves_database_and_refreshes_only_basic
     db.release_dev_runtime_writer_lease(root)
 
 
+def test_first_cow_custody_still_required_with_committed_business_wal(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+    )
+    code = """
+import os, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute('PRAGMA journal_mode=WAL')
+c.execute('PRAGMA wal_autocheckpoint=0')
+c.execute('UPDATE backlog_bugs SET title=? WHERE bug_id=?',
+          ('committed business data', 'AC-0000'))
+c.commit()
+os._exit(0)
+"""
+    subprocess.run([sys.executable, "-c", code, str(database)], check=True)
+    wal = Path(str(database) + "-wal")
+    assert wal.stat().st_size > 32
+    database_before, wal_before = database.read_bytes(), wal.read_bytes()
+    assert db._select_dev_cow_generation_phase(
+        root, linked_v3_receipt=linked, source_identity=source,
+        stable_binding=db.verified_stable_database_binding(),
+    ) is db._DevCowGenerationPhase.FIRST_ISSUANCE
+    with pytest.raises(ValueError, match="requires live first-start custody"):
+        db._validate_dev_cow_completed_basic_restart(
+            root, source_identity=source,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+    assert database.read_bytes() == database_before
+    assert wal.read_bytes() == wal_before
+    assert str(database.absolute()) not in db._DEV_DATABASE_WRITER_LEASES
+
+
+@pytest.mark.parametrize("source_descendant", (False, True))
+def test_completed_cow_basic_restart_recovers_committed_wal_and_closed_observer(
+    tmp_path, monkeypatch, source_descendant,
+):
+    """A normal observer close in WAL survives restart of a completed world."""
+    from agent.governance import db
+
+    root, database, historical, _stable, launch_path = (
+        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+    )
+    candidate = historical
+    if source_descendant:
+        candidate = _defer_completed_source_and_open_clean_successor(
+            tmp_path, historical,
+        )
+        monkeypatch.setattr(
+            db, "__file__",
+            str(Path(candidate["root"]) / "agent" / "governance" / "db.py"),
+        )
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "INSERT INTO observer_sessions (session_id,project_id,token_hash,"
+        "registered_at,last_seen_at) VALUES (?,?,?,?,?)",
+        ("obs-wal-restart", "aming-claw", "fixture-observer-token-hash",
+         "2026-09-04T16:00:00Z", "2026-09-04T16:00:00Z"),
+    )
+    connection.execute(
+        "INSERT INTO contract_runtime_executions (contract_execution_id,"
+        "project_id,backlog_id,contract_id,version,revision,"
+        "execution_state_revision,record_json,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("cex-wal-restart", "aming-claw", "AC-0000", "direct-main", "1", "3",
+         5, '{"completed_lines":["implementation"]}', "2026-09-04T16:00:00Z",
+         "2026-09-04T16:00:00Z"),
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    database_before = database.read_bytes()
+    receipt_before = launch_path.read_bytes()
+    archive_before = {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted((root / "archive").rglob("*")) if path.is_file()
+    }
+    record = json.dumps({
+        "completed_lines": ["implementation", "qa", "reconcile", "close_ready"],
+        "candidate": historical["commit"], "state": "completed",
+    }, sort_keys=True)
+    # SQLite owns the WAL format.  A real stopped subprocess commits terminal
+    # evidence, then the observer close, without closing/checkpointing its DB.
+    code = """
+import os, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute('PRAGMA journal_mode=WAL')
+c.execute('PRAGMA wal_autocheckpoint=0')
+c.execute('UPDATE backlog_bugs SET status=?, "commit"=?, fixed_at=?, updated_at=? '
+          'WHERE bug_id=?', ('FIXED', sys.argv[2], '2026-09-04T16:06:16Z',
+                            '2026-09-04T16:06:16Z', 'AC-0000'))
+c.execute('UPDATE contract_runtime_executions SET execution_state_revision=9, '
+          'record_json=?, updated_at=? WHERE contract_execution_id=?',
+          (sys.argv[3], '2026-09-04T16:06:16Z', 'cex-wal-restart'))
+c.executemany('INSERT INTO task_timeline_events '
+              '(project_id,backlog_id,task_id,event_type,status,commit_sha,created_at) '
+              'VALUES (?,?,?,?,?,?,?)',
+              [('aming-claw', 'AC-0000', 'cex-wal-restart', event, 'passed',
+                sys.argv[2], '2026-09-04T16:06:16Z')
+               for event in ('qa.independent_verification', 'observer.reconcile',
+                             'observer.close_ready', 'backlog.close')])
+c.commit()
+c.execute('UPDATE observer_sessions SET status=?, closed_at=?, last_seen_at=? '
+          'WHERE session_id=?', ('closed', '2026-09-04T16:08:25Z',
+                                '2026-09-04T16:08:25Z', 'obs-wal-restart'))
+c.commit()
+os._exit(0)
+"""
+    subprocess.run(
+        [sys.executable, "-c", code, str(database), historical["commit"], record],
+        check=True,
+    )
+    wal = Path(str(database) + "-wal")
+    assert wal.is_file() and wal.stat().st_size > 32
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        expected_projection = db._sqlite_logical_projection(connection)
+        assert connection.execute(
+            "SELECT status,closed_at FROM observer_sessions WHERE session_id=?",
+            ("obs-wal-restart",),
+        ).fetchone() == ("closed", "2026-09-04T16:08:25Z")
+    finally:
+        connection.close()
+    assert database.read_bytes() == database_before
+    immutable = sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True)
+    try:
+        assert immutable.execute(
+            "SELECT status FROM observer_sessions WHERE session_id=?",
+            ("obs-wal-restart",),
+        ).fetchone() == ("active",)
+        assert db._sqlite_logical_projection(immutable) != expected_projection
+    finally:
+        immutable.close()
+    logical_before = db._database_logical_sha256(database)
+    recoveries = []
+    original_recover = db._recover_verified_existing_dev_sqlite
+
+    def recover_under_existing_lease(recovery_root, recovery_database):
+        assert recovery_root == root and recovery_database == database
+        db._validate_dev_cow_basic_restart_writer_lease(database)
+        assert wal.stat().st_size > 32
+        recoveries.append(database)
+        return original_recover(recovery_root, recovery_database)
+
+    monkeypatch.setattr(
+        db, "_recover_verified_existing_dev_sqlite", recover_under_existing_lease,
+    )
+    binding = db.bootstrap_dev_governance_store(
+        root, source_identity=candidate,
+        process_identity={
+            "pid": os.getpid(), "start_identity": f"pid:{os.getpid()}:cli-bootstrap",
+        },
+    )
+
+    assert recoveries == [database]
+    assert binding["restart_safe"] is True
+    assert binding["source_upgraded"] is False
+    assert binding["source_tip_identity"] == {
+        key: historical[key] for key in db._DEV_SOURCE_TIP_KEYS
+    }
+    assert binding["current_process_identity"]["pid"] == 42
+    assert not wal.exists() or wal.stat().st_size == 0
+    assert database.read_bytes() != database_before  # Expected SQLite checkpoint.
+    assert db._database_logical_sha256(database) == logical_before
+    connection = sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True)
+    try:
+        assert db._sqlite_logical_projection(connection) == expected_projection
+        assert connection.execute(
+            'SELECT status,"commit",fixed_at FROM backlog_bugs WHERE bug_id=?',
+            ("AC-0000",),
+        ).fetchone() == ("FIXED", historical["commit"], "2026-09-04T16:06:16Z")
+        assert connection.execute(
+            "SELECT execution_state_revision,record_json FROM contract_runtime_executions "
+            "WHERE contract_execution_id=?", ("cex-wal-restart",),
+        ).fetchone() == (9, record)
+        assert connection.execute(
+            "SELECT status,closed_at FROM observer_sessions WHERE session_id=?",
+            ("obs-wal-restart",),
+        ).fetchone() == ("closed", "2026-09-04T16:08:25Z")
+    finally:
+        connection.close()
+    assert launch_path.read_bytes() == receipt_before
+    assert {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted((root / "archive").rglob("*")) if path.is_file()
+    } == archive_before
+    db.release_dev_runtime_writer_lease(root)
+
+
 def test_completed_cow_basic_restart_returns_before_normal_sqlite_connect(
     tmp_path, monkeypatch,
 ):
