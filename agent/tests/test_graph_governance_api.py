@@ -201148,6 +201148,217 @@ def test_ac_dev_entered_parallel_lane_route_revalidates_parent_in_writer(
     assert tuple(conn.iterdump()) == raced["dump"]
 
 
+def _prepare_ac_dev_recovered_parallel_before_prefill(conn, monkeypatch, tmp_path):
+    case = _prepare_ac_dev_entered_parallel_lane_routes(conn, monkeypatch, tmp_path)
+    runtime = server._contract_runtime(conn)
+    source_id = case["execution_id"]
+    source = runtime.store.get(source_id)
+    # The old execution and its accepted prefill are historical input. Nothing
+    # is seeded for the new recovery execution, route, or first prefill.
+    source["definition_hash"] = "sha256:stale-rev10-recovery-fixture"
+    runtime.store.update(source_id, source)
+    conn.commit()
+    source_route_ref = conn.execute(
+        "SELECT route_token_ref FROM observer_route_token_refs WHERE task_id=?",
+        (source_id,),
+    ).fetchone()[0]
+    recovered = server.handle_project_contract_runtime_recover(_ctx_with_role(
+        {"project_id": case["project_id"]}, "observer", method="POST", body={
+            "backlog_id": case["backlog_id"],
+            "stale_contract_execution_id": source_id,
+            "recovery_policy": "start_new_execution",
+            "route_token_ref": source_route_ref,
+        },
+    ))
+    assert recovered["ok"] is True, recovered
+    recovery_id = recovered["recovery_contract_execution_id"]
+    assert recovered["historical_evidence_replayed"] is False
+    assert recovered["authoritative_pass_synthesized"] is False
+    assert runtime.store.get(recovery_id)["completed_lines"] == []
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs WHERE task_id=?",
+        (recovery_id,),
+    ).fetchone()[0] == 0
+    session_id = conn.execute("SELECT session_id FROM observer_sessions").fetchone()[0]
+    case.update({
+        "source_id": source_id, "source_record": copy.deepcopy(source),
+        "source_route_ref": source_route_ref, "recovery_id": recovery_id,
+        "recovery": recovered, "observer_session_id": session_id,
+        "guide_body": {
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "continue_contract_chain", "response_view": "compact",
+            "task_id": recovery_id, "observer_session_id": session_id,
+            "route_token_ref": source_route_ref,
+            "target_project_root": case["world"]["target_project_root"],
+            "target_head_commit": case["world"]["target_head_commit"],
+            "target_ref": "refs/heads/codex/ac-dev",
+        },
+    })
+    return case
+
+
+def test_ac_dev_recovered_parallel_continues_through_issuer_to_first_prefill(
+    conn, monkeypatch, tmp_path, record_property,
+):
+    case = _prepare_ac_dev_recovered_parallel_before_prefill(conn, monkeypatch, tmp_path)
+    project_id, recovery_id = case["project_id"], case["recovery_id"]
+    runtime = server._contract_runtime(conn)
+    old_registry = tuple(conn.execute(
+        "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
+        (case["source_route_ref"],),
+    ).fetchone())
+    for field, value in (
+        ("task_id", case["source_id"]),
+        ("target_head_commit", "f" * 40),
+        ("target_project_root", str(tmp_path / "foreign-world")),
+    ):
+        before, changes = tuple(conn.iterdump()), conn.total_changes
+        with pytest.raises(GovernanceError):
+            server.handle_project_onboard_route_guide(_ctx(
+                {"project_id": project_id}, method="POST",
+                body={**case["guide_body"], field: value},
+            ))
+        assert conn.total_changes == changes
+        assert tuple(conn.iterdump()) == before
+    before = tuple(conn.iterdump())
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": project_id}, method="POST", body=case["guide_body"],
+    ))
+    assert tuple(conn.iterdump()) == before
+    assert guide["contract_execution_id"] == recovery_id
+    assert case["recovery"]["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
+    recovery_onboard_body = case["recovery"]["next_legal_action"]["copy_safe_body"]
+    assert recovery_onboard_body["task_id"] == recovery_id
+    assert recovery_onboard_body["route_token_ref"] == case["source_route_ref"]
+    assert guide["host_precursor_required"] is True
+    precursor = guide["host_precursor_action"]
+    assert precursor["mcp_tool"] == "observer_route_context_issue"
+    body = precursor["copy_safe_body"]
+    assert set(body).issubset({
+        "project_id", "caller_role", "backlog_id", "task_id", "target_files",
+        "owned_files", "allowed_actions", "evidence_refs", "parent_route_identity",
+        "target_head_commit",
+    })  # Existing observer_route_context_issue MCP fields.
+    assert body["task_id"] == recovery_id
+    assert body["target_files"] == body["owned_files"] == sorted(case["target_files"])
+    assert body["parent_route_identity"]["route_token_ref"] == case["source_route_ref"]
+    issued = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": project_id}, method="POST", body=body,
+    ))
+    assert isinstance(issued, dict) and issued["ok"] is True, json.dumps(issued, sort_keys=True)
+    assert issued["ref_registered"] is True
+    resolved = observer_route_context.resolve_route_token_ref(
+        conn, project_id=project_id,
+        storage_project_id=server._route_registry_storage_project_id(project_id),
+        backlog_id=case["backlog_id"], task_id=recovery_id,
+        route_token_ref=issued["route_token_ref"],
+    )
+    assert resolved["scope"]["task_id"] == recovery_id
+    assert conn.execute(
+        "SELECT project_id FROM observer_route_token_refs WHERE route_token_ref=?",
+        (issued["route_token_ref"],),
+    ).fetchone()[0] == server._route_registry_storage_project_id(project_id)
+    assert runtime.store.get(recovery_id)["completed_lines"] == []
+    before, changes = tuple(conn.iterdump()), conn.total_changes
+    with pytest.raises(GovernanceError):
+        server.handle_observer_route_context_issue(_ctx(
+            {"project_id": project_id}, method="POST", body=body,
+        ))
+    assert conn.total_changes == changes
+    assert tuple(conn.iterdump()) == before
+    fresh_body = {**case["guide_body"], "route_token_ref": issued["route_token_ref"]}
+    fresh = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": project_id}, method="POST", body=fresh_body,
+    ))
+    assert fresh.get("contract_execution_id") == recovery_id, json.dumps(fresh, sort_keys=True)
+    assert fresh["next_legal_action"]["line_id"] == "observer_prefill_child_contracts"
+    assert fresh["host_precursor_action"]["mcp_tool"] == "contract_runtime_current"
+    read_body = fresh["host_precursor_action"]["copy_safe_body"]
+    assert read_body["project_id"] == project_id
+    assert read_body["contract_execution_id"] == recovery_id
+    current = server.handle_project_contract_runtime_current_state(_ctx(
+        {key: read_body[key] for key in ("project_id", "contract_execution_id")},
+        query={key: value for key, value in read_body.items()
+               if key not in {"project_id", "contract_execution_id"}},
+    ))
+    prefill = current["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"]
+    accepted = server.handle_project_contract_runtime_line_write(_ctx(
+        {"project_id": project_id, "contract_execution_id": recovery_id},
+        method="POST", body=prefill,
+    ))
+    assert accepted["ok"] is True, accepted
+    plan = server._contract_runtime_mf_parallel_admitted_prefill_child_plan(
+        runtime.store.get(recovery_id)
+    )
+    assert plan["contract_execution_id"] == recovery_id
+    assert plan["row_owned_files"] == case["plan"]["row_owned_files"]
+    assert plan["acceptance_criteria"] == case["plan"]["acceptance_criteria"]
+    assert plan["parent_route_binding"]["route_token_ref"] == issued["route_token_ref"]
+    after_prefill = server.handle_project_contract_runtime_current_state(_ctx(
+        {key: read_body[key] for key in ("project_id", "contract_execution_id")},
+        query={key: value for key, value in read_body.items()
+               if key not in {"project_id", "contract_execution_id"}},
+    ))
+    assert after_prefill["next_legal_action"]["line_id"] == "observer_dispatch_bounded_workers"
+    assert len(after_prefill["next_legal_action"]["per_lane_observer_route_context_issue"]["request_bodies"]) == 2
+    assert runtime.store.get(case["source_id"]) == case["source_record"]
+    assert tuple(conn.execute(
+        "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
+        (case["source_route_ref"],),
+    ).fetchone()) == old_registry
+    record_property("recovered_parallel_first_prefill", json.dumps({
+        "source_execution_id": case["source_id"], "recovery_execution_id": recovery_id,
+        "issuer_body": body, "route_ref": issued["route_token_ref"],
+        "first_prefill_accepted": True, "historical_evidence_replayed": False,
+    }, sort_keys=True))
+
+
+@pytest.mark.parametrize("drift", ["source_route", "current_execution", "row_scope"])
+def test_ac_dev_recovered_parallel_continuation_revalidates_in_writer(
+    conn, monkeypatch, tmp_path, drift,
+):
+    case = _prepare_ac_dev_recovered_parallel_before_prefill(conn, monkeypatch, tmp_path)
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=case["guide_body"],
+    ))
+    body = guide["host_precursor_action"]["copy_safe_body"]
+    original = server._ac_dev_mf_parallel_onboard_route_issue_precheck
+    raced = {}
+
+    def precheck_then_change(**kwargs):
+        expected = original(**kwargs)
+        if drift == "source_route":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET status='superseded' WHERE route_token_ref=?",
+                (case["source_route_ref"],),
+            )
+        elif drift == "current_execution":
+            conn.execute(
+                "UPDATE backlog_contract_chain_current SET current_contract_execution_id=? "
+                "WHERE project_id=? AND backlog_id=?",
+                (case["source_id"], case["project_id"], case["backlog_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE backlog_bugs SET target_files=? WHERE bug_id=?",
+                (json.dumps(["docs/outside-recovered-scope.md"]), case["backlog_id"]),
+            )
+        conn.commit()
+        raced.update({"dump": tuple(conn.iterdump()), "changes": conn.total_changes})
+        return expected
+
+    monkeypatch.setattr(server, "_ac_dev_mf_parallel_onboard_route_issue_precheck", precheck_then_change)
+    status, rejected = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=body,
+    ))
+    assert status == 409
+    assert rejected["zero_write_rejection"] is True
+    assert rejected["route_registry_mutated"] is False
+    assert rejected["contract_runtime_mutated"] is False
+    assert conn.total_changes == raced["changes"]
+    assert tuple(conn.iterdump()) == raced["dump"]
+
+
 def _prepare_ac_dev_existing_parallel_parent(conn, monkeypatch, tmp_path, *, real_git_world=False):
     """Seed the persisted pre-registration producer, without erasing history."""
 
