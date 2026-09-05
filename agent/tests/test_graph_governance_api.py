@@ -200940,6 +200940,214 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
     }
 
 
+def _prepare_ac_dev_entered_parallel_lane_routes(conn, monkeypatch, tmp_path):
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-ENTERED-PARALLEL-LANE-ROUTES",
+        real_git_world=True,
+    )
+    project_id, backlog_id = case["project_id"], case["backlog_id"]
+    repository_root = Path(case["world"]["target_project_root"])
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    fixture_registry = server._registry_project_config
+    monkeypatch.setattr(server, "_registry_project_config", lambda selected: (
+        ({**fixture_registry(PID)[0], "project_id": project_id}, "test_registry")
+        if selected == project_id else fixture_registry(selected)
+    ))
+    issued_parent = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": project_id}, method="POST", body=case["body"],
+    ))
+    assert issued_parent["ok"] is True, issued_parent
+    status, registered = server.handle_observer_session_register(_ctx(
+        {"project_id": project_id}, method="POST", body={
+            "project_id": project_id, "backlog_id": backlog_id,
+            "task_id": case["parent_execution_id"],
+            "cex_id": case["parent_execution_id"],
+            "route_token_ref": issued_parent["route_token_ref"],
+        },
+    ))
+    assert status == 201, registered
+    entered = server.handle_project_mf_parallel_enter(_ctx(
+        {"project_id": project_id}, method="POST", body={
+            "project_id": project_id, "backlog_id": backlog_id,
+            "task_id": "entered-parallel-lanes", "onboard_service_waiver": True,
+            "target_files": case["target_files"], "owned_files": case["target_files"],
+            "reason": "Admit the two declared lane plans before route issuance.",
+            "observer_session_id": registered["session_id"],
+            "observer_route_token_ref": issued_parent["route_token_ref"],
+            "metadata": {"required_worker_count": 2, "lane_intents": [
+                {"task_id": f"entered-parallel-lane-{index}",
+                 "worker_id": f"worker-{index}", "worker_slot_id": f"slot-{index}",
+                 "owned_files": [path]}
+                for index, path in enumerate(case["target_files"], start=1)
+            ]},
+        },
+    ))
+    assert entered["ok"] is True, entered
+    execution_id = entered["contract_execution_id"]
+    assert entered["parent_contract_execution_id"] == case["parent_execution_id"]
+    assert server._contract_runtime_store(conn).get(execution_id)["revision"] == "rev10"
+
+    # Isolated transport credentials use the real issuer/registry. The entry,
+    # typed prefill admission, guide producer and lane issuer stay unpatched.
+    submit_route = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id, backlog_id=backlog_id, task_id=execution_id,
+        target_files=case["target_files"],
+        allowed_actions=["contract_runtime_current", "contract_runtime_submit_line"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id=project_id,
+        storage_project_id=server._route_registry_storage_project_id(project_id),
+        route_token_ref=submit_route["route_token_ref"], token=submit_route["route_token"],
+    )
+    current_ctx = _ctx(
+        {"project_id": project_id, "contract_execution_id": execution_id},
+        query={"observer_session_id": registered["session_id"],
+               "observer_route_token_ref": submit_route["route_token_ref"]},
+    )
+    current = server.handle_project_contract_runtime_current_state(current_ctx)
+    prefill = current["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"]
+    accepted = server.handle_project_contract_runtime_line_write(_ctx(
+        {"project_id": project_id, "contract_execution_id": execution_id},
+        method="POST", body=prefill,
+    ))
+    assert accepted["ok"] is True, accepted
+    current = server.handle_project_contract_runtime_current_state(current_ctx)
+    assert current["runtime_guide"]["prefill_child_plan_projection"]["status"] == (
+        "admitted_plan_projected"
+    )
+    record = server._contract_runtime_store(conn).get(execution_id)
+    plan = server._contract_runtime_mf_parallel_admitted_prefill_child_plan(record)
+    assert plan["parent_route_binding"]["route_token_ref"] == issued_parent["route_token_ref"]
+    case.update({
+        "execution_id": execution_id, "record": record, "plan": plan,
+        "recipe": current["next_legal_action"]["per_lane_observer_route_context_issue"],
+    })
+    return case
+
+
+def test_ac_dev_entered_parallel_lane_routes_consume_emitted_bodies_and_precheck(
+    conn, monkeypatch, tmp_path, record_property,
+):
+    case = _prepare_ac_dev_entered_parallel_lane_routes(conn, monkeypatch, tmp_path)
+    project_id, execution_id = case["project_id"], case["execution_id"]
+    recipe = case["recipe"]
+    assert recipe["required_issue_count"] == 2
+    record_property("entered_parallel_producer", json.dumps({
+        "contract_execution_id": execution_id, "contract_revision": "rev10",
+        "accepted_plan_hash": case["plan"]["plan_hash"],
+        "request_bodies": recipe["request_bodies"],
+        "expected_direct_execution_id": server._operator_supervised_direct_main_execution_id(
+            project_id, case["backlog_id"], revision="rev3", world_authority=case["world"],
+        ),
+    }, sort_keys=True))
+    for field, value in (
+        ("task_id", "cex-mf-parallel-unadmitted"),
+        ("parent_route_identity", {
+            **recipe["request_bodies"][0]["parent_route_identity"],
+            "route_token_ref": "rtok-wrong-parent",
+        }),
+        ("project_id", "other-project"),
+        ("target_head_commit", "f" * 40),
+        ("target_files", ["docs/outside-lane.md"]),
+        ("allowed_actions", ["parallel_branch_allocate", "task_timeline_append", "merge"]),
+    ):
+        malformed = {**copy.deepcopy(recipe["request_bodies"][0]), field: value}
+        before, changes = tuple(conn.iterdump()), conn.total_changes
+        with pytest.raises(GovernanceError):
+            server.handle_observer_route_context_issue(_ctx(
+                {"project_id": project_id}, method="POST", body=malformed,
+            ))
+        assert conn.total_changes == changes, field
+        assert tuple(conn.iterdump()) == before, field
+    before_execution = tuple(conn.execute(
+        "SELECT * FROM contract_runtime_executions ORDER BY contract_execution_id"
+    ).fetchall())
+    children = []
+    for body, lane in zip(recipe["request_bodies"], case["plan"]["lanes"], strict=True):
+        assert body["task_id"] == execution_id
+        assert body["target_files"] == body["owned_files"] == lane["owned_files"]
+        assert body["parent_route_identity"] == case["plan"]["parent_route_binding"]["route_identity"]
+        assert body["evidence_refs"][-1] == f"lane_task:{lane['task_id']}"
+        server._guard_dev_runtime_request(
+            method="POST", path=f"/api/projects/{project_id}/observer/route-context/issue",
+            path_params={"project_id": project_id}, body=body,
+        )
+        issued = server.handle_observer_route_context_issue(_ctx(
+            {"project_id": project_id}, method="POST", body=body,
+        ))
+        assert isinstance(issued, dict) and issued["ok"] is True, issued
+        assert issued["ref_registered"] is True
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=server._route_registry_storage_project_id(project_id),
+            backlog_id=case["backlog_id"], task_id=execution_id,
+            route_token_ref=issued["route_token_ref"],
+        )
+        assert resolved["target_files"] == resolved["owned_files"] == lane["owned_files"]
+        assert resolved["allowed_actions"] == body["allowed_actions"]
+        assert all(resolved["parent_route_lineage"][key] == value
+                   for key, value in body["parent_route_identity"].items())
+        children.append(issued)
+    assert len({child["route_token_ref"] for child in children}) == 2
+    assert tuple(conn.execute(
+        "SELECT * FROM contract_runtime_executions ORDER BY contract_execution_id"
+    ).fetchall()) == before_execution
+    precheck_body = copy.deepcopy(recipe["atomic_precheck"]["request_body_template"])
+    for binding, child in zip(recipe["route_token_ref_bindings"], children, strict=True):
+        precheck_body["lanes"][binding["lane_index"]]["route_token_ref"] = child["route_token_ref"]
+    prechecked = server.handle_graph_governance_parallel_branch_allocate_precheck(_ctx(
+        {"project_id": project_id}, method="POST", body=precheck_body,
+    ))
+    assert prechecked["ok"] is True, prechecked
+    assert len(prechecked["copy_safe_allocation_bodies"]) == 2
+    assert [body["owned_files"] for body in prechecked["copy_safe_allocation_bodies"]] == [
+        lane["owned_files"] for lane in case["plan"]["lanes"]
+    ]
+    assert all(body["parent_task_id"] == execution_id
+               for body in prechecked["copy_safe_allocation_bodies"])
+    record_property("entered_parallel_lane_routes", json.dumps({
+        "contract_execution_id": execution_id, "contract_revision": "rev10",
+        "accepted_plan_hash": case["plan"]["plan_hash"],
+        "request_bodies": recipe["request_bodies"],
+        "child_route_refs": [child["route_token_ref"] for child in children],
+        "atomic_precheck_ok": prechecked["ok"],
+        "allocation_count": len(prechecked["copy_safe_allocation_bodies"]),
+    }, sort_keys=True))
+
+
+def test_ac_dev_entered_parallel_lane_route_revalidates_parent_in_writer(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_entered_parallel_lane_routes(conn, monkeypatch, tmp_path)
+    body = case["recipe"]["request_bodies"][0]
+    original = server._ac_dev_mf_parallel_onboard_route_issue_precheck
+    raced = {}
+
+    def precheck_then_revoke(**kwargs):
+        expected = original(**kwargs)
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='superseded' WHERE route_token_ref=?",
+            (case["plan"]["parent_route_binding"]["route_token_ref"],),
+        )
+        conn.commit()
+        raced.update({"dump": tuple(conn.iterdump()), "changes": conn.total_changes})
+        return expected
+
+    monkeypatch.setattr(server, "_ac_dev_mf_parallel_onboard_route_issue_precheck", precheck_then_revoke)
+    status, rejected = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=body,
+    ))
+    assert status == 409
+    assert rejected["reason"] == "entered_parallel_parent_route_inactive"
+    assert rejected["zero_write_rejection"] is True
+    assert conn.total_changes == raced["changes"]
+    assert tuple(conn.iterdump()) == raced["dump"]
+
+
 def _prepare_ac_dev_existing_parallel_parent(conn, monkeypatch, tmp_path, *, real_git_world=False):
     """Seed the persisted pre-registration producer, without erasing history."""
 

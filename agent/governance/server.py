@@ -8301,8 +8301,9 @@ def _observer_route_context_issue_request_kind(
     handler with a request hint. Canonical adoption has a closed reference-only
     envelope. A row-first MF Parallel precursor is only a candidate here; the
     handler re-derives its complete authority from the persisted Onboard parent
-    and backlog row before it can reach the ordinary issuer. Every other
-    unmarked envelope remains the legacy guide-copy Direct bootstrap input. A
+    and backlog row before it can reach the ordinary issuer. Entered Parallel
+    lane candidates must likewise match the current admitted prefill producer.
+    Every other unmarked envelope remains the legacy guide-copy Direct bootstrap input. A
     Direct field beside the canonical marker is never silently discarded or
     routed as a different dev operation.
     """
@@ -8325,6 +8326,13 @@ def _observer_route_context_issue_request_kind(
         and "mf_parallel_enter" in allowed_actions
     ):
         return "mf_parallel_onboard_precursor"
+    if (
+        "canonical_ref_adoption" not in body
+        and isinstance(allowed_actions, list)
+        and "parallel_branch_allocate" in allowed_actions
+        and isinstance(body.get("parent_route_identity"), Mapping)
+    ):
+        return "mf_parallel_entered_lane"
     if "canonical_ref_adoption" not in body:
         return "direct_bootstrap"
     canonical_fields = {
@@ -9356,7 +9364,9 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 project_id=project_id,
                 body=body,
             )
-        if request_kind == "mf_parallel_onboard_precursor":
+        if request_kind in {
+            "mf_parallel_onboard_precursor", "mf_parallel_entered_lane",
+        }:
             body = _ac_dev_mf_parallel_onboard_route_issue_precheck(
                 project_id=project_id,
                 body=body,
@@ -9774,7 +9784,10 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                         token=issued["route_token"],
                         commit=False,
                     )
-                    if "parent_route_identity" in mf_parallel_final_body:
+                    if (
+                        request_kind == "mf_parallel_onboard_precursor"
+                        and "parent_route_identity" in mf_parallel_final_body
+                    ):
                         parent_id = str(mf_parallel_final_body["task_id"])
                         parent = _contract_runtime_store(conn).get(parent_id)
                         revision = int(parent["execution_state_revision"])
@@ -153650,11 +153663,11 @@ def _ac_dev_mf_parallel_onboard_route_issue_rejection(
     body: Mapping[str, Any] | None = None,
     expected_body: Mapping[str, Any] | None = None,
 ) -> GovernanceError:
-    """Build one public, physical-zero-write MF precursor rejection."""
+    """Build one public, physical-zero-write MF route rejection."""
 
     return GovernanceError(
         "ac_dev_mf_parallel_onboard_route_precursor_rejected",
-        "MF Parallel route issuance requires one exact current Onboard service scope",
+        "MF Parallel route issuance requires one exact current server-produced scope",
         409,
         {
             "schema_version": (
@@ -153684,7 +153697,7 @@ def _ac_dev_mf_parallel_onboard_route_issue_precheck(
     body: Mapping[str, Any],
     query: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Re-derive one row-first MF route precursor from durable state."""
+    """Re-derive one MF precursor or admitted lane route from durable state."""
 
     if _runtime_plane() != "dev" or project_id != "aming-claw":
         raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
@@ -153714,7 +153727,7 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
     body: Mapping[str, Any],
     token: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Revalidate MF precursor authority on the caller's DB snapshot/lock."""
+    """Revalidate MF route authority on the caller's DB snapshot/lock."""
 
     def reject(
         reason: str,
@@ -153754,6 +153767,14 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
     if row is None or str(_row_get(row, "status", "")).strip() != "OPEN":
         reject("backlog_not_open")
     target_files = _backlog_declared_direct_file_scope(conn, backlog_id)
+    if _observer_route_context_issue_request_kind(body) == "mf_parallel_entered_lane":
+        expected_body = _ac_dev_mf_parallel_entered_lane_route_issue_body(
+            conn, project_id=project_id, body=body, row_files=target_files,
+        )
+        _ac_dev_mf_parallel_route_issue_token_revalidate(
+            body=body, expected_body=expected_body, token=token,
+        )
+        return expected_body
     expected_body = _onboard_route_guide_completed_mf_parallel_action_input(
         project_id=project_id,
         backlog_id=backlog_id,
@@ -153827,8 +153848,120 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
         reject("onboard_route_already_issued", expected_body)
     if task_id != expected_task_id or dict(body) != expected_body:
         reject("not_current_guide_exact", expected_body)
+    _ac_dev_mf_parallel_route_issue_token_revalidate(
+        body=body, expected_body=expected_body, token=token,
+    )
+    return expected_body
+
+
+def _ac_dev_mf_parallel_entered_lane_route_issue_body(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    row_files: Sequence[str],
+) -> dict[str, Any]:
+    """Join the existing issuer to the current, accepted rev10 lane producer."""
+
+    from . import observer_route_context
+
+    def reject(reason: str) -> NoReturn:
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+            reason=reason, body=body,
+        )
+
+    backlog_id = str(body.get("backlog_id") or "")
+    execution_id = str(body.get("task_id") or "")
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
+    except ContractRuntimeError:
+        reject("entered_parallel_execution_missing")
+    if not (
+        record.get("project_id") == project_id
+        and record.get("backlog_id") == backlog_id
+        and record.get("contract_execution_id") == execution_id
+        and _is_mf_parallel_record_contract_id(str(record.get("contract_id") or ""))
+        and record.get("revision") == "rev10"
+        and (record.get("execution_state") or {}).get("status") == "active"
+    ):
+        reject("entered_parallel_execution_identity_mismatch")
+    current = conn.execute(
+        "SELECT current_contract_execution_id FROM backlog_contract_chain_current "
+        "WHERE project_id=? AND backlog_id=?", (project_id, backlog_id),
+    ).fetchone()
+    if _row_get(current, "current_contract_execution_id", "") != execution_id:
+        reject("entered_parallel_not_current")
+    plan = _contract_runtime_mf_parallel_admitted_prefill_child_plan(record)
+    if not plan or plan.get("row_owned_files") != sorted(row_files):
+        reject("entered_parallel_admitted_prefill_missing_or_changed")
+    prefill_acceptance = [
+        _contract_runtime_completed_line_acceptance(
+            conn, project_id=project_id, record=record,
+            completed_line_index=index, expected_line=line,
+        )
+        for index, line in enumerate(record.get("completed_lines") or [])
+        if isinstance(line, Mapping)
+        and line.get("stage_id") == "orchestration"
+        and line.get("line_id") == "observer_prefill_child_contracts"
+        and line.get("payload") == _contract_runtime_mf_parallel_prefill_payload(plan)
+    ]
+    if (
+        len(prefill_acceptance) != 1
+        or prefill_acceptance[0].get("db_verified") is not True
+    ):
+        reject("entered_parallel_prefill_not_db_accepted")
+    binding = plan["parent_route_binding"]
+    parent_identity = binding["route_identity"]
+    try:
+        parent_route = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            backlog_id=backlog_id, route_token_ref=binding["route_token_ref"],
+        )
+    except observer_route_context.RouteTokenRefError:
+        reject("entered_parallel_parent_route_inactive")
+    if not (
+        isinstance(parent_route, Mapping)
+        and parent_route.get("caller_role") == "observer"
+        and parent_route.get("scope", {}).get("task_id") in {
+            execution_id, record.get("parent_contract_execution_id"),
+        }
+        and all(parent_route.get(field) == parent_identity.get(field)
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
+        and set(row_files).issubset(parent_route.get("target_files") or [])
+        and set(row_files).issubset(parent_route.get("owned_files") or [])
+    ):
+        reject("entered_parallel_parent_route_binding_mismatch")
+    current_record = _contract_runtime_read(
+        conn, contract_execution_id=execution_id, actor_role="observer",
+    )
+    next_action = _runtime_next_action_from_guide(
+        _contract_runtime_guide_for_response(current_record, actor_role="observer")
+    )
+    recipe = next_action.get("per_lane_observer_route_context_issue") or {}
+    matches = [candidate for candidate in recipe.get("request_bodies") or []
+               if isinstance(candidate, Mapping) and dict(candidate) == dict(body)]
+    if len(matches) != 1:
+        reject("entered_parallel_not_current_lane_guide_exact")
+    return dict(matches[0])
+
+
+def _ac_dev_mf_parallel_route_issue_token_revalidate(
+    *,
+    body: Mapping[str, Any],
+    expected_body: Mapping[str, Any],
+    token: Mapping[str, Any] | None,
+) -> None:
+    """Keep the issuer's exact token and parent-lineage check shared by MF shapes."""
+
+    def reject(reason: str) -> NoReturn:
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+            reason=reason, body=body, expected_body=expected_body,
+        )
+
     if token is not None:
         token_scope = token.get("scope") if isinstance(token.get("scope"), Mapping) else {}
+        expected_files = sorted(expected_body["target_files"])
         expected_evidence_refs = [
             f"route:{str(token.get('route_id') or '').strip()}",
             *expected_body["evidence_refs"],
@@ -153836,13 +153969,13 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
         token_ready = bool(
             dict(token_scope)
             == {
-                "project_id": project_id,
-                "backlog_id": backlog_id,
-                "task_id": expected_task_id,
+                "project_id": expected_body["project_id"],
+                "backlog_id": expected_body["backlog_id"],
+                "task_id": expected_body["task_id"],
             }
             and str(token.get("caller_role") or "").strip() == "observer"
-            and list(token.get("target_files") or []) == sorted(target_files)
-            and list(token.get("owned_files") or []) == sorted(target_files)
+            and list(token.get("target_files") or []) == expected_files
+            and list(token.get("owned_files") or []) == expected_files
             and list(token.get("allowed_actions") or [])
             == expected_body["allowed_actions"]
             and list(token.get("evidence_refs") or []) == expected_evidence_refs
@@ -153858,15 +153991,14 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
             )
         )
         if not token_ready:
-            reject("issued_token_identity_mismatch", expected_body)
+            reject("issued_token_identity_mismatch")
         if "parent_route_identity" in expected_body:
             lineage = token.get("parent_route_lineage") or {}
             if not all(
                 lineage.get(field) == value
                 for field, value in expected_body["parent_route_identity"].items()
             ):
-                reject("issued_token_lineage_mismatch", expected_body)
-    return expected_body
+                reject("issued_token_lineage_mismatch")
 
 
 def _ac_dev_mf_parallel_parent_sessions(
