@@ -3999,6 +3999,16 @@ def _guard_dev_runtime_request(
 
     if method not in {"POST", "DELETE"}:
         return None
+    if method == "POST" and path == "/api/project/bootstrap" and body.get("mode") == "registry_config_recovery":
+        if body.get("project_id") != AC_PROJECT_ID or not body.get("workspace_path"):
+            raise _dev_runtime_zero_write_rejection(
+                code="ac_dev_registry_recovery_scope_required", path=path,
+                detail="registry recovery requires the exact AC project and canonical workspace",
+            )
+        _dev_validate_source_root(path=path, body=body, required=True)
+        # Admit only this metadata operation to its existing bootstrap gate.
+        # Generic bootstrap remains outside the dev write-path allowlist.
+        return None
     if not _dev_write_path_allowed(path):
         raise _dev_runtime_zero_write_rejection(
             code="ac_dev_mutation_not_allowlisted",
@@ -6270,6 +6280,7 @@ def handle_project_bootstrap(ctx: RequestContext):
 
     Body: {
         "workspace_path": "/path/to/project" (required),
+        "mode": "registry_config_recovery" (optional; existing AC dev metadata only),
         "project_id": "my-project" (optional),
         "project_name": "my-project" (optional),
         "language": "python" (optional),
@@ -6282,8 +6293,22 @@ def handle_project_bootstrap(ctx: RequestContext):
     workspace_path = ctx.body.get("workspace_path", "").strip()
     if not workspace_path:
         return 400, {"error": "workspace_path is required"}
+    mode = ctx.body.get("mode", "")
+    if mode not in ("", "registry_config_recovery"):
+        raise ValidationError("unsupported project bootstrap mode")
+    recovery = mode == "registry_config_recovery"
+    _guard_dev_runtime_request(
+        method=ctx.method, path="/api/project/bootstrap", path_params=ctx.path_params,
+        body=ctx.body, query=ctx.query,
+    )
+    if recovery:
+        if _runtime_plane() != "dev":
+            raise ValidationError("registry config recovery requires the canonical AC dev project")
+        if any(key in ctx.body for key in ("config_override", "language", "project_name", "scan_depth", "exclude_patterns")):
+            raise ValidationError("registry config recovery does not accept bootstrap or config overrides")
     project_id = _bootstrap_route_gate_project_id(ctx.body, workspace_path)
-    first_run = _project_bootstrap_first_run_allowed(project_id)
+    # Registry loss is not first-run authority in an existing dev world.
+    first_run = False if recovery else _project_bootstrap_first_run_allowed(project_id)
     config_override = _bootstrap_config_override(ctx.body or {})
     route_handoff = _route_bootstrap_handoff(
         ctx.body or {},
@@ -6312,13 +6337,18 @@ def handle_project_bootstrap(ctx: RequestContext):
         raise
 
     try:
-        result = project_service.bootstrap_project(
-            workspace_path=workspace_path,
-            project_name=ctx.body.get("project_name", ""),
-            config_override=config_override,
-            scan_depth=ctx.body.get("scan_depth", 3),
-            exclude_patterns=ctx.body.get("exclude_patterns"),
-        )
+        if recovery:
+            result = project_service.recover_dev_project_config_metadata(
+                project_id=project_id, workspace_path=workspace_path,
+            )
+        else:
+            result = project_service.bootstrap_project(
+                workspace_path=workspace_path,
+                project_name=ctx.body.get("project_name", ""),
+                config_override=config_override,
+                scan_depth=ctx.body.get("scan_depth", 3),
+                exclude_patterns=ctx.body.get("exclude_patterns"),
+            )
         pid = str(result.get("project_id") or project_id or "").strip()
         if pid:
             conn = get_connection(pid)

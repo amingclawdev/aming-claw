@@ -797,6 +797,116 @@ def set_project_config_metadata(
     return {k: v for k, v in entry.items() if k != "password_hash"}
 
 
+def recover_dev_project_config_metadata(
+    project_id: str,
+    workspace_path: str,
+    *,
+    actor: str = "project_bootstrap",
+) -> dict:
+    """Restore registry metadata from the existing canonical dev world.
+
+    The caller must first consume the project_bootstrap route gate. This
+    operation neither initializes stores nor rebuilds their historical facts.
+    """
+    from project_config import load_project_config
+    from .db import canonical_ac_database_identity
+
+    if os.environ.get("AMING_CLAW_RUNTIME_PLANE", "").strip() != "dev" or project_id != "aming-claw":
+        raise ValidationError("registry config recovery requires the canonical AC dev project")
+    workspace = Path(workspace_path).resolve(strict=True)
+    if workspace != Path(__file__).resolve().parents[2]:
+        raise ValidationError("registry config recovery requires the canonical AC workspace")
+    database = _resolve_project_dir(project_id) / "governance.db"
+    if not database.is_file():
+        raise ValidationError("registry config recovery requires an existing governance database")
+    conn = get_connection(project_id)
+    try:
+        identity = canonical_ac_database_identity(conn)
+        if identity.get("world_id") != "ac-dev" or identity.get("project_id") != project_id:
+            raise ValidationError("registry config recovery requires the existing canonical dev world")
+        active = conn.execute(
+            "SELECT s.snapshot_id FROM graph_snapshot_refs r "
+            "JOIN graph_snapshots s ON s.project_id=r.project_id AND s.snapshot_id=r.snapshot_id "
+            "WHERE r.project_id=? AND r.ref_name='active'", (project_id,),
+        ).fetchone()
+        if active is None:
+            raise ValidationError("registry config recovery requires the existing active graph")
+        snapshot_id = str(active[0])
+    finally:
+        conn.close()
+
+    with _PROJECTS_LOCK:
+        projects = _load_projects()
+        entries = projects["projects"]
+        absent = project_id not in entries
+        entry = entries.get(project_id)
+        if not absent:
+            if not isinstance(entry, dict) or entry.get("project_id") != project_id:
+                raise ValidationError("existing registry entry has conflicting project identity")
+            if Path(str(entry.get("workspace_path") or "")).resolve() != workspace:
+                raise ValidationError("existing registry entry has conflicting workspace identity")
+        existing_config = entry.get("project_config") if isinstance(entry, dict) else None
+        if existing_config:
+            if not isinstance(existing_config, dict) or existing_config.get("project_id") != project_id:
+                raise ValidationError("existing project config is invalid; explicit config repair is required")
+            recovery_state = "already_configured"
+            expected_config = existing_config
+        else:
+            config_path = next(
+                (workspace / name for name in (".aming-claw.yaml", ".aming-claw.json")
+                 if (workspace / name).is_file()),
+                None,
+            )
+            if config_path is None:
+                raise ValidationError("registry config recovery requires a real workspace configuration file")
+            # Never use generated defaults or caller-supplied command overrides.
+            config_bytes = config_path.read_bytes()
+            config = load_project_config(workspace)
+            if config.project_id != project_id:
+                raise ValidationError("workspace config project_id does not match the canonical AC project")
+            if config_path.read_bytes() != config_bytes:
+                raise ValidationError("workspace config changed during registry recovery; retry with a stable file")
+            expected_config = project_config_to_metadata(config)
+            recovery_state = "registry_entry_restored" if absent else "project_config_restored"
+            now = _utc_iso()
+            if absent:
+                entry = {
+                    "project_id": project_id, "name": project_id,
+                    "workspace_path": str(workspace), "initialized": True,
+                    "status": "active", "active_snapshot_id": snapshot_id,
+                }
+                entries[project_id] = entry
+            entry.update({
+                "project_config": expected_config,
+                "project_config_source": "workspace_config",
+                "project_config_updated_at": now,
+                "project_config_updated_by": actor,
+                "project_config_recovery": {
+                    "schema_version": "project_registry_config_recovery.v1",
+                    "recovery_state": recovery_state,
+                    "recovered_at": now,
+                    "workspace_config_path": config_path.name,
+                    "workspace_config_sha256": "sha256:" + hashlib.sha256(config_bytes).hexdigest(),
+                    "database_identity": identity,
+                },
+            })
+            _save_projects(projects)
+
+        # Read through the real registry API after persistence, including replay.
+        readback = get_project_config_metadata(project_id)
+        if readback != expected_config:
+            raise ValidationError("registry config recovery metadata readback failed")
+    return {
+        "project_id": project_id,
+        "bootstrap_mode": "registry_config_recovery",
+        "recovery_state": recovery_state,
+        "metadata_readback_verified": True,
+        "config": readback,
+        "database_identity": identity,
+        "snapshot_id": snapshot_id,
+    }
+
+
 def update_project_ai_routing_metadata(
     project_id: str,
     routing: dict,

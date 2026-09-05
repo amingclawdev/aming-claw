@@ -200856,6 +200856,7 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
     tmp_path,
     *,
     backlog_id: str,
+    real_git_world: bool = False,
 ):
     project_id = "aming-claw"
     _initialize_ac_dev_guide_schema(conn)
@@ -200873,6 +200874,17 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
     root = tmp_path / "ac-dev-mf-parallel-route"
     root.mkdir()
     commit = "7" * 40
+    if real_git_world:
+        _init_test_git_repo(root)
+        subprocess.run(["git", "branch", "-m", "codex/ac-dev"], cwd=root, check=True)
+        source = Path(server.project_service.__file__).resolve().parents[2] / ".aming-claw.yaml"
+        (root / ".aming-claw.yaml").write_bytes(source.read_bytes())
+        subprocess.run(["git", "add", ".aming-claw.yaml"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "canonical workspace configuration"],
+            cwd=root, check=True, capture_output=True,
+        )
+        commit = batch_jobs.git_commit(root)
     world = _fixed_ac_dev_direct_world(root, commit)
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
@@ -200928,12 +200940,13 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
     }
 
 
-def _prepare_ac_dev_existing_parallel_parent(conn, monkeypatch, tmp_path):
+def _prepare_ac_dev_existing_parallel_parent(conn, monkeypatch, tmp_path, *, real_git_world=False):
     """Seed the persisted pre-registration producer, without erasing history."""
 
     case = _prepare_ac_dev_mf_parallel_route_precursor(
         conn, monkeypatch, tmp_path,
         backlog_id="AC-DEV-EXISTING-PARALLEL-PARENT",
+        real_git_world=real_git_world,
     )
     parent_id = case["parent_execution_id"]
     historical = observer_route_context.issue_observer_write_route_context(
@@ -216086,3 +216099,464 @@ def test_parentless_direct_main_four_gates_pin_claimed_exact_cex(
 
     assert calls == [child_id, child_id, child_id, child_id]
     assert tuple(conn.iterdump()) == before
+
+
+@pytest.fixture()
+def dev_registry_recovery_world(isolated_project_init_http, monkeypatch, tmp_path, request):
+    """Existing file-backed dev world; the entire projects registry is absent.
+
+    Deliberately does not use ``conn``: its registered-config injection would
+    conceal the production failure. Only physical test-world paths are rebound;
+    HTTP dispatch, route authentication, config loading and Parallel entry run.
+    """
+    registry_root, post = isolated_project_init_http
+    project_dir = registry_root / "aming-claw"
+    project_dir.mkdir(parents=True)
+    database = project_dir / "governance.db"
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    for _owner, ensure_owner_schema, _inventory in governance_db._graph_schema_owner_registry():
+        ensure_owner_schema(connection)
+    semantic_enrichment._ensure_semantic_state_schema(connection)
+    graph_query_trace.ensure_schema(connection)
+    _initialize_ac_dev_guide_schema(connection)
+    for module in (server, governance_db, server.project_service):
+        monkeypatch.setattr(module, "get_connection", lambda _pid: _NoCloseConn(connection))
+    case = _prepare_ac_dev_existing_parallel_parent(connection, monkeypatch, tmp_path, real_git_world=True)
+    root = Path(case["world"]["target_project_root"])
+    head = batch_jobs.git_commit(root)
+    monkeypatch.setattr(server, "_dev_exact_source_root", lambda: root.resolve())
+    monkeypatch.setattr(server.project_service, "__file__", str(root / "agent/governance/project_service.py"))
+    monkeypatch.setattr(governance_db, "_canonical_ac_dev_identity_database_path", lambda: database)
+    genesis_hash = "sha256:" + hashlib.sha256(b"existing isolated dev genesis").hexdigest()
+    connection.executemany(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+        [("governance_world_id", "ac-dev"), ("governance_world_genesis_sha256", genesis_hash)],
+    )
+    connection.execute(
+        "INSERT INTO tasks(task_id, project_id, status, created_at, updated_at) "
+        "VALUES ('retained-task', 'aming-claw', 'completed', '2026-09-01', '2026-09-01')"
+    )
+    snapshot_id = "retained-active-" + head[:12]
+    store.create_graph_snapshot(
+        connection, "aming-claw", snapshot_id=snapshot_id,
+        commit_sha=head, snapshot_kind="full", status="active",
+        graph_json={"nodes": [], "edges": []}, created_by="historical-fixture",
+    )
+    connection.execute(
+        "INSERT INTO graph_snapshot_refs(project_id, ref_name, snapshot_id, commit_sha, updated_at) "
+        "VALUES ('aming-claw', 'active', ?, ?, '2026-09-01')", (snapshot_id, head),
+    )
+    connection.commit()
+
+    project_id, backlog_id = case["project_id"], case["backlog_id"]
+    guide_body = {
+        "project_id": project_id, "backlog_id": backlog_id, "role": "observer",
+        "work_type": "mf_parallel", "response_view": "compact",
+        "route_token_ref": case["historical"]["route_token_ref"],
+    }
+    prefix = f"/api/projects/{project_id}"
+    status, guide = post(prefix + "/onboard-route-guide", guide_body)
+    assert status == 200, guide
+    status, issued = post(prefix + "/observer/route-context/issue", guide["host_precursor_action"]["copy_safe_body"])
+    assert status == 200 and issued["ok"], issued
+    guide_body["route_token_ref"] = issued["route_token_ref"]
+    status, guide = post(prefix + "/onboard-route-guide", guide_body)
+    assert status == 200, guide
+    status, registered = post(prefix + "/observer-sessions/register", guide["host_precursor_action"]["copy_safe_body"])
+    assert status == 201, registered
+    status, heartbeat = post(prefix + f"/observer-sessions/{registered['session_id']}/heartbeat", {
+        "project_id": project_id, "session_token": registered["session_token"],
+    })
+    assert status == 200 and heartbeat["session"]["computed_status"] == "active", heartbeat
+    guide_body["observer_session_id"] = registered["session_id"]
+    status, refreshed = post(prefix + "/onboard-route-guide", guide_body)
+    assert status == 200, refreshed
+    enter_body = {
+        **refreshed["next_legal_action"]["successor_action_input"]["static_body"],
+        "task_id": "registry-recovery-parallel",
+        "reason": "Verify restored original registered commands in the existing world.",
+        "observer_session_id": registered["session_id"],
+        "observer_route_token_ref": issued["route_token_ref"],
+        "metadata": {"required_worker_count": 2, "lane_intents": [
+            {"task_id": f"registry-lane-{index}", "worker_id": f"registry-worker-{index}",
+             "worker_slot_id": f"slot-{index}", "owned_files": [path]}
+            for index, path in enumerate(case["target_files"], start=1)
+        ]},
+    }
+    recovery_body = {"project_id": project_id, "workspace_path": str(root),
+                     "mode": "registry_config_recovery"}
+    if getattr(request, "param", "") != "without_bootstrap_token":
+        # Historical conditional-token regressions remain distinct from the
+        # approved-waiver request, which must not issue or use this credential.
+        bootstrap = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id, backlog_id="AC-DEV-REGISTRY-RECOVERY-FIXTURE",
+            task_id="registry-config-recovery", target_files=[str(root)],
+            allowed_actions=["project_bootstrap"], evidence_refs=["fixture:existing-bootstrap-authority"],
+            project_root=str(root),
+        )
+        observer_route_context.persist_route_token_ref(
+            connection, project_id=project_id,
+            storage_project_id=server._route_registry_storage_project_id(project_id),
+            route_token_ref=bootstrap["route_token_ref"], token=bootstrap["route_token"],
+        )
+        connection.commit()
+        recovery_body["route_token_ref"] = bootstrap["route_token_ref"]
+    registry = registry_root / "projects.json"
+    assert not registry.exists()
+    assert server._registry_project_config(project_id)[0] == {}
+    assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+    def historical_facts():
+        return {
+            table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY 1, 2")]
+            for table in ("schema_meta", "tasks", "contract_runtime_executions", "graph_snapshots",
+                          "graph_snapshot_refs", "graph_ref_events", "project_version", "observer_route_token_refs")
+        }
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("registry recovery called full initialization/bootstrap/reconcile/backfill/version write")
+
+    from agent.governance import chain_trailer
+    for module, name in (
+        (server.project_service, "init_project"), (server.project_service, "bootstrap_project"),
+        (chain_trailer, "backfill_legacy_chain_history"),
+    ):
+        monkeypatch.setattr(module, name, forbidden)
+    yield {
+        **case, "connection": connection, "database": database, "registry": registry,
+        "root": root, "head": head, "post": post, "historical_facts": historical_facts,
+        "enter_body": enter_body, "enter_path": prefix + "/mf-parallel/enter",
+        "recovery_body": recovery_body,
+    }
+    connection.close()
+
+
+def _assert_registry_missing_parallel_failure(case):
+    before = case["historical_facts"]()
+    status, blocked = case["post"](case["enter_path"], case["enter_body"])
+    assert status == 400, blocked
+    assert blocked["message"] == "mf_parallel rev10 prefill requires registered project test commands"
+    assert blocked["details"]["reason"] == "registered project config snapshot is missing"
+    assert blocked["details"]["test_command_authority"] == "project_config.testing"
+    assert blocked["details"]["writes_performed"] is False
+    assert case["historical_facts"]() == before
+    assert not case["registry"].exists()
+    return blocked
+
+
+def test_dev_registry_config_recovery_real_missing_registry_baseline(dev_registry_recovery_world, record_property):
+    case = dev_registry_recovery_world
+    blocked = _assert_registry_missing_parallel_failure(case)
+    record_property("registered_config_baseline", json.dumps({
+        "registry_absent": True, "database_quick_check": "ok",
+        "retained_fact_tables": list(case["historical_facts"]()),
+        "entry_error": blocked["message"], "entry_details": blocked["details"],
+        "registry_reader_mocked": False,
+    }, sort_keys=True))
+
+
+def test_dev_registry_config_recovery_forward_authenticated_request(dev_registry_recovery_world, record_property):
+    case = dev_registry_recovery_world
+    _assert_registry_missing_parallel_failure(case)
+    before = case["historical_facts"]()
+    identity = governance_db.canonical_ac_database_identity(case["connection"])
+    status, recovered = case["post"]("/api/project/bootstrap", case["recovery_body"])
+    assert status == 200, recovered
+    assert recovered["recovery_state"] == "registry_entry_restored"
+    assert recovered["metadata_readback_verified"] is True
+    assert recovered["route_token_gate"]["action"] == "project_bootstrap"
+    assert recovered["route_token_gate"]["registry_verified"] is True
+    assert recovered["route_token_gate"].get("server_minted") is not True
+    assert recovered["route_bootstrap_handoff"]["first_run"] is False
+    assert governance_db.canonical_ac_database_identity(case["connection"]) == identity
+    assert case["historical_facts"]() == before
+    persisted = json.loads(case["registry"].read_text())
+    assert set(persisted["projects"]) == {"aming-claw"}
+    entry = persisted["projects"]["aming-claw"]
+    fresh_config = server.project_service.get_project_config_metadata("aming-claw")
+    assert fresh_config == entry["project_config"] == recovered["config"]
+    assert fresh_config["testing"]["unit_command"] == "python -m pytest agent/tests/ -q --tb=short"
+    assert fresh_config["testing"]["e2e_command"] == "bash scripts/e2e-task-test.sh"
+    assert fresh_config["testing"]["e2e"]["auto_run"] is False
+    assert entry["project_config_recovery"]["database_identity"] == identity
+    assert entry["project_config_recovery"]["workspace_config_sha256"] == (
+        "sha256:" + hashlib.sha256((case["root"] / ".aming-claw.yaml").read_bytes()).hexdigest()
+    )
+    registry_bytes = case["registry"].read_bytes()
+    # An existing valid snapshot remains authoritative even if local commands
+    # subsequently change; recovery is not a configuration overwrite API.
+    config_file = case["root"] / ".aming-claw.yaml"
+    config_file.write_text(config_file.read_text().replace("python -m pytest agent/tests/ -q --tb=short", "python -m unittest"))
+    status, repeated = case["post"]("/api/project/bootstrap", case["recovery_body"])
+    assert status == 200 and repeated["recovery_state"] == "already_configured", repeated
+    assert case["registry"].read_bytes() == registry_bytes
+    assert case["historical_facts"]() == before
+
+    status, entered = case["post"](case["enter_path"], case["enter_body"])
+    assert status == 200 and entered["ok"] is True, entered
+    assert entered["parent_contract_execution_id"] == case["parent_execution_id"]
+    child = server._contract_runtime_store(case["connection"]).get(entered["contract_execution_id"])
+    plan = child["metadata"]["observer_prefill_child_plan"]
+    authority = plan["test_command_authority"]
+    assert authority["source"] == "project_config.testing"
+    assert authority["command_fields"] == {
+        "unit_command": "python -m pytest agent/tests/ -q --tb=short",
+        "e2e_command": "bash scripts/e2e-task-test.sh",
+    }
+    assert authority["test_commands"] == ["python -m pytest agent/tests/ -q --tb=short"]
+    after = case["historical_facts"]()
+    for table, rows in before.items():
+        if table == "contract_runtime_executions":
+            # Entry may advance the parent/add a child. Its historical accepted
+            # lines remain facts; equality is only required around recovery.
+            parent = server._contract_runtime_store(case["connection"]).get(case["parent_execution_id"])
+            assert parent["completed_lines"][:len(case["parent"]["completed_lines"])] == case["parent"]["completed_lines"]
+        else:
+            assert all(row in after[table] for row in rows)
+    record_property("registered_config_recovery", json.dumps({
+        "identity": identity, "recovery_state": recovered["recovery_state"],
+        "metadata_readback_verified": True, "recovery_preserved_historical_facts": True,
+        "parallel_entry_authenticated": True, "authority": authority,
+        "source_repair_regression_only": True, "parallel_e2e_pass_claimed": False,
+    }, sort_keys=True))
+
+
+@pytest.mark.parametrize("dev_registry_recovery_world", ["without_bootstrap_token"], indirect=True)
+@pytest.mark.parametrize("waiver_type", ["manual_fix", "same_worktree"])
+def test_dev_registry_config_recovery_approved_waiver_guarded_http(
+    dev_registry_recovery_world, waiver_type, record_property,
+):
+    """Exercise the existing waiver consumer, not a new issuer or live approval."""
+    from agent.governance import task_timeline
+
+    case = dev_registry_recovery_world
+    blocked = _assert_registry_missing_parallel_failure(case)
+    assert "route_token_ref" not in case["recovery_body"]
+    identity = governance_db.canonical_ac_database_identity(case["connection"])
+    source_root = Path(__file__).resolve().parents[2]
+    source_files = ["agent/governance/project_service.py", "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py"]
+    repair_backlog_id = "AC-DEV-REGISTERED-PROJECT-CONFIG-RECOVERY-R1-20260905"
+    repair_cex = "cex-direct-main-15890a240553c77a14f1"
+    binding = {
+        "fixture_only": True, "live_supervisor_authorization": False,
+        "repair_backlog_id": repair_backlog_id, "repair_contract_execution_id": repair_cex,
+        "isolated_parallel_backlog_id": case["backlog_id"],
+        "isolated_parent_contract_execution_id": case["parent_execution_id"],
+        "project_id": case["project_id"], "database_identity": identity,
+        "database_path": str(case["database"].resolve()), "workspace_path": str(case["root"]),
+        "isolated_workspace_head": case["head"],
+        "active_snapshot": dict(case["connection"].execute(
+            "SELECT snapshot_id, commit_sha FROM graph_snapshot_refs "
+            "WHERE project_id='aming-claw' AND ref_name='active'"
+        ).fetchone()),
+        "candidate_source_head": batch_jobs.git_commit(source_root),
+        "candidate_source_sha256": {
+            path: hashlib.sha256((source_root / path).read_bytes()).hexdigest() for path in source_files
+        },
+        "allowed_actions": ["project_bootstrap"], "mode": "registry_config_recovery",
+        "waiver_type": waiver_type,
+    }
+    binding_hash = "sha256:" + hashlib.sha256(
+        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    # This is explicit test setup of an already-approved supervisor decision.
+    # It is neither an advertised issuance API nor authorization for live dev.
+    approval = task_timeline.record_event(
+        case["connection"], project_id=case["project_id"], backlog_id=repair_backlog_id,
+        task_id=repair_cex, event_type="route_waiver_recorded",
+        phase="route_gate", event_kind="route_waiver", actor="fixture-only-supervisor",
+        status="approved", decision="approved",
+        payload={"fixture_only": True, "fixture_approval_binding": binding},
+        verification={"fixture_only": True, "binding_sha256": binding_hash},
+        commit_sha=binding["candidate_source_head"], post_commit_hooks=False,
+    )
+    case["connection"].commit()
+    with sqlite3.connect(case["database"]) as readback:
+        durable_approval = readback.execute(
+            "SELECT payload_json, verification_json FROM task_timeline_events WHERE id=?",
+            (approval["id"],),
+        ).fetchone()
+    assert json.loads(durable_approval[0])["fixture_approval_binding"] == binding
+    assert json.loads(durable_approval[1])["binding_sha256"] == binding_hash
+    approval_ref = f"fixture:task_timeline_events:{approval['id']}:{binding_hash}"
+    waiver = {
+        "status": "approved", "waiver_type": waiver_type,
+        "allowed_actions": ["project_bootstrap"], "project_id": case["project_id"],
+        "backlog_id": repair_backlog_id, "task_id": repair_cex,
+        "route_context_hash": binding_hash, "prompt_contract_id": "fixture-registry-recovery-approved-waiver-v1",
+        "caller_role": "fixture-only-supervisor",
+        "reason": "Fixture-only supervisor approves config metadata recovery for this exact isolated world and candidate.",
+        "timeline_evidence_refs": [approval_ref], "fixture_approval_binding": binding,
+    }
+    recovery_body = {**case["recovery_body"], "route_waiver": waiver}
+    before = case["historical_facts"]()
+    status, recovered = case["post"]("/api/project/bootstrap", recovery_body)
+    assert status == 200, recovered
+    gate = recovered["route_token_gate"]
+    assert gate["decision"] == "route_waiver" and gate["action"] == "project_bootstrap"
+    assert gate["allowed"] is True and gate["waiver_type"] == waiver_type
+    assert gate["route_context_hash"] == binding_hash
+    assert gate["timeline_evidence"] == [approval_ref]
+    assert gate["scope"] == {"project_id": case["project_id"], "backlog_id": repair_backlog_id, "task_id": repair_cex}
+    assert gate.get("registry_verified") is not True and gate.get("server_minted") is not True
+    assert recovered["route_bootstrap_handoff"]["first_run"] is False
+    assert recovered["recovery_state"] == "registry_entry_restored"
+    assert recovered["metadata_readback_verified"] is True
+    with sqlite3.connect(case["database"]) as readback:
+        durable_gate = readback.execute(
+            "SELECT payload_json, verification_json, status FROM task_timeline_events "
+            "WHERE event_type='route_token_gate.project_bootstrap' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert json.loads(durable_gate[0])["route_token_gate"] == gate
+    assert json.loads(durable_gate[1]) == gate and durable_gate[2] == "accepted"
+    persisted = json.loads(case["registry"].read_text())
+    assert set(persisted["projects"]) == {"aming-claw"}
+    entry = persisted["projects"]["aming-claw"]
+    config = server.project_service.get_project_config_metadata("aming-claw")
+    assert config == entry["project_config"] == recovered["config"]
+    assert entry["project_config_recovery"]["database_identity"] == identity
+    assert case["historical_facts"]() == before
+    registry_bytes = case["registry"].read_bytes()
+    status, repeated = case["post"]("/api/project/bootstrap", recovery_body)
+    assert status == 200 and repeated["recovery_state"] == "already_configured", repeated
+    assert case["registry"].read_bytes() == registry_bytes
+    assert case["historical_facts"]() == before
+
+    status, entered = case["post"](case["enter_path"], case["enter_body"])
+    assert status == 200 and entered["ok"] is True, entered
+    assert entered["parent_contract_execution_id"] == case["parent_execution_id"]
+    child = server._contract_runtime_store(case["connection"]).get(entered["contract_execution_id"])
+    authority = child["metadata"]["observer_prefill_child_plan"]["test_command_authority"]
+    assert authority["source"] == "project_config.testing"
+    assert authority["command_fields"] == {
+        "unit_command": "python -m pytest agent/tests/ -q --tb=short",
+        "e2e_command": "bash scripts/e2e-task-test.sh",
+    }
+    assert config["testing"]["e2e"]["auto_run"] is False
+    assert authority["test_commands"] == [config["testing"]["unit_command"]]
+    assert governance_db.canonical_ac_database_identity(case["connection"]) == identity
+    after = case["historical_facts"]()
+    for table, rows in before.items():
+        if table == "contract_runtime_executions":
+            parent = server._contract_runtime_store(case["connection"]).get(case["parent_execution_id"])
+            assert parent["completed_lines"][:len(case["parent"]["completed_lines"])] == case["parent"]["completed_lines"]
+        else:
+            assert all(row in after[table] for row in rows)
+    record_property("approved_waiver_guarded_recovery", json.dumps({
+        "fixture_only": True, "live_supervisor_authorization": False, "approval_binding": binding,
+        "approval_event_id": approval["id"], "approval_binding_sha256": binding_hash,
+        "request": recovery_body, "response": recovered, "http_status": 200,
+        "missing_registry_entry_error": blocked["message"],
+        "durable_approval_readback": True, "durable_gate_readback": True,
+        "registered_metadata_readback": config, "recovery_preserved_historical_facts": True,
+        "authenticated_parallel_entry": True, "authority": authority,
+        "separate_waiver_issuer_used": False, "seeded_bootstrap_token_used": False,
+        "source_repair_regression_only": True, "parallel_e2e_pass_claimed": False,
+    }, sort_keys=True))
+
+
+def test_dev_registry_config_recovery_repairs_only_missing_config(dev_registry_recovery_world):
+    case = dev_registry_recovery_world
+    existing = {
+        "project_id": "aming-claw", "workspace_path": str(case["root"]),
+        "name": "Retained project", "initialized": True, "status": "active",
+        "created_at": "2026-08-01T00:00:00Z", "password_hash": "retained-hash",
+    }
+    other = {"project_id": "retained-external", "project_config": {"untouched": True}}
+    server.project_service._save_projects({"version": 1, "projects": {
+        "aming-claw": existing, "retained-external": other,
+    }})
+    before = case["historical_facts"]()
+    status, result = case["post"]("/api/project/bootstrap", case["recovery_body"])
+    assert status == 200 and result["recovery_state"] == "project_config_restored", result
+    entries = json.loads(case["registry"].read_text())["projects"]
+    assert entries["retained-external"] == other
+    assert {key: entries["aming-claw"][key] for key in existing} == existing
+    assert case["historical_facts"]() == before
+    assert server.project_service.get_project_config_metadata("aming-claw") == result["config"]
+
+
+@pytest.mark.parametrize("case_kind", ["missing_credential", "wrong_action", "generic_bootstrap", "wrong_project", "wrong_workspace", "config_override"])
+def test_dev_registry_config_recovery_request_gates_preserve_scope(dev_registry_recovery_world, monkeypatch, tmp_path, case_kind):
+    case = dev_registry_recovery_world
+    body = dict(case["recovery_body"])
+    expected_status = 400
+    if case_kind == "missing_credential":
+        body.pop("route_token_ref")
+        expected_status = 422
+    elif case_kind == "wrong_action":
+        body["route_token_ref"] = case["enter_body"]["observer_route_token_ref"]
+        expected_status = 422
+    elif case_kind == "generic_bootstrap":
+        body.pop("mode")
+    elif case_kind == "wrong_project":
+        body["project_id"] = "another-project"
+    elif case_kind == "wrong_workspace":
+        other_root = tmp_path / "other-workspace"
+        other_root.mkdir()
+        body["workspace_path"] = str(other_root)
+    elif case_kind == "config_override":
+        body["config_override"] = {"testing": {"unit_command": "caller command"}}
+
+    def no_first_run(*_args, **_kwargs):
+        pytest.fail("missing registry was used to mint first-run bootstrap authority")
+
+    monkeypatch.setattr(server, "_mint_first_run_bootstrap_route_gate", no_first_run)
+    before = case["historical_facts"]()
+    status, rejected = case["post"]("/api/project/bootstrap", body)
+    assert status == expected_status, rejected
+    assert not case["registry"].exists()
+    assert case["historical_facts"]() == before
+    assert server._dev_write_path_allowed("/api/project/bootstrap") is False
+
+
+@pytest.mark.parametrize("precondition", ["missing_config_file", "different_config_project", "invalid_config", "missing_world_identity", "missing_active_graph"])
+def test_dev_registry_config_recovery_requires_existing_world_and_real_config(dev_registry_recovery_world, precondition):
+    case = dev_registry_recovery_world
+    config_file = case["root"] / ".aming-claw.yaml"
+    if precondition == "missing_config_file":
+        config_file.rename(case["root"] / ".aming-claw.yaml.saved")
+    elif precondition == "different_config_project":
+        config_file.write_text(config_file.read_text().replace('project_id: "aming-claw"', 'project_id: "other-project"'))
+    elif precondition == "invalid_config":
+        config_file.write_text('project_id: [\n')
+    elif precondition == "missing_world_identity":
+        case["connection"].execute("DELETE FROM schema_meta WHERE key='governance_world_genesis_sha256'")
+    elif precondition == "missing_active_graph":
+        case["connection"].execute("DELETE FROM graph_snapshot_refs WHERE ref_name='active'")
+    case["connection"].commit()
+    before = case["historical_facts"]()
+    status, rejected = case["post"]("/api/project/bootstrap", case["recovery_body"])
+    assert status == 400, rejected
+    assert not case["registry"].exists()
+    assert case["historical_facts"]() == before
+
+
+def test_dev_registry_config_recovery_direct_issuance_authority_gap(
+    dev_registry_recovery_world, monkeypatch, tmp_path, record_property,
+):
+    """Do not confuse an isolated seeded bootstrap token with callable issuance."""
+    case = dev_registry_recovery_world
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        case["connection"], monkeypatch, tmp_path,
+        backlog_id="AC-DEV-REGISTRY-RECOVERY-ISSUANCE-PROBE",
+    )
+    advertised = prepared["issue_body"]
+    assert "project_bootstrap" not in advertised["allowed_actions"]
+    request = {**advertised, "allowed_actions": [*advertised["allowed_actions"], "project_bootstrap"]}
+    before = case["historical_facts"]()
+    status, rejected = case["post"]("/api/projects/aming-claw/observer/route-context/issue", request)
+    assert status == 409, rejected
+    assert rejected["error"] == "ac_dev_direct_route_bootstrap_not_guide_bound"
+    assert rejected["details"]["writes_performed"] is False
+    assert case["historical_facts"]() == before
+    assert not case["registry"].exists()
+    record_property("bootstrap_issuance_authority_gap", json.dumps({
+        "advertised_request": advertised, "attempted_request": request,
+        "status": status, "response": rejected,
+        "bootstrap_authority_in_forward_fixture": "separate source-issuer seeded token",
+        "live_readiness_proven": False, "global_impossibility_claimed": False,
+    }, sort_keys=True))
