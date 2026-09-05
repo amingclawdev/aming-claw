@@ -200928,6 +200928,320 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
     }
 
 
+def _prepare_ac_dev_existing_parallel_parent(conn, monkeypatch, tmp_path):
+    """Seed the persisted pre-registration producer, without erasing history."""
+
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-EXISTING-PARALLEL-PARENT",
+    )
+    parent_id = case["parent_execution_id"]
+    historical = observer_route_context.issue_observer_write_route_context(
+        project_id=case["project_id"], backlog_id=case["backlog_id"],
+        task_id=parent_id, target_files=case["target_files"],
+        allowed_actions=["onboard_route_guide", "mf_parallel_enter", "graph_query"],
+        evidence_refs=[f"onboard_service:{parent_id}", f"backlog:{case['backlog_id']}"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn, project_id=case["project_id"],
+        storage_project_id=server._route_registry_storage_project_id(case["project_id"]),
+        route_token_ref=historical["route_token_ref"], token=historical["route_token"],
+    )
+    parent = server._onboard_service_materialize_parent_record(
+        conn, project_id=case["project_id"], backlog_id=case["backlog_id"],
+        route_token_ref=historical["route_token_ref"],
+    )
+    conn.commit()
+    assert parent["execution_state_revision"] == 2
+    assert conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0] == 0
+    case.update({"parent": parent, "historical": historical})
+    return case
+
+
+def test_ac_dev_existing_parallel_parent_continues_through_real_registration_and_entry(
+    conn, monkeypatch, tmp_path, record_property,
+):
+    case = _prepare_ac_dev_existing_parallel_parent(conn, monkeypatch, tmp_path)
+    project_id, backlog_id = case["project_id"], case["backlog_id"]
+    parent_id = case["parent_execution_id"]
+    old_ref = case["historical"]["route_token_ref"]
+    old_registry = tuple(conn.execute(
+        "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?", (old_ref,),
+    ).fetchone())
+    old_lines = copy.deepcopy(case["parent"]["completed_lines"])
+    registration = {
+        "project_id": project_id, "backlog_id": backlog_id,
+        "task_id": parent_id, "cex_id": parent_id, "route_token_ref": old_ref,
+    }
+    denied = server.handle_observer_session_register(
+        _ctx({"project_id": project_id}, method="POST", body=registration)
+    )
+    assert denied[0] == 403
+    assert conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0] == 0
+
+    guide_body = {
+        "backlog_id": backlog_id, "role": "observer", "work_type": "mf_parallel",
+        "response_view": "compact", "route_token_ref": old_ref,
+    }
+    guide = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": project_id}, method="POST", body=guide_body)
+    )
+    assert guide["host_precursor_required"] is True, guide["next_legal_action"]
+    precursor = guide["host_precursor_action"]
+    assert precursor["mcp_tool"] == "observer_route_context_issue"
+    continuation_body = precursor["copy_safe_body"]
+    assert continuation_body["parent_route_identity"]["route_token_ref"] == old_ref
+    assert continuation_body["task_id"] == parent_id
+    assert continuation_body["allowed_actions"] == case["body"]["allowed_actions"]
+    full_guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": project_id}, method="POST",
+        body={**guide_body, "response_view": "full"},
+    ))
+    assert full_guide["next_legal_action"]["host_precursor_action"] == precursor
+    for path, body in (
+        ("observer/route-context/issue", continuation_body),
+        ("observer-sessions/register", registration),
+    ):
+        server._guard_dev_runtime_request(
+            method="POST", path=f"/api/projects/{project_id}/{path}",
+            path_params={"project_id": project_id}, body=body,
+        )
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": project_id}, method="POST", body=continuation_body)
+    )
+    assert issued["ok"] is True, issued
+    new_ref = issued["route_token_ref"]
+    assert new_ref != old_ref
+    assert issued["route_token"]["parent_route_lineage"]["route_token_ref"] == old_ref
+    current_parent = server._contract_runtime_store(conn).get(parent_id)
+    assert current_parent["route_token_ref"] == new_ref
+    assert current_parent["execution_state_revision"] == 3
+    assert current_parent["completed_lines"][:-1] == old_lines
+    continuation_line = current_parent["completed_lines"][-1]
+    assert continuation_line["evidence_kind"] == "onboard_service_session_continuation"
+    assert continuation_line["payload"]["previous_execution_state_hash"] == (
+        case["parent"]["execution_state"]["execution_state_hash"]
+    )
+    assert continuation_line["payload"]["previous_route_token_ref"] == old_ref
+    assert continuation_line["payload"]["route_token_ref"] == new_ref
+    before_replay = tuple(conn.iterdump())
+    for replay_body in (continuation_body, case["body"]):
+        with pytest.raises(GovernanceError):
+            server.handle_observer_route_context_issue(
+                _ctx({"project_id": project_id}, method="POST", body=replay_body)
+            )
+        assert tuple(conn.iterdump()) == before_replay
+    with pytest.raises(GovernanceError) as rollback:
+        server.handle_project_onboard_route_guide(
+            _ctx({"project_id": project_id}, method="POST", body=guide_body)
+        )
+    assert rollback.value.details["reason"] == "session_continuation_current_ref_conflict"
+    assert tuple(conn.iterdump()) == before_replay
+
+    # Current selection can advance; the accepted old evidence and token cannot.
+    assert tuple(conn.execute(
+        "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?", (old_ref,),
+    ).fetchone()) == old_registry
+    assert server.handle_observer_session_register(
+        _ctx({"project_id": project_id}, method="POST", body=registration)
+    )[0] == 403
+    guide_body["route_token_ref"] = new_ref
+    registration_guide = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": project_id}, method="POST", body=guide_body)
+    )
+    register_action = registration_guide["host_precursor_action"]
+    assert register_action["mcp_tool"] == "observer_session_register"
+    assert register_action["copy_safe_body"] == {**registration, "route_token_ref": new_ref}
+    server._guard_dev_runtime_request(
+        method="POST", path=f"/api/projects/{project_id}/observer-sessions/register",
+        path_params={"project_id": project_id}, body=register_action["copy_safe_body"],
+    )
+    status, registered = server.handle_observer_session_register(
+        _ctx({"project_id": project_id}, method="POST", body=register_action["copy_safe_body"])
+    )
+    assert status == 201, registered
+    assert server.handle_observer_session_heartbeat(_ctx(
+        {"project_id": project_id, "session_id": registered["session_id"]},
+        method="POST", body={"session_token": registered["session_token"]},
+    ))["session"]["computed_status"] == "active"
+
+    registry_config = server._registry_project_config
+    monkeypatch.setattr(server, "_registry_project_config", lambda selected: (
+        ({**registry_config(PID)[0], "project_id": project_id}, "test_registry")
+        if selected == project_id else registry_config(selected)
+    ))
+    guide_body["observer_session_id"] = registered["session_id"]
+    refreshed = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": project_id}, method="POST", body=guide_body)
+    )
+    assert refreshed["host_precursor_required"] is False
+    successor = refreshed["next_legal_action"]["successor_action_input"]
+    entered = server.handle_project_mf_parallel_enter(_ctx(
+        {"project_id": project_id}, method="POST", body={
+            **successor["static_body"], "task_id": "existing-parent-worker",
+            "reason": "Enter the current service continuation after real registration.",
+            "observer_session_id": registered["session_id"],
+            "observer_route_token_ref": new_ref,
+            "metadata": {"required_worker_count": 2, "lane_intents": [
+                {"task_id": f"existing-parent-lane-{index}", "worker_id": f"worker-{index}",
+                 "worker_slot_id": f"slot-{index}", "owned_files": [path]}
+                for index, path in enumerate(case["target_files"], start=1)
+            ]},
+        },
+    ))
+    assert entered["ok"] is True
+    assert entered["parent_contract_execution_id"] == parent_id
+    assert entered["root_contract_execution_id"] == parent_id
+    child = server._contract_runtime_store(conn).get(entered["contract_execution_id"])
+    assert child["metadata"]["observer_prefill_child_plan"]["parent_route_binding"]["route_token_ref"] == new_ref
+    assert tuple(conn.execute(
+        "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?", (old_ref,),
+    ).fetchone()) == old_registry
+    assert server._contract_runtime_store(conn).get(parent_id)["completed_lines"][:len(old_lines)] == old_lines
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions WHERE contract_id=?",
+        ("operator_supervised_direct_main",),
+    ).fetchone()[0] == 0
+    record_property("existing_parent_continuation", json.dumps({
+        "historical_parent_revision": 2, "historical_actions": case["historical"]["route_token"]["allowed_actions"],
+        "historical_session_count": 0, "continuation": continuation_line,
+        "entered_contract_execution_id": entered["contract_execution_id"],
+        "historical_evidence_preserved": True,
+    }, sort_keys=True))
+
+
+def _existing_parallel_continuation_body(conn, case):
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "mf_parallel", "response_view": "compact",
+            "route_token_ref": case["historical"]["route_token_ref"],
+        },
+    ))
+    return copy.deepcopy(guide["host_precursor_action"]["copy_safe_body"])
+
+
+def _change_existing_parallel_continuation_scope(conn, case, change):
+    if change == "closed_row":
+        conn.execute("UPDATE backlog_bugs SET status='FIXED' WHERE bug_id=?", (case["backlog_id"],))
+    elif change == "changed_files":
+        conn.execute("UPDATE backlog_bugs SET target_files='[\"docs/changed.md\"]' WHERE bug_id=?", (case["backlog_id"],))
+    elif change == "changed_current":
+        conn.execute(
+            "UPDATE backlog_contract_chain_current SET active_child_contract_execution_id=? WHERE backlog_id=?",
+            ("cex-concurrent-child", case["backlog_id"]),
+        )
+    elif change == "changed_parent":
+        parent = server._contract_runtime_store(conn).get(case["parent_execution_id"])
+        updated = server._onboard_service_refresh_execution_state(
+            parent, completed_lines=parent["completed_lines"],
+            route_token_ref=parent["route_token_ref"],
+            revision=parent["execution_state_revision"] + 1,
+        )
+        server._contract_runtime_store(conn).update(case["parent_execution_id"], updated)
+    elif change == "historical_route_inactive":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='superseded' WHERE route_token_ref=?",
+            (case["historical"]["route_token_ref"],),
+        )
+    elif change in {"historical_actions", "historical_files", "historical_provenance"}:
+        column, value = {
+            "historical_actions": ("allowed_actions_json", '["mf_parallel_enter"]'),
+            "historical_files": ("owned_files_json", '["docs/changed.md"]'),
+            "historical_provenance": ("evidence_refs_json", '["caller:unsupported"]'),
+        }[change]
+        conn.execute(
+            f"UPDATE observer_route_token_refs SET {column}=? WHERE route_token_ref=?",
+            (value, case["historical"]["route_token_ref"]),
+        )
+    elif change == "prior_session":
+        observer_session.register_session(
+            conn, project_id=case["project_id"], capabilities={"route_provenance": {
+                "backlog_id": case["backlog_id"], "task_id": case["parent_execution_id"],
+                "cex_id": case["parent_execution_id"],
+                "route_token_ref": case["historical"]["route_token_ref"],
+            }},
+        )
+    elif change == "duplicate_continuation":
+        issued = server.handle_observer_route_context_issue(_ctx(
+            {"project_id": case["project_id"]}, method="POST",
+            body=_existing_parallel_continuation_body(conn, case),
+        ))
+        assert issued["ok"] is True
+    else:
+        raise AssertionError(change)
+    conn.commit()
+
+
+@pytest.mark.parametrize("attack", [
+    "caller_files", "caller_actions", "caller_parent", "caller_provenance", "caller_world",
+    "first_issue", "query", "closed_row", "changed_files", "changed_current", "changed_parent",
+    "historical_route_inactive", "historical_actions", "historical_files", "historical_provenance",
+    "prior_session", "duplicate_continuation",
+])
+def test_ac_dev_existing_parallel_continuation_rejects_scope_and_replay_without_writes(
+    conn, monkeypatch, tmp_path, attack,
+):
+    case = _prepare_ac_dev_existing_parallel_parent(conn, monkeypatch, tmp_path)
+    body = _existing_parallel_continuation_body(conn, case)
+    query = {}
+    if attack == "caller_files":
+        body["target_files"].append("docs/caller.md")
+    elif attack == "caller_actions":
+        body["allowed_actions"].append("task_timeline_append")
+    elif attack == "caller_parent":
+        body["parent_route_identity"]["route_token_ref"] = "rtok-caller"
+    elif attack == "caller_provenance":
+        body["evidence_refs"] = [f"contract_runtime:{case['parent_execution_id']}"]
+    elif attack == "caller_world":
+        body["target_head_commit"] = "f" * 40
+    elif attack == "first_issue":
+        body = case["body"]
+    elif attack == "query":
+        query = {"allowed_actions": "observer_session_register"}
+    else:
+        _change_existing_parallel_continuation_scope(conn, case, attack)
+    before, changes = tuple(conn.iterdump()), conn.total_changes
+    with pytest.raises(GovernanceError):
+        server.handle_observer_route_context_issue(_ctx(
+            {"project_id": case["project_id"]}, method="POST", body=body, query=query,
+        ))
+    assert conn.total_changes == changes
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("race", [
+    "closed_row", "changed_files", "changed_current", "changed_parent",
+    "historical_route_inactive", "prior_session", "duplicate_continuation",
+])
+def test_ac_dev_existing_parallel_continuation_revalidates_before_atomic_writer(
+    conn, monkeypatch, tmp_path, race,
+):
+    case = _prepare_ac_dev_existing_parallel_parent(conn, monkeypatch, tmp_path)
+    body = _existing_parallel_continuation_body(conn, case)
+    original = server._ac_dev_mf_parallel_onboard_route_issue_precheck
+    raced = {}
+
+    def precheck_then_race(**kwargs):
+        checked = original(**kwargs)
+        if not raced:
+            raced["started"] = True
+            _change_existing_parallel_continuation_scope(conn, case, race)
+            raced["dump"] = tuple(conn.iterdump())
+            raced["changes"] = conn.total_changes
+        return checked
+
+    monkeypatch.setattr(server, "_ac_dev_mf_parallel_onboard_route_issue_precheck", precheck_then_race)
+    status, result = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=body,
+    ))
+    assert status == 409
+    assert result["zero_write_rejection"] is True
+    assert result["writes_performed"] is False
+    assert conn.total_changes == raced["changes"]
+    assert tuple(conn.iterdump()) == raced["dump"]
+
+
 def test_ac_dev_mf_parallel_onboard_route_precursor_uses_ordinary_issuer(
     conn,
     monkeypatch,

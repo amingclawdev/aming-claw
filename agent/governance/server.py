@@ -9672,13 +9672,20 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     try:
         conn = get_connection(project_id)
         try:
-            observer_route_context.attach_same_scope_reissue_proof(
-                conn,
-                project_id=project_id,
-                storage_project_id=_route_registry_storage_project_id(project_id),
-                route_token_ref=str(issued.get("route_token_ref") or ""),
-                token=issued["route_token"],
-            )
+            if (
+                mf_parallel_final_body is None
+                or "parent_route_identity" not in mf_parallel_final_body
+            ):
+                observer_route_context.attach_same_scope_reissue_proof(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
+                    route_token_ref=str(issued.get("route_token_ref") or ""),
+                    token=issued["route_token"],
+                )
+            # A service continuation derives its grant from the current parent,
+            # not an inactive ref. Its writer below must still prove the old
+            # lineage ref is active, including after a concurrent revocation.
         finally:
             conn.close()
     except observer_route_context.RouteTokenRefError as exc:
@@ -9737,6 +9744,39 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                         token=issued["route_token"],
                         commit=False,
                     )
+                    if "parent_route_identity" in mf_parallel_final_body:
+                        parent_id = str(mf_parallel_final_body["task_id"])
+                        parent = _contract_runtime_store(conn).get(parent_id)
+                        revision = int(parent["execution_state_revision"])
+                        continuation_line = {
+                            "stage_id": "onboard_service",
+                            "line_id": "observer_session_continuation",
+                            "actor_role": "observer",
+                            "evidence_kind": "onboard_service_session_continuation",
+                            "payload": {
+                                "source_of_authority": "onboard_route_guide_service",
+                                "previous_execution_state_hash": (
+                                    parent["execution_state"]["execution_state_hash"]
+                                ),
+                                "previous_route_token_ref": parent["route_token_ref"],
+                                "route_token_ref": issued["route_token_ref"],
+                                "action_input": dict(mf_parallel_final_body),
+                            },
+                        }
+                        updated_parent = _onboard_service_refresh_execution_state(
+                            parent,
+                            completed_lines=[
+                                *parent["completed_lines"], continuation_line,
+                            ],
+                            route_token_ref=issued["route_token_ref"],
+                            revision=revision + 1,
+                        )
+                        _contract_runtime_store(conn).update(
+                            parent_id, updated_parent, expected_revision=revision,
+                        )
+                        upsert_contract_chain_root_current_binding(
+                            conn, updated_parent,
+                        )
                     conn.commit()
                 except Exception:
                     if conn.in_transaction:
@@ -146762,6 +146802,20 @@ def _onboard_service_materialize_parent_record(
         )
         return updated
     existing_route_token_ref = str(existing.get("route_token_ref") or "").strip()
+    session_continuation_previous_refs = {
+        str((line.get("payload") or {}).get("previous_route_token_ref") or "")
+        for line in existing.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and line.get("evidence_kind") == "onboard_service_session_continuation"
+    }
+    if (
+        requested_route_token_ref
+        and requested_route_token_ref in session_continuation_previous_refs
+        and requested_route_token_ref != existing_route_token_ref
+    ):
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+            reason="session_continuation_current_ref_conflict",
+        )
     existing_ref_state = _onboard_service_route_token_ref_state(
         conn,
         project_id=project_id,
@@ -146770,7 +146824,8 @@ def _onboard_service_materialize_parent_record(
         route_token_ref=existing_route_token_ref,
     )
     effective_route_token_ref = (
-        "" if existing_ref_state == "invalid" else existing_route_token_ref
+        "" if existing_ref_state == "invalid" and not session_continuation_previous_refs
+        else existing_route_token_ref
     )
     if requested_route_token_ref:
         if requested_ref_state == "active":
@@ -153569,7 +153624,7 @@ def _ac_dev_mf_parallel_onboard_route_issue_rejection(
 
     return GovernanceError(
         "ac_dev_mf_parallel_onboard_route_precursor_rejected",
-        "MF Parallel route issuance requires one fresh persisted Onboard scope",
+        "MF Parallel route issuance requires one exact current Onboard service scope",
         409,
         {
             "schema_version": (
@@ -153599,7 +153654,7 @@ def _ac_dev_mf_parallel_onboard_route_issue_precheck(
     body: Mapping[str, Any],
     query: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Re-derive one fresh row-first MF route precursor from durable state."""
+    """Re-derive one row-first MF route precursor from durable state."""
 
     if _runtime_plane() != "dev" or project_id != "aming-claw":
         raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
@@ -153688,7 +153743,11 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
         and str(parent.get("root_contract_execution_id") or "").strip()
         == expected_task_id
         and not str(parent.get("parent_contract_execution_id") or "").strip()
-        and not str(parent.get("route_token_ref") or "").strip()
+        and (
+            bool(str(parent.get("route_token_ref") or "").strip())
+            if "parent_route_identity" in body
+            else not str(parent.get("route_token_ref") or "").strip()
+        )
         and int(parent.get("execution_state_revision") or 0) >= 1
     )
     if not parent_ready:
@@ -153727,7 +153786,14 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
             expected_task_id,
         ),
     ).fetchone()[0]
-    if int(route_count or 0) != 0:
+    if "parent_route_identity" in body:
+        if int(route_count or 0) != 1:
+            reject("session_continuation_route_ambiguous", expected_body)
+        expected_body = _ac_dev_mf_parallel_session_continuation_input(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            parent=parent, action_input=expected_body,
+        )
+    elif int(route_count or 0) != 0:
         reject("onboard_route_already_issued", expected_body)
     if task_id != expected_task_id or dict(body) != expected_body:
         reject("not_current_guide_exact", expected_body)
@@ -153763,7 +153829,196 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
         )
         if not token_ready:
             reject("issued_token_identity_mismatch", expected_body)
+        if "parent_route_identity" in expected_body:
+            lineage = token.get("parent_route_lineage") or {}
+            if not all(
+                lineage.get(field) == value
+                for field, value in expected_body["parent_route_identity"].items()
+            ):
+                reject("issued_token_lineage_mismatch", expected_body)
     return expected_body
+
+
+def _ac_dev_mf_parallel_parent_sessions(
+    conn: sqlite3.Connection, *, project_id: str, parent_id: str, route_ref: str,
+) -> list[sqlite3.Row]:
+    """Read prior same-parent sessions; closed sessions also disprove bootstrap."""
+
+    matching = []
+    for row in conn.execute(
+        "SELECT capabilities_json FROM observer_sessions WHERE project_id=?",
+        (project_id,),
+    ).fetchall():
+        try:
+            capabilities = json.loads(row["capabilities_json"])
+        except (TypeError, ValueError):
+            raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+                reason="session_continuation_session_provenance_ambiguous",
+            )
+        provenance = (
+            capabilities.get("route_provenance", {})
+            if isinstance(capabilities, Mapping) else {}
+        )
+        if isinstance(provenance, Mapping) and (
+            provenance.get("task_id") == parent_id
+            or provenance.get("cex_id") == parent_id
+            or provenance.get("route_token_ref") == route_ref
+        ):
+            matching.append(row)
+    return matching
+
+
+def _ac_dev_mf_parallel_session_continuation_input(
+    conn: sqlite3.Connection, *, project_id: str, backlog_id: str,
+    parent: Mapping[str, Any], action_input: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive current service scope; the historical ref supplies lineage only."""
+
+    from . import observer_route_context
+
+    def reject(reason: str) -> NoReturn:
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(reason=reason)
+
+    parent_id = _onboard_service_execution_id(project_id, backlog_id)
+    verified = _onboard_service_parent_for_successor(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        parent_contract_execution_id=parent_id, require_complete=True,
+    )
+    if (
+        verified != parent
+        or int(parent.get("execution_state_revision") or 0) < 2
+        or parent.get("completed_lines") != [_onboard_service_waiver_line()]
+        or conn.execute(
+            "SELECT 1 FROM contract_runtime_executions WHERE project_id=? "
+            "AND backlog_id=? AND parent_contract_execution_id=? LIMIT 1",
+            (project_id, backlog_id, parent_id),
+        ).fetchone() is not None
+    ):
+        reject("session_continuation_parent_entered_or_changed")
+    old_ref = str(parent["route_token_ref"])
+    try:
+        old = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=old_ref, backlog_id=backlog_id, task_id=parent_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        reject("session_continuation_historical_route_inactive")
+    if not isinstance(old, Mapping) or not (
+        old.get("caller_role") == "observer"
+        and old.get("scope") == {
+            "project_id": project_id, "backlog_id": backlog_id, "task_id": parent_id,
+        }
+        and old.get("target_files") == action_input["target_files"]
+        and old.get("owned_files") == action_input["target_files"]
+        and old.get("allowed_actions") == [
+            "onboard_route_guide", "mf_parallel_enter", "graph_query",
+        ]
+        and old.get("evidence_refs") == [
+            f"route:{old.get('route_id')}",
+            f"onboard_service:{parent_id}", f"backlog:{backlog_id}",
+        ]
+        and not old.get("source_free_operation")
+    ):
+        reject("session_continuation_historical_scope_mismatch")
+    if _ac_dev_mf_parallel_parent_sessions(
+        conn, project_id=project_id, parent_id=parent_id, route_ref=old_ref,
+    ):
+        reject("session_continuation_prior_session_exists")
+    return {
+        **dict(action_input),
+        "parent_route_identity": {
+            **{field: old[field] for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS},
+            "route_token_ref": old_ref,
+            "selected_project": project_id,
+            "selected_backlog_id": backlog_id,
+        },
+        "evidence_refs": [
+            *action_input["evidence_refs"],
+            "onboard_service_session_continuation:"
+            + parent["execution_state"]["execution_state_hash"],
+        ],
+    }
+
+
+def _ac_dev_mf_parallel_session_precursor(
+    conn: sqlite3.Connection, *, project_id: str, backlog_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    """Project the two service-owned steps for an existing unentered parent."""
+
+    from . import observer_route_context
+
+    parent_id = _onboard_service_execution_id(project_id, backlog_id)
+    try:
+        parent = _contract_runtime_store(conn).get(parent_id)
+    except ContractRuntimeError:
+        return {}
+    current_ref = str(parent.get("route_token_ref") or "")
+    if not current_ref:
+        return {}
+    continued = any(
+        line.get("evidence_kind") == "onboard_service_session_continuation"
+        for line in parent.get("completed_lines") or [] if isinstance(line, Mapping)
+    )
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=current_ref, backlog_id=backlog_id, task_id=parent_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        if not continued:
+            return {}
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+            reason="session_continuation_current_route_inactive",
+        )
+    if not resolved or (
+        "observer_session_register" in resolved["allowed_actions"] and not continued
+    ):
+        return {}
+    if continued and _ac_dev_mf_parallel_parent_sessions(
+        conn, project_id=project_id, parent_id=parent_id, route_ref=current_ref,
+    ):
+        # Session recovery and subsequent same-scope renewals keep their existing
+        # authenticated paths once this zero-session bootstrap has been consumed.
+        return {}
+    if route_token_ref not in {"", current_ref}:
+        raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+            reason="session_continuation_current_ref_conflict",
+        )
+    if continued:
+        body = {
+            "project_id": project_id, "backlog_id": backlog_id,
+            "task_id": parent_id, "cex_id": parent_id, "route_token_ref": current_ref,
+        }
+        observer_route_context.resolve_observer_session_registration_route(
+            conn, storage_project_id=_route_registry_storage_project_id(project_id),
+            **body,
+        )
+        action = "observer_session_register"
+        path = "/api/projects/{project_id}/observer-sessions/register"
+    else:
+        body = _ac_dev_mf_parallel_session_continuation_input(
+            conn, project_id=project_id, backlog_id=backlog_id, parent=parent,
+            action_input=_onboard_route_guide_completed_mf_parallel_action_input(
+                project_id=project_id, backlog_id=backlog_id,
+                target_files=_backlog_declared_direct_file_scope(conn, backlog_id),
+            ),
+        )
+        body = _ac_dev_mf_parallel_onboard_route_issue_revalidate(
+            conn, project_id=project_id, body=body,
+        )
+        action = "observer_route_context_issue"
+        path = "/api/projects/{project_id}/observer/route-context/issue"
+    return {
+        "schema_version": "guide.host_precursor_action.v1",
+        "source_of_authority": "onboard_route_guide_service",
+        "action": action, "facade": action, "mcp_tool": action,
+        "method": "POST", "path": path, "body_source": "copy_safe_body",
+        "copy_safe_body": body, "refresh_after_success": True,
+        "raw_route_token_exposed": False,
+    }
 
 
 def _ac_dev_direct_route_issue_precheck(
@@ -173290,6 +173545,18 @@ def _onboard_route_guide_service_response(
     no_direct_fix = not bool(direct_fix_authority["entry_allowed"])
     historical_source_resume = bool(direct_fix_authority["resume_allowed"])
     materialize_route_token_ref = route_token_ref
+    mf_parallel_session_precursor = {}
+    if (
+        _runtime_plane() == "dev" and project_id == "aming-claw"
+        and str(role or "").strip() == "observer"
+        and str(work_type or "").strip() in {"parallel_worker", "mf_parallel"}
+    ):
+        # Check the durable chain before materialization can refresh its mutable
+        # selection. A historical route is lineage, never registration authority.
+        mf_parallel_session_precursor = _ac_dev_mf_parallel_session_precursor(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+        )
     if (
         str(role or "").strip() == "observer"
         and str(work_type or "").strip() == "legacy_operator_recovery"
@@ -173730,6 +173997,32 @@ def _onboard_route_guide_service_response(
                     completed_source_free_reconcile_authority
                 ),
             )
+    if (
+        mf_parallel_session_precursor
+        and next_action.get("action") == "mf_parallel_enter"
+    ):
+        continuation_issue_required = (
+            mf_parallel_session_precursor["action"] == "observer_route_context_issue"
+        )
+        next_action = {
+            **next_action,
+            "host_precursor_action": mf_parallel_session_precursor,
+            "action_input": {},
+            "action_input_ready": False,
+            "observer_route_context_issue": {
+                "required": continuation_issue_required,
+                "mcp_tool": "observer_route_context_issue",
+                "copy_safe_body": (
+                    mf_parallel_session_precursor["copy_safe_body"]
+                    if continuation_issue_required
+                    else {}
+                ),
+            },
+            "next_step": (
+                "consume the exact service precursor, refresh the guide, register "
+                "the observer session, then enter Parallel with authenticated scope"
+            ),
+        }
     if wrong_family_contract_update_supersession:
         supersession_authority = dict(
             wrong_family_contract_update_supersession.get("authority") or {}
