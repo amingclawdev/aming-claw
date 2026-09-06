@@ -106359,6 +106359,270 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
     )
 
 
+def _strict_direct_main_close_ready_completion_world(conn, monkeypatch, tmp_path):
+    """Reach close-ready through the existing strict rev3 public facades."""
+
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="CLOSE-COMPLETION",
+    )
+    qa_snapshot = "full-direct-close-completion-qa"
+    qa_event = _append_authenticated_qa_verification(
+        conn, backlog_id=world["backlog_id"], task_id=world["task_id"],
+        commit_sha=world["candidate_commit"], snapshot_id=qa_snapshot,
+        principal_id="qa:direct-close-completion",
+    )
+    monkeypatch.setitem(
+        server._GOVERNANCE_MANAGER_CERTIFICATES, PID, _test_manager_certificate(),
+    )
+    monkeypatch.setattr(
+        server, "_graph_governance_project_root",
+        lambda _project_id, _body: world["project_root"],
+    )
+    snapshot_id = "full-direct-close-completion-reconciled"
+
+    def reconcile_snapshot(db, project_id, _root, **kwargs):
+        # Only graph construction is a fixture; protected reconciliation,
+        # provenance validation and both timeline/Contract writers are real.
+        store.create_graph_snapshot(
+            db, project_id, snapshot_id=snapshot_id,
+            commit_sha=world["candidate_commit"], snapshot_kind="full",
+            graph_json=_graph(), notes=json.dumps({"run_id": kwargs["run_id"]}),
+        )
+        db.commit()
+        return {
+            "ok": True, "snapshot_id": snapshot_id,
+            "projection_id": "semproj-direct-close-completion",
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(
+        state_reconcile, "run_state_only_full_reconcile", reconcile_snapshot,
+    )
+    status, reconciled = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID}, method="POST",
+            body={
+                "target_commit_sha": world["candidate_commit"],
+                "snapshot_id": snapshot_id, "activate": True,
+                "semantic_enrich": False, "run_id": "direct-close-completion",
+                "expected_old_snapshot_id": qa_snapshot,
+                "backlog_id": world["backlog_id"],
+                "contract_execution_id": world["task_id"],
+                "observer_session_id": _insert_active_observer_session_ref(
+                    conn, session_id="obs-direct-close-completion",
+                ),
+                "observer_route_token_ref": world["route_token_ref"],
+            },
+        )
+    )
+    assert status == 201, reconciled
+    assert reconciled["activated"] is True
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body={
+                "backlog_id": world["backlog_id"], "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": world["route_token_ref"],
+            },
+        )
+    )
+    action = guide["next_legal_action"]
+    assert action["mcp_tool"] == "task_timeline_append"
+    assert action["line_id"] == "observer_reconcile"
+    body = copy.deepcopy(action["copy_safe_body"])
+    body["verification"]["test_results"] = (
+        _canonical_parentless_direct_main_test_results(world["candidate_commit"])
+    )
+    body["payload"].update({"no_pass_claim": True, "overall_release_pass": False})
+    runtime = server._contract_runtime(conn)
+    before = runtime.store.get(world["task_id"])
+    assert before["revision"] == "rev3"
+    assert [line["line_id"] for line in before["completed_lines"]] == [
+        "observer_bind_direct_scope", "observer_graph_context",
+        "observer_direct_implementation_exception", "observer_implementation",
+        "qa_graph_context", "qa_independent_verification",
+    ]
+    conn.commit()
+    return {**world, "close_body": body, "qa_event": qa_event, "runtime": runtime}
+
+
+def test_strict_direct_close_ready_rejects_nested_failure_before_immutable_write(
+    conn, monkeypatch, tmp_path,
+):
+    """The actual caller must reject, leaving the same position correctable."""
+
+    world = _strict_direct_main_close_ready_completion_world(conn, monkeypatch, tmp_path)
+    runtime, task_id = world["runtime"], world["task_id"]
+    original_preservation = {
+        "command": "pytest -q historical-preservation",
+        "passed": 15, "failed": 1, "exit_code": 1,
+        "evidence_ref": "audit:original-preservation-result",
+    }
+    invalid_body = copy.deepcopy(world["close_body"])
+    invalid_body["verification"]["test_results"]["original_preservation_result"] = (
+        copy.deepcopy(original_preservation)
+    )
+    before_record = runtime.store.get(task_id)
+    before_dump = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    rejected = None
+    accepted = None
+    try:
+        accepted = server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID}, "observer", method="POST", body=invalid_body,
+            )
+        )
+    except GovernanceError as error:
+        rejected = error
+    after_record = runtime.store.get(task_id)
+    close_lines = [
+        line for line in after_record["completed_lines"]
+        if line["line_id"] == "observer_close_ready"
+    ]
+    print("DIRECT_CLOSE_COMPLETION_CAUSAL " + json.dumps({
+        "loaded_server": server.__file__,
+        "server_sha256": hashlib.sha256(Path(server.__file__).read_bytes()).hexdigest(),
+        "actual_caller": "server.handle_task_timeline_append",
+        "contract_revision": before_record["revision"],
+        "nested_historical_failed": original_preservation["failed"],
+        "accepted_timeline_id": accepted["id"] if accepted else None,
+        "rejection_code": rejected.code if rejected else None,
+        "execution_revision_before": before_record["execution_state_revision"],
+        "execution_revision_after": after_record["execution_state_revision"],
+        "completed_lines_before": len(before_record["completed_lines"]),
+        "completed_lines_after": len(after_record["completed_lines"]),
+        "persisted_close_completion_eligible": (
+            _line_status_allows_contract_completion(close_lines[0]) if close_lines else None
+        ),
+        "db_changes": conn.total_changes - before_changes,
+    }, sort_keys=True))
+    assert rejected is not None, (
+        "strict Direct caller persisted nested historical failed=1 as close-ready; "
+        "the immutable close line is not completion-eligible"
+    )
+    assert rejected.code == "parentless_direct_main_close_ready_canonical_evidence_incomplete"
+    assert rejected.details["missing_requirement_ids"] == ["close_ready_contract_completion"]
+    assert rejected.details["zero_write_rejection"] is True
+    assert rejected.details["writes_performed"] is False
+    assert "verification" in rejected.details["guide"]["correction"]
+    assert "task_timeline_append" in rejected.details["guide"]["correction"]
+    assert "audit" in rejected.details["guide"]["correction"]
+    assert runtime.store.get(task_id) == before_record
+    assert tuple(conn.iterdump()) == before_dump
+    assert conn.total_changes == before_changes
+
+    # Correct the evidence location, not the historical result. No line has
+    # been consumed and no bypass, waiver or previous generation is inherited.
+    corrected = copy.deepcopy(world["close_body"])
+    corrected["payload"]["audit_refs"] = {
+        "original_preservation_result": original_preservation,
+        "qa_event_ref": f"timeline:{world['qa_event']['id']}",
+    }
+    current_tests = copy.deepcopy(corrected["verification"]["test_results"])
+    accepted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST", body=corrected,
+        )
+    )
+    completed = runtime.store.get(task_id)
+    close_line = completed["completed_lines"][-1]
+    assert completed["completed_lines"][:6] == before_record["completed_lines"]
+    assert completed["execution_state_revision"] == before_record["execution_state_revision"] + 2
+    assert [line["line_id"] for line in completed["completed_lines"][-2:]] == [
+        "observer_reconcile", "observer_close_ready",
+    ]
+    assert _line_status_allows_contract_completion(close_line) is True
+    assert completed["runtime_guide"]["next_legal_action"] is None
+    assert close_line["verification"]["test_results"] == current_tests
+    assert accepted["payload"]["audit_refs"]["original_preservation_result"] == original_preservation
+    assert accepted["payload"]["no_pass_claim"] is True
+    assert accepted["payload"]["overall_release_pass"] is False
+    assert accepted["payload"]["direct_contract_runtime_lineage"]["pass_synthesized"] is False
+    print("DIRECT_CLOSE_COMPLETION_CORRECTED " + json.dumps({
+        "accepted_timeline_id": accepted["id"], "same_unconsumed_position": True,
+        "completion_eligible": True, "historical_failed_retained": 1,
+        "no_pass_claim": True, "overall_release_pass": False,
+        "prior_six_lines_unchanged": True,
+    }, sort_keys=True))
+
+
+def test_strict_direct_close_ready_normalization_preserves_immutable_crash_retry(
+    conn, monkeypatch, tmp_path,
+):
+    # The existing, unrepaired/unwaived production expiry projection changes
+    # seconds_remaining and the token hash across time. A fixed clock tests
+    # equal-projection normalization/retry only, not real across-time recovery.
+    route_now = datetime.now(timezone.utc)
+    original_route_clock = observer_route_context._utc_datetime
+    monkeypatch.setattr(
+        observer_route_context, "_utc_datetime",
+        lambda now=None: route_now if now is None else original_route_clock(now),
+    )
+    world = _strict_direct_main_close_ready_completion_world(conn, monkeypatch, tmp_path)
+    runtime, task_id = world["runtime"], world["task_id"]
+    prospective_lines = []
+
+    def completion_check(line):
+        prospective_lines.append(copy.deepcopy(line))
+        return _line_status_allows_contract_completion(line)
+
+    monkeypatch.setattr(server, "_line_status_allows_contract_completion", completion_check)
+
+    def append(body):
+        return server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID}, "observer", method="POST", body=copy.deepcopy(body),
+            )
+        )
+
+    accepted = append(world["close_body"])
+    completed = runtime.store.get(task_id)
+    assert len(prospective_lines) == 1
+    assert prospective_lines[0] == completed["completed_lines"][-1]
+    before_dump, before_changes = tuple(conn.iterdump()), conn.total_changes
+    with pytest.raises(GovernanceError) as materialized:
+        append(world["close_body"])
+    assert materialized.value.code == (
+        "operator_supervised_direct_main_timeline_already_materialized"
+    )
+    assert tuple(conn.iterdump()) == before_dump
+    assert conn.total_changes == before_changes
+
+    # Simulate only the existing missing-timeline crash window in the isolated
+    # test DB. The previously accepted immutable Contract line remains exact.
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE project_id = ? AND id = ?",
+        (PID, accepted["id"]),
+    )
+    conn.commit()
+    before_dump, before_changes = tuple(conn.iterdump()), conn.total_changes
+    changed = copy.deepcopy(world["close_body"])
+    changed["payload"]["reason"] = "not the immutable admission"
+    with pytest.raises(GovernanceError) as mismatch:
+        append(changed)
+    assert mismatch.value.code == "operator_supervised_direct_main_partial_admission_mismatch"
+    assert mismatch.value.details["writes_performed"] is False
+    assert tuple(conn.iterdump()) == before_dump
+    assert conn.total_changes == before_changes
+    recovered = append(world["close_body"])
+    assert recovered["id"] != accepted["id"]
+    assert runtime.store.get(task_id) == completed
+    assert recovered["payload"]["direct_contract_runtime_lineage"]["completed_line_refs"] == [{
+        "stage_id": "close_ready", "line_id": "observer_close_ready",
+        "evidence_kind": "close_ready",
+        "execution_state_revision": completed["execution_state_revision"],
+        "existing_line_reused": True,
+    }]
+    assert len(prospective_lines) == 1
+    assert len(task_timeline.list_events(
+        conn, PID, backlog_id=world["backlog_id"], task_id=task_id,
+        event_kind="close_ready", limit=10,
+    )) == 1
+
+
 def test_parentless_direct_main_close_ready_prewrite_gate_preserves_nonapplicable_cases(
     conn,
 ):

@@ -111,6 +111,7 @@ from .contracts.runtime import (
     _enrich_line_instance_fields,
     _enrich_qa_evidence_provenance,
     _line_evidence_from_write,
+    _line_status_allows_contract_completion,
     _worker_commit_completed_implementation,
     _worker_commit_text,
     _worker_fence_containment,
@@ -156616,10 +156617,10 @@ def _operator_supervised_direct_main_expected_line_evidence(
 ) -> dict[str, Any]:
     """Rebuild the exact persisted line produced by the Direct adapter.
 
-    This is used only for crash-window recovery after ContractRuntime accepted
-    a line but before the public timeline event committed.  Reuse is legal only
-    when every persisted field matches the write that the facade would submit;
-    a line-id match alone is never retry authority.
+    Used for prospective close-ready completion checks and crash-window
+    recovery after ContractRuntime accepted a line but before the public
+    timeline event committed. Reuse is legal only when every persisted field
+    matches the facade write; a line-id match alone is never retry authority.
     """
 
     body = {
@@ -194875,7 +194876,7 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
         alias: task_timeline._event_has_evidence(prospective, {alias})
         for alias in ("redeploy_runtime_sync", "active_full_reconcile")
     }
-    return {
+    gate = {
         "schema_version": (
             "parentless_direct_main.close_ready_prewrite_gate.v1"
         ),
@@ -194923,6 +194924,53 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
         },
         "selected_scope": selected_scope,
     }
+    if strict_binding and not missing and not any(
+        str(line.get("line_id") or "").strip() == "observer_close_ready"
+        for line in selected_record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ):
+        # Use the adapter's actual persisted-line normalization before either
+        # reconcile or close can consume an immutable position. Already
+        # admitted lines retain the exact crash-window/replay comparison.
+        timeline_payload = {
+            **dict(normalized_payload),
+            "direct_close_ready_prewrite_authority": dict(gate),
+        }
+        if runtime_deployment_authority:
+            timeline_payload["runtime_deployment_authority"] = dict(
+                runtime_deployment_authority
+            )
+        prospective_line = _operator_supervised_direct_main_expected_line_evidence(
+            selected_record,
+            actor_role="observer",
+            stage_id="close_ready",
+            line_id="observer_close_ready",
+            evidence_kind="close_ready",
+            payload={
+                "schema_version": (
+                    "operator_supervised_direct_main.close_ready_evidence.v1"
+                ),
+                "timeline_payload": timeline_payload,
+                "verification": dict(close_ready_verification),
+                "runtime_deployment_authority": dict(runtime_deployment_authority),
+                "direct_close_ready_prewrite_authority": dict(gate),
+            },
+            extra={
+                "commit_sha": str(body.get("commit_sha") or "").strip(),
+                "status": str(body.get("status") or "").strip(),
+                "verification": dict(close_ready_verification),
+            },
+        )
+        if not _line_status_allows_contract_completion(prospective_line):
+            gate.update(
+                passed=False,
+                status="failed",
+                missing_requirement_ids=["close_ready_contract_completion"],
+            )
+            gate["canonical_requirements"]["close_ready_contract_completion"] = [
+                "normalized observer_close_ready line satisfies ContractRuntime completion"
+            ]
+    return gate
 
 
 def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
@@ -202864,6 +202912,19 @@ def _handle_task_timeline_append(ctx: RequestContext):
                     ),
                     "guide": {
                         "correction": (
+                            "correct current-scope verification truthfully; do not "
+                            "claim passed while a current failure remains. Retain "
+                            "historical-only results in payload.audit_refs outside "
+                            "verification, preserving no_pass_claim and no overall "
+                            "release PASS. Resubmit task_timeline_append at the same "
+                            "unconsumed position, then rerun mf_timeline_precheck "
+                            "before the first backlog_close"
+                            if "close_ready_contract_completion" in (
+                                direct_main_close_ready_prewrite_gate.get(
+                                    "missing_requirement_ids"
+                                ) or []
+                            )
+                            else
                             "replace descriptive aliases with the canonical "
                             "close_ready fields, then rerun mf_timeline_precheck "
                             "before the first backlog_close"
