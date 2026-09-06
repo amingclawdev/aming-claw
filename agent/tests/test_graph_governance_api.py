@@ -78993,6 +78993,390 @@ def test_special_pre_read_guide_marker_cannot_replace_strict_authority(
     assert conn.total_changes == before_changes
 
 
+
+
+def _setup_principal_parity_reissue_case(conn, monkeypatch, tmp_path, revision):
+    """Seed allocation inputs, then use real dispatch and initial-join writers."""
+
+    from dataclasses import replace
+
+    suffix = f"principal-parity-{revision}"
+    now_iso = "2099-08-02T01:00:00Z"
+    monkeypatch.setattr(server, "_utc_now", lambda: now_iso)
+    backlog_id = f"AC-{suffix.upper()}"
+    execution_id = f"cex-{suffix}"
+    task_id = f"{suffix}-worker"
+    target_root = tmp_path / suffix
+    target_root.mkdir()
+    row_files = ("agent/governance/server.py", "agent/tests/test_graph_governance_api.py")
+    if revision == "rev7":
+        row_files = row_files[:1]
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn, backlog_id=backlog_id, task_id=f"{suffix}-parent",
+        worker_task_id=task_id, fence_token=f"fence-{suffix}", token="",
+        worktree_path=str(target_root), target_project_root=str(target_root),
+        contract_execution_id=execution_id, base_commit="a" * 40,
+        owned_files=row_files, parent_task_is_contract_execution=True,
+        pinned_revision=revision, submit_dispatch=False,
+    )
+    context = upsert_branch_context(
+        conn, replace(
+            context, worker_slot_id=f"logical-slot-{suffix}",
+            agent_id=context.worker_id, allocation_owner=context.worker_id,
+            owned_files=row_files[:1], target_files=row_files[:1],
+            lease_expires_at="",
+        ), now_iso=now_iso,
+    )
+    contexts = [context]
+    if revision == "rev10":
+        contexts.append(_insert_mf_parallel_source_backed_runtime_context(
+            conn, backlog_id=backlog_id, task_id=f"{suffix}-sibling",
+            parent_task_id=execution_id, fence_token=f"fence-{suffix}-sibling",
+            token="", target_project_root=str(target_root),
+            worktree_path=str(target_root / "sibling"),
+            base_commit="a" * 40, target_head_commit="a" * 40,
+            merge_queue_id=f"mq-{suffix}-sibling", owned_files=row_files[1:],
+        ))
+        sibling = contexts[-1]
+        contexts[-1] = upsert_branch_context(
+            conn, replace(sibling,
+                          worker_slot_id=f"logical-slot-{suffix}-sibling",
+                          agent_id=sibling.worker_id,
+                          allocation_owner=sibling.worker_id,
+                          lease_expires_at=""), now_iso=now_iso,
+        )
+    criteria = [{"id": "AC-PRINCIPAL-PARITY",
+                 "required_scope": {"kind": "files", "files": list(row_files)}}]
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, acceptance_criteria = ? WHERE bug_id = ?",
+        (json.dumps(row_files), json.dumps(criteria), backlog_id),
+    )
+    workers = []
+    for lane in contexts:
+        worker = _mf_parallel_rev3_worker_dispatch_payload(
+            conn, backlog_id=backlog_id, runtime_context=lane,
+            route_label=f"{lane.task_id}-dispatch", route_task_id=execution_id,
+            parent_task_id=execution_id,
+        )
+        worker["worker_id"] = lane.worker_id
+        worker["agent_id"] = lane.agent_id or lane.worker_id
+        workers.append(worker)
+        append_branch_contract_revision(
+            conn, lane, revision_id=f"crev-{lane.task_id}",
+            route_identity=worker["route_identity"],
+            payload={
+                "schema_version": "parallel_branch_allocate_contract_revision.v1",
+                "source": "parallel_branch_allocate",
+                "contract_execution_id": execution_id,
+                "runtime_context_id": lane.runtime_context_id,
+                "task_id": lane.task_id, "parent_task_id": execution_id,
+                "worker_id": lane.worker_id, "worker_slot_id": lane.worker_slot_id,
+                "target_project_root": str(target_root),
+                "route_identity": worker["route_identity"],
+            }, now_iso=now_iso,
+        )
+        # The normal allocator emits this task-owned observer dispatch audit.
+        # Reuse that producer for the seeded allocation, not a fabricated
+        # worker receipt/startup or a hand-written accepted timeline payload.
+        allocation_audit = server._record_bounded_worker_dispatch_event(
+            conn, PID,
+            body={**worker, "backlog_id": backlog_id,
+                  "contract_execution_id": execution_id,
+                  "observer_command_id": execution_id,
+                  "fence_token": lane.fence_token},
+            branch_runtime_evidence={
+                "context": parallel_branch_runtime.public_branch_context_to_dict(lane),
+            }, source="parallel_branch_allocate",
+            request_id=f"fixture-allocation-{lane.task_id}",
+        )
+        assert allocation_audit["ok"] is True, allocation_audit
+    conn.commit()
+    dispatched = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer", method="POST",
+            body={
+                "stage_id": "dispatch", "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker", "status": "passed",
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": task_id, "parent_task_id": execution_id,
+                "payload": {"bounded_workers": workers, "worker_count": len(workers),
+                            "acceptance_criteria": criteria},
+            },
+        )
+    )
+    assert dispatched["ok"] is True, json.dumps(dispatched, sort_keys=True)
+    selected = server._contract_runtime_read(
+        conn, contract_execution_id=execution_id, actor_role="mf_sub",
+    )["runtime_guide"]["next_legal_action"]
+    assert selected["line_id"] == "worker_read_runtime_guide"
+    context = next(lane for lane in contexts
+                   if lane.runtime_context_id == selected["runtime_context_id"])
+    task_id = context.task_id
+    selected_worker = next(worker for worker in workers if worker["task_id"] == task_id)
+    print(json.dumps({
+        "milestone": "normal_dispatch_public_lineage", "revision": revision,
+        "service_event_ids": [event["id"] for event in server._runtime_context_service_timeline_events(
+            conn, project_id=PID, task_id=task_id, backlog_id=backlog_id,
+        )],
+        "task_event_ids": [row[0] for row in conn.execute(
+            "SELECT id FROM task_timeline_events WHERE project_id = ? AND task_id = ? AND backlog_id = ? ORDER BY id",
+            (PID, task_id, backlog_id),
+        )],
+    }, sort_keys=True))
+    host_session_id = f"desktop-host-session-{suffix}"
+    worker_session_id = f"desktop-worker-session-{suffix}"
+    host_startup_id = f"desktop-startup-{suffix}"
+    initial_request = _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator", method="POST",
+            body={
+                "task_id": task_id, "parent_task_id": execution_id,
+                "contract_execution_id": execution_id,
+                "target_project_root": str(target_root),
+                "worker_id": context.worker_id, "worker_slot_id": context.worker_slot_id,
+                "agent_id": context.worker_id, "actual_host_worker_id": context.worker_id,
+                "worker_session_id": worker_session_id, "host_session_id": host_session_id,
+                "host_startup_id": host_startup_id, "ttl_seconds": 3600,
+                "now_iso": now_iso,
+                "reason": "issue the exact allocated host before any worker read",
+                **selected_worker["route_identity"],
+            },
+    )
+    try:
+        initial = server.handle_graph_governance_runtime_context_session_token_initial_join(
+            initial_request
+        )
+    except GovernanceError as exc:
+        print(json.dumps({"milestone": "initial_join_fixture_refusal",
+                          "code": exc.code, "details": exc.details,
+                          "allocated_identity": {
+                              field: getattr(context, field) for field in (
+                                  "worker_id", "worker_slot_id", "agent_id", "allocation_owner",
+                                  "actual_host_worker_id", "host_startup_id", "host_session_id",
+                              )}}, sort_keys=True))
+        raise
+    assert initial["ok"] is True
+    events = task_timeline.list_events(conn, PID, task_id=task_id, backlog_id=backlog_id)
+    initial_event = next(event for event in events
+                         if event["payload"].get("action") == "runtime_context_session_token_initial_join")
+    return {
+        "backlog_id": backlog_id, "task_id": task_id, "parent_task_id": execution_id,
+        "worker_id": context.worker_id, "worker_session_id": worker_session_id,
+        "host_session_id": host_session_id, "host_startup_id": host_startup_id,
+        "target_root": target_root, "route_identity": selected_worker["route_identity"],
+        "context": get_branch_context(conn, PID, task_id),
+        "initial_join": initial, "initial_join_event": initial_event,
+    }
+
+
+
+@pytest.mark.parametrize("revision", ["rev10"])
+def test_safe_ref_loss_reissue_guide_preserves_slot_and_host_principals(
+    conn,
+    monkeypatch,
+    tmp_path,
+    revision,
+):
+    """Consume real GET bodies after dispatch -> join -> special -> reissue."""
+
+    case = _setup_principal_parity_reissue_case(conn, monkeypatch, tmp_path, revision)
+    host_worker_id = case["worker_id"]
+    record_before = copy.deepcopy(
+        server._contract_runtime_store(conn).get(case["parent_task_id"])
+    )
+    assert record_before["revision"] == revision
+    assert any(line["line_id"] == "observer_dispatch_bounded_workers"
+               and line["status"] == "passed"
+               for line in record_before["completed_lines"])
+    special = _pre_lineage_rejoin(
+        case, body_updates={"worker_slot_id": case["context"].worker_slot_id},
+    )
+    assert special["bounded_rejoin_kind"] == "special_authority_rejoin"
+    current = get_branch_context(conn, PID, case["task_id"])
+    assert current is not None
+    assert current.actual_host_worker_id == host_worker_id
+    assert current.worker_slot_id != host_worker_id
+    old_events = copy.deepcopy(_pre_lineage_case_events(conn, case))
+    old_event_ids = {event["id"] for event in old_events}
+    path = {"project_id": PID, "runtime_context_id": current.runtime_context_id}
+
+    def fresh_guide(session_ref):
+        before = "\n".join(conn.iterdump())
+        changes = conn.total_changes
+        with pytest.raises(GovernanceError) as missing_auth:
+            server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+                _ctx_with_role(
+                    path, "mf_sub",
+                    query={
+                        "view": "full",
+                        "task_id": case["task_id"],
+                        "parent_task_id": case["parent_task_id"],
+                        "session_token_ref": session_ref,
+                        "target_project_root": str(case["target_root"]),
+                        **case["route_identity"],
+                    },
+                )
+            )
+        assert missing_auth.value.code == "fence_invalidated_or_unknown"
+        assert "\n".join(conn.iterdump()) == before
+        assert conn.total_changes == changes
+        return missing_auth.value.details
+
+    def returned_body(guide):
+        assert guide["next_legal_action"] == "reissue_runtime_session_token"
+        body = copy.deepcopy(
+            guide["actionable_payloads"]["session_token_reissue_submission"][
+                "copy_safe_body"
+            ]
+        )
+        assert body["actual_host_worker_id"] == host_worker_id
+        assert body["worker_slot_id"] == current.worker_slot_id
+        assert body["contract_execution_id"] == case["parent_task_id"]
+        assert body["host_session_id"] == case["host_session_id"]
+        assert "session_token" not in body and "fence_token" not in body
+        return body
+
+    first_guide = fresh_guide(special["session_token_ref"])
+    print(json.dumps({"milestone": "first_safe_ref_guide_selection",
+                      "next_legal_action": first_guide["next_legal_action"]}, sort_keys=True))
+    first_body = returned_body(first_guide)
+    first = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(path, "mf_sub", method="POST", body=first_body)
+    )
+    assert first["ok"] is True
+    assert first["principal_id"] == current.worker_slot_id
+    assert first["host_envelope"]["principal_id"] == host_worker_id
+    assert first["host_envelope"]["actual_host_worker_id"] == host_worker_id
+    assert first["host_envelope"]["host_session_id"] == case["host_session_id"]
+    events = _pre_lineage_case_events(conn, case)
+    first_event = next(event for event in events
+                       if event["payload"].get("session_token_ref") == first["session_token_ref"]
+                       and event["payload"].get("action") == "runtime_context_session_token_reissue")
+    assert first_event["status"] == "accepted"
+    assert first_event["payload"]["principal_id"] == current.worker_slot_id
+    assert first_event["payload"]["safe_ref_reissue_authority"][
+        "initial_join_event_ref"
+    ] == f"timeline:{case['initial_join_event']['id']}"
+    assert first_event["payload"]["safe_ref_reissue_authority"][
+        "session_authority_event_ref"
+    ] == special["audit_event_ref"]
+
+    # Advance only the test clock, not the accepted lease/audit or checkpoint.
+    monkeypatch.setattr(server, "_utc_now", lambda: "2099-08-02T03:00:01Z")
+    current = get_branch_context(conn, PID, case["task_id"])
+    lease = parallel_branch_runtime.runtime_context_session_token_lease_view(
+        current, now_iso=server._utc_now(),
+    )
+    assert lease["status"] == "expired"
+    assert lease["lease_record_valid"] is True
+    prior_identity = {
+        field: first_event["payload"][field] for field in (
+            "project_id", "backlog_id", "contract_execution_id",
+            "runtime_context_id", "task_id", "parent_task_id",
+            "worker_id", "worker_slot_id", "principal_id", "session_token_ref",
+        )
+    }
+    loss_guide = fresh_guide(first["session_token_ref"])
+    print(json.dumps({
+        "milestone": "accepted_dispatch_initial_join_special_rejoin_safe_ref_then_expired_get",
+        "loaded_server": server.__file__,
+        "server_sha256": hashlib.sha256(Path(server.__file__).read_bytes()).hexdigest(),
+        "contract_revision": revision,
+        "initial_join_event_ref": f"timeline:{case['initial_join_event']['id']}",
+        "special_event_ref": special["audit_event_ref"],
+        "first_safe_ref_event_ref": f"timeline:{first_event['id']}",
+        "prior_identity": prior_identity,
+        "physical_host_principal": host_worker_id,
+        "lease_status": lease["status"],
+        "next_legal_action": loss_guide["next_legal_action"],
+        "rejoin_eligibility": {
+            key: loss_guide.get("diagnostics", {}).get(
+                "session_token_rejoin_eligibility", {}).get(key)
+            for key in ("mode", "eligible", "safe_ref_prestartup_reissue_diagnostics")
+        },
+    }, sort_keys=True))
+    loss_body = returned_body(loss_guide)
+
+    # These are caller mutations only; each real writer must reject without
+    # touching the current ref, checkpoint, historical audit or CR position.
+    for field in (
+        "contract_execution_id", "runtime_context_id", "task_id", "parent_task_id",
+        "target_project_root", "worker_id", "worker_slot_id", "agent_id",
+        "allocation_owner", "actual_host_worker_id", "worker_session_id",
+        "host_startup_id", "host_session_id", "route_id", "route_token_ref",
+        "session_token_ref",
+    ):
+        wrong = {**loss_body, field: f"foreign-{field}"}
+        before = "\n".join(conn.iterdump())
+        with pytest.raises(GovernanceError):
+            server.handle_graph_governance_runtime_context_session_token_reissue(
+                _ctx_with_role(path, "mf_sub", method="POST", body=wrong)
+            )
+        assert "\n".join(conn.iterdump()) == before, field
+
+    replacement = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(path, "mf_sub", method="POST", body=loss_body)
+    )
+    authority = replacement["safe_ref_loss_replacement_authority"]
+    assert replacement["ok"] is True
+    assert authority["prior_reissue_event_ref"] == f"timeline:{first_event['id']}"
+    assert authority["loss_replacement_generation"] == 1
+    assert authority["lease_status_at_replacement"] == "expired"
+    assert authority["stage_checkpoint_id"] == first_event["payload"][
+        "safe_ref_reissue_authority"
+    ]["stage_checkpoint_id"]
+    assert replacement["principal_id"] == current.worker_slot_id
+    assert replacement["host_envelope"]["principal_id"] == host_worker_id
+    after = get_branch_context(conn, PID, case["task_id"])
+    assert runtime_context_session_token_ref(after) == replacement["session_token_ref"]
+    assert after.status == current.status
+    added = [event for event in _pre_lineage_case_events(conn, case)
+             if event["id"] not in {old["id"] for old in events}]
+    assert len(added) == 1 and added[0]["status"] == "accepted"
+    assert added[0]["payload"]["safe_ref_loss_replacement_authority"] == authority
+    before_replay = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(path, "mf_sub", method="POST", body=loss_body)
+        )
+    assert "\n".join(conn.iterdump()) == before_replay
+
+    # The existing managed-host second loss budget is not changed by parity.
+    second_body = returned_body(fresh_guide(replacement["session_token_ref"]))
+    second = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(path, "mf_sub", method="POST", body=second_body)
+    )
+    assert second["safe_ref_loss_replacement_authority"]["loss_replacement_generation"] == 2
+    assert second["safe_ref_loss_replacement_authority"]["max_loss_replacements"] == 2
+    exhausted_guide = fresh_guide(second["session_token_ref"])
+    assert exhausted_guide["next_legal_action"] != "reissue_runtime_session_token"
+    before_exhausted = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                path, "mf_sub", method="POST",
+                body={**second_body, "session_token_ref": second["session_token_ref"]},
+            )
+        )
+    assert "\n".join(conn.iterdump()) == before_exhausted
+
+    final_events = _pre_lineage_case_events(conn, case)
+    assert {event["id"]: event for event in final_events if event["id"] in old_event_ids} == {
+        event["id"]: event for event in old_events
+    }
+    assert server._contract_runtime_store(conn).get(case["parent_task_id"]) == record_before
+    assert server._runtime_context_contract_runtime_worker_sequence_evidence(
+        conn, project_id=PID, context=after,
+    ) == {}
+    serialized = json.dumps(final_events, sort_keys=True)
+    assert all(secret not in serialized
+               for result in (case["initial_join"], special, first, replacement, second)
+               for secret in (result["session_token"], result["fence_token"]))
+    print(f"{revision}: real Guide -> loss writer/readback accepted; replay/exhaustion zero-write; no worker or CR progress")
+
+
+
 def test_special_safe_ref_reissue_recovers_exact_worker_before_read(
     conn,
     monkeypatch,

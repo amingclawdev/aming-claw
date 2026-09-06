@@ -55665,9 +55665,11 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             now_iso=now_iso,
         )
         current_lease_status = str(current_lease.get("status") or "").strip()
-        expected_principal = str(
-            context.actual_host_worker_id
-            or context.worker_slot_id
+        # Reissue's durable top-level principal names the logical slot;
+        # its host envelope uses the separately validated physical host.
+        # Keep these namespaces distinct, matching the existing producer.
+        expected_slot_principal = str(
+            context.worker_slot_id
             or context.worker_id
             or context.agent_id
             or ""
@@ -55705,7 +55707,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             "parent_task_id": expected_parent_task_id,
             "worker_id": expected_worker_id,
             "worker_slot_id": expected_worker_slot_id,
-            "principal_id": expected_principal,
+            "principal_id": expected_slot_principal,
             "session_token_ref": presented_session_ref,
         }
         prior_lease_expected = {
