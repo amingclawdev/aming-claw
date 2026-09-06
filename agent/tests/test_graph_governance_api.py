@@ -201577,6 +201577,303 @@ def test_ac_dev_recovered_parallel_continues_through_issuer_to_first_prefill(
     }, sort_keys=True))
 
 
+def _prepare_ac_dev_recovered_parallel_after_prefill(conn, monkeypatch, tmp_path):
+    case = _prepare_ac_dev_recovered_parallel_before_prefill(conn, monkeypatch, tmp_path)
+    project_id, recovery_id = case["project_id"], case["recovery_id"]
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": project_id}, method="POST", body=case["guide_body"],
+    ))
+    issued = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": project_id}, method="POST",
+        body=guide["host_precursor_action"]["copy_safe_body"],
+    ))
+    assert issued["ok"] is True, issued
+    case["limited_ref"] = issued["route_token_ref"]
+    case["guide_body"]["route_token_ref"] = case["limited_ref"]
+    current_query = {
+        "observer_session_id": case["observer_session_id"],
+        "observer_route_token_ref": case["limited_ref"],
+    }
+    current = server.handle_project_contract_runtime_current_state(_ctx(
+        {"project_id": project_id, "contract_execution_id": recovery_id},
+        query=current_query,
+    ))
+    accepted = server.handle_project_contract_runtime_line_write(_ctx(
+        {"project_id": project_id, "contract_execution_id": recovery_id},
+        method="POST",
+        body=current["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"],
+    ))
+    assert accepted["ok"] is True, accepted
+    case["current_query"] = current_query
+    return case
+
+
+def test_ac_dev_recovered_entered_parallel_guide_issues_current_line_no_pass_route(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_recovered_parallel_after_prefill(conn, monkeypatch, tmp_path)
+    project_id, recovery_id = case["project_id"], case["recovery_id"]
+    path = {"project_id": project_id, "contract_execution_id": recovery_id}
+    runtime = server._contract_runtime(conn)
+    current = server.handle_project_contract_runtime_current_state(_ctx(
+        path, query=case["current_query"],
+    ))
+    before_record = copy.deepcopy(runtime.store.get(recovery_id))
+    before_registry = {row["route_token_ref"]: tuple(row) for row in conn.execute(
+        "SELECT * FROM observer_route_token_refs ORDER BY route_token_ref",
+    )}
+    before_root = tuple(conn.execute(
+        "SELECT root_contract_execution_id, current_contract_execution_id, contract_chain_id "
+        "FROM backlog_contract_chain_current WHERE project_id=? AND backlog_id=?",
+        (project_id, case["backlog_id"]),
+    ).fetchone())
+    before_generation = conn.execute(
+        "SELECT generation FROM backlog_contract_chain_current WHERE project_id=? AND backlog_id=?",
+        (project_id, case["backlog_id"]),
+    ).fetchone()[0]
+    bypass = current["runtime_guide"]["line_bypass_guidance"]
+    body = {**bypass["create_new_copy_safe_body"],
+        **case["current_query"],
+        "bypass_identity": f"bypass:{recovery_id}:dispatch-route-continuation",
+        "classification": "process_contract_conflict",
+        "reason": "The retained lane allocation identity gap remains a separate repair.",
+        "decision": "Continue this current line with one audited no-PASS diagnostic.",
+        "evidence_refs": [f"backlog:{case['backlog_id']}", "incident:limited-route"],
+    }
+    before, changes = tuple(conn.iterdump()), conn.total_changes
+    with pytest.raises(GovernanceError) as denied:
+        server.handle_project_contract_runtime_line_bypass(_ctx(path, method="POST", body=body))
+    assert denied.value.details["proof_error"] == "route_token_ref_action_not_allowed"
+    assert conn.total_changes == changes and tuple(conn.iterdump()) == before
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": project_id}, method="POST", body=case["guide_body"],
+    ))
+    print("RECOVERED_ENTERED_BYPASS_CAUSAL " + json.dumps({
+        "loaded_server": server.__file__,
+        "server_sha256": hashlib.sha256(Path(server.__file__).read_bytes()).hexdigest(),
+        "contract_execution_id": recovery_id,
+        "revision": before_record["execution_state_revision"],
+        "denial": denied.value.details["proof_error"],
+        "denial_db_changes": conn.total_changes - changes,
+        "host_precursor": guide.get("host_precursor_action", {}).get("mcp_tool"),
+    }, sort_keys=True))
+    assert guide["host_precursor_required"] is True, (
+        "entered recovered limited route has no legal issuer continuation for its advertised bypass"
+    )
+    precursor = guide["host_precursor_action"]
+    assert precursor["mcp_tool"] == "observer_route_context_issue"
+    issue_body = precursor["copy_safe_body"]
+    assert set(issue_body["allowed_actions"]) == {
+        "contract_runtime_current", "contract_runtime_bypass_line",
+    }
+    assert issue_body["task_id"] == recovery_id
+    assert issue_body["target_files"] == issue_body["owned_files"] == sorted(case["target_files"])
+    assert issue_body["parent_route_identity"]["route_token_ref"] == case["limited_ref"]
+    issued = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": project_id}, method="POST", body=issue_body,
+    ))
+    assert isinstance(issued, dict) and issued["ok"] is True, issued
+    assert issued["route_token_ref"] != case["limited_ref"]
+    assert runtime.store.get(recovery_id) == before_record
+    assert {ref: tuple(conn.execute(
+        "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?", (ref,),
+    ).fetchone()) for ref in before_registry} == before_registry
+    assert bypass["status"] == "route_continuation_required"
+    read_body = {**precursor["after_issue_action"]["copy_safe_body"],
+                 "observer_route_token_ref": issued["route_token_ref"]}
+    assert read_body["observer_session_id"] == case["observer_session_id"]
+    assert read_body["contract_execution_id"] == recovery_id
+    fresh = server.handle_project_contract_runtime_current_state(_ctx(
+        {key: read_body[key] for key in ("project_id", "contract_execution_id")},
+        query={key: value for key, value in read_body.items()
+               if key not in {"project_id", "contract_execution_id"}},
+    ))
+    fresh_bypass = fresh["runtime_guide"]["line_bypass_guidance"]
+    assert fresh_bypass["status"] == "executable_for_authenticated_bypass_actor"
+    fresh_body = {**fresh_bypass["create_new_copy_safe_body"],
+        **{key: body[key] for key in (
+            "bypass_identity", "classification", "reason", "decision", "evidence_refs",
+        )},
+    }
+    assert fresh_body["observer_session_id"] == case["observer_session_id"]
+    assert fresh_body["observer_route_token_ref"] == issued["route_token_ref"]
+    assert fresh_body["runtime_guide_hash"] == fresh_bypass["current_line_binding"]["runtime_guide_hash"]
+    # Issuance preserves the old limited authority. Neither that ref nor an
+    # actor_role body claim can authorize the actual observer bypass writer.
+    for rejected_body in (
+        {**fresh_body, "observer_route_token_ref": case["limited_ref"]},
+        {**{key: value for key, value in fresh_body.items()
+            if key not in {"observer_session_id", "observer_route_token_ref"}},
+         "actor_role": "observer"},
+    ):
+        before, changes = tuple(conn.iterdump()), conn.total_changes
+        try:
+            role_rejected = server.handle_project_contract_runtime_line_bypass(_ctx(
+                path, method="POST", body=rejected_body,
+            ))
+        except GovernanceError:
+            role_rejected = {"ok": False}
+        assert role_rejected["ok"] is False, role_rejected
+        assert conn.total_changes == changes and tuple(conn.iterdump()) == before
+    for field, value in (
+        ("line_id", "observer_prefill_child_contracts"),
+        ("execution_state_revision", fresh_body["execution_state_revision"] - 1),
+        ("runtime_guide_hash", "sha256:" + "f" * 64),
+    ):
+        before, changes = tuple(conn.iterdump()), conn.total_changes
+        stale = server.handle_project_contract_runtime_line_bypass(_ctx(
+            path, method="POST", body={**fresh_body, field: value},
+        ))
+        assert stale["ok"] is False, stale
+        assert conn.total_changes == changes and tuple(conn.iterdump()) == before
+    conn.execute("UPDATE observer_sessions SET status='closed' WHERE session_id=?",
+                 (case["observer_session_id"],))
+    conn.commit()
+    before, changes = tuple(conn.iterdump()), conn.total_changes
+    with pytest.raises(GovernanceError) as inactive:
+        server.handle_project_contract_runtime_line_bypass(_ctx(path, method="POST", body=fresh_body))
+    assert inactive.value.details["proof_error"] == "observer_session_not_active"
+    assert conn.total_changes == changes and tuple(conn.iterdump()) == before
+    conn.execute("UPDATE observer_sessions SET status='active' WHERE session_id=?",
+                 (case["observer_session_id"],))
+    conn.commit()
+    # A generic source/root row is evidence, never the line's diagnostic. The
+    # existing writer must roll back the whole attempt on that binding error.
+    before = tuple(conn.iterdump())
+    with pytest.raises(server.ValidationError):
+        server.handle_project_contract_runtime_line_bypass(_ctx(
+            path, method="POST",
+            body={**fresh_body, "diagnostic_backlog_id": case["backlog_id"]},
+        ))
+    assert tuple(conn.iterdump()) == before
+    accepted = server.handle_project_contract_runtime_line_bypass(_ctx(
+        path, method="POST", body=fresh_body,
+    ))
+    assert accepted["ok"] is True and accepted["idempotent"] is False, accepted
+    assert accepted["written_line"]["status"] == "waived"
+    assert accepted["decision"]["no_pass_claim"] is True
+    diagnostic_id = accepted["diagnostic_backlog_id"]
+    diagnostic = conn.execute("SELECT * FROM backlog_bugs WHERE bug_id=?", (diagnostic_id,)).fetchone()
+    assert diagnostic["status"] == "OPEN"
+    link = json.loads(diagnostic["chain_trigger_json"])
+    assert link["source_backlog_id"] == case["backlog_id"]
+    assert link["contract_execution_id"] == recovery_id
+    assert link["line_id"] == body["line_id"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs WHERE bug_id LIKE 'AC-CONTRACT-LINE-BYPASS-%'",
+    ).fetchone()[0] == 1
+    assert conn.execute("SELECT status FROM backlog_bugs WHERE bug_id=?", (case["backlog_id"],)).fetchone()[0] == "OPEN"
+    after_record = runtime.store.get(recovery_id)
+    assert after_record["completed_lines"][:-1] == before_record["completed_lines"]
+    assert after_record["execution_state_revision"] == before_record["execution_state_revision"] + 1
+    assert after_record["metadata"]["observer_prefill_child_plan"] == before_record["metadata"]["observer_prefill_child_plan"]
+    assert runtime.store.get(case["source_id"]) == case["source_record"]
+    assert tuple(conn.execute(
+        "SELECT root_contract_execution_id, current_contract_execution_id, contract_chain_id "
+        "FROM backlog_contract_chain_current WHERE project_id=? AND backlog_id=?",
+        (project_id, case["backlog_id"]),
+    ).fetchone()) == before_root
+    assert conn.execute(
+        "SELECT generation FROM backlog_contract_chain_current WHERE project_id=? AND backlog_id=?",
+        (project_id, case["backlog_id"]),
+    ).fetchone()[0] == before_generation + 1
+    events = conn.execute(
+        "SELECT backlog_id, event_type FROM task_timeline_events WHERE correlation_id=? ORDER BY id",
+        (f"contract-line-bypass:{body['bypass_identity']}",),
+    ).fetchall()
+    assert [tuple(row) for row in events] == [
+        (case["backlog_id"], "contract_line_bypass"),
+        (diagnostic_id, "contract_line_bypass_diagnostic_linked"),
+    ]
+    before, changes = tuple(conn.iterdump()), conn.total_changes
+    replay = server.handle_project_contract_runtime_line_bypass(_ctx(path, method="POST", body=fresh_body))
+    assert replay["ok"] is True and replay["idempotent"] is True
+    assert replay["timeline_events"] == []
+    assert conn.total_changes == changes and tuple(conn.iterdump()) == before
+    print("RECOVERED_ENTERED_BYPASS_ACCEPTED " + json.dumps({
+        "contract_execution_id": recovery_id, "diagnostic_backlog_id": diagnostic_id,
+        "waived_line": body["line_id"], "diagnostic_status": "OPEN",
+        "no_pass_claim": True, "old_authority_unchanged": True,
+        "same_request_replay_appended": False,
+    }, sort_keys=True))
+
+
+def test_ac_dev_recovered_entered_bypass_route_rejects_scope_and_role_tampering(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_recovered_parallel_after_prefill(conn, monkeypatch, tmp_path)
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=case["guide_body"],
+    ))
+    body = guide["host_precursor_action"]["copy_safe_body"]
+    for field, value in (
+        ("project_id", "foreign-project"), ("backlog_id", "AC-FOREIGN"),
+        ("task_id", case["source_id"]), ("caller_role", "qa"),
+        ("allowed_actions", [*body["allowed_actions"], "parallel_branch_allocate"]),
+        ("target_files", [*body["target_files"], "docs/outside.md"]),
+        ("owned_files", [*body["owned_files"], "docs/outside.md"]),
+        ("parent_route_identity", {**body["parent_route_identity"],
+                                   "route_token_ref": case["source_route_ref"]}),
+    ):
+        before, changes = tuple(conn.iterdump()), conn.total_changes
+        with pytest.raises(GovernanceError):
+            server.handle_observer_route_context_issue(_ctx(
+                {"project_id": case["project_id"]}, method="POST", body={**body, field: value},
+            ))
+        assert conn.total_changes == changes and tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("drift", ["parent_route", "current_execution", "row_scope", "current_state"])
+def test_ac_dev_recovered_entered_bypass_route_revalidates_in_registry_writer(
+    conn, monkeypatch, tmp_path, drift,
+):
+    case = _prepare_ac_dev_recovered_parallel_after_prefill(conn, monkeypatch, tmp_path)
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=case["guide_body"],
+    ))
+    body = guide["host_precursor_action"]["copy_safe_body"]
+    original = server._ac_dev_mf_parallel_onboard_route_issue_precheck
+    raced = {}
+
+    def precheck_then_change(**kwargs):
+        expected = original(**kwargs)
+        if drift == "parent_route":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET status='superseded' WHERE route_token_ref=?",
+                (case["limited_ref"],),
+            )
+        elif drift == "current_execution":
+            conn.execute(
+                "UPDATE backlog_contract_chain_current SET current_contract_execution_id=? "
+                "WHERE project_id=? AND backlog_id=?",
+                (case["source_id"], case["project_id"], case["backlog_id"]),
+            )
+        elif drift == "row_scope":
+            conn.execute(
+                "UPDATE backlog_bugs SET target_files=? WHERE bug_id=?",
+                (json.dumps(["docs/outside-recovered-scope.md"]), case["backlog_id"]),
+            )
+        else:
+            runtime = server._contract_runtime(conn)
+            record = runtime.store.get(case["recovery_id"])
+            record["execution_state_revision"] += 1
+            runtime.store.update(case["recovery_id"], record)
+        conn.commit()
+        raced.update({"dump": tuple(conn.iterdump()), "changes": conn.total_changes})
+        return expected
+
+    monkeypatch.setattr(server, "_ac_dev_mf_parallel_onboard_route_issue_precheck", precheck_then_change)
+    status, rejected = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=body,
+    ))
+    assert status == 409, rejected
+    assert rejected["zero_write_rejection"] is True
+    assert rejected["route_registry_mutated"] is False
+    assert rejected["contract_runtime_mutated"] is False
+    assert conn.total_changes == raced["changes"]
+    assert tuple(conn.iterdump()) == raced["dump"]
+
+
 @pytest.mark.parametrize("drift", ["source_route", "current_execution", "row_scope"])
 def test_ac_dev_recovered_parallel_continuation_revalidates_in_writer(
     conn, monkeypatch, tmp_path, drift,

@@ -8337,10 +8337,16 @@ def _observer_route_context_issue_request_kind(
     if (
         "canonical_ref_adoption" not in body
         and isinstance(allowed_actions, list)
-        and "contract_runtime_submit_line" in allowed_actions
+        and any(action in allowed_actions for action in (
+            "contract_runtime_submit_line", "contract_runtime_bypass_line",
+        ))
         and isinstance(body.get("parent_route_identity"), Mapping)
     ):
-        return "mf_parallel_recovery_continuation"
+        return (
+            "mf_parallel_recovery_bypass_continuation"
+            if "contract_runtime_bypass_line" in allowed_actions
+            else "mf_parallel_recovery_continuation"
+        )
     if "canonical_ref_adoption" not in body:
         return "direct_bootstrap"
     canonical_fields = {
@@ -9374,7 +9380,7 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             )
         if request_kind in {
             "mf_parallel_onboard_precursor", "mf_parallel_entered_lane",
-            "mf_parallel_recovery_continuation",
+            "mf_parallel_recovery_continuation", "mf_parallel_recovery_bypass_continuation",
         }:
             body = _ac_dev_mf_parallel_onboard_route_issue_precheck(
                 project_id=project_id,
@@ -119672,7 +119678,11 @@ def _contract_runtime_guide_for_response(
                 aligned_bypass["no_pass_generation_status"] = (
                     "active_generation_inherited_bypass_required"
                 )
-            aligned_bypass["status"] = "executable_for_authenticated_bypass_actor"
+            aligned_bypass["status"] = (
+                "route_continuation_required"
+                if aligned_bypass.get("route_action_authorized") is False
+                else "executable_for_authenticated_bypass_actor"
+            )
         else:
             for key in (
                 "current_line_binding",
@@ -126881,6 +126891,47 @@ def _contract_runtime_bind_observer_dispatch_transport_proof(
         if isinstance(guide.get("next_legal_action"), Mapping)
         else {}
     )
+    if (
+        conn is not None and project_id == AC_PROJECT_ID and _runtime_plane() == "dev"
+        and (record.get("metadata") or {}).get("facade") == "contract_runtime_recovery"
+        and _is_mf_parallel_record_contract_id(str(record.get("contract_id") or ""))
+        and record.get("revision") == "rev10" and record.get("completed_lines")
+        and isinstance(observer_proof, Mapping) and observer_proof.get("role") == "observer"
+        and guide.get("line_bypass_guidance")
+    ):
+        from . import observer_route_context
+
+        route_ref = str(observer_proof["route_token_ref"])
+        route = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            backlog_id=str(record["backlog_id"]), task_id=str(record["contract_execution_id"]),
+            route_token_ref=route_ref,
+        )
+        allowed = {_normalized_contract_runtime_action(item)
+                   for item in route.get("allowed_actions") or []}
+        bypass = deepcopy(guide["line_bypass_guidance"])
+        bypass["route_action_authorized"] = bool(
+            "contract_runtime_bypass_line" in allowed or "contract_runtime_facade" in allowed
+        )
+        if bypass["route_action_authorized"]:
+            for key in ("create_new_copy_safe_body", "reuse_existing_open_copy_safe_body",
+                        "inherited_bypass_copy_safe_body"):
+                if isinstance(bypass.get(key), Mapping):
+                    bypass[key] = {**bypass[key],
+                        "observer_session_id": observer_proof["observer_session_id"],
+                        "observer_route_token_ref": route_ref,
+                    }
+        else:
+            issue_body = _ac_dev_mf_parallel_recovery_route_issue_body(
+                conn, project_id=project_id, record=record,
+            )
+            bypass["route_continuation"] = {
+                "mcp_tool": "observer_route_context_issue", "copy_safe_body": issue_body,
+                "after_issue": "Read this exact contract_runtime_current with the new ref and the same active observer session before bypassing.",
+            }
+        guide["line_bypass_guidance"] = bypass
+        projected["runtime_guide"] = guide
     next_line_id = str(next_action.get("line_id") or "").strip()
     if (
         not next_line_id
@@ -153797,7 +153848,9 @@ def _ac_dev_mf_parallel_onboard_route_issue_revalidate(
     if row is None or str(_row_get(row, "status", "")).strip() != "OPEN":
         reject("backlog_not_open")
     target_files = _backlog_declared_direct_file_scope(conn, backlog_id)
-    if _observer_route_context_issue_request_kind(body) == "mf_parallel_recovery_continuation":
+    if _observer_route_context_issue_request_kind(body) in {
+        "mf_parallel_recovery_continuation", "mf_parallel_recovery_bypass_continuation",
+    }:
         record = _ac_dev_mf_parallel_current_recovery(
             conn, project_id=project_id, backlog_id=backlog_id,
         )
@@ -153969,7 +154022,7 @@ def _ac_dev_mf_parallel_current_recovery(
 def _ac_dev_mf_parallel_recovery_route_issue_body(
     conn, *, project_id: str, record: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Project an existing issuer body for one recovered CEX's first prefill."""
+    """Continue first Prefill or an entered recovered CEX through the existing issuer."""
 
     from . import observer_route_context
 
@@ -153977,21 +154030,50 @@ def _ac_dev_mf_parallel_recovery_route_issue_body(
         return {}
     execution_id, backlog_id = record["contract_execution_id"], record["backlog_id"]
     metadata = record.get("metadata") or {}
-    if record.get("completed_lines") or metadata.get("recovery_observer_route_continuation"):
+    entered = bool(record.get("completed_lines"))
+    if not entered and metadata.get("recovery_observer_route_continuation"):
         return {}
-    next_action = _runtime_next_action_from_guide(
-        _contract_runtime_guide_for_response(record, actor_role="observer")
-    )
-    if next_action.get("line_id") != "observer_prefill_child_contracts":
+    guide = _contract_runtime_guide_for_response(record, actor_role="observer")
+    next_action = _runtime_next_action_from_guide(guide)
+    bypass = guide.get("line_bypass_guidance") or {}
+    if entered and not (
+        bypass.get("authorization", {}).get("reader_role_authorized") is True
+        and bypass.get("current_line_binding", {}).get("line_id") == next_action.get("line_id")
+        and next_action.get("line_id")
+    ):
+        return {}
+    if not entered and next_action.get("line_id") != "observer_prefill_child_contracts":
         return {}
     source_id = metadata["stale_contract_execution_id"]
     source = _contract_runtime_store(conn).get(source_id)
     plan = (source.get("metadata") or {}).get("observer_prefill_child_plan") or {}
+    if entered:
+        plan = _contract_runtime_mf_parallel_admitted_prefill_child_plan(record)
+        accepted_prefill = [
+            _contract_runtime_completed_line_acceptance(
+                conn, project_id=project_id, record=record,
+                completed_line_index=index, expected_line=line,
+            )
+            for index, line in enumerate(record.get("completed_lines") or [])
+            if isinstance(line, Mapping) and line.get("stage_id") == "orchestration"
+            and line.get("line_id") == "observer_prefill_child_contracts"
+            and line.get("payload") == _contract_runtime_mf_parallel_prefill_payload(plan)
+        ]
+        current = conn.execute(
+            "SELECT current_contract_execution_id FROM backlog_contract_chain_current "
+            "WHERE project_id=? AND backlog_id=?", (project_id, backlog_id),
+        ).fetchone()
+        if (not plan or len(accepted_prefill) != 1
+                or accepted_prefill[0].get("db_verified") is not True
+                or _row_get(current, "current_contract_execution_id", "") != execution_id):
+            raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
+                reason="recovery_bypass_prefill_not_current_db_accepted",
+            )
     row_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
     row_criteria, _ = _backlog_acceptance_scope_authority(conn, backlog_id)
     if not (
         (source.get("metadata") or {}).get("observer_prefill_child_plan_required") is True
-        and _contract_runtime_mf_parallel_prefill_plan_valid(source, plan)
+        and _contract_runtime_mf_parallel_prefill_plan_valid(record if entered else source, plan)
         and plan.get("row_owned_files") == row_files
         and plan.get("acceptance_criteria") == row_criteria
         and _backlog_row_status_for_onboard_route(conn, backlog_id) == "OPEN"
@@ -154010,11 +154092,16 @@ def _ac_dev_mf_parallel_recovery_route_issue_body(
         source_route = {}
     if not (
         source_route and source_route.get("caller_role") == "observer"
-        and source_route.get("scope", {}).get("task_id") in {
+        and source_route.get("scope", {}).get("task_id") in ({execution_id} if entered else {
             source_id, source.get("parent_contract_execution_id"),
-        }
+        })
         and source_route.get("target_files") == row_files
         and source_route.get("owned_files") == row_files
+        and (not entered or (
+            plan["parent_route_binding"]["route_token_ref"] == route_ref
+            and all(source_route.get(field) == plan["parent_route_binding"]["route_identity"].get(field)
+                    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
+        ))
     ):
         raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
             reason="recovery_continuation_source_route_inactive_or_mismatched",
@@ -154026,7 +154113,8 @@ def _ac_dev_mf_parallel_recovery_route_issue_body(
         "target_head_commit": world["target_head_commit"],
         "target_files": row_files, "owned_files": row_files,
         "allowed_actions": _observer_route_context_issue_allowed_actions([
-            "contract_runtime_current", "contract_runtime_submit_line",
+            "contract_runtime_current",
+            "contract_runtime_bypass_line" if entered else "contract_runtime_submit_line",
         ]),
         "parent_route_identity": {
             **{field: source_route[field] for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS},
@@ -154037,6 +154125,12 @@ def _ac_dev_mf_parallel_recovery_route_issue_body(
             f"contract_runtime:{execution_id}", f"recovery_source:{source_id}",
             "recovery_state:" + stable_sha256(_contract_runtime_store(conn).get(execution_id)),
             "recovery_source_state:" + stable_sha256(source),
+            *([
+                f"recovery_bypass_line:{next_action['line_id']}",
+                f"recovery_revision:{record['execution_state_revision']}",
+                "recovery_bypass_current_line:" + stable_sha256(bypass["current_line_binding"]),
+                "recovery_bypass_guide:" + str(guide["runtime_guide_hash"]),
+            ] if entered else []),
             "recovery_world:" + stable_sha256({
                 field: world[field] for field in (
                     "namespace_hash", "target_project_root", "target_head_commit", "target_ref",
@@ -173932,11 +174026,19 @@ def _onboard_route_guide_service_response(
             raise _ac_dev_mf_parallel_onboard_route_issue_rejection(
                 reason="recovery_continuation_current_ref_conflict",
             )
-        response = _contract_runtime_response(recovered_parallel, actor_role=role)
-        next_action = dict(response["next_legal_action"])
         issue_body = _ac_dev_mf_parallel_recovery_route_issue_body(
             conn, project_id=project_id, record=recovered_parallel,
         )
+        if issue_body and recovered_parallel.get("completed_lines"):
+            recovered_parallel = deepcopy(recovered_parallel)
+            recovered_parallel["runtime_guide"]["line_bypass_guidance"].update({
+                "route_action_authorized": False,
+                "route_continuation": {
+                    "mcp_tool": "observer_route_context_issue", "copy_safe_body": issue_body,
+                },
+            })
+        response = _contract_runtime_response(recovered_parallel, actor_role=role)
+        next_action = dict(response["next_legal_action"])
         if issue_body:
             next_action.update({
                 "host_precursor_action": {
@@ -173947,6 +174049,19 @@ def _onboard_route_guide_service_response(
                 },
                 "action_input_ready": False,
             })
+            if recovered_parallel.get("completed_lines"):
+                next_action["host_precursor_action"]["after_issue_action"] = {
+                    "mcp_tool": "contract_runtime_current", "method": "GET",
+                    "path": f"/api/projects/{project_id}/contract-runtime/{recovered_parallel['contract_execution_id']}/current-state",
+                    "copy_safe_body": {
+                        "project_id": project_id,
+                        "contract_execution_id": recovered_parallel["contract_execution_id"],
+                        "observer_session_id": str((request_body or {}).get("observer_session_id") or "<same active observer session id>"),
+                        "observer_route_token_ref": "<route_token_ref from issuer response>",
+                    },
+                    "required_replacements": {"observer_route_token_ref": "observer_route_context_issue.route_token_ref"},
+                    "next_step": "Use this fresh Current line/revision/writer hash and bound observer proof for the no-PASS bypass.",
+                }
         elif response_view == "compact" and next_action.get("line_id") == "observer_prefill_child_contracts":
             # The typed plan belongs to the existing current/line-write facade.
             # Keep Onboard bounded and expose that exact authenticated read.
