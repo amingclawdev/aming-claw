@@ -4115,6 +4115,141 @@ def test_active_runtime_context_tools_are_read_only_and_route_to_current_service
     ]
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "suffix"),
+    [
+        ("runtime_context_current", "current-state"),
+        ("runtime_context_worker_guide", "worker-guide"),
+    ],
+)
+def test_runtime_context_get_real_dispatcher_survives_legacy_timeout(
+    monkeypatch, tool_name, suffix,
+):
+    from urllib.parse import parse_qs, urlparse
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "aming-claw")
+    monkeypatch.delenv("AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS", raising=False)
+    for env_key in mcp_tools._WORKER_AUTH_ENV_FIELDS.values():
+        monkeypatch.delenv(env_key, raising=False)
+    fixture = _managed_allocation_auth_fixture()
+    identity = fixture["identity"]
+    host = object.__new__(plugin_mcp_server.AmingClawMCP)
+    host.project_id = "aming-claw"
+    host.gov_url = "http://127.0.0.1:40008"
+    calls = []
+    response = {
+        "ok": True,
+        "status": "current",
+        "project_id": identity["project_id"],
+        "runtime_context_id": identity["runtime_context_id"],
+        "task_id": identity["task_id"],
+        "response_view": "compact",
+        "next_legal_action": "record_read_receipt",
+        "canonical_executable_action": {
+            "mcp_tool": "runtime_context_read_receipt",
+            "copy_safe_body": dict(identity),
+        },
+    }
+
+    def request_json(method, url, data=None, timeout=15):
+        calls.append((method, url, data, timeout))
+        if url.endswith("/parallel-branches/allocate"):
+            return fixture["allocation_response"]
+        parsed = urlparse(url)
+        assert method == "GET" and data is None
+        assert parsed.scheme + "://" + parsed.netloc == host.gov_url
+        assert parsed.path == (
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            f"{identity['runtime_context_id']}/{suffix}"
+        )
+        expected_query = {
+            key: [identity[key]]
+            for key in (
+                "parent_task_id", "task_id", "session_token_ref",
+                "target_project_root", *fixture["route"],
+            )
+        }
+        expected_query.update({
+            "view": ["compact"],
+            "session_token": [fixture["session_sentinel"]],
+            "fence_token": [fixture["fence_sentinel"]],
+        })
+        assert parse_qs(parsed.query) == expected_query
+        # Model a 30-second response without sleeping or replacing the helper.
+        if timeout < 30:
+            return {"error": "timed out", "simulated_response_seconds": 30}
+        return response
+
+    host._request_json = request_json
+    dispatcher = ToolDispatcher(host._http, worker_pool=None)
+    staged = dispatcher.dispatch("parallel_branch_allocate", fixture["allocation_args"])
+    _assert_managed_allocation_auth_is_public_safe(staged, fixture)
+    request = {**identity, "managed_host_envelope_ref": staged["managed_host_envelope_ref"]}
+    original_request = dict(request)
+    result = dispatcher.dispatch(tool_name, request)
+    assert request == original_request
+    assert len(calls) == 2 and calls[-1][0] == "GET"
+    assert dispatcher._host_envelope_continuity.pending_count() == 1
+    print(f"{tool_name}: simulated_response_seconds=30 transport_timeout={calls[-1][3]}")
+    assert result.get("ok") is True, result
+    assert calls[-1][3] == 120
+    assert result["canonical_executable_action"] == response["canonical_executable_action"]
+    for key in ("session_sentinel", "fence_sentinel", "nested_sentinel"):
+        assert fixture[key] not in json.dumps(result, sort_keys=True)
+
+
+@pytest.mark.parametrize("tool_name", ["runtime_context_current", "runtime_context_worker_guide"])
+@pytest.mark.parametrize(
+    ("configured_timeout", "response_seconds", "expected_timeout"),
+    [(None, 121, 120), ("1", 11, 10), ("999999", 3601, 3600), ("bad", 121, 120), ("45", 30, 45)],
+)
+def test_runtime_context_get_bound_host_timeout_policy_and_failures(
+    monkeypatch, tool_name, configured_timeout, response_seconds, expected_timeout,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "aming-claw")
+    for env_key in mcp_tools._WORKER_AUTH_ENV_FIELDS.values():
+        monkeypatch.delenv(env_key, raising=False)
+    env_key = "AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS"
+    if configured_timeout is None:
+        monkeypatch.delenv(env_key, raising=False)
+    else:
+        monkeypatch.setenv(env_key, configured_timeout)
+    host = object.__new__(plugin_mcp_server.AmingClawMCP)
+    host.project_id = "aming-claw"
+    host.gov_url = "http://127.0.0.1:40008"
+    calls = []
+    service_error = {"ok": False, "error": "runtime_context_session_token_missing", "http_status": 422}
+
+    def request_json(method, url, data=None, timeout=15):
+        calls.append((method, url, data, timeout))
+        assert method == "GET" and data is None
+        assert "timeout_seconds=" not in url
+        assert "/mfrctx-timeout%2Fencoded%3F/" in url
+        if response_seconds > timeout:
+            raise TimeoutError("simulated bounded transport deadline")
+        return service_error
+
+    host._request_json = request_json
+    dispatcher = ToolDispatcher(host._http, worker_pool=None)
+    result = dispatcher.dispatch(tool_name, {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-timeout/encoded?",
+    })
+    assert len(calls) == 1 and calls[0][3] == expected_timeout
+    assert dispatcher._host_envelope_continuity.pending_count() == 0
+    if response_seconds > expected_timeout:
+        assert result == {
+            "ok": False,
+            "error": "request_timeout",
+            "message": "simulated bounded transport deadline",
+            "timeout_seconds": expected_timeout,
+        }
+    else:
+        assert result == service_error
+
+
 def test_runtime_context_worker_guide_adapter_schemas_preserve_safe_route_identity():
     expected = {
         "task_id",

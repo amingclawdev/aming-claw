@@ -9520,10 +9520,11 @@ class ToolDispatcher:
             query = _runtime_context_query(request_args)
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
-            result = self._api(
+            result = self._governance_api_with_timeout(
                 "GET",
                 f"/api/graph-governance/{pid}/runtime-contexts/"
                 f"{runtime_context_id}/{suffix}{qs}",
+                timeout_seconds=_contract_runtime_mcp_timeout_seconds(args),
             )
             return (
                 _bounded_worker_guide_result(
