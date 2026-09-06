@@ -45571,7 +45571,15 @@ def _runtime_context_worker_recovery_payloads(
     rejoin_eligibility = dict(session_token_rejoin_eligibility or {})
     rejoin_advertised = (
         not rejoin_eligibility
-        or rejoin_eligibility.get("eligible") is True
+        or (
+            rejoin_eligibility.get("eligible") is True
+            and not (
+                rejoin_eligibility.get("mode") == "safe_ref_prestartup_reissue"
+                and isinstance(rejoin_eligibility.get("authority"), Mapping)
+                and rejoin_eligibility["authority"].get("pre_read_special_authority")
+                is True
+            )
+        )
     )
     pre_lineage_bootstrap_recovery = bool(
         rejoin_eligibility.get("eligible") is True
@@ -66390,11 +66398,21 @@ def _runtime_context_session_rejoin_guidance_eligibility(
         and not effective_startup_ref
         and last_recovery_action == "mf_subagent_session_token_reissued"
     )
+    # The special pre-lineage rejoin already has a safe-ref writer path, but
+    # no read/startup Fact yet.  This marker only selects its strict authority
+    # check below; it cannot authorize reissue by itself.
+    pre_receipt_special_reissue = bool(
+        not effective_read_receipt_ref
+        and not effective_startup_ref
+        and last_recovery_action
+        == "mf_subagent_pre_lineage_session_token_rejoin_issued"
+    )
     if (
         status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
         and (
             post_receipt_prestartup_reissue
             or pre_receipt_loss_replacement_reissue
+            or pre_receipt_special_reissue
         )
     ):
         route_identity = dict(recovery_route_identity)
@@ -66558,6 +66576,22 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                 "error": str(getattr(exc, "code", "") or type(exc).__name__),
             }
         if safe_ref_authority is not None:
+            if safe_ref_authority.pre_read_special_authority:
+                # The existing resolver inside the authority check derives
+                # the CEX even before a worker-read sequence exists.  Project
+                # that verified identity and the actual pre-read lineage.
+                for key in ("body", "copy_safe_body"):
+                    reissue_submission[key]["contract_execution_id"] = (
+                        safe_ref_authority.contract_execution_id
+                    )
+                reissue_submission["required_current_lineage"] = [
+                    item
+                    for item in reissue_submission["required_current_lineage"]
+                    if item != "accepted ContractRuntime worker_read_runtime_guide"
+                ] + [
+                    "accepted special pre-lineage rejoin",
+                    "absent ContractRuntime worker_read_runtime_guide",
+                ]
             projection.update(
                 {
                     "eligible": True,
