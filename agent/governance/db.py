@@ -3101,6 +3101,28 @@ def _validate_dev_source_tip_custody(
     )
 
 
+def _dev_custody_pid_incarnation_changed(process: Mapping[str, object]) -> bool:
+    """Prove the historical incarnation ended, not that the current PID is dead."""
+    pid = process.get("pid")
+    stored = str(process.get("start_identity") or "")
+    if (type(pid) is not int or pid <= 0
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", stored)):
+        return False
+    try:
+        observed = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+            text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    started = observed.stdout.strip() if observed.returncode == 0 else ""
+    if not started or len(started.splitlines()) != 1:
+        return False
+    # Custody hashes stripped lstart only; writer-lease identity is different.
+    current = "sha256:" + hashlib.sha256(started.encode("utf-8")).hexdigest()
+    return current != stored
+
+
 def _validate_dev_current_process_custody(
     process: Mapping[str, object], *, root: Path,
     candidate_source: Mapping[str, object],
@@ -3146,11 +3168,14 @@ def _validate_dev_current_process_custody(
         except ProcessLookupError:
             pass
         except (OSError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "AC dev completed process custody liveness is unavailable"
-            ) from exc
+            if not (isinstance(exc, PermissionError)
+                    and _dev_custody_pid_incarnation_changed(value)):
+                raise ValueError(
+                    "AC dev completed process custody liveness is unavailable"
+                ) from exc
         else:
-            raise ValueError("AC dev completed process custody PID is still live")
+            if not _dev_custody_pid_incarnation_changed(value):
+                raise ValueError("AC dev completed process custody PID is still live")
     if completed_dead_pre_normalization and not argv_canonical:
         try:
             listener = subprocess.run(
@@ -5867,11 +5892,14 @@ def _validate_dev_cow_completed_basic_restart(
         except ProcessLookupError:
             pass
         except (OSError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "AC dev COW completed basic restart process state is unavailable"
-            ) from exc
+            if not (isinstance(exc, PermissionError)
+                    and _dev_custody_pid_incarnation_changed(process)):
+                raise ValueError(
+                    "AC dev COW completed basic restart process state is unavailable"
+                ) from exc
         else:
-            raise ValueError("AC dev COW completed basic restart process is still live")
+            if not _dev_custody_pid_incarnation_changed(process):
+                raise ValueError("AC dev COW completed basic restart process is still live")
     _validate_existing_adoption_receipt(root)
     if (
         _durable_database_sha256(database) != database_before

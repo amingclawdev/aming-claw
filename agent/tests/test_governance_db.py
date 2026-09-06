@@ -3960,6 +3960,154 @@ def _completed_cow_basic_restart_fixture(tmp_path, monkeypatch):
     return root, database, candidate, stable, launch_path
 
 
+@pytest.mark.parametrize("entrypoint", ("completed_axis", "basic_restart"))
+@pytest.mark.parametrize(
+    "observation",
+    ("different", "matching", "unavailable", "unreadable", "ambiguous", "dead"),
+)
+def test_completed_cow_pid_incarnation_restart_real_paths(
+    tmp_path, monkeypatch, entrypoint, observation,
+):
+    """Exercise both real guards without treating numeric PID reuse as death."""
+    import errno
+    from agent.governance import db
+
+    pid = 42  # Isolated historical fixture only; no real signal is sent.
+    old_start = "Sat Sep  5 07:00:00 2026"
+    new_start = "Sun Sep  6 11:55:45 2026"
+    os_view = {"started": old_start, "error": False, "fresh": False}
+    ps_queries = []
+    original_run = subprocess.run
+
+    def process_start_query(args, *positional, **kwargs):
+        if list(args) == ["ps", "-o", "lstart=", "-p", str(pid)]:
+            assert kwargs.get("text") is True
+            if os_view["fresh"]:
+                ps_queries.append(list(args))
+            if os_view["error"]:
+                raise PermissionError(errno.EPERM, "isolated ps unavailable")
+            return subprocess.CompletedProcess(
+                args, 0, stdout="  " + os_view["started"] + "  \n", stderr="",
+            )
+        return original_run(args, *positional, **kwargs)
+
+    monkeypatch.setattr(db.subprocess, "run", process_start_query)
+    root, database, candidate, _stable, launch_path = (
+        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+    )
+    with sqlite3.connect(database) as connection:
+        historical = json.loads(connection.execute(
+            "SELECT value FROM schema_meta WHERE key=?",
+            ("governance_world_current_process_json",),
+        ).fetchone()[0])
+    assert historical["pid"] == pid
+    assert historical["start_identity"] == (
+        "sha256:" + hashlib.sha256(old_start.encode()).hexdigest()
+    )
+    # Only the OS observation changes after the completed fixture is sealed.
+    # Its metadata, phase, source history, receipts and lease are not rewritten.
+    os_view.update(
+        fresh=True,
+        started={
+            "different": new_start,
+            "matching": old_start,
+            "unavailable": "",
+            "unreadable": "",
+            "ambiguous": old_start + "\n" + new_start,
+            "dead": "",
+        }[observation],
+        error=observation == "unreadable",
+    )
+    kill_probes = []
+
+    def process_presence(observed, signal_number):
+        assert (observed, signal_number) == (pid, 0)
+        frame = sys._getframe(1)
+        callers = []
+        while frame is not None:
+            if frame.f_code.co_name in {
+                "_validate_dev_current_process_custody",
+                "_validate_dev_cow_completed_basic_restart",
+            }:
+                callers.append(frame.f_code.co_name)
+            frame = frame.f_back
+        kill_probes.append(callers)
+        # The basic-restart path first observes the old PID absent during its
+        # two completed-axis reads, then observes a reused PID at its own
+        # final guard. This reaches that independent numeric-PID check on base
+        # without mocking the phase selector or either production validator.
+        if (observation == "dead"
+                or (entrypoint == "basic_restart" and len(kill_probes) <= 2)):
+            raise ProcessLookupError(errno.ESRCH, "isolated old incarnation ended")
+        if observation != "matching":
+            raise PermissionError(errno.EPERM, "isolated reused PID is protected")
+
+    monkeypatch.setattr(db.os, "kill", process_presence)
+    before = database.read_bytes()
+    logical_before = db._database_logical_sha256(database)
+    launch_before = launch_path.read_bytes()
+    archive_before = {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted((root / "archive").rglob("*")) if path.is_file()
+    }
+    loaded_source = Path(
+        db._validate_dev_current_process_custody.__code__.co_filename
+    )
+    print(json.dumps({
+        "milestone": "completed_cow_incarnation_probe",
+        "entrypoint": entrypoint, "observation": observation,
+        "loaded_db_source": str(loaded_source),
+        "loaded_db_sha256": hashlib.sha256(loaded_source.read_bytes()).hexdigest(),
+        "stored_start_identity": historical["start_identity"],
+        "test_pid": os.getpid(), "historical_fixture_pid": pid,
+    }, sort_keys=True))
+
+    def exercise():
+        if entrypoint == "completed_axis":
+            return db._validate_dev_cow_completed_process_axis(
+                historical, root=root, source_identity=candidate,
+                historical_source_tip=candidate,
+            )
+        result = db.bootstrap_dev_governance_store(
+            root, source_identity=candidate,
+            process_identity={
+                "pid": os.getpid(),
+                "start_identity": f"pid:{os.getpid()}:cli-bootstrap",
+            },
+        )
+        assert result["restart_safe"] is True
+        assert result["created"] is False
+        assert result["current_process_identity"] == historical
+        return result
+
+    try:
+        if observation in {"different", "dead"}:
+            exercise()
+        else:
+            with pytest.raises(ValueError):
+                exercise()
+        if entrypoint == "basic_restart":
+            assert len(kill_probes) >= 3
+            assert "_validate_dev_current_process_custody" in kill_probes[0]
+            assert "_validate_dev_current_process_custody" in kill_probes[1]
+            assert kill_probes[2] == ["_validate_dev_cow_completed_basic_restart"]
+        else:
+            assert kill_probes[0] == ["_validate_dev_current_process_custody"]
+        if observation == "different":
+            assert ps_queries  # The fresh identity must belong to PID 42, not self.
+        assert database.read_bytes() == before
+        assert db._database_logical_sha256(database) == logical_before
+        assert launch_path.read_bytes() == launch_before
+        assert {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in sorted((root / "archive").rglob("*")) if path.is_file()
+        } == archive_before
+    finally:
+        db.release_dev_runtime_writer_lease(root)
+        print(json.dumps({"kill_probe_callers": kill_probes,
+                          "fresh_historical_pid_queries": ps_queries}, sort_keys=True))
+
+
 def _defer_completed_source_and_open_clean_successor(
     tmp_path, historical_source,
 ):
