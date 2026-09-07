@@ -151678,9 +151678,9 @@ def _operator_supervised_direct_main_record_matches_dev_world(
     identity_fields = (
         "schema_version", "accepted", "server_derived", "caller_claims_trusted",
         "runtime_plane", "runtime_port", "bind_host", "target_project_root",
-        "worktree_path", "branch", "target_ref", "stable_anchor_commit",
+        "worktree_path", "branch", "target_ref",
         "database_identity", "world_id", "runtime_stale", "violations",
-        "namespace_hash", "storage_contract_id",
+        "storage_contract_id",
     )
     if not (
         world_authority.get("accepted") is True
@@ -151706,6 +151706,56 @@ def _operator_supervised_direct_main_record_matches_dev_world(
             or not all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
                        for commit in current_commits | record_commits)):
         return False
+    original_anchor = str(record_world.get("stable_anchor_commit") or "")
+    current_anchor = str(world_authority.get("stable_anchor_commit") or "")
+    if original_anchor == current_anchor:
+        if record_world.get("namespace_hash") != world_authority.get("namespace_hash"):
+            return False
+    else:
+        # Namespace hashes include the stable anchor, not just the physical
+        # dev world.  Authenticate each original projection before admitting
+        # an advancing anchor; never rekey the execution or rewrite its Fact.
+        database_identity = record_world.get("database_identity")
+        if not (
+            _ac_dev_database_identity_valid(database_identity)
+            and record.get("project_id") == database_identity.get("project_id")
+            and all(binding.get(key) == record.get(key) for key in (
+                "project_id", "backlog_id", "contract_execution_id",
+            ))
+            and binding.get("binding_hash") == stable_sha256({
+                key: value for key, value in binding.items() if key != "binding_hash"
+            })
+            and all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", anchor)
+                    for anchor in (original_anchor, current_anchor))
+        ):
+            return False
+        for world in (record_world, world_authority):
+            if not (
+                world.get("namespace_hash") == direct_main_dev_namespace_hash(world)
+                and world.get("world_hash") == stable_sha256({
+                    key: value for key, value in world.items()
+                    if key not in {"world_hash", "storage_contract_id", "authority_hash"}
+                })
+                and world.get("authority_hash") == stable_sha256({
+                    key: value for key, value in world.items() if key != "authority_hash"
+                })
+            ):
+                return False
+        if direct_main_dev_namespace_hash({
+            **record_world, "stable_anchor_commit": current_anchor,
+        }) != world_authority.get("namespace_hash"):
+            return False
+        try:
+            # Resolve in this same registered root, including unchanged HEADs:
+            # a well-formed but nonexistent object is not continuity proof.
+            for commit in {original_anchor, current_anchor, *record_commits, *current_commits}:
+                _parallel_branch_resolve_canonical_commit(
+                    root, commit, field="direct_runtime_continuity_commit",
+                )
+        except GovernanceError:
+            return False
+        if not _git_commit_is_ancestor(root, original_anchor, current_anchor):
+            return False
     if record_commits == current_commits:
         return True
     return all(_git_commit_is_ancestor(root, commit, next(iter(current_commits)))

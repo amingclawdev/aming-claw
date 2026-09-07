@@ -4919,6 +4919,244 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     assert conn.total_changes == before_restart
 
 
+def _ac_dev_anchor_continuity_world(root, commit, anchor):
+    world = _fixed_ac_dev_direct_world(root, commit)
+    world.pop("stable_database_identity")
+    world.update({
+        "stable_anchor_commit": anchor,
+        "database_identity": {
+            "schema_version": "ac_governance_database_identity.v2",
+            "world_id": "ac-dev", "project_id": "aming-claw",
+            "device": 17, "inode": 23,
+            "relative_path_sha256": _fake_sha("same-dev-database-path"),
+            "genesis_sha256": _fake_sha("same-dev-genesis"),
+        },
+    })
+    return _rehash_ac_dev_anchor_continuity_world(world)
+
+
+def _rehash_ac_dev_anchor_continuity_world(world):
+    core = {key: copy.deepcopy(value) for key, value in world.items()
+            if key not in {"world_hash", "storage_contract_id", "authority_hash"}}
+    core["namespace_hash"] = server.direct_main_dev_namespace_hash(core)
+    authority = {**core, "world_hash": server.stable_sha256(core),
+                 "storage_contract_id": "operator_supervised_direct_main"}
+    authority["authority_hash"] = server.stable_sha256(authority)
+    return authority
+
+
+def _prepare_ac_dev_anchor_continuity(conn, monkeypatch):
+    # Reproduce the measured anchors with real repository objects, but create
+    # all route/ContractRuntime evidence through producers in the test DB.
+    # The live governance DB and the archived Batch CEX are never opened.
+    root = Path(__file__).resolve().parents[2]
+    original_anchor = "2cfd1c132734cece9e659144b9f9e5606b59a406"
+    current_anchor = "da0198b21dfb2694f465880d98fd1bdd52ec9896"
+    current_commit = "0f919a45c2e01c11d2144bf905b14ba175bed6c0"
+    issuance_anchor = "88ba7a7ccbeaed9c3678c4febcb27df0ead8a9ac"
+    assert len({original_anchor, current_anchor, issuance_anchor}) == 3
+    assert server._git_commit_is_ancestor(root, original_anchor, current_anchor)
+    assert server._git_commit_is_ancestor(root, current_anchor, current_commit)
+    original = _ac_dev_anchor_continuity_world(root, current_anchor, original_anchor)
+    current = _ac_dev_anchor_continuity_world(root, current_commit, current_anchor)
+    assert original["namespace_hash"] != current["namespace_hash"]
+    project_id = "aming-claw"
+    backlog_id = "AC-DEV-ANCHOR-CONTINUITY-FIXTURE"
+    files = ["agent/governance/server.py", "agent/tests/test_graph_governance_api.py"]
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute("UPDATE backlog_bugs SET target_files=?, test_files='[]' WHERE bug_id=?",
+                 (json.dumps(files), backlog_id))
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    monkeypatch.setattr(server, "_operator_supervised_direct_main_dev_world_authority",
+                        lambda: copy.deepcopy(original))
+    task_id = server._operator_supervised_direct_main_execution_id(
+        project_id, backlog_id, revision="rev3", world_authority=original)
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id, backlog_id=backlog_id, task_id=task_id,
+        target_files=files,
+        allowed_actions=list(server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS),
+        evidence_refs=[f"backlog:{backlog_id}", f"contract_runtime:{task_id}",
+                       "contract_definition:operator_supervised_direct_main.v1.rev3"],
+    )
+    route_ref = issued["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn, project_id=project_id, route_token_ref=route_ref,
+        token=issued["route_token"],
+    )
+    server._operator_supervised_direct_main_start_runtime(
+        conn, project_id=project_id, backlog_id=backlog_id, task_id=task_id,
+        route_token_ref=route_ref,
+        world_ref=server._operator_supervised_direct_main_world_ref(project_id=project_id),
+    )
+    server._operator_supervised_direct_main_apply_timeline_runtime(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        event_kind="observer_direct_implementation_exception",
+        body={"event_type": "mf.observer_direct_implementation_exception",
+              "phase": "pre_mutation", "status": "accepted",
+              "decision": "operator_supervised_direct_main_approved"},
+        normalized_payload={},
+        pre_mutation_graph_trace_gate={
+            "passed": True,
+            "db_evidence": {"db_verified": True,
+                            "verified_trace_ids": ["gqt-anchor-continuity-fixture"]}},
+        pre_mutation_request_fingerprint=_fake_sha("anchor-continuity-pre-mutation"),
+    )
+    session_id = _insert_ac_dev_active_observer_session(
+        conn, project_id=project_id, session_id="obs-anchor-continuity-fixture")
+    conn.commit()
+    record = server._contract_runtime(conn).current_record(task_id, actor_role="observer")
+    assert record["execution_state_revision"] == 4
+    assert len(record["completed_lines"]) == 3
+    monkeypatch.setattr(server, "_operator_supervised_direct_main_dev_world_authority",
+                        lambda: copy.deepcopy(current))
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: {
+            "dev_refs": [server.AC_DEV_BRANCH, f"refs/heads/{server.AC_DEV_BRANCH}"],
+            "dev_runtime_port": 40008, "dev_worktree_root": str(root),
+            "dev_head_commit": current_commit, "dev_contract_execution_ids": [task_id],
+            "server_derived": True,
+        },
+    )
+    return {"root": root, "original": original, "current": current,
+            "record": record, "project_id": project_id, "backlog_id": backlog_id,
+            "task_id": task_id, "route_ref": route_ref, "session_id": session_id,
+            "current_commit": current_commit, "issuance_anchor": issuance_anchor}
+
+
+def test_ac_dev_anchor_continuity_preserves_normal_guide_and_implementation(conn, monkeypatch):
+    case = _prepare_ac_dev_anchor_continuity(conn, monkeypatch)
+    record = case["record"]
+    binding = copy.deepcopy(record["metadata"]["operator_supervised_direct_main_runtime_binding"])
+    before = tuple(conn.iterdump())
+    guide = server._onboard_operator_supervised_direct_main_runtime_response(
+        conn, project_id=case["project_id"], backlog_id=case["backlog_id"],
+        route_token_ref=case["route_ref"], role="observer",
+        work_type="operator_supervised_direct_main", response_view="full",
+        request_body={"task_id": case["task_id"], "observer_session_id": case["session_id"]},
+    )
+    assert guide["contract_execution_id"] == case["task_id"]
+    assert guide["ok"] is True, guide.get("error")
+    assert guide["next_legal_action"]["line_id"] == "observer_implementation"
+    body = guide["next_legal_action"]["copy_safe_body"]
+    assert body["task_id"] == case["task_id"]
+    scope = server._contract_runtime_parentless_direct_main_selected_scope(
+        conn, project_id=case["project_id"], backlog_id=case["backlog_id"],
+        contract_execution_id=body["task_id"], route_token_ref=case["route_ref"],
+        rebuild_if_missing=False,
+    )
+    assert scope["resolved"] is True
+    assert scope["contract_execution_id"] == case["task_id"]
+    assert tuple(conn.iterdump()) == before
+    # Exercise the implementation adapter after the common world consumer;
+    # this is test evidence, not candidate runtime QA or a live timeline write.
+    server._operator_supervised_direct_main_apply_timeline_runtime(
+        conn, project_id=case["project_id"], backlog_id=case["backlog_id"],
+        contract_execution_id=body["task_id"], event_kind="implementation",
+        body={"commit_sha": case["current_commit"]},
+        normalized_payload={"changed_files": binding["owned_files"],
+                            "test_results": _canonical_parentless_direct_main_test_results(
+                                case["current_commit"])},
+    )
+    after = server._contract_runtime(conn).current_record(case["task_id"], actor_role="observer")
+    assert after["completed_lines"][:3] == record["completed_lines"]
+    assert after["completed_lines"][3]["line_id"] == "observer_implementation"
+    assert after["metadata"]["operator_supervised_direct_main_runtime_binding"] == binding
+    assert server._operator_supervised_direct_main_record_matches_dev_world(record, case["original"])
+    assert server._operator_supervised_direct_main_execution_id(
+        case["project_id"], case["backlog_id"], revision="rev3",
+        world_authority=case["current"],
+    ) != case["task_id"]  # New issuance stays current-anchor based; old CEX is not rekeyed.
+
+
+def test_ac_dev_anchor_continuity_preserves_no_pass_consumer(conn, monkeypatch):
+    case = _prepare_ac_dev_anchor_continuity(conn, monkeypatch)
+    record = case["record"]
+    body = copy.deepcopy(server._contract_runtime_guide_for_response(
+        record, actor_role="observer")["line_bypass_guidance"]["create_new_copy_safe_body"])
+    body.update({
+        "classification": "cross_plane_runtime_blocker",
+        "reason": "fixture existing line remains blocked without QA",
+        "decision": "waive this fixture line without PASS",
+        "evidence_refs": [f"backlog:{case['backlog_id']}"],
+        "task_id": case["task_id"], "observer_session_id": case["session_id"],
+        "observer_route_token_ref": case["route_ref"],
+    })
+    accepted = server.handle_project_contract_runtime_line_bypass(_ctx(
+        {"project_id": case["project_id"], "contract_execution_id": case["task_id"]},
+        method="POST", body=body,
+    ))
+    assert accepted["written_line"]["status"] == "waived"
+    assert accepted["written_line"]["payload"]["no_pass_generation"]["authoritative_pass_synthesized"] is False
+    after = server._contract_runtime(conn).current_record(case["task_id"], actor_role="observer")
+    assert after["completed_lines"][:3] == record["completed_lines"]
+    assert after["metadata"]["operator_supervised_direct_main_runtime_binding"] == record[
+        "metadata"]["operator_supervised_direct_main_runtime_binding"]
+
+
+def test_ac_dev_anchor_continuity_rejects_identity_hash_and_ancestry_drift(conn, monkeypatch):
+    case = _prepare_ac_dev_anchor_continuity(conn, monkeypatch)
+    record, current = case["record"], case["current"]
+    before = tuple(conn.iterdump())
+    assert server._operator_supervised_direct_main_record_matches_dev_world(record, current)
+    for field, value in {
+        "target_project_root": str(case["root"] / "other"),
+        "worktree_path": str(case["root"] / "other"),
+        "branch": "codex/other", "target_ref": "refs/heads/codex/other",
+        "runtime_port": 40000, "world_id": "ac-stable", "runtime_stale": True,
+        "violations": ["runtime_worktree_dirty"], "accepted": False,
+        "stable_anchor_commit": "0" * 40,
+    }.items():
+        drift = _rehash_ac_dev_anchor_continuity_world({**current, field: value})
+        assert not server._operator_supervised_direct_main_record_matches_dev_world(record, drift), field
+    for field, value in {"device": 18, "inode": 24,
+                         "relative_path_sha256": _fake_sha("other-database-path"),
+                         "genesis_sha256": _fake_sha("other-genesis"),
+                         "project_id": "other", "world_id": "ac-stable"}.items():
+        drift = _rehash_ac_dev_anchor_continuity_world({
+            **current, "database_identity": {**current["database_identity"], field: value}})
+        assert not server._operator_supervised_direct_main_record_matches_dev_world(record, drift), field
+    for field in ("namespace_hash", "world_hash", "authority_hash"):
+        assert not server._operator_supervised_direct_main_record_matches_dev_world(
+            record, {**current, field: _fake_sha("forged-hash")}), field
+    forged = copy.deepcopy(record)
+    forged["metadata"]["operator_supervised_direct_main_runtime_binding"]["binding_hash"] = _fake_sha("forged-binding")
+    assert not server._operator_supervised_direct_main_record_matches_dev_world(forged, current)
+    for field in ("namespace_hash", "world_hash", "authority_hash"):
+        forged = copy.deepcopy(record)
+        binding = forged["metadata"]["operator_supervised_direct_main_runtime_binding"]
+        binding["runtime_world_authority"][field] = _fake_sha("forged-original-world")
+        binding["binding_hash"] = server.stable_sha256({
+            key: value for key, value in binding.items() if key != "binding_hash"})
+        assert not server._operator_supervised_direct_main_record_matches_dev_world(forged, current), field
+    assert not server._operator_supervised_direct_main_record_matches_dev_world(
+        {**record, "project_id": "other"}, current)
+    for invalid in ("not-a-commit", "0" * 40):
+        drift = _rehash_ac_dev_anchor_continuity_world({
+            **current, "target_head_commit": invalid, "loaded_runtime_commit": invalid})
+        assert not server._operator_supervised_direct_main_record_matches_dev_world(record, drift)
+    # Issuance provenance is an older, distinct anchor, not a replacement for
+    # the authenticated original stable anchor.  Reversing either lineage fails.
+    reversed_anchor = _rehash_ac_dev_anchor_continuity_world({
+        **current, "stable_anchor_commit": case["issuance_anchor"]})
+    assert not server._operator_supervised_direct_main_record_matches_dev_world(record, reversed_anchor)
+    reversed_head = _rehash_ac_dev_anchor_continuity_world({
+        **current, "target_head_commit": case["original"]["stable_anchor_commit"],
+        "loaded_runtime_commit": case["original"]["stable_anchor_commit"]})
+    assert not server._operator_supervised_direct_main_record_matches_dev_world(record, reversed_head)
+    monkeypatch.setattr(server, "_operator_supervised_direct_main_dev_world_authority",
+                        lambda: copy.deepcopy(reversed_anchor))
+    with pytest.raises(GovernanceError) as rejected:
+        server._operator_supervised_direct_main_strict_records(
+            conn, project_id=case["project_id"], backlog_id=case["backlog_id"])
+    assert rejected.value.code == "ac_dev_direct_main_runtime_world_lineage_invalid"
+    assert rejected.value.details["writes_performed"] is False
+    assert tuple(conn.iterdump()) == before
+
+
 def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
     conn,
     monkeypatch,
