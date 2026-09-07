@@ -225760,6 +225760,19 @@ def _contract_runtime_mf_parallel_recovery_prefill_metadata(
         {field: deepcopy(lane[field]) for field in _MF_PARALLEL_LANE_INTENT_FIELDS}
         for lane in source_plan["lanes"]
     ]
+    # A recovery is a new execution, not an exact same-lane allocator retry.
+    # RuntimeContexts are keyed by project/task and physical custody is also
+    # derived from task/worker. Reusing those execution identities would ask
+    # the allocator to adopt the predecessor's immutable custody. Namespace
+    # only the new task/worker identities before the typed plan is frozen;
+    # the source CEX retains the original intent and the slot/file split stays
+    # unchanged. The existing stable-id producer makes replay deterministic.
+    for lane in lane_intents:
+        for field in ("task_id", "worker_id"):
+            lane[field] = _contract_runtime_stable_id(
+                f"mf-recovery-{field.removesuffix('_id')}",
+                project_id, backlog_id, contract_execution_id, lane[field],
+            )
     plan = _contract_runtime_mf_parallel_build_prefill_child_plan(
         project_id=project_id, backlog_id=backlog_id,
         contract_execution_id=contract_execution_id,
@@ -225777,6 +225790,25 @@ def _contract_runtime_mf_parallel_recovery_prefill_metadata(
         ),
         parent_route_binding=parent_route_binding, lane_intents=lane_intents,
     )
+    # Reuse the allocator's read-only custody check before admitting this NEW
+    # plan. Do not call the full allocation precheck here: it correctly needs
+    # an already-admitted plan and separately issued per-lane routes. Its later
+    # recheck remains authoritative, including collisions arising afterwards.
+    from . import batch_jobs
+
+    repository_root = _parallel_branch_allocate_precheck_registered_repository(project_id)
+    base_commit = batch_jobs.git_commit(repository_root).strip().lower()
+    for lane in plan["lanes"]:
+        lane_slug = _parallel_branch_allocate_slug(f"{lane['task_id']}-{lane['worker_id']}")
+        _parallel_branch_allocate_precheck_custody(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            task_id=lane["task_id"], worker_id=lane["worker_id"],
+            worker_slot_id=lane["worker_slot_id"], repository_root=repository_root,
+            worktree_path=repository_root / ".worktrees" / lane_slug,
+            branch_ref=f"refs/heads/codex/{_parallel_branch_allocate_slug(lane['task_id'])}",
+            base_commit=base_commit, owned_files=lane["owned_files"],
+        )
     return {
         "owned_files": declared_files, "target_files": declared_files,
         "test_files": row_test_files, "required_worker_count": required_worker_count,

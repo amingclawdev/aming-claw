@@ -140570,7 +140570,10 @@ def _fresh_rev10_prefill_recovery_case(conn, *, stale_definition=True):
     }
 
 
-def test_fresh_rev10_recovery_rebuilds_consumable_prefill_before_start(conn, monkeypatch):
+def test_fresh_rev10_recovery_rebuilds_consumable_prefill_before_start(conn, monkeypatch, tmp_path):
+    repository = tmp_path / "recovery-prefill-world"
+    _init_test_git_repo(repository)
+    monkeypatch.setattr(server.project_service, "resolve_project_root", lambda *_args, **_kwargs: repository)
     case = _fresh_rev10_prefill_recovery_case(conn)
     source = case["source"]
     source_plan = source["metadata"]["observer_prefill_child_plan"]
@@ -140697,6 +140700,9 @@ def test_fresh_rev10_recovery_invalid_inputs_reject_before_start(conn, monkeypat
 
 
 def test_fresh_rev10_dead_initial_join_recovery_preserves_typed_prefill(conn, monkeypatch, tmp_path):
+    repository = tmp_path / "dead-initial-join-world"
+    _init_test_git_repo(repository)
+    monkeypatch.setattr(server.project_service, "resolve_project_root", lambda *_args, **_kwargs: repository)
     now_iso = "2099-08-02T01:00:00Z"
     monkeypatch.setattr(server, "_utc_now", lambda: now_iso)
     case = _fresh_rev10_prefill_recovery_case(conn, stale_definition=False)
@@ -140809,6 +140815,213 @@ def test_fresh_rev10_dead_initial_join_recovery_preserves_typed_prefill(conn, mo
     assert server._contract_runtime_mf_parallel_admitted_prefill_child_plan(
         runtime.store.get(fresh["contract_execution_id"])
     ) == fresh["metadata"]["observer_prefill_child_plan"]
+
+
+def test_fresh_rev10_dead_initial_join_recovery_allocates_new_custody(
+    conn, monkeypatch, tmp_path,
+):
+    repository = tmp_path / "recovered-allocation-world"
+    head = _init_test_git_repo(repository)
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root",
+        lambda *_args, **_kwargs: repository,
+    )
+    case = _fresh_rev10_prefill_recovery_case(conn, stale_definition=False)
+    runtime = server._contract_runtime(conn)
+    source = case["source"]
+    source_id, backlog_id = source["contract_execution_id"], source["backlog_id"]
+
+    def current(execution_id):
+        return server.handle_project_contract_runtime_current_state(_ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id}, "observer",
+        ))
+
+    def allocate_emitted_lanes(execution_id):
+        recipe = current(execution_id)["next_legal_action"][
+            "per_lane_observer_route_context_issue"
+        ]
+        body = copy.deepcopy(recipe["atomic_precheck"]["request_body_template"])
+        for issue_body, binding in zip(
+            recipe["request_bodies"], recipe["route_token_ref_bindings"], strict=True,
+        ):
+            issued = server.handle_observer_route_context_issue(_ctx(
+                {"project_id": PID}, method="POST", body=issue_body,
+            ))
+            if isinstance(issued, tuple):
+                issued = issued[1]
+            assert issued["ok"] is True
+            body["lanes"][binding["lane_index"]]["route_token_ref"] = issued["route_token_ref"]
+        before = tuple(conn.iterdump())
+        prechecked = server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx({"project_id": PID}, method="POST", body=body),
+        )
+        assert prechecked["ok"] is True
+        assert prechecked["atomic"] is True and prechecked["lane_count"] == 2
+        assert tuple(conn.iterdump()) == before
+        allocations = []
+        for allocation_body in prechecked["copy_safe_allocation_bodies"]:
+            unchanged = copy.deepcopy(allocation_body)
+            status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+                _ctx({"project_id": PID}, method="POST", body=allocation_body),
+            )
+            assert status == 201 and allocated["ok"] is True
+            assert allocation_body == unchanged
+            context = get_branch_context(conn, PID, allocation_body["task_id"])
+            assert context is not None
+            for field in ("task_id", "worker_id", "worker_slot_id", "branch_ref", "worktree_path"):
+                assert getattr(context, field) == allocated["context"][field] == unchanged[field]
+            assert context.parent_task_id == execution_id
+            assert context.base_commit == context.target_head_commit == head
+            assert set(context.owned_files) == set(unchanged["owned_files"])
+            assert Path(context.worktree_path).is_dir()
+            allocations.append((context, unchanged["route_identity"]))
+        return allocations
+
+    old_allocations = allocate_emitted_lanes(source_id)
+    dispatch_body = current(source_id)["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    dispatched = server.handle_project_contract_runtime_line_write(_ctx_with_role(
+        {"project_id": PID, "contract_execution_id": source_id}, "observer",
+        method="POST", body=dispatch_body,
+    ))
+    assert dispatched["ok"] is True, dispatched.get("decision")
+    context, identity = old_allocations[0]
+    joined = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator", method="POST", body={
+                "task_id": context.task_id, "parent_task_id": source_id,
+                "contract_execution_id": source_id,
+                "target_project_root": context.target_project_root,
+                "worker_id": context.worker_id, "worker_slot_id": context.worker_slot_id,
+                "agent_id": context.worker_id, "actual_host_worker_id": context.worker_id,
+                "worker_session_id": "recovered-allocation-native-worker",
+                "host_session_id": "recovered-allocation-native-worker",
+                "host_startup_id": "recovered-allocation-native-startup",
+                **identity, "ttl_seconds": 3600,
+                "reason": "Exercise real expired predecessor custody before fresh recovery.",
+            },
+        )
+    )
+    assert joined["ok"] is True
+
+    class ExpiredWorkerClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + timedelta(hours=2)
+
+    # Advance only the worker lease clock; do not edit persisted custody.
+    monkeypatch.setattr(parallel_branch_runtime, "datetime", ExpiredWorkerClock)
+    authority = server._contract_runtime_dead_initial_join_recovery_authority(
+        conn, project_id=PID, record=runtime.current_record(source_id, actor_role="observer"),
+    )
+    assert authority and authority["initial_join_lease_inactive"] is True
+    def historical_row_hashes():
+        tables = (
+            "contract_runtime_executions", "parallel_branch_runtime_contexts",
+            "parallel_branch_runtime_contract_revisions", "parallel_branch_merge_queue_items",
+            "observer_route_token_refs", "task_timeline_events",
+        )
+        prefixes = tuple(f'INSERT INTO "{table}"' for table in tables)
+        return {
+            hashlib.sha256(row.encode()).hexdigest()
+            for row in conn.iterdump() if row.startswith(prefixes)
+        }
+
+    old_rows = historical_row_hashes()
+    old_record = runtime.store.get(source_id)
+    old_contexts = [asdict(get_branch_context(conn, PID, ctx.task_id))
+                    for ctx, _identity in old_allocations]
+    old_git = _allocation_custody_git_snapshot(repository)
+    recovered = server.handle_project_contract_runtime_recover(_ctx(
+        {"project_id": PID}, method="POST", body={
+            **case["body"], "recovery_policy": "invalid_runtime_context_authority",
+            "recovery_authority_hash": authority["authority_hash"],
+        },
+    ))
+    recovery_id = recovered["contract_execution_id"]
+    assert recovery_id != source_id
+    assert recovered["historical_evidence_replayed"] is False
+    assert recovered["authoritative_pass_synthesized"] is False
+    prefill = recovered["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"]
+    accepted = server.handle_project_contract_runtime_line_write(_ctx_with_role(
+        {"project_id": PID, "contract_execution_id": recovery_id}, "observer",
+        method="POST", body=prefill,
+    ))
+    assert accepted["ok"] is True
+    fresh_plan = runtime.store.get(recovery_id)["metadata"]["observer_prefill_child_plan"]
+    assert fresh_plan["acceptance_criteria"] == source["metadata"]["observer_prefill_child_plan"]["acceptance_criteria"]
+    for old_lane, new_lane in zip(
+        source["metadata"]["observer_prefill_child_plan"]["lanes"], fresh_plan["lanes"], strict=True,
+    ):
+        for field in ("worker_slot_id", "owned_files", "test_files", "test_commands"):
+            assert new_lane[field] == old_lane[field]
+    new_allocations = allocate_emitted_lanes(recovery_id)
+    for field in ("runtime_context_id", "task_id", "worker_id", "branch_ref", "worktree_path"):
+        assert {getattr(ctx, field) for ctx, _ in old_allocations}.isdisjoint(
+            {getattr(ctx, field) for ctx, _ in new_allocations}
+        )
+    assert runtime.store.get(source_id) == old_record
+    assert [asdict(get_branch_context(conn, PID, ctx.task_id))
+            for ctx, _identity in old_allocations] == old_contexts
+    # All old authority, completed Facts, timeline and custody rows survive
+    # byte-for-byte; only additive recovery/allocation rows are permitted.
+    # Mutable current-position projections and SQLite sequence counters are
+    # not historical Facts. Compare the actual old authority/custody rows.
+    assert old_rows.issubset(historical_row_hashes())
+    new_git = _allocation_custody_git_snapshot(repository)
+    assert set(old_git["branches"].splitlines()).issubset(new_git["branches"].splitlines())
+    assert set(old_git["worktrees"].split("\n\n")).issubset(new_git["worktrees"].split("\n\n"))
+
+
+def test_fresh_rev10_recovery_checks_custody_before_start(conn, monkeypatch, tmp_path):
+    repository = tmp_path / "recovery-custody-conflict"
+    head = _init_test_git_repo(repository)
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root",
+        lambda *_args, **_kwargs: repository,
+    )
+    case = _fresh_rev10_prefill_recovery_case(conn)
+    source = case["source"]
+    projected = server.handle_project_contract_runtime_current_state(_ctx_with_role(
+        {"project_id": PID, "contract_execution_id": source["contract_execution_id"]},
+        "observer",
+    ))
+    recovery_id = projected["recovery"]["recovery_contract_execution_id"]
+    # Inspect the real producer's read-only output, not an assumed ID format.
+    # Nothing from this projection is seeded into the recovery execution.
+    metadata = server._contract_runtime_mf_parallel_recovery_prefill_metadata(
+        conn, ctx=_ctx({"project_id": PID}, body=case["body"]),
+        source_record=source, contract_execution_id=recovery_id,
+        route_token_ref=case["body"]["observer_route_token_ref"],
+    )
+    lane = metadata["observer_prefill_child_plan"]["lanes"][1]
+    lane_path = repository / ".worktrees" / server._parallel_branch_allocate_slug(
+        f"{lane['task_id']}-{lane['worker_id']}"
+    )
+    _materialize_precheck_custody(
+        repository_root=repository, worktree_path=lane_path,
+        branch_ref="refs/heads/foreign-owner", commit_sha=head,
+    )
+    before_db = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    before_git = _allocation_custody_git_snapshot(repository)
+
+    def forbidden_start(*args, **kwargs):
+        pytest.fail("custody conflict reached new execution admission")
+
+    monkeypatch.setattr(type(server._contract_runtime(conn)), "start_execution", forbidden_start)
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_contract_runtime_recover(_ctx(
+            {"project_id": PID}, method="POST", body=case["body"],
+        ))
+    assert rejected.value.code == "parallel_branch_allocate_precheck_custody_collision"
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["existing_worktree_touched"] is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before_db
+    assert _allocation_custody_git_snapshot(repository) == before_git
 
 
 def test_existing_rev10_recovery_without_marker_is_not_backfilled(conn, monkeypatch):
