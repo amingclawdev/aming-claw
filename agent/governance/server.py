@@ -143857,6 +143857,60 @@ _MF_PARALLEL_LANE_INTENT_FIELDS = frozenset(
 )
 
 
+def _contract_runtime_mf_parallel_cardinality_selection(
+    *,
+    required_worker_count: int,
+    observer_selected_cardinality: bool,
+    batch_child_authority: Mapping[str, Any],
+    source: str = "",
+) -> dict[str, Any]:
+    selection = {
+        "schema_version": "mf_parallel.observer_worker_cardinality_selection.v1",
+        "source": source or (
+            "authenticated_observer_mf_parallel_enter"
+            if observer_selected_cardinality
+            else "legacy_implicit_standalone_two_worker_compatibility"
+        ),
+        "observer_selected": observer_selected_cardinality,
+        "selection_origin": "mf_parallel_enter",
+        "selection_frozen": True,
+        "selection_frozen_at_enter": True,
+        "required_worker_count": required_worker_count,
+        "worker_count_policy": "exactly",
+        "atomic_dispatch_required": required_worker_count > 1,
+        "batch_row_scoped_successor": bool(batch_child_authority),
+        "batch_child_authority": dict(batch_child_authority),
+        "caller_may_change_after_enter": False,
+        "fresh_mcp_contract_requires_explicit_selection": True,
+        "legacy_implicit_compatibility": not observer_selected_cardinality,
+    }
+    selection["selection_hash"] = stable_sha256(selection)
+    return selection
+
+
+def _contract_runtime_mf_parallel_parent_route_binding(
+    *, route_token_ref: str, observer_proof: Mapping[str, Any] | None,
+    source: str = "authenticated_observer_mf_parallel_enter",
+) -> dict[str, Any]:
+    route_identity = (
+        observer_proof.get("route_identity")
+        if isinstance(observer_proof, Mapping)
+        and isinstance(observer_proof.get("route_identity"), Mapping)
+        else {}
+    )
+    binding = {
+        "schema_version": "mf_parallel.parent_route_binding.v1",
+        "source": source,
+        "route_token_ref": route_token_ref,
+        "route_identity": {
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+    }
+    binding["binding_hash"] = stable_sha256(binding)
+    return binding
+
+
 def _contract_runtime_mf_parallel_project_test_command_authority(
     project_id: str,
 ) -> dict[str, Any]:
@@ -221126,30 +221180,12 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                         "caller_override_allowed": False,
                     },
                 )
-        worker_cardinality_selection = {
-            "schema_version": (
-                "mf_parallel.observer_worker_cardinality_selection.v1"
-            ),
-            "source": (
-                "authenticated_observer_mf_parallel_enter"
-                if observer_selected_cardinality
-                else "legacy_implicit_standalone_two_worker_compatibility"
-            ),
-            "observer_selected": observer_selected_cardinality,
-            "selection_origin": "mf_parallel_enter",
-            "selection_frozen": True,
-            "selection_frozen_at_enter": True,
-            "required_worker_count": required_worker_count,
-            "worker_count_policy": "exactly",
-            "atomic_dispatch_required": required_worker_count > 1,
-            "batch_row_scoped_successor": bool(batch_child_authority),
-            "batch_child_authority": batch_child_authority,
-            "caller_may_change_after_enter": False,
-            "fresh_mcp_contract_requires_explicit_selection": True,
-            "legacy_implicit_compatibility": not observer_selected_cardinality,
-        }
-        worker_cardinality_selection["selection_hash"] = stable_sha256(
-            worker_cardinality_selection
+        worker_cardinality_selection = (
+            _contract_runtime_mf_parallel_cardinality_selection(
+                required_worker_count=required_worker_count,
+                observer_selected_cardinality=observer_selected_cardinality,
+                batch_child_authority=batch_child_authority,
+            )
         )
         row = conn.execute(
             "SELECT target_files, test_files FROM backlog_bugs WHERE bug_id = ?",
@@ -221386,23 +221422,11 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 "_contract_runtime_observer_proof",
                 None,
             )
-            route_identity = (
-                observer_proof.get("route_identity")
-                if isinstance(observer_proof, Mapping)
-                and isinstance(observer_proof.get("route_identity"), Mapping)
-                else {}
-            )
-            parent_route_binding = {
-                "schema_version": "mf_parallel.parent_route_binding.v1",
-                "source": "authenticated_observer_mf_parallel_enter",
-                "route_token_ref": route_token_ref,
-                "route_identity": {
-                    field: str(route_identity.get(field) or "").strip()
-                    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-                },
-            }
-            parent_route_binding["binding_hash"] = stable_sha256(
-                parent_route_binding
+            parent_route_binding = (
+                _contract_runtime_mf_parallel_parent_route_binding(
+                    route_token_ref=route_token_ref,
+                    observer_proof=observer_proof,
+                )
             )
             prefill_child_plan = (
                 _contract_runtime_mf_parallel_build_prefill_child_plan(
@@ -225653,6 +225677,121 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     return response
 
 
+def _contract_runtime_mf_parallel_recovery_prefill_metadata(
+    conn,
+    *,
+    ctx: RequestContext,
+    source_record: Mapping[str, Any],
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    """Revalidate semantic intent, not an old plan/Fact, for a fresh rev10 CEX."""
+
+    project_id = ctx.get_project_id()
+    backlog_id = str(source_record.get("backlog_id") or "")
+    source_metadata = source_record.get("metadata") or {}
+    source_plan = source_metadata.get("observer_prefill_child_plan") or {}
+    if not (
+        source_record.get("project_id") == project_id
+        and source_metadata.get("observer_prefill_child_plan_required") is True
+        and _contract_runtime_mf_parallel_prefill_plan_valid(
+            source_record, source_plan
+        )
+    ):
+        raise ValidationError(
+            "fresh mf_parallel rev10 recovery requires valid typed lane intent",
+            {"writes_performed": False, "mutation_performed": False},
+        )
+    source_selection = source_metadata["observer_worker_cardinality_selection"]
+    required_worker_count = _contract_runtime_mf_parallel_required_worker_count(
+        source_record, conn=conn, project_id=project_id,
+    )
+    if required_worker_count != source_plan["required_worker_count"]:
+        raise ValidationError(
+            "fresh mf_parallel rev10 recovery worker cardinality is no longer valid",
+            {"writes_performed": False, "mutation_performed": False},
+        )
+    task_id = str((source_record.get("backlog_lineage") or {}).get("task_id") or "")
+    batch_claim = source_selection.get("batch_child_authority") or {}
+    batch_authority = (
+        _contract_runtime_mf_batch_child_worker_cardinality_authority(
+            conn, project_id=project_id, backlog_id=backlog_id, task_id=task_id,
+            batch_id=str(batch_claim.get("batch_id") or ""),
+            merge_queue_id=str(batch_claim.get("merge_queue_id") or ""),
+            queue_item_id=str(batch_claim.get("queue_item_id") or ""),
+        )
+        if batch_claim else {}
+    )
+    selection = _contract_runtime_mf_parallel_cardinality_selection(
+        required_worker_count=required_worker_count,
+        observer_selected_cardinality=True,
+        batch_child_authority=batch_authority,
+        source="authenticated_observer_contract_runtime_recover",
+    )
+    row = conn.execute(
+        "SELECT target_files, test_files FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    row_test_files = _string_list_field(_row_get(row, "test_files", ""))
+    declared_files = _runtime_context_public_file_values([
+        *_string_list_field(_row_get(row, "target_files", "")), *row_test_files,
+    ])
+    criteria, closure = _require_backlog_acceptance_file_fence_closure(
+        conn, project_id=project_id, backlog_id=backlog_id, task_id=task_id,
+        allowed_files=declared_files, actor_role="observer",
+        reported_acceptance_criteria=source_plan["acceptance_criteria"],
+    )
+    observer_proof = getattr(ctx, "_contract_runtime_observer_proof", None)
+    if not observer_proof:
+        observer_proof = _resolve_contract_runtime_observer_proof(
+            ctx, conn, project_id=project_id, action="contract_runtime_recover",
+            backlog_id=backlog_id,
+            contract_execution_id=str(source_record["contract_execution_id"]),
+            record=source_record,
+        )
+        ctx._contract_runtime_observer_proof = observer_proof
+    parent_route_binding = _contract_runtime_mf_parallel_parent_route_binding(
+        route_token_ref=route_token_ref, observer_proof=observer_proof,
+        source="authenticated_observer_contract_runtime_recover",
+    )
+    # Drop every source materialization/hash. The existing builder owns all
+    # derived fields, and current registry/row/route authority is read afresh.
+    lane_intents = [
+        {field: deepcopy(lane[field]) for field in _MF_PARALLEL_LANE_INTENT_FIELDS}
+        for lane in source_plan["lanes"]
+    ]
+    plan = _contract_runtime_mf_parallel_build_prefill_child_plan(
+        project_id=project_id, backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        parent_contract_execution_id=str(
+            source_record.get("parent_contract_execution_id") or ""
+        ),
+        root_contract_execution_id=str(
+            source_record.get("root_contract_execution_id") or ""
+        ),
+        required_worker_count=required_worker_count,
+        declared_files=declared_files, row_test_files=row_test_files,
+        acceptance_criteria=criteria, acceptance_scope_closure=closure,
+        test_command_authority=(
+            _contract_runtime_mf_parallel_project_test_command_authority(project_id)
+        ),
+        parent_route_binding=parent_route_binding, lane_intents=lane_intents,
+    )
+    return {
+        "owned_files": declared_files, "target_files": declared_files,
+        "test_files": row_test_files, "required_worker_count": required_worker_count,
+        "acceptance_criteria": criteria, "acceptance_scope_closure": closure,
+        "observer_prefill_child_plan_required": True,
+        "observer_prefill_child_plan": plan,
+        # plan.source / selection_origin retain the existing typed producer
+        # vocabulary; this metadata records the actual invocation provenance.
+        "observer_prefill_child_plan_source": "authenticated_observer_contract_runtime_recover",
+        "observer_worker_cardinality_selection": selection,
+        "observer_worker_cardinality_initial_selection": deepcopy(selection),
+        "observer_worker_cardinality_revisions": [],
+    }
+
+
 @route("POST", "/api/projects/{project_id}/contract-runtime/recover")
 def handle_project_contract_runtime_recover(ctx: RequestContext):
     """Start an idempotent current-definition execution for one stale pin."""
@@ -225932,6 +226071,51 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                 recovery_metadata["current_repair_target"] = (
                     current_repair_target
                 )
+            recovery_route_ref = route_token_ref
+            if (
+                _is_mf_parallel_record_contract_id(
+                    str(source_record.get("contract_id") or "")
+                )
+                and source_record.get("revision") == "rev10"
+            ):
+                recovery_metadata.update(
+                    _contract_runtime_mf_parallel_recovery_prefill_metadata(
+                        conn, ctx=ctx, source_record=source_record,
+                        contract_execution_id=recovery_execution_id,
+                        route_token_ref=route_token_ref,
+                    )
+                )
+                binding = _contract_runtime_issue_child_route_token_ref(
+                    conn, project_id=project_id, backlog_id=backlog_id,
+                    child_contract_execution_id=recovery_execution_id,
+                    parent_route_token_ref=route_token_ref,
+                    parent_record=source_record,
+                    target_files=recovery_metadata["owned_files"],
+                    source="contract_runtime_recovery",
+                )
+                candidate = _contract_runtime_apply_route_token_binding(
+                    {
+                        **dict(source_record),
+                        "contract_execution_id": recovery_execution_id,
+                        "completed_lines": [],
+                        "metadata": recovery_metadata,
+                        "backlog_lineage": backlog_lineage,
+                    },
+                    binding=binding,
+                )
+                if not (
+                    binding.get("status") == "issued_child_ref"
+                    and _contract_runtime_mf_parallel_prefill_plan_valid(
+                        candidate, recovery_metadata["observer_prefill_child_plan"]
+                    )
+                ):
+                    raise ValidationError(
+                        "fresh mf_parallel rev10 recovery requires current child route authority",
+                        {"reason": binding.get("reason"), "fail_closed": True},
+                    )
+                recovery_metadata = candidate["metadata"]
+                backlog_lineage = candidate["backlog_lineage"]
+                recovery_route_ref = candidate["route_token_ref"]
             try:
                 recovery_record = runtime.start_execution(
                     str(source_record.get("contract_id") or ""),
@@ -225941,7 +226125,7 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                     contract_execution_id=recovery_execution_id,
                     version=str(source_record.get("version") or "") or None,
                     revision=str(source_record.get("revision") or "") or None,
-                    route_token_ref=route_token_ref,
+                    route_token_ref=recovery_route_ref,
                     parent_contract_execution_id=str(
                         source_record.get("parent_contract_execution_id") or ""
                     ),
@@ -226010,6 +226194,15 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
             recovery_execution_id,
             actor_role=actor_role,
         )
+        recovery_record = _contract_runtime_apply_mf_parallel_prefill_plan_projection(
+            recovery_record
+        )
+        observer_proof = getattr(ctx, "_contract_runtime_observer_proof", None)
+        if isinstance(observer_proof, Mapping):
+            recovery_record = _contract_runtime_bind_observer_dispatch_transport_proof(
+                recovery_record,
+                {**dict(observer_proof), "route_token_ref": recovery_record["route_token_ref"]},
+            )
         conn.commit()
 
     response = _contract_runtime_response(

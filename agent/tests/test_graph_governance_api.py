@@ -140508,6 +140508,341 @@ def test_generic_stale_contract_runtime_projection_exposes_copy_safe_mcp_recover
     }
 
 
+def _fresh_rev10_prefill_recovery_case(conn, *, stale_definition=True):
+    backlog_id = "AC-REV10-RECOVERY-PREFILL-PARITY"
+    task_id = "rev10-recovery-prefill-parity"
+    files = ["agent/governance/server.py", "agent/tests/test_graph_governance_api.py"]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
+        (json.dumps(files[:1]), json.dumps(files[1:]), backlog_id),
+    )
+    session_id = _insert_active_observer_session_ref(
+        conn, session_id="obs-rev10-recovery-prefill-parity",
+    )
+    execution_id = server._mf_parallel_execution_id(
+        PID, backlog_id, server._onboard_service_execution_id(PID, backlog_id), task_id,
+    )
+    enter_ref = "rtok-rev10-prefill-original-enter"
+    _persist_contract_runtime_observer_route_ref(
+        conn, backlog_id=backlog_id, contract_execution_id=execution_id,
+        route_token_ref=enter_ref, target_files=files,
+        allowed_actions=["mf_parallel_enter", "contract_runtime_submit_line"],
+    )
+    entered = server.handle_project_mf_parallel_enter(_ctx(
+        {"project_id": PID}, method="POST", body={
+            "backlog_id": backlog_id, "task_id": task_id,
+            "reason": "Exercise normal enter and fresh recovery producer parity.",
+            "observer_session_id": session_id, "observer_route_token_ref": enter_ref,
+            "onboard_service_waiver": True, "owned_files": files,
+            "metadata": {"required_worker_count": 2, "lane_intents": [
+                {"task_id": f"{task_id}-{index}", "worker_id": f"worker-{index}",
+                 "worker_slot_id": f"worker-{index}", "owned_files": [path]}
+                for index, path in enumerate(files)
+            ]},
+        },
+    ))
+    original_body = entered["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"]
+    accepted = server.handle_project_contract_runtime_line_write(_ctx(
+        {"project_id": PID, "contract_execution_id": execution_id},
+        method="POST", body=original_body,
+    ))
+    assert accepted["ok"] is True
+    runtime = server._contract_runtime(conn)
+    source = runtime.store.get(execution_id)
+    if stale_definition:
+        source["definition_hash"] = "sha256:old-current-rev10-definition"
+        runtime.store.update(execution_id, source)
+    recover_ref = "rtok-rev10-prefill-current-recovery-parent"
+    _persist_contract_runtime_observer_route_ref(
+        conn, backlog_id=backlog_id, contract_execution_id=execution_id,
+        route_token_ref=recover_ref, target_files=files,
+        allowed_actions=["contract_runtime_recover", "contract_runtime_current"],
+    )
+    conn.commit()
+    return {
+        "source": runtime.store.get(execution_id), "files": files,
+        "body": {
+            "backlog_id": backlog_id, "stale_contract_execution_id": execution_id,
+            "recovery_policy": "start_new_execution",
+            "observer_session_id": session_id, "observer_route_token_ref": recover_ref,
+        },
+    }
+
+
+def test_fresh_rev10_recovery_rebuilds_consumable_prefill_before_start(conn, monkeypatch):
+    case = _fresh_rev10_prefill_recovery_case(conn)
+    source = case["source"]
+    source_plan = source["metadata"]["observer_prefill_child_plan"]
+    config, config_source = server._registry_project_config(PID)
+    current_config = copy.deepcopy(config)
+    current_config["testing"]["unit_command"] = "python -m pytest tests/current.py -q"
+    monkeypatch.setattr(server, "_registry_project_config", lambda _pid: (current_config, config_source))
+    runtime = server._contract_runtime(conn)
+    starts = []
+    real_start = type(runtime).start_execution
+
+    def checked_start(self, *args, **kwargs):
+        metadata = kwargs["metadata"]
+        plan = metadata["observer_prefill_child_plan"]
+        assert metadata["observer_prefill_child_plan_required"] is True
+        assert plan["contract_execution_id"] == kwargs["contract_execution_id"]
+        assert metadata["observer_worker_cardinality_selection"]["required_worker_count"] == 2
+        assert metadata["route_token_ref_binding"]["child_contract_execution_id"] == kwargs["contract_execution_id"]
+        assert kwargs["route_token_ref"] != case["body"]["observer_route_token_ref"]
+        starts.append(kwargs["contract_execution_id"])
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(runtime), "start_execution", checked_start)
+    recovered = server.handle_project_contract_runtime_recover(_ctx(
+        {"project_id": PID}, method="POST", body=case["body"],
+    ))
+    execution_id = recovered["contract_execution_id"]
+    assert starts == [execution_id]
+    assert execution_id != source["contract_execution_id"]
+    record = runtime.store.get(execution_id)
+    metadata = record["metadata"]
+    plan = metadata["observer_prefill_child_plan"]
+    assert record["completed_lines"] == []
+    assert plan["plan_hash"] != source_plan["plan_hash"]
+    assert plan["test_commands"] == [current_config["testing"]["unit_command"]]
+    assert plan["test_command_authority"]["authority_hash"] != source_plan["test_command_authority"]["authority_hash"]
+    assert plan["parent_route_binding"]["route_token_ref"] == case["body"]["observer_route_token_ref"]
+    assert metadata["observer_prefill_child_plan_source"] == "authenticated_observer_contract_runtime_recover"
+    assert metadata["observer_worker_cardinality_selection"]["source"] == "authenticated_observer_contract_runtime_recover"
+    assert metadata["observer_worker_cardinality_revisions"] == []
+    assert runtime.store.get(source["contract_execution_id"]) == source
+    assert recovered["historical_evidence_replayed"] is False
+    assert recovered["authoritative_pass_synthesized"] is False
+    resolved = observer_route_context.resolve_route_token_ref(
+        conn, project_id=PID, backlog_id=source["backlog_id"],
+        task_id=execution_id, route_token_ref=record["route_token_ref"],
+    )
+    assert resolved["scope"]["task_id"] == execution_id
+    assert resolved["parent_route_lineage"]["route_token_ref"] == case["body"]["observer_route_token_ref"]
+    current = server.handle_project_contract_runtime_current_state(_ctx(
+        {"project_id": PID, "contract_execution_id": execution_id}, query={
+            "observer_session_id": case["body"]["observer_session_id"],
+            "observer_route_token_ref": record["route_token_ref"],
+        },
+    ))
+    copy_body = current["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"]
+    assert copy_body == recovered["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"]
+    assert copy_body["payload"] == server._contract_runtime_mf_parallel_prefill_payload(plan)
+    for payload in (None, server._contract_runtime_mf_parallel_prefill_payload(source_plan)):
+        invalid_body = copy.deepcopy(copy_body)
+        if payload is None:
+            invalid_body.pop("payload")
+        else:
+            invalid_body["payload"] = payload
+        rejected = server.handle_project_contract_runtime_line_write(_ctx(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            method="POST", body=invalid_body,
+        ))
+        assert rejected["ok"] is False
+        assert runtime.store.get(execution_id)["completed_lines"] == []
+    accepted = server.handle_project_contract_runtime_line_write(_ctx(
+        {"project_id": PID, "contract_execution_id": execution_id},
+        method="POST", body=copy_body,
+    ))
+    assert accepted["ok"] is True
+    persisted = runtime.store.get(execution_id)
+    assert persisted["completed_lines"][0]["payload"] == copy_body["payload"]
+    # This is the unchanged strict plan selector consumed by pre-merge.
+    assert server._contract_runtime_mf_parallel_admitted_prefill_child_plan(persisted) == plan
+    before_replay = "\n".join(conn.iterdump())
+    replay = server.handle_project_contract_runtime_recover(_ctx(
+        {"project_id": PID}, method="POST", body=case["body"],
+    ))
+    assert replay["idempotent"] is True
+    assert starts == [execution_id]
+    assert "\n".join(conn.iterdump()) == before_replay
+
+
+@pytest.mark.parametrize("invalid_input", [
+    "missing_marker", "plan_hash", "cardinality", "row_fence", "test_commands", "route",
+])
+def test_fresh_rev10_recovery_invalid_inputs_reject_before_start(conn, monkeypatch, invalid_input):
+    case = _fresh_rev10_prefill_recovery_case(conn)
+    runtime = server._contract_runtime(conn)
+    source = case["source"]
+    if invalid_input == "missing_marker":
+        source["metadata"].pop("observer_prefill_child_plan_required")
+    elif invalid_input == "plan_hash":
+        source["metadata"]["observer_prefill_child_plan"]["plan_hash"] = "sha256:stale-plan"
+    elif invalid_input == "cardinality":
+        source["metadata"]["observer_worker_cardinality_selection"]["required_worker_count"] = 1
+    elif invalid_input == "row_fence":
+        conn.execute("UPDATE backlog_bugs SET test_files='[]' WHERE bug_id=?", (source["backlog_id"],))
+    elif invalid_input == "test_commands":
+        config, config_source = server._registry_project_config(PID)
+        invalid_config = copy.deepcopy(config)
+        invalid_config["testing"] = {}
+        monkeypatch.setattr(server, "_registry_project_config", lambda _pid: (invalid_config, config_source))
+    else:
+        case["body"]["observer_route_token_ref"] = "rtok-not-registered-for-recovery"
+    runtime.store.update(source["contract_execution_id"], source)
+    conn.commit()
+    before = "\n".join(conn.iterdump())
+
+    def forbidden_start(*args, **kwargs):
+        pytest.fail("invalid recovery input reached start_execution")
+
+    monkeypatch.setattr(type(runtime), "start_execution", forbidden_start)
+    with pytest.raises((ValidationError, PermissionDeniedError, server.GovernanceError)):
+        server.handle_project_contract_runtime_recover(_ctx(
+            {"project_id": PID}, method="POST", body=case["body"],
+        ))
+    assert "\n".join(conn.iterdump()) == before
+
+
+def test_fresh_rev10_dead_initial_join_recovery_preserves_typed_prefill(conn, monkeypatch, tmp_path):
+    now_iso = "2099-08-02T01:00:00Z"
+    monkeypatch.setattr(server, "_utc_now", lambda: now_iso)
+    case = _fresh_rev10_prefill_recovery_case(conn, stale_definition=False)
+    source = case["source"]
+    execution_id, backlog_id = source["contract_execution_id"], source["backlog_id"]
+    plan = source["metadata"]["observer_prefill_child_plan"]
+    workers, contexts = [], []
+    for lane in plan["lanes"]:
+        worker_path = tmp_path / lane["task_id"]
+        worker_path.mkdir()
+        context = _insert_mf_parallel_source_backed_runtime_context(
+            conn, backlog_id=backlog_id, task_id=lane["task_id"],
+            parent_task_id=execution_id, worker_id=lane["worker_id"],
+            worker_slot_id=lane["worker_slot_id"], token="",
+            fence_token=f"fence-{lane['task_id']}",
+            worktree_path=str(worker_path), target_project_root=str(worker_path),
+            base_commit="a" * 40, target_head_commit="a" * 40,
+            merge_queue_id=f"mq-{lane['task_id']}",
+            owned_files=tuple(lane["owned_files"]),
+        )
+        context = upsert_branch_context(conn, replace(
+            context, agent_id=context.worker_id, allocation_owner=context.worker_id,
+        ), now_iso=now_iso)
+        payload = _mf_parallel_rev3_worker_dispatch_payload(
+            conn, backlog_id=backlog_id, runtime_context=context,
+            route_label=lane["task_id"], route_task_id=execution_id,
+        )
+        payload.update({field: copy.deepcopy(lane[field]) for field in (
+            "worker_id", "worker_slot_id", "test_files", "test_commands",
+        )})
+        payload["agent_id"] = context.worker_id
+        workers.append(payload)
+        contexts.append(context)
+    dispatch = server.handle_project_contract_runtime_line_write(_ctx_with_role(
+        {"project_id": PID, "contract_execution_id": execution_id}, "observer",
+        method="POST", body={
+            "stage_id": "dispatch", "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "dispatch_bounded_worker",
+            "payload": {"bounded_workers": workers, "worker_count": 2,
+                        "acceptance_criteria": plan["acceptance_criteria"]},
+        },
+    ))
+    assert dispatch["ok"] is True, dispatch.get("decision")
+    # Allocation contexts above are bounded fixture rows. Supply their normal
+    # per-worker dispatch audit projection as well, before the real join Gate.
+    for worker in workers:
+        task_timeline.record_event(
+            conn, project_id=PID, backlog_id=backlog_id, task_id=worker["task_id"],
+            event_type="mf_subagent.dispatch", event_kind="bounded_implementation_worker_dispatch",
+            actor="observer", status="accepted",
+            payload={**worker, "bounded_implementation_worker_dispatch": worker},
+        )
+    context = contexts[0]
+    identity = workers[0]["route_identity"]
+    append_branch_contract_revision(
+        conn, context, revision_id="crev-rev10-dead-initial-join",
+        route_identity=identity, payload={
+            "schema_version": "parallel_branch_allocate_contract_revision.v1",
+            "source": "parallel_branch_allocate", "contract_execution_id": execution_id,
+            "runtime_context_id": context.runtime_context_id, "task_id": context.task_id,
+            "parent_task_id": execution_id, "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "target_project_root": context.target_project_root, "route_identity": identity,
+        }, now_iso=now_iso,
+    )
+    conn.commit()
+    joined = server.handle_graph_governance_runtime_context_session_token_initial_join(_ctx_with_role(
+        {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+        "coordinator", method="POST", body={
+            "task_id": context.task_id, "parent_task_id": execution_id,
+            "contract_execution_id": execution_id, "target_project_root": context.target_project_root,
+            "worker_id": context.worker_id, "worker_slot_id": context.worker_slot_id,
+            "agent_id": context.worker_id, "actual_host_worker_id": context.worker_id,
+            "worker_session_id": "session-rev10-expiring-initial-join",
+            "host_session_id": "session-rev10-expiring-initial-join",
+            "host_startup_id": "startup-rev10-expiring-initial-join",
+            **identity, "reason": "Reproduce expired current-rev10 initial join.",
+            "ttl_seconds": 3600, "now_iso": now_iso,
+        },
+    ))
+    assert joined["ok"] is True, joined
+    saved = get_branch_context(conn, PID, context.task_id)
+    upsert_branch_context(conn, replace(saved, lease_expires_at="2000-01-01T00:00:00Z"), now_iso=now_iso)
+    conn.commit()
+    runtime = server._contract_runtime(conn)
+    original = runtime.store.get(execution_id)
+    current = runtime.current_record(execution_id, actor_role="observer")
+    authority = server._contract_runtime_dead_initial_join_recovery_authority(
+        conn, project_id=PID, record=current,
+    )
+    assert authority and authority["revision"] == "rev10"
+    assert authority["initial_join_lease_inactive"] is True
+    body = {**case["body"], "recovery_policy": "invalid_runtime_context_authority",
+            "recovery_authority_hash": authority["authority_hash"]}
+    recovered = server.handle_project_contract_runtime_recover(_ctx(
+        {"project_id": PID}, method="POST", body=body,
+    ))
+    assert recovered["recovery_reason"] == "invalid_runtime_context_authority"
+    assert recovered["contract_execution_id"] == authority["recovery_contract_execution_id"]
+    fresh = runtime.store.get(recovered["contract_execution_id"])
+    assert fresh["completed_lines"] == []
+    assert fresh["metadata"]["observer_prefill_child_plan_required"] is True
+    assert runtime.store.get(execution_id) == original
+    copy_body = recovered["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"]
+    accepted = server.handle_project_contract_runtime_line_write(_ctx(
+        {"project_id": PID, "contract_execution_id": fresh["contract_execution_id"]},
+        method="POST", body=copy_body,
+    ))
+    assert accepted["ok"] is True, accepted
+    assert server._contract_runtime_mf_parallel_admitted_prefill_child_plan(
+        runtime.store.get(fresh["contract_execution_id"])
+    ) == fresh["metadata"]["observer_prefill_child_plan"]
+
+
+def test_existing_rev10_recovery_without_marker_is_not_backfilled(conn, monkeypatch):
+    case = _fresh_rev10_prefill_recovery_case(conn)
+    runtime = server._contract_runtime(conn)
+    source = case["source"]
+    try:
+        runtime.current_record(source["contract_execution_id"], actor_role="observer")
+    except server.StalePinnedContractExecutionError as stale:
+        recovery_id = server._contract_runtime_stale_recovery_id(stale)
+    runtime.start_execution(
+        server.MF_PARALLEL_CONTRACT_ID, project_id=PID,
+        backlog_id=source["backlog_id"], actor_role="observer",
+        contract_execution_id=recovery_id, version="v2", revision="rev10",
+        parent_contract_execution_id=source["parent_contract_execution_id"],
+        root_contract_execution_id=source["root_contract_execution_id"],
+        contract_chain_id=source["contract_chain_id"],
+        metadata={"stale_contract_execution_id": source["contract_execution_id"]},
+    )
+    conn.commit()
+    before = "\n".join(conn.iterdump())
+
+    def forbidden_producer(*args, **kwargs):
+        pytest.fail("historical recovery attempted fresh plan production")
+
+    monkeypatch.setattr(server, "_contract_runtime_mf_parallel_recovery_prefill_metadata", forbidden_producer)
+    result = server.handle_project_contract_runtime_recover(_ctx(
+        {"project_id": PID}, method="POST", body=case["body"],
+    ))
+    assert result["idempotent"] is True
+    assert "\n".join(conn.iterdump()) == before
+    assert "observer_prefill_child_plan_required" not in runtime.store.get(recovery_id)["metadata"]
+
+
 def test_generic_contract_runtime_recovery_preserves_stale_evidence_without_replay(
     conn, tmp_path
 ):
