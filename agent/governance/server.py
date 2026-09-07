@@ -88184,6 +88184,104 @@ def _active_epoch_worldref_precheck_fresh_repair_successor(
     }
 
 
+def _integration_epoch_governed_worktree_clean(project_root: Path) -> bool:
+    """Apply the existing generated-path policy only to untracked entries."""
+
+    if _git_clean_worktree_verified(project_root):
+        return True
+    try:
+        result = _qa_git_bytes(
+            project_root,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            timeout=10,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.decode(
+        "utf-8", errors="surrogateescape"
+    ).splitlines():
+        paths = parse_git_porcelain_paths(line)
+        if not paths or not line.startswith("?? ") or filter_dirty_files(paths):
+            return False
+    return True
+
+
+def _integration_epoch_pending_merge_action(conn, epoch) -> dict[str, Any]:
+    """Keep an already-landed member's own merge-credit line executable."""
+
+    from .parallel_branch_runtime import get_branch_context, get_merge_queue_item
+
+    if len(epoch.merged_prefix) != epoch.merge_cursor:
+        return {}
+    try:
+        root = project_service.resolve_project_root(
+            epoch.project_id, None, fallback_self=False
+        )
+        if root is None or not _integration_epoch_governed_worktree_clean(Path(root)):
+            return {}
+        target_head = _parallel_branch_resolve_canonical_commit(
+            Path(root), epoch.target_ref, field="target_ref"
+        )
+        epoch_head = _parallel_branch_resolve_canonical_commit(
+            Path(root), epoch.current_head, field="epoch.current_head"
+        )
+        if target_head != epoch_head or _git_head_commit(Path(root)) != target_head:
+            return {}
+    except Exception:
+        return {}
+    for index, queue_item_id in enumerate(epoch.merged_prefix, start=1):
+        item = get_merge_queue_item(
+            conn, epoch.project_id, epoch.merge_queue_id, queue_item_id
+        )
+        if (
+            item is None or item.status != "merged" or item.queue_index != index
+            or item.target_ref != epoch.target_ref
+        ):
+            return {}
+        context = get_branch_context(conn, epoch.project_id, item.task_id)
+        if (
+            context is None
+            or context.backlog_id != item.backlog_id
+            or context.batch_id != epoch.batch_id
+            or context.merge_queue_id != epoch.merge_queue_id
+        ):
+            return {}
+        try:
+            record = _contract_runtime_read(
+                conn,
+                contract_execution_id=context.parent_task_id,
+                actor_role="observer",
+            )
+            record = _contract_runtime_bind_observer_dispatch_transport_proof(
+                record, None, conn=conn, project_id=epoch.project_id,
+            )
+        except ContractRuntimeError:
+            return {}
+        action = _runtime_next_action_from_guide(record.get("runtime_guide") or {})
+        if action.get("line_id") != "observer_merge":
+            continue
+        authority = _contract_runtime_observer_merge_durable_authority(
+            conn, project_id=epoch.project_id, record=record
+        )
+        if not (
+            authority.get("db_verified") is True
+            and authority.get("project_id") == epoch.project_id
+            and authority.get("contract_execution_id") == context.parent_task_id
+            and authority.get("merge_queue_id") == epoch.merge_queue_id
+            and authority.get("queue_item_id") == queue_item_id
+            and _git_commit_is_ancestor(Path(root), item.merge_commit, target_head)
+        ):
+            return {}
+        return {
+            **action,
+            "backlog_id": item.backlog_id,
+            "contract_execution_id": context.parent_task_id,
+        }
+    return {}
+
+
 def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
     """Project incomplete-fanin reconcile input from canonical Git HEAD."""
 
@@ -88214,7 +88312,7 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
             )
         if project_root is not None and not current_target_head_blocker:
             try:
-                clean_worktree_verified = _git_clean_worktree_verified(
+                clean_worktree_verified = _integration_epoch_governed_worktree_clean(
                     Path(project_root)
                 )
             except Exception:
@@ -88270,6 +88368,7 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
         and epoch.remaining_queue_item_ids == (epoch.active_queue_item_id,)
     ):
         target_world_head = ""
+        epoch_world_head = ""
         target_world_head_validated = False
         target_world_blocker = ""
         target_descends_from_epoch_world = False
@@ -88286,7 +88385,7 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
             target_world_blocker = "target_world_project_not_registered"
         if project_root is not None and not target_world_blocker:
             root = Path(project_root)
-            if not _git_clean_worktree_verified(root):
+            if not _integration_epoch_governed_worktree_clean(root):
                 target_world_blocker = "target_world_worktree_not_clean"
             else:
                 try:
@@ -88309,15 +88408,23 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
                     if not target_world_head_validated:
                         target_world_blocker = "target_world_head_not_full"
                     else:
+                        try:
+                            epoch_world_head = _parallel_branch_resolve_canonical_commit(
+                                root, epoch.current_head, field="epoch.current_head"
+                            )
+                        except Exception:
+                            target_world_blocker = "epoch_world_head_not_git_object"
+                            target_world_head_validated = False
                         target_descends_from_epoch_world = (
-                            _git_commit_is_ancestor(
+                            bool(epoch_world_head)
+                            and _git_commit_is_ancestor(
                                 root,
-                                epoch.current_head,
+                                epoch_world_head,
                                 target_world_head,
                             )
                         )
         if (
-            target_world_head != str(epoch.current_head or "").lower()
+            (target_world_blocker or target_world_head != epoch_world_head)
             and (target_world_head or target_world_blocker)
         ):
             worldref_projection = integration_epoch_worldref_seal_action_payload(
@@ -88346,13 +88453,26 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
                     return repair_successor
             return worldref_projection
 
-    return integration_epoch_resume_payload(
+    resume = integration_epoch_resume_payload(
         conn,
         epoch,
         current_target_head=current_target_head,
         current_target_head_validated=current_target_head_validated,
         current_target_head_blocker=current_target_head_blocker,
     )
+    if epoch.status == INTEGRATION_EPOCH_OPEN and not epoch.incomplete_fanin:
+        merge_action = _integration_epoch_pending_merge_action(conn, epoch)
+        if merge_action:
+            return merge_action
+        successor = _entered_batch_successor_resume_projection(
+            conn,
+            project_id=epoch.project_id,
+            coordination_backlog_id=epoch.coordination_backlog_id,
+            active_epoch=epoch,
+        )
+        if successor:
+            return dict(successor.get("next_legal_action") or {})
+    return resume
 
 
 def _verify_incomplete_fanin_reconcile_target(
@@ -135347,6 +135467,7 @@ def _entered_batch_successor_resume_projection(
     *,
     project_id: str,
     coordination_backlog_id: str,
+    active_epoch: Any = None,
 ) -> dict[str, Any]:
     """Project the next durable batch child without reopening the batch.
 
@@ -135448,6 +135569,58 @@ def _entered_batch_successor_resume_projection(
     if not planned:
         return blocked("entered_batch_has_no_planned_successor")
     selected = planned[0]
+    if active_epoch is not None:
+        ordered_ids = tuple(str(row.get("queue_item_id") or "") for row in queue)
+        cursor = active_epoch.merge_cursor
+        if not (
+            active_epoch.project_id == project_id
+            and active_epoch.coordination_backlog_id == coordination_backlog_id
+            and active_epoch.batch_id == batch_id
+            and active_epoch.merge_queue_id == merge_queue_id
+            and active_epoch.status == "open"
+            and not active_epoch.incomplete_fanin
+            and 0 <= cursor < len(queue)
+            and active_epoch.merged_prefix == ordered_ids[:cursor]
+            and active_epoch.remaining_queue_item_ids == ordered_ids[cursor:]
+            and active_epoch.active_queue_item_id == selected.get("queue_item_id")
+            and active_epoch.active_task_id == selected.get("task_id")
+            and active_epoch.active_backlog_id == selected.get("backlog_id")
+            and active_epoch.target_ref == selected.get("target_ref")
+            and int(selected.get("queue_index") or 0) == cursor + 1
+        ):
+            return blocked("entered_batch_active_epoch_identity_mismatch")
+        from .parallel_branch_runtime import get_branch_context
+
+        for merged in queue[:cursor]:
+            context = get_branch_context(conn, project_id, merged["task_id"])
+            if context is None or merged.get("status") != "merged":
+                return blocked("entered_batch_prior_merge_credit_unverified")
+            try:
+                prior = _contract_runtime_store(conn).get(context.parent_task_id)
+            except ContractRuntimeError:
+                return blocked("entered_batch_prior_merge_credit_unverified")
+            accepted_merge = any(
+                isinstance(line, Mapping)
+                and line.get("line_id") == "observer_merge"
+                and _contract_runtime_completed_line_acceptance(
+                    conn, project_id=project_id, record=prior,
+                    completed_line_index=index, expected_line=line,
+                ).get("db_verified") is True
+                for index, line in enumerate(prior.get("completed_lines") or [])
+            )
+            authority = _contract_runtime_shared_batch_child_lane_merge_authority(
+                conn, project_id=project_id, record=prior, context=context,
+                timeline_events=_runtime_context_service_timeline_events(
+                    conn, project_id=project_id, task_id=context.task_id,
+                    backlog_id=context.backlog_id,
+                ),
+            ) if accepted_merge else {}
+            if not (
+                authority.get("authority_verified") is True
+                and authority.get("merge_queue_id") == merge_queue_id
+                and authority.get("queue_item_id") == merged["queue_item_id"]
+            ):
+                return blocked("entered_batch_prior_merge_credit_unverified")
     fanout = payload.get("fanout_policy")
     successors = (
         fanout.get("per_row_successors")
@@ -135525,7 +135698,10 @@ def _entered_batch_successor_resume_projection(
         project_id=project_id,
         dirty_entries=[item for item in status.stdout.split(b"\0") if item],
     )
-    if dirty_entries:
+    if dirty_entries and not (
+        active_epoch is not None
+        and _integration_epoch_governed_worktree_clean(canonical_root)
+    ):
         return blocked("entered_batch_current_worktree_not_clean")
     current_head = str(_git_head_commit(canonical_root) or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", current_head):
@@ -135561,6 +135737,22 @@ def _entered_batch_successor_resume_projection(
         and _git_commit_is_ancestor(canonical_root, historical_base, current_head)
     ):
         return blocked("entered_batch_historical_base_not_ancestor")
+    if active_epoch is not None:
+        try:
+            epoch_head = _parallel_branch_resolve_canonical_commit(
+                canonical_root, active_epoch.current_head, field="epoch.current_head"
+            )
+            epoch_base = _parallel_branch_resolve_canonical_commit(
+                canonical_root, active_epoch.base_head, field="epoch.base_head"
+            )
+        except GovernanceError:
+            return blocked("entered_batch_active_epoch_git_world_unresolved")
+        if epoch_head != current_head or epoch_base != historical_base:
+            return blocked("entered_batch_active_epoch_git_world_mismatch")
+    # An OPEN batch retains its original graph world until the one final
+    # reconcile.  Project the original child entry with the current target,
+    # not an early current-full requirement or rewritten historical queue.
+    graph_commit = historical_base if active_epoch is not None else current_head
     try:
         active_row = conn.execute(
             """
@@ -135572,7 +135764,7 @@ def _entered_batch_successor_resume_projection(
              WHERE r.project_id = ? AND r.ref_name = 'active'
                AND r.commit_sha = ? AND s.commit_sha = ?
             """,
-            (project_id, current_head, current_head),
+            (project_id, graph_commit, graph_commit),
         ).fetchone()
     except sqlite3.Error:
         active_row = None
@@ -135589,6 +135781,10 @@ def _entered_batch_successor_resume_projection(
     if integrity.get("valid") is not True:
         return blocked("entered_batch_current_graph_snapshot_invalid")
     current_snapshot_id = str(active_snapshot.get("snapshot_id") or "").strip()
+    if active_epoch is not None and current_snapshot_id != str(
+        durable_successor_item.get("snapshot_id") or ""
+    ).strip():
+        return blocked("entered_batch_active_epoch_graph_world_mismatch")
     if not re.fullmatch(
         r"full-(?:[0-9a-f]{7}-[0-9a-f]{4}|[0-9a-f]{12}-[0-9a-f]{12})",
         current_snapshot_id,
@@ -165762,8 +165958,9 @@ def _onboard_guide_capsule_bounded_section(
     *,
     section_name: str,
     overflow_fallback: Mapping[str, Any] | None = None,
+    max_depth: int = 5,
 ) -> dict[str, Any]:
-    projected = _onboard_guide_capsule_bounded_copy(value)
+    projected = _onboard_guide_capsule_bounded_copy(value, max_depth=max_depth)
     if not isinstance(projected, Mapping):
         projected = {"value": projected}
     projected = dict(projected)
@@ -169554,10 +169751,20 @@ def _onboard_route_guide_compact_service_response(
         # selected Contract action is not ready.
         action_input = {}
         action_input_path = ""
+    # The original batch child body includes metadata.lane_intents[].owned_files.
+    # Keep that executable shape through both compact wrappers, without changing
+    # the section byte cap, collection bounds, or raw-auth filtering.
+    entered_batch_copy_depth = (
+        8
+        if next_action.get("source") == "durable_entered_batch"
+        and next_action.get("id") == "resume_entered_batch_successor"
+        else 5
+    )
     successor_action_input = (
         _onboard_guide_capsule_bounded_section(
             next_action.get("successor_action_input"),
             section_name="successor_action_input",
+            max_depth=entered_batch_copy_depth,
         )
         if isinstance(next_action.get("successor_action_input"), Mapping)
         else {}
@@ -170188,6 +170395,7 @@ def _onboard_route_guide_compact_service_response(
             "next_action": _onboard_guide_capsule_bounded_section(
                 next_action_projection,
                 section_name="next_action",
+                max_depth=entered_batch_copy_depth,
             ),
             "authority": _onboard_guide_capsule_bounded_section(
                 authority,
@@ -170211,6 +170419,7 @@ def _onboard_route_guide_compact_service_response(
                     "host_precursor_action": host_precursor_action,
                 },
                 section_name="action_input",
+                max_depth=entered_batch_copy_depth,
                 overflow_fallback=(
                     {
                         "schema_version": (
@@ -225383,7 +225592,13 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
         response["integration_epoch_resume_projection"] = epoch_projection
         response["integration_epoch"] = active_epoch_payload
         response["integration_backlog_scope"] = active_epoch_backlog_scope
-        response["next_legal_action"] = active_epoch_resume
+        own_action = response.get("contract_runtime_next_legal_action") or {}
+        if not (
+            active_epoch_resume.get("contract_execution_id") == contract_execution_id
+            and active_epoch_resume.get("line_id") == "observer_merge"
+            and own_action.get("line_id") == "observer_merge"
+        ):
+            response["next_legal_action"] = active_epoch_resume
         response["position_skippable"] = False
     return response
 

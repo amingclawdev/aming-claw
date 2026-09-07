@@ -183799,9 +183799,279 @@ def _stub_worldref_seal_git(monkeypatch, tmp_path, *, head="b" * 40):
     monkeypatch.setattr(
         server,
         "_parallel_branch_resolve_canonical_commit",
-        lambda _root, _ref, *, field: head,
+        lambda _root, _ref, *, field: _ref if field == "epoch.current_head" else head,
     )
     monkeypatch.setattr(server, "_git_commit_is_ancestor", lambda *_args: True)
+
+
+@pytest.mark.parametrize("abbreviated", [False, True])
+def test_open_epoch_generated_paths_and_same_git_object_do_not_select_seal(
+    conn, monkeypatch, tmp_path, abbreviated,
+):
+    root, target_ref, _base, head = _worldref_production_git_repo(tmp_path)
+    epoch = _worldref_seal_server_fixture(
+        conn, current_head=head[:7] if abbreviated else head, target_ref=target_ref,
+    )
+    marker = root / ".aming-claw-demo-environment.json"
+    marker.write_text("generated marker\n", encoding="utf-8")
+    (root / ".worktrees" / "managed").mkdir(parents=True)
+    (root / ".worktrees" / "managed" / "generated.txt").write_text("local\n")
+    monkeypatch.setattr(server.project_service, "resolve_project_root", lambda *_a, **_k: root)
+    before = conn.total_changes
+    assert server._git_clean_worktree_verified(root) is False
+    assert server._server_integration_epoch_resume_payload(conn, epoch)["id"] == "resume_batch_merge"
+    assert conn.total_changes == before
+    assert get_integration_epoch(conn, PID, epoch.batch_id) == epoch
+    assert marker.read_text() == "generated marker\n"
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+def test_open_epoch_generated_policy_retains_governed_and_tracked_dirtiness(
+    conn, monkeypatch, tmp_path, tracked,
+):
+    root, target_ref, _base, head = _worldref_production_git_repo(tmp_path)
+    path = root / (".aming-claw-demo-environment.json" if tracked else "source.py")
+    if tracked:
+        path.write_text("tracked\n")
+        subprocess.run(["git", "add", path.name], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "tracked marker"], cwd=root, check=True, capture_output=True)
+        head = batch_jobs.git_commit(root)
+    path.write_text("dirty\n")
+    epoch = _worldref_seal_server_fixture(conn, current_head=head[:7], target_ref=target_ref)
+    monkeypatch.setattr(server.project_service, "resolve_project_root", lambda *_a, **_k: root)
+    before = conn.total_changes
+    assert server._integration_epoch_governed_worktree_clean(root) is False
+    resume = server._server_integration_epoch_resume_payload(conn, epoch)
+    assert resume["id"] == "integration_epoch_worldref_seal_refused"
+    assert "target_world_worktree_not_clean" in json.dumps(resume)
+    assert conn.total_changes == before
+
+
+def _open_batch_normal_projection_world(conn, monkeypatch, tmp_path):
+    """Real Git and durable batch/worker/merge evidence; no QA or final reconcile."""
+    root = tmp_path / "normal-batch-target"
+    base = _init_test_git_repo(root)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=root, check=True)
+    snapshot_id = f"full-{base[:12]}-{'3' * 12}"
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id=snapshot_id, commit_sha=base,
+        snapshot_kind="full", graph_json=_graph(),
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot_id)
+    prepared = _prepare_guide_bound_mf_batch_entry(
+        conn, suffix="OPEN-NORMAL-PROJECTION", required_worker_count=2,
+        target_head_commit=base, graph_snapshot_id=snapshot_id,
+    )
+    entered = server.handle_project_mf_batch_parallel_enter(
+        _ctx({"project_id": PID}, method="POST", body=prepared["action_input"])
+    )
+    successors = entered["per_row_successors"]
+    a_body = copy.deepcopy(successors[0]["body"])
+    a_backlog, a_task = a_body["backlog_id"], a_body["task_id"]
+    a_cex = server._mf_parallel_execution_id(
+        PID, a_backlog, server._onboard_service_execution_id(PID, a_backlog), a_task,
+    )
+    route_ref = "rtok-open-normal-projection-a"
+    _persist_contract_runtime_observer_route_ref(
+        conn, backlog_id=a_backlog, contract_execution_id=a_cex, route_token_ref=route_ref,
+        allowed_actions=["mf_parallel_enter", "mf_parallel_revise", "contract_runtime_current", "contract_runtime_submit_line", "task_timeline_append"],
+    )
+    a_body.update(observer_session_id=prepared["observer_session_id"], observer_route_token_ref=route_ref)
+    server.handle_project_mf_parallel_enter(_ctx({"project_id": PID}, method="POST", body=a_body))
+    _admit_mf_parallel_prefill_child_plan(conn, contract_execution_id=a_cex)
+    record = server._contract_runtime_store(conn).get(a_cex)
+    lane = server._contract_runtime_mf_parallel_admitted_prefill_child_plan(record)["lanes"][0]
+    files = list(successors[0]["owned_files"])
+    head = _commit_test_git_files(root, [files[0]], message="normal A merge")
+    queue_id = entered["merge_queue_plan"]["merge_queue_id"]
+    a_item = parallel_branch_runtime.get_merge_queue_item(conn, PID, queue_id, a_body["merge_queue_item"]["queue_item_id"])
+    b_body = copy.deepcopy(successors[1]["body"])
+    b_item_id = b_body["merge_queue_item"]["queue_item_id"]
+    context = upsert_branch_context(conn, BranchTaskRuntimeContext(
+        project_id=PID, batch_id=entered["batch_id"], backlog_id=a_backlog,
+        task_id=a_task, parent_task_id=a_cex, root_task_id=a_cex,
+        runtime_context_id="mfrctx-open-normal-projection-a", worker_id=lane["worker_id"],
+        worker_slot_id="source", target_project_root=str(root), worktree_path=str(root),
+        branch_ref="refs/heads/main", status=STATE_MERGED, merge_queue_id=queue_id,
+        base_commit=base, target_head_commit=base, head_commit=head,
+        owned_files=tuple(files), lease_expires_at="2999-01-01T00:00:00Z",
+    ))
+    upsert_merge_queue_items(conn, [replace(
+        a_item, status=STATE_MERGED, branch_ref=context.branch_ref, branch_head=head,
+        merge_commit=head, target_head_before_merge=base, target_head_after_merge=head,
+        current_target_head=head, completed_at="2026-09-07T00:00:00Z",
+    )])
+    runtime_store = server._contract_runtime_store(conn)
+    worker = {
+        "runtime_context_id": context.runtime_context_id, "task_id": a_task,
+        "parent_task_id": a_cex, "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id, "worker_role": "mf_sub",
+        "merge_queue_id": queue_id, "branch_ref": context.branch_ref,
+        "worktree_path": str(root), "target_project_root": str(root), "base_commit": base,
+        "line_instance_id": f"runtime_context:{context.runtime_context_id}",
+    }
+    _batch_qa_append_line(runtime_store, record, {
+        "stage_id": "dispatch", "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer", "evidence_kind": "dispatch_bounded_worker", **worker,
+        "payload": {**worker, "bounded_workers": [worker], "required_worker_count": 1, "worker_count": 1},
+    })
+    for line in _batch_qa_worker_lines(context=context, commit_sha=head, parent_task_id=a_cex):
+        _batch_qa_append_line(runtime_store, record, line)
+    merge_event = task_timeline.record_event(
+        conn, project_id=PID, backlog_id=a_backlog, task_id=a_task,
+        event_type="merge.live", event_kind="merge", phase="merge", actor="observer",
+        status="passed", commit_sha=head, payload={
+            **worker, "contract_execution_id": a_cex, "queue_item_id": a_item.queue_item_id,
+            "merge_commit": head, "target_head_after_merge": head,
+        },
+    )
+    bootstrap = server._onboard_service_materialize_parent_record(
+        conn, project_id=PID, backlog_id=b_body["backlog_id"],
+    )
+    epoch = upsert_integration_epoch(conn, IntegrationEpoch(
+        project_id=PID, batch_id=entered["batch_id"], epoch_id="epoch-open-normal-projection",
+        coordination_backlog_id=prepared["backlog_id"], target_ref="refs/heads/main",
+        base_head=base, current_head=head[:7], last_merge_commit=head[:7],
+        merge_queue_id=queue_id, merge_cursor=1, merged_prefix=(a_item.queue_item_id,),
+        remaining_queue_item_ids=(b_item_id,), status="open", active_queue_item_id=b_item_id,
+        active_task_id=b_body["task_id"], active_backlog_id=b_body["backlog_id"],
+    ))
+    conn.commit()
+    monkeypatch.setattr(server.project_service, "resolve_project_root", lambda *_a, **_k: root)
+    (root / ".aming-claw-demo-environment.json").write_text("generated\n")
+    (root / ".worktrees" / "managed").mkdir(parents=True)
+    (root / ".worktrees" / "managed" / "state.txt").write_text("local\n")
+    return SimpleNamespace(root=root, base=base, head=head, snapshot=snapshot, prepared=prepared,
+                           entered=entered, epoch=epoch, a_cex=a_cex, context=context,
+                           bootstrap=bootstrap, b_body=b_body, merge_event=merge_event)
+
+
+def test_open_batch_normal_projection_consumes_merge_credit_then_original_ordered_entry(
+    conn, monkeypatch, tmp_path,
+):
+    world = _open_batch_normal_projection_world(conn, monkeypatch, tmp_path)
+    before = conn.total_changes
+    current = server.handle_project_contract_runtime_current_state(_ctx_with_role(
+        {"project_id": PID, "contract_execution_id": world.a_cex}, "observer",
+    ))
+    action = current["next_legal_action"]
+    assert action["line_id"] == "observer_merge"
+    assert action["action"] == "record_merge"
+    assert action == current["contract_runtime_next_legal_action"]
+    assert conn.total_changes == before
+    body = copy.deepcopy(action["writer_role_safe_copy_payload"]["copy_payload"])
+    accepted = server.handle_project_contract_runtime_line_write(_ctx_with_role(
+        {"project_id": PID, "contract_execution_id": world.a_cex}, "observer",
+        method="POST", body=body,
+    ))
+    assert accepted["ok"] is True
+    before_guide = conn.total_changes
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": PID}, method="POST", body={
+            "backlog_id": world.b_body["backlog_id"], "role": "observer",
+            "work_type": "parallel_worker", "response_view": "compact",
+        },
+    ))
+    next_action = guide["next_legal_action"]
+    assert next_action["action"] == "mf_parallel_enter"
+    successor_body = copy.deepcopy(next_action["successor_action_input"]["static_body"])
+    assert successor_body["target_head_commit"] == world.head
+    assert successor_body["graph_snapshot_id"] == world.snapshot["snapshot_id"]
+    assert successor_body["merge_queue_item"]["base_commit"] == world.base
+    assert successor_body["metadata"]["lane_intents"] == world.b_body["metadata"]["lane_intents"]
+    capsule = server.handle_project_onboard_route_guide_capsule(_ctx(
+        {"project_id": PID}, method="POST", body={
+            "guide_capsule_ref": guide["guide_capsule_ref"],
+            "sections": ["next_action", "action_input"],
+            "backlog_id": world.b_body["backlog_id"], "role": "observer",
+            "work_type": "parallel_worker",
+        },
+    ))
+    assert capsule["sections"]["next_action"]["successor_action_input"]["static_body"] == successor_body
+    assert capsule["sections"]["action_input"]["successor_body"]["static_body"] == successor_body
+    assert conn.total_changes == before_guide
+    bootstrap_after = server._contract_runtime_store(conn).get(world.bootstrap["contract_execution_id"])
+    assert bootstrap_after["completed_lines"] == world.bootstrap["completed_lines"]
+    assert bootstrap_after["execution_state_revision"] == world.bootstrap["execution_state_revision"]
+    b_cex = server._mf_parallel_execution_id(PID, world.b_body["backlog_id"],
+        world.bootstrap["contract_execution_id"], world.b_body["task_id"])
+    b_ref = "rtok-open-normal-projection-b"
+    _persist_contract_runtime_observer_route_ref(
+        conn, backlog_id=world.b_body["backlog_id"], contract_execution_id=b_cex,
+        route_token_ref=b_ref, allowed_actions=["mf_parallel_enter", "mf_parallel_revise"],
+    )
+    successor_body.update(observer_session_id=world.prepared["observer_session_id"], observer_route_token_ref=b_ref)
+    entered_b = server.handle_project_mf_parallel_enter(_ctx(
+        {"project_id": PID}, method="POST", body=successor_body,
+    ))
+    assert entered_b["ok"] is True
+    assert entered_b["contract_execution_id"] == b_cex
+    assert get_integration_epoch(conn, PID, world.epoch.batch_id) == world.epoch
+    assert batch_jobs.git_commit(world.root) == world.head
+    assert conn.execute("SELECT COUNT(*) FROM task_timeline_events WHERE event_type = 'merge.live'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM task_timeline_events WHERE event_type = 'graph.reconcile'").fetchone()[0] == 0
+
+
+def test_open_batch_normal_projection_retains_world_order_and_genuine_seal_guards(
+    conn, monkeypatch, tmp_path,
+):
+    world = _open_batch_normal_projection_world(conn, monkeypatch, tmp_path)
+
+    def project(epoch):
+        return server._entered_batch_successor_resume_projection(
+            conn, project_id=PID, coordination_backlog_id=world.prepared["backlog_id"],
+            active_epoch=epoch,
+        )
+
+    before = conn.total_changes
+    assert project(world.epoch)["blocker"]["code"] == "entered_batch_prior_merge_credit_unverified"
+    assert server._integration_epoch_pending_merge_action(
+        conn, replace(world.epoch, batch_id="wrong-batch"),
+    ) == {}
+    assert conn.total_changes == before
+    action = server._integration_epoch_pending_merge_action(conn, world.epoch)
+    server.handle_project_contract_runtime_line_write(_ctx_with_role(
+        {"project_id": PID, "contract_execution_id": world.a_cex}, "observer",
+        method="POST", body=copy.deepcopy(action["writer_role_safe_copy_payload"]["copy_payload"]),
+    ))
+    before = conn.total_changes
+    for field, value, code in (
+        ("project_id", "wrong-project", "entered_batch_active_epoch_identity_mismatch"),
+        ("batch_id", "wrong-batch", "entered_batch_active_epoch_identity_mismatch"),
+        ("merge_queue_id", "wrong-queue", "entered_batch_active_epoch_identity_mismatch"),
+        ("merge_cursor", 0, "entered_batch_active_epoch_identity_mismatch"),
+        ("active_task_id", "wrong-task", "entered_batch_active_epoch_identity_mismatch"),
+        ("target_ref", "refs/heads/other", "entered_batch_active_epoch_identity_mismatch"),
+        ("current_head", world.base, "entered_batch_active_epoch_git_world_mismatch"),
+        ("base_head", world.head, "entered_batch_active_epoch_git_world_mismatch"),
+        ("current_head", "f" * 40, "entered_batch_active_epoch_git_world_unresolved"),
+    ):
+        result = project(replace(world.epoch, **{field: value}))
+        assert result["blocker"]["code"] == code, field
+        assert result["next_legal_action"]["action"] == "no_runtime_action"
+    with monkeypatch.context() as scoped:
+        scoped.setattr(server.project_service, "resolve_project_root", lambda *_a, **_k: None)
+        assert project(world.epoch)["blocker"]["code"] == "entered_batch_current_project_root_unavailable"
+    foreign_root = tmp_path / "foreign-world"
+    _init_test_git_repo(foreign_root, filename="foreign.txt")
+    subprocess.run(["git", "branch", "-M", "main"], cwd=foreign_root, check=True)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(server.project_service, "resolve_project_root", lambda *_a, **_k: foreign_root)
+        assert project(world.epoch)["blocker"]["code"] == "entered_batch_historical_base_not_ancestor"
+    assert conn.total_changes == before
+
+    # A real foreign target advance still takes the existing no-PASS seal
+    # precheck; B's historical bootstrap is evidence that must not be erased.
+    _commit_test_git_files(world.root, ["foreign-advance.txt"], message="foreign advance")
+    refusal = server._server_integration_epoch_resume_payload(conn, world.epoch)
+    assert refusal["id"] == "integration_epoch_worldref_seal_refused"
+    assert "contract_runtime_execution" in {item["code"] for item in refusal["blockers"]}
+    assert refusal["writes_performed"] is False
+    assert conn.total_changes == before
+    assert get_integration_epoch(conn, PID, world.epoch.batch_id) == world.epoch
+    bootstrap_after = server._contract_runtime_store(conn).get(world.bootstrap["contract_execution_id"])
+    assert bootstrap_after["completed_lines"] == world.bootstrap["completed_lines"]
+    assert bootstrap_after["execution_state_revision"] == world.bootstrap["execution_state_revision"]
 
 
 def test_parallel_branch_canonical_commit_resolver_accepts_exact_ids_and_managed_refs(
