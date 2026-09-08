@@ -3302,10 +3302,18 @@ def _verify_dev_source_upgrade(
         )
         if worktrees.returncode != 0:
             raise ValueError("AC dev source upgrade worktree registry unavailable")
-        registered = {
-            Path(line.removeprefix("worktree ")).resolve(strict=True)
-            for line in worktrees.stdout.splitlines() if line.startswith("worktree ")
-        }
+        registered = set()
+        for line in worktrees.stdout.splitlines():
+            if not line.startswith("worktree "):
+                continue
+            registered_path = Path(line.removeprefix("worktree "))
+            try:
+                registered.add(registered_path.resolve(strict=True))
+            except FileNotFoundError:
+                # Missing unrelated checkouts are not required source identities.
+                # Keep required entries strict, including disappearance here.
+                if registered_path in (previous_root, candidate_root):
+                    raise
         if previous_root not in registered or candidate_root not in registered:
             raise ValueError("AC dev source upgrade worktree is not registered")
         previous_commit = str(previous.get("commit") or "").lower()

@@ -2452,6 +2452,100 @@ def _pointer_only_dev_worktrees(tmp_path: Path) -> tuple[Path, Path, str, str]:
     return old, new, commit_a, commit_b
 
 
+def _leave_unrelated_worktree_missing(tmp_path, source_root, commit):
+    """Keep a real isolated registry entry after moving only its checkout."""
+    unrelated = tmp_path / "unrelated-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(unrelated), commit],
+        cwd=source_root, check=True, capture_output=True,
+    )
+    unrelated.rename(tmp_path / "moved-unrelated-worktree")
+    assert not unrelated.exists()
+    return unrelated
+
+
+def _source_worktree_registry_snapshot(source_root):
+    registry = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=source_root,
+        check=True, capture_output=True, text=True,
+    ).stdout
+    common = Path(subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"], cwd=source_root,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip())
+    if not common.is_absolute():
+        common = source_root / common
+    metadata = common.resolve(strict=True) / "worktrees"
+    return registry, {
+        str(path.relative_to(metadata)): path.read_bytes()
+        for path in metadata.rglob("*") if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_ac_dev_source_upgrade_ignores_missing_unrelated_registered_worktree(
+    tmp_path, monkeypatch, historical,
+):
+    from agent.governance import db
+
+    old, new, commit_a, commit_b = _pointer_only_dev_worktrees(tmp_path)
+    storage = tmp_path / "dev-storage"
+    storage.mkdir()
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(storage))
+    previous = {
+        "root": str(old.resolve()), "branch": "codex/ac-dev", "commit": commit_a,
+        "source_sha256": "sha256:" + hashlib.sha256(
+            (old / "agent" / "cli.py").read_bytes()
+        ).hexdigest(),
+    }
+    candidate = {**previous, "root": str(new.resolve()), "commit": commit_b}
+    missing = _leave_unrelated_worktree_missing(tmp_path, new, commit_a)
+    # Prime Git's index stat cache before comparing the registry byte-for-byte.
+    for root in (old, new):
+        assert not subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    before = _source_worktree_registry_snapshot(new)
+    for root in (old, new, missing):
+        assert f"worktree {root}\n" in before[0]
+
+    db._verify_dev_source_upgrade(
+        previous, candidate, historical_worktree_advisory=historical,
+    )
+
+    assert _source_worktree_registry_snapshot(new) == before
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("defect", ["previous_missing", "candidate_missing", "candidate_unregistered"])
+def test_ac_dev_source_upgrade_still_requires_both_registered_roots(
+    tmp_path, monkeypatch, defect,
+):
+    from agent.governance import db
+
+    old, new, commit_a, commit_b = _pointer_only_dev_worktrees(tmp_path)
+    storage = tmp_path / "dev-storage"
+    storage.mkdir()
+    monkeypatch.setenv(db.AC_DEV_STORAGE_ROOT_ENV, str(storage))
+    previous = {"root": str(old.resolve()), "branch": "codex/ac-dev", "commit": commit_a}
+    candidate = {**previous, "root": str(new.resolve()), "commit": commit_b}
+    if defect == "previous_missing":
+        old.rename(tmp_path / "moved-required-previous")
+    elif defect == "candidate_missing":
+        new.rename(tmp_path / "moved-required-candidate")
+    else:
+        unregistered = tmp_path / "unregistered-candidate"
+        shutil.copytree(new, unregistered)
+        candidate["root"] = str(unregistered.resolve())
+    expected = "not registered" if defect == "candidate_unregistered" else "root mismatch"
+
+    with pytest.raises(ValueError, match=expected):
+        db._verify_dev_source_upgrade(
+            previous, candidate, historical_worktree_advisory=True,
+        )
+
+
 def test_ac_dev_pointer_only_physical_root_continuity_accepts_exact_registered_handoff(tmp_path, monkeypatch):
     from agent.governance import db
 
@@ -3068,6 +3162,43 @@ def test_current_cow_source_accepts_clean_canonical_descendant_of_historical_tip
         capture_output=True, text=True,
     ).stdout.strip() == current["commit"]
     conn.close()
+
+
+def test_current_cow_source_preserves_history_with_unrelated_missing_worktree(
+    tmp_path, monkeypatch,
+):
+    db, conn, storage, receipt, historical, current = (
+        _current_cow_historical_tip_fixture(tmp_path, monkeypatch)
+    )
+    current_root = Path(current["root"])
+    missing = _leave_unrelated_worktree_missing(
+        tmp_path, current_root, historical["commit"],
+    )
+    # Historical mode keeps the existing deferred, dirty old checkout semantics.
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=historical["root"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip() == "M agent/cli.py"
+    assert not subprocess.run(
+        ["git", "status", "--porcelain"], cwd=current_root,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    registry_before = _source_worktree_registry_snapshot(current_root)
+    database_before = tuple(conn.iterdump())
+    adoption = Path(receipt["history"]["adoption"]["path"])
+    adoption_before = adoption.read_bytes()
+    receipt_before = json.dumps(receipt, sort_keys=True)
+
+    try:
+        db._verify_current_cow_successor_source(conn, storage, receipt)
+
+        assert tuple(conn.iterdump()) == database_before
+        assert adoption.read_bytes() == adoption_before
+        assert json.dumps(receipt, sort_keys=True) == receipt_before
+        assert _source_worktree_registry_snapshot(current_root) == registry_before
+        assert not missing.exists()
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(
