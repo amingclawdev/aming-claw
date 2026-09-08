@@ -156883,6 +156883,36 @@ def _operator_supervised_direct_main_qa_facade_binding(
     current_action = (
         current_action if isinstance(current_action, Mapping) else {}
     )
+    if (
+        str(current_action.get("owner_role") or "").strip() != "qa"
+        and any(
+            isinstance(item, Mapping)
+            and item.get("line_id") == "qa_independent_verification"
+            for item in record.get("completed_lines") or []
+        )
+    ):
+        # The QA writer Guide has advanced. It cannot authorize another write
+        # or reconstruct the old writer hash. Leave only immutable, fully
+        # authenticated evidence comparison to the existing replay path.
+        for field, expected_value in {
+            "contract_execution_id": record.get("contract_execution_id"),
+            "direct_runtime_binding_hash": runtime_binding.get("binding_hash"),
+        }.items():
+            if body.get(field) != expected_value:
+                raise GovernanceError(
+                    "operator_supervised_direct_main_qa_binding_mismatch",
+                    "Direct Main QA replay binding does not match the pinned execution",
+                    422,
+                    {
+                        "field": field,
+                        "expected": expected_value,
+                        "actual": body.get(field),
+                        "zero_contract_runtime_write": True,
+                        "zero_timeline_write": True,
+                        "writes_performed": False,
+                    },
+                )
+        return {"completed_qa_replay": True}
     current_line_identity = {
         field: str(current_action.get(field) or "").strip()
         for field in ("stage_id", "line_id", "evidence_kind")
@@ -157035,7 +157065,7 @@ def _operator_supervised_direct_main_qa_facade_binding(
     }
 
 
-def _operator_supervised_direct_main_expected_line_evidence(
+def _operator_supervised_direct_main_runtime_line_write(
     record: Mapping[str, Any],
     *,
     actor_role: str,
@@ -157044,14 +157074,9 @@ def _operator_supervised_direct_main_expected_line_evidence(
     evidence_kind: str,
     payload: Mapping[str, Any],
     extra: Mapping[str, Any] | None = None,
+    qa_session: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Rebuild the exact persisted line produced by the Direct adapter.
-
-    Used for prospective close-ready completion checks and crash-window
-    recovery after ContractRuntime accepted a line but before the public
-    timeline event committed. Reuse is legal only when every persisted field
-    matches the facade write; a line-id match alone is never retry authority.
-    """
+    """Normalize one Direct write identically for precheck, submit and replay."""
 
     body = {
         "stage_id": stage_id,
@@ -157068,11 +157093,50 @@ def _operator_supervised_direct_main_expected_line_evidence(
         body,
         actor_role=actor_role,
     )
-    # ContractRuntime derives these two safe persisted surfaces immediately
-    # before Gate evaluation.  Mirror that deterministic normalization so the
-    # comparison covers the complete completed-line evidence, including QA.
+    if actor_role == "qa" and qa_session is not None:
+        write = _contract_runtime_bind_authenticated_qa_provenance(
+            qa_session,
+            write=write,
+            source="operator_supervised_direct_main_timeline_qa_binding",
+            binding_claims={
+                (
+                    "independent_verification_session_matched"
+                    if line_id == "qa_independent_verification"
+                    else "graph_trace_session_matched"
+                ): True,
+            },
+        )
     _enrich_line_instance_fields(write)
     _enrich_qa_evidence_provenance(write, actor_role)
+    return write
+
+
+def _operator_supervised_direct_main_expected_line_evidence(
+    record: Mapping[str, Any],
+    *,
+    actor_role: str,
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+    payload: Mapping[str, Any],
+    extra: Mapping[str, Any] | None = None,
+    qa_session: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rebuild the complete persisted line, including authenticated QA fields.
+
+    A crash-window retry must match every field, not merely the line id.
+    """
+
+    write = _operator_supervised_direct_main_runtime_line_write(
+        record,
+        actor_role=actor_role,
+        stage_id=stage_id,
+        line_id=line_id,
+        evidence_kind=evidence_kind,
+        payload=payload,
+        extra=extra,
+        qa_session=qa_session,
+    )
     return _line_evidence_from_write(write, actor_role)
 
 
@@ -157086,6 +157150,7 @@ def _operator_supervised_direct_main_submit_runtime_line(
     expected_evidence_kind: str,
     payload: Mapping[str, Any],
     extra: Mapping[str, Any] | None = None,
+    qa_session: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
     record = runtime.current_record(
@@ -157122,20 +157187,15 @@ def _operator_supervised_direct_main_submit_runtime_line(
                 "writes_performed": False,
             },
         )
-    body = {
-        "stage_id": expected_stage_id,
-        "line_id": expected_line_id,
-        "evidence_kind": expected_evidence_kind,
-        "payload": _operator_supervised_direct_main_runtime_line_payload(
-            record,
-            payload,
-        ),
-        **dict(extra or {}),
-    }
-    write = _contract_runtime_line_write_body(
+    write = _operator_supervised_direct_main_runtime_line_write(
         record,
-        body,
         actor_role=actor_role,
+        stage_id=expected_stage_id,
+        line_id=expected_line_id,
+        evidence_kind=expected_evidence_kind,
+        payload=payload,
+        extra=extra,
+        qa_session=qa_session,
     )
     result = runtime.submit_line_write(
         contract_execution_id,
@@ -159173,6 +159233,7 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
     pre_mutation_graph_trace_gate: Mapping[str, Any] | None = None,
     pre_mutation_request_fingerprint: str = "",
     trusted_qa_verification_authority: Mapping[str, Any] | None = None,
+    timeline_replay_event_id: int = 0,
 ) -> dict[str, Any]:
     """Map accepted public timeline evidence onto the pinned Direct lines."""
 
@@ -159200,6 +159261,7 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
     ]
     event_key = str(event_kind or "").strip().lower().replace("-", "_")
     line_refs: list[dict[str, Any]] = []
+    qa_session = None
 
     def submit(
         actor_role: str,
@@ -159227,7 +159289,12 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
                 event_kind=str(event_kind or "").strip(),
                 limit=2,
             )
-            if materialized_events:
+            if materialized_events and not (
+                timeline_replay_event_id
+                and len(materialized_events) == 1
+                and int(materialized_events[0].get("id") or 0)
+                == timeline_replay_event_id
+            ):
                 raise GovernanceError(
                     "operator_supervised_direct_main_timeline_already_materialized",
                     (
@@ -159255,6 +159322,7 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
                     evidence_kind=evidence_kind,
                     payload=payload,
                     extra=extra,
+                    qa_session=qa_session,
                 )
             )
             existing_line = dict(existing_lines[0])
@@ -159284,6 +159352,43 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
                     expected_payload[projected_once_field] = (
                         existing_payload[projected_once_field]
                     )
+            if actor_role == "qa":
+                existing_timeline_payload = existing_payload.get("timeline_payload")
+                expected_timeline_payload = expected_payload.get("timeline_payload")
+                if isinstance(existing_timeline_payload, Mapping) and isinstance(
+                    expected_timeline_payload, Mapping
+                ) and "contract_runtime_close_evidence_gate" in existing_timeline_payload:
+                    # This server-only projection describes the former writer
+                    # position. Session proof, authored evidence and all other
+                    # canonical fields must still match independently.
+                    expected_timeline_payload = {
+                        **dict(expected_timeline_payload),
+                        "contract_runtime_close_evidence_gate": existing_timeline_payload[
+                            "contract_runtime_close_evidence_gate"
+                        ],
+                    }
+                    current_decision = expected_timeline_payload.get(
+                        "contract_gate_decision"
+                    )
+                    if isinstance(current_decision, Mapping):
+                        # Recompute the dependent projection, rather than copy
+                        # a saved decision or its authority. All current proof
+                        # and authored evidence remain in the expected write.
+                        expected_timeline_payload["contract_gate_decision"] = (
+                            task_timeline._timeline_contract_gate_decision(
+                                event=body,
+                                payload=expected_timeline_payload,
+                                verification=body.get("verification") or {},
+                                artifact_refs=body.get("artifact_refs") or {},
+                                meta_contract_gate=current_decision.get(
+                                    "meta_contract_gate"
+                                ) or {},
+                                authority_source=str(
+                                    current_decision.get("source_of_authority") or ""
+                                ),
+                            )
+                        )
+                    expected_payload["timeline_payload"] = expected_timeline_payload
             if expected_payload:
                 expected_line["payload"] = expected_payload
             if not (
@@ -159303,6 +159408,17 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
                     if stable_sha256(existing_payload.get(key))
                     != stable_sha256(expected_payload.get(key))
                 )
+                existing_timeline_payload = existing_payload.get("timeline_payload")
+                expected_timeline_payload = expected_payload.get("timeline_payload")
+                mismatched_timeline_payload_fields = sorted(
+                    key
+                    for key in set(existing_timeline_payload or {})
+                    | set(expected_timeline_payload or {})
+                    if stable_sha256(existing_timeline_payload.get(key))
+                    != stable_sha256(expected_timeline_payload.get(key))
+                ) if isinstance(existing_timeline_payload, Mapping) and isinstance(
+                    expected_timeline_payload, Mapping
+                ) else []
                 raise GovernanceError(
                     "operator_supervised_direct_main_partial_admission_mismatch",
                     (
@@ -159316,6 +159432,9 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
                         "mismatched_fields": mismatched_fields,
                         "mismatched_payload_fields": (
                             mismatched_payload_fields
+                        ),
+                        "mismatched_timeline_payload_fields": (
+                            mismatched_timeline_payload_fields
                         ),
                         "zero_write_rejection": True,
                         "writes_performed": False,
@@ -159333,6 +159452,19 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
                 }
             )
             return
+        if timeline_replay_event_id:
+            raise GovernanceError(
+                "operator_supervised_direct_main_partial_admission_mismatch",
+                "Direct Main timeline replay requires its complete immutable runtime evidence",
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "line_id": line_id,
+                    "zero_contract_runtime_write": True,
+                    "zero_timeline_write": True,
+                    "writes_performed": False,
+                },
+            )
         record = _operator_supervised_direct_main_submit_runtime_line(
             conn,
             contract_execution_id=contract_execution_id,
@@ -159342,6 +159474,7 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
             expected_evidence_kind=evidence_kind,
             payload=payload,
             extra=extra,
+            qa_session=qa_session,
         )
         line_refs.append(
             {
@@ -159453,6 +159586,12 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
         from . import task_timeline
 
         qa_session_proof = dict(trusted_qa_verification_authority)
+        # Only the public handler's authenticated, scope- and graph-verified
+        # proof supplies these binder inputs; body.qa_authority is not used.
+        qa_session = {
+            "principal_id": qa_session_proof["principal_id"],
+            "session_id": qa_session_proof["qa_session_id"],
+        }
         qa_authority = task_timeline.source_backed_qa_session_authority(
             qa_session_proof
         )
@@ -159466,44 +159605,111 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
                 )
             ]
         )
+        graph_payload = {
+            "schema_version": (
+                "operator_supervised_direct_main.qa_graph_evidence.v1"
+            ),
+            "graph_trace_ids": trace_ids,
+            "qa_authority": qa_authority,
+        }
+        graph_extra = {
+            "graph_trace_ids": trace_ids,
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "db_verified": True,
+            "target_project_root": str(
+                binding.get("target_project_root") or ""
+            ),
+        }
+        qa_payload = {
+            "schema_version": (
+                "operator_supervised_direct_main.qa_evidence.v1"
+            ),
+            "qa_authority": qa_authority,
+            "timeline_payload": dict(normalized_payload),
+        }
+        qa_extra = {
+            "commit_sha": str(body.get("commit_sha") or "").strip(),
+            "status": str(body.get("status") or "").strip(),
+            "verification": dict(body.get("verification") or {}),
+            "artifact_refs": dict(body.get("artifact_refs") or {}),
+        }
+        # The facade publishes two lines. Compile the complete QA envelope
+        # against the prospective graph prefix BEFORE either line is written.
+        # The existing Runtime precheck uses the same completion compiler as
+        # submit_line_write; this projection never changes the stored record.
+        projected_lines = list(record.get("completed_lines") or [])
+        if not any(
+            line.get("line_id") == "qa_graph_context"
+            for line in projected_lines
+        ):
+            projected_lines.append(
+                _operator_supervised_direct_main_expected_line_evidence(
+                    record,
+                    actor_role="qa",
+                    stage_id="qa_graph_context",
+                    line_id="qa_graph_context",
+                    evidence_kind="graph_trace",
+                    payload=graph_payload,
+                    extra=graph_extra,
+                    qa_session=qa_session,
+                )
+            )
+        precheck = None
+        if not any(
+            line.get("line_id") == "qa_independent_verification"
+            for line in projected_lines
+        ):
+            prospective = runtime.projected_record(
+                contract_execution_id,
+                actor_role="qa",
+                completed_lines=projected_lines,
+            )
+            qa_write = _operator_supervised_direct_main_runtime_line_write(
+                prospective,
+                actor_role="qa",
+                stage_id="qa",
+                line_id="qa_independent_verification",
+                evidence_kind="independent_verification",
+                payload=qa_payload,
+                extra=qa_extra,
+                qa_session=qa_session,
+            )
+            precheck = runtime.precheck_line_write(
+                contract_execution_id,
+                qa_write,
+                actor_role="qa",
+                projected_completed_lines=projected_lines,
+            )
+        if precheck is not None and precheck.get("ok") is not True:
+            raise GovernanceError(
+                "operator_supervised_direct_main_runtime_line_rejected",
+                "Direct Main QA envelope did not satisfy ContractRuntime",
+                422,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "stage_id": "qa",
+                    "line_id": "qa_independent_verification",
+                    "decision": dict(precheck.get("decision") or {}),
+                    **{
+                        field: precheck[field]
+                        for field in _CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS
+                        if field in precheck
+                    },
+                    "zero_write_rejection": True,
+                    "zero_contract_runtime_write": True,
+                    "zero_timeline_write": True,
+                    "completed_line_mutated": False,
+                    "writes_performed": False,
+                },
+            )
         submit(
-            "qa",
-            "qa_graph_context",
-            "qa_graph_context",
-            "graph_trace",
-            {
-                "schema_version": (
-                    "operator_supervised_direct_main.qa_graph_evidence.v1"
-                ),
-                "graph_trace_ids": trace_ids,
-                "qa_authority": qa_authority,
-            },
-            {
-                "graph_trace_ids": trace_ids,
-                "query_source": "qa",
-                "query_purpose": "independent_verification",
-                "db_verified": True,
-                "target_project_root": str(
-                    binding.get("target_project_root") or ""
-                ),
-            },
+            "qa", "qa_graph_context", "qa_graph_context", "graph_trace",
+            graph_payload, graph_extra,
         )
         submit(
-            "qa",
-            "qa",
-            "qa_independent_verification",
-            "independent_verification",
-            {
-                "schema_version": (
-                    "operator_supervised_direct_main.qa_evidence.v1"
-                ),
-                "qa_authority": qa_authority,
-                "timeline_payload": dict(normalized_payload),
-            },
-            {
-                "commit_sha": str(body.get("commit_sha") or "").strip(),
-                "status": str(body.get("status") or "").strip(),
-            },
+            "qa", "qa", "qa_independent_verification", "independent_verification",
+            qa_payload, qa_extra,
         )
     elif event_key in {"reconcile", "current_full_reconcile"}:
         reconcile_authority = (
@@ -185773,7 +185979,9 @@ def _contract_runtime_close_gate(
             body=body,
         )
     )
-    if direct_qa_facade_binding:
+    if direct_qa_facade_binding and not direct_qa_facade_binding.get(
+        "completed_qa_replay"
+    ):
         canonical_norm_payload = (
             _operator_supervised_direct_main_runtime_line_payload(
                 authority_record,
@@ -186586,12 +186794,18 @@ def _contract_runtime_close_gate(
         # The facade fields prove that the caller copied the exact current QA
         # writer binding.  The Direct Main adapter below remains the sole
         # canonical writer for its paired graph and verdict runtime lines.
+        # After completion, defer only immutable comparison to that adapter;
+        # never send a replay through the generic new-line writer.
         return {
             "schema_version": (
                 _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
             ),
             "accepted": True,
-            "status": "validated_submission",
+            "status": (
+                "immutable_replay_comparison_required"
+                if direct_qa_facade_binding.get("completed_qa_replay")
+                else "validated_submission"
+            ),
             "primary_decision_source": True,
             "agent_facing_decision_source": (
                 "contract_runtime_first_missing_line"
@@ -201253,6 +201467,7 @@ def _qa_timeline_idempotent_replay(
     body: Mapping[str, Any],
     event_kind: str,
     norm_payload: Mapping[str, Any],
+    trusted_qa_verification_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Reuse an exact authenticated QA authority after an ambiguous append."""
 
@@ -201334,6 +201549,27 @@ def _qa_timeline_idempotent_replay(
             != authority_hash
         ):
             continue
+        # Direct QA replay must compare the same canonical persisted envelope
+        # as actual submission and missing-timeline crash recovery. An equal
+        # session/graph authority alone does not make changed evidence a replay.
+        direct_records = _operator_supervised_direct_main_strict_records(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+        )
+        if direct_records:
+            _operator_supervised_direct_main_apply_timeline_runtime(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=task_id,
+                event_kind=event_kind,
+                body=body,
+                normalized_payload=norm_payload,
+                trusted_qa_verification_authority=trusted_qa_verification_authority,
+                timeline_replay_event_id=int(existing.get("id") or 0),
+            )
         replay = {
             **existing,
             "idempotent_replay": True,
@@ -203043,6 +203279,7 @@ def _handle_task_timeline_append(ctx: RequestContext):
                 body=ctx.body or {},
                 event_kind=norm_event_kind,
                 norm_payload=norm_payload,
+                trusted_qa_verification_authority=trusted_qa_verification_authority,
             )
             if qa_replay:
                 qa_replay_payload = (

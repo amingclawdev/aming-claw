@@ -2357,6 +2357,146 @@ def _direct_qa_facade_http_session(conn, world):
     return append, body, guide
 
 
+@pytest.mark.parametrize("container", ["payload", "verification", "artifact_refs"])
+def test_direct_qa_http_authored_pass_compiler_rejection_is_zero_write(
+    conn, monkeypatch, tmp_path, container,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="QA-AUTHORED-PASS-COMPILER",
+    )
+    append, body, _guide = _direct_qa_facade_http_session(conn, world)
+    # The incident's authored PASS carried this nested failed audit observation.
+    # It is not the Rule's container-local baseline_observation syntax.
+    body.setdefault(container, {})["audit_refs"] = [{
+        "kind": "baseline_only_compatibility_observation",
+        "status": "failed",
+        "counted_as_pass": False,
+        "waived": False,
+        "scope": "audit_only_not_current_verification",
+        "report_ref": "independent-qa-report.json",
+        "report_sha256": _fake_sha("original-independent-qa-report"),
+        "section": "baseline_only_non_green_observation",
+        "candidate_exit_code": 1,
+        "base_exit_code": 1,
+        "node": "test_ac_dev_recovered_parallel_continues_through_issuer_to_first_prefill",
+        "reason": "Unchanged isolated fixture omits required observer_session_id; both fresh single-node runs reject partial proof before the changed statements.",
+    }]
+    assert body["status"] == "passed"
+    runtime = server._contract_runtime(conn)
+    before = copy.deepcopy(runtime.store.get(world["task_id"]))
+    compiled_before = copy.deepcopy(runtime.current_record(
+        world["task_id"], actor_role="qa",
+    )["execution_state"])
+    events_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    changes_before = conn.total_changes
+
+    with pytest.raises(GovernanceError) as caught:
+        append(copy.deepcopy(body))
+
+    assert caught.value.code == "operator_supervised_direct_main_runtime_line_rejected"
+    details = caught.value.details
+    assert "qa_authored_pass_not_completion_satisfying" in details["decision"]["errors"]
+    assert details["qa_pass_write_compiler_parity_prevented"] is True
+    assert details["zero_contract_runtime_write"] is True
+    assert details["zero_timeline_write"] is True
+    assert details["completed_line_mutated"] is False
+    assert details["writes_performed"] is False
+    assert "baseline_observation" in details["remediation"]
+    assert details["next_legal_action"] == (
+        "resubmit_qa_independent_verification_with_compiler_satisfying_evidence"
+    )
+    after = runtime.store.get(world["task_id"])
+    assert after == before
+    assert after["execution_state_revision"] == before["execution_state_revision"]
+    assert after["completed_lines"] == before["completed_lines"]
+    assert runtime.current_record(world["task_id"], actor_role="qa")[
+        "execution_state"
+    ] == compiled_before
+    assert conn.total_changes == changes_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == events_before
+
+
+@pytest.mark.parametrize("crash_window", [False, True])
+def test_direct_qa_http_valid_pass_binds_canonical_completion_and_exact_replay(
+    conn, monkeypatch, tmp_path, crash_window,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="QA-CANONICAL-PASS-CONTROL",
+    )
+    append, body, _guide = _direct_qa_facade_http_session(conn, world)
+    body["payload"]["audit_refs"] = [{
+        "status": "baseline_observation", "failed": 1,
+        "counted_as_pass": False, "waived": False,
+    }]
+    runtime = server._contract_runtime(conn)
+    if crash_window:
+        original_apply = server._operator_supervised_direct_main_apply_timeline_runtime
+
+        def crash_after_both_runtime_lines(*args, **kwargs):
+            result = original_apply(*args, **kwargs)
+            conn.commit()
+            raise RuntimeError("injected crash after both QA lines, before timeline")
+
+        events_before = conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events"
+        ).fetchone()[0]
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                server, "_operator_supervised_direct_main_apply_timeline_runtime",
+                crash_after_both_runtime_lines,
+            )
+            with pytest.raises(GovernanceError):
+                append(copy.deepcopy(body))
+        crash_record = copy.deepcopy(runtime.store.get(world["task_id"]))
+        assert [item["line_id"] for item in crash_record["completed_lines"]][-2:] == [
+            "qa_graph_context", "qa_independent_verification",
+        ]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events"
+        ).fetchone()[0] == events_before
+    accepted = append(copy.deepcopy(body))
+    if crash_window:
+        assert runtime.store.get(world["task_id"]) == crash_record
+    current = runtime.current_record(world["task_id"], actor_role="qa")
+    line = current["completed_lines"][-1]
+    provenance = line["qa_evidence_provenance"]
+    binding = provenance["authenticated_qa_binding"]
+    assert binding["server_derived"] is True
+    assert binding["qa_principal"] == body["actor"]
+    assert binding["qa_session_id"] == append.qa_session_id
+    assert binding["independent_verification_session_matched"] is True
+    for item in (line, provenance):
+        assert item["authorization_source"] == "qa_session_token_ref"
+        assert item["evidence_owner_actor"] == body["actor"]
+        assert item["evidence_owner_session"] == append.qa_session_id
+        assert item["submitter_session"] == append.qa_session_id
+        assert item["observer_impersonation"] is False
+        assert item["parent_materialization_authorized"] is False
+    assert provenance["completion_status_gate"]["top_level_status_passing"] is True
+    assert {"qa_graph_context", "qa_independent_verification"}.issubset({
+        item["line_id"] for item in current["execution_state"]["completed_lines"]
+    })
+    assert current["runtime_guide"]["next_legal_action"]["line_id"] == "observer_reconcile"
+    before = copy.deepcopy(runtime.store.get(world["task_id"]))
+    changes_before = conn.total_changes
+    replay = append(copy.deepcopy(body))
+    assert replay["id"] == accepted["id"]
+    assert replay["idempotent_replay"] is True
+    assert runtime.store.get(world["task_id"]) == before
+    assert conn.total_changes == changes_before
+    changed = copy.deepcopy(body)
+    changed["payload"]["audit_refs"][0]["status"] = "failed"
+    with pytest.raises(GovernanceError) as caught:
+        append(changed)
+    assert caught.value.code == "operator_supervised_direct_main_partial_admission_mismatch"
+    assert runtime.store.get(world["task_id"]) == before
+    assert conn.total_changes == changes_before
+
+
 @pytest.mark.parametrize("verdict", ["passed", "failed"])
 @pytest.mark.parametrize("graph_prefix", [False, True])
 @pytest.mark.parametrize("revision", ["rev2", "rev3"])
