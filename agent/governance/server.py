@@ -149946,6 +149946,9 @@ def _onboard_selected_qa_contract_runtime_guidance(
         "schema_version": guidance_schema,
         "next_action": action,
         "contract_execution_id": execution_id,
+        "contract_id": str(selected_record.get("contract_id") or ""),
+        "contract_revision_id": str(selected_record.get("revision") or ""),
+        "current_stage_id": str(action.get("stage_id") or ""),
         "current_line_id": line_id,
         "current_action": current_action,
         "current_action_source": str(
@@ -150035,41 +150038,68 @@ def _onboard_selected_qa_contract_runtime_guidance(
     target_root, target_root_conflict, _target_root_present = _dispatch_identity(
         "target_project_root", "project_root", "repo_root"
     )
-    completed_line_ids = {
-        str(candidate.get("line_id") or "").strip()
-        for _index, candidate in _contract_runtime_completed_lines(dispatch_record)
-        if _contract_runtime_line_status_passes(candidate)
-    }
-    postmerge_qa_ready = bool(
-        _is_mf_parallel_postmerge_revision(dispatch_record)
-        and {"observer_merge", "observer_reconcile"}.issubset(
-            completed_line_ids
+    postmerge_qa_root = _is_mf_parallel_postmerge_revision(dispatch_record)
+    postmerge_authority: Mapping[str, Any] = {}
+    qa_principal = f"qa:{worker_task_id}"
+    qa_session_id = ""
+    if postmerge_qa_root:
+        # Use the same selected revision/stage authority as the consumer.
+        # A combined graph task and its final worker lane are distinct scopes.
+        resolver = (
+            _contract_runtime_rev8_postmerge_qa_authority
+            if line_id == "qa_graph_context"
+            else _contract_runtime_postmerge_qa_worker_identity_authority
         )
-    )
-    registered_project_root = (
-        project_service.resolve_project_root(
-            project_id,
-            None,
-            fallback_self=True,
+        resolved = (
+            resolver(conn, project_id=project_id, record=dispatch_record)
+            if conn is not None
+            else {}
         )
-        if postmerge_qa_ready
-        else None
-    )
-    canonical_qa_root = (
-        str(Path(registered_project_root).resolve())
-        if registered_project_root is not None
-        else ""
-    )
-    postmerge_qa_root = bool(postmerge_qa_ready and canonical_qa_root)
+        if resolved.get("verified") is not True:
+            return {
+                **base_guidance,
+                "status": "blocked", "executable": False, "ordered_steps": [],
+                "blocker": {
+                    "id": (
+                        "contract_runtime_rev8_postmerge_qa_authority_required"
+                        if line_id == "qa_graph_context"
+                        else "contract_runtime_qa_worker_identity_unresolved"
+                    ),
+                    "authority_status": str(resolved.get("status") or "missing"),
+                    "blocker_codes": list(resolved.get("blocker_codes") or []),
+                    "fail_closed": True,
+                },
+            }
+        postmerge_authority = (
+            resolved
+            if line_id == "qa_graph_context"
+            else _contract_runtime_persisted_postmerge_qa_authority(dispatch_record)
+        )
+        qa_principal = f"qa:{postmerge_authority['qa_graph_trace_task_id']}"
+        if line_id == "qa_independent_verification":
+            # The resolver validated this newest graph round and frozen ticket.
+            # Refresh its principal's session; never select an older round.
+            graph_line = next(
+                line
+                for line in reversed(dispatch_record.get("completed_lines") or [])
+                if isinstance(line, Mapping)
+                and str(line.get("line_id") or "").strip() == "qa_graph_context"
+            )
+            session_binding = graph_line["qa_evidence_provenance"][
+                "authenticated_qa_binding"
+            ]
+            qa_principal = str(session_binding["qa_principal"])
+            qa_session_id = str(session_binding["qa_session_id"])
     repo_root = (
-        canonical_qa_root
+        str(postmerge_authority.get("target_project_root") or "")
         if postmerge_qa_root
         else worktree
         if worktree_present
         else target_root
     )
     qa_root_source = (
-        "reconciled_canonical_project_root"
+        str(postmerge_authority.get("target_root_source") or "")
+        or "reconciled_canonical_project_root"
         if postmerge_qa_root
         else "assigned_worker_worktree"
         if worktree_present
@@ -150091,8 +150121,6 @@ def _onboard_selected_qa_contract_runtime_guidance(
         field for field, value in (("task_id", worker_task_id), ("repo_root", repo_root))
         if not value
     ]
-    if postmerge_qa_ready and not canonical_qa_root:
-        missing.append("registered_canonical_project_root")
     conflicts = [
         field for field, conflict in (
             ("task_id", task_conflict),
@@ -150117,14 +150145,14 @@ def _onboard_selected_qa_contract_runtime_guidance(
         "$backlog_id": backlog_id,
         "$contract_execution_id": execution_id,
         "$original_worker_task_id": worker_task_id,
-        "$principal_id": f"qa:{worker_task_id}",
+        "$principal_id": qa_principal,
         "$assigned_worktree": repo_root,
         "$qa_session_token_ref": dict(token_transport),
     }
     if postmerge_qa_root:
         replacements[
             "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
-        ] = "<full final canonical HEAD from git rev-parse HEAD in qa_query_root>"
+        ] = str(postmerge_authority["candidate_commit_sha"])
     unresolved_placeholders: set[str] = set()
 
     def _render_machine_value(value: Any) -> Any:
@@ -150142,6 +150170,20 @@ def _onboard_selected_qa_contract_runtime_guidance(
         return value
 
     steps = _render_machine_value(ordered_steps_template)
+    if postmerge_qa_root:
+        for step in steps:
+            if step["id"] in {"qa_session_register", "graph_query_schema"}:
+                step["arguments"]["task_id"] = str(
+                    postmerge_authority["qa_graph_trace_task_id"]
+                )
+            if step["id"] == "qa_session_register" and qa_session_id:
+                step["expected_session_id"] = qa_session_id
+                step["on_session_identity_mismatch"] = "report_public_blocker_only"
+        canonical_dispatch_identity.update({
+            "qa_graph_trace_task_id": postmerge_authority["qa_graph_trace_task_id"],
+            "qa_graph_trace_task_source": postmerge_authority["qa_graph_trace_task_source"],
+            "qa_candidate_commit_sha": postmerge_authority["candidate_commit_sha"],
+        })
     if unresolved_placeholders:
         return {
             **base_guidance,
@@ -170666,6 +170708,28 @@ def _onboard_route_guide_compact_service_response(
         if selected_role_key == "qa"
         else {}
     )
+    qa_recipe_record = (
+        qa_runtime_record if isinstance(qa_runtime_record, Mapping) else record
+    )
+    # Retain the executable MF recipe within the existing section cap without
+    # the full guide's duplicate machine contract and next action.  Strict
+    # Direct keeps its separate transport.
+    selected_qa_recipe = (
+        {
+            key: selected_qa_guidance[key]
+            for key in (
+                "schema_version", "contract_execution_id", "contract_id",
+                "contract_revision_id", "current_stage_id", "current_line_id",
+                "ordered_steps", "redundant_graph_query_required",
+                "status", "executable", "blocker",
+            )
+            if key in selected_qa_guidance
+        }
+        if selected_qa_guidance and _is_mf_parallel_record_contract_id(
+            str(qa_recipe_record.get("contract_id") or "")
+        )
+        else {}
+    )
     selected_bindings = (
         selected_qa_guidance.get("legitimate_evidence_bindings")
         if isinstance(
@@ -170789,19 +170853,23 @@ def _onboard_route_guide_compact_service_response(
                     "legitimate_evidence_bindings": (
                         legitimate_evidence_bindings
                     ),
-                    "direct_main_evidence_shapes": direct_main_evidence_shapes,
-                    "required_sequence": [
-                        "read_compact_onboard_route_guide",
-                        "fetch_only_named_bounded_sections_when_needed",
-                        "execute_only_the_current_source_backed_next_action",
-                        "refresh_after_every_runtime_transition",
-                    ],
-                    "source_fallback": (
-                        "refresh compact onboard_route_guide; do not grep guide "
-                        "text or read implementation source to reconstruct inputs"
-                    ),
+                    **({"selected_role_guidance": selected_qa_recipe}
+                       if selected_qa_recipe else {
+                        "direct_main_evidence_shapes": direct_main_evidence_shapes,
+                        "required_sequence": [
+                            "read_compact_onboard_route_guide",
+                            "fetch_only_named_bounded_sections_when_needed",
+                            "execute_only_the_current_source_backed_next_action",
+                            "refresh_after_every_runtime_transition",
+                        ],
+                        "source_fallback": (
+                            "refresh compact onboard_route_guide; do not grep guide "
+                            "text or read implementation source to reconstruct inputs"
+                        ),
+                    }),
                 },
                 section_name="role_guidance",
+                max_depth=8 if selected_qa_recipe else 5,
             ),
             "graph_first": _onboard_guide_capsule_bounded_section(
                 graph_first_preflight,

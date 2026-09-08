@@ -129183,7 +129183,7 @@ def _selected_qa_runtime_guidance(
     *,
     include_dispatch: bool = True,
     conflicting_worktree: bool = False,
-    pinned_revision: str = "",
+    pinned_revision: str = "rev7",
     postmerge_complete: bool = False,
 ) -> dict[str, Any]:
     completed_lines = []
@@ -129370,50 +129370,197 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
     assert "graph_query" not in json.dumps(conflict)
 
 
-def test_onboard_selected_postmerge_qa_binds_reconciled_canonical_root(
-    monkeypatch,
-):
-    canonical_root = str(Path("/tmp/canonical-project-root").resolve())
+def _selected_postmerge_qa_recipe_fixture(conn, tmp_path, monkeypatch):
+    candidate_root = tmp_path / "selected-postmerge-candidate"
+    comparison_base = _init_test_git_repo(candidate_root)
+    candidate_commit = _commit_test_git_files(candidate_root, ["candidate.txt"])
+    record = _rev8_postmerge_qa_binding_record()
+    record["revision"] = "rev10"
+    worker = record["completed_lines"][0]["payload"]["bounded_workers"][-1]
+    record["completed_lines"][0]["payload"].update({
+        **worker,
+        "worktree_path": str(tmp_path / "original-worker-worktree"),
+        "target_project_root": str(candidate_root),
+    })
+    state = _install_rev8_postmerge_qa_helper_boundaries(
+        monkeypatch, record, terminal_commit=candidate_commit,
+        verified_batch_child=True,
+    )
+    state["target_owner"] = candidate_root
+    state["current_full"]["target_project_root"] = str(candidate_root)
+    state["current_full"]["authority_hash"] = server.stable_sha256({
+        key: value for key, value in state["current_full"].items()
+        if key != "authority_hash"
+    })
+    state["current_receipt"]["terminal_current_full_reconcile_authority"] = (
+        copy.deepcopy(state["current_full"])
+    )
+    _accept_rev8_test_current_receipt(monkeypatch, record, state)
     monkeypatch.setattr(
-        server.project_service,
-        "resolve_project_root",
-        lambda *_args, **_kwargs: Path("/tmp/canonical-project-root"),
+        server.project_service, "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else candidate_root
+        ),
     )
-    guidance = _selected_qa_runtime_guidance(
-        "qa_graph_context",
-        "record_graph_trace",
-        pinned_revision="rev9",
-        postmerge_complete=True,
+    _activate_basic_graph(
+        conn, "full-selected-postmerge-candidate", commit_sha=candidate_commit,
     )
-
-    graph_args = guidance["ordered_steps"][1]["arguments"]
-    assert graph_args["repo_root"] == canonical_root
-    assert graph_args["commit_sha"] == (
-        "<full final canonical HEAD from git rev-parse HEAD in qa_query_root>"
+    # Comparison lineage is a separate existing service boundary.  Keep its
+    # exact git object fixed while exercising real namespace/session consumers.
+    monkeypatch.setattr(
+        server, "_contract_runtime_server_postmerge_comparison_base_commit",
+        lambda *_args, **_kwargs: comparison_base,
     )
-    assert guidance["ordered_steps"][0]["arguments"]["commit_sha"] == (
-        "<full final canonical HEAD from git rev-parse HEAD in qa_query_root>"
-    )
-    assert guidance["canonical_dispatch_identity"] == {
-        "project_id": PID,
-        "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
-        "original_worker_task_id": "original-worker-task",
-        "assigned_worktree": "/tmp/assigned-qa-worktree",
-        "qa_query_root": canonical_root,
-        "qa_query_root_source": "reconciled_canonical_project_root",
+    action = {
+        "contract_execution_id": record["contract_execution_id"],
+        "contract_id": record["contract_id"],
+        "stage_id": "qa_graph_context", "line_id": "qa_graph_context",
+        "action": "record_graph_trace", "owner_role": "qa",
+        "evidence_kind": "graph_trace",
     }
-    binding = guidance["legitimate_evidence_bindings"][
-        "mf_parallel_qa_graph_context"
-    ]
-    assert binding["target_project_root"] == canonical_root
-    assert binding["target_project_root_source"] == (
-        "reconciled_canonical_project_root"
+    record["runtime_guide"] = {"next_legal_action": action}
+    return record, action, state
+
+
+def _register_and_query_selected_qa_recipe(guidance):
+    registration = guidance["ordered_steps"][0]["arguments"]
+    status, registered = server.handle_role_assign(
+        _ctx_with_role({}, "coordinator", method="POST", body={
+            **registration, "role": "qa",
+        })
     )
+    assert status == 201
+    query = copy.deepcopy(guidance["ordered_steps"][1]["arguments"])
+    # The MCP adapter transports this descriptor as a process-local token ref.
+    query.pop("qa_session_token_ref")
+    qa_ctx = _ctx_with_role({"project_id": PID}, "qa", method="POST", body=query)
+    qa_ctx._session.update({
+        field: registered[field] for field in ("session_id", "principal_id", "scope")
+    })
+    queried = server.handle_graph_governance_query(qa_ctx)
+    assert queried["ok"] is True
+    return qa_ctx, queried
+
+
+def test_onboard_selected_postmerge_qa_recipe_reaches_existing_consumer(
+    conn, tmp_path, monkeypatch,
+):
+    record, action, state = _selected_postmerge_qa_recipe_fixture(
+        conn, tmp_path, monkeypatch,
+    )
+    outer = {
+        "project_id": PID, "backlog_id": record["backlog_id"],
+        "contract_execution_id": "onboard-service-outer-row",
+        "contract_id": "onboard", "revision": "rev7",
+    }
+    authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        conn, project_id=PID, record=record,
+    )
+    assert authority["verified"] is True
+    guidance = server._onboard_selected_qa_contract_runtime_guidance(
+        outer, next_legal_action=action, qa_runtime_record=record, conn=conn,
+    )
+    registration, graph = [step["arguments"] for step in guidance["ordered_steps"][:2]]
+    assert guidance["contract_revision_id"] == "rev10"
+    assert guidance["current_stage_id"] == "qa_graph_context"
+    assert registration["task_id"] == graph["task_id"] == authority["qa_graph_trace_task_id"]
+    assert registration["task_id"] == record["contract_execution_id"]
+    assert registration["principal_id"] == f"qa:{registration['task_id']}"
+    assert registration["commit_sha"] == graph["commit_sha"] == authority["candidate_commit_sha"]
+    assert graph["repo_root"] == authority["target_project_root"]
+    identity = guidance["canonical_dispatch_identity"]
+    assert identity["original_worker_task_id"] == authority["task_id"]
+    assert identity["original_worker_task_id"] != graph["task_id"]
+    assert identity["qa_graph_trace_task_source"] == "ContractRuntime.contract_execution_id"
+    assert identity["qa_query_root_source"] == authority["target_root_source"]
+    binding = guidance["legitimate_evidence_bindings"]["mf_parallel_qa_graph_context"]
+    assert binding["target_project_root"] == graph["repo_root"]
     assert binding["canonical_project_root_is_the_query_target"] is True
-    assert binding["canonical_project_root_is_not_the_query_target"] is False
+    qa_ctx, queried = _register_and_query_selected_qa_recipe(guidance)
+    bound = server._contract_runtime_bind_qa_graph_authority(
+        qa_ctx, conn, project_id=PID, record=record,
+        write={"stage_id": "qa_graph_context", "line_id": "qa_graph_context",
+               "actor_role": "qa", "evidence_kind": "graph_trace", "status": "accepted"},
+        body={"graph_trace_ids": [queried["trace_id"]]},
+        policy={"lookup_key_fields": ["graph_trace_ids"], "authority_object_path": "payload.graph_trace_evidence"},
+    )
+    assert bound["task_id"] == registration["task_id"]
+    assert bound["payload"]["graph_trace_evidence"]["db_verified"] is True
+    assert bound["payload"]["graph_trace_evidence"]["qa_session_id"] == qa_ctx._session["session_id"]
+
+    # The old worker-scoped recipe still queries successfully but cannot satisfy
+    # this CEX-scoped consumer.  Do not relabel its session or persisted trace.
+    old_recipe = copy.deepcopy(guidance)
+    old_recipe["ordered_steps"][0]["arguments"]["principal_id"] = "qa:old-worker-recipe"
+    for step in old_recipe["ordered_steps"][:2]:
+        step["arguments"]["task_id"] = identity["original_worker_task_id"]
+    old_ctx, old_query = _register_and_query_selected_qa_recipe(old_recipe)
+    with pytest.raises(GovernanceError) as rejected:
+        server._contract_runtime_bind_qa_graph_authority(
+            old_ctx, conn, project_id=PID, record=record,
+            write={"line_id": "qa_graph_context", "status": "accepted"},
+            body={"graph_trace_ids": [old_query["trace_id"]]},
+            policy={"lookup_key_fields": ["graph_trace_ids"], "authority_object_path": "payload.graph_trace_evidence"},
+        )
+    assert rejected.value.code == "contract_runtime_qa_graph_trace_identity_mismatch"
+    assert {item["field"] for item in rejected.value.details["identity_mismatches"]} == {"task_id"}
+
+    record["completed_lines"].append(bound)
+    verdict_action = {
+        **action, "stage_id": "qa", "line_id": "qa_independent_verification",
+        "action": "record_independent_verification", "evidence_kind": "independent_verification",
+    }
+    record["runtime_guide"]["next_legal_action"] = verdict_action
+    monkeypatch.setattr(
+        server, "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: pytest.fail("verdict must use the newest frozen ticket"),
+    )
+    verdict = server._onboard_selected_qa_contract_runtime_guidance(
+        outer, next_legal_action=verdict_action, qa_runtime_record=record, conn=conn,
+    )
+    assert verdict["current_stage_id"] == "qa"
+    assert verdict["redundant_graph_query_required"] is False
+    assert all(step.get("mcp_tool") != "graph_query" for step in verdict["ordered_steps"])
+    refresh_step = verdict["ordered_steps"][0]
+    assert refresh_step["arguments"] == registration
+    assert refresh_step["expected_session_id"] == qa_ctx._session["session_id"]
+    _, refreshed = server.handle_role_assign(
+        _ctx_with_role({}, "coordinator", method="POST", body={
+            **refresh_step["arguments"], "role": "qa",
+        })
+    )
+    assert refreshed["session_id"] == qa_ctx._session["session_id"]
+    independent = server._contract_runtime_bind_qa_independent_verification_authority(
+        qa_ctx, conn, project_id=PID, record=record,
+        write={"stage_id": "qa", "line_id": "qa_independent_verification",
+               "actor_role": "qa", "evidence_kind": "independent_verification", "status": "accepted"},
+    )
+    assert independent["task_id"] == authority["task_id"]
+    assert independent["task_id"] != registration["task_id"]
+    assert independent["runtime_context_id"] == authority["runtime_context_id"]
+    assert independent["parent_task_id"] == record["contract_execution_id"]
 
 
-def test_onboard_selected_postmerge_revision_before_reconcile_keeps_worker_root():
+def test_onboard_selected_postmerge_verdict_rejects_newest_missing_ticket(monkeypatch):
+    record = _rev8_postmerge_independent_qa_record()
+    record["completed_lines"].append({"line_id": "qa_graph_context", "payload": {}})
+    monkeypatch.setattr(
+        server, "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: pytest.fail("missing newest ticket cannot recompute old authority"),
+    )
+    guidance = server._onboard_selected_qa_contract_runtime_guidance(
+        record,
+        next_legal_action={**record["runtime_guide"]["next_legal_action"],
+                           "contract_execution_id": record["contract_execution_id"]},
+        conn=object(),
+    )
+    assert guidance["status"] == "blocked"
+    assert guidance["ordered_steps"] == []
+    assert guidance["blocker"]["id"] == "contract_runtime_qa_worker_identity_unresolved"
+    assert guidance["blocker"]["blocker_codes"] == ["persisted_postmerge_qa_authority_missing"]
+
+
+def test_onboard_selected_postmerge_revision_without_authority_blocks():
     guidance = _selected_qa_runtime_guidance(
         "qa_graph_context",
         "record_graph_trace",
@@ -129421,12 +129568,88 @@ def test_onboard_selected_postmerge_revision_before_reconcile_keeps_worker_root(
         postmerge_complete=False,
     )
 
-    assert guidance["ordered_steps"][1]["arguments"]["repo_root"] == (
-        "/tmp/assigned-qa-worktree"
+    assert guidance["status"] == "blocked"
+    assert guidance["ordered_steps"] == []
+    assert guidance["blocker"]["id"] == "contract_runtime_rev8_postmerge_qa_authority_required"
+
+
+@pytest.mark.parametrize("response_view", ["full", "compact"])
+def test_onboard_selected_postmerge_no_task_hint_full_and_capsule_recipe(
+    conn, tmp_path, monkeypatch, response_view,
+):
+    record, action, _state = _selected_postmerge_qa_recipe_fixture(
+        conn, tmp_path, monkeypatch,
     )
-    assert guidance["canonical_dispatch_identity"]["qa_query_root_source"] == (
-        "assigned_worker_worktree"
+    _insert_simple_mf_close_backlog(conn, record["backlog_id"])
+    selected_reads = []
+    original_get = SQLiteContractExecutionStore.get
+    runtime_class = type(server._contract_runtime(conn))
+    original_current_record = runtime_class.current_record
+
+    # Isolate the durable selector/storage boundary.  The full service must
+    # resolve this exact selected child itself from an input with no task hint.
+    def selected_get(self, execution_id):
+        if execution_id == record["contract_execution_id"]:
+            selected_reads.append(("get", execution_id))
+            return copy.deepcopy(record)
+        return original_get(self, execution_id)
+
+    def selected_current_record(self, execution_id, **kwargs):
+        if execution_id == record["contract_execution_id"]:
+            selected_reads.append((kwargs["actor_role"], execution_id))
+            return copy.deepcopy(record)
+        return original_current_record(self, execution_id, **kwargs)
+
+    monkeypatch.setattr(SQLiteContractExecutionStore, "get", selected_get)
+    monkeypatch.setattr(runtime_class, "current_record", selected_current_record)
+    monkeypatch.setattr(
+        server, "_contract_chain_current_projection",
+        lambda *_args, **_kwargs: {
+            "schema_version": "backlog_contract_chain.current.v1",
+            "project_id": PID, "backlog_id": record["backlog_id"],
+            "active_child_contract_execution_id": record["contract_execution_id"],
+            "next_legal_action": dict(action),
+            "readiness_state": "waiting_qa", "degraded": False,
+        },
     )
+    request = {
+        "backlog_id": record["backlog_id"], "role": "qa",
+        "work_type": "qa_verification", "response_view": response_view,
+    }
+    response = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": PID}, method="POST", body=request)
+    )
+    assert "task_id" not in request
+    assert ("qa", record["contract_execution_id"]) in selected_reads
+    expected = server._onboard_selected_qa_contract_runtime_guidance(
+        {"project_id": PID, "backlog_id": record["backlog_id"]},
+        next_legal_action=action, qa_runtime_record=record, conn=conn,
+    )
+    if response_view == "compact":
+        capsule = server.handle_project_onboard_route_guide_capsule(
+            _ctx({"project_id": PID}, method="POST", body={
+                "guide_capsule_ref": response["guide_capsule_ref"],
+                "backlog_id": record["backlog_id"], "role": "qa",
+                "work_type": "qa_verification", "sections": ["role_guidance"],
+            })
+        )
+        role_guidance = capsule["sections"]["role_guidance"]
+        assert role_guidance.get("truncated") is not True
+        assert server._onboard_guide_capsule_serialized_bytes(role_guidance) <= 6144
+        guidance = role_guidance["selected_role_guidance"]
+    else:
+        guidance = response["agent_onboard_guidance"]["selected_role_guidance"]
+    assert guidance["ordered_steps"] == expected["ordered_steps"]
+    assert guidance["contract_revision_id"] == record["revision"]
+    qa_ctx, queried = _register_and_query_selected_qa_recipe(guidance)
+    bound = server._contract_runtime_bind_qa_graph_authority(
+        qa_ctx, conn, project_id=PID, record=record,
+        write={"line_id": "qa_graph_context", "status": "accepted"},
+        body={"graph_trace_ids": [queried["trace_id"]]},
+        policy={"lookup_key_fields": ["graph_trace_ids"], "authority_object_path": "payload.graph_trace_evidence"},
+    )
+    assert bound["task_id"] == record["contract_execution_id"]
+    assert bound["payload"]["graph_trace_evidence"]["db_verified"] is True
 
 
 def test_onboard_qa_machine_contract_binding_drives_emitted_guidance(
@@ -129515,10 +129738,11 @@ def test_onboard_selected_qa_verdict_guidance_skips_redundant_graph_and_advances
         "writer_role_safe_copy_payload.copy_payload"
     )
     assert verdict["copy_all_safe_fields"] is True
-    assert verdict["add_arguments"]["payload"] == {
-        "tests": "<exact pytest node ids and outcomes>",
-        "summary": "<clear PASS or FAIL summary>",
-    }
+    assert verdict["add_arguments"]["payload"] == guidance["machine_contract"][
+        "line_contract"
+    ]["ordered_steps"][3]["add_arguments"]["payload"]
+    assert verdict["add_arguments"]["payload"]["tests"] == "<exact pytest node ids and outcomes>"
+    assert verdict["add_arguments"]["payload"]["summary"] == "<clear PASS or FAIL summary>"
     assert verdict["add_arguments"]["qa_session_token_ref"][
         "raw_value_exposed"
     ] is False
@@ -129529,6 +129753,7 @@ def test_onboard_selected_qa_verdict_guidance_skips_redundant_graph_and_advances
 def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
     conn,
     tmp_path,
+    monkeypatch,
 ):
     backlog_id = "AC-ONBOARD-QA-ACTIVE-CHILD-DISPATCH"
     worker_task_id = "handler-original-worker-task"
@@ -129536,7 +129761,8 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
     assigned_worktree = tmp_path / "assigned-worktree"
     canonical_root.mkdir()
     assigned_worktree.mkdir()
-    head_commit = _init_test_git_repo(assigned_worktree)
+    base_commit = _init_test_git_repo(assigned_worktree)
+    head_commit = _commit_test_git_files(assigned_worktree, ["candidate.txt"])
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
         conn,
         backlog_id=backlog_id,
@@ -129546,6 +129772,8 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
         token="token-handler-active-child",
         worktree_path=str(assigned_worktree),
         target_project_root=str(canonical_root),
+        pinned_revision="rev7",
+        base_commit=base_commit,
     )
     evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
         conn,
@@ -129563,6 +129791,7 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
         graph_trace_id="gqt-handler-active-child-worker",
         head_commit=head_commit,
         implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+        include_worker_finish=True,
     )
     current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
@@ -129666,7 +129895,7 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
     assert capsule_response["legitimate_evidence_bindings"] == bindings
     assert compact_guidance["contract_runtime_authority"] == {
         "source_of_authority": "contract_runtime",
-        "authority_decision_source": "contract_runtime_current_state",
+        "authority_decision_source": "backlog_contract_chain_current",
         "contract_execution_id": successor["contract_execution_id"],
         "current_line_id": "qa_graph_context",
         "current_action": "record_graph_trace",
@@ -129714,6 +129943,30 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
     assert response["http_envelope_serialization_reserve_chars"] == 512
     assert serialized_chars <= 64000 - 512
     assert "token-handler-active-child" not in serialized_response
+
+    # Exercise the pinned legacy recipe against its existing worker consumer.
+    assert guidance["contract_revision_id"] == "rev7"
+    legacy_recipe = copy.deepcopy(guidance)
+    for step in legacy_recipe["ordered_steps"][:2]:
+        step["arguments"]["commit_sha"] = head_commit
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else assigned_worktree
+        ),
+    )
+    _activate_basic_graph(conn, "full-selected-legacy-qa", commit_sha=head_commit)
+    qa_ctx, queried = _register_and_query_selected_qa_recipe(legacy_recipe)
+    bound = server._contract_runtime_bind_qa_graph_authority(
+        qa_ctx, conn, project_id=PID,
+        record=server._contract_runtime_store(conn).get(successor["contract_execution_id"]),
+        write={"line_id": "qa_graph_context", "status": "accepted"},
+        body={"graph_trace_ids": [queried["trace_id"]]},
+        policy={"lookup_key_fields": ["graph_trace_ids"], "authority_object_path": "payload.graph_trace_evidence"},
+    )
+    assert bound["task_id"] == worker_task_id
+    assert bound["task_id"] != successor["contract_execution_id"]
+    assert bound["payload"]["graph_trace_evidence"]["db_verified"] is True
 
 
 def test_onboard_route_guide_observer_discovers_separate_parallel_worker_host(conn):
