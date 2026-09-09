@@ -151168,6 +151168,85 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
     )
 
 
+def _operator_supervised_direct_main_stable_bypass_exemption(
+    conn,
+    *,
+    project_id: str,
+    execution_id: str,
+) -> bool:
+    """Prove one canonical Direct row is stable before the dev-only accessor."""
+
+    try:
+        rows = conn.execute(
+            """SELECT project_id, backlog_id, contract_id, record_json
+               FROM contract_runtime_executions
+               WHERE contract_execution_id = ?""",
+            (execution_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    physical_project_id = str(row["project_id"] or "")
+    physical_backlog_id = str(row["backlog_id"] or "").strip()
+    physical_contract_id = str(row["contract_id"] or "")
+    if not (
+        physical_project_id == project_id
+        and physical_backlog_id
+        and physical_contract_id == "operator_supervised_direct_main"
+    ):
+        return False
+    try:
+        record = json.loads(
+            str(row["record_json"] or "{}"),
+            object_pairs_hook=_operator_supervised_direct_main_closed_json_object,
+        )
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(record, Mapping) or not (
+        str(record.get("project_id") or "") == project_id
+        and str(record.get("backlog_id") or "").strip()
+        == physical_backlog_id
+        and str(record.get("contract_id") or "")
+        == "operator_supervised_direct_main"
+        and str(record.get("contract_execution_id") or "").strip()
+        == execution_id
+    ):
+        return False
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    if not (
+        "runtime_world_authority" in binding
+        and type(binding.get("runtime_world_authority")) is dict
+        and not binding["runtime_world_authority"]
+    ):
+        return False
+    ownership = _operator_supervised_direct_main_persisted_world_ownership(
+        conn,
+        project_id=project_id,
+        backlog_id=physical_backlog_id,
+    )
+    return bool(
+        ownership.get("complete") is True
+        and ownership.get("world") == "stable"
+        and ownership.get("contract_execution_count") == 1
+        and ownership.get("contract_execution_id") == execution_id
+        and not ownership.get("violations")
+    )
+
+
 def _operator_supervised_direct_main_request_claim_values(
     request_body: Mapping[str, Any] | None,
     field: str,
@@ -227483,7 +227562,18 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
 
     with DBContext(project_id) as conn:
         runtime = _contract_runtime(conn)
-        physical_dev = runtime.store.get_dev_direct_main_physical(execution_id)
+        stable_direct = (
+            _operator_supervised_direct_main_stable_bypass_exemption(
+                conn,
+                project_id=project_id,
+                execution_id=execution_id,
+            )
+        )
+        physical_dev = (
+            None
+            if stable_direct
+            else runtime.store.get_dev_direct_main_physical(execution_id)
+        )
         if physical_dev is not None and _runtime_plane() != "dev":
             raise GovernanceError(
                 "historical_cross_world_contract_runtime_read_only",

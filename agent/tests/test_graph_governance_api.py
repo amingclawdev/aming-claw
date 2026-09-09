@@ -209475,6 +209475,11 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     assert ownership["world"] == "stable"
     assert ownership["contract_execution_id"] == execution_id
     assert ownership["complete"] is True
+    assert server._operator_supervised_direct_main_stable_bypass_exemption(
+        conn,
+        project_id=project_id,
+        execution_id=execution_id,
+    ) is True
     attacks: list[dict[str, Any]] = []
     binding_extra = copy.deepcopy(binding)
     binding_extra["unexpected_authority"] = True
@@ -209564,6 +209569,475 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
     runtime_identity["stable_database_identity"] = database_identity
     assert conn.total_changes == before
     assert tuple(conn.iterdump()) == before_rows
+
+
+@pytest.mark.parametrize(
+    "target_line",
+    ["observer_implementation", "qa_graph_context"],
+)
+def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
+    monkeypatch,
+    tmp_path,
+    target_line,
+):
+    from agent.tests.test_governance_db import _install_fixed_stable_boundary
+
+    project_id = "world-r2-external"
+    backlog_id = f"WORLD-R2-STABLE-BYPASS-{target_line.upper()}"
+    workspace = tmp_path / "external-project"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    for args in (
+        ["init", "-b", "main"],
+        ["add", "app.py"],
+        [
+            "-c", "user.name=World R2 Test",
+            "-c", "user.email=world-r2@example.invalid",
+            "commit", "-m", "stable external fixture",
+        ],
+    ):
+        subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            check=True,
+            capture_output=True,
+        )
+
+    shared = _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    control_database = (
+        shared
+        / Path(server.AC_DATABASE_STABLE_RELATIVE_PATH).relative_to(
+            "shared-volume"
+        )
+    )
+    with sqlite3.connect(control_database) as stable_control:
+        stable_control.execute(
+            "CREATE TABLE stable_fixture_identity (id INTEGER PRIMARY KEY)"
+        )
+    database = (
+        shared / "codex-tasks" / "state" / "governance"
+        / project_id / "governance.db"
+    )
+    governance_root = database.parent.parent
+    monkeypatch.setattr(
+        server.project_service,
+        "_governance_root",
+        lambda: governance_root,
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "_governance_root",
+        lambda: governance_root,
+    )
+    initialized = server.project_service.init_project(
+        project_id,
+        project_name="World R2 external fixture",
+        workspace_path=str(workspace),
+    )
+    assert initialized["project"]["project_id"] == project_id
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    try:
+        _ensure_schema(conn)
+        _initialize_ac_dev_guide_schema(conn)
+        _insert_simple_mf_close_backlog(conn, backlog_id)
+        conn.execute(
+            "UPDATE backlog_bugs SET target_files=?, test_files='[]' WHERE bug_id=?",
+            (json.dumps(["app.py"]), backlog_id),
+        )
+        conn.commit()
+
+        monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+        monkeypatch.setenv("SHARED_VOLUME_PATH", str(shared))
+        stable_binding = governance_db.verified_stable_database_binding()
+        assert stable_binding["database_path"] == str(
+            control_database.resolve()
+        )
+        stable_identity = stable_binding["stable_database_identity"]
+        monkeypatch.setattr(
+            server.project_service,
+            "resolve_project_root",
+            lambda selected_project_id, *_args, **_kwargs: (
+                str(workspace)
+                if selected_project_id == project_id
+                else pytest.fail("cross-project root lookup")
+            ),
+        )
+        monkeypatch.setattr(
+            server,
+            "_runtime_plane_identity",
+            lambda: {
+                "status": "ready",
+                "plane": "stable",
+                "port": server.AC_STABLE_SERVICE_PORT,
+                "world_id": "ac-stable",
+                "stable_database_identity": stable_identity,
+            },
+        )
+        monkeypatch.setitem(
+            server.LOADED_RUNTIME_IDENTITY,
+            "stable_database_identity",
+            copy.deepcopy(stable_identity),
+        )
+        monkeypatch.setitem(
+            server.LOADED_RUNTIME_IDENTITY,
+            "stable_shared_volume_path",
+            str(shared.resolve()),
+        )
+        execution_id = server._operator_supervised_direct_main_execution_id(
+            project_id,
+            backlog_id,
+            revision="rev3",
+        )
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=execution_id,
+            target_files=["app.py"],
+            allowed_actions=list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+            evidence_refs=[
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{execution_id}",
+                "contract_definition:operator_supervised_direct_main.v1.rev3",
+            ],
+        )
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=issued["route_token_ref"],
+            token=issued["route_token"],
+        )
+        server._operator_supervised_direct_main_start_runtime(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=execution_id,
+            route_token_ref=issued["route_token_ref"],
+            world_ref=server._operator_supervised_direct_main_world_ref(
+                project_id=project_id
+            ),
+        )
+        # Seed the already accepted canonical three-line prefix. This fixture
+        # does not claim to exercise the normal graph/prewrite admission path.
+        server._operator_supervised_direct_main_apply_timeline_runtime(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            event_kind="observer_direct_implementation_exception",
+            body={
+                "event_type": "mf.observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "decision": "operator_supervised_direct_main_approved",
+            },
+            normalized_payload={},
+            pre_mutation_graph_trace_gate={
+                "passed": True,
+                "db_evidence": {
+                    "db_verified": True,
+                    "verified_trace_ids": ["gqt-world-r2-stable-fixture"],
+                },
+            },
+            pre_mutation_request_fingerprint=_fake_sha(
+                "world-r2-stable-pre-mutation"
+            ),
+        )
+        session_id = _insert_ac_dev_active_observer_session(
+            conn,
+            project_id=project_id,
+            session_id="obs-world-r2-stable",
+        )
+        conn.commit()
+        current = server._contract_runtime(conn).current_record(
+            execution_id,
+            actor_role="observer",
+        )
+        assert current["execution_state_revision"] == 4
+        assert len(current["completed_lines"]) == 3
+        ownership = (
+            server._operator_supervised_direct_main_persisted_world_ownership(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        )
+        assert ownership["world"] == "stable"
+        assert ownership["complete"] is True
+
+        class ExistingConnectionContext:
+            def __init__(self, _project_id):
+                assert _project_id == project_id
+
+            def __enter__(self):
+                return conn
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(server, "DBContext", ExistingConnectionContext)
+        actor_role = "observer"
+        request_session = None
+        if target_line == "qa_graph_context":
+            (workspace / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(workspace), "add", "app.py"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "-c",
+                    "user.name=World R2 Test",
+                    "-c",
+                    "user.email=world-r2@example.invalid",
+                    "commit",
+                    "-m",
+                    "materialize stable QA fixture",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            implementation_commit = subprocess.run(
+                ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            route_identity = current["metadata"][
+                "operator_supervised_direct_main_runtime_binding"
+            ]["route_identity"]
+            implementation = server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": project_id},
+                    "observer",
+                    method="POST",
+                    body={
+                        "backlog_id": backlog_id,
+                        "task_id": execution_id,
+                        "route_token_ref": issued["route_token_ref"],
+                        "event_type": "observer.implementation",
+                        "event_kind": "implementation",
+                        "phase": "implementation",
+                        "status": "passed",
+                        "actor": "observer",
+                        "commit_sha": implementation_commit,
+                        "payload": {
+                            **route_identity,
+                            "changed_files": ["app.py"],
+                            "test_results": (
+                                _canonical_parentless_direct_main_test_results(
+                                    implementation_commit,
+                                    command=(
+                                        "pytest -q world-r2-stable-qa-fixture"
+                                    ),
+                                )
+                            ),
+                            "dirty_scope_check": {
+                                "allowed_files": ["app.py"],
+                                "changed_files": ["app.py"],
+                                "unexpected_files": [],
+                                "exact_match": True,
+                            },
+                        },
+                    },
+                )
+            )
+            assert implementation["event_kind"] == "implementation"
+            assert implementation["status"] == "passed"
+            assert implementation["payload"]["direct_contract_runtime_lineage"][
+                "completed_line_refs"
+            ] == [
+                {
+                    "stage_id": "implementation",
+                    "line_id": "observer_implementation",
+                    "evidence_kind": "implementation",
+                    "execution_state_revision": 5,
+                }
+            ]
+            implementation_events = task_timeline.list_events(
+                conn,
+                project_id,
+                backlog_id=backlog_id,
+                task_id=execution_id,
+                event_kind="implementation",
+                limit=2,
+            )
+            assert [event["id"] for event in implementation_events] == [
+                implementation["id"]
+            ]
+            current = server._contract_runtime(conn).current_record(
+                execution_id,
+                actor_role="qa",
+            )
+            assert current["execution_state_revision"] == 5
+            assert len(current["completed_lines"]) == 4
+            assert current["runtime_guide"]["next_legal_action"]["line_id"] == (
+                "qa_graph_context"
+            )
+            graph_policy = governance_db.classify_graph_activation_connection(
+                conn
+            )
+            assert graph_policy["classification_reason"] == (
+                "verified_stable_registered_external_project"
+            )
+            assert graph_policy["active_graph_activation_allowed"] is True
+            _activate_basic_graph(
+                conn,
+                "full-world-r2-stable-qa",
+                project_id=project_id,
+                commit_sha=implementation_commit,
+            )
+            qa_scope = [
+                f"backlog:{backlog_id}",
+                f"task:{execution_id}",
+                f"commit:{implementation_commit}",
+                server._qa_scope_binding_ref(
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=execution_id,
+                    commit_sha=implementation_commit,
+                ),
+            ]
+            registered = server.role_service.register(
+                conn,
+                "qa:world-r2-stable",
+                project_id,
+                "qa",
+                scope=qa_scope,
+            )
+            conn.commit()
+            request_session = {
+                "session_id": registered["session_id"],
+                "principal_id": "qa:world-r2-stable",
+                "project_id": project_id,
+                "role": "qa",
+                "scope": qa_scope,
+            }
+            actor_role = "qa"
+
+        guide = server._onboard_operator_supervised_direct_main_runtime_response(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=issued["route_token_ref"],
+            role=actor_role,
+            work_type=(
+                "qa_verification"
+                if actor_role == "qa"
+                else "operator_supervised_direct_main"
+            ),
+            response_view="full",
+            request_body={
+                "task_id": execution_id,
+                **(
+                    {"observer_session_id": session_id}
+                    if actor_role == "observer"
+                    else {}
+                ),
+            },
+        )
+        assert guide["contract_execution_id"] == execution_id
+        assert guide["next_legal_action"]["line_id"] == target_line
+        runtime_guide = server._contract_runtime_guide_for_response(
+            current,
+            actor_role=actor_role,
+        )
+        bypass = copy.deepcopy(
+            runtime_guide["line_bypass_guidance"]["create_new_copy_safe_body"]
+        )
+        bypass.update(
+            {
+                "classification": "stable_fixture_blocker",
+                "reason": "the bounded fixture cannot perform production mutation",
+                "decision": "record one audited no-PASS continuation",
+                "evidence_refs": [f"backlog:{backlog_id}"],
+                "task_id": execution_id,
+            }
+        )
+        bypass.pop("observer_session_id", None)
+        bypass.pop("observer_route_token_ref", None)
+        bypass.pop("route_token_ref", None)
+
+        request_context = _ctx_with_role(
+            {
+                "project_id": project_id,
+                "contract_execution_id": execution_id,
+            },
+            actor_role,
+            method="POST",
+            body=bypass,
+        )
+        if request_session is not None:
+            request_context._session = request_session
+        business_before = tuple(conn.iterdump())
+        changes_before_rejections = conn.total_changes
+        for case, expected_error in (
+            ("stale_revision", "execution_state_revision mismatch"),
+            ("stale_guide", "runtime_guide_hash mismatch"),
+            ("wrong_line", "bypass does not match current line"),
+        ):
+            invalid = copy.deepcopy(bypass)
+            invalid["bypass_identity"] += f":negative:{case}"
+            if case == "stale_revision":
+                invalid["execution_state_revision"] -= 1
+            elif case == "stale_guide":
+                invalid["runtime_guide_hash"] = "sha256:" + "f" * 64
+            else:
+                invalid["line_id"] = "wrong_line"
+            invalid_context = _ctx_with_role(
+                {
+                    "project_id": project_id,
+                    "contract_execution_id": execution_id,
+                },
+                actor_role,
+                method="POST",
+                body=invalid,
+            )
+            if request_session is not None:
+                invalid_context._session = request_session
+            rejected = server.handle_project_contract_runtime_line_bypass(
+                invalid_context
+            )
+            assert rejected["ok"] is False
+            assert expected_error in rejected["decision"]["errors"]
+            assert tuple(conn.iterdump()) == business_before
+            assert conn.total_changes == changes_before_rejections
+        accepted = server.handle_project_contract_runtime_line_bypass(
+            request_context
+        )
+        assert accepted["ok"] is True
+        assert accepted["written_line"]["status"] == "waived"
+        assert accepted["written_line"]["payload"]["no_pass_generation"][
+            "authoritative_pass_synthesized"
+        ] is False
+        assert accepted["diagnostic_status"] == "OPEN"
+        assert len(accepted["timeline_events"]) == 2
+        changes = conn.total_changes
+        replay_context = _ctx_with_role(
+            {
+                "project_id": project_id,
+                "contract_execution_id": execution_id,
+            },
+            actor_role,
+            method="POST",
+            body=bypass,
+        )
+        if request_session is not None:
+            replay_context._session = request_session
+        replay = server.handle_project_contract_runtime_line_bypass(
+            replay_context
+        )
+        assert replay["ok"] is True
+        assert replay["idempotent"] is True
+        assert replay["timeline_events"] == []
+        assert conn.total_changes == changes
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(
@@ -209695,7 +210169,7 @@ def test_legacy_empty_world_requires_exact_stable_physical_binding(
 
 @pytest.mark.parametrize(
     "case",
-    ["missing", "multiple", "cross_binding", "mixed_world"],
+    ["missing", "missing_world", "multiple", "cross_binding", "mixed_world"],
 )
 def test_onboard_persisted_world_ownership_fails_closed_zero_write(
     conn,
@@ -209752,6 +210226,19 @@ def test_onboard_persisted_world_ownership_fails_closed_zero_write(
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
     before = conn.total_changes
     before_rows = tuple(conn.iterdump())
+
+    if case != "missing":
+        assert server._operator_supervised_direct_main_stable_bypass_exemption(
+            conn,
+            project_id=PID,
+            execution_id=f"cex-world-{case}-0",
+        ) is False
+    if case == "missing_world":
+        # Guide preserves its historical projection, while the new bypass
+        # exemption still fails closed before the strict dev accessor.
+        assert conn.total_changes == before
+        assert tuple(conn.iterdump()) == before_rows
+        return
 
     with pytest.raises(GovernanceError) as rejected:
         server._require_onboard_dev_selector_endpoint(
