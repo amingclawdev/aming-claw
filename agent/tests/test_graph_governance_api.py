@@ -105268,6 +105268,401 @@ def _canonical_parentless_direct_main_commit_message(
     )
 
 
+def test_parentless_direct_main_implementation_admission_is_atomic_file_backed(
+    tmp_path,
+    monkeypatch,
+):
+    """Keep generic Runtime validation ahead of the sole Direct line writer."""
+
+    isolated_root = tmp_path.resolve() / "atomicity-state"
+    database_path = tmp_path.resolve() / "atomicity.sqlite3"
+
+    def isolated_governance_root():
+        assert isolated_root.resolve().is_relative_to(tmp_path.resolve())
+        assert not isolated_root.is_symlink()
+        return isolated_root
+
+    monkeypatch.setattr(
+        governance_db, "_governance_root", isolated_governance_root
+    )
+    monkeypatch.setattr(
+        server.audit_service, "_governance_root", isolated_governance_root
+    )
+    from agent.governance import redis_client
+
+    def reject_external_redis(_self):
+        raise AssertionError("atomicity test forbids external Redis connections")
+
+    monkeypatch.setattr(
+        redis_client,
+        "_instance",
+        redis_client.RedisClient(url="redis://test-disabled.invalid:0/0"),
+    )
+    monkeypatch.setattr(
+        redis_client.RedisClient, "connect", reject_external_redis
+    )
+
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "schema_version": "ac_graph_activation_policy.v1",
+            "runtime_plane": "stable",
+            "active_graph_activation_allowed": True,
+            "classification_reason": "isolated_file_backed_test_connection",
+            "project_id": PID,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(connection),
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(connection),
+    )
+    original_registry_project_config = server._registry_project_config
+
+    def registered_project_config(project_id: str):
+        if project_id == PID:
+            return (
+                {
+                    "project_id": PID,
+                    "testing": {
+                        "unit_command": (
+                            "python -m pytest "
+                            "agent/tests/test_graph_governance_api.py -q"
+                        ),
+                        "e2e_command": "bash scripts/e2e-task-test.sh",
+                        "e2e": {"auto_run": False},
+                    },
+                },
+                "isolated_file_backed_registry",
+            )
+        return original_registry_project_config(project_id)
+
+    monkeypatch.setattr(
+        server, "_registry_project_config", registered_project_config
+    )
+    active_project_root: Path | None = None
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: active_project_root,
+    )
+
+    def fresh_snapshot(task_id: str, backlog_id: str) -> dict[str, Any]:
+        fresh = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        fresh.row_factory = sqlite3.Row
+        try:
+            record = server._contract_runtime(fresh).store.get(task_id)
+            implementation_events = [
+                event
+                for event in task_timeline.list_events(
+                    fresh,
+                    PID,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                    limit=1000,
+                )
+                if task_timeline._close_event_key(event) == "implementation"
+            ]
+            return {
+                "record": copy.deepcopy(record),
+                "execution_state_revision": record[
+                    "execution_state_revision"
+                ],
+                "completed_lines": copy.deepcopy(record["completed_lines"]),
+                "implementation_events": copy.deepcopy(
+                    implementation_events
+                ),
+            }
+        finally:
+            fresh.close()
+
+    def prepare(suffix: str) -> dict[str, Any]:
+        nonlocal active_project_root
+        backlog_id = f"AC-DIRECT-IMPLEMENTATION-ATOMICITY-{suffix.upper()}"
+        active_project_root = tmp_path / f"atomicity-git-{suffix}"
+        parent_commit = _init_test_git_repo(active_project_root)
+        row_files = [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ]
+        task_id, route_token_ref, route_identity = (
+            _parentless_direct_main_pre_mutation_graph_scope(
+                connection,
+                backlog_id=backlog_id,
+                row_files=row_files,
+            )
+        )
+        trace_id = (
+            "gqt-20260909-"
+            + hashlib.sha256(suffix.encode("utf-8")).hexdigest()[:10]
+        )
+        _insert_observer_graph_query_trace(
+            connection,
+            trace_id=trace_id,
+            snapshot_id=f"scope-atomicity-{suffix}",
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_identity=route_identity,
+            commit_sha=parent_commit,
+            target_project_root=str(active_project_root),
+        )
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=_canonical_parentless_direct_main_pre_mutation_body(
+                    append_base={
+                        "backlog_id": backlog_id,
+                        "task_id": task_id,
+                        "route_token_ref": route_token_ref,
+                    },
+                    route_identity=route_identity,
+                    allowed_files=row_files,
+                    graph_trace_ids=[trace_id],
+                ),
+            )
+        )
+        prefix = server._contract_runtime(connection).store.get(task_id)
+        assert prefix["execution_state_revision"] == 4
+        assert [line["line_id"] for line in prefix["completed_lines"]] == [
+            "observer_bind_direct_scope",
+            "observer_graph_context",
+            "observer_direct_implementation_exception",
+        ]
+        implementation_commit = _commit_test_git_files(
+            active_project_root,
+            row_files,
+            message=_canonical_parentless_direct_main_commit_message(
+                backlog_id=backlog_id,
+                task_id=task_id,
+                parent_commit=parent_commit,
+            ),
+        )
+        body = _canonical_parentless_direct_main_implementation_body(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_token_ref=route_token_ref,
+            route_identity=route_identity,
+            commit_sha=implementation_commit,
+            changed_files=row_files,
+            allowed_files=row_files,
+        )
+        return {
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "project_root": active_project_root,
+            "route_identity": route_identity,
+            "implementation_commit": implementation_commit,
+            "body": body,
+            "runtime_binding_hash": prefix["metadata"][
+                "operator_supervised_direct_main_runtime_binding"
+            ]["binding_hash"],
+        }
+
+    try:
+        for suffix, binding_value in (
+            ("missing-binding", None),
+            ("wrong-binding", "sha256:" + "f" * 64),
+        ):
+            case = prepare(suffix)
+            body = copy.deepcopy(case["body"])
+            body["contract_execution_id"] = case["task_id"]
+            if binding_value is None:
+                body["payload"].pop("direct_runtime_binding_hash", None)
+            else:
+                body["payload"]["direct_runtime_binding_hash"] = binding_value
+            before = fresh_snapshot(case["task_id"], case["backlog_id"])
+            with pytest.raises(GovernanceError) as rejected:
+                server.handle_task_timeline_append(
+                    _ctx_with_role(
+                        {"project_id": PID},
+                        "observer",
+                        method="POST",
+                        body=body,
+                    )
+                )
+            after = fresh_snapshot(case["task_id"], case["backlog_id"])
+            assert rejected.value.code == "contract_runtime_close_evidence_rejected"
+            assert rejected.value.details["zero_write_rejection"] is True
+            assert rejected.value.details["writes_performed"] is False
+            assert rejected.value.details["completed_line_mutated"] is False
+            assert before == after
+
+        admitted_cases: dict[
+            str,
+            tuple[dict[str, Any], dict[str, Any], dict[str, Any]],
+        ] = {}
+        for suffix, generic_selector in (
+            ("task-id-only", False),
+            ("generic-exact", True),
+        ):
+            case = prepare(suffix)
+            body = copy.deepcopy(case["body"])
+            if generic_selector:
+                body["contract_execution_id"] = case["task_id"]
+                body["payload"]["direct_runtime_binding_hash"] = case[
+                    "runtime_binding_hash"
+                ]
+            else:
+                assert "contract_execution_id" not in body
+                assert "direct_runtime_binding_hash" not in body["payload"]
+            response = server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=body,
+                )
+            )
+            after = fresh_snapshot(case["task_id"], case["backlog_id"])
+            implementation_lines = [
+                line
+                for line in after["completed_lines"]
+                if line.get("line_id") == "observer_implementation"
+            ]
+            assert after["execution_state_revision"] == 5
+            assert len(implementation_lines) == 1
+            assert len(after["implementation_events"]) == 1
+            line = implementation_lines[0]
+            event = after["implementation_events"][0]
+            assert line["commit_sha"] == case["implementation_commit"]
+            assert event["commit_sha"] == case["implementation_commit"]
+            assert line["payload"]["direct_runtime_binding_hash"] == case[
+                "runtime_binding_hash"
+            ]
+            event_binding = event["payload"].get(
+                "direct_runtime_binding_hash"
+            ) or event["payload"][
+                "direct_main_implementation_commit_prewrite_authority"
+            ]["runtime_binding_hash"]
+            assert event_binding == case["runtime_binding_hash"]
+            assert event["payload"]["route_id"] == case["route_identity"][
+                "route_id"
+            ]
+            assert event["payload"]["route_context_hash"] == case[
+                "route_identity"
+            ]["route_context_hash"]
+            admitted_cases[suffix] = (case, response, copy.deepcopy(body))
+
+        replay_case, first_response, replay_body = admitted_cases[
+            "task-id-only"
+        ]
+        active_project_root = replay_case["project_root"]
+        accepted = fresh_snapshot(
+            replay_case["task_id"], replay_case["backlog_id"]
+        )
+        connection.execute(
+            "DELETE FROM task_timeline_events WHERE project_id = ? AND id = ?",
+            (PID, first_response["id"]),
+        )
+        connection.commit()
+        missing_projection = fresh_snapshot(
+            replay_case["task_id"], replay_case["backlog_id"]
+        )
+        assert missing_projection["record"] == accepted["record"]
+        assert missing_projection["implementation_events"] == []
+
+        changed = copy.deepcopy(replay_body)
+        changed["payload"]["reason"] = "different partial-admission retry"
+        with pytest.raises(GovernanceError) as mismatch:
+            server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=changed,
+                )
+            )
+        assert mismatch.value.code == (
+            "operator_supervised_direct_main_partial_admission_mismatch"
+        )
+        assert mismatch.value.details["zero_write_rejection"] is True
+        assert mismatch.value.details["writes_performed"] is False
+        assert fresh_snapshot(
+            replay_case["task_id"], replay_case["backlog_id"]
+        ) == missing_projection
+
+        recovered = server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(replay_body),
+            )
+        )
+        recovered_snapshot = fresh_snapshot(
+            replay_case["task_id"], replay_case["backlog_id"]
+        )
+        assert recovered["id"] != first_response["id"]
+        assert recovered_snapshot["record"] == accepted["record"]
+        assert len(recovered_snapshot["implementation_events"]) == 1
+        recovered_event = recovered_snapshot["implementation_events"][0]
+        assert recovered_event["commit_sha"] == replay_case[
+            "implementation_commit"
+        ]
+        assert recovered_event["payload"]["route_id"] == replay_case[
+            "route_identity"
+        ]["route_id"]
+        assert recovered_event["payload"]["route_context_hash"] == replay_case[
+            "route_identity"
+        ]["route_context_hash"]
+        assert recovered_event["payload"][
+            "direct_main_implementation_commit_prewrite_authority"
+        ]["runtime_binding_hash"] == replay_case["runtime_binding_hash"]
+        assert sum(
+            line.get("line_id") == "observer_implementation"
+            for line in recovered_snapshot["completed_lines"]
+        ) == 1
+
+        generic_case, generic_response, generic_body = admitted_cases[
+            "generic-exact"
+        ]
+        active_project_root = generic_case["project_root"]
+        generic_accepted = fresh_snapshot(
+            generic_case["task_id"], generic_case["backlog_id"]
+        )
+        connection.execute(
+            "DELETE FROM task_timeline_events WHERE project_id = ? AND id = ?",
+            (PID, generic_response["id"]),
+        )
+        connection.commit()
+        generic_missing_projection = fresh_snapshot(
+            generic_case["task_id"], generic_case["backlog_id"]
+        )
+        assert generic_missing_projection["record"] == generic_accepted["record"]
+        assert generic_missing_projection["implementation_events"] == []
+        with pytest.raises(GovernanceError) as generic_rejected:
+            server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=copy.deepcopy(generic_body),
+                )
+            )
+        assert generic_rejected.value.code == (
+            "contract_runtime_close_evidence_rejected"
+        )
+        assert generic_rejected.value.details["zero_write_rejection"] is True
+        assert generic_rejected.value.details["writes_performed"] is False
+        assert fresh_snapshot(
+            generic_case["task_id"], generic_case["backlog_id"]
+        ) == generic_missing_projection
+    finally:
+        connection.close()
+
+
 def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_clean_head(
     conn,
     monkeypatch,

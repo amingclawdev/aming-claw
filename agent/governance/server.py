@@ -187020,15 +187020,38 @@ def _contract_runtime_close_gate(
             "canonical_submit_required": True,
             "direct_main_qa_facade_binding_validated": True,
         }
-    result = runtime.submit_line_write(
-        contract_execution_id,
-        write,
-        actor_role=actor_role,
-        projected_completed_lines=_contract_runtime_projection_completed_lines(
-            projection
-        ),
-        projection=projection,
+    direct_implementation_precheck_only = bool(
+        str(authority_record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(authority_record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        and actor_role == "observer"
+        and _contract_runtime_close_normalized(event_kind)
+        == "implementation"
     )
+    if direct_implementation_precheck_only:
+        # A generic Contract selector is an additional prewrite validator for
+        # Direct implementation evidence.  The timeline adapter below remains
+        # the sole canonical writer after every server projection is complete.
+        result = runtime.precheck_line_write(
+            contract_execution_id,
+            write,
+            actor_role=actor_role,
+            projected_completed_lines=(
+                _contract_runtime_projection_completed_lines(projection)
+            ),
+            projection=projection,
+        )
+    else:
+        result = runtime.submit_line_write(
+            contract_execution_id,
+            write,
+            actor_role=actor_role,
+            projected_completed_lines=(
+                _contract_runtime_projection_completed_lines(projection)
+            ),
+            projection=projection,
+        )
     if not result.get("ok"):
         diagnostics = {
             "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
@@ -187046,6 +187069,16 @@ def _contract_runtime_close_gate(
             "decision": result.get("decision") or {},
             **_contract_runtime_qa_rejection_response_fields(result),
         }
+        if direct_implementation_precheck_only:
+            diagnostics.update(
+                {
+                    "zero_write_rejection": True,
+                    "zero_contract_runtime_write": True,
+                    "zero_timeline_write": True,
+                    "completed_line_mutated": False,
+                    "writes_performed": False,
+                }
+            )
         identity_mismatch = _contract_runtime_projection_dispatch_identity_mismatch(
             projection
         )
@@ -187059,6 +187092,36 @@ def _contract_runtime_close_gate(
             422,
             diagnostics,
         )
+    if direct_implementation_precheck_only:
+        return {
+            "schema_version": (
+                _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+            ),
+            "accepted": True,
+            "status": "validated_submission",
+            "primary_decision_source": True,
+            "agent_facing_decision_source": (
+                "contract_runtime_first_missing_line"
+            ),
+            "meta_contract_gate_decision_source": False,
+            "contract_execution_id": contract_execution_id,
+            "contract_id": str(authority_record.get("contract_id") or ""),
+            "actor_role": actor_role,
+            "requested_event_kind": event_kind,
+            "stage_id": line.get("stage_id", ""),
+            "line_id": line.get("line_id", ""),
+            "evidence_kind": line.get("evidence_kind", ""),
+            "decision": result.get("decision") or {},
+            "next_legal_action": dict(
+                current_state.get("next_legal_action") or {}
+            ),
+            "canonical_submit_required": True,
+            "contract_runtime_precheck_only": True,
+            "zero_contract_runtime_write": True,
+            "zero_timeline_write": True,
+            "completed_line_mutated": False,
+            "writes_performed": False,
+        }
     _onboard_guide_capsule_invalidate_contract_runtime_transition(
         project_id=project_id,
         result=result,
