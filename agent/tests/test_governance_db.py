@@ -33,7 +33,8 @@ def _install_fixed_stable_boundary(monkeypatch, tmp_path):
     database = shared / "codex-tasks" / "state" / "governance" / "aming-claw" / "governance.db"
     database.parent.mkdir(parents=True)
     database.touch()
-    subprocess.run(["git", "init", "-b", "codex/direct-no-pass-post-reconcile-r2"], cwd=stable_root, check=True, capture_output=True)
+    (stable_root / ".gitignore").write_text("/shared-volume/\n")
+    subprocess.run(["git", "init", "-b", "main"], cwd=stable_root, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=stable_root, check=True)
     subprocess.run(["git", "config", "user.name", "AC Test"], cwd=stable_root, check=True)
     subprocess.run(["git", "add", "."], cwd=stable_root, check=True)
@@ -45,7 +46,7 @@ def _install_fixed_stable_boundary(monkeypatch, tmp_path):
         "status": "ok", "service": "governance", "port": 40000,
         "runtime_plane": "stable", "runtime_stale": False, "pid": 4242,
         "runtime_loaded_version": head,
-        "runtime_plane_identity": {"worktree_root": str(stable_root), "branch": "codex/direct-no-pass-post-reconcile-r2", "commit": head, "stable_anchor_commit": head, "database_identity": database_identity, "stable_database_identity": database_identity, "project_allowlist": []},
+        "runtime_plane_identity": {"worktree_root": str(stable_root), "branch": "main", "expected_branch": "main", "status": "ready", "plane": "stable", "world_id": "ac-stable", "worktree_dirty": False, "violations": [], "commit": head, "stable_anchor_commit": head, "database_identity": database_identity, "stable_database_identity": database_identity, "project_allowlist": []},
         "loaded_runtime_identity": {"loaded_commit": head, "loaded_source_path": str(source / "server.py"), "loaded_source_sha256": source_hash, "worktree_source_sha256": source_hash},
     }
     for module in (db, __import__("agent.governance.db", fromlist=["db"])):
@@ -58,6 +59,184 @@ def _install_fixed_stable_boundary(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def fixed_stable_boundary(monkeypatch, tmp_path):
     _install_fixed_stable_boundary(monkeypatch, tmp_path)
+
+
+def _main_transition_fixture(monkeypatch, tmp_path, *, pipeline=False):
+    """One admitted source instance, real Git lineage, and separate physical DBs."""
+    from governance import db, observer_route_context
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+
+    stable = Path(db._verified_stable_binding()["shared_volume_path"]).parent
+    dev = (tmp_path / "main-transition-dev").resolve()
+    old_branch = "codex/direct-no-pass-post-reconcile-r2"
+    rule_path = "agent/governance/contract_definitions/operator_supervised_direct_main.v1.rev3.json"
+    rule_source = Path(__file__).resolve().parents[1] / "governance/contract_definitions/operator_supervised_direct_main.v1.rev3.json"
+
+    def git(*args, root=stable):
+        return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
+
+    git("branch", "-m", old_branch)
+    for file in ("agent/cli.py", "agent/governance/server.py"):
+        (stable / file).write_text(f'AC_STABLE_BRANCH = "{old_branch}"\n')
+    (stable / rule_path).parent.mkdir(parents=True)
+    (stable / rule_path).write_bytes(rule_source.read_bytes())
+    if pipeline:
+        (stable / "scripts").mkdir()
+        (stable / "scripts/merge-and-deploy.sh").write_text("# historical stable verifier fixture\n")
+    git("add", ".")
+    git("commit", "-qm", "exact stable preimage")
+    anchor = git("rev-parse", "HEAD")
+    git("branch", "main", anchor)
+    git("worktree", "add", "-q", "-b", "codex/ac-dev", str(dev), anchor)
+    (dev / "agent/governance/db.py").write_text("# independently admitted dev source\n")
+    git("add", ".", root=dev)
+    git("commit", "-qm", "dev base", root=dev)
+    base = git("rev-parse", "HEAD", root=dev)
+    backlog = "AC-STABLE-MAIN-DEPLOYMENT-BINDING-R1-20260908"
+    execution = "cex-direct-main-main-binding-fixture"
+    for file in ("agent/cli.py", "agent/governance/server.py"):
+        (dev / file).write_text('AC_STABLE_BRANCH = "main"\n')
+    if pipeline:
+        (dev / "scripts/merge-and-deploy.sh").write_bytes((Path(__file__).resolve().parents[2] / "scripts/merge-and-deploy.sh").read_bytes())
+    git("add", ".", root=dev)
+    trailers = {
+        "Chain-Source-Task": execution, "Chain-Source-Contract-Execution": execution,
+        "Chain-Source-Stage": "implementation", "Chain-Task": execution,
+        "Chain-Bug-Id": backlog, "Chain-Backlog": backlog,
+        "Chain-Route": "operator_supervised_direct_main", "Chain-Parent": base,
+    }
+    git("commit", "-qm", "main candidate\n\n" + "\n".join(f"{k}: {v}" for k, v in trailers.items()), root=dev)
+    candidate = git("rev-parse", "HEAD", root=dev)
+    storage = resolve_ac_dev_storage_root(stable / "shared-volume")
+    database = storage / db.AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE contract_runtime_executions(project_id,backlog_id,contract_id,contract_execution_id,record_json)")
+    files = sorted([
+        "agent/cli.py", "agent/governance/server.py", "agent/governance/db.py",
+        "scripts/merge-and-deploy.sh", "agent/tests/test_cli.py",
+        "agent/tests/test_graph_governance_api.py", "agent/tests/test_governance_db.py",
+        "agent/tests/test_deploy_chain.py",
+    ])
+    world = {
+        "accepted": True, "server_derived": True, "caller_claims_trusted": False,
+        "runtime_plane": "dev", "runtime_port": 40008, "world_id": "ac-dev",
+        "runtime_stale": False, "branch": "codex/ac-dev", "bind_host": "127.0.0.1",
+        "target_head_commit": base, "loaded_runtime_commit": base,
+        "stable_anchor_commit": anchor,
+        "database_identity": {"device": database.stat().st_dev, "inode": database.stat().st_ino,
+                              "world_id": "ac-dev", "project_id": "aming-claw"},
+    }
+    binding = {
+        "project_id": "aming-claw", "backlog_id": backlog, "contract_execution_id": execution,
+        "base_commit": base, "server_derived": True, "caller_claims_trusted": False,
+        "strict_runtime_binding_required": True, "owned_files": files, "target_files": files,
+        "target_project_root": str(dev), "worktree_path": str(dev), "runtime_world_authority": world,
+        "route_identity": {"route_token_ref": "rtok-main-binding-fixture"},
+    }
+    binding["binding_hash"] = db._world_genesis_hash(binding)
+    record = {
+        "project_id": "aming-claw", "backlog_id": backlog, "contract_id": "operator_supervised_direct_main",
+        "contract_execution_id": execution, "version": "v1", "revision": "rev3",
+        "metadata": {"operator_supervised_direct_main_runtime_binding": binding},
+        "execution_state": {"next_action": {"stage_id": "implementation"}},
+        "definition_raw_source_sha256": "sha256:" + hashlib.sha256(rule_source.read_bytes()).hexdigest(),
+        "completed_lines": [
+            {"line_id": "observer_bind_direct_scope", "stage_id": "route_gate", "actor_role": "observer",
+             "evidence_kind": "contract_binding", "payload": {"direct_runtime_binding": binding}},
+            {"line_id": "observer_graph_context", "stage_id": "graph_first", "actor_role": "observer",
+             "evidence_kind": "graph_trace", "db_verified": True},
+            {"line_id": "observer_direct_implementation_exception", "stage_id": "pre_mutation", "actor_role": "observer",
+             "evidence_kind": "observer_direct_implementation_exception", "payload": {
+                "server_admitted_single_pre_mutation": True, "direct_runtime_binding_hash": binding["binding_hash"],
+                "event": {"event_type": "mf.observer_direct_implementation_exception",
+                    "event_kind": "observer_direct_implementation_exception", "phase": "pre_mutation",
+                    "status": "accepted", "decision": "operator_supervised_direct_main_approved"}}},
+        ],
+    }
+
+    def save():
+        with sqlite3.connect(database) as conn:
+            conn.execute("DELETE FROM contract_runtime_executions")
+            conn.execute("INSERT INTO contract_runtime_executions VALUES (?,?,?,?,?)", (
+                "aming-claw", backlog, "operator_supervised_direct_main", execution, json.dumps(record)))
+
+    save()
+    route = {"scope": {"project_id": "aming-claw", "task_id": execution, "backlog_id": backlog},
+             "owned_files": files, "target_files": files,
+             "route_token_ref": "rtok-main-binding-fixture"}
+    for module in (observer_route_context, __import__("agent.governance.observer_route_context", fromlist=["route"])):
+        monkeypatch.setattr(module, "resolve_route_token_ref_renewal_descendant", lambda *_a, **_k: route)
+    health = db._stable_health_request()
+    health["runtime_loaded_version"] = anchor
+    health["runtime_plane_identity"].update({
+        "branch": old_branch, "expected_branch": old_branch, "commit": anchor, "stable_anchor_commit": anchor,
+        "status": "ready", "plane": "stable", "world_id": "ac-stable", "worktree_dirty": False, "violations": [],
+    })
+    source_hash = "sha256:" + hashlib.sha256((stable / "agent/governance/server.py").read_bytes()).hexdigest()
+    health["loaded_runtime_identity"].update({"loaded_commit": anchor, "loaded_source_sha256": source_hash,
+                                               "worktree_source_sha256": source_hash})
+    health["runtime_loaded_source_sha256"] = source_hash
+    for module in (db, __import__("agent.governance.db", fromlist=["db"])):
+        monkeypatch.setattr(module, "__file__", str(dev / "agent/governance/db.py"))
+        monkeypatch.setattr(module, "_stable_health_request", lambda: health)
+    return db, stable, dev, record, health, save, git, candidate
+
+
+def test_main_binding_single_candidate_basic_preimage_is_exact_and_read_only(monkeypatch, tmp_path):
+    db, stable, dev, record, health, save, git, candidate = _main_transition_fixture(monkeypatch, tmp_path)
+    before = (git("rev-parse", "HEAD"), git("rev-parse", "refs/heads/main"), git("status", "--porcelain"))
+    binding = db.verified_stable_database_binding()
+    transition = binding["branch_binding_transition"]
+    assert transition["candidate_commit"] == candidate
+    assert transition["base_commit"] == record["metadata"]["operator_supervised_direct_main_runtime_binding"]["base_commit"]
+    assert transition["phase"] == "implementation"
+    assert transition["stable_branch_postimage"] == "main"
+    assert transition["stable_deploy_authorized"] is False
+    assert transition["writes_performed"] is False
+    assert binding["stable_database_identity"] == health["runtime_plane_identity"]["database_identity"]
+    assert before == (git("rev-parse", "HEAD"), git("rev-parse", "refs/heads/main"), git("status", "--porcelain"))
+
+
+@pytest.mark.parametrize("drift", ["dirty_stable", "dirty_dev", "wrong_parent", "no_pre_mutation", "wrong_phase", "stale_health", "wrong_world", "not_ready", "branch_only_switch", "main_ref", "extra_instance", "line_actor", "line_stage", "line_evidence", "pre_event_status", "unverified_graph"])
+def test_main_binding_transition_rejects_exact_preimage_and_custody_drift(monkeypatch, tmp_path, drift):
+    db, stable, dev, record, health, save, git, candidate = _main_transition_fixture(monkeypatch, tmp_path)
+    if drift == "dirty_stable":
+        (stable / "unexpected").write_text("dirty")
+    elif drift == "dirty_dev":
+        (dev / "unexpected").write_text("dirty")
+    elif drift == "wrong_parent":
+        git("commit", "--allow-empty", "-qm", "unadmitted descendant", root=dev)
+    elif drift == "no_pre_mutation":
+        record["completed_lines"].pop(); save()
+    elif drift == "wrong_phase":
+        record["execution_state"]["next_action"]["stage_id"] = "route_gate"; save()
+    elif drift == "stale_health":
+        health["runtime_stale"] = True
+    elif drift == "wrong_world":
+        health["runtime_plane_identity"]["world_id"] = "ac-dev"
+    elif drift == "not_ready":
+        health["runtime_plane_identity"]["status"] = "invalid"
+    elif drift == "branch_only_switch":
+        git("switch", "-q", "main")
+        health["runtime_plane_identity"]["branch"] = "main"
+        health["runtime_plane_identity"]["status"] = "invalid"
+    elif drift == "main_ref":
+        git("update-ref", "refs/heads/main", candidate)
+    elif drift == "extra_instance":
+        from agent.runtime_plane import resolve_ac_dev_storage_root
+        database = resolve_ac_dev_storage_root(stable / "shared-volume") / db.AC_DATABASE_DEV_RELATIVE_PATH
+        with sqlite3.connect(database) as conn:
+            conn.execute("INSERT INTO contract_runtime_executions SELECT * FROM contract_runtime_executions")
+    elif drift in {"line_actor", "line_stage", "line_evidence"}:
+        key = {"line_actor": "actor_role", "line_stage": "stage_id", "line_evidence": "evidence_kind"}[drift]
+        record["completed_lines"][0][key] = "caller-value"; save()
+    elif drift == "pre_event_status":
+        record["completed_lines"][2]["payload"]["event"]["status"] = "rejected"; save()
+    elif drift == "unverified_graph":
+        record["completed_lines"][1]["db_verified"] = False; save()
+    with pytest.raises((RuntimeError, ValueError)):
+        db.verified_stable_database_binding()
 
 
 def _canonical_dev_world(tmp_path: Path) -> tuple[Path, Path]:
@@ -1645,7 +1824,7 @@ def test_verified_stable_binding_rejects_each_health_process_and_source_mismatch
         "status": "ok", "service": "governance", "port": 40000,
         "runtime_plane": "stable", "runtime_stale": False, "pid": 4242,
         "runtime_loaded_version": head,
-        "runtime_plane_identity": {"worktree_root": str(root), "branch": "codex/direct-no-pass-post-reconcile-r2", "commit": head, "stable_anchor_commit": head, "database_identity": database_identity, "stable_database_identity": database_identity, "project_allowlist": []},
+        "runtime_plane_identity": {"worktree_root": str(root), "branch": "main", "expected_branch": "main", "status": "ready", "plane": "stable", "world_id": "ac-stable", "worktree_dirty": False, "violations": [], "commit": head, "stable_anchor_commit": head, "database_identity": database_identity, "stable_database_identity": database_identity, "project_allowlist": []},
         "loaded_runtime_identity": {"loaded_commit": head, "loaded_source_path": str(source), "loaded_source_sha256": digest, "worktree_source_sha256": digest},
     }
     if defect == "offline":

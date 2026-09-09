@@ -206,6 +206,185 @@ def _stable_process_identity(pid: int) -> tuple[str, str, str]:
     return start, command, cwd
 
 
+def _stable_main_transition_context(
+    source_root: Path, stable_root: Path, stable_anchor: str, *, postimage: bool = False,
+) -> dict[str, object]:
+    """Read the admitted main-binding instance for its exact Basic dev refresh.
+
+    This is a preimage of that instance, not another stable branch policy. The
+    old ref comes from the admitted immutable source, never from an environment
+    variable, a caller manifest, or an old-generation promotion plan. Normal
+    stable startup and every postimage consumer still require main.
+    """
+    from . import observer_route_context
+    from .contracts import runtime as contract_runtime
+    from .contracts.schema import iter_stage_lines
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+
+    backlog_id = "AC-STABLE-MAIN-DEPLOYMENT-BINDING-R1-20260908"
+    expected_files = sorted([
+        "agent/cli.py", "agent/governance/server.py", "agent/governance/db.py",
+        "scripts/merge-and-deploy.sh", "agent/tests/test_cli.py",
+        "agent/tests/test_graph_governance_api.py", "agent/tests/test_governance_db.py",
+        "agent/tests/test_deploy_chain.py",
+    ])
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=source_root, capture_output=True, text=True,
+            timeout=10, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError("AC main transition Git identity is unavailable")
+        return result.stdout.strip()
+
+    def branch_at(commit: str, path: str) -> str:
+        matches = re.findall(r'^AC_STABLE_BRANCH = "([^"\n]+)"$', git("show", f"{commit}:{path}"), re.M)
+        if len(matches) != 1:
+            raise RuntimeError("AC main transition immutable branch policy is ambiguous")
+        return matches[0]
+
+    candidate = git("rev-parse", "HEAD")
+    if (git("symbolic-ref", "HEAD") != "refs/heads/codex/ac-dev"
+            or git("status", "--porcelain")
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate)):
+        raise RuntimeError("AC main transition requires the exact clean dev candidate")
+    dev_root = resolve_ac_dev_storage_root(stable_root / "shared-volume")
+    database = _absolute_non_symlink_root(dev_root, create=False) / AC_DATABASE_DEV_RELATIVE_PATH
+    before = database.stat(follow_symlinks=False)
+    if (database.is_symlink() or not stat.S_ISREG(before.st_mode)
+            or database.resolve(strict=True) != database):
+        raise RuntimeError("AC main transition dev database custody is invalid")
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT project_id,backlog_id,contract_id,contract_execution_id,record_json "
+            "FROM contract_runtime_executions WHERE project_id=? AND backlog_id=? "
+            "AND contract_id='operator_supervised_direct_main'",
+            (AC_PROJECT_ID, backlog_id),
+        ).fetchall()
+        if len(rows) != 1:
+            raise RuntimeError("AC main transition requires one admitted current instance")
+        record = json.loads(rows[0]["record_json"])
+        binding = (record.get("metadata") or {}).get("operator_supervised_direct_main_runtime_binding") or {}
+        world = binding.get("runtime_world_authority") or {}
+        identity = world.get("database_identity") or {}
+        base = str(binding.get("base_commit") or "")
+        execution = str(record.get("contract_execution_id") or "")
+        lines = record.get("completed_lines") or []
+        by_id = {line.get("line_id"): line for line in lines}
+        pre = by_id.get("observer_direct_implementation_exception", {}).get("payload") or {}
+        stage = (record.get("execution_state") or {}).get("next_action") or {}
+        required_lines = {"observer_bind_direct_scope", "observer_graph_context", "observer_direct_implementation_exception"}
+        definition_path = "agent/governance/contract_definitions/operator_supervised_direct_main.v1.rev3.json"
+        definition_bytes = subprocess.check_output(["git", "show", f"{base}:{definition_path}"], cwd=source_root)
+        if ("sha256:" + hashlib.sha256(definition_bytes).hexdigest() != record.get("definition_raw_source_sha256")
+                or (source_root / definition_path).read_bytes() != definition_bytes):
+            raise RuntimeError("AC main transition requires its unchanged source Rule")
+        rule = json.loads(definition_bytes)
+        source_lines = {line["line_id"]: {**line, "stage_id": owner["stage_id"]}
+                        for owner, line in iter_stage_lines(rule)}
+        def completed_line_matches(line):
+            source = source_lines.get(line.get("line_id")) or {}
+            return bool(source
+                and line.get("stage_id") == source["stage_id"]
+                and line.get("evidence_kind") == source["evidence_kind"]
+                and line.get("actor_role") in source["allowed_writer_roles"]
+                and contract_runtime._line_shape_allows_contract_completion(line)
+                and contract_runtime._line_status_allows_contract_completion(line, source_record=record))
+        if not (
+            all(record.get(key) == rows[0][key] for key in (
+                "project_id", "backlog_id", "contract_id", "contract_execution_id"))
+            and record.get("version") == "v1" and record.get("revision") == "rev3"
+            and len(by_id) == len(lines) and required_lines <= set(by_id)
+            and all(completed_line_matches(line) for line in lines)
+            and stage.get("stage_id") in {"implementation", "qa_graph_context", "qa", "reconcile", "close_ready"}
+            and (stage.get("stage_id") != "close_ready" or all(
+                key in by_id
+                for key in ("observer_implementation", "qa_graph_context", "qa_independent_verification", "observer_reconcile")))
+            and not any(str(line.get("status") or "").lower() in {
+                "failed", "no-pass", "no_pass", "waived", "rejected"} for line in lines)
+            and pre.get("server_admitted_single_pre_mutation") is True
+            and all((pre.get("event") or {}).get(key) == value for key, value in {
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception", "phase": "pre_mutation",
+                "status": "accepted", "decision": "operator_supervised_direct_main_approved"}.items())
+            and by_id["observer_graph_context"].get("db_verified") is True
+            and pre.get("direct_runtime_binding_hash") == binding.get("binding_hash")
+            and binding.get("binding_hash") == _world_genesis_hash({
+                key: value for key, value in binding.items() if key != "binding_hash"})
+            and (by_id["observer_bind_direct_scope"].get("payload") or {}).get("direct_runtime_binding") == binding
+            and all(binding.get(key) == record.get(key) for key in ("project_id", "backlog_id", "contract_execution_id"))
+            and binding.get("server_derived") is True and binding.get("caller_claims_trusted") is False
+            and binding.get("strict_runtime_binding_required") is True
+            and sorted(binding.get("owned_files") or []) == expected_files
+            and sorted(binding.get("target_files") or []) == expected_files
+            and binding.get("target_project_root") == binding.get("worktree_path") == str(source_root)
+            and world.get("accepted") is True and world.get("server_derived") is True
+            and world.get("caller_claims_trusted") is False
+            and world.get("runtime_plane") == "dev" and world.get("runtime_port") == 40008
+            and world.get("world_id") == "ac-dev" and world.get("runtime_stale") is False
+            and world.get("branch") == "codex/ac-dev" and world.get("bind_host") == "127.0.0.1"
+            and world.get("target_head_commit") == world.get("loaded_runtime_commit") == base
+            and world.get("stable_anchor_commit") == stable_anchor
+            and identity.get("world_id") == "ac-dev" and identity.get("project_id") == AC_PROJECT_ID
+            and (identity.get("device"), identity.get("inode")) == (before.st_dev, before.st_ino)
+            and git("rev-list", "--parents", "-n", "1", candidate).split() == [candidate, base]
+            and git("rev-parse", "refs/heads/main") == (candidate if postimage else stable_anchor)
+        ):
+            raise RuntimeError("AC main transition current instance/source/phase mismatch")
+        phase_policy = ((rule.get("system_layer") or {}).get("graph_binding_policy") or {}).get("candidate_commit_evidence_policy") or {}
+        if not (phase_policy.get("enabled") is True and phase_policy.get("line_ids") == ["observer_implementation"]):
+            raise RuntimeError("AC main transition candidate phase is not source-owned")
+        route = observer_route_context.resolve_route_token_ref_renewal_descendant(
+            conn, project_id=AC_PROJECT_ID, storage_project_id=AC_PROJECT_ID,
+            route_token_ref=str((binding.get("route_identity") or {}).get("route_token_ref") or ""),
+        )
+        route_scope = (route or {}).get("scope") or {}
+        if not route or route_scope != {"project_id": AC_PROJECT_ID, "task_id": execution, "backlog_id": backlog_id}:
+            raise RuntimeError("AC main transition route identity is unavailable")
+        if sorted(route.get("owned_files") or []) != expected_files or sorted(route.get("target_files") or []) != expected_files:
+            raise RuntimeError("AC main transition route scope changed")
+        trailers = {}
+        for line in git("show", "-s", "--format=%(trailers:only,unfold=true)", candidate).splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                trailers.setdefault(key, []).append(value.strip())
+        expected_trailers = {
+            "Chain-Source-Task": execution, "Chain-Source-Contract-Execution": execution,
+            "Chain-Source-Stage": "implementation", "Chain-Task": execution,
+            "Chain-Bug-Id": backlog_id, "Chain-Backlog": backlog_id,
+            "Chain-Route": "operator_supervised_direct_main", "Chain-Parent": base,
+        }
+        if any(trailers.get(key) != [value] for key, value in expected_trailers.items()):
+            raise RuntimeError("AC main transition candidate trailers do not prove custody")
+        changed = git("diff", "--name-only", base, candidate).splitlines()
+        if not changed or not set(changed) <= set(expected_files):
+            raise RuntimeError("AC main transition candidate escaped its file fence")
+        old_branch = branch_at(base, "agent/cli.py")
+        if (old_branch in {"main", "codex/ac-dev"}
+                or branch_at(base, "agent/governance/server.py") != old_branch
+                or branch_at(stable_anchor, "agent/cli.py") != old_branch
+                or branch_at(stable_anchor, "agent/governance/server.py") != old_branch
+                or branch_at(candidate, "agent/cli.py") != "main"
+                or branch_at(candidate, "agent/governance/server.py") != "main"):
+            raise RuntimeError("AC main transition immutable preimage/postimage mismatch")
+        after = database.stat(follow_symlinks=False)
+        if database.is_symlink() or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise RuntimeError("AC main transition dev database changed during read")
+    return {
+        "schema_version": "ac_stable_main_binding_instance.v1",
+        "backlog_id": backlog_id, "contract_execution_id": execution,
+        "base_commit": base, "candidate_commit": candidate,
+        "stable_anchor_commit": stable_anchor, "stable_branch_preimage": old_branch,
+        "stable_branch_postimage": "main", "phase": stage["stage_id"],
+        "dev_worktree": str(source_root), "stable_worktree": str(stable_root),
+        "direct_runtime_binding_hash": binding["binding_hash"],
+        "dev_database_identity": identity, "route_token_ref": route["route_token_ref"],
+        "stable_deploy_authorized": False, "writes_performed": False,
+    }
+
+
 def _verified_stable_binding() -> dict[str, object]:
     """Read-only fixed-40000 + unique stable-worktree authority for AC dev."""
     health = _stable_health_request()
@@ -220,11 +399,26 @@ def _verified_stable_binding() -> dict[str, object]:
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=5, check=False)
     roots = []
+    worktrees = []
     for block in result.stdout.strip().split("\n\n"):
         fields = dict(line.split(" ", 1) if " " in line else (line, "") for line in block.splitlines())
-        if fields.get("branch") == "refs/heads/codex/direct-no-pass-post-reconcile-r2" and fields.get("worktree"):
+        worktrees.append(fields)
+        if fields.get("branch") == "refs/heads/main" and fields.get("worktree"):
             roots.append(Path(fields["worktree"]).resolve(strict=True))
-    if len(roots) != 1:
+    transition = {}
+    expected_branch = "main"
+    if not roots:
+        identity = health.get("runtime_plane_identity") or {}
+        stable_root = Path(str(identity.get("worktree_root") or "")).resolve(strict=True)
+        transition = _stable_main_transition_context(root, stable_root, str(identity.get("commit") or ""))
+        expected_branch = str(transition["stable_branch_preimage"])
+        roots = [Path(row["worktree"]).resolve(strict=True) for row in worktrees
+                 if row.get("branch") == "refs/heads/" + expected_branch and row.get("worktree")]
+        dev_roots = [Path(row["worktree"]).resolve(strict=True) for row in worktrees
+                     if row.get("branch") == "refs/heads/codex/ac-dev" and row.get("worktree")]
+        if roots != [stable_root] or dev_roots != [root]:
+            raise RuntimeError("AC main transition worktree identity is ambiguous")
+    if result.returncode != 0 or len(roots) != 1:
         raise RuntimeError("AC stable authority worktree is unavailable")
     stable_root = roots[0]
     server_command = "agent.governance.server" in command or (
@@ -243,8 +437,14 @@ def _verified_stable_binding() -> dict[str, object]:
     loaded = health.get("loaded_runtime_identity") if isinstance(health.get("loaded_runtime_identity"), Mapping) else {}
     if not (
         health.get("runtime_loaded_version") == head
+        and identity.get("status") == "ready"
+        and identity.get("plane") == "stable"
+        and identity.get("world_id") == AC_STABLE_WORLD_ID
+        and identity.get("expected_branch") == expected_branch
+        and identity.get("worktree_dirty") is False
+        and not identity.get("violations")
         and identity.get("worktree_root") == str(stable_root)
-        and identity.get("branch") == "codex/direct-no-pass-post-reconcile-r2"
+        and identity.get("branch") == expected_branch
         and identity.get("commit") == head
         and identity.get("stable_anchor_commit") == head
         and loaded.get("loaded_commit") == head
@@ -257,7 +457,15 @@ def _verified_stable_binding() -> dict[str, object]:
     shared = roots[0] / "shared-volume"
     if not shared.is_dir() or shared.is_symlink() or shared.resolve(strict=True) != shared:
         raise RuntimeError("AC stable authority shared volume is invalid")
-    return {"shared_volume_path": str(shared), "health": dict(health), "stable_head": head}
+    for args, expected in ((["symbolic-ref", "HEAD"], "refs/heads/" + expected_branch),
+                           (["status", "--porcelain"], "")):
+        probe = subprocess.run(["git", *args], cwd=stable_root, capture_output=True,
+                               text=True, timeout=5, check=False)
+        if probe.returncode or probe.stdout.strip() != expected:
+            raise RuntimeError("AC stable authority worktree identity changed")
+    return {"shared_volume_path": str(shared), "health": dict(health), "stable_head": head,
+            "process_identity": {"pid": health["pid"], "birth": _start, "command": command, "cwd": cwd},
+            **({"branch_binding_transition": transition} if transition else {})}
 
 
 def verified_stable_database_binding(

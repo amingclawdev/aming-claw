@@ -7,6 +7,7 @@ AC8: Tests cover:
   (d) stderr content included in failure summary
 """
 import json
+import copy
 import hashlib
 import ast
 import base64
@@ -330,7 +331,7 @@ class TestExplicitACPromotionScript:
         assert "operator_signoff" in text
         assert "release_operator_head_queue_events" in text
         assert "nonce replay/ambiguity" in text
-        assert 'STABLE_BRANCH="codex/direct-no-pass-post-reconcile-r2"' in text
+        assert 'STABLE_BRANCH="main"' in text
         assert 'manifest.get("stable_branch")' in text
         assert 'branch") == expected' in text
         assert "contract_execution_id" in text
@@ -347,7 +348,7 @@ class TestExplicitACPromotionScript:
         assert "runtime_plane_identity" in text
         assert "runtime_stale" in text
         assert "/ac-stable-promotion/complete" in text
-        assert 'refs/heads/main' not in text
+        assert 'refs/heads/main' in text
         assert 'MAIN_WORKTREE' not in text
         assert "git merge-base --is-ancestor" in text
         assert "PRE_MERGE_STABLE" in text
@@ -2058,7 +2059,7 @@ http.server.HTTPServer(("127.0.0.1",port),Handler).serve_forever()
             assert result.returncode == 0, result.stderr
             return result.stdout
 
-        run(["git", "init", "-b", "codex/direct-no-pass-post-reconcile-r2"], stable_root)
+        run(["git", "init", "-b", "main"], stable_root)
         run(["git", "config", "user.email", "test@example.com"], stable_root)
         run(["git", "config", "user.name", "Test"], stable_root)
         for path in (
@@ -2112,7 +2113,7 @@ http.server.HTTPServer(("127.0.0.1",port),Handler).serve_forever()
             "backlog_id": backlog_id,
             "contract_execution_id": cex,
             "stable_anchor_commit": stable,
-            "stable_branch": "codex/direct-no-pass-post-reconcile-r2",
+            "stable_branch": "main",
             "branch": "codex/ac-dev",
             "candidate_commit": candidate,
             "file_fence": fence,
@@ -2521,3 +2522,146 @@ http.server.HTTPServer(("127.0.0.1",port),Handler).serve_forever()
             cwd=tmp_path / "stable",
             text=True,
         ).strip() == stable
+
+
+@pytest.mark.parametrize("fault", ["none", "candidate_start", "after_branch", "after_patch"])
+def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tmp_path, fault):
+    from agent.tests.test_graph_governance_api import _main_binding_release_fixture, _ctx_with_role
+    from agent.governance import server, db
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path)
+    manifest = fixture["manifest"]
+    stable, dev = fixture["stable"], fixture["dev"]
+    anchor, candidate = manifest["stable_anchor_commit"], fixture["candidate"]
+    old_branch = fixture["instance"]["stable_branch_preimage"]
+    script = TestExplicitACPromotionScript._script()
+    runtime = TestExplicitACPromotionScript._activation_runtime()
+    precheck = server._ac_main_binding_precheck(manifest)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    plan_path = tmp_path / "main-activation.json"
+    source_lines = script.read_text().splitlines()
+    start = next(i + 1 for i, line in enumerate(source_lines) if 'python3 - "$ACTIVATION_PLAN" "$DRY_RUN"' in line)
+    end = next(i for i in range(start, len(source_lines)) if source_lines[i] == "PY")
+    prepare_source = "\n".join(source_lines[start:end]) + "\n"
+    run = subprocess.run
+    def prepare_process_boundary(args, **kwargs):
+        if args[0] == "ps":
+            output = fixture["old_process"]["birth" if args[-1] == "lstart=" else "command"] + "\n"
+            return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+        if args[0] == "lsof":
+            return subprocess.CompletedProcess(args, 0, stdout=str(fixture["old_process"]["pid"]) + "\n", stderr="")
+        return run(args, **kwargs)
+    args = ["prepare", str(plan_path), "false", str(manifest_path), json.dumps(precheck), str(stable), str(dev), anchor, candidate,
+            json.dumps(manifest["stable_database_identity"]), str(fixture["stable_db"]), str(fixture["old_process"]["pid"]),
+            str(Path(sys.executable).resolve()), precheck["verifier_sha256"], "40000"]
+    with monkeypatch.context() as boundary:
+        boundary.setattr(subprocess, "run", prepare_process_boundary)
+        boundary.setattr(sys, "argv", args)
+        exec(compile(prepare_source, str(script), "exec"), {"__name__": "main_prepare_fixture"})
+    plan = json.loads(plan_path.read_bytes())
+    assert plan["manifest"] == manifest
+    assert plan["stable_branch"] == "main"
+    assert plan["schema_version"] == "ac_stable_activation_plan.v2"
+    assert plan["completion_body_template"]["schema_version"] == "ac_stable_promotion_completion.v1"
+    assert fixture["git"]("branch", "--show-current") == old_branch
+    with monkeypatch.context() as boundary:
+        boundary.setattr(sys, "argv", ["script", "activate", str(plan_path), "false", str(script)])
+        patch = runtime["validate_plan"](plan, plan_path.read_bytes(), str(script))
+    before_db = fixture["stable_db"].read_bytes()
+    preimage_health = copy.deepcopy(fixture["health"])
+    class ProcessBoundary(runtime["RealOps"]):
+        def __init__(self):
+            self.identity = dict(plan["old_process"])
+            self.loaded = anchor
+            self.calls = []
+            self.failed = False
+            self.completed = False
+        def run(self, args, cwd, code, *, input_bytes=None):
+            self.calls.append(tuple(args))
+            result = super().run(args, cwd, code, input_bytes=input_bytes)
+            if not self.failed and ((fault == "after_branch" and args[:3] == ["git", "switch", "main"])
+                    or (fault == "after_patch" and args[:4] == ["git", "apply", "--index", "-"])):
+                self.failed = True
+                runtime["fail"]("fixture_crash_after_mutation", fault)
+            return result
+        def pid_identity(self, pid):
+            return dict(self.identity) if self.identity.get("pid") == pid else {}
+        def pid_alive(self, pid):
+            return self.identity.get("pid") == pid
+        def port_pids(self, port):
+            assert port == 40000
+            return [self.identity["pid"]] if self.identity else []
+        def health(self, port):
+            assert port == 40000
+            health = copy.deepcopy(preimage_health)
+            source_hash = plan["stable_runtime_source_sha256"] if self.loaded == anchor else plan["candidate_runtime_source_sha256"]
+            branch = old_branch if self.loaded == anchor else "main"
+            health.update({"pid": self.identity["pid"], "runtime_loaded_version": self.loaded, "runtime_loaded_source_sha256": source_hash})
+            health["runtime_plane_identity"].update({"branch": branch, "expected_branch": branch, "commit": self.loaded, "stable_anchor_commit": self.loaded})
+            health["loaded_runtime_identity"].update({"loaded_commit": self.loaded, "loaded_source_sha256": source_hash, "worktree_source_sha256": source_hash})
+            return health
+        def stop(self, identity, port, code, **kwargs):
+            assert self.identity == identity and port == 40000
+            self.identity = {}
+        def start(self, launch, cwd, log, environment):
+            assert cwd == str(stable)
+            if fault == "candidate_start" and launch == plan["candidate_launch_spec"]:
+                runtime["fail"]("fixture_candidate_start_failed", "isolated process boundary")
+            self.loaded = candidate if launch == plan["candidate_launch_spec"] else anchor
+            self.identity = {"pid": 52002 if self.loaded == candidate else 52003, "birth": "fixture-new-birth", "command": " ".join([plan["runtime_process_executable"], *launch[1:]])}
+            fixture["health"].clear(); fixture["health"].update(self.health(40000))
+            return self.identity["pid"]
+        def lane(self, command, cwd):
+            assert command in plan["lane_commands"] and cwd in {str(stable), str(dev)}
+        def reproject(self, selected, script_path):
+            return server._ac_main_binding_precheck(selected["manifest"])
+        def complete(self, body, token):
+            assert body["previous_promotion_receipt_hash"] is None
+            assert server._ac_promotion_request_previous_receipt(body, previous_stable=anchor) is None
+            def connection(_project):
+                conn = sqlite3.connect(fixture["stable_db"])
+                conn.row_factory = sqlite3.Row
+                return conn
+            ctx = _ctx_with_role({"project_id": "aming-claw"}, "operator", method="POST", body=body)
+            ctx.token = token
+            with monkeypatch.context() as boundary:
+                boundary.setattr(server, "get_connection", connection)
+                boundary.setattr(server, "canonical_ac_database_identity", lambda conn: manifest["stable_database_identity"])
+                boundary.setattr(server, "_runtime_plane_identity", lambda: self.health(40000)["runtime_plane_identity"])
+                receipt = server.handle_ac_stable_promotion_complete(ctx)
+                replay = server.handle_ac_stable_promotion_complete(ctx)
+            assert receipt["idempotent"] is False
+            assert replay["idempotent"] is True
+            assert receipt["timeline_event_id"] == replay["timeline_event_id"]
+            assert receipt["promotion_receipt_hash"] == replay["promotion_receipt_hash"]
+            self.completed = True
+            return receipt
+    ops = ProcessBoundary()
+    for module in (fixture["db"], db):
+        monkeypatch.setattr(module, "_stable_process_identity", lambda pid: (ops.pid_identity(pid).get("birth", ""), ops.pid_identity(pid).get("command", ""), str(stable)))
+    journal = runtime["Journal"](plan["journal_path"], plan["plan_hash"])
+    result = runtime["ActivationMachine"](plan, patch, ops, journal, "isolated-token", str(script)).activate()
+    assert result["ok"] is (fault == "none")
+    assert ops.completed is (fault == "none")
+    assert fixture["git"]("rev-parse", "refs/heads/" + old_branch) == anchor
+    assert fixture["git"]("status", "--porcelain") == ""
+    assert fixture["git"]("rev-parse", "HEAD", root=dev) == candidate
+    assert fixture["git"]("status", "--porcelain", root=dev) == ""
+    if fault == "none":
+        assert fixture["git"]("branch", "--show-current") == "main"
+        assert fixture["git"]("rev-parse", "refs/heads/main") == candidate
+        assert journal.rows[-1]["state"] == "COMPLETED"
+        with sqlite3.connect(fixture["stable_db"]) as conn:
+            rows = conn.execute("SELECT payload_json FROM task_timeline_events WHERE event_type='ac.stable_promotion_completed'").fetchall()
+        assert len(rows) == 1
+        receipt = json.loads(rows[0][0])
+        assert receipt["prior_promotion"] == manifest["prior_promotion"]
+        assert receipt["stable_branch"] == "main"
+        assert receipt["previous_promotion_receipt_hash"] is None
+    else:
+        assert fixture["stable_db"].read_bytes() == before_db
+        assert result["rolled_back"] is True
+        assert fixture["git"]("branch", "--show-current") == old_branch
+        assert fixture["git"]("rev-parse", "refs/heads/main") == anchor
+        assert journal.rows[-1]["state"] == "ROLLED_BACK"
+    assert not any("reset" in call or "clean" in call for call in ops.calls)

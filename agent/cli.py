@@ -60,7 +60,7 @@ DEFAULT_GOVERNANCE_URL = "http://localhost:40000"
 AC_STABLE_SERVICE_PORT = 40000
 AC_DEV_SERVICE_PORT = 40008
 AC_DEV_BRANCH = "codex/ac-dev"
-AC_STABLE_BRANCH = "codex/direct-no-pass-post-reconcile-r2"
+AC_STABLE_BRANCH = "main"
 AC_STABLE_ANCHOR_COMMIT = "a25838f15f949ac434cf78e03f20760e82ff81f0"
 AC_DATABASE_STABLE_RELATIVE_PATH = (
     "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"

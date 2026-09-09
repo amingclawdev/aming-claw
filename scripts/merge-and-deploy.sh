@@ -9,7 +9,7 @@ BOOTSTRAP_ANCHOR="a25838f15f949ac434cf78e03f20760e82ff81f0"
 ROLLBACK_BASELINE="1012ec422160738356678f721ea470d583fe2be6"
 ROLLBACK_BACKLOG="AC-PROMOTION-ACTIVATION-ROLLBACK-RESTART-P0-20260827"
 ROLLBACK_CEX="cex-direct-main-60df8f3e0c9a1fbce338"
-STABLE_BRANCH="codex/direct-no-pass-post-reconcile-r2"
+STABLE_BRANCH="main"
 DEV_BRANCH="codex/ac-dev"
 STABLE_PORT="40000"
 MANIFEST=""
@@ -137,9 +137,20 @@ def validate_plan(plan, raw, script_path):
         fail("activation_plan_not_canonical", "activation plan bytes are not canonical")
     if plan.get("project_id") != "aming-claw" or plan.get("stable_port") != 40000 or plan.get("bind_host") != "127.0.0.1":
         fail("activation_plan_scope_invalid", "activation plan is not exact AC stable scope")
-    if plan.get("stable_branch") != "codex/direct-no-pass-post-reconcile-r2" or plan.get("dev_branch") != "codex/ac-dev":
+    manifest = plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {}
+    current_main = (manifest.get("prior_promotion") or {}).get("kind") == "current_instance"
+    instance = {}
+    if current_main:
+        from agent.governance import server
+        instance = server._ac_main_binding_release_instance(candidate=plan.get("candidate_commit", ""), anchor=plan.get("stable_anchor_commit", ""), recovery=True)
+        evidence = server._ac_main_binding_activation_evidence(instance, manifest)
+        if not (plan.get("dev_worktree") == instance["dev_worktree"] and plan.get("stable_worktree") == instance["stable_worktree"]):
+            fail("activation_plan_source_invalid", "main plan escaped its admitted worktrees")
+    else:
+        evidence = manifest
+    if plan.get("stable_branch") != ("main" if current_main else "codex/direct-no-pass-post-reconcile-r2") or plan.get("dev_branch") != "codex/ac-dev":
         fail("activation_plan_branch_invalid", "activation plan branch scope mismatch")
-    if plan.get("stable_anchor_commit") != "a25838f15f949ac434cf78e03f20760e82ff81f0":
+    if not current_main and plan.get("stable_anchor_commit") != "a25838f15f949ac434cf78e03f20760e82ff81f0":
         fail("activation_plan_anchor_invalid", "activation plan anchor mismatch")
     if not re.fullmatch(r"[0-9a-f]{40}", str(plan.get("candidate_commit") or "")):
         fail("activation_plan_candidate_invalid", "activation candidate is malformed")
@@ -148,35 +159,35 @@ def validate_plan(plan, raw, script_path):
     manifest = plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {}
     precheck = plan.get("precheck_receipt") if isinstance(plan.get("precheck_receipt"), dict) else {}
     if not (
-        manifest.get("schema_version") == "ac_stable_promotion_manifest.v2"
+        manifest.get("schema_version") == ("ac_stable_promotion_manifest.v1" if current_main else "ac_stable_promotion_manifest.v2")
         and plan.get("manifest_sha256") == sha(manifest)
         and plan.get("promotion_intent_sha256") == manifest.get("promotion_intent_sha256")
         and plan.get("promotion_manifest_sha256") == manifest.get("promotion_manifest_sha256")
-        and plan.get("implementation_delta") == manifest.get("implementation_delta")
-        and plan.get("promotion_delta") == manifest.get("promotion_delta")
+        and plan.get("implementation_delta") == evidence.get("implementation_delta")
+        and plan.get("promotion_delta") == evidence.get("promotion_delta")
         and plan.get("qa_candidate_intent_sha256")
-        == manifest.get("qa_candidate_intent_sha256")
+        == evidence.get("qa_candidate_intent_sha256")
         and plan.get("custody_authority")
-        == manifest.get("custody_authority")
-        and plan.get("candidate_tree_sha") == manifest.get("candidate_tree_sha")
+        == evidence.get("custody_authority")
+        and plan.get("candidate_tree_sha") == evidence.get("candidate_tree_sha")
         and plan.get("stable_runtime_source_sha256")
-        == manifest.get("stable_runtime_source_sha256")
+        == evidence.get("stable_runtime_source_sha256")
         and plan.get("candidate_runtime_source_sha256")
-        == manifest.get("candidate_runtime_source_sha256")
-        and plan.get("activation_policy") == manifest.get("activation_policy")
-        and precheck.get("schema_version") == "ac_stable_promotion_precheck_receipt.v2"
+        == evidence.get("candidate_runtime_source_sha256")
+        and plan.get("activation_policy") == evidence.get("activation_policy")
+        and precheck.get("schema_version") == ("ac_stable_promotion_precheck_receipt.v1" if current_main else "ac_stable_promotion_precheck_receipt.v2")
         and plan.get("precheck_receipt_hash") == precheck.get("receipt_hash")
         and precheck.get("receipt_hash")
         == sha({key: value for key, value in precheck.items() if key != "receipt_hash"})
         and precheck.get("candidate_commit") == plan.get("candidate_commit")
-        and precheck.get("candidate_tree_sha") == plan.get("candidate_tree_sha")
-        and precheck.get("stable_runtime_source_sha256")
+        and (evidence.get("candidate_tree_sha") if current_main else precheck.get("candidate_tree_sha")) == plan.get("candidate_tree_sha")
+        and (evidence.get("stable_runtime_source_sha256") if current_main else precheck.get("stable_runtime_source_sha256"))
         == plan.get("stable_runtime_source_sha256")
-        and precheck.get("candidate_runtime_source_sha256")
+        and (evidence.get("candidate_runtime_source_sha256") if current_main else precheck.get("candidate_runtime_source_sha256"))
         == plan.get("candidate_runtime_source_sha256")
-        and precheck.get("qa_candidate_intent_sha256")
+        and (evidence.get("qa_candidate_intent_sha256") if current_main else precheck.get("qa_candidate_intent_sha256"))
         == plan.get("qa_candidate_intent_sha256")
-        and precheck.get("custody_authority")
+        and (evidence.get("custody_authority") if current_main else precheck.get("custody_authority"))
         == plan.get("custody_authority")
         and precheck.get("stable_anchor_commit") == plan.get("stable_anchor_commit")
         and precheck.get("stable_database_identity") == plan.get("stable_database_identity")
@@ -188,7 +199,7 @@ def validate_plan(plan, raw, script_path):
         == plan.get("forward_patch_sha256")
         == plan.get("reverse_apply_patch_sha256")
         == (plan.get("promotion_delta") or {}).get("diff_sha256")
-        == (manifest.get("promotion_delta") or {}).get("diff_sha256")
+        == (evidence.get("promotion_delta") or {}).get("diff_sha256")
     ):
         fail("activation_plan_patch_hash_mismatch", "prepared reverse patch digest mismatch")
     python_bin = str((plan.get("candidate_launch_spec") or [""])[0])
@@ -210,6 +221,13 @@ def validate_plan(plan, raw, script_path):
         python_bin, "-m", "agent.cli", "start", "--workspace",
         plan.get("stable_worktree"), "--port", "40000",
     ]
+    if current_main:
+        expected_old_launch = [python_bin, "-m", "agent.cli", "start", "--workspace", plan.get("stable_worktree"),
+            "--runtime-plane", "stable", "--port", "40000", "--shared-volume-path", str(Path(plan["stable_worktree"]) / "shared-volume"),
+            "--stable-anchor-commit", plan["stable_anchor_commit"]]
+        captured_process = instance["prior_promotion"]["preimage"]["process_identity"]
+        if plan.get("old_process") != {key: captured_process[key] for key in ("pid", "birth", "command")}:
+            fail("activation_plan_process_invalid", "main plan old process differs from accepted authority")
     expected_environment = {
         "PYTHONPATH": plan.get("stable_worktree"),
         "SHARED_VOLUME_PATH": str(Path(plan.get("stable_worktree")) / "shared-volume"),
@@ -522,6 +540,9 @@ class RealOps:
         import sqlite3
         conn = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
         try:
+            if getattr(self, "main_binding", False):
+                from agent.governance import server
+                return server._ac_main_binding_graph_identity(conn, source_identity=self.main_binding_source)
             rows = conn.execute(
                 "SELECT project_id,snapshot_id,commit_sha,is_active FROM graph_snapshots WHERE project_id='aming-claw' ORDER BY snapshot_id"
             ).fetchall()
@@ -533,8 +554,14 @@ class RealOps:
 class ActivationMachine:
     def __init__(self, plan, patch, ops, journal, token, script_path=""):
         self.plan = plan
+        prior = (plan.get("manifest") or {}).get("prior_promotion") or {}
+        self.main_binding = prior.get("kind") == "current_instance"
+        self.preimage_branch = (prior["preimage"]["instance"]["stable_branch_preimage"]
+                                if self.main_binding else plan["stable_branch"])
         self.patch = patch
         self.ops = ops
+        self.ops.main_binding = self.main_binding
+        self.ops.main_binding_source = plan
         self.journal = journal
         self.token = token
         self.script_path = script_path
@@ -641,13 +668,15 @@ class ActivationMachine:
         raw = self.ops.git(
             self.plan["stable_worktree"], "worktree", "list", "--porcelain"
         )
-        expected_branch = "refs/heads/" + self.plan["stable_branch"]
+        expected_branch = "refs/heads/" + self.preimage_branch
         matches = []
         for block in raw.strip().split("\n\n"):
             values = dict(
                 line.split(" ", 1) if " " in line else (line, "")
                 for line in block.splitlines()
             )
+            if self.main_binding and values.get("branch") == "refs/heads/main":
+                fail("activation_main_worktree_ambiguous", "main was attached before the exact transition")
             if values.get("branch") == expected_branch:
                 matches.append(values.get("worktree", ""))
         if matches != [self.plan["stable_worktree"]]:
@@ -655,6 +684,15 @@ class ActivationMachine:
                 "activation_stable_worktree_ambiguous",
                 "exactly one canonical stable branch worktree is required",
             )
+
+    def exact_main_preimage_refs(self):
+        if not self.main_binding:
+            return
+        stable = self.plan["stable_worktree"]
+        anchor = self.plan["stable_anchor_commit"]
+        if (self.ops.git(stable, "rev-parse", "refs/heads/main") != anchor
+                or self.ops.git(stable, "rev-parse", "refs/heads/" + self.preimage_branch) != anchor):
+            fail("activation_main_preimage_ref_drift", "main/preimage refs no longer equal the admitted anchor")
 
     def exact_health(self, expected_commit, expected_pid=0, *, legacy=False):
         health = self.ops.health(self.plan["stable_port"])
@@ -681,13 +719,20 @@ class ActivationMachine:
             and not identity
             or (
                 identity.get("plane") == "stable"
-                and identity.get("branch") == self.plan["stable_branch"]
+                and identity.get("branch") == (self.preimage_branch if legacy else self.plan["stable_branch"])
                 and identity.get("commit") == expected_commit
                 and identity.get("stable_anchor_commit") == expected_commit
                 and identity.get("stable_database_identity")
                 == self.plan["stable_database_identity"]
             )
         )
+        if self.main_binding:
+            plane = bool(plane and identity.get("status") == "ready"
+                         and identity.get("world_id") == "ac-stable"
+                         and identity.get("worktree_root") == self.plan["stable_worktree"]
+                         and identity.get("worktree_dirty") is False
+                         and not identity.get("violations")
+                         and identity.get("expected_branch") == (self.preimage_branch if legacy else "main"))
         if not (common and plane):
             fail("activation_health_identity_mismatch", "stable health is not exact expected identity")
         self.exact_database()
@@ -888,9 +933,10 @@ class ActivationMachine:
         stable = self.plan["stable_worktree"]
         dev = self.plan["dev_worktree"]
         self.exact_stable_worktree()
+        self.exact_main_preimage_refs()
         if self.ops.git(stable, "rev-parse", "HEAD") != self.plan["stable_anchor_commit"]:
             fail("activation_cas_anchor_drift", "stable HEAD changed before mutation")
-        if self.ops.git(stable, "branch", "--show-current") != self.plan["stable_branch"]:
+        if self.ops.git(stable, "branch", "--show-current") != self.preimage_branch:
             fail("activation_cas_branch_drift", "stable branch changed before mutation")
         if self.ops.git(stable, "status", "--porcelain"):
             fail("activation_cas_dirty_stable", "stable worktree is dirty")
@@ -925,13 +971,14 @@ class ActivationMachine:
             )
 
     def validate_non_process_after_stop(self):
+        self.exact_main_preimage_refs()
         stable = self.plan["stable_worktree"]
         dev = self.plan["dev_worktree"]
         if not (
             self.ops.git(stable, "rev-parse", "HEAD")
             == self.plan["stable_anchor_commit"]
             and self.ops.git(stable, "branch", "--show-current")
-            == self.plan["stable_branch"]
+            == self.preimage_branch
             and self.ops.git(stable, "status", "--porcelain") == ""
             and self.ops.git(dev, "rev-parse", "HEAD")
             == self.plan["candidate_commit"]
@@ -1002,7 +1049,7 @@ class ActivationMachine:
                 if listeners != [expected_old_identity["pid"]]:
                     fail("rollback_listener_ambiguous", "unexpected anchor listener")
                 if (
-                    self.ops.git(stable, "branch", "--show-current") != self.plan["stable_branch"]
+                    self.ops.git(stable, "branch", "--show-current") != self.preimage_branch
                 ):
                     fail("rollback_anchor_source_ambiguous", "anchor source is not exact and clean")
                 if (
@@ -1144,6 +1191,14 @@ class ActivationMachine:
                 fail("rollback_ref_ambiguous", "stable ref is neither exact candidate nor anchor")
             if self.ops.git(stable, "rev-parse", "HEAD") != anchor or self.ops.git(stable, "status", "--porcelain"):
                 fail("rollback_anchor_verification_failed", "stable source did not return cleanly to anchor")
+            if self.main_binding:
+                self.exact_main_preimage_refs()
+                branch = self.ops.git(stable, "branch", "--show-current")
+                if branch not in {"main", self.preimage_branch}:
+                    fail("rollback_branch_ambiguous", "stable symbolic ref escaped the exact instance")
+                if branch == "main":
+                    self.ops.run(["git", "switch", self.preimage_branch], stable, "rollback_branch_restore_failed")
+                self.journal.append("ROLLBACK_BRANCH_RESTORED")
             self.exact_database()
             self.candidate_pid = self.ops.start(
                 self.plan["old_launch_spec"],
@@ -1240,11 +1295,20 @@ class ActivationMachine:
             self.ops.stop(self.plan["old_process"], self.plan["stable_port"], "activation_old_stop_failed")
             self.journal.append("OLD_STOPPED")
             self.validate_non_process_after_stop()
-            self.ops.run(
-                ["git", "merge", "--ff-only", self.plan["candidate_commit"]],
-                self.plan["stable_worktree"],
-                "activation_ff_failed",
-            )
+            if self.main_binding:
+                stable = self.plan["stable_worktree"]
+                self.ops.run(["git", "switch", "main"], stable, "activation_main_select_failed")
+                self.journal.append("MAIN_BRANCH_SELECTED")
+                self.exact_main_preimage_refs()
+                self.ops.run(["git", "apply", "--index", "-"], stable, "activation_main_patch_failed", input_bytes=self.patch)
+                self.journal.append("MAIN_PATCH_APPLIED")
+                self.ops.run(["git", "update-ref", "refs/heads/main", self.plan["candidate_commit"], self.plan["stable_anchor_commit"]], stable, "activation_main_ref_cas_failed")
+            else:
+                self.ops.run(
+                    ["git", "merge", "--ff-only", self.plan["candidate_commit"]],
+                    self.plan["stable_worktree"],
+                    "activation_ff_failed",
+                )
             self.journal.append("SOURCE_ADVANCED", {"candidate_commit": self.plan["candidate_commit"]})
             self.candidate_pid = self.ops.start(
                 self.plan["candidate_launch_spec"],
@@ -1457,6 +1521,26 @@ print("true" if value is True else "false" if value is False else value)
 PY
 }
 
+# Historical plans keep their exact generation. The migration preimage is
+# selected only by the admitted current instance, never a manifest branch claim.
+MANIFEST_SCHEMA="$(manifest_value schema_version)"
+MAIN_BINDING_INSTANCE=""
+if [ "$MANIFEST_SCHEMA" = "ac_stable_promotion_manifest.v2" ]; then
+    STABLE_BRANCH="codex/direct-no-pass-post-reconcile-r2"
+elif [ "$(manifest_optional_value prior_promotion.kind)" = "current_instance" ]; then
+    MAIN_BINDING_INSTANCE="$(python3 - "$MANIFEST" <<'PY_MAIN'
+import json, sys
+from agent.governance import server
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+instance = server._ac_main_binding_release_instance(candidate=manifest["candidate_commit"], anchor=manifest["stable_anchor_commit"], require_close_ready=True)
+if instance["postimage"] or manifest.get("prior_promotion") != instance["prior_promotion"]:
+    raise SystemExit("Promotion blocked: current main instance preimage mismatch")
+print(json.dumps(instance, sort_keys=True))
+PY_MAIN
+)"
+    STABLE_BRANCH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["stable_branch_preimage"])' <<<"$MAIN_BINDING_INSTANCE")"
+fi
+
 STABLE_WORKTREE="$(python3 - "$STABLE_BRANCH" <<'PY'
 import subprocess, sys
 raw = subprocess.check_output(["git", "worktree", "list", "--porcelain"], text=True)
@@ -1483,6 +1567,10 @@ MANIFEST_ANCHOR="$(manifest_value stable_anchor_commit)"
 STABLE_RUNTIME_SOURCE_SHA256="$(manifest_optional_value stable_runtime_source_sha256)"
 CANDIDATE_RUNTIME_SOURCE_SHA256="$(manifest_optional_value candidate_runtime_source_sha256)"
 CURRENT_STABLE="$(git -C "$STABLE_WORKTREE" rev-parse HEAD)"
+if [ -n "$MAIN_BINDING_INSTANCE" ]; then
+    STABLE_RUNTIME_SOURCE_SHA256="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["stable_runtime_source_sha256"])' <<<"$MAIN_BINDING_INSTANCE")"
+    CANDIDATE_RUNTIME_SOURCE_SHA256="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["candidate_runtime_source_sha256"])' <<<"$MAIN_BINDING_INSTANCE")"
+fi
 
 if [ "$(git branch --show-current)" != "$DEV_BRANCH" ]; then
     echo "Promotion blocked: only $DEV_BRANCH may be promoted." >&2; exit 1
@@ -1595,6 +1683,16 @@ from pathlib import Path
 manifest_path, db_raw, stable, candidate, diff_hash, verifier_hash, bootstrap, database_identity_raw = sys.argv[1:]
 manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
 database_identity = json.loads(database_identity_raw)
+if (manifest.get("prior_promotion") or {}).get("kind") == "current_instance":
+    from agent.governance import server
+    receipt = server._ac_main_binding_precheck(manifest)
+    if not (receipt["stable_anchor_commit"] == stable and receipt["candidate_commit"] == candidate
+            and receipt["diff_sha256"] == diff_hash and receipt["verifier_sha256"] == verifier_hash
+            and receipt["stable_database_identity"] == database_identity):
+        raise SystemExit("Promotion blocked: current instance verifier binding mismatch")
+    print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    raise SystemExit(0)
+
 
 def fail(message): raise SystemExit("Promotion blocked: " + message)
 def sha(value):
@@ -1634,7 +1732,7 @@ required_top = {
 if manifest.get("schema_version") != "ac_stable_promotion_manifest.v1": fail("schema_version mismatch")
 if set(manifest) != required_top: fail("manifest has missing or extra fields")
 if manifest.get("project_id") != "aming-claw": fail("project_id must be aming-claw")
-if manifest.get("stable_branch") != "codex/direct-no-pass-post-reconcile-r2": fail("stable_branch mismatch")
+if manifest.get("stable_branch") != "main": fail("stable_branch mismatch")
 if manifest.get("branch") != "codex/ac-dev": fail("candidate branch mismatch")
 if manifest.get("stable_anchor_commit") != stable: fail("stable anchor mismatch")
 if manifest.get("candidate_commit") != candidate: fail("candidate commit mismatch")
@@ -2838,9 +2936,10 @@ PRECHECK_RECEIPT_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)
 # Fallible source checks and stable-anchor health all happen before mutation.
 python3 -m py_compile agent/cli.py agent/governance/db.py agent/governance/server.py
 bash -n scripts/merge-and-deploy.sh
-OLD_PID="$(python3 - "$CURRENT_STABLE" "$STABLE_PORT" "$STABLE_DATABASE_IDENTITY" "$STABLE_RUNTIME_SOURCE_SHA256" <<'PY'
+OLD_PID="$(python3 - "$CURRENT_STABLE" "$STABLE_PORT" "$STABLE_DATABASE_IDENTITY" "$STABLE_RUNTIME_SOURCE_SHA256" "$STABLE_BRANCH" <<'PY'
 import json, sys, urllib.request
 anchor, port, database_identity_raw, source_sha256 = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+expected_branch = sys.argv[5]
 database_identity = json.loads(database_identity_raw)
 with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=5) as response:
     health = json.load(response)
@@ -2858,7 +2957,7 @@ plane_identity_ok = bool(
     or (
         plane_identity.get("plane") == "stable"
         and plane_identity.get("branch")
-        == "codex/direct-no-pass-post-reconcile-r2"
+        == expected_branch
         and plane_identity.get("commit") == anchor
         and plane_identity.get("stable_anchor_commit") == anchor
         and plane_identity.get("stable_database_identity") == database_identity
@@ -2971,9 +3070,19 @@ if plan_path.exists():
 manifest = json.loads(Path(manifest_raw).read_text(encoding="utf-8"))
 precheck = json.loads(precheck_raw)
 database_identity = json.loads(database_identity_raw)
-if manifest.get("schema_version") != "ac_stable_promotion_manifest.v2":
+current_main = (manifest.get("prior_promotion") or {}).get("kind") == "current_instance"
+instance = {}
+if current_main:
+    from agent.governance import server
+    instance = server._ac_main_binding_release_instance(candidate=candidate, anchor=stable, require_close_ready=True)
+    evidence = server._ac_main_binding_activation_evidence(instance, manifest)
+    if precheck != server._ac_main_binding_precheck(manifest):
+        fail("activation_plan_precheck_invalid", "current instance durable precheck changed")
+else:
+    evidence = manifest
+if not current_main and manifest.get("schema_version") != "ac_stable_promotion_manifest.v2":
     fail("activation_plan_manifest_invalid", "prepare requires an exact v2 manifest")
-if precheck.get("schema_version") != "ac_stable_promotion_precheck_receipt.v2":
+if precheck.get("schema_version") != ("ac_stable_promotion_precheck_receipt.v1" if current_main else "ac_stable_promotion_precheck_receipt.v2"):
     fail("activation_plan_precheck_invalid", "prepare requires an exact v2 precheck receipt")
 if precheck.get("receipt_hash") != sha(
     {key: value for key, value in precheck.items() if key != "receipt_hash"}
@@ -3027,10 +3136,10 @@ candidate_runtime_source_sha256 = sha(
     )
 )
 if not (
-    manifest.get("candidate_tree_sha") == tree_sha
-    and manifest.get("stable_runtime_source_sha256")
+    evidence.get("candidate_tree_sha") == tree_sha
+    and evidence.get("stable_runtime_source_sha256")
     == stable_runtime_source_sha256
-    and manifest.get("candidate_runtime_source_sha256")
+    and evidence.get("candidate_runtime_source_sha256")
     == candidate_runtime_source_sha256
 ):
     fail(
@@ -3045,7 +3154,7 @@ patch = run(
     dev_root,
     "activation_plan_patch_invalid",
 )
-if not patch or sha(patch) != manifest["promotion_delta"]["diff_sha256"]:
+if not patch or sha(patch) != evidence["promotion_delta"]["diff_sha256"]:
     fail("activation_plan_patch_invalid", "prepared full-index patch differs from promotion delta")
 database_relative_path = (
     "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
@@ -3071,19 +3180,29 @@ database_uri = database.as_uri() + "?mode=ro"
 import sqlite3
 conn = sqlite3.connect(database_uri, uri=True)
 try:
-    rows = conn.execute(
-        "SELECT project_id,snapshot_id,commit_sha,is_active FROM graph_snapshots "
-        "WHERE project_id='aming-claw' ORDER BY snapshot_id"
-    ).fetchall()
+    if current_main:
+        graph_hash = server._ac_main_binding_graph_identity(conn, source_identity=instance)
+    else:
+        rows = conn.execute(
+            "SELECT project_id,snapshot_id,commit_sha,is_active FROM graph_snapshots "
+            "WHERE project_id='aming-claw' ORDER BY snapshot_id"
+        ).fetchall()
+        graph_hash = sha([list(row) for row in rows])
 finally:
     conn.close()
-graph_hash = sha([list(row) for row in rows])
 python_bin = str(Path(python_raw).resolve(strict=True))
 shared = str(stable_root / "shared-volume")
 old_launch = [
     python_bin, "-m", "agent.cli", "start", "--workspace",
     str(stable_root), "--port", "40000",
 ]
+if current_main:
+    old_launch = [python_bin, "-m", "agent.cli", "start", "--workspace", str(stable_root),
+                  "--runtime-plane", "stable", "--port", "40000", "--shared-volume-path", shared,
+                  "--stable-anchor-commit", stable]
+    captured_process = instance["prior_promotion"]["preimage"]["process_identity"]
+    if old_process != {key: captured_process[key] for key in ("pid", "birth", "command")}:
+        fail("activation_plan_process_invalid", "stable process differs from the accepted instance preimage")
 candidate_launch = [
     python_bin, "-m", "agent.cli", "start", "--runtime-plane", "stable",
     "--port", "40000", "--stable-anchor-commit", candidate,
@@ -3114,7 +3233,7 @@ lane_commands = [
 journal_path = plan_path.with_suffix(plan_path.suffix + ".journal")
 lock_path = plan_path.with_suffix(plan_path.suffix + ".lock")
 completion = {
-    "schema_version": "ac_stable_promotion_completion.v2",
+    "schema_version": "ac_stable_promotion_completion.v1" if current_main else "ac_stable_promotion_completion.v2",
     "project_id": "aming-claw",
     "backlog_id": manifest["backlog_id"],
     "contract_execution_id": manifest["contract_execution_id"],
@@ -3124,7 +3243,7 @@ completion = {
     "candidate_runtime_source_sha256": candidate_runtime_source_sha256,
     "previous_stable_commit": stable,
     "promotion_intent_sha256": manifest["promotion_intent_sha256"],
-    "qa_candidate_intent_sha256": manifest[
+    "qa_candidate_intent_sha256": evidence[
         "qa_candidate_intent_sha256"
     ],
     "promotion_manifest_sha256": manifest["promotion_manifest_sha256"],
@@ -3133,12 +3252,12 @@ completion = {
     "precheck_receipt": precheck,
     "promotion_manifest": manifest,
     "previous_promotion_receipt_hash": precheck.get("previous_promotion_receipt_hash", ""),
-    "implementation_delta": manifest["implementation_delta"],
-    "promotion_delta": manifest["promotion_delta"],
-    "diff_sha256": manifest["promotion_delta"]["diff_sha256"],
-    "file_fence": manifest["promotion_delta"]["file_fence"],
-    "rollback_authority_hash": manifest["rollback_authority_hash"],
-    "custody_authority": manifest["custody_authority"],
+    "implementation_delta": evidence["implementation_delta"],
+    "promotion_delta": evidence["promotion_delta"],
+    "diff_sha256": evidence["promotion_delta"]["diff_sha256"],
+    "file_fence": evidence["promotion_delta"]["file_fence"],
+    **({} if current_main else {"rollback_authority_hash": manifest["rollback_authority_hash"]}),
+    "custody_authority": evidence["custody_authority"],
     "deploy": manifest["deploy"],
     "stable_database_identity": database_identity,
     "operator_approval_ref": precheck["operator_approval_ref"],
@@ -3150,7 +3269,7 @@ core = {
     "project_id": "aming-claw",
     "backlog_id": manifest["backlog_id"],
     "contract_execution_id": manifest["contract_execution_id"],
-    "stable_branch": "codex/direct-no-pass-post-reconcile-r2",
+    "stable_branch": "main" if current_main else "codex/direct-no-pass-post-reconcile-r2",
     "dev_branch": "codex/ac-dev",
     "stable_worktree": str(stable_root),
     "dev_worktree": str(dev_root),
@@ -3159,12 +3278,12 @@ core = {
     "candidate_tree_sha": tree_sha,
     "stable_runtime_source_sha256": stable_runtime_source_sha256,
     "candidate_runtime_source_sha256": candidate_runtime_source_sha256,
-    "implementation_delta": manifest["implementation_delta"],
-    "promotion_delta": manifest["promotion_delta"],
-    "qa_candidate_intent_sha256": manifest[
+    "implementation_delta": evidence["implementation_delta"],
+    "promotion_delta": evidence["promotion_delta"],
+    "qa_candidate_intent_sha256": evidence[
         "qa_candidate_intent_sha256"
     ],
-    "custody_authority": manifest["custody_authority"],
+    "custody_authority": evidence["custody_authority"],
     "manifest": manifest,
     "manifest_sha256": sha(manifest),
     "promotion_intent_sha256": manifest["promotion_intent_sha256"],
@@ -3192,7 +3311,7 @@ core = {
     "journal_path": str(journal_path),
     "lock_path": str(lock_path),
     "completion_body_template": completion,
-    "activation_policy": manifest["activation_policy"],
+    "activation_policy": evidence["activation_policy"],
 }
 plan = {**core, "plan_hash": sha(core)}
 payload = (canonical(plan) + "\n").encode("utf-8")

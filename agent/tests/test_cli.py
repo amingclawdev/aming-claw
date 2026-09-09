@@ -3744,80 +3744,45 @@ class TestACDevRuntimeCli:
             cli._verified_generic_graph_identity(graph, loaded_commit=commit) == {}
         )
 
-    def test_generic_database_binding_allows_absent_health_identity_but_rejects_mismatch(
+    def test_stable_database_binding_adapts_the_verified_db_boundary(
         self, monkeypatch, tmp_path
     ):
         import agent.cli as cli
+        from agent.governance import db
 
-        source = tmp_path / "ac-dev"
-        source.mkdir()
         stable = tmp_path / "stable"
-        database = (
-            stable
-            / cli.AC_DATABASE_STABLE_RELATIVE_PATH
-        )
+        database = stable / cli.AC_DATABASE_STABLE_RELATIVE_PATH
         database.parent.mkdir(parents=True)
         database.touch()
         stable_commit = "c" * 40
-        monkeypatch.setattr(
-            cli,
-            "_source_git_identity",
-            lambda: {
-                "root": str(source),
-                "branch": cli.AC_DEV_BRANCH,
-                "commit": "d" * 40,
-                "dirty": "",
-            },
-        )
-        monkeypatch.setattr(
-            cli.subprocess,
-            "run",
-            lambda *_args, **_kwargs: types.SimpleNamespace(
-                returncode=0,
-                stdout=(
-                    f"worktree {stable}\n"
-                    f"branch refs/heads/{cli.AC_STABLE_BRANCH}\n"
-                ),
-                stderr="",
-            ),
-        )
-        monkeypatch.setattr(
-            cli,
-            "_current_stable_runtime_authority",
-            lambda: {
-                "commit": stable_commit,
-                "mode": "verified_generic",
-                "health": {"runtime_plane_identity": {}},
-            },
-        )
+        identity = {
+            "schema_version": "ac_stable_database_identity.v1",
+            "device": database.stat().st_dev, "inode": database.stat().st_ino,
+            "stable_relative_path_sha256": "sha256:" + hashlib.sha256(
+                cli.AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+            ).hexdigest(),
+        }
+        def verified(requested_shared_volume, *, stable_anchor_commit):
+            assert requested_shared_volume == str(stable / "shared-volume")
+            assert stable_anchor_commit == stable_commit
+            return {"shared_volume_path": stable / "shared-volume", "stable_database_identity": identity}
+        monkeypatch.setattr(db, "verified_stable_database_binding", verified)
 
         binding = cli._canonical_stable_database_binding(
             str(stable / "shared-volume"),
             stable_anchor_commit=stable_commit,
         )
-        assert binding["stable_database_identity"]["inode"] == database.stat().st_ino
-
-        monkeypatch.setattr(
-            cli,
-            "_current_stable_runtime_authority",
-            lambda: {
-                "commit": stable_commit,
-                "mode": "verified_generic",
-                "health": {
-                    "runtime_plane_identity": {
-                        "stable_database_identity": {
-                            **binding["stable_database_identity"],
-                            "inode": binding["stable_database_identity"]["inode"] + 1,
-                        }
-                    }
-                },
-            },
-        )
-        with pytest.raises(cli.click.ClickException, match="differs"):
+        assert binding == {"shared_volume_path": str(stable / "shared-volume"), "stable_database_identity": identity}
+        rejected = RuntimeError("stable database identity differs from its health authority")
+        def mismatched(*_args, **_kwargs):
+            raise rejected
+        monkeypatch.setattr(db, "verified_stable_database_binding", mismatched)
+        with pytest.raises(cli.click.ClickException, match="unavailable") as error:
             cli._canonical_stable_database_binding(
                 str(stable / "shared-volume"),
                 stable_anchor_commit=stable_commit,
             )
+        assert error.value.__cause__ is rejected
 
     def test_dev_anchor_tracks_exact_current_stable_health(self, monkeypatch):
         import agent.cli as cli
@@ -6008,3 +5973,17 @@ def test_durable_stop_v2_attacks_fail_closed(tmp_path, monkeypatch, attack, expe
     if not signals:
         assert list(runtime.glob("exit.*.json")) == []
         assert list(runtime.glob("stop.*.json")) == []
+
+
+def test_main_binding_cli_anchor_is_the_exact_main_ref(monkeypatch, tmp_path):
+    import agent.cli as cli
+    assert cli.AC_STABLE_BRANCH == "main"
+    seen = []
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: {"root": str(tmp_path)})
+    def git_probe(args, **kwargs):
+        seen.append(args)
+        return SimpleNamespace(returncode=0, stdout="a" * 40 + "\n")
+    from types import SimpleNamespace
+    monkeypatch.setattr(cli.subprocess, "run", git_probe)
+    assert cli._local_stable_source_anchor() == "a" * 40
+    assert seen == [["git", "rev-parse", "--verify", "refs/heads/main"]]
