@@ -183,11 +183,13 @@ def _main_transition_fixture(monkeypatch, tmp_path, *, pipeline=False):
     return db, stable, dev, record, health, save, git, candidate
 
 
-def test_main_binding_single_candidate_basic_preimage_is_exact_and_read_only(monkeypatch, tmp_path):
+def test_main_binding_release_preimage_stays_exact_and_physical_binding_is_separate(monkeypatch, tmp_path):
     db, stable, dev, record, health, save, git, candidate = _main_transition_fixture(monkeypatch, tmp_path)
     before = (git("rev-parse", "HEAD"), git("rev-parse", "refs/heads/main"), git("status", "--porcelain"))
+    transition = db._stable_main_transition_context(
+        dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
+    )
     binding = db.verified_stable_database_binding()
-    transition = binding["branch_binding_transition"]
     assert transition["candidate_commit"] == candidate
     assert transition["base_commit"] == record["metadata"]["operator_supervised_direct_main_runtime_binding"]["base_commit"]
     assert transition["phase"] == "implementation"
@@ -195,22 +197,21 @@ def test_main_binding_single_candidate_basic_preimage_is_exact_and_read_only(mon
     assert transition["stable_deploy_authorized"] is False
     assert transition["writes_performed"] is False
     assert binding["stable_database_identity"] == health["runtime_plane_identity"]["database_identity"]
+    assert "branch_binding_transition" not in binding
+    assert "binding_hash" not in binding
+    assert "phase" not in binding
     assert before == (git("rev-parse", "HEAD"), git("rev-parse", "refs/heads/main"), git("status", "--porcelain"))
 
 
-@pytest.mark.parametrize("drift", ["dirty_stable", "dirty_dev", "wrong_parent", "no_pre_mutation", "wrong_phase", "stale_health", "wrong_world", "not_ready", "branch_only_switch", "main_ref", "extra_instance", "line_actor", "line_stage", "line_evidence", "pre_event_status", "unverified_graph"])
-def test_main_binding_transition_rejects_exact_preimage_and_custody_drift(monkeypatch, tmp_path, drift):
+@pytest.mark.parametrize("drift", ["dirty_stable", "dirty_dev", "detached_dev", "stale_health", "wrong_world", "not_ready", "branch_only_switch", "main_ref", "anchor_branch_policy", "wrong_main_worktree", "stable_root_symlink", "stable_source_symlink"])
+def test_main_physical_binding_rejects_exact_preimage_and_custody_drift(monkeypatch, tmp_path, drift):
     db, stable, dev, record, health, save, git, candidate = _main_transition_fixture(monkeypatch, tmp_path)
     if drift == "dirty_stable":
         (stable / "unexpected").write_text("dirty")
     elif drift == "dirty_dev":
         (dev / "unexpected").write_text("dirty")
-    elif drift == "wrong_parent":
-        git("commit", "--allow-empty", "-qm", "unadmitted descendant", root=dev)
-    elif drift == "no_pre_mutation":
-        record["completed_lines"].pop(); save()
-    elif drift == "wrong_phase":
-        record["execution_state"]["next_action"]["stage_id"] = "route_gate"; save()
+    elif drift == "detached_dev":
+        git("switch", "--detach", "-q", root=dev)
     elif drift == "stale_health":
         health["runtime_stale"] = True
     elif drift == "wrong_world":
@@ -223,6 +224,56 @@ def test_main_binding_transition_rejects_exact_preimage_and_custody_drift(monkey
         health["runtime_plane_identity"]["status"] = "invalid"
     elif drift == "main_ref":
         git("update-ref", "refs/heads/main", candidate)
+    elif drift == "anchor_branch_policy":
+        (stable / "agent/governance/server.py").write_text(
+            'AC_STABLE_BRANCH = "codex/contradictory-stable"\n'
+        )
+        git("add", "agent/governance/server.py")
+        git("commit", "-qm", "contradictory immutable stable policy")
+        anchor = git("rev-parse", "HEAD")
+        git("update-ref", "refs/heads/main", anchor)
+        digest = "sha256:" + hashlib.sha256(
+            (stable / "agent/governance/server.py").read_bytes()
+        ).hexdigest()
+        health["runtime_loaded_version"] = anchor
+        health["runtime_plane_identity"].update({
+            "commit": anchor, "stable_anchor_commit": anchor,
+        })
+        health["loaded_runtime_identity"].update({
+            "loaded_commit": anchor,
+            "loaded_source_sha256": digest,
+            "worktree_source_sha256": digest,
+        })
+    elif drift == "wrong_main_worktree":
+        git("worktree", "add", "-q", str(tmp_path / "unexpected-main"), "main")
+    elif drift == "stable_root_symlink":
+        alias = tmp_path / "stable-alias"
+        alias.symlink_to(stable, target_is_directory=True)
+        health["runtime_plane_identity"]["worktree_root"] = str(alias)
+    elif drift == "stable_source_symlink":
+        source = stable / "agent/governance/server.py"
+        outside = tmp_path / "stable-server.py"
+        outside.write_bytes(source.read_bytes())
+        source.unlink()
+        source.symlink_to(outside)
+        digest = "sha256:" + hashlib.sha256(outside.read_bytes()).hexdigest()
+        health["loaded_runtime_identity"].update({
+            "loaded_source_sha256": digest,
+            "worktree_source_sha256": digest,
+        })
+    with pytest.raises((RuntimeError, ValueError)):
+        db.verified_stable_database_binding()
+
+
+@pytest.mark.parametrize("drift", ["wrong_parent", "no_pre_mutation", "wrong_phase", "extra_instance", "line_actor", "line_stage", "line_evidence", "pre_event_status", "unverified_graph"])
+def test_main_release_checker_retains_instance_phase_and_evidence_rejections(monkeypatch, tmp_path, drift):
+    db, stable, dev, record, health, save, git, candidate = _main_transition_fixture(monkeypatch, tmp_path)
+    if drift == "wrong_parent":
+        git("commit", "--allow-empty", "-qm", "unadmitted descendant", root=dev)
+    elif drift == "no_pre_mutation":
+        record["completed_lines"].pop(); save()
+    elif drift == "wrong_phase":
+        record["execution_state"]["next_action"]["stage_id"] = "route_gate"; save()
     elif drift == "extra_instance":
         from agent.runtime_plane import resolve_ac_dev_storage_root
         database = resolve_ac_dev_storage_root(stable / "shared-volume") / db.AC_DATABASE_DEV_RELATIVE_PATH
@@ -236,7 +287,247 @@ def test_main_binding_transition_rejects_exact_preimage_and_custody_drift(monkey
     elif drift == "unverified_graph":
         record["completed_lines"][1]["db_verified"] = False; save()
     with pytest.raises((RuntimeError, ValueError)):
-        db.verified_stable_database_binding()
+        db._stable_main_transition_context(
+            dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
+        )
+
+
+def test_terminal_no_pass_does_not_block_physical_binding_or_authorize_release(monkeypatch, tmp_path):
+    db, stable, dev, record, health, save, git, candidate = _main_transition_fixture(monkeypatch, tmp_path)
+    record["completed_lines"].extend([
+        {
+            "line_id": "observer_implementation", "stage_id": "implementation",
+            "actor_role": "observer", "evidence_kind": "implementation",
+            "status": "completed", "payload": {"commit_sha": candidate},
+        },
+        {
+            "line_id": "qa_graph_context", "stage_id": "qa_graph_context",
+            "actor_role": "qa", "evidence_kind": "graph_trace",
+            "status": "completed", "payload": {"trace_id": "fixture-trace"},
+        },
+        {
+            "line_id": "qa_independent_verification", "stage_id": "qa",
+            "actor_role": "qa", "evidence_kind": "independent_verification",
+            "status": "failed",
+            "payload": {"test_results": {"status": "passed"}, "verdict": "NO-PASS"},
+        },
+    ])
+    record["execution_state"]["next_action"] = {
+        "stage_id": "qa_graph_context", "line_id": "qa_graph_context",
+    }
+    save()
+
+    binding = db.verified_stable_database_binding()
+
+    assert binding["stable_head"] == health["runtime_plane_identity"]["stable_anchor_commit"]
+    assert "branch_binding_transition" not in binding
+    assert "accepted" not in binding
+    assert "pre_mutation" not in binding
+    with pytest.raises(RuntimeError, match="current instance/source/phase mismatch"):
+        db._stable_main_transition_context(
+            dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
+        )
+
+
+def test_real_cow_get_connection_terminal_read_is_pure_and_non_writable(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+    from agent.governance.contracts import ContractDefinitionRegistry
+    from agent.governance.contracts.runtime import (
+        ContractRuntime,
+        SQLiteContractExecutionStore,
+    )
+
+    binding_root = tmp_path / "physical-binding"
+    binding_root.mkdir()
+    _release_db, stable, dev, release_record, health, _save, _git, _candidate = (
+        _main_transition_fixture(monkeypatch, binding_root)
+    )
+    production_verified_binding = db.verified_stable_database_binding
+    production_revalidate_binding = db._revalidate_stable_database_binding
+    root, database, linked, source, _process, _receipt = (
+        _phase_z_cow_prestart_fixture(
+            tmp_path / "cow-world", monkeypatch, source_root=dev,
+        )
+    )
+    _phase_z_bind_first_start_runtime(tmp_path / "cow-world", monkeypatch, root)
+    custody = _phase_z_durable_process(root, source, pid=os.getpid())
+    db.commit_dev_child_custody(
+        root, source_identity=source, process_identity=custody,
+        linked_v3_receipt=linked,
+    )
+    execution = "cex-direct-main-terminal-recovery-fixture"
+    backlog = "AC-STABLE-MAIN-DEPLOYMENT-BINDING-R1-20260908"
+    setup_connection = sqlite3.connect(database)
+    setup_connection.row_factory = sqlite3.Row
+    store = SQLiteContractExecutionStore(setup_connection)
+    setup_runtime = ContractRuntime(ContractDefinitionRegistry(), store=store)
+    setup_connection.execute(
+        "INSERT INTO backlog_bugs(bug_id,status,created_at,updated_at) VALUES(?,?,?,?)",
+        (backlog, "OPEN", "2026-09-09T00:00:00Z", "2026-09-09T00:00:00Z"),
+    )
+    created = setup_runtime.start_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev3",
+        project_id="aming-claw",
+        backlog_id=backlog,
+        actor_role="observer",
+        contract_execution_id=execution,
+        route_token_ref="rtok-terminal-recovery-fixture",
+        metadata=release_record["metadata"],
+    )
+    completed = [
+        {
+            "stage_id": "route_gate", "line_id": "observer_bind_direct_scope",
+            "actor_role": "observer", "evidence_kind": "contract_binding",
+            "status": "completed", "payload": {"fixture": "canonical-runtime-line"},
+        },
+        {
+            "stage_id": "graph_first", "line_id": "observer_graph_context",
+            "actor_role": "observer", "evidence_kind": "graph_trace",
+            "status": "completed", "payload": {"fixture": "canonical-runtime-line"},
+        },
+        {
+            "stage_id": "pre_mutation",
+            "line_id": "observer_direct_implementation_exception",
+            "actor_role": "observer",
+            "evidence_kind": "observer_direct_implementation_exception",
+            "status": "completed", "payload": {"fixture": "canonical-runtime-line"},
+        },
+        {
+            "stage_id": "implementation", "line_id": "observer_implementation",
+            "actor_role": "observer", "evidence_kind": "implementation",
+            "payload": {
+                "event": {"status": "passed"},
+                "commit_sha": source["commit"],
+                "test_results": {"status": "passed", "passed": 1, "failed": 0},
+            },
+        },
+        {
+            "stage_id": "qa_graph_context", "line_id": "qa_graph_context",
+            "actor_role": "qa", "evidence_kind": "graph_trace",
+            "status": "completed", "payload": {"fixture": "canonical-runtime-line"},
+        },
+        {
+            "stage_id": "qa", "line_id": "qa_independent_verification",
+            "actor_role": "qa", "evidence_kind": "independent_verification",
+            "status": "failed",
+            "payload": {
+                "verdict": "NO-PASS",
+                "test_results": {"status": "passed", "passed": 999, "failed": 0},
+            },
+        },
+    ]
+    persisted = store.get(execution)
+    persisted["status"] = "active"
+    persisted["execution_state_revision"] = 7
+    persisted["completed_lines"] = completed
+    store.update(execution, persisted)
+    setup_connection.executemany(
+        "INSERT INTO task_timeline_events(id,project_id,backlog_id,task_id,event_type,"
+        "phase,event_kind,actor,status,commit_sha,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (329, "aming-claw", backlog, execution, "implementation", "implementation",
+             "implementation", "observer", "passed", source["commit"], "2026-09-09T00:01:00Z"),
+            (330, "aming-claw", backlog, execution, "qa.independent_verification", "qa",
+             "independent_verification", "qa", "failed", source["commit"], "2026-09-09T00:02:00Z"),
+        ],
+    )
+    setup_connection.commit()
+    setup_connection.close()
+
+    monkeypatch.setattr(db, "verified_stable_database_binding", production_verified_binding)
+    monkeypatch.setattr(db, "_revalidate_stable_database_binding", production_revalidate_binding)
+    monkeypatch.setenv(db.AC_STABLE_SHARED_VOLUME_ENV, str(stable / "shared-volume"))
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    with pytest.raises(RuntimeError, match="current instance/source/phase mismatch"):
+        db._stable_main_transition_context(
+            dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
+        )
+    physical_calls = []
+    original_physical = db._stable_main_physical_preimage_branch
+
+    def observed_physical(*args, **kwargs):
+        physical_calls.append((args[0], args[1], args[2]))
+        return original_physical(*args, **kwargs)
+
+    monkeypatch.setattr(db, "_stable_main_physical_preimage_branch", observed_physical)
+    binding = db.verified_stable_database_binding()
+    assert "branch_binding_transition" not in binding
+    assert physical_calls == [
+        (dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"])
+    ]
+    connection = db.get_connection("aming-claw")
+    try:
+        assert Path(connection.execute("PRAGMA database_list").fetchone()[2]) == database
+        assert len(physical_calls) >= 2
+        store = SQLiteContractExecutionStore(connection)
+        runtime = ContractRuntime(ContractDefinitionRegistry(), store=store)
+        before = store.get(execution)
+        history_before = connection.execute(
+            "SELECT id,event_type,phase,event_kind,actor,status,commit_sha "
+            "FROM task_timeline_events WHERE id IN (329,330) ORDER BY id"
+        ).fetchall()
+        backlog_before = connection.execute(
+            'SELECT status,"commit" FROM backlog_bugs WHERE bug_id=?', (backlog,),
+        ).fetchone()
+
+        current = runtime.current_record(execution, actor_role="observer")
+
+        assert store.get(execution) == before
+        assert current["status"] == "active"
+        state = current["execution_state"]
+        guide = current["runtime_guide"]
+        assert state["terminal"] is True
+        for key in (
+            "scheduler_eligible", "current_eligible", "close_eligible",
+            "resume_eligible", "retry_eligible", "write_eligible",
+        ):
+            assert state[key] is False
+        assert guide["next_legal_action"] is None
+        assert guide["readiness_state"] == "terminal_no_pass"
+        assert guide["disposition"] == "terminal_no_pass"
+        for key in (
+            "writer_role_safe_copy_payload", "line_bypass_guidance",
+            "failed_qa_rework", "post_projection_submit_line_guidance",
+        ):
+            assert key not in guide
+        disposition = guide["terminal_disposition"]
+        assert disposition["source_line_id"] == "qa_independent_verification"
+        assert disposition["authoritative_pass_synthesized"] is False
+
+        rejected = runtime.submit_line_write(
+            execution,
+            {
+                "project_id": "aming-claw",
+                "backlog_id": backlog,
+                "contract_execution_id": execution,
+                "definition_hash": created["definition_hash"],
+                "instruction_bundle_hash": created["instruction_bundle_hash"],
+                "execution_state_revision": current["execution_state_revision"],
+                "runtime_guide_hash": guide["runtime_guide_hash"],
+                "stage_id": "reconcile",
+                "line_id": "observer_reconcile",
+                "actor_role": "observer",
+                "evidence_kind": "current_full_reconcile",
+            },
+            actor_role="observer",
+        )
+        assert rejected["ok"] is False
+        assert store.get(execution) == before
+        assert connection.execute(
+            "SELECT id,event_type,phase,event_kind,actor,status,commit_sha "
+            "FROM task_timeline_events WHERE id IN (329,330) ORDER BY id"
+        ).fetchall() == history_before
+        backlog_after = connection.execute(
+            'SELECT status,"commit" FROM backlog_bugs WHERE bug_id=?', (backlog,),
+        ).fetchone()
+        assert tuple(backlog_after) == tuple(backlog_before) == ("OPEN", "")
+    finally:
+        connection.close()
+        db.release_dev_runtime_writer_lease(root)
 
 
 def _canonical_dev_world(tmp_path: Path) -> tuple[Path, Path]:
@@ -1805,7 +2096,7 @@ def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path, m
 
 @pytest.mark.parametrize(
     "defect",
-    ["offline", "wrong-port", "pid-zero", "start", "command", "cwd", "source", "head", "loaded-commit", "plane-commit", "database", "stable-database"],
+    ["offline", "wrong-port", "pid-zero", "start", "command", "cwd", "source", "loaded-path", "head", "loaded-commit", "plane-commit", "database", "stable-database"],
 )
 def test_verified_stable_binding_rejects_each_health_process_and_source_mismatch(
     monkeypatch, defect
@@ -1833,6 +2124,7 @@ def test_verified_stable_binding_rejects_each_health_process_and_source_mismatch
         if defect == "wrong-port": health["port"] = 40008
         if defect == "pid-zero": health["pid"] = 0
         if defect == "source": health["loaded_runtime_identity"]["loaded_source_sha256"] = "sha256:" + "0" * 64
+        if defect == "loaded-path": health["loaded_runtime_identity"]["loaded_source_path"] = str(source.parent / "other.py")
         if defect == "head": health["runtime_loaded_version"] = "0" * 40
         if defect == "loaded-commit": health["loaded_runtime_identity"]["loaded_commit"] = "0" * 40
         if defect == "plane-commit": health["runtime_plane_identity"]["commit"] = "0" * 40
@@ -3772,26 +4064,31 @@ def test_dev_issuance_ancestry_anchor_fails_closed_on_chain_drift(tmp_path, tamp
         db.dev_issuance_ancestry_anchor_commit(root)
 
 
-def _phase_z_cow_prestart_fixture(tmp_path, monkeypatch):
+def _phase_z_cow_prestart_fixture(tmp_path, monkeypatch, *, source_root=None):
     """Build one real COW successor whose issuance meta is externally sealed."""
     from agent.governance import db
 
-    git_fixture = tmp_path / "git-source"
-    git_fixture.mkdir()
-    source_root, source_commit = _dev_source_repo(git_fixture)
-    server_source = source_root / "agent" / "governance" / "server.py"
-    server_source.parent.mkdir()
-    server_source.write_text("# canonical server source producer\n", encoding="utf-8")
-    loaded_db_source = source_root / "agent" / "governance" / "db.py"
-    loaded_db_source.write_text("# loaded DB module location fixture\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "agent/governance/server.py", "agent/governance/db.py"],
-        cwd=source_root, check=True,
-    )
-    subprocess.run(
-        ["git", "commit", "--amend", "--no-edit"], cwd=source_root,
-        check=True, capture_output=True,
-    )
+    if source_root is None:
+        git_fixture = tmp_path / "git-source"
+        git_fixture.mkdir()
+        source_root, _source_commit = _dev_source_repo(git_fixture)
+        server_source = source_root / "agent" / "governance" / "server.py"
+        server_source.parent.mkdir()
+        server_source.write_text("# canonical server source producer\n", encoding="utf-8")
+        loaded_db_source = source_root / "agent" / "governance" / "db.py"
+        loaded_db_source.write_text("# loaded DB module location fixture\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "agent/governance/server.py", "agent/governance/db.py"],
+            cwd=source_root, check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "--amend", "--no-edit"], cwd=source_root,
+            check=True, capture_output=True,
+        )
+    else:
+        source_root = Path(source_root).resolve(strict=True)
+        server_source = source_root / "agent" / "governance" / "server.py"
+        loaded_db_source = source_root / "agent" / "governance" / "db.py"
     source_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
         capture_output=True, text=True,

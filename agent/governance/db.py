@@ -385,6 +385,102 @@ def _stable_main_transition_context(
     }
 
 
+def _stable_main_physical_preimage_branch(
+    source_root: Path,
+    stable_root: Path,
+    stable_anchor: str,
+    worktrees: Sequence[Mapping[str, str]],
+) -> str:
+    """Verify the one physical old-branch preimage without release authority.
+
+    This is deliberately independent of ContractRuntime.  It proves only that
+    the already-running stable process is rooted at the immutable anchor whose
+    CLI and server agree on one historical branch while ``main`` still names
+    that same anchor.  Release-stage instance, phase, evidence, parent and
+    trailer checks remain owned by :func:`_stable_main_transition_context`.
+    """
+
+    source_root = _absolute_non_symlink_root(source_root, create=False)
+    stable_root = _absolute_non_symlink_root(stable_root, create=False)
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor):
+        raise RuntimeError("AC main physical preimage anchor is invalid")
+
+    def git(root: Path, *args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True,
+            timeout=10, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError("AC main physical preimage Git identity is unavailable")
+        return result.stdout.strip()
+
+    def branch_at(commit: str, path: str) -> str:
+        source = git(source_root, "show", f"{commit}:{path}")
+        matches = re.findall(r'^AC_STABLE_BRANCH = "([^"\n]+)"$', source, re.M)
+        if len(matches) != 1:
+            raise RuntimeError("AC main physical preimage branch policy is ambiguous")
+        return matches[0]
+
+    def roots_for(branch: str) -> list[Path]:
+        roots: list[Path] = []
+        for row in worktrees:
+            if row.get("branch") != "refs/heads/" + branch or not row.get("worktree"):
+                continue
+            try:
+                roots.append(
+                    _absolute_non_symlink_root(
+                        Path(str(row["worktree"])), create=False,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    "AC main physical preimage worktree is not canonical"
+                ) from exc
+        return roots
+
+    stable_head = git(stable_root, "rev-parse", "HEAD").lower()
+    main_head = git(source_root, "rev-parse", "refs/heads/main").lower()
+    source_head = git(source_root, "rev-parse", "HEAD").lower()
+    if (
+        stable_head != stable_anchor
+        or main_head != stable_anchor
+        or git(source_root, "symbolic-ref", "HEAD") != "refs/heads/codex/ac-dev"
+        or git(source_root, "status", "--porcelain")
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", source_head)
+    ):
+        raise RuntimeError("AC main physical preimage source identity is invalid")
+
+    old_branch = branch_at(stable_anchor, "agent/cli.py")
+    if (
+        old_branch in {"main", "codex/ac-dev"}
+        or branch_at(stable_anchor, "agent/governance/server.py") != old_branch
+        or roots_for(old_branch) != [stable_root]
+        or roots_for("codex/ac-dev") != [source_root]
+    ):
+        raise RuntimeError("AC main physical preimage worktree identity is ambiguous")
+
+    for root, paths in (
+        (stable_root, ("agent/cli.py", "agent/governance/server.py")),
+        (source_root, ("agent/cli.py", "agent/governance/server.py", "agent/governance/db.py")),
+    ):
+        for relative in paths:
+            path = (root / relative).absolute()
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RuntimeError("AC main physical preimage source is unavailable") from exc
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(metadata.st_mode)
+                or path.resolve(strict=True) != path
+                or path.read_bytes() != subprocess.check_output(
+                    ["git", "show", f"HEAD:{relative}"], cwd=root,
+                )
+            ):
+                raise RuntimeError("AC main physical preimage source identity is invalid")
+    return old_branch
+
+
 def _verified_stable_binding() -> dict[str, object]:
     """Read-only fixed-40000 + unique stable-worktree authority for AC dev."""
     health = _stable_health_request()
@@ -396,7 +492,14 @@ def _verified_stable_binding() -> dict[str, object]:
     ):
         raise RuntimeError("AC stable authority health is invalid")
     _start, command, cwd = _stable_process_identity(int(health["pid"]))
-    root = Path(__file__).resolve().parents[2]
+    module_path = Path(__file__).expanduser().absolute()
+    if (
+        module_path.is_symlink()
+        or not module_path.is_file()
+        or module_path.resolve(strict=True) != module_path
+    ):
+        raise RuntimeError("AC stable authority loaded source path is invalid")
+    root = _absolute_non_symlink_root(module_path.parents[2], create=False)
     result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=5, check=False)
     roots = []
     worktrees = []
@@ -404,20 +507,27 @@ def _verified_stable_binding() -> dict[str, object]:
         fields = dict(line.split(" ", 1) if " " in line else (line, "") for line in block.splitlines())
         worktrees.append(fields)
         if fields.get("branch") == "refs/heads/main" and fields.get("worktree"):
-            roots.append(Path(fields["worktree"]).resolve(strict=True))
-    transition = {}
+            try:
+                roots.append(
+                    _absolute_non_symlink_root(
+                        Path(fields["worktree"]), create=False,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("AC stable authority worktree is not canonical") from exc
     expected_branch = "main"
     if not roots:
         identity = health.get("runtime_plane_identity") or {}
-        stable_root = Path(str(identity.get("worktree_root") or "")).resolve(strict=True)
-        transition = _stable_main_transition_context(root, stable_root, str(identity.get("commit") or ""))
-        expected_branch = str(transition["stable_branch_preimage"])
-        roots = [Path(row["worktree"]).resolve(strict=True) for row in worktrees
-                 if row.get("branch") == "refs/heads/" + expected_branch and row.get("worktree")]
-        dev_roots = [Path(row["worktree"]).resolve(strict=True) for row in worktrees
-                     if row.get("branch") == "refs/heads/codex/ac-dev" and row.get("worktree")]
-        if roots != [stable_root] or dev_roots != [root]:
-            raise RuntimeError("AC main transition worktree identity is ambiguous")
+        try:
+            stable_root = _absolute_non_symlink_root(
+                Path(str(identity.get("worktree_root") or "")), create=False,
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("AC main physical preimage stable root is invalid") from exc
+        expected_branch = _stable_main_physical_preimage_branch(
+            root, stable_root, str(identity.get("commit") or ""), worktrees,
+        )
+        roots = [stable_root]
     if result.returncode != 0 or len(roots) != 1:
         raise RuntimeError("AC stable authority worktree is unavailable")
     stable_root = roots[0]
@@ -464,8 +574,7 @@ def _verified_stable_binding() -> dict[str, object]:
         if probe.returncode or probe.stdout.strip() != expected:
             raise RuntimeError("AC stable authority worktree identity changed")
     return {"shared_volume_path": str(shared), "health": dict(health), "stable_head": head,
-            "process_identity": {"pid": health["pid"], "birth": _start, "command": command, "cwd": cwd},
-            **({"branch_binding_transition": transition} if transition else {})}
+            "process_identity": {"pid": health["pid"], "birth": _start, "command": command, "cwd": cwd}}
 
 
 def verified_stable_database_binding(
