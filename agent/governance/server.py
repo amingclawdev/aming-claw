@@ -180,7 +180,6 @@ AC_DEV_BRANCH = "codex/ac-dev"
 AC_STABLE_BRANCH = "main"
 # Frozen promotion generations retain their original branch and receipt hashes.
 _AC_HISTORICAL_PROMOTION_BRANCH = "codex/direct-no-pass-post-reconcile-r2"
-_AC_MAIN_BINDING_BACKLOG_ID = "AC-STABLE-MAIN-DEPLOYMENT-BINDING-R1-20260908"
 AC_STABLE_ANCHOR_COMMIT = "a25838f15f949ac434cf78e03f20760e82ff81f0"
 _RUNTIME_PLANE_ENV = "AMING_CLAW_RUNTIME_PLANE"
 _STABLE_ANCHOR_ENV = "AMING_CLAW_STABLE_ANCHOR_COMMIT"
@@ -3508,6 +3507,24 @@ def _runtime_world_zero_write_rejection(
     )
 
 
+def _ac_stable_promotion_signoff_body(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Recognize the existing canonical signoff carrier, never a queue action."""
+    if (body.get("action") != "reorder"
+            or not set(body) <= {"project_id", "action", "backlog_ids", "reason"}
+            or not isinstance(body.get("backlog_ids"), list)):
+        return {}
+    try:
+        reason = json.loads(body.get("reason") or "")
+    except (TypeError, ValueError):
+        return {}
+    if (not isinstance(reason, dict)
+            or reason.get("schema_version") != "ac_stable_promotion_operator_signoff.v1"
+            or reason.get("project_id") != AC_PROJECT_ID
+            or body.get("reason") != json.dumps(reason, sort_keys=True, separators=(",", ":"))):
+        return {}
+    return reason
+
+
 def _guard_runtime_world_request(
     *,
     method: str,
@@ -3519,8 +3536,9 @@ def _guard_runtime_world_request(
 ) -> None:
     """Enforce stable/dev project domains before handlers or DB access.
 
-    Port 40000 owns every non-AC project and rejects both the canonical AC id
-    and any value that normalizes to it.  Port 40008 owns exactly the canonical
+    Port 40000 owns every non-AC project and rejects AC business requests;
+    only its existing authenticated promotion signoff/receipt is local control.
+    Port 40008 owns exactly the canonical
     ``aming-claw`` spelling.  No cross-world read bridge exists: a caller must
     connect to the owning service.  Mutations additionally require a scoped
     project claim and a non-empty credential; authentication remains the
@@ -3576,6 +3594,17 @@ def _guard_runtime_world_request(
             path=path,
             detail="mutation requires an explicit source-backed project identity",
         )
+    # These existing release control operations record the stable service's own
+    # signoff/receipt. They are not AC business APIs or a cross-world bridge.
+    # Authentication and exact deployment/QA/signoff checks remain in its handler.
+    if (plane == "stable" and method == "POST"
+            and (path == "/api/projects/aming-claw/ac-stable-promotion/complete"
+                 or (path == "/api/projects/aming-claw/release-operator-head-queue"
+                     and _ac_stable_promotion_signoff_body(body)))
+            and path_params.get("project_id") == AC_PROJECT_ID and token
+            and normalized_claims and all(raw == canonical == AC_PROJECT_ID
+                                         for _source, raw, canonical in normalized_claims)):
+        return None
     if plane == "dev":
         for source, raw, canonical in normalized_claims:
             if raw != AC_PROJECT_ID or canonical != AC_PROJECT_ID:
@@ -172683,9 +172712,10 @@ def _ac_promotion_successor_qa_projection(
             and proof.get("task_id") == contract_execution_id
             and proof.get("commit_sha") == candidate["candidate_commit"]
             and proof.get("principal_id") == event.get("actor")
-            and line.get("stage_id") == "qa"
-            and line.get("line_id") == "qa_independent_verification"
-            and line.get("contract_execution_id") == contract_execution_id
+            and (main_instance is not None or (
+                line.get("stage_id") == "qa"
+                and line.get("line_id") == "qa_independent_verification"
+                and line.get("contract_execution_id") == contract_execution_id))
             and review.get("candidate_commit_sha") == candidate["candidate_commit"]
             and review.get("comparison_base_commit_sha") == comparison["base_commit"]
             and review.get("comparison_authority_required") is True
@@ -172704,6 +172734,10 @@ def _ac_promotion_successor_qa_projection(
             and re.fullmatch(r"sha256:[0-9a-f]{64}", str(branch.get("report_sha256") or ""))
             and lane_pass
             and replay_count == 1
+            and (main_instance is None or (
+                event.get("id") == main_instance.get("canonical_qa_event_id")
+                and all(isinstance(item, str) for item in [branch.get("test_id"), *(lane.get("test_id") for lane in lanes.values())])
+                and len({branch.get("test_id"), *(lane.get("test_id") for lane in lanes.values())}) == 4))
         ):
             valid.append({"event": event, "evidence": evidence, "authority": authority, "promotion_gate_results": results})
     if len(valid) != 1:
@@ -174464,20 +174498,34 @@ def _ac_promotion_rollback_route_guide_overlay(
 
 def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
     response = _onboard_route_guide_service_response_base(conn, **kwargs)
-    if (kwargs.get("project_id") != "aming-claw" or kwargs.get("backlog_id") != _AC_MAIN_BINDING_BACKLOG_ID
+    if (kwargs.get("project_id") != "aming-claw" or not kwargs.get("backlog_id")
             or _runtime_plane() != "dev"):
+        return response
+    # Select by the immutable current candidate before observing any release
+    # dependency. An unrelated backlog's Guide must not inherit this candidate's
+    # incomplete implementation, QA, stable-process or route state.
+    try:
+        raw = _ac_promotion_successor_git_bytes(Path(__file__).absolute().parents[2],
+            ["show", "-s", "--format=%(trailers:only,unfold=true)", "HEAD"]).decode()
+        owners = [line.partition(":")[2].strip() for line in raw.splitlines()
+                  if line.partition(":")[0] == "Chain-Backlog"]
+    except (GovernanceError, OSError, ValueError):
+        return response
+    if owners != [kwargs["backlog_id"]]:
         return response
     from contextlib import closing
     try:
         world = _operator_supervised_direct_main_dev_world_authority()
         instance = _ac_main_binding_release_instance(candidate=world["target_head_commit"])
+        if instance["backlog_id"] != kwargs["backlog_id"]:
+            return response
         intent = _ac_main_binding_intent(instance)
         intent_hash = stable_sha256(intent)
         candidate = {**instance, **instance["promotion_delta"]}
         with closing(_ac_main_binding_dev_connection(instance)) as qa_conn:
-            qa = _ac_promotion_successor_qa_projection(qa_conn, project_id="aming-claw", backlog_id=_AC_MAIN_BINDING_BACKLOG_ID, contract_execution_id=instance["contract_execution_id"], candidate=candidate, promotion_intent_sha256=intent_hash, main_instance=instance)
+            qa = _ac_promotion_successor_qa_projection(qa_conn, project_id="aming-claw", backlog_id=instance["backlog_id"], contract_execution_id=instance["contract_execution_id"], candidate=candidate, promotion_intent_sha256=intent_hash, main_instance=instance)
         projection = {"intent": intent, "promotion_intent_sha256": intent_hash, "prior_promotion": instance["prior_promotion"],
-                      "qa_projection": qa, "phase": instance["phase"], "writes_performed": False,
+                      "qa_projection": qa, "release_evidence_complete": instance["release_evidence_complete"], "writes_performed": False,
                       "activation_authorized": False, "preparation_only": True,
                       "qa_comparison": instance["implementation_delta"]}
         if qa.get("accepted") is True:
@@ -174486,9 +174534,9 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
             stable_db = Path(instance["stable_worktree"]) / db.AC_DATABASE_STABLE_RELATIVE_PATH
             with closing(sqlite3.connect(stable_db.as_uri() + "?mode=ro", uri=True)) as stable_conn:
                 stable_conn.row_factory = sqlite3.Row
-                signoff = _ac_promotion_successor_signoff_projection(stable_conn, project_id="aming-claw", backlog_id=_AC_MAIN_BINDING_BACKLOG_ID, contract_execution_id=instance["contract_execution_id"], candidate=candidate, qa=qa, intent=intent, promotion_intent_sha256=intent_hash, verifier_sha256=verifier_hash, prior_promotion=instance["prior_promotion"])
+                signoff = _ac_promotion_successor_signoff_projection(stable_conn, project_id="aming-claw", backlog_id=instance["backlog_id"], contract_execution_id=instance["contract_execution_id"], candidate=candidate, qa=qa, intent=intent, promotion_intent_sha256=intent_hash, verifier_sha256=verifier_hash, prior_promotion=instance["prior_promotion"])
             projection.update({"verifier_sha256": verifier_hash, "operator_signoff_projection": signoff})
-            if signoff.get("accepted") is True and instance["phase"] == "close_ready":
+            if signoff.get("accepted") is True and instance["release_evidence_complete"]:
                 projection["promotion_manifest"] = {**intent, "promotion_intent_sha256": intent_hash,
                     "promotion_manifest_sha256": signoff["manifest_hash"], "prior_promotion": instance["prior_promotion"],
                     "gates": {"qa_verdict": {"timeline_event_id": qa["timeline_event_id"], "status": "passed"},
@@ -196491,13 +196539,6 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         "zero_write_on_failure": True,
         "historical_backfill_allowed": False,
     }
-    if project_id == "aming-claw" and backlog_id == _AC_MAIN_BINDING_BACKLOG_ID and not commit_missing:
-        # The ordinary accepted implementation event is the durable carrier of
-        # this instance's observed preimage. It is not a historical promotion.
-        commit_authority["stable_main_binding_preimage"] = _ac_main_binding_preimage(
-            candidate=commit_sha, execution=task_id,
-            binding_hash=str(strict_binding.get("binding_hash") or ""),
-        )
     commit_authority["authority_hash"] = stable_sha256(commit_authority)
     alias_fields = []
     for container_name, container in (
@@ -210164,24 +210205,6 @@ def _ac_main_binding_instance_core(instance: Mapping[str, Any]) -> dict[str, Any
             if key not in {"phase", "route_token_ref", "stable_deploy_authorized", "writes_performed"}}
 
 
-def _ac_main_binding_preimage(*, candidate: str, execution: str, binding_hash: str) -> dict[str, Any]:
-    from . import db
-    binding = db.verified_stable_database_binding()
-    instance = binding.get("branch_binding_transition") or {}
-    world = _operator_supervised_direct_main_dev_world_authority()
-    if not (instance.get("candidate_commit") == candidate
-            and instance.get("contract_execution_id") == execution
-            and instance.get("direct_runtime_binding_hash") == binding_hash
-            and instance.get("phase") == "implementation"
-            and world.get("target_head_commit") == world.get("loaded_runtime_commit") == candidate):
-        raise ValidationError("main binding implementation lacks its exact live preimage")
-    body = {"instance": _ac_main_binding_instance_core(instance),
-            "stable_health": binding["health"],
-            "stable_database_identity": binding["stable_database_identity"],
-            "process_identity": binding["process_identity"]}
-    return {**body, "preimage_hash": stable_sha256(body)}
-
-
 def _ac_main_binding_dev_connection(instance: Mapping[str, Any]):
     """Open only the admitted physical dev database; never the caller's path."""
     from . import db
@@ -210205,124 +210228,272 @@ def _ac_main_binding_dev_connection(instance: Mapping[str, Any]):
 
 def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
                                      require_close_ready: bool = False, recovery: bool = False) -> dict[str, Any]:
-    """Project this admitted migration and its accepted implementation event.
+    """Join current deployment configuration to the candidate's source evidence.
 
-    Historical bootstrap and timeline-receipt instances never enter here. The
-    CEX, old branch, sole parent, route, file fence and both DB identities are
-    rederived before a manifest's predecessor claim is compared.
+    No particular backlog, original migration base, or live development phase
+    defines deployment identity. Ordinary Direct custody remains a separate
+    check against the candidate's own accepted record and immutable parent.
+    Recovery uses the approved anchor's source configuration; live preparation
+    additionally reads the real stable health, process and database binding.
     """
     from contextlib import closing
     from . import db
-    binding = {} if recovery else db.verified_stable_database_binding()
-    source_root = Path(__file__).resolve().parents[2]
-    raw = _ac_promotion_successor_git_bytes(source_root, ["worktree", "list", "--porcelain"]).decode()
-    dev_roots = []
-    worktrees = []
-    for block in raw.strip().split("\n\n"):
-        row = dict(line.split(" ", 1) if " " in line else (line, "") for line in block.splitlines())
-        worktrees.append(row)
-        if row.get("branch") == "refs/heads/codex/ac-dev":
-            dev_roots.append(Path(row["worktree"]).resolve(strict=True))
+    from .contracts import runtime as contract_runtime
+    from .contracts.schema import iter_stage_lines
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+
+    source_root = db._absolute_non_symlink_root(Path(__file__).absolute().parents[2], create=False)
+    def git(*args):
+        return _ac_promotion_successor_git_bytes(source_root, list(args))
+    worktrees = [dict(line.split(" ", 1) if " " in line else (line, "")
+                     for line in block.splitlines())
+                 for block in git("worktree", "list", "--porcelain").decode().strip().split("\n\n")]
+    dev_roots = [db._absolute_non_symlink_root(Path(row["worktree"]), create=False)
+                 for row in worktrees if row.get("branch") == "refs/heads/codex/ac-dev"]
     if len(dev_roots) != 1:
-        raise ValidationError("main binding dev worktree is ambiguous")
+        raise ValidationError("release dev worktree is ambiguous")
     dev_root = dev_roots[0]
     actual_candidate = _ac_promotion_successor_git_bytes(dev_root, ["rev-parse", "HEAD"]).decode().strip()
-    if recovery:
-        # Recovery has no healthy listener to consult. Source-owned Git refs
-        # select the sole worktree; the accepted event below proves its DB and
-        # preimage. This projection authorizes no normal promotion on its own.
-        base_cli = _ac_promotion_successor_git_bytes(dev_root, ["show", "HEAD^:agent/cli.py"]).decode()
-        branches = re.findall(r'^AC_STABLE_BRANCH = "([^"\n]+)"$', base_cli, re.M)
-        if len(branches) != 1 or branches[0] in {"main", "codex/ac-dev"}:
-            raise ValidationError("main binding recovery immutable branch is unavailable")
-        roots = [Path(row["worktree"]).resolve(strict=True) for row in worktrees
-                 if row.get("branch") in {"refs/heads/main", "refs/heads/" + branches[0]}]
-        if len(roots) != 1:
-            raise ValidationError("main binding recovery stable worktree is ambiguous")
-        stable_root = roots[0]
-        database = stable_root / db.AC_DATABASE_STABLE_RELATIVE_PATH
-        metadata = database.stat(follow_symlinks=False)
-        if database.is_symlink() or database.resolve(strict=True) != database:
-            raise ValidationError("main binding recovery stable DB path changed")
-        binding = {"shared_volume_path": str(stable_root / "shared-volume"),
-                   "stable_head": _ac_promotion_successor_git_bytes(dev_root, ["rev-parse", "refs/heads/main"]).decode().strip(),
-                   "stable_database_identity": {"schema_version": "ac_stable_database_identity.v1", "device": metadata.st_dev, "inode": metadata.st_ino,
-                        "stable_relative_path_sha256": "sha256:" + hashlib.sha256(db.AC_DATABASE_STABLE_RELATIVE_PATH.encode()).hexdigest()}}
-    stable_root = Path(binding["shared_volume_path"]).parent
-    postimage = binding["stable_head"] == actual_candidate
+    if candidate and candidate != actual_candidate:
+        raise ValidationError("release candidate differs from current dev source")
+    main_head = git("rev-parse", "refs/heads/main").decode().strip()
     if not anchor:
-        if postimage:
-            raise ValidationError("main binding postimage requires its explicit predecessor")
-        anchor = binding["stable_head"]
+        if main_head == actual_candidate:
+            raise ValidationError("release postimage requires its explicit predecessor")
+        anchor = main_head
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", anchor):
+        raise ValidationError("release anchor is malformed")
+    branches = re.findall(r'^AC_STABLE_BRANCH = "([^"\n]+)"$', git("show", f"{anchor}:agent/cli.py").decode(), re.M)
+    if len(branches) != 1:
+        raise ValidationError("release anchor branch configuration is ambiguous")
+    roots = [db._absolute_non_symlink_root(Path(row["worktree"]), create=False)
+             for row in worktrees if row.get("branch") in {"refs/heads/main", "refs/heads/" + branches[0]}]
+    if len(roots) != 1:
+        raise ValidationError("release stable worktree is ambiguous")
+    stable_root = roots[0]
+    postimage = main_head == actual_candidate
     instance = db._stable_main_transition_context(dev_root, stable_root, anchor, postimage=postimage)
-    if ((candidate and candidate != instance["candidate_commit"])
-            or binding["stable_head"] != (actual_candidate if postimage else anchor)
-            or (require_close_ready and instance["phase"] != "close_ready")):
-        raise ValidationError("main binding release candidate/phase mismatch")
+    database = stable_root / db.AC_DATABASE_STABLE_RELATIVE_PATH
+    metadata = database.stat(follow_symlinks=False)
+    if (database.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+            or database.resolve(strict=True) != database):
+        raise ValidationError("release stable DB path changed")
+    stable_identity = {"schema_version": "ac_stable_database_identity.v1",
+        "device": metadata.st_dev, "inode": metadata.st_ino,
+        "stable_relative_path_sha256": "sha256:" + hashlib.sha256(db.AC_DATABASE_STABLE_RELATIVE_PATH.encode()).hexdigest()}
+    if not recovery:
+        physical = db.verified_stable_database_binding()
+        if (Path(physical["shared_volume_path"]).parent != stable_root
+                or physical["stable_head"] != (actual_candidate if postimage else anchor)
+                or physical["stable_database_identity"] != stable_identity):
+            raise ValidationError("release live stable identity changed")
+
+    trailers = {}
+    for line in git("show", "-s", "--format=%(trailers:only,unfold=true)", actual_candidate).decode().splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            trailers.setdefault(key, []).append(value.strip())
+    execution_values = trailers.get("Chain-Source-Contract-Execution", [])
+    backlog_values = trailers.get("Chain-Backlog", [])
+    if len(execution_values) != 1 or len(backlog_values) != 1:
+        raise ValidationError("release candidate lacks ordinary Direct source custody")
+    execution, backlog = execution_values[0], backlog_values[0]
+    dev_database = db._absolute_non_symlink_root(resolve_ac_dev_storage_root(stable_root / "shared-volume"), create=False) / db.AC_DATABASE_DEV_RELATIVE_PATH
+    dev_stat = dev_database.stat(follow_symlinks=False)
+    instance["dev_database_identity"] = {"device": dev_stat.st_dev, "inode": dev_stat.st_ino}
     with closing(_ac_main_binding_dev_connection(instance)) as conn:
-        record = json.loads(conn.execute(
-            "SELECT record_json FROM contract_runtime_executions WHERE project_id=? AND contract_execution_id=?",
-            ("aming-claw", instance["contract_execution_id"]),
-        ).fetchone()[0])
-        completed = [line for line in record.get("completed_lines", [])
-                     if line.get("line_id") == "observer_implementation"
-                     and line.get("status") in {"pass", "passed"}
-                     and line.get("commit_sha") == actual_candidate]
-        rows = conn.execute(
-            "SELECT * FROM task_timeline_events WHERE project_id=? AND backlog_id=? AND task_id=? "
-            "AND event_type='observer.implementation' ORDER BY id",
-            ("aming-claw", _AC_MAIN_BINDING_BACKLOG_ID, instance["contract_execution_id"]),
-        ).fetchall()
-        if len(completed) != 1 or len(rows) != 1:
-            raise ValidationError("main binding needs its unique accepted implementation event")
-        event = _ac_promotion_row_to_event(rows[0])
+        rows = conn.execute("SELECT record_json FROM contract_runtime_executions WHERE project_id=? AND backlog_id=? AND contract_execution_id=? AND contract_id='operator_supervised_direct_main'",
+                            ("aming-claw", backlog, execution)).fetchall()
+        if len(rows) != 1:
+            raise ValidationError("release candidate requires its unique Direct source record")
+        record = json.loads(rows[0][0])
+        binding = (record.get("metadata") or {}).get("operator_supervised_direct_main_runtime_binding") or {}
+        world = binding.get("runtime_world_authority") or {}
+        identity = world.get("database_identity") or {}
+        base = str(binding.get("base_commit") or "")
+        expected_trailers = {"Chain-Source-Task": execution, "Chain-Source-Contract-Execution": execution,
+            "Chain-Source-Stage": "implementation", "Chain-Task": execution,
+            "Chain-Bug-Id": backlog, "Chain-Backlog": backlog,
+            "Chain-Route": "operator_supervised_direct_main", "Chain-Parent": base}
+        changed = git("diff", "--name-only", base, actual_candidate).decode().splitlines()
+        if not (all(trailers.get(k) == [v] for k, v in expected_trailers.items())
+                and git("rev-list", "--parents", "-n", "1", actual_candidate).decode().split() == [actual_candidate, base]
+                and all(record.get(k) == v and binding.get(k) == v for k, v in {
+                    "project_id": "aming-claw", "backlog_id": backlog, "contract_execution_id": execution}.items())
+                and record.get("contract_id") == "operator_supervised_direct_main"
+                and record.get("version") == "v1" and record.get("revision") == "rev3"
+                and binding.get("server_derived") is True and binding.get("caller_claims_trusted") is False
+                and binding.get("strict_runtime_binding_required") is True
+                and binding.get("binding_hash") == stable_sha256({k: v for k, v in binding.items() if k != "binding_hash"})
+                and binding.get("target_project_root") == binding.get("worktree_path") == str(dev_root)
+                and changed and set(changed) <= set(binding.get("owned_files") or []) <= set(binding.get("target_files") or [])
+                and world.get("accepted") is True and world.get("server_derived") is True
+                and world.get("caller_claims_trusted") is False and world.get("runtime_stale") is False
+                and world.get("runtime_plane") == "dev" and world.get("runtime_port") == 40008
+                and world.get("branch") == "codex/ac-dev" and world.get("bind_host") == "127.0.0.1"
+                and world.get("world_id") == identity.get("world_id") == "ac-dev"
+                and identity.get("project_id") == "aming-claw"
+                and (identity.get("device"), identity.get("inode")) == (dev_stat.st_dev, dev_stat.st_ino)
+                and world.get("target_head_commit") == world.get("loaded_runtime_commit") == base):
+            raise ValidationError("release ordinary Direct source identity mismatch")
+        definition_path = "agent/governance/contract_definitions/operator_supervised_direct_main.v1.rev3.json"
+        definition_bytes = git("show", f"{base}:{definition_path}")
+        if ("sha256:" + hashlib.sha256(definition_bytes).hexdigest() != record.get("definition_raw_source_sha256")
+                or (dev_root / definition_path).read_bytes() != definition_bytes):
+            raise ValidationError("release source Rule changed")
+        source_lines = {line["line_id"]: {**line, "stage_id": owner["stage_id"]}
+                        for owner, line in iter_stage_lines(json.loads(definition_bytes))}
+        lines = record.get("completed_lines") or []
+        by_id = {line.get("line_id"): line for line in lines}
+        for line in lines:
+            source = source_lines.get(line.get("line_id")) or {}
+            if not (source and line.get("stage_id") == source["stage_id"]
+                    and line.get("evidence_kind") == source["evidence_kind"]
+                    and line.get("actor_role") in source["allowed_writer_roles"]
+                    and contract_runtime._line_shape_allows_contract_completion(line)
+                    and contract_runtime._line_status_allows_contract_completion(line, source_record=record)
+                    and str(line.get("status") or "").lower() not in {"failed", "no-pass", "no_pass", "waived", "rejected"}):
+                raise ValidationError("release canonical source line is not completed")
+        required = {"observer_bind_direct_scope", "observer_graph_context", "observer_direct_implementation_exception", "observer_implementation"}
+        if require_close_ready:
+            required |= {"qa_graph_context", "qa_independent_verification", "observer_reconcile"}
+        if len(by_id) != len(lines) or not required <= set(by_id):
+            raise ValidationError("release canonical source/reconcile evidence is incomplete")
+        pre = by_id["observer_direct_implementation_exception"].get("payload") or {}
+        if not (pre.get("server_admitted_single_pre_mutation") is True
+                and pre.get("direct_runtime_binding_hash") == binding["binding_hash"]
+                and (by_id["observer_bind_direct_scope"].get("payload") or {}).get("direct_runtime_binding") == binding
+                and by_id["observer_graph_context"].get("db_verified") is True
+                and all((pre.get("event") or {}).get(k) == v for k, v in {
+                    "event_type": "mf.observer_direct_implementation_exception", "event_kind": "observer_direct_implementation_exception",
+                    "phase": "pre_mutation", "status": "accepted", "decision": "operator_supervised_direct_main_approved"}.items())):
+            raise ValidationError("release source admission evidence mismatch")
+        events = conn.execute("SELECT * FROM task_timeline_events WHERE project_id=? AND backlog_id=? AND task_id=? AND event_type=? ORDER BY id",
+                              ("aming-claw", backlog, execution, _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE)).fetchall()
+        if len(events) != 1:
+            raise ValidationError("release needs its unique accepted implementation event")
+        event = _ac_promotion_row_to_event(events[0])
         authority = (event.get("payload") or {}).get("direct_main_implementation_commit_prewrite_authority") or {}
-        preimage = authority.get("stable_main_binding_preimage") or {}
-        captured = preimage.get("instance") or {}
-        if not (
-            event.get("commit_sha") == actual_candidate and event.get("status") in {"pass", "passed"}
-            and authority.get("server_derived") is True and authority.get("passed") is True
-            and authority.get("commit_sha") == authority.get("canonical_head_commit") == actual_candidate
-            and authority.get("task_id") == instance["contract_execution_id"]
-            and authority.get("runtime_binding_hash") == instance["direct_runtime_binding_hash"]
-            and authority.get("authority_hash") == stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})
-            and preimage.get("preimage_hash") == stable_sha256({k: v for k, v in preimage.items() if k != "preimage_hash"})
-            and captured == _ac_main_binding_instance_core(instance)
-            and preimage.get("stable_database_identity") == binding["stable_database_identity"]
+        if not _operator_supervised_direct_main_persisted_active_route_authority_valid(
+            authority.get("active_route_authority") or {}, project_id="aming-claw",
+            backlog_id=backlog, task_id=execution, immutable_route_identity=binding.get("route_identity") or {},
+            active_route_token_ref=str(authority.get("route_token_ref") or ""),
+            expected_files=binding.get("owned_files") or [],
         ):
-            raise ValidationError("main binding accepted implementation/preimage mismatch")
-    old_health = preimage["stable_health"]
-    old_identity = old_health.get("runtime_plane_identity") or {}
-    old_source_hash = "sha256:" + hashlib.sha256(_ac_promotion_successor_git_bytes(dev_root, ["show", f"{anchor}:agent/governance/server.py"])).hexdigest()
-    if not (old_health.get("runtime_loaded_version") == anchor
-            and old_health.get("runtime_stale") is False
-            and old_identity.get("status") == "ready"
-            and old_identity.get("branch") == instance["stable_branch_preimage"]
-            and old_identity.get("world_id") == "ac-stable"
-            and old_identity.get("worktree_root") == str(stable_root)
-            and old_identity.get("worktree_dirty") is False
-            and (old_health.get("loaded_runtime_identity") or {}).get("loaded_source_sha256") == old_source_hash
-            and preimage["process_identity"].get("pid") == old_health.get("pid")
-            and Path(preimage["process_identity"].get("cwd", "")).resolve() == stable_root):
-        raise ValidationError("main binding captured preimage is not exact stable source/process authority")
+            raise ValidationError("release accepted source route authority mismatch")
+        completed = by_id["observer_implementation"]
+        payload = completed.get("payload") or {}
+        if not (event.get("commit_sha") == actual_candidate and event.get("status") in {"pass", "passed"}
+                and event.get("phase") == event.get("event_kind") == "implementation"
+                and (completed.get("commit_sha") or payload.get("commit_sha")) == actual_candidate
+                and payload.get("direct_runtime_binding_hash") == binding["binding_hash"]
+                and (payload.get("event") or {}).get("status", completed.get("status")) in {"pass", "passed"}
+                and authority.get("server_derived") is True and authority.get("passed") is True
+                and authority.get("commit_sha") == authority.get("canonical_head_commit") == actual_candidate
+                and authority.get("task_id") == execution and authority.get("runtime_binding_hash") == binding["binding_hash"]
+                and authority.get("authority_hash") == stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})
+                and (payload.get("event") or {}).get("actor", event.get("actor")) == event.get("actor")):
+            raise ValidationError("release accepted implementation identity mismatch")
+        qa_event_id = None
+        qa_line = by_id.get("qa_independent_verification")
+        if qa_line is not None:
+            qa_payload = qa_line.get("payload") or {}
+            qa_authority = qa_payload.get("qa_authority") or {}
+            proof = qa_authority.get("qa_session_proof") or {}
+            graph_line = by_id.get("qa_graph_context") or {}
+            matching = []
+            for row in conn.execute("SELECT * FROM task_timeline_events WHERE project_id=? AND backlog_id=? AND task_id=? AND event_type='qa.independent_verification'", ("aming-claw", backlog, execution)):
+                accepted = _ac_promotion_row_to_event(row)
+                accepted_authority = (accepted.get("payload") or {}).get("source_backed_contract_gate_authority") or {}
+                canonical_authority = _contract_runtime_strip_authority_claims(
+                    accepted_authority, field_names=_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS)
+                if (canonical_authority == qa_authority
+                        and accepted.get("commit_sha") == actual_candidate
+                        and accepted.get("status") in {"pass", "passed"}
+                        and accepted.get("phase") == "qa"
+                        and accepted.get("event_kind") == "independent_verification"
+                        and accepted.get("actor") == proof.get("principal_id")):
+                    matching.append(accepted)
+            if not (len(matching) == 1
+                    and _contract_runtime_authenticated_qa_provenance(qa_line)
+                    and qa_line.get("commit_sha") == actual_candidate
+                    and qa_line.get("status") in {"pass", "passed"}
+                    and qa_payload.get("direct_runtime_binding_hash") == binding["binding_hash"]
+                    and qa_line.get("evidence_owner_actor") == proof.get("principal_id")
+                    and qa_line.get("evidence_owner_session") == proof.get("qa_session_id")
+                    and qa_payload.get("timeline_payload", {}).get("source_backed_contract_gate_authority") == qa_authority
+                    and graph_line.get("db_verified") is True
+                    and (graph_line.get("payload") or {}).get("qa_authority") == qa_authority
+                    and (graph_line.get("payload") or {}).get("direct_runtime_binding_hash") == binding["binding_hash"]
+                    and graph_line.get("graph_trace_ids") == proof.get("graph_trace_ids")):
+                raise ValidationError("release canonical QA line differs from its unique accepted event")
+            qa_event_id = int(matching[0]["id"])
+        reconcile_line = by_id.get("observer_reconcile")
+        if reconcile_line is not None:
+            reconcile_payload = reconcile_line.get("payload") or {}
+            timeline_payload = reconcile_payload.get("timeline_payload") or {}
+            matching = []
+            for row in conn.execute("SELECT * FROM task_timeline_events WHERE project_id=? AND backlog_id=? AND task_id=? AND phase='reconcile' AND event_kind IN ('reconcile','current_full_reconcile') AND commit_sha=? AND status IN ('pass','passed')", ("aming-claw", backlog, execution, actual_candidate)):
+                accepted = _ac_promotion_row_to_event(row)
+                if (timeline_payload and all((accepted.get("payload") or {}).get(k) == v for k, v in timeline_payload.items())
+                        and (timeline_payload.get("event") or {}).get("actor") == accepted.get("actor")):
+                    matching.append(accepted)
+            if not (len(matching) == 1 and reconcile_line.get("commit_sha") == actual_candidate
+                    and reconcile_payload.get("direct_runtime_binding_hash") == binding["binding_hash"]):
+                raise ValidationError("release canonical reconcile differs from its unique accepted event")
+    instance.update({"backlog_id": backlog, "contract_execution_id": execution, "base_commit": base,
+        "direct_runtime_binding_hash": binding["binding_hash"], "dev_database_identity": identity})
+    preimage = {"instance": _ac_main_binding_instance_core(instance), "stable_database_identity": stable_identity}
+    preimage["preimage_hash"] = stable_sha256(preimage)
+    source_custody = {"kind": "current_instance", "implementation_event_id": int(event["id"]),
+                      "implementation_event_hash": _ac_promotion_event_hash(event), "preimage": preimage}
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as stable_conn:
+        stable_conn.row_factory = sqlite3.Row
+        predecessors = [item for item in _ac_promotion_completion_events(stable_conn, "aming-claw")
+                        if item.get("commit_sha") == anchor]
+    if predecessors:
+        if len(predecessors) != 1:
+            raise ValidationError("release predecessor receipt is ambiguous")
+        previous = predecessors[0]
+        receipt = previous.get("payload") or {}
+        receipt_hash = receipt.get("promotion_receipt_hash")
+        if not (previous.get("status") == "accepted" and previous.get("phase") == "release"
+                and previous.get("event_kind") == "stable_promotion"
+                and receipt.get("promoted_commit") == anchor
+                and receipt.get("stable_database_identity") == stable_identity
+                and receipt.get("schema_version") in {"ac_stable_promotion_completion_receipt.v1", "ac_stable_promotion_completion_receipt.v2"}
+                and receipt_hash == stable_sha256({k: v for k, v in receipt.items() if k != "promotion_receipt_hash"})):
+            raise ValidationError("release predecessor receipt identity/hash mismatch")
+        prior = {"kind": "timeline_receipt", "timeline_event_id": int(previous["id"]), "receipt_hash": receipt_hash}
+    elif branches[0] == "main" or anchor == AC_STABLE_ANCHOR_COMMIT:
+        raise ValidationError("ordinary main successor requires its existing predecessor receipt")
+    else:
+        prior = source_custody
     def delta(base):
-        patch = _ac_promotion_successor_git_bytes(dev_root, ["diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "-M", f"{base}..{actual_candidate}", "--", "."])
-        files = _ac_promotion_successor_git_bytes(dev_root, ["diff", "--name-only", base, actual_candidate]).decode().splitlines()
+        patch = git("diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "-M", f"{base}..{actual_candidate}", "--", ".")
+        files = git("diff", "--name-only", base, actual_candidate).decode().splitlines()
         return {"base_commit": base, "candidate_commit": actual_candidate,
                 "file_fence": files, "diff_sha256": "sha256:" + hashlib.sha256(patch).hexdigest()}
     return {**instance, "postimage": postimage,
-            "implementation_delta": delta(instance["base_commit"]), "promotion_delta": delta(anchor),
-            "stable_database_identity": binding["stable_database_identity"],
-            "candidate_tree_sha": _ac_promotion_successor_git_bytes(dev_root, ["rev-parse", "HEAD^{tree}"]).decode().strip(),
-            "stable_runtime_source_sha256": old_source_hash,
-            "candidate_runtime_source_sha256": "sha256:" + hashlib.sha256(_ac_promotion_successor_git_bytes(dev_root, ["show", f"{actual_candidate}:agent/governance/server.py"])).hexdigest(),
-            "prior_promotion": {"kind": "current_instance", "implementation_event_id": int(event["id"]),
-                                "implementation_event_hash": _ac_promotion_event_hash(event), "preimage": preimage}}
+        "canonical_qa_event_id": qa_event_id,
+        "source_custody": source_custody,
+        "release_evidence_complete": {"qa_graph_context", "qa_independent_verification", "observer_reconcile"} <= set(by_id),
+        "implementation_delta": delta(base), "promotion_delta": delta(anchor), "stable_database_identity": stable_identity,
+        "candidate_tree_sha": git("rev-parse", f"{actual_candidate}^{{tree}}").decode().strip(),
+        "stable_runtime_source_sha256": "sha256:" + hashlib.sha256(git("show", f"{anchor}:agent/governance/server.py")).hexdigest(),
+        "candidate_runtime_source_sha256": "sha256:" + hashlib.sha256(git("show", f"{actual_candidate}:agent/governance/server.py")).hexdigest(),
+        "prior_promotion": prior}
+
+
+def _ac_current_main_manifest(manifest: Any) -> bool:
+    return bool(isinstance(manifest, Mapping)
+                and manifest.get("schema_version") == "ac_stable_promotion_manifest.v1"
+                and manifest.get("stable_branch") == "main")
 
 
 def _ac_main_binding_intent(instance: Mapping[str, Any]) -> dict[str, Any]:
     return {"schema_version": "ac_stable_promotion_manifest.v1", "project_id": "aming-claw",
-            "backlog_id": _AC_MAIN_BINDING_BACKLOG_ID, "contract_execution_id": instance["contract_execution_id"],
+            "backlog_id": instance["backlog_id"], "contract_execution_id": instance["contract_execution_id"],
             "stable_anchor_commit": instance["stable_anchor_commit"], "stable_branch": "main", "branch": "codex/ac-dev",
             "candidate_commit": instance["candidate_commit"], "file_fence": instance["promotion_delta"]["file_fence"],
             "diff_sha256": instance["promotion_delta"]["diff_sha256"], "stable_database_identity": instance["stable_database_identity"],
@@ -210336,7 +210507,7 @@ def _ac_main_binding_activation_evidence(instance: Mapping[str, Any], manifest: 
     return {**dict(manifest), **{key: instance[key] for key in (
                 "candidate_tree_sha", "stable_runtime_source_sha256", "candidate_runtime_source_sha256", "implementation_delta", "promotion_delta")},
             "qa_candidate_intent_sha256": manifest["promotion_intent_sha256"],
-            "custody_authority": instance["prior_promotion"],
+            "custody_authority": instance["source_custody"],
             "activation_policy": {"schema_version": "ac_stable_activation_policy.v2", "prepare_required": True,
                 "activation_plan_required": True, "automatic_activation": False, "rollback_required_after_first_mutation": True}}
 
@@ -210364,7 +210535,7 @@ def _validate_ac_stable_promotion_durable_evidence(conn, **kwargs) -> None:
     from contextlib import closing
     manifest = kwargs["body"].get("promotion_manifest")
     prior = manifest.get("prior_promotion") if isinstance(manifest, Mapping) else None
-    if not isinstance(prior, Mapping) or prior.get("kind") != "current_instance":
+    if not _ac_current_main_manifest(manifest):
         return _validate_ac_stable_promotion_durable_evidence_core(conn, **kwargs)
     instance = _ac_main_binding_release_instance(candidate=kwargs["candidate"], anchor=kwargs["previous_stable"], require_close_ready=True)
     if manifest.get("prior_promotion") != instance["prior_promotion"]:
@@ -210398,17 +210569,20 @@ def _ac_main_binding_precheck(manifest: Mapping[str, Any]) -> dict[str, Any]:
                     "promotion_manifest_sha256": manifest.get("promotion_manifest_sha256"),
                     "stable_anchor_commit": instance["stable_anchor_commit"], "candidate_commit": instance["candidate_commit"],
                     "diff_sha256": intent["diff_sha256"], "stable_database_identity": instance["stable_database_identity"],
-                    "previous_promotion_receipt_hash": None, "prior_promotion_event_id": None,
+                    "previous_promotion_receipt_hash": instance["prior_promotion"].get("receipt_hash"),
+                    "prior_promotion_event_id": instance["prior_promotion"].get("timeline_event_id"),
                     "gate_event_ids": {"qa_verdict": qa_id, "operator_signoff": signoff_id},
                     "operator_approval_ref": f"release-operator-head-queue-event:{signoff_id}",
                     "gate_evidence_hashes": {"qa_verdict": _ac_promotion_event_hash(qa), "operator_signoff": stable_sha256({key: signoff.get(key) for key in ("id", "project_id", "action", "backlog_id", "actor", "reason", "before_json", "after_json", "created_at")})},
                     "pass_synthesized": False, "writes_performed": False}
         precheck["receipt_hash"] = stable_sha256(precheck)
         body = {"promotion_manifest": dict(manifest), "precheck_receipt": precheck, "precheck_receipt_hash": precheck["receipt_hash"], "promotion_manifest_sha256": manifest.get("promotion_manifest_sha256")}
-        _validate_ac_stable_promotion_durable_evidence_core(conn, body=body, project_id="aming-claw", backlog_id=_AC_MAIN_BINDING_BACKLOG_ID, contract_execution_id=instance["contract_execution_id"], candidate=instance["candidate_commit"], previous_stable=instance["stable_anchor_commit"], file_fence=intent["file_fence"], diff_sha256=intent["diff_sha256"], verifier_sha256=verifier, promotion_intent_sha256=precheck["promotion_intent_sha256"], deploy=intent["deploy"], stable_database_identity=instance["stable_database_identity"], operator_approval_ref=precheck["operator_approval_ref"], qa_conn=qa_conn, main_instance=instance)
+        _validate_ac_stable_promotion_durable_evidence_core(conn, body=body, project_id="aming-claw", backlog_id=instance["backlog_id"], contract_execution_id=instance["contract_execution_id"], candidate=instance["candidate_commit"], previous_stable=instance["stable_anchor_commit"], file_fence=intent["file_fence"], diff_sha256=intent["diff_sha256"], verifier_sha256=verifier, promotion_intent_sha256=precheck["promotion_intent_sha256"], deploy=intent["deploy"], stable_database_identity=instance["stable_database_identity"], operator_approval_ref=precheck["operator_approval_ref"], qa_conn=qa_conn, main_instance=instance)
         for event in _ac_promotion_completion_events(conn, "aming-claw"):
             payload = event.get("payload") or {}
-            if event.get("commit_sha") in {instance["stable_anchor_commit"], instance["candidate_commit"]} or payload.get("previous_stable_commit") == instance["stable_anchor_commit"]:
+            if (event.get("commit_sha") == instance["candidate_commit"]
+                    or (event.get("commit_sha") == instance["stable_anchor_commit"] and event.get("id") != precheck["prior_promotion_event_id"])
+                    or payload.get("previous_stable_commit") == instance["stable_anchor_commit"]):
                 raise ValidationError("current instance conflicts with an existing promotion receipt chain")
     return precheck
 
@@ -210630,6 +210804,8 @@ def _validate_ac_stable_promotion_durable_evidence_core(
         or qa_event.get("task_id") != contract_execution_id
     ):
         raise ValidationError("durable QA verdict is missing", fail_details)
+    if main_instance is not None and qa_event_id != main_instance.get("canonical_qa_event_id"):
+        raise ValidationError("durable QA verdict differs from the canonical source line", fail_details)
     if (
         qa_event.get("event_type") != "qa.independent_verification"
         or qa_event.get("event_kind") != "independent_verification"
@@ -210663,7 +210839,7 @@ def _validate_ac_stable_promotion_durable_evidence_core(
     ):
         raise ValidationError("durable QA authority scope mismatch", fail_details)
     canonical_line = _ac_promotion_first_mapping(qa_evidence, "contract_runtime_canonical_line")
-    if not (
+    if main_instance is None and not (
         canonical_line.get("stage_id") == "qa"
         and canonical_line.get("line_id") == "qa_independent_verification"
         and canonical_line.get("contract_execution_id") == contract_execution_id
@@ -210714,6 +210890,10 @@ def _validate_ac_stable_promotion_durable_evidence_core(
             and re.fullmatch(r"sha256:[0-9a-f]{64}", str(lane.get("report_sha256") or ""))
         ):
             raise ValidationError("durable QA lane subresult is incomplete", fail_details)
+    if main_instance is not None:
+        result_ids = [branch_result.get("test_id"), *(lane.get("test_id") for lane in lanes.values())]
+        if not all(isinstance(item, str) for item in result_ids) or len(set(result_ids)) != 4:
+            raise ValidationError("durable QA promotion subresults must identify four distinct results", fail_details)
     authority_hash = str(authority.get("authority_hash") or "")
     authority_rows = qa_conn.execute(
         """SELECT * FROM task_timeline_events
@@ -210826,7 +211006,7 @@ def _validate_ac_stable_promotion_durable_evidence_core(
         raise ValidationError("durable operator signoff hash mismatch", fail_details)
 
     prior = manifest.get("prior_promotion")
-    if main_instance is not None:
+    if main_instance is not None and isinstance(prior, Mapping) and prior.get("kind") == "current_instance":
         if (prior != main_instance["prior_promotion"] or precheck.get("previous_promotion_receipt_hash") is not None or precheck.get("prior_promotion_event_id") is not None):
             raise ValidationError("current instance predecessor projection mismatch", fail_details)
         return
@@ -211275,7 +211455,7 @@ def _ac_promotion_request_previous_receipt(
             set(prior) == {"kind", "implementation_event_id", "implementation_event_hash", "preimage"}
             and isinstance(instance, Mapping)
             and manifest.get("schema_version") == "ac_stable_promotion_manifest.v1"
-            and manifest.get("backlog_id") == instance.get("backlog_id") == _AC_MAIN_BINDING_BACKLOG_ID
+            and manifest.get("backlog_id") == instance.get("backlog_id") and bool(instance.get("backlog_id"))
             and manifest.get("contract_execution_id") == instance.get("contract_execution_id")
             and manifest.get("candidate_commit") == instance.get("candidate_commit")
             and previous_stable == instance.get("stable_anchor_commit") != AC_STABLE_ANCHOR_COMMIT
@@ -211336,6 +211516,31 @@ def _ac_promotion_request_previous_receipt(
     return body_previous
 
 
+def _ac_stable_release_control_connection(database_identity: Mapping[str, Any]):
+    """Open the existing physical stable control DB without project creation/DDL."""
+    from . import db
+    if _runtime_plane() != "stable":
+        raise ValidationError("stable release control requires the stable plane")
+    stable_root = db._absolute_non_symlink_root(Path(__file__).absolute().parents[2], create=False)
+    database = stable_root / db.AC_DATABASE_STABLE_RELATIVE_PATH
+    before = database.stat(follow_symlinks=False)
+    if (database.is_symlink() or not stat.S_ISREG(before.st_mode)
+            or database.resolve(strict=True) != database
+            or canonical_ac_database_identity() != database_identity):
+        raise ValidationError("release control canonical stable database is invalid")
+    conn = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        after = database.stat(follow_symlinks=False)
+        if (database.is_symlink() or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or canonical_ac_database_identity(conn) != database_identity):
+            raise ValidationError("release control stable database changed during open")
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
 @route("POST", "/api/projects/{project_id}/ac-stable-promotion/complete")
 def handle_ac_stable_promotion_complete(ctx: RequestContext):
     """Persist the chained receipt only from the exact deployed stable runtime."""
@@ -211367,7 +211572,7 @@ def handle_ac_stable_promotion_complete(ctx: RequestContext):
         else {}
     )
     prior_body = manifest_body.get("prior_promotion")
-    current_main = isinstance(prior_body, Mapping) and prior_body.get("kind") == "current_instance"
+    current_main = _ac_current_main_manifest(manifest_body)
     completion_v2 = bool(
         body.get("schema_version") == "ac_stable_promotion_completion.v2"
         and manifest_body.get("schema_version")
@@ -211724,9 +211929,11 @@ def handle_ac_stable_promotion_complete(ctx: RequestContext):
 
     from . import task_timeline
 
-    conn = get_connection(project_id)
+    conn = _ac_stable_release_control_connection(database_identity) if current_main else get_connection(project_id)
     try:
         session = ctx.require_auth(conn)
+        if current_main and session.get("project_id") != project_id:
+            raise PermissionDeniedError(str(session.get("role") or "unknown"), "ac_stable_promotion_complete")
         if str(session.get("role") or "").lower() not in {
             "coordinator",
             "operator",
@@ -224759,7 +224966,21 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
             409,
             capability,
         )
-    with DBContext(project_id) as conn:
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    signoff = _ac_stable_promotion_signoff_body(body)
+    stable_signoff = (_runtime_plane() == "stable" and project_id == AC_PROJECT_ID
+                      and ctx.method == "POST" and bool(ctx.token) and bool(signoff))
+    if stable_signoff:
+        from contextlib import closing
+        from . import db
+        physical = db.verified_stable_database_binding()
+        if (signoff.get("stable_database_identity") != physical["stable_database_identity"]
+                or signoff.get("stable_anchor_commit") != physical["stable_head"]):
+            raise ValidationError("operator signoff stable preimage differs from the live binding")
+        connection_context = closing(_ac_stable_release_control_connection(physical["stable_database_identity"]))
+    else:
+        connection_context = DBContext(project_id)
+    with connection_context as conn:
         if ctx.method == "GET":
             return {
                 "ok": True,
@@ -224855,6 +225076,10 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
             actor = str(
                 session.get("principal_id") or session.get("role") or "operator"
             )
+            if stable_signoff and (session.get("project_id") != project_id
+                    or actor != signoff.get("operator_principal_id")
+                    or not _ac_promotion_operator_principal_valid(actor)):
+                raise PermissionDeniedError(str(session.get("role") or "unknown"), "ac_stable_promotion_signoff")
 
         # Serialize the bounded read/validate/write sequence across governance
         # processes so position shifts and exact-membership reorder stay atomic.
@@ -224990,8 +225215,10 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                 str(item.get("backlog_id") or "")
                 for item in before_view.get("items") or []
             ]
+            if stable_signoff and requested != existing_ids:
+                raise ValidationError("promotion signoff must preserve the exact release queue order")
             try:
-                ordered = release_operator_head_queue_order(
+                ordered = list(existing_ids) if stable_signoff else release_operator_head_queue_order(
                     requested,
                     existing_backlog_ids=existing_ids,
                 )

@@ -138,7 +138,7 @@ def validate_plan(plan, raw, script_path):
     if plan.get("project_id") != "aming-claw" or plan.get("stable_port") != 40000 or plan.get("bind_host") != "127.0.0.1":
         fail("activation_plan_scope_invalid", "activation plan is not exact AC stable scope")
     manifest = plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {}
-    current_main = (manifest.get("prior_promotion") or {}).get("kind") == "current_instance"
+    current_main = manifest.get("schema_version") == "ac_stable_promotion_manifest.v1" and manifest.get("stable_branch") == "main"
     instance = {}
     if current_main:
         from agent.governance import server
@@ -225,9 +225,12 @@ def validate_plan(plan, raw, script_path):
         expected_old_launch = [python_bin, "-m", "agent.cli", "start", "--workspace", plan.get("stable_worktree"),
             "--runtime-plane", "stable", "--port", "40000", "--shared-volume-path", str(Path(plan["stable_worktree"]) / "shared-volume"),
             "--stable-anchor-commit", plan["stable_anchor_commit"]]
-        captured_process = instance["prior_promotion"]["preimage"]["process_identity"]
-        if plan.get("old_process") != {key: captured_process[key] for key in ("pid", "birth", "command")}:
-            fail("activation_plan_process_invalid", "main plan old process differs from accepted authority")
+    old_launch_choices = [expected_old_launch]
+    if current_main:
+        old_launch_choices.append([python_bin, "-m", "agent.cli", "start", "--runtime-plane", "stable",
+            "--port", "40000", "--stable-anchor-commit", plan["stable_anchor_commit"],
+            "--workspace", plan["stable_worktree"], "--shared-volume-path", str(Path(plan["stable_worktree"]) / "shared-volume")])
+        expected_old_launch = plan.get("old_launch_spec") or []
     expected_environment = {
         "PYTHONPATH": plan.get("stable_worktree"),
         "SHARED_VOLUME_PATH": str(Path(plan.get("stable_worktree")) / "shared-volume"),
@@ -243,6 +246,7 @@ def validate_plan(plan, raw, script_path):
         Path(python_bin).is_absolute()
         and plan.get("candidate_launch_spec") == expected_candidate_launch
         and plan.get("old_launch_spec") == expected_old_launch
+        and expected_old_launch in old_launch_choices
         and plan.get("candidate_launch_environment") == expected_environment
         and plan.get("old_launch_environment") == expected_environment
         and Path(runtime_process_executable).is_absolute()
@@ -554,9 +558,9 @@ class RealOps:
 class ActivationMachine:
     def __init__(self, plan, patch, ops, journal, token, script_path=""):
         self.plan = plan
-        prior = (plan.get("manifest") or {}).get("prior_promotion") or {}
-        self.main_binding = prior.get("kind") == "current_instance"
-        self.preimage_branch = (prior["preimage"]["instance"]["stable_branch_preimage"]
+        manifest = plan.get("manifest") or {}
+        self.main_binding = manifest.get("schema_version") == "ac_stable_promotion_manifest.v1" and manifest.get("stable_branch") == "main"
+        self.preimage_branch = (plan["custody_authority"]["preimage"]["instance"]["stable_branch_preimage"]
                                 if self.main_binding else plan["stable_branch"])
         self.patch = patch
         self.ops = ops
@@ -675,7 +679,7 @@ class ActivationMachine:
                 line.split(" ", 1) if " " in line else (line, "")
                 for line in block.splitlines()
             )
-            if self.main_binding and values.get("branch") == "refs/heads/main":
+            if self.main_binding and self.preimage_branch != "main" and values.get("branch") == "refs/heads/main":
                 fail("activation_main_worktree_ambiguous", "main was attached before the exact transition")
             if values.get("branch") == expected_branch:
                 matches.append(values.get("worktree", ""))
@@ -1295,20 +1299,15 @@ class ActivationMachine:
             self.ops.stop(self.plan["old_process"], self.plan["stable_port"], "activation_old_stop_failed")
             self.journal.append("OLD_STOPPED")
             self.validate_non_process_after_stop()
-            if self.main_binding:
-                stable = self.plan["stable_worktree"]
-                self.ops.run(["git", "switch", "main"], stable, "activation_main_select_failed")
-                self.journal.append("MAIN_BRANCH_SELECTED")
+            if self.preimage_branch != self.plan["stable_branch"]:
+                self.ops.run(["git", "switch", self.plan["stable_branch"]], self.plan["stable_worktree"], "activation_branch_select_failed")
+                self.journal.append("BRANCH_SELECTED")
                 self.exact_main_preimage_refs()
-                self.ops.run(["git", "apply", "--index", "-"], stable, "activation_main_patch_failed", input_bytes=self.patch)
-                self.journal.append("MAIN_PATCH_APPLIED")
-                self.ops.run(["git", "update-ref", "refs/heads/main", self.plan["candidate_commit"], self.plan["stable_anchor_commit"]], stable, "activation_main_ref_cas_failed")
-            else:
-                self.ops.run(
-                    ["git", "merge", "--ff-only", self.plan["candidate_commit"]],
-                    self.plan["stable_worktree"],
-                    "activation_ff_failed",
-                )
+            self.ops.run(
+                ["git", "merge", "--ff-only", self.plan["candidate_commit"]],
+                self.plan["stable_worktree"],
+                "activation_ff_failed",
+            )
             self.journal.append("SOURCE_ADVANCED", {"candidate_commit": self.plan["candidate_commit"]})
             self.candidate_pid = self.ops.start(
                 self.plan["candidate_launch_spec"],
@@ -1521,13 +1520,13 @@ print("true" if value is True else "false" if value is False else value)
 PY
 }
 
-# Historical plans keep their exact generation. The migration preimage is
-# selected only by the admitted current instance, never a manifest branch claim.
+# Historical plans keep their exact generation. Current release configuration
+# comes from immutable anchor/candidate source, with ordinary source/QA authority.
 MANIFEST_SCHEMA="$(manifest_value schema_version)"
 MAIN_BINDING_INSTANCE=""
 if [ "$MANIFEST_SCHEMA" = "ac_stable_promotion_manifest.v2" ]; then
     STABLE_BRANCH="codex/direct-no-pass-post-reconcile-r2"
-elif [ "$(manifest_optional_value prior_promotion.kind)" = "current_instance" ]; then
+elif [ "$MANIFEST_SCHEMA" = "ac_stable_promotion_manifest.v1" ] && [ "$(manifest_optional_value stable_branch)" = "main" ]; then
     MAIN_BINDING_INSTANCE="$(python3 - "$MANIFEST" <<'PY_MAIN'
 import json, sys
 from agent.governance import server
@@ -1683,7 +1682,7 @@ from pathlib import Path
 manifest_path, db_raw, stable, candidate, diff_hash, verifier_hash, bootstrap, database_identity_raw = sys.argv[1:]
 manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
 database_identity = json.loads(database_identity_raw)
-if (manifest.get("prior_promotion") or {}).get("kind") == "current_instance":
+if manifest.get("schema_version") == "ac_stable_promotion_manifest.v1" and manifest.get("stable_branch") == "main":
     from agent.governance import server
     receipt = server._ac_main_binding_precheck(manifest)
     if not (receipt["stable_anchor_commit"] == stable and receipt["candidate_commit"] == candidate
@@ -3070,7 +3069,7 @@ if plan_path.exists():
 manifest = json.loads(Path(manifest_raw).read_text(encoding="utf-8"))
 precheck = json.loads(precheck_raw)
 database_identity = json.loads(database_identity_raw)
-current_main = (manifest.get("prior_promotion") or {}).get("kind") == "current_instance"
+current_main = manifest.get("schema_version") == "ac_stable_promotion_manifest.v1" and manifest.get("stable_branch") == "main"
 instance = {}
 if current_main:
     from agent.governance import server
@@ -3200,9 +3199,6 @@ if current_main:
     old_launch = [python_bin, "-m", "agent.cli", "start", "--workspace", str(stable_root),
                   "--runtime-plane", "stable", "--port", "40000", "--shared-volume-path", shared,
                   "--stable-anchor-commit", stable]
-    captured_process = instance["prior_promotion"]["preimage"]["process_identity"]
-    if old_process != {key: captured_process[key] for key in ("pid", "birth", "command")}:
-        fail("activation_plan_process_invalid", "stable process differs from the accepted instance preimage")
 candidate_launch = [
     python_bin, "-m", "agent.cli", "start", "--runtime-plane", "stable",
     "--port", "40000", "--stable-anchor-commit", candidate,
@@ -3213,6 +3209,11 @@ launch_environment = {
     "SHARED_VOLUME_PATH": shared,
 }
 runtime_process_executable = command.split(" ", 1)[0]
+if current_main:
+    ordinary_old_launch = [python_bin, "-m", "agent.cli", "start", "--runtime-plane", "stable",
+        "--port", "40000", "--stable-anchor-commit", stable, "--workspace", str(stable_root), "--shared-volume-path", shared]
+    if command == " ".join([runtime_process_executable, *ordinary_old_launch[1:]]):
+        old_launch = ordinary_old_launch
 expected_old_process_command = " ".join(
     [runtime_process_executable, *old_launch[1:]]
 )

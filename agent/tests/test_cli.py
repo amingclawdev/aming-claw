@@ -5977,13 +5977,18 @@ def test_durable_stop_v2_attacks_fail_closed(tmp_path, monkeypatch, attack, expe
 
 def test_main_binding_cli_anchor_is_the_exact_main_ref(monkeypatch, tmp_path):
     import agent.cli as cli
+    from agent.tests.test_governance_db import _install_fixed_stable_boundary, _main_transition_fixture
+    _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    db, stable, dev, record, health, save, git, candidate = _main_transition_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "__file__", str(dev / "agent/cli.py"))
     assert cli.AC_STABLE_BRANCH == "main"
-    seen = []
-    monkeypatch.setattr(cli, "_source_git_identity", lambda: {"root": str(tmp_path)})
-    def git_probe(args, **kwargs):
-        seen.append(args)
-        return SimpleNamespace(returncode=0, stdout="a" * 40 + "\n")
-    from types import SimpleNamespace
-    monkeypatch.setattr(cli.subprocess, "run", git_probe)
-    assert cli._local_stable_source_anchor() == "a" * 40
-    assert seen == [["git", "rev-parse", "--verify", "refs/heads/main"]]
+    assert cli._source_git_identity()["branch"] == "codex/ac-dev"
+    anchor = health["runtime_loaded_version"]
+    assert candidate != anchor
+    assert cli._local_stable_source_anchor() == anchor
+    # A later normal main ref is selected independently of the old task record.
+    git("update-ref", "refs/heads/main", candidate, anchor)
+    assert cli._local_stable_source_anchor() == candidate
+    git("update-ref", "-d", "refs/heads/main", candidate)
+    with pytest.raises(cli.click.ClickException, match="anchor is unavailable"):
+        cli._local_stable_source_anchor()

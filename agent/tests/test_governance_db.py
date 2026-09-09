@@ -32,7 +32,8 @@ def _install_fixed_stable_boundary(monkeypatch, tmp_path):
     shared.mkdir()
     database = shared / "codex-tasks" / "state" / "governance" / "aming-claw" / "governance.db"
     database.parent.mkdir(parents=True)
-    database.touch()
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE fixture_sqlite_file_identity(value)")
     (stable_root / ".gitignore").write_text("/shared-volume/\n")
     subprocess.run(["git", "init", "-b", "main"], cwd=stable_root, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=stable_root, check=True)
@@ -61,21 +62,22 @@ def fixed_stable_boundary(monkeypatch, tmp_path):
     _install_fixed_stable_boundary(monkeypatch, tmp_path)
 
 
-def _main_transition_fixture(monkeypatch, tmp_path, *, pipeline=False):
+def _main_transition_fixture(monkeypatch, tmp_path, *, pipeline=False, anchor_branch="codex/direct-no-pass-post-reconcile-r2"):
     """One admitted source instance, real Git lineage, and separate physical DBs."""
     from governance import db, observer_route_context
     from agent.runtime_plane import resolve_ac_dev_storage_root
 
     stable = Path(db._verified_stable_binding()["shared_volume_path"]).parent
     dev = (tmp_path / "main-transition-dev").resolve()
-    old_branch = "codex/direct-no-pass-post-reconcile-r2"
+    old_branch = anchor_branch
     rule_path = "agent/governance/contract_definitions/operator_supervised_direct_main.v1.rev3.json"
     rule_source = Path(__file__).resolve().parents[1] / "governance/contract_definitions/operator_supervised_direct_main.v1.rev3.json"
 
     def git(*args, root=stable):
         return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
 
-    git("branch", "-m", old_branch)
+    if git("branch", "--show-current") != old_branch:
+        git("branch", "-m", old_branch)
     for file in ("agent/cli.py", "agent/governance/server.py"):
         (stable / file).write_text(f'AC_STABLE_BRANCH = "{old_branch}"\n')
     (stable / rule_path).parent.mkdir(parents=True)
@@ -86,16 +88,20 @@ def _main_transition_fixture(monkeypatch, tmp_path, *, pipeline=False):
     git("add", ".")
     git("commit", "-qm", "exact stable preimage")
     anchor = git("rev-parse", "HEAD")
-    git("branch", "main", anchor)
+    if old_branch != "main":
+        git("branch", "main", anchor)
     git("worktree", "add", "-q", "-b", "codex/ac-dev", str(dev), anchor)
     (dev / "agent/governance/db.py").write_text("# independently admitted dev source\n")
+    for file in ("agent/cli.py", "agent/governance/server.py"):
+        (dev / file).write_text('AC_STABLE_BRANCH = "main"\n')
     git("add", ".", root=dev)
     git("commit", "-qm", "dev base", root=dev)
     base = git("rev-parse", "HEAD", root=dev)
-    backlog = "AC-STABLE-MAIN-DEPLOYMENT-BINDING-R1-20260908"
+    backlog = "AC-ORDINARY-CONFIGURATION-RELEASE"
     execution = "cex-direct-main-main-binding-fixture"
     for file in ("agent/cli.py", "agent/governance/server.py"):
         (dev / file).write_text('AC_STABLE_BRANCH = "main"\n')
+    (dev / "agent/governance/db.py").write_text("# current ordinary dev candidate\n")
     if pipeline:
         (dev / "scripts/merge-and-deploy.sh").write_bytes((Path(__file__).resolve().parents[2] / "scripts/merge-and-deploy.sh").read_bytes())
     git("add", ".", root=dev)
@@ -127,12 +133,24 @@ def _main_transition_fixture(monkeypatch, tmp_path, *, pipeline=False):
         "database_identity": {"device": database.stat().st_dev, "inode": database.stat().st_ino,
                               "world_id": "ac-dev", "project_id": "aming-claw"},
     }
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw", backlog_id=backlog, task_id=execution,
+        target_files=files, project_root=dev,
+    )
+    with sqlite3.connect(database) as conn:
+        conn.row_factory = sqlite3.Row
+        observer_route_context.persist_route_token_ref(
+            conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"],
+            token=issued["route_token"],
+        )
     binding = {
         "project_id": "aming-claw", "backlog_id": backlog, "contract_execution_id": execution,
         "base_commit": base, "server_derived": True, "caller_claims_trusted": False,
         "strict_runtime_binding_required": True, "owned_files": files, "target_files": files,
         "target_project_root": str(dev), "worktree_path": str(dev), "runtime_world_authority": world,
-        "route_identity": {"route_token_ref": "rtok-main-binding-fixture"},
+        "route_identity": {**{key: issued["route_token"][key] for key in (
+            "route_id", "route_context_hash", "prompt_contract_id", "prompt_contract_hash", "visible_injection_manifest_hash")},
+            "route_token_ref": issued["route_token_ref"]},
     }
     binding["binding_hash"] = db._world_genesis_hash(binding)
     record = {
@@ -162,11 +180,6 @@ def _main_transition_fixture(monkeypatch, tmp_path, *, pipeline=False):
                 "aming-claw", backlog, "operator_supervised_direct_main", execution, json.dumps(record)))
 
     save()
-    route = {"scope": {"project_id": "aming-claw", "task_id": execution, "backlog_id": backlog},
-             "owned_files": files, "target_files": files,
-             "route_token_ref": "rtok-main-binding-fixture"}
-    for module in (observer_route_context, __import__("agent.governance.observer_route_context", fromlist=["route"])):
-        monkeypatch.setattr(module, "resolve_route_token_ref_renewal_descendant", lambda *_a, **_k: route)
     health = db._stable_health_request()
     health["runtime_loaded_version"] = anchor
     health["runtime_plane_identity"].update({
@@ -191,8 +204,9 @@ def test_main_binding_release_preimage_stays_exact_and_physical_binding_is_separ
     )
     binding = db.verified_stable_database_binding()
     assert transition["candidate_commit"] == candidate
-    assert transition["base_commit"] == record["metadata"]["operator_supervised_direct_main_runtime_binding"]["base_commit"]
-    assert transition["phase"] == "implementation"
+    assert "base_commit" not in transition
+    assert "phase" not in transition
+    assert "contract_execution_id" not in transition
     assert transition["stable_branch_postimage"] == "main"
     assert transition["stable_deploy_authorized"] is False
     assert transition["writes_performed"] is False
@@ -266,7 +280,7 @@ def test_main_physical_binding_rejects_exact_preimage_and_custody_drift(monkeypa
 
 
 @pytest.mark.parametrize("drift", ["wrong_parent", "no_pre_mutation", "wrong_phase", "extra_instance", "line_actor", "line_stage", "line_evidence", "pre_event_status", "unverified_graph"])
-def test_main_release_checker_retains_instance_phase_and_evidence_rejections(monkeypatch, tmp_path, drift):
+def test_main_configuration_does_not_depend_on_development_record(monkeypatch, tmp_path, drift):
     db, stable, dev, record, health, save, git, candidate = _main_transition_fixture(monkeypatch, tmp_path)
     if drift == "wrong_parent":
         git("commit", "--allow-empty", "-qm", "unadmitted descendant", root=dev)
@@ -286,10 +300,13 @@ def test_main_release_checker_retains_instance_phase_and_evidence_rejections(mon
         record["completed_lines"][2]["payload"]["event"]["status"] = "rejected"; save()
     elif drift == "unverified_graph":
         record["completed_lines"][1]["db_verified"] = False; save()
-    with pytest.raises((RuntimeError, ValueError)):
-        db._stable_main_transition_context(
-            dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
-        )
+    config = db._stable_main_transition_context(
+        dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
+    )
+    assert config["candidate_commit"] == git("rev-parse", "HEAD", root=dev)
+    assert "contract_execution_id" not in config
+    assert "phase" not in config
+
 
 
 def test_terminal_no_pass_does_not_block_physical_binding_or_authorize_release(monkeypatch, tmp_path):
@@ -323,10 +340,11 @@ def test_terminal_no_pass_does_not_block_physical_binding_or_authorize_release(m
     assert "branch_binding_transition" not in binding
     assert "accepted" not in binding
     assert "pre_mutation" not in binding
-    with pytest.raises(RuntimeError, match="current instance/source/phase mismatch"):
-        db._stable_main_transition_context(
-            dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
-        )
+    configuration = db._stable_main_transition_context(
+        dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
+    )
+    assert "phase" not in configuration
+    assert configuration["stable_deploy_authorized"] is False
 
 
 def test_real_cow_get_connection_terminal_read_is_pure_and_non_writable(
@@ -442,10 +460,11 @@ def test_real_cow_get_connection_terminal_read_is_pure_and_non_writable(
     monkeypatch.setattr(db, "_revalidate_stable_database_binding", production_revalidate_binding)
     monkeypatch.setenv(db.AC_STABLE_SHARED_VOLUME_ENV, str(stable / "shared-volume"))
     monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
-    with pytest.raises(RuntimeError, match="current instance/source/phase mismatch"):
-        db._stable_main_transition_context(
-            dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
-        )
+    configuration = db._stable_main_transition_context(
+        dev, stable, health["runtime_plane_identity"]["stable_anchor_commit"],
+    )
+    assert "phase" not in configuration
+    assert configuration["stable_deploy_authorized"] is False
     physical_calls = []
     original_physical = db._stable_main_physical_preimage_branch
 

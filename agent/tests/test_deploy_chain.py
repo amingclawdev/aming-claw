@@ -433,7 +433,8 @@ class TestExplicitACPromotionScript:
         )
         database = stable / database_relative_path
         database.parent.mkdir(parents=True)
-        database.write_bytes(b"db")
+        with sqlite3.connect(database) as conn:
+            conn.execute("CREATE TABLE historical_control_fixture(value)")
         metadata = database.stat()
         python_bin = str(Path(sys.executable).resolve())
         anchor = "a25838f15f949ac434cf78e03f20760e82ff81f0"
@@ -1590,7 +1591,8 @@ class TestExplicitACPromotionScript:
         )
         database = root / database_relative
         database.parent.mkdir(parents=True)
-        database.write_bytes(b"db")
+        with sqlite3.connect(database) as conn:
+            conn.execute("CREATE TABLE historical_control_fixture(value)")
         git("add", ".")
         git("commit", "-qm", "anchor")
         anchor = git("rev-parse", "HEAD").strip()
@@ -2524,11 +2526,16 @@ http.server.HTTPServer(("127.0.0.1",port),Handler).serve_forever()
         ).strip() == stable
 
 
-@pytest.mark.parametrize("fault", ["none", "candidate_start", "after_branch", "after_patch"])
-def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tmp_path, fault):
-    from agent.tests.test_graph_governance_api import _main_binding_release_fixture, _ctx_with_role
+@pytest.mark.parametrize("main_preimage,fault", [(False, "none"), (False, "candidate_start"), (False, "after_branch"), (False, "after_source"), (True, "none"), (True, "after_source")])
+def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tmp_path, main_preimage, fault):
+    from agent.tests.test_graph_governance_api import _main_binding_release_fixture
     from agent.governance import server, db
-    fixture = _main_binding_release_fixture(monkeypatch, tmp_path)
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path, main_preimage=main_preimage)
+    # Real authentication in the physical fixture control DB, never a cached role.
+    with sqlite3.connect(fixture["stable_db"]) as conn:
+        conn.row_factory = sqlite3.Row
+        wrong_role = server.role_service.register(conn, "observer-fixture", "aming-claw", "observer")
+        wrong_project = server.role_service.register(conn, "external-coordinator", "external-project", "coordinator")
     manifest = fixture["manifest"]
     stable, dev = fixture["stable"], fixture["dev"]
     anchor, candidate = manifest["stable_anchor_commit"], fixture["candidate"]
@@ -2580,7 +2587,7 @@ def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tm
             self.calls.append(tuple(args))
             result = super().run(args, cwd, code, input_bytes=input_bytes)
             if not self.failed and ((fault == "after_branch" and args[:3] == ["git", "switch", "main"])
-                    or (fault == "after_patch" and args[:4] == ["git", "apply", "--index", "-"])):
+                    or (fault == "after_source" and args[:3] == ["git", "merge", "--ff-only"])):
                 self.failed = True
                 runtime["fail"]("fixture_crash_after_mutation", fault)
             return result
@@ -2598,8 +2605,22 @@ def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tm
             branch = old_branch if self.loaded == anchor else "main"
             health.update({"pid": self.identity["pid"], "runtime_loaded_version": self.loaded, "runtime_loaded_source_sha256": source_hash})
             health["runtime_plane_identity"].update({"branch": branch, "expected_branch": branch, "commit": self.loaded, "stable_anchor_commit": self.loaded})
+            if self.loaded == candidate:
+                with monkeypatch.context() as boundary:
+                    self.stable_runtime(boundary)
+                    health["runtime_plane_identity"] = server._runtime_plane_identity()
+                assert health["runtime_plane_identity"]["status"] == "ready"
             health["loaded_runtime_identity"].update({"loaded_commit": self.loaded, "loaded_source_sha256": source_hash, "worktree_source_sha256": source_hash})
             return health
+        def stable_runtime(self, boundary):
+            boundary.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+            boundary.setenv("AMING_CLAW_HOME", str(stable))
+            boundary.setenv("SHARED_VOLUME_PATH", str(stable / "shared-volume"))
+            boundary.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", candidate)
+            boundary.delenv(server.BUILD_COMMIT_ENV, raising=False)
+            boundary.setattr(server, "__file__", str(stable / "agent/governance/server.py"))
+            boundary.setattr(server, "PORT", 40000)
+            boundary.setattr(server, "SERVER_PID", self.identity["pid"])
         def stop(self, identity, port, code, **kwargs):
             assert self.identity == identity and port == 40000
             self.identity = {}
@@ -2616,20 +2637,23 @@ def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tm
         def reproject(self, selected, script_path):
             return server._ac_main_binding_precheck(selected["manifest"])
         def complete(self, body, token):
-            assert body["previous_promotion_receipt_hash"] is None
-            assert server._ac_promotion_request_previous_receipt(body, previous_stable=anchor) is None
-            def connection(_project):
-                conn = sqlite3.connect(fixture["stable_db"])
-                conn.row_factory = sqlite3.Row
-                return conn
-            ctx = _ctx_with_role({"project_id": "aming-claw"}, "operator", method="POST", body=body)
-            ctx.token = token
+            previous_receipt = manifest["prior_promotion"].get("receipt_hash")
+            assert body["previous_promotion_receipt_hash"] == previous_receipt
+            assert server._ac_promotion_request_previous_receipt(body, previous_stable=anchor) == previous_receipt
+            def request(credential):
+                ctx = server.RequestContext(None, "POST", {"project_id": "aming-claw"}, {}, body, "isolated-release", credential, "")
+                server._guard_runtime_world_request(method="POST", path="/api/projects/aming-claw/ac-stable-promotion/complete",
+                    path_params=ctx.path_params, body=body, query={}, token=credential)
+                return server.handle_ac_stable_promotion_complete(ctx)
             with monkeypatch.context() as boundary:
-                boundary.setattr(server, "get_connection", connection)
-                boundary.setattr(server, "canonical_ac_database_identity", lambda conn: manifest["stable_database_identity"])
-                boundary.setattr(server, "_runtime_plane_identity", lambda: self.health(40000)["runtime_plane_identity"])
-                receipt = server.handle_ac_stable_promotion_complete(ctx)
-                replay = server.handle_ac_stable_promotion_complete(ctx)
+                self.stable_runtime(boundary)
+                for rejected in (wrong_role["token"], wrong_project["token"]):
+                    with pytest.raises(server.PermissionDeniedError):
+                        request(rejected)
+                with pytest.raises(ValueError, match="stable runtime rejects the AC project domain"):
+                    db.get_connection("aming-claw")
+                receipt = request(token)
+                replay = request(token)
             assert receipt["idempotent"] is False
             assert replay["idempotent"] is True
             assert receipt["timeline_event_id"] == replay["timeline_event_id"]
@@ -2640,10 +2664,11 @@ def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tm
     for module in (fixture["db"], db):
         monkeypatch.setattr(module, "_stable_process_identity", lambda pid: (ops.pid_identity(pid).get("birth", ""), ops.pid_identity(pid).get("command", ""), str(stable)))
     journal = runtime["Journal"](plan["journal_path"], plan["plan_hash"])
-    result = runtime["ActivationMachine"](plan, patch, ops, journal, "isolated-token", str(script)).activate()
+    result = runtime["ActivationMachine"](plan, patch, ops, journal, fixture["operator_token"], str(script)).activate()
     assert result["ok"] is (fault == "none")
     assert ops.completed is (fault == "none")
-    assert fixture["git"]("rev-parse", "refs/heads/" + old_branch) == anchor
+    if not main_preimage:
+        assert fixture["git"]("rev-parse", "refs/heads/" + old_branch) == anchor
     assert fixture["git"]("status", "--porcelain") == ""
     assert fixture["git"]("rev-parse", "HEAD", root=dev) == candidate
     assert fixture["git"]("status", "--porcelain", root=dev) == ""
@@ -2653,11 +2678,11 @@ def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tm
         assert journal.rows[-1]["state"] == "COMPLETED"
         with sqlite3.connect(fixture["stable_db"]) as conn:
             rows = conn.execute("SELECT payload_json FROM task_timeline_events WHERE event_type='ac.stable_promotion_completed'").fetchall()
-        assert len(rows) == 1
-        receipt = json.loads(rows[0][0])
+        assert len(rows) == (2 if main_preimage else 1)
+        receipt = json.loads(rows[-1][0])
         assert receipt["prior_promotion"] == manifest["prior_promotion"]
         assert receipt["stable_branch"] == "main"
-        assert receipt["previous_promotion_receipt_hash"] is None
+        assert receipt["previous_promotion_receipt_hash"] == manifest["prior_promotion"].get("receipt_hash")
     else:
         assert fixture["stable_db"].read_bytes() == before_db
         assert result["rolled_back"] is True
