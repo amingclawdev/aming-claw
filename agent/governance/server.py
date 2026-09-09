@@ -210226,6 +210226,36 @@ def _ac_main_binding_dev_connection(instance: Mapping[str, Any]):
     return conn
 
 
+def _ac_main_binding_validate_reconcile(conn, *, record: Mapping[str, Any],
+                                        completed: Mapping[str, Any], candidate: str) -> None:
+    """Consume the normal current-full carrier, retaining historical projections."""
+    payload = completed.get("payload") or {}
+    binding = (record.get("metadata") or {}).get("operator_supervised_direct_main_runtime_binding") or {}
+    valid = False
+    if "direct_current_full_reconcile_authority" in payload:
+        # The normal close facade materializes this line from the graph Fact;
+        # timeline_payload is its close request, not a second reconcile event.
+        current = _operator_supervised_direct_main_current_full_reconcile_authority(
+            conn, project_id=record["project_id"], backlog_id=record["backlog_id"],
+            contract_execution_id=record["contract_execution_id"], record=record,
+        )
+        valid = bool(current and payload["direct_current_full_reconcile_authority"] == current
+                     and current.get("qa_passed") is True and current.get("close_satisfying") is True
+                     and current.get("target_commit_sha") == candidate)
+    else:
+        timeline_payload = payload.get("timeline_payload") or {}
+        matching = []
+        for row in conn.execute("SELECT * FROM task_timeline_events WHERE project_id=? AND backlog_id=? AND task_id=? AND phase='reconcile' AND event_kind IN ('reconcile','current_full_reconcile') AND commit_sha=? AND status IN ('pass','passed')", (record["project_id"], record["backlog_id"], record["contract_execution_id"], candidate)):
+            accepted = _ac_promotion_row_to_event(row)
+            if (timeline_payload and all((accepted.get("payload") or {}).get(k) == v for k, v in timeline_payload.items())
+                    and (timeline_payload.get("event") or {}).get("actor") == accepted.get("actor")):
+                matching.append(accepted)
+        valid = len(matching) == 1
+    if not (valid and completed.get("commit_sha") == candidate
+            and payload.get("direct_runtime_binding_hash") == binding.get("binding_hash")):
+        raise ValidationError("release canonical reconcile differs from its unique accepted event")
+
+
 def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
                                      require_close_ready: bool = False, recovery: bool = False) -> dict[str, Any]:
     """Join current deployment configuration to the candidate's source evidence.
@@ -210383,11 +210413,16 @@ def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
             raise ValidationError("release accepted source route authority mismatch")
         completed = by_id["observer_implementation"]
         payload = completed.get("payload") or {}
+        # The normal writer stores commit/test_results, without a line status
+        # or payload.event. Completion was checked against the Rule above;
+        # its accepted verdict belongs to the unique timeline/prewrite Fact.
+        # Retain rejection of an explicitly contradictory legacy projection.
         if not (event.get("commit_sha") == actual_candidate and event.get("status") in {"pass", "passed"}
                 and event.get("phase") == event.get("event_kind") == "implementation"
                 and (completed.get("commit_sha") or payload.get("commit_sha")) == actual_candidate
                 and payload.get("direct_runtime_binding_hash") == binding["binding_hash"]
-                and (payload.get("event") or {}).get("status", completed.get("status")) in {"pass", "passed"}
+                and ("status" not in (payload.get("event") or {})
+                     or payload["event"]["status"] in {"pass", "passed"})
                 and authority.get("server_derived") is True and authority.get("passed") is True
                 and authority.get("commit_sha") == authority.get("canonical_head_commit") == actual_candidate
                 and authority.get("task_id") == execution and authority.get("runtime_binding_hash") == binding["binding_hash"]
@@ -210430,17 +210465,8 @@ def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
             qa_event_id = int(matching[0]["id"])
         reconcile_line = by_id.get("observer_reconcile")
         if reconcile_line is not None:
-            reconcile_payload = reconcile_line.get("payload") or {}
-            timeline_payload = reconcile_payload.get("timeline_payload") or {}
-            matching = []
-            for row in conn.execute("SELECT * FROM task_timeline_events WHERE project_id=? AND backlog_id=? AND task_id=? AND phase='reconcile' AND event_kind IN ('reconcile','current_full_reconcile') AND commit_sha=? AND status IN ('pass','passed')", ("aming-claw", backlog, execution, actual_candidate)):
-                accepted = _ac_promotion_row_to_event(row)
-                if (timeline_payload and all((accepted.get("payload") or {}).get(k) == v for k, v in timeline_payload.items())
-                        and (timeline_payload.get("event") or {}).get("actor") == accepted.get("actor")):
-                    matching.append(accepted)
-            if not (len(matching) == 1 and reconcile_line.get("commit_sha") == actual_candidate
-                    and reconcile_payload.get("direct_runtime_binding_hash") == binding["binding_hash"]):
-                raise ValidationError("release canonical reconcile differs from its unique accepted event")
+            _ac_main_binding_validate_reconcile(conn, record=record,
+                completed=reconcile_line, candidate=actual_candidate)
     instance.update({"backlog_id": backlog, "contract_execution_id": execution, "base_commit": base,
         "direct_runtime_binding_hash": binding["binding_hash"], "dev_database_identity": identity})
     preimage = {"instance": _ac_main_binding_instance_core(instance), "stable_database_identity": stable_identity}

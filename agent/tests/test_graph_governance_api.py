@@ -104517,7 +104517,7 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
         implementation_commit
     )
     assert qa_action["copy_safe_body"]["actor"] == (
-        "<copy the authenticated QA principal_id>"
+        f"qa:{task_id}"
     )
     assert qa_action["facade_action_projection"]["qa_authored"] is True
     assert qa_action["facade_action_projection"][
@@ -105124,6 +105124,8 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
     completed_record = server._contract_runtime(conn).store.get(task_id)
     assert len(completed_record["execution_state"]["completed_lines"]) == 8
     assert completed_record["runtime_guide"]["next_legal_action"] is None
+    if execution_revision == "rev3" and not route_renewal:
+        _assert_normal_reconcile_release_carrier(conn, completed_record, tmp_path)
     completed_guide = server.handle_project_onboard_route_guide(
         _ctx_with_role(
             {"project_id": PID},
@@ -220702,6 +220704,319 @@ def test_dev_registry_config_recovery_direct_issuance_authority_gap(
         "bootstrap_authority_in_forward_fixture": "separate source-issuer seeded token",
         "live_readiness_proven": False, "global_impossibility_claimed": False,
     }, sort_keys=True))
+
+
+def _assert_normal_reconcile_release_carrier(source, record, tmp_path):
+    """Check actual normal-facade output against its durable current-full Facts."""
+    line = next(item for item in record["completed_lines"] if item["line_id"] == "observer_reconcile")
+    assert "status" not in line
+    assert "event" not in line["payload"]["timeline_payload"]
+    candidate = line["commit_sha"]
+    source.commit()
+    for defect in ("none", "canonical_commit", "canonical_binding", "authority_missing", "authority_hash",
+                   "authority_event", "no_pass", "missing_provenance", "provenance_hash",
+                   "snapshot_commit", "event_status"):
+        path = tmp_path / f"normal-reconcile-{defect}.sqlite3"
+        with sqlite3.connect(path) as connection:
+            source.backup(connection)
+            mutated = copy.deepcopy(record)
+            completed = next(item for item in mutated["completed_lines"] if item["line_id"] == "observer_reconcile")
+            authority = completed["payload"]["direct_current_full_reconcile_authority"]
+            if defect == "canonical_commit":
+                completed["commit_sha"] = "f" * 40
+            elif defect == "canonical_binding":
+                completed["payload"]["direct_runtime_binding_hash"] = "sha256:" + "f" * 64
+            elif defect == "authority_missing":
+                completed["payload"].pop("direct_current_full_reconcile_authority")
+            elif defect == "authority_hash":
+                authority["authority_hash"] = "sha256:" + "f" * 64
+            elif defect == "authority_event":
+                authority["reconcile_event_id"] += 1
+                authority["authority_hash"] = server.stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})
+            elif defect == "no_pass":
+                authority.update(qa_passed=False, close_satisfying=False)
+                authority["authority_hash"] = server.stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})
+            elif defect == "missing_provenance":
+                connection.execute("DELETE FROM graph_current_full_reconcile_provenance")
+            elif defect == "provenance_hash":
+                connection.execute("UPDATE graph_current_full_reconcile_provenance SET provenance_hash=?", ("sha256:" + "f" * 64,))
+            elif defect == "snapshot_commit":
+                connection.execute("UPDATE graph_snapshots SET commit_sha=? WHERE snapshot_id=?", ("f" * 40, authority["active_snapshot_id"]))
+            elif defect == "event_status":
+                connection.execute("UPDATE task_timeline_events SET status='failed' WHERE id=?", (authority["reconcile_event_id"],))
+            connection.execute("UPDATE contract_runtime_executions SET record_json=? WHERE contract_execution_id=?",
+                               (json.dumps(mutated), record["contract_execution_id"]))
+            connection.commit()
+
+        def snapshot():
+            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as fresh:
+                return tuple(fresh.iterdump())
+
+        before = snapshot()
+        with sqlite3.connect(path) as connection:
+            connection.row_factory = sqlite3.Row
+            persisted = json.loads(connection.execute("SELECT record_json FROM contract_runtime_executions WHERE contract_execution_id=?", (record["contract_execution_id"],)).fetchone()[0])
+            completed = next(item for item in persisted["completed_lines"] if item["line_id"] == "observer_reconcile")
+            if defect == "none":
+                server._ac_main_binding_validate_reconcile(connection, record=persisted, completed=completed, candidate=candidate)
+            else:
+                with pytest.raises(server.ValidationError, match="canonical reconcile"):
+                    server._ac_main_binding_validate_reconcile(connection, record=persisted, completed=completed, candidate=candidate)
+        assert snapshot() == before
+
+
+def _main_binding_normal_implementation_fixture(monkeypatch, tmp_path):
+    """Seed only admission, then use the authenticated normal implementation writer.
+
+    Git objects, the immutable Rule, routes, ContractRuntime, prewrite checks,
+    and both physical SQLite files are real. Loaded/process/health observations
+    and connection paths are isolated; this does not exercise a live service.
+    """
+    from agent.tests.test_governance_db import (
+        _install_fixed_stable_boundary, _main_transition_fixture,
+    )
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    from agent.governance.redis_client import RedisClient
+
+    _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    db, stable, dev, seeded, health, _, git, base = _main_transition_fixture(
+        monkeypatch, tmp_path, pipeline=True,
+    )
+    monkeypatch.setattr(server, "__file__", str(dev / "agent/governance/server.py"))
+    database = resolve_ac_dev_storage_root(stable / "shared-volume") / db.AC_DATABASE_DEV_RELATIVE_PATH
+    stable_database = stable / db.AC_DATABASE_STABLE_RELATIVE_PATH
+    assert database.resolve().is_relative_to(tmp_path.resolve())
+    assert stable_database.resolve().is_relative_to(tmp_path.resolve())
+
+    def connect(project_id="aming-claw"):
+        assert project_id == "aming-claw"
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    # Replace the physical-boundary helper's minimal table with the real schema
+    # before entering verify-only dev mode. No accepted implementation is seeded.
+    with connect() as connection:
+        connection.execute("DROP TABLE contract_runtime_executions")
+        _ensure_schema(connection)
+        store.ensure_schema(connection)
+        _initialize_ac_dev_guide_schema(connection)
+    with sqlite3.connect(stable_database) as connection:
+        _ensure_schema(connection)
+    monkeypatch.setattr(server, "get_connection", connect)
+    monkeypatch.setattr(governance_db, "get_connection", connect)
+    monkeypatch.setattr(server.project_service, "resolve_project_root", lambda *a, **k: dev)
+    offline_cache = RedisClient()
+    monkeypatch.setattr(server.role_service, "get_redis", lambda: offline_cache)
+    monkeypatch.setattr(server.audit_service, "_governance_root", lambda: tmp_path / "audit")
+    identity = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": "ac-dev", "project_id": "aming-claw",
+        "device": database.stat().st_dev, "inode": database.stat().st_ino,
+        "relative_path_sha256": server.stable_sha256(db.AC_DATABASE_DEV_RELATIVE_PATH),
+        "genesis_sha256": server.stable_sha256({"fixture": str(database)}),
+    }
+    loaded = {"commit": base}
+
+    def runtime_identity():
+        return {
+            "status": "ready", "plane": "dev", "port": 40008,
+            "bind_host": "127.0.0.1", "branch": "codex/ac-dev",
+            "worktree_root": str(dev), "worktree_dirty": bool(git("status", "--porcelain", root=dev)),
+            "commit": loaded["commit"], "stable_anchor_commit": health["runtime_loaded_version"],
+            "database_identity": identity,
+        }
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "_runtime_plane_identity", runtime_identity)
+    monkeypatch.setattr(server, "get_server_version", lambda: loaded["commit"])
+    monkeypatch.setattr(server, "governance_loaded_runtime_identity", lambda _version: {
+        "loaded_commit": loaded["commit"], "runtime_stale": False,
+        "loaded_source_sha256": "sha256:" + hashlib.sha256((dev / "agent/governance/server.py").read_bytes()).hexdigest(),
+    })
+    world = server._operator_supervised_direct_main_dev_world_authority()
+    task_id = seeded["contract_execution_id"]
+    backlog_id = seeded["backlog_id"]
+    original_binding = seeded["metadata"]["operator_supervised_direct_main_runtime_binding"]
+    files = original_binding["owned_files"]
+    route = original_binding["route_identity"]
+    with connect() as connection:
+        _insert_simple_mf_close_backlog(connection, backlog_id)
+        connection.execute("UPDATE backlog_bugs SET target_files=? WHERE bug_id=?", (json.dumps(files), backlog_id))
+        connection.commit()
+        world_ref = server._operator_supervised_direct_main_world_ref(project_id="aming-claw")
+        assert world_ref["accepted"] is True
+        binding = server._operator_supervised_direct_main_build_runtime_binding(
+            project_id="aming-claw", backlog_id=backlog_id, execution_id=task_id,
+            route_authority={"route_identity": route, "row_declared_files": files},
+            world_ref=world_ref, dev_world=world,
+        )
+        runtime = server._contract_runtime(connection)
+        record = runtime.start_execution(
+            "operator_supervised_direct_main", version="v1", revision="rev3",
+            project_id="aming-claw", backlog_id=backlog_id, actor_role="observer",
+            contract_execution_id=task_id, root_contract_execution_id=task_id,
+            route_token_ref=route["route_token_ref"],
+            metadata={"operator_supervised_direct_main_runtime_binding": binding},
+        )
+        prefix = copy.deepcopy(seeded["completed_lines"])
+        prefix[0]["payload"]["direct_runtime_binding"] = binding
+        for line in prefix:
+            line.setdefault("payload", {})["direct_runtime_binding_hash"] = binding["binding_hash"]
+        record["completed_lines"] = prefix
+        record["execution_state_revision"] = 4
+        runtime.store.update(task_id, record, expected_revision=1)
+        connection.execute(
+            "INSERT INTO task_timeline_events(project_id,backlog_id,task_id,event_type,phase,event_kind,actor,status,decision,payload_json,verification_json,artifact_refs_json,created_at) "
+            "VALUES (?,?,?,'mf.observer_direct_implementation_exception','pre_mutation','observer_direct_implementation_exception','observer','accepted','operator_supervised_direct_main_approved',?,'{}','{}','2026-09-09T00:00:00Z')",
+            ("aming-claw", backlog_id, task_id, json.dumps({
+                **route, "observer_direct_pre_mutation_authority": {
+                    "accepted": True, "server_projected": True,
+                    "projection_source": "task_timeline_append_pre_persistence_gate",
+                    "row_declared_files": files,
+                },
+            })),
+        )
+        session = server.role_service.register(connection, "observer-normal-release", "aming-claw", "observer", scope=["*"])
+        connection.commit()
+        assert runtime.current_record(task_id, actor_role="observer")["runtime_guide"]["next_legal_action"]["line_id"] == "observer_implementation"
+
+    (dev / "agent/governance/server.py").write_text('AC_STABLE_BRANCH = "main"\n# normal implementation candidate\n')
+    git("add", "agent/governance/server.py", root=dev)
+    git("commit", "-qm", _canonical_parentless_direct_main_commit_message(
+        backlog_id=backlog_id, task_id=task_id, parent_commit=base,
+    ), root=dev)
+    candidate = git("rev-parse", "HEAD", root=dev)
+    loaded["commit"] = candidate  # isolated observation of the ordinary dev refresh
+    body = _canonical_parentless_direct_main_implementation_body(
+        backlog_id=backlog_id, task_id=task_id, route_token_ref=route["route_token_ref"],
+        route_identity=route, commit_sha=candidate,
+        changed_files=["agent/governance/server.py"], allowed_files=files,
+    )
+    context = server.RequestContext(None, "POST", {"project_id": "aming-claw"}, {}, body,
+                                    "normal-release-implementation", session["token"], "")
+    response = server.handle_task_timeline_append(context)
+    assert response.get("status") == "passed", response
+
+    def snapshot():
+        # A fresh independent reader observes durable row/event bytes, including
+        # any accidental writes committed by a failed consumer invocation.
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as fresh:
+            rows = fresh.execute("SELECT * FROM contract_runtime_executions ORDER BY contract_execution_id").fetchall()
+            events = fresh.execute("SELECT * FROM task_timeline_events ORDER BY id").fetchall()
+        with sqlite3.connect(f"file:{stable_database}?mode=ro", uri=True) as fresh:
+            stable_rows = tuple(fresh.iterdump())
+        return rows, events, stable_rows
+
+    with connect() as connection:
+        record = server._contract_runtime(connection).store.get(task_id)
+        events = [event for event in task_timeline.list_events(connection, "aming-claw", backlog_id=backlog_id, task_id=task_id, limit=1000)
+                  if event["event_type"] == "observer.implementation"]
+    assert record["execution_state_revision"] == 5
+    assert len(events) == 1
+    implementation = next(line for line in record["completed_lines"] if line["line_id"] == "observer_implementation")
+    assert "status" not in implementation
+    assert "event" not in implementation["payload"]
+    assert implementation["commit_sha"] == candidate
+    assert implementation["test_results"]["status"] == "passed"
+    assert events[0]["status"] == "passed"
+    authority = events[0]["payload"]["direct_main_implementation_commit_prewrite_authority"]
+    assert authority["passed"] is True and authority["server_derived"] is True
+    assert authority["canonical_head_commit"] == authority["commit_sha"] == candidate
+    assert authority["runtime_binding_hash"] == binding["binding_hash"]
+    assert authority["commit_trailers_exact"] is True
+    return {"record": record, "candidate": candidate, "base": base, "dev": dev,
+            "dev_db": database, "stable_db": stable_database, "connect": connect,
+            "snapshot": snapshot, "implementation": implementation, "event": events[0]}
+
+
+def test_main_release_consumes_normal_statusless_implementation(monkeypatch, tmp_path, record_property):
+    case = _main_binding_normal_implementation_fixture(monkeypatch, tmp_path)
+    before = case["snapshot"]()
+    instance = server._ac_main_binding_release_instance()
+    assert instance["candidate_commit"] == case["candidate"]
+    assert instance["contract_execution_id"] == case["record"]["contract_execution_id"]
+    assert instance["source_custody"]["implementation_event_id"] == case["event"]["id"]
+    assert instance["source_custody"]["implementation_event_hash"] == server._ac_promotion_event_hash(case["event"])
+    assert case["snapshot"]() == before
+    record_property("normal_producer", json.dumps({
+        "canonical_keys": sorted(case["implementation"]),
+        "canonical_payload_keys": sorted(case["implementation"]["payload"]),
+        "execution_state_revision": case["record"]["execution_state_revision"],
+        "implementation_event_id": case["event"]["id"],
+        "implementation_event_status": case["event"]["status"],
+        "prewrite_authority_hash": case["event"]["payload"]["direct_main_implementation_commit_prewrite_authority"]["authority_hash"],
+        "candidate_commit": case["candidate"], "parent_commit": case["base"],
+        "physical_readback_unchanged": True,
+    }, sort_keys=True))
+
+
+@pytest.mark.parametrize("defect", [
+    "missing_event", "duplicate_event", "event_commit", "event_status", "event_phase",
+    "canonical_commit", "canonical_binding", "canonical_failed", "canonical_actor",
+    "canonical_stage", "canonical_evidence", "prewrite_commit", "prewrite_task",
+    "prewrite_binding", "prewrite_hash", "route_hash", "legacy_failed_projection",
+])
+def test_main_release_normal_implementation_denials_are_durable_zero_write(monkeypatch, tmp_path, defect, record_property):
+    case = _main_binding_normal_implementation_fixture(monkeypatch, tmp_path)
+    record = case["record"]
+    line = case["implementation"]
+    event = case["event"]
+    authority = event["payload"]["direct_main_implementation_commit_prewrite_authority"]
+    if defect == "canonical_commit":
+        line["commit_sha"] = case["base"]
+    elif defect == "canonical_binding":
+        line["payload"]["direct_runtime_binding_hash"] = "sha256:" + "f" * 64
+    elif defect == "canonical_failed":
+        line["status"] = "failed"
+    elif defect == "canonical_actor":
+        line["actor_role"] = "qa"
+    elif defect == "canonical_stage":
+        line["stage_id"] = "qa"
+    elif defect == "canonical_evidence":
+        line["evidence_kind"] = "independent_verification"
+    elif defect == "legacy_failed_projection":
+        line["payload"]["event"] = {"status": "failed"}
+    elif defect in {"prewrite_commit", "prewrite_task", "prewrite_binding"}:
+        field, value = {
+            "prewrite_commit": ("canonical_head_commit", case["base"]),
+            "prewrite_task": ("task_id", "cex-direct-main-unrelated"),
+            "prewrite_binding": ("runtime_binding_hash", "sha256:" + "f" * 64),
+        }[defect]
+        authority[field] = value
+        authority["authority_hash"] = server.stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})
+    elif defect == "prewrite_hash":
+        authority["authority_hash"] = "sha256:" + "f" * 64
+    elif defect == "route_hash":
+        authority["active_route_authority"]["authority_hash"] = "sha256:" + "f" * 64
+        authority["authority_hash"] = server.stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})
+    with case["connect"]() as connection:
+        connection.execute("UPDATE contract_runtime_executions SET record_json=? WHERE contract_execution_id=?",
+                           (json.dumps(record), record["contract_execution_id"]))
+        connection.execute("UPDATE task_timeline_events SET payload_json=? WHERE id=?", (json.dumps(event["payload"]), event["id"]))
+        if defect == "missing_event":
+            connection.execute("DELETE FROM task_timeline_events WHERE id=?", (event["id"],))
+        elif defect == "duplicate_event":
+            row = dict(connection.execute("SELECT * FROM task_timeline_events WHERE id=?", (event["id"],)).fetchone())
+            row.pop("id")
+            connection.execute(f"INSERT INTO task_timeline_events({','.join(row)}) VALUES ({','.join('?' for _ in row)})", tuple(row.values()))
+        elif defect in {"event_commit", "event_status", "event_phase"}:
+            field, value = {"event_commit": ("commit_sha", case["base"]),
+                            "event_status": ("status", "failed"), "event_phase": ("phase", "qa")}[defect]
+            connection.execute(f"UPDATE task_timeline_events SET {field}=? WHERE id=?", (value, event["id"]))
+        connection.commit()
+    before = case["snapshot"]()
+    reason = "release accepted implementation identity mismatch"
+    if defect in {"missing_event", "duplicate_event"}:
+        reason = "release needs its unique accepted implementation event"
+    elif defect in {"canonical_failed", "canonical_actor", "canonical_stage", "canonical_evidence"}:
+        reason = "release canonical source line is not completed"
+    elif defect == "route_hash":
+        reason = "release accepted source route authority mismatch"
+    with pytest.raises(server.ValidationError, match=reason) as rejected:
+        server._ac_main_binding_release_instance()
+    assert case["snapshot"]() == before
+    record_property("rejection_reason", str(rejected.value))
 
 
 def _main_binding_release_fixture(monkeypatch, tmp_path, *, main_preimage=False):
