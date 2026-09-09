@@ -1954,9 +1954,15 @@ def _strict_direct_main_comparison_world(
     suffix: str,
     revision: str = "rev3",
     successor: bool = False,
+    declared_files: list[str] | None = None,
+    actual_files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a real rev3 Direct Main round through its public facades."""
 
+    declared_files = list(
+        declared_files or ["agent/governance/server.py"]
+    )
+    actual_files = list(actual_files or ["agent/governance/server.py"])
     backlog_id = f"AC-DIRECT-MAIN-COMPARISON-{suffix}"
     project_root = tmp_path / f"direct-main-comparison-{suffix.lower()}"
     base_commit = _init_test_git_repo(project_root)
@@ -1974,6 +1980,7 @@ def _strict_direct_main_comparison_world(
         _parentless_direct_main_pre_mutation_graph_scope(
             conn,
             backlog_id=backlog_id,
+            row_files=declared_files,
         )
     )
     if successor:
@@ -2016,19 +2023,20 @@ def _strict_direct_main_comparison_world(
                     "route_token_ref": route_token_ref,
                 },
                 route_identity=route_identity,
-                allowed_files=["agent/governance/server.py"],
+                allowed_files=declared_files,
                 graph_trace_ids=[trace_id],
             ),
         )
     )
-    changed_path = project_root / "agent" / "governance" / "server.py"
-    changed_path.parent.mkdir(parents=True, exist_ok=True)
-    changed_path.write_text(
-        f"DIRECT_MAIN_COMPARISON = {suffix!r}\n",
-        encoding="utf-8",
-    )
+    for relative_path in actual_files:
+        changed_path = project_root / relative_path
+        changed_path.parent.mkdir(parents=True, exist_ok=True)
+        changed_path.write_text(
+            f"DIRECT_MAIN_COMPARISON = {suffix!r}\n",
+            encoding="utf-8",
+        )
     subprocess.run(
-        ["git", "add", "agent/governance/server.py"],
+        ["git", "add", "--", *actual_files],
         cwd=project_root,
         check=True,
         capture_output=True,
@@ -2062,6 +2070,8 @@ def _strict_direct_main_comparison_world(
                 route_token_ref=route_token_ref,
                 route_identity=route_identity,
                 commit_sha=candidate_commit,
+                changed_files=actual_files,
+                allowed_files=declared_files,
             ),
         )
     )
@@ -2877,6 +2887,198 @@ def test_strict_direct_main_rev3_comparison_authority_persists_exact_diff(
     assert trace["root_identity"]["comparison_base_commit_sha"] == (
         world["base_commit"]
     )
+
+
+def test_strict_direct_main_rev3_comparison_authority_accepts_actual_subset(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    declared_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="R3-ACTUAL-SUBSET",
+        declared_files=declared_files,
+        actual_files=["agent/governance/server.py"],
+    )
+    before_changes = conn.total_changes
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+            "comparison_base_commit_sha": "f" * 40,
+            "changed_files": declared_files,
+        },
+    )
+
+    assert authority == {
+        "commit_sha": world["base_commit"],
+        "source": server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        "lineage_source": server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+    }
+    assert conn.total_changes == before_changes
+
+
+def test_strict_direct_main_rev3_comparison_authority_rejects_unequal_actual_subsets(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    declared_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="R3-UNEQUAL-ACTUAL-SUBSETS",
+        declared_files=declared_files,
+        actual_files=["agent/governance/server.py"],
+    )
+    runtime = server._contract_runtime(conn)
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    )
+    implementation = next(
+        event for event in events if event["event_kind"] == "implementation"
+    )
+    payload = copy.deepcopy(implementation["payload"])
+    prewrite = payload[
+        "direct_main_implementation_commit_prewrite_authority"
+    ]
+    prewrite["verified_changed_files"] = [
+        "agent/tests/test_graph_governance_api.py"
+    ]
+    prewrite["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in prewrite.items()
+            if key != "authority_hash"
+        }
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(payload, sort_keys=True), int(implementation["id"])),
+    )
+    conn.commit()
+    before_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    )
+    before_record = runtime.store.get(world["task_id"])
+    before_changes = conn.total_changes
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+        },
+    )
+
+    assert authority["machine_reason"] == (
+        "exact_candidate_direct_main_file_fence_mismatch"
+    )
+    assert authority["identity_mismatches"] == [
+        {
+            "field": "parent_to_candidate_changed_files",
+            "expected": declared_files,
+            "actual": ["agent/governance/server.py"],
+        }
+    ]
+    assert authority["zero_write_rejection"] is True
+    assert authority["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert runtime.store.get(world["task_id"]) == before_record
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    ) == before_events
+
+
+def test_strict_direct_main_rev3_comparison_authority_preserves_exact_declared_fence(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    declared_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="R3-DECLARED-FENCE-MISMATCH",
+        declared_files=declared_files,
+        actual_files=["agent/governance/server.py"],
+    )
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(world["task_id"])
+    binding = record["metadata"][
+        "operator_supervised_direct_main_runtime_binding"
+    ]
+    binding["target_files"] = ["agent/governance/server.py"]
+    binding["binding_hash"] = server.stable_sha256(
+        {key: value for key, value in binding.items() if key != "binding_hash"}
+    )
+    runtime.store.update(world["task_id"], record)
+    before_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    )
+    before_record = runtime.store.get(world["task_id"])
+    before_changes = conn.total_changes
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+        },
+    )
+
+    assert authority["machine_reason"] == (
+        "exact_candidate_direct_main_runtime_binding_invalid"
+    )
+    assert authority["zero_write_rejection"] is True
+    assert authority["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert runtime.store.get(world["task_id"]) == before_record
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    ) == before_events
 
 
 @pytest.mark.parametrize(
@@ -103221,7 +103423,11 @@ def _canonical_parentless_direct_main_implementation_body(
     route_token_ref: str,
     route_identity: Mapping[str, str],
     commit_sha: str,
+    changed_files: list[str] | None = None,
+    allowed_files: list[str] | None = None,
 ) -> dict[str, Any]:
+    changed_files = list(changed_files or ["agent/governance/server.py"])
+    allowed_files = list(allowed_files or changed_files)
     return {
         "backlog_id": backlog_id,
         "task_id": task_id,
@@ -103234,13 +103440,13 @@ def _canonical_parentless_direct_main_implementation_body(
         "commit_sha": commit_sha,
         "payload": {
             **dict(route_identity),
-            "changed_files": ["agent/governance/server.py"],
+            "changed_files": changed_files,
             "test_results": _canonical_parentless_direct_main_test_results(
                 commit_sha
             ),
             "dirty_scope_check": {
-                "allowed_files": ["agent/governance/server.py"],
-                "changed_files": ["agent/governance/server.py"],
+                "allowed_files": allowed_files,
+                "changed_files": changed_files,
                 "unexpected_files": [],
                 "exact_match": True,
             },
@@ -105263,6 +105469,7 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
 
     for mutation in (
         "missing_changed_files",
+        "empty_changed_files",
         "duplicate_changed_files",
         "extra_changed_file",
         "mismatched_scope_claim",
@@ -105276,6 +105483,11 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
         )
         if mutation == "missing_changed_files":
             invalid_scope_body["payload"].pop("changed_files")
+        elif mutation == "empty_changed_files":
+            invalid_scope_body["payload"]["changed_files"] = []
+            invalid_scope_body["payload"]["dirty_scope_check"][
+                "changed_files"
+            ] = []
         elif mutation == "duplicate_changed_files":
             invalid_scope_body["payload"]["changed_files"] = [
                 "agent/governance/server.py",

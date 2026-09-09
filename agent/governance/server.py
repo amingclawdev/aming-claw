@@ -14997,8 +14997,9 @@ def _qa_exact_candidate_direct_main_strict_comparison_authority(
         declared_files
         and declared_files == binding_owned_files
         and declared_files == binding_target_files
-        and declared_files == prewrite_changed_files
-        and declared_files == diff_changed_files
+        and prewrite_changed_files
+        and prewrite_changed_files == diff_changed_files
+        and set(diff_changed_files).issubset(declared_files)
     ):
         return _qa_exact_candidate_direct_main_comparison_failure(
             "exact_candidate_direct_main_file_fence_mismatch",
