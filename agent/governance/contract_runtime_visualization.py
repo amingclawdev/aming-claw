@@ -8,6 +8,8 @@ never cross the returned payload.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -596,9 +598,14 @@ def _runtime_record_summary(record: Mapping[str, Any]) -> dict[str, Any]:
 
 def _event_summary(event: Mapping[str, Any]) -> dict[str, Any]:
     event_id = event.get("id") or event.get("event_id") or ""
+    payload = _mapping(event.get("payload"))
+    verification = _mapping(event.get("verification"))
+    artifact_refs = _mapping(event.get("artifact_refs"))
+    provenance = _event_provenance(event, payload, verification, artifact_refs)
     summary = {
         "id": event_id,
         "event_id": event_id,
+        "project_id": _text(event.get("project_id")),
         "backlog_id": _text(event.get("backlog_id")),
         "task_id": _text(event.get("task_id")),
         "event_type": _text(event.get("event_type")),
@@ -609,7 +616,17 @@ def _event_summary(event: Mapping[str, Any]) -> dict[str, Any]:
         "commit_sha": _text(event.get("commit_sha")),
         "parent_event_id": event.get("parent_event_id") or None,
         "created_at": _text(event.get("created_at")),
+        "contract_execution_id": _nested_text(
+            event, "contract_execution_id", "current_contract_execution_id"
+        ),
+        "source_event_id": _nested_text(event, "source_event_id") or _text(event_id),
+        "provenance": provenance,
     }
+    acceptance_evidence = _acceptance_evidence_projection(
+        (payload, verification, artifact_refs), provenance
+    )
+    if acceptance_evidence:
+        summary["acceptance_evidence"] = acceptance_evidence
     payload_ref = _mapping(event.get("payload_ref"))
     if payload_ref:
         summary["payload_ref"] = {
@@ -617,7 +634,226 @@ def _event_summary(event: Mapping[str, Any]) -> dict[str, Any]:
             for key in ("event_id", "payload_sha256", "payload_bytes")
             if payload_ref.get(key) not in (None, "")
         }
+    summary["raw_evidence_omitted"] = bool(
+        event.get("raw_evidence_omitted") is True or payload_ref
+    )
+    summary["raw_data_status"] = (
+        "omitted" if summary["raw_evidence_omitted"] else "public_safe"
+    )
     return summary
+
+
+def _acceptance_evidence_projection(
+    roots: Sequence[Mapping[str, Any]],
+    provenance: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    projected: list[dict[str, Any]] = []
+    for root in roots:
+        for key in ("acceptance_evidence", "acceptance_verification", "criterion_evidence"):
+            raw = root.get(key)
+            values = raw if isinstance(raw, list) else [raw]
+            for value in values:
+                item = _mapping(value)
+                criterion_id = _text(
+                    item.get("criterion_id")
+                    or item.get("acceptance_id")
+                    or item.get("id")
+                )
+                if not criterion_id:
+                    continue
+                scope = _mapping(item.get("required_scope") or item.get("scope_binding"))
+                public_scope: dict[str, Any] = {}
+                kind = _public_compat_scalar(scope.get("kind"))
+                if isinstance(kind, str):
+                    public_scope["kind"] = kind
+                for scope_key in ("files", "nodes"):
+                    raw_values = scope.get(scope_key)
+                    if not isinstance(raw_values, list):
+                        continue
+                    safe_values = [
+                        public
+                        for candidate in raw_values[:64]
+                        if isinstance((public := _public_compat_scalar(candidate)), str)
+                    ]
+                    if safe_values:
+                        public_scope[scope_key] = safe_values
+                dependency_id = _public_compat_scalar(scope.get("dependency_id"))
+                if isinstance(dependency_id, str):
+                    public_scope["dependency_id"] = dependency_id
+                projected.append({
+                    "criterion_id": criterion_id,
+                    "required_scope": public_scope,
+                    "evidence_ref": _safe_ref(
+                        item.get("evidence_ref")
+                        or item.get("source_ref")
+                        or item.get("event_ref")
+                    ),
+                    "authority_bound": (
+                        item.get("authority_bound") is True
+                        and provenance.get("classification") == "authority_bound"
+                        and provenance.get("projection_verified") is True
+                    ),
+                    "authority_source": _text(item.get("authority_source")),
+                })
+    return projected[:64]
+
+
+def _event_provenance(
+    event: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    artifact_refs: Mapping[str, Any],
+) -> dict[str, Any]:
+    del verification, artifact_refs  # Only persistence-normalized payload producers qualify.
+    event_scope = {
+        "project_id": _text(event.get("project_id")),
+        "backlog_id": _text(event.get("backlog_id")),
+        "task_id": _text(event.get("task_id")),
+        "source_event_id": _text(event.get("id") or event.get("event_id")),
+    }
+
+    def projected(classification: str, label: str, source: str) -> dict[str, Any]:
+        return {
+            "schema_version": "contract_runtime.event_provenance.v1",
+            "classification": classification,
+            "label": label,
+            "source": source,
+            "projection_source": "contract_runtime_visualization._event_provenance",
+            "projection_verified": classification != "unknown",
+            "authority_bound": classification == "authority_bound",
+            "scope": event_scope,
+        }
+
+    authority = _mapping(payload.get("source_backed_contract_gate_authority"))
+    authority_hash_valid = _canonical_envelope_hash_valid(authority, "authority_hash")
+    proof = _mapping(authority.get("worker_evidence_provenance"))
+    worker_required = (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+        "session_token_ref",
+        "fence_token_hash",
+    )
+    if (
+        authority_hash_valid
+        and authority.get("schema_version")
+        == "source_backed_contract_gate_authority.v1"
+        and authority.get("source") == "server_runtime_context_worker_proof"
+        and authority.get("source_of_authority") == "runtime_context_worker_proof"
+        and proof.get("source") == "runtime_context_copy_safe_worker_proof"
+        and proof.get("verified") is True
+        and proof.get("worker_owned") is True
+        and proof.get("observer_impersonation") is False
+        and _text(proof.get("worker_role")) == "mf_sub"
+        and all(_text(proof.get(field)) for field in worker_required)
+        and (_text(proof.get("worker_slot_id")) or _text(proof.get("worker_id")))
+        and _text(proof.get("task_id")) == event_scope["task_id"]
+    ):
+        return projected(
+            "agent_authored",
+            "Agent-authored record",
+            "server-verified worker evidence",
+        )
+
+    decision = _mapping(payload.get("contract_gate_decision"))
+    authority_source = _text(decision.get("source_of_authority"))
+    decision_valid = (
+        _canonical_envelope_hash_valid(decision, "decision_hash")
+        and decision.get("schema_version") == "contract_gate_decision.v1"
+        and decision.get("primary_decision_source") is True
+        and decision.get("action") == "task_timeline_append"
+        and decision.get("ok") is True
+        and _text(decision.get("decision")).lower() in {"allow", "warn"}
+    )
+    qa_proof = _mapping(authority.get("qa_session_proof"))
+    qa_scope_matches = all(
+        event_scope[field] and _text(qa_proof.get(field)) == event_scope[field]
+        for field in ("project_id", "backlog_id", "task_id")
+    )
+    qa_proof_valid = (
+        authority_hash_valid
+        and authority.get("schema_version")
+        == "source_backed_contract_gate_authority.v1"
+        and authority.get("source") == "server_qa_session_verification"
+        and authority.get("source_of_authority") == "qa_session_verification"
+        and qa_proof.get("schema_version") == "qa_session_scope_proof.v1"
+        and qa_proof.get("source") == "authenticated_qa_session"
+        and qa_proof.get("role") == "qa"
+        and qa_proof.get("verified") is True
+        and qa_proof.get("observer_impersonation") is False
+        and qa_proof.get("db_verified_graph_trace") is True
+        and qa_proof.get("query_source") == "qa"
+        and qa_proof.get("query_purpose") == "independent_verification"
+        and bool(qa_proof.get("graph_trace_ids"))
+        and qa_scope_matches
+    )
+    if decision_valid and authority_source == "qa_session_verification" and qa_proof_valid:
+        return projected(
+            "authority_bound",
+            "Authority-bound evidence",
+            "server-verified QA session evidence",
+        )
+
+    lineage = _mapping(payload.get("bounded_worker_dispatch_child_route_lineage"))
+    if (
+        lineage.get("schema_version")
+        == "bounded_worker_dispatch_child_route_lineage.v1"
+        and lineage.get("accepted") is True
+        and lineage.get("service_generated") is True
+        and lineage.get("source") == "observer_runtime_text_prepare"
+        and lineage.get("acceptance_source")
+        == "service_generated_runtime_text_dispatch"
+        and _text(lineage.get("task_id")) == event_scope["task_id"]
+        and _text(lineage.get("runtime_context_id"))
+        and _text(lineage.get("parent_task_id"))
+        and _text(lineage.get("worker_slot_id"))
+        and _text(lineage.get("route_token_ref"))
+        and _text(lineage.get("parent_route_context_hash"))
+        and _text(lineage.get("child_route_context_hash"))
+    ):
+        return projected(
+            "system_dispatched",
+            "System-dispatched record",
+            "service-generated dispatch lineage",
+        )
+    return projected(
+        "unknown",
+        "Provenance unknown",
+        "no verified source-backed provenance binding",
+    )
+
+
+def _canonical_envelope_hash_valid(value: Mapping[str, Any], field: str) -> bool:
+    actual = _text(value.get(field))
+    if not actual.startswith("sha256:"):
+        return False
+    body = {key: item for key, item in dict(value).items() if key != field}
+    try:
+        canonical = json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+    except TypeError:
+        canonical = json.dumps(
+            repr(body), sort_keys=True, separators=(",", ":")
+        )
+    expected = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return actual == expected
+
+
+def _backlog_disposition_state(status: Any) -> str:
+    normalized = _text(status).upper()
+    if normalized == "FIXED":
+        return "fixed"
+    if normalized == "WAIVED":
+        return "waived"
+    if normalized == "SUPERSEDED":
+        return "superseded"
+    if normalized in {"CLOSED", "DONE", "RESOLVED"}:
+        return "closed"
+    if normalized in {"OPEN", "QUEUED", "CLAIMED", "IN_CHAIN", "RUNNING"}:
+        return "open"
+    return "unavailable"
 
 
 def _legacy_advisory(value: Any) -> dict[str, Any]:
@@ -945,7 +1181,7 @@ def build_contract_runtime_visualization(
     } for line in line_states if line.get("bypassed") and isinstance(line.get("bypass"), Mapping)]
 
     row_status = _text(backlog.get("status"))
-    close_state = "closed" if row_status.upper() in {"FIXED", "CLOSED"} else "open"
+    close_state = _backlog_disposition_state(row_status)
     projection_source_refs = _safe_refs(current.get("source_refs") or [])
     return {
         "schema_version": SCHEMA_VERSION,
@@ -992,6 +1228,7 @@ def build_contract_runtime_visualization(
         },
         "backlog_close_readiness": {
             "state": close_state,
+            "disposition_status": row_status.upper() or "UNAVAILABLE",
             "backlog_status": row_status,
             "contract_execution_state": _text(runtime_current.get("readiness_state")),
             "contract_complete_implies_backlog_close": False,

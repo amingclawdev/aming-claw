@@ -9,6 +9,9 @@ import {
   buildBacklogEmptyVerificationFixtureDagForTest,
   buildBacklogParallelTimelineFixtureDagForTest,
   buildBacklogSemanticLaneParityFixtureDagForTest,
+  acceptanceCriteriaFrom,
+  acceptanceCriterionVerification,
+  BacklogAcceptanceCriteria,
   filterBacklogHotWindowRows,
 } from "./BacklogView";
 
@@ -153,7 +156,9 @@ assertBacklogAuthority(
 );
 assertBacklogAuthority(
   backlogViewSource.includes("Historical compact ledger (advisory)")
-    && backlogViewSource.includes("Historical ledger action (advisory)"),
+    && backlogViewSource.includes("Historical action (advisory)")
+    && backlogViewSource.includes("{historicalOpen ? <>")
+    && backlogViewSource.includes("<CompactLedgerPanel ledger={compactLedger}"),
   "legacy compact-ledger actions must be labeled advisory when canonical authority is present",
 );
 assertBacklogAuthority(
@@ -244,4 +249,78 @@ assertBacklogAuthority(
     && authorityPanelSsr.includes("WAIVED · record 2 · waiver approved · diagnostic AC-DIAG-WAIVER")
     && !authorityPanelSsr.includes("CONTINUE_WITH_AUDITED_BYPASS"),
   "bypass history must render canonical BYPASSED/WAIVED labels while retaining reason and diagnostic refs",
+);
+
+const cl188AcceptanceObjects = Array.from({ length: 6 }, (_, index) => ({
+  id: `CL188-0${index + 1}`,
+  text: `CL188 criterion ${index + 1}`,
+  required_scope: {
+    kind: index === 1 ? "files_and_nodes" : "files",
+    files: index === 1 ? ["corridor_kit/compiler.py", "tests/test_corridor_kit.py"] : ["tests/test_corridor_kit.py"],
+    ...(index === 1 ? { nodes: ["source_pipeline_admission"] } : {}),
+  },
+}));
+const normalizedCl188 = acceptanceCriteriaFrom(cl188AcceptanceObjects);
+assertBacklogAuthority(
+  normalizedCl188.length === 6
+    && normalizedCl188[1]?.id === "CL188-02"
+    && normalizedCl188[1]?.text === "CL188 criterion 2"
+    && normalizedCl188[1]?.required_scope?.nodes?.[0] === "source_pipeline_admission",
+  "CL188 six-object acceptance must preserve stable id, text, and required scope",
+);
+const cl188UnknownMarkup = renderToStaticMarkup(<BacklogAcceptanceCriteria criteria={normalizedCl188} events={[]} />);
+assertBacklogAuthority(
+  cl188UnknownMarkup.includes("CL188-01")
+    && cl188UnknownMarkup.includes("CL188 criterion 6")
+    && cl188UnknownMarkup.includes("file: tests/test_corridor_kit.py")
+    && cl188UnknownMarkup.includes("verification unknown")
+    && !cl188UnknownMarkup.includes("[object Object]"),
+  "structured acceptance SSR must render six objects without object coercion or fabricated verification",
+);
+const boundCriterionEvent = {
+  id: 18801,
+  event_id: "18801",
+  project_id: "aming-claw",
+  event_type: "qa.acceptance",
+  event_kind: "verification",
+  backlog_id: "CL188",
+  task_id: "cex-cl188",
+  provenance: {
+    schema_version: "contract_runtime.event_provenance.v1",
+    classification: "authority_bound",
+    label: "Authority-bound evidence",
+    source: "server-verified QA session evidence",
+    projection_source: "contract_runtime_visualization._event_provenance",
+    projection_verified: true,
+    authority_bound: true,
+    scope: {
+      project_id: "aming-claw",
+      backlog_id: "CL188",
+      task_id: "cex-cl188",
+      source_event_id: "18801",
+    },
+  },
+  acceptance_evidence: [{
+      criterion_id: "CL188-02",
+      required_scope: cl188AcceptanceObjects[1]?.required_scope,
+      evidence_ref: "timeline:18801",
+      authority_bound: true,
+      authority_source: "qa_session_verification",
+  }],
+  payload: {},
+};
+assertBacklogAuthority(
+  acceptanceCriterionVerification(normalizedCl188[1]!, [boundCriterionEvent]) === "verified",
+  "only an explicit matching authority, scope, and evidence ref may verify acceptance",
+);
+const mismatchedBinding = structuredClone(boundCriterionEvent);
+mismatchedBinding.acceptance_evidence[0]!.required_scope = { kind: "files", files: ["different.py"] };
+assertBacklogAuthority(
+  acceptanceCriterionVerification(normalizedCl188[1]!, [mismatchedBinding]) === "unlinked",
+  "mismatched acceptance scope must remain unlinked",
+);
+const legacyAcceptance = acceptanceCriteriaFrom(["legacy acceptance string"]);
+assertBacklogAuthority(
+  legacyAcceptance[0]?.legacy === true && legacyAcceptance[0]?.text === "legacy acceptance string",
+  "legacy string acceptance must remain supported",
 );

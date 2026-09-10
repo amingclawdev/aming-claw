@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError } from "../lib/api";
+import { api, ApiError, durableTimelineEventId } from "../lib/api";
 import {
   useEventStreamWithFreshness,
   sseStatusTone,
@@ -20,7 +20,6 @@ import {
   readPlaybackEventParam,
   resolveInitialPlaybackFrameId,
   resolveSelectedFrameIdForEventParam,
-  contractRuntimeCompatibilityRepairValues,
   taskPlaybackNextLegalActionPresentations,
   projectBacklogHotWindow,
   projectCurrentTimelineHotWindow,
@@ -166,6 +165,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   // included a playback_event param, we hold the raw event-id string here and
   // resolve it to a frame once the trace finishes loading (async race guard).
   const [selectedEventParam, setSelectedEventParamState] = useState<string>(() => readPlaybackEventParam());
+  const [exactEventError, setExactEventError] = useState("");
   const selectedEventParamRef = useRef(readPlaybackEventParam());
   const setSelectedEventParam = useCallback((value: string) => {
     selectedEventParamRef.current = value;
@@ -254,6 +254,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setSelectedBugId(readSelectedBacklogId());
     setSelectedFrameId("");
     setSelectedEventParam(readPlaybackEventParam());
+    setExactEventError("");
     setSelectedActivityFrameId("");
     setEventsPage(0);
     setPlaying(false);
@@ -743,7 +744,10 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     const resolution = resolveSelectedFrameIdForEventParam(frames, selectedEventParam, selectedFrameId);
     if (resolution.matched) {
       setSelectedFrameId(resolution.frameId);
+      setExactEventError("");
       setPlaying(false);
+    } else {
+      setExactEventError(`Durable event ${selectedEventParam} is unavailable in this scoped playback response.`);
     }
     // Clear the pending state regardless of whether we found a match so later
     // event-card clicks for the same warm trace can re-resolve a new param.
@@ -772,6 +776,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     setSelectedFrameId("");
     // Clear any pending deep-link event param — user is manually switching rows.
     setSelectedEventParam("");
+    setExactEventError("");
     setPlaying(false);
     writeSelectedBacklogId(bugId);
   };
@@ -784,11 +789,12 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   const navigateToPlaybackEvent = useCallback((backlogId: string, eventId?: string | number | null) => {
     const targetBacklogId = backlogId.trim();
     if (!targetBacklogId) return;
-    const nextEventId = eventId != null ? String(eventId) : "";
+    const nextEventId = durableTimelineEventId(eventId);
     navigateToPlayback(targetBacklogId, nextEventId);
     setSelectedBugId(targetBacklogId);
     setMode("history");
     setPlaying(false);
+    setExactEventError("");
     if (nextEventId) {
       const warmFrames = playbackByBugRef.current[targetBacklogId]?.trace.frames ?? [];
       const resolution = resolveSelectedFrameIdForEventParam(warmFrames, nextEventId, "");
@@ -816,7 +822,13 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
       ? activityTrace.frames.find((frame) => frame.id === selectedActivityFrameId)
       : null;
     const frame = selectedActivityFrame ?? activityTrace.frames[activityTrace.frames.length - 1] ?? null;
-    const eventId = frame?.source_event_id || frame?.id || "";
+    if (frame?.identity_kind === "current_snapshot") {
+      setLocalActivityBugId(backlogId);
+      setSelectedActivityFrameId(frame.id);
+      setMode("activity");
+      return;
+    }
+    const eventId = frame?.durable_event_id || "";
     navigateToPlayback(backlogId, eventId);
     setSelectedBugId(backlogId);
     if (eventId) {
@@ -928,7 +940,16 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 // the Playback view can select the matching frame after load.
                 // F4: Use pushState so the browser Back button restores the
                 // Current tab card list (popstate handler reads ACTIVITY_TAB_PARAM).
-                const eventId = card.id != null ? String(card.id) : "";
+                if (card.identity_kind === "current_snapshot") {
+                  setLocalActivityBugId(card.backlog_id);
+                  const currentFrame = playbackByBugRef.current[card.backlog_id]?.trace.frames.find(
+                    (frame) => frame.source_event_id === String(card.id) || frame.contract_execution_id === card.contract_execution_id,
+                  );
+                  setSelectedActivityFrameId(currentFrame?.id ?? "");
+                  setMode("activity");
+                  return;
+                }
+                const eventId = card.durable_event_id;
                 navigateToPlayback(card.backlog_id, eventId);
                 setSelectedBugId(card.backlog_id);
                 const warmFrames = playbackByBugRef.current[card.backlog_id]?.trace.frames ?? [];
@@ -1123,12 +1144,11 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
               )}
             </div>
             <NextLegalActionCallout trace={activeTrace} selectedFrameId={activeFrameId} surface="Playback" />
-            <CompatibilityRepairTargets trace={activeTrace} surface="Playback" />
             <TaskPlaybackPanel
               trace={activeTrace}
               selectedFrameId={activeFrameId}
               loading={selectedPlaybackLoading}
-              error={selectedPlaybackError}
+              error={[selectedPlaybackError, exactEventError].filter(Boolean).join(" | ")}
               onSelectFrame={(frameId) => {
                 setSelectedFrameId(frameId);
                 setPlaying(false);
@@ -1197,7 +1217,7 @@ function NextLegalActionCallout({
     >
       <header style={{ alignItems: "baseline", display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "space-between" }}>
         <strong style={{ color: "var(--ink-900)", fontSize: 15 }}>{surface} · Next legal action</strong>
-        <small style={{ color: "var(--ink-600)" }}>ContractRuntime/current-chain first · historical actions advisory</small>
+        <small style={{ color: "var(--ink-600)" }}>ContractRuntime/current-chain authority</small>
       </header>
       <div style={{ display: "grid", gap: 8 }}>
         {actions.map((item) => {
@@ -1249,20 +1269,11 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
     laneStatusSummary(trace, "verification", "QA"),
     laneStatusSummary(trace, "gate", "close gate"),
   ]);
-  const nextExpected = authority
-    ? currentAction?.evidence_kind || "none recorded"
-    : trace.close_gate_summary.next_expected_evidence.length > 0
-    ? trace.close_gate_summary.next_expected_evidence.join(", ")
-    : firstHintValue(latestEvent, ["next_expected_evidence", "missing_event_kinds", "missing_requirement_ids"]) || "none recorded";
+  const nextExpected = authority ? currentAction?.evidence_kind || "none recorded" : "current authority unavailable";
   const authorityBlocker = currentAction?.block_reason
     || authority?.contract_execution_progress.line_states.find((line) => line.display_status === "BLOCKED" || line.display_status === "FAILED")?.line_id
     || "";
-  const blocker = authority
-    ? authorityBlocker || "none recorded"
-    : latestFrame?.failure_diagnosis[0]
-    ? `${latestFrame.failure_diagnosis[0].label}: ${latestFrame.failure_diagnosis[0].value}`
-    : firstHintValue(latestEvent, ["blocker_ids", "blockers", "missing_event_kinds", "missing_requirement_ids"])
-      || (trace.close_gate_summary.blocked ? trace.close_gate_summary.reason_sentence : "none recorded");
+  const blocker = authority ? authorityBlocker || "none recorded" : "current authority unavailable";
   const activeCount = hint?.active_count != null ? `${hint.active_count} active` : "";
   const singleActive = hint?.single_active_task ? singleActiveSummary(hint.single_active_task) : "";
   const compactRuntimeState = currentSnapshot
@@ -1272,7 +1283,6 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
       currentSnapshot.next_legal_action.action || currentSnapshot.next_legal_action.id,
     ])
     : "";
-  const compatibilityRepairTargets = contractRuntimeCompatibilityRepairValues(authority);
   return (
     <div className="task-playback-chip-section" aria-label="Current stream state">
       <strong>Current stream state</strong>
@@ -1285,37 +1295,10 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
         <span>Worker/QA/close gate: {laneState || "none recorded"}</span>
         {authority ? <span>Contract progress: {authority.contract_execution_progress.display_status}</span> : null}
         {authority ? <span>Backlog row close authority: {authority.backlog_close_readiness.display_status}</span> : null}
-        {authority ? (
-          <span>
-            Historical diagnostics: {authority.historical_diagnostics.timeline_events.length} events
-            {authority.historical_diagnostics.truncated ? `; partial; next cursor ${authority.historical_diagnostics.next_cursor || "available"}` : "; response complete"}
-          </span>
-        ) : null}
         <span>Next expected evidence: {nextExpected}</span>
         <span>Blocker: {blocker}</span>
-        {compatibilityRepairTargets.map((target) => (
-          <span key={target}>Compatibility repair target (advisory): {target}</span>
-        ))}
       </div>
     </div>
-  );
-}
-
-function CompatibilityRepairTargets({ trace, surface }: { trace: TaskPlaybackTrace; surface: string }) {
-  const targets = contractRuntimeCompatibilityRepairValues(trace.authority_view);
-  if (targets.length === 0) return null;
-  return (
-    <details className="task-playback-compatibility-details" aria-label={`${surface} compatibility repair targets`}>
-      <summary>
-        <strong>{surface} compatibility repair targets (advisory)</strong>
-        <span>{targets.length}</span>
-      </summary>
-      <div className="task-playback-chip-section">
-        <div>
-          {targets.map((target) => <span key={target}>{target}</span>)}
-        </div>
-      </div>
-    </details>
   );
 }
 
@@ -1325,34 +1308,11 @@ function laneStatusSummary(trace: TaskPlaybackTrace, laneId: string, label: stri
   return `${label} ${lane.status} (${lane.frame_count})`;
 }
 
-function firstHintValue(record: Record<string, unknown>, keys: string[]): string {
-  for (const key of keys) {
-    const value = compactUnknown(record[key]);
-    if (value) return value;
-  }
-  return "";
-}
-
 function hintText(record: Record<string, unknown>, key: string): string {
   const value = record[key];
   if (typeof value === "string") return value.trim();
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return "";
-}
-
-function compactUnknown(value: unknown): string {
-  if (value == null || value === "") return "";
-  if (Array.isArray(value)) return value.map(compactUnknown).filter(Boolean).slice(0, 6).join(", ");
-  if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .map(([key, item]) => {
-        const text = compactUnknown(item);
-        return text ? `${key}: ${text}` : "";
-      })
-      .filter(Boolean);
-    return entries.slice(0, 4).join("; ");
-  }
-  return String(value).trim();
 }
 
 function compactJoin(values: string[]): string {
@@ -1608,6 +1568,7 @@ function ActivityEventCardList({
             ? new Date(card.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })
             : "";
           const canOpenPlayback = Boolean(card.backlog_id);
+          const actionLabel = card.identity_kind === "current_snapshot" ? "Open Current state" : "Open playback history";
           return (
             <li
               key={card.id}
@@ -1618,8 +1579,8 @@ function ActivityEventCardList({
                 className="activity-event-card-btn"
                 onClick={() => onCardClick(card)}
                 disabled={!canOpenPlayback}
-                aria-label={canOpenPlayback ? `Open playback history for ${card.backlog_id}` : `Playback unavailable for ${card.event_kind}`}
-                title={canOpenPlayback ? `Open playback history for ${card.backlog_id}` : "Playback unavailable: event has no backlog_id"}
+                aria-label={canOpenPlayback ? `${actionLabel} for ${card.backlog_id}` : `Event unavailable for ${card.event_kind}`}
+                title={canOpenPlayback ? `${actionLabel} for ${card.backlog_id}` : "Event unavailable: event has no backlog_id"}
               >
                 <div className="activity-event-card-meta">
                   <span className="activity-event-card-time mono">{at}</span>
@@ -1628,22 +1589,14 @@ function ActivityEventCardList({
                   {card.backlog_id ? (
                     <span className="activity-event-card-backlog-tag mono" title={card.backlog_id}>{card.backlog_id}</span>
                   ) : null}
+                  <span>{card.identity_label}</span>
+                  <span className={`task-playback-provenance provenance-${card.provenance.kind}`} title={card.provenance.source}>{card.provenance.label}</span>
                 </div>
                 <div className="activity-event-card-body">
                   <strong className="activity-event-card-kind">{card.event_kind}</strong>
                   <p className="activity-event-card-headline">{card.headline}</p>
+                  {card.structured_view_status !== "supported" ? <span className="status-badge status-unknown">unsupported structured view</span> : null}
                 </div>
-                {card.next_legal_action ? (
-                  <div
-                    className={`activity-event-card-next-action activity-event-card-next-action--${card.next_legal_action_disposition.toLowerCase()}`}
-                    data-next-legal-action-authority="advisory"
-                    data-next-legal-action-disposition={card.next_legal_action_disposition}
-                  >
-                    <strong>Advisory next legal action</strong>
-                    <b>{card.next_legal_action_disposition}</b>
-                    <span>{card.next_legal_action}</span>
-                  </div>
-                ) : null}
                 {card.evidence_count > 0 ? (
                   <div className="activity-event-card-evidence">
                     <span>{card.evidence_count} ref{card.evidence_count === 1 ? "" : "s"}</span>

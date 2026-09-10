@@ -30,6 +30,7 @@ import {
   pushPlaybackNavStack,
   popPlaybackNavStack,
   projectEventToCard,
+  projectTaskPlaybackFrame,
   sliceEventPage,
   truncateHash,
   categorizeEvidenceRef,
@@ -47,7 +48,7 @@ import {
 } from "./taskPlayback";
 import { projectTaskTimelineEvent, projectGateMatrix, timelineStatusFromEvent } from "./taskTimelineSemantics";
 import type { GateMatrixProjection } from "./taskTimelineSemantics";
-import { api } from "./api";
+import { api, durableTimelineEventId } from "./api";
 // BacklogView still cannot be imported in Node because it binds React/browser state.
 // Lane attribution (AC-3) and DAG headline (AC-2) are verified below via semantic
 // projections of the same event shapes used by BacklogView's rawWorkerKeyForEvent.
@@ -1198,6 +1199,7 @@ export const taskPlaybackHistoricalSemanticFixtureSummary = [
   ...taskPlaybackAuthorityAdapterAssertions(),
   ...taskPlaybackTypedDagAssertions(),
   ...taskPlaybackCompactLedgerProjectionAssertions(),
+  ...taskPlaybackAuthorityOnlyFallbackAssertions(),
 ];
 
 function assertFixture(condition: boolean, message: string): void {
@@ -1346,6 +1348,224 @@ async function taskPlaybackApiSingleFlightAssertions(): Promise<string[]> {
 }
 
 export const taskPlaybackApiSingleFlightSummary = await taskPlaybackApiSingleFlightAssertions();
+
+function taskPlaybackAuthorityOnlyFallbackAssertions(): string[] {
+  for (const status of ["no_pass", "terminal_no_pass", "not_passed"]) {
+    assertFixture(contractRuntimeAuthorityDisplayStatus(status) === "FAILED", `${status} must never normalize to PASS`);
+  }
+  assertFixture(contractRuntimeAuthorityDisplayStatus("closed") === "COMPLETED", "closed execution must not synthesize QA PASS");
+  assertFixture(contractRuntimeAuthorityDisplayStatus("passage_recorded") !== "PASS", "unknown pass-like strings must never become PASS by substring");
+  assertFixture(contractRuntimeAuthorityDisplayStatus("FIXED") === "FIXED", "FIXED disposition must remain distinct");
+  assertFixture(contractRuntimeAuthorityDisplayStatus("SUPERSEDED") === "SUPERSEDED", "SUPERSEDED disposition must remain distinct");
+
+  const unknownEvent: TaskTimelineEvent = {
+    id: 901,
+    event_id: "901",
+    event_type: "future.renderer.unknown",
+    event_kind: "future_kind",
+    project_id: "aming-claw",
+    backlog_id: "AC-FALLBACK",
+    task_id: "cex-fallback",
+    contract_execution_id: "cex-fallback",
+    actor: "untrusted actor claiming authority",
+    status: "no_pass",
+    payload: {
+      api_token: "secret-value-must-not-render",
+      worktree_path: "/Users/private/worktree",
+      markup: "<script>globalThis.fixtureExecuted=true</script>",
+    },
+    created_at: "2026-09-10T08:00:00Z",
+  };
+  const unknownFrame = projectTaskPlaybackFrame(unknownEvent);
+  assertFixture(unknownFrame.structured_view_status === "unsupported", "unknown event types must retain an unsupported frame");
+  assertFixture(
+    unknownFrame.source_event_id === "901"
+      && unknownFrame.backlog_id === "AC-FALLBACK"
+      && unknownFrame.contract_execution_id === "cex-fallback",
+    "fallback frame must retain identity and scope",
+  );
+  assertFixture(
+    !JSON.stringify(unknownFrame.detail_inspector).includes("secret-value-must-not-render")
+      && !JSON.stringify(unknownFrame.detail_inspector).includes("/Users/private/worktree"),
+    "fallback inspector must redact token/private-path values",
+  );
+  const rendererFailure = projectTaskPlaybackFrame(unknownEvent, 0, () => { throw new Error("fixture renderer failure"); });
+  assertFixture(rendererFailure.structured_view_status === "renderer_error", "renderer failure must retain a safe fallback frame");
+
+  const projectedProvenance = (
+    classification: "authority_bound" | "agent_authored" | "system_dispatched",
+    source: string,
+  ): TaskTimelineEvent["provenance"] => ({
+    schema_version: "contract_runtime.event_provenance.v1",
+    classification,
+    label: classification,
+    source,
+    projection_source: "contract_runtime_visualization._event_provenance",
+    projection_verified: true,
+    authority_bound: classification === "authority_bound",
+    scope: {
+      project_id: "aming-claw",
+      backlog_id: "AC-FALLBACK",
+      task_id: "cex-fallback",
+      source_event_id: "901",
+    },
+  });
+  const authorityEvent: TaskTimelineEvent = {
+    ...unknownEvent,
+    provenance: projectedProvenance("authority_bound", "server-verified QA session evidence"),
+  };
+  assertFixture(projectTaskPlaybackFrame(authorityEvent).provenance.kind === "authority_bound", "verified, scope-matched producer projection must label authority-bound evidence");
+  for (const forged of [
+    { ...unknownEvent, provenance: { classification: "authority_bound", authority_bound: true } },
+    { ...unknownEvent, payload: { source_backed_contract_gate_authority: { contract_execution_id: "cex-fallback" } } },
+    { ...unknownEvent, payload: { direct_contract_runtime_binding: { contract_execution_id: "cex-fallback", line_id: "observer_implementation" } } },
+    {
+      ...unknownEvent,
+      payload: {
+        contract_gate_decision: {
+          schema_version: "contract_gate_decision.v1",
+          primary_decision_source: true,
+          action: "task_timeline_append",
+          ok: true,
+          decision: "allow",
+          decision_hash: `sha256:${"a".repeat(64)}`,
+          source_of_authority: "qa_session_verification",
+        },
+      },
+    },
+    {
+      ...unknownEvent,
+      provenance: {
+        ...projectedProvenance("authority_bound", "server-verified QA session evidence"),
+        scope: {
+          project_id: "aming-claw",
+          backlog_id: "AC-DIFFERENT",
+          task_id: "cex-fallback",
+          source_event_id: "901",
+        },
+      },
+    },
+    {
+      ...unknownEvent,
+      payload: {
+        source_backed_contract_gate_authority: {
+          schema_version: "source_backed_contract_gate_authority.v1",
+          source: "server_runtime_context_worker_proof",
+          source_of_authority: "runtime_context_worker_proof",
+          authority_hash: `sha256:${"b".repeat(64)}`,
+          worker_evidence_provenance: {
+            source: "runtime_context_copy_safe_worker_proof",
+            verified: true,
+            worker_owned: true,
+            observer_impersonation: false,
+            task_id: "different-task",
+          },
+        },
+      },
+    },
+  ] satisfies TaskTimelineEvent[]) {
+    assertFixture(projectTaskPlaybackFrame(forged).provenance.kind === "unknown", "forged, incomplete, or mismatched provenance must remain unknown");
+  }
+
+  const agentEvent: TaskTimelineEvent = {
+    ...unknownEvent,
+    provenance: projectedProvenance("agent_authored", "server-verified worker evidence"),
+  };
+  assertFixture(projectTaskPlaybackFrame(agentEvent).provenance.kind === "agent_authored", "verified worker producer projection must label an agent-authored record");
+  const dispatchEvent: TaskTimelineEvent = {
+    ...unknownEvent,
+    provenance: projectedProvenance("system_dispatched", "service-generated dispatch lineage"),
+  };
+  assertFixture(projectTaskPlaybackFrame(dispatchEvent).provenance.kind === "system_dispatched", "verified dispatch producer projection must label a system dispatch");
+
+  const snapshot = projectEventToCard({
+    ...unknownEvent,
+    id: undefined,
+    event_id: "contract-runtime-current:cex-fallback",
+    event_type: "contract_runtime.current_state",
+    payload: { synthetic_current: true, append_only_history: false },
+  });
+  const durable = projectEventToCard(unknownEvent);
+  assertFixture(snapshot.identity_kind === "current_snapshot" && snapshot.durable_event_id === "", "synthetic state must be snapshot-not-history");
+  assertFixture(durable.identity_kind === "durable_event" && durable.durable_event_id === "901", "numeric append-only event must retain durable identity");
+  assertFixture(!buildPlaybackUrl("aming-claw", "AC-FALLBACK", snapshot.id).includes("playback_event="), "typed snapshot id must never enter Playback exact_event_id");
+  assertFixture(buildPlaybackUrl("aming-claw", "AC-FALLBACK", 901).includes("playback_event=901"), "durable event id must remain exact-linkable");
+  assertFixture(durableTimelineEventId("contract-runtime-current:cex-fallback") === "" && durableTimelineEventId("0") === "", "typed and zero ids must not coerce to a durable event");
+  return ["authority-only terminals, fallback rendering, provenance, and durable identity fixtures passed"];
+}
+
+async function taskPlaybackLazyRawAssertions(): Promise<string[]> {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  let responseProject = "aming-claw";
+  let eventProject = "aming-claw";
+  let eventContractExecution = "cex-raw";
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    await Promise.resolve();
+    return new Response(JSON.stringify({
+      ok: true,
+      project_id: responseProject,
+      backlog_id: "AC-RAW-BOUNDARY",
+      events: [],
+      count: 0,
+      exact_event: {
+        id: 902,
+        event_id: "902",
+        project_id: eventProject,
+        backlog_id: "AC-RAW-BOUNDARY",
+        task_id: "cex-raw",
+        contract_execution_id: eventContractExecution,
+        event_type: "future.raw",
+        payload: { access_token: "raw-secret", host_path: "/Users/private/raw" },
+        payload_json: JSON.stringify({ access_token: "raw-secret-json-column", host_path: "/Users/private/raw-json-column" }),
+      },
+      request_id: "req-raw-fixture",
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    const event = await api.timelineEventRawFor("aming-claw", "AC-RAW-BOUNDARY", 902, "cex-raw");
+    const rendered = JSON.stringify(event);
+    assertFixture(fetchCount === 1, "raw exact event should load only when the lazy API is called");
+    assertFixture(
+      !rendered.includes("raw-secret")
+        && !rendered.includes("raw-secret-json-column")
+        && !rendered.includes("/Users/private/raw"),
+      "decoded and JSON-column raw exact data must be sanitized before renderer/copy access",
+    );
+    responseProject = "different-project";
+    let scopedError = "";
+    try {
+      await api.timelineEventRawFor("aming-claw", "AC-RAW-BOUNDARY", 902, "cex-raw");
+    } catch (error) {
+      scopedError = String(error);
+    }
+    assertFixture(scopedError.includes("project/backlog scope"), "raw exact response must reject mismatched project scope");
+    responseProject = "aming-claw";
+    eventProject = "different-project";
+    scopedError = "";
+    try {
+      await api.timelineEventRawFor("aming-claw", "AC-RAW-BOUNDARY", 902, "cex-raw");
+    } catch (error) {
+      scopedError = String(error);
+    }
+    assertFixture(scopedError.includes("requested event scope"), "raw exact response must reject a cross-project event inside a matching response envelope");
+    eventProject = "aming-claw";
+    eventContractExecution = "cex-delayed-other";
+    scopedError = "";
+    try {
+      await api.timelineEventRawFor("aming-claw", "AC-RAW-BOUNDARY", 902, "cex-raw");
+    } catch (error) {
+      scopedError = String(error);
+    }
+    assertFixture(scopedError.includes("selected ContractRuntime execution"), "raw exact response must reject a delayed event from another CEX");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  return ["lazy raw exact-event fetch is scoped and sanitized"];
+}
+
+export const taskPlaybackLazyRawSummary = await taskPlaybackLazyRawAssertions();
 
 function typedDagVisualizationFixture(
   contractId: "direct_main.v1" | "mf_parallel.v2" | "mf_batch_parallel.v1",
@@ -1829,9 +2049,8 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     "Current and Playback presentation data should retain every canonical runtime/current-chain next action",
   );
   assertFixture(
-    nextActionPresentations.some((item) => item.label === "Selected event next legal action (advisory)" && item.action_text.includes("dedicated Current and Playback action callout"))
-      && nextActionPresentations.some((item) => item.label === "Legacy next legal action (advisory)" && item.advisory_only),
-    "Playback selected-event and legacy next actions should remain explicit advisory callouts",
+    !nextActionPresentations.some((item) => item.source.startsWith("selected_event:") || item.source === "legacy_close_gate_summary" || item.source.startsWith("legacy_advisory:")),
+    "ordinary Current and Playback actions must exclude selected-event and legacy advisory actions",
   );
   const legacyFallbackPresentations = taskPlaybackNextLegalActionPresentations({
     ...nextActionTrace,
@@ -1844,8 +2063,8 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     },
   });
   assertFixture(
-    legacyFallbackPresentations.some((item) => item.source === "legacy_close_gate_summary" && item.disposition === "ADVISORY" && item.action_text.includes("legacy close-gate repair remains visible")),
-    "legacy/no-authority Current data should retain close-gate next action as an advisory callout",
+    legacyFallbackPresentations.length === 0,
+    "missing current authority must remain unavailable instead of promoting a legacy close-gate action",
   );
 
   for (const dispositionFixture of [
@@ -2085,14 +2304,14 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
   );
   assertFixture(
     new Set(dogfoodViews.map((view) => view.cache_identity.key)).size === dogfoodViews.length
-      && dogfoodViews.every((view) => view.backlog_close_readiness.display_status === "BLOCKED"),
-    "dogfood executions/revisions/events should remain cache-distinct while OPEN row close stays blocked",
+      && dogfoodViews.every((view) => view.backlog_close_readiness.display_status === "OPEN"),
+    "dogfood executions/revisions/events should remain cache-distinct while actual OPEN backlog disposition stays OPEN",
   );
   const dogfoodAuthorityMatrices = dogfoodViews.map((view) => projectContractRuntimeGateMatrix(view));
   assertFixture(
     dogfoodAuthorityMatrices.every((matrix) => matrix.gatePresent && !matrix.overallPassed)
-      && dogfoodAuthorityMatrices.every((matrix) => matrix.rows.some((row) => row.id === "contract_runtime.backlog_close_readiness" && row.status === "failed")),
-    "direct-main, mf_parallel, and mf_batch_parallel Contract & Gate matrices must derive blocked close state from canonical authority",
+      && dogfoodAuthorityMatrices.every((matrix) => matrix.rows.some((row) => row.id === "contract_runtime.backlog_close_readiness" && row.status === "unknown")),
+    "direct-main, mf_parallel, and mf_batch_parallel matrices must keep OPEN backlog disposition separate from execution blockers",
   );
   assertFixture(
     dogfoodAuthorityMatrices[1].rows.some((row) => row.familyLabel === "ContractRuntime worker execution")
@@ -2661,8 +2880,9 @@ function taskPlaybackAuditCloseAssertions(): string[] {
     "WAIVED rows should be visually distinct from normal FIXED rows",
   );
   assertFixture(
-    backlogViewSource.includes("Audit close") && backlogViewSource.includes("Evidence") && backlogViewSource.includes("not reconstructed"),
-    "detail summary should surface audit close, QA acceptance, and non-reconstructed evidence state",
+    backlogViewSource.includes("Load historical MF gate, contract inputs and public-safe raw audit")
+      && backlogViewSource.includes("Historical MF close gate (advisory)"),
+    "legacy close and audit evidence should remain behind the explicit historical audit control",
   );
 
   const taskPlaybackViewSource = readFileSync(new URL("../views/TaskPlaybackView.tsx", import.meta.url), "utf8");
@@ -3121,6 +3341,15 @@ function taskPlaybackNewestFirstAssertions(): string[] {
       at: `2026-06-10T12:0${seq}:00Z`,
       lane_id: "observer",
       source_event_id: `#${seq}`,
+      identity_kind: "durable_event",
+      durable_event_id: String(seq),
+      backlog_id: "fixture-backlog",
+      task_id: "fixture-task",
+      contract_execution_id: "fixture-cex",
+      structured_view_status: "supported",
+      structured_view_message: "",
+      provenance: { kind: "unknown", label: "Provenance unknown", source: "test fixture" },
+      raw_data: { status: "available", payload_bytes: null, truncated: false, notice: "test fixture" },
       event_type: "test",
       event_kind: "test",
       phase: "test",
@@ -3836,19 +4065,21 @@ function taskPlaybackProjectEventToCardAssertions(): string[] {
   }
 
   const activityViewSource = readFileSync(new URL("../views/TaskPlaybackView.tsx", import.meta.url), "utf8");
+  const playbackPanelSource = readFileSync(new URL("../components/TaskPlaybackPanel.tsx", import.meta.url), "utf8");
   const activityStylesSource = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
   assertIa(
-    activityViewSource.includes("card.next_legal_action ?")
-      && activityViewSource.includes("activity-event-card-next-action")
-      && activityViewSource.includes('data-next-legal-action-authority="advisory"'),
-    "Current event cards should render only non-empty actions with explicit advisory authority",
+    !activityViewSource.includes("card.next_legal_action ?")
+      && activityViewSource.includes("card.identity_label")
+      && activityViewSource.includes("card.provenance.label"),
+    "Current event cards should exclude historical actions and show identity plus provenance",
   );
   assertIa(
-    activityViewSource.includes('<details className="task-playback-compatibility-details"')
+    playbackPanelSource.includes("Historical close-gate audit")
+      && playbackPanelSource.includes("{closeGateMatrixExpanded ? (")
       && activityStylesSource.includes(".task-playback-main > .task-playback-next-action-callout")
       && activityStylesSource.includes("overflow-y: auto;")
       && activityStylesSource.includes("position: sticky;"),
-    "Playback should keep the action prominent, collapse compatibility diagnostics, and make the right column vertically accessible",
+    "Playback should keep the action prominent, lazy-load historical gate diagnostics, and make the right column vertically accessible",
   );
   assertIa(
     /@media \(min-width: 981px\)[\s\S]*?\.task-playback-main > \.task-playback-panel \{[\s\S]*?height:\s*auto;[\s\S]*?min-height:\s*max-content;[\s\S]*?overflow:\s*visible;/.test(activityStylesSource)
@@ -5054,8 +5285,10 @@ function playbackLayoutFrameAreaAssertions(): string[] {
     "close gate expansion should reset only on backlog-level trace reset, not frame selection",
   );
   assertFixture(
-    /<PlaybackGateMatrix[\s\S]*expanded=\{closeGateMatrixExpanded\}[\s\S]*onToggle=\{\(\) => setCloseGateMatrixExpanded/.test(componentSource),
-    "PlaybackGateMatrix should receive persistent expanded state and a toggle",
+    componentSource.includes("Historical close-gate audit")
+      && componentSource.includes("open={closeGateMatrixExpanded}")
+      && componentSource.includes("closeGateMatrixExpanded ?"),
+    "legacy close-gate content should remain behind an explicit lazy historical audit disclosure",
   );
   assertFixture(
     /task-playback-panel[\s\S]*closeGateMatrixExpanded\s*\?\s*" close-gate-expanded"/.test(componentSource),
@@ -5153,10 +5386,10 @@ function ueBlockerUrlAssertions(): string[] {
   assertFixture(!url1.includes("playback_event="), `buildPlaybackUrl with no eventId must not emit playback_event param (got: ${url1})`);
   results.push(`buildPlaybackUrl canonical form OK: ${url1}`);
 
-  // ── buildPlaybackUrl — with string event id ──────────────────────────────
+  // ── buildPlaybackUrl — typed snapshot ids are not durable history ────────
   const url2 = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", "my-event-id", base);
-  assertFixture(url2.includes("playback_event=my-event-id"), `buildPlaybackUrl must emit playback_event param with string id (got: ${url2})`);
-  results.push(`buildPlaybackUrl with string eventId OK: ${url2}`);
+  assertFixture(!url2.includes("playback_event="), `buildPlaybackUrl must suppress typed snapshot ids (got: ${url2})`);
+  results.push(`buildPlaybackUrl suppresses typed snapshot eventId: ${url2}`);
 
   // ── buildPlaybackUrl — with numeric event id ─────────────────────────────
   const url3 = buildPlaybackUrl("aming-claw", "AC-SOME-BLOCKER-20260611", 1234, base);
@@ -5198,9 +5431,10 @@ function ueBlockerUrlAssertions(): string[] {
     "AC-RUNTIME current activity history button should not switch to sample trace without playback_backlog",
   );
   assertFixture(
-    openHistoryHandler.includes("frame?.source_event_id || frame?.id ||")
+    openHistoryHandler.includes('frame?.identity_kind === "current_snapshot"')
+      && openHistoryHandler.includes("frame?.durable_event_id ||")
       && openHistoryHandler.includes("resolveSelectedFrameIdForEventParam"),
-    "current activity history button should preserve selected/newest event when a frame id is available",
+    "current activity history button should preserve durable ids and keep synthetic snapshots in Current",
   );
   assertFixture(
     /<button\s+type="button"\s+className="action-btn"\s+onClick=\{openActivityPlaybackHistory\}>/.test(viewSource),
@@ -5233,7 +5467,7 @@ function ueBlockerUrlAssertions(): string[] {
     viewSource.includes("const selectedPlaybackLoading = (selectedState?.loading ?? false) || (!selectedBug && (selectedBacklogDetail?.loading ?? false));")
       && viewSource.includes("const selectedPlaybackError = selectedState?.error || (!selectedBug ? selectedBacklogDetail?.error ?? \"\" : \"\");")
       && viewSource.includes("loading={selectedPlaybackLoading}")
-      && viewSource.includes("error={selectedPlaybackError}"),
+      && viewSource.includes('error={[selectedPlaybackError, exactEventError].filter(Boolean).join(" | ")}'),
     "failed backlog-detail fallback should surface loading/error instead of presenting an empty no-evidence trace",
   );
   assertFixture(

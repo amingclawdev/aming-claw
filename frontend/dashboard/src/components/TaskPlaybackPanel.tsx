@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from "react";
+import { api } from "../lib/api";
 
 import type {
   ContractRuntimeAuthorityViewModel,
@@ -18,6 +19,7 @@ import {
   isPlaybackEventEvidenceRef,
   latestPlaybackFrameId,
   popPlaybackNavStack,
+  projectTaskPlaybackFrame,
   pushPlaybackNavStack,
   taskPlaybackCompactLedgerDisplayState,
   truncateHash,
@@ -33,6 +35,13 @@ type FrameDateFilter = "all" | string;
 type GraphTraceLookupState = {
   loading: boolean;
   rows: EvidenceInspectorRow[];
+  error: string;
+};
+type RawEventLookupState = {
+  frameId: string;
+  loading: boolean;
+  inspector: TaskPlaybackFrame["detail_inspector"] | null;
+  notice: string;
   error: string;
 };
 
@@ -103,7 +112,7 @@ function authorityBypassRecordLabel(record: Record<string, unknown>, index: numb
 
 export function contractRuntimeAuthorityStatusClass(status: string): string {
   const normalized = status.trim().toUpperCase();
-  if (normalized === "PASS") return "status-complete";
+  if (normalized === "PASS" || normalized === "FIXED") return "status-complete";
   if (normalized === "BLOCKED" || normalized === "FAILED") return "status-failed";
   if (normalized === "RUNNING" || normalized === "WAITING") return "status-running";
   return "status-unknown";
@@ -249,11 +258,62 @@ export default function TaskPlaybackPanel({
     null;
   const selectedFrameKey = selectedFrame?.id ?? "";
   const [advancedEvidenceOpenFrameId, setAdvancedEvidenceOpenFrameId] = useState("");
+  const [rawEventLookup, setRawEventLookup] = useState<RawEventLookupState>({
+    frameId: "",
+    loading: false,
+    inspector: null,
+    notice: "",
+    error: "",
+  });
   const [selectedEvidenceRef, setSelectedEvidenceRef] = useState<EvidenceRef | null>(null);
   const advancedEvidenceOpen = Boolean(selectedFrameKey && advancedEvidenceOpenFrameId === selectedFrameKey);
   const gate = trace.close_gate_summary;
   const selectedEvidenceLinks = selectedFrame?.evidence_links ?? selectedFrame?.evidence_refs ?? [];
   const selectedInspector = selectedFrame?.detail_inspector ?? null;
+
+  const toggleAdvancedEvidence = (open: boolean) => {
+    setAdvancedEvidenceOpenFrameId(open ? selectedFrameKey : "");
+    if (!open || !selectedFrame || selectedFrame.raw_data.status !== "omitted") return;
+    if (!selectedFrame.durable_event_id) {
+      setRawEventLookup({
+        frameId: selectedFrame.id,
+        loading: false,
+        inspector: null,
+        notice: "",
+        error: "Raw data unavailable: this item is a current snapshot, not a durable history event.",
+      });
+      return;
+    }
+    if (rawEventLookup.frameId === selectedFrame.id && (rawEventLookup.loading || rawEventLookup.inspector || rawEventLookup.error)) return;
+    const frameId = selectedFrame.id;
+    setRawEventLookup({ frameId, loading: true, inspector: null, notice: "", error: "" });
+    void api.timelineEventRawFor(
+      trace.project_id,
+      trace.backlog_id,
+      selectedFrame.durable_event_id,
+      selectedFrame.contract_execution_id,
+    ).then(
+      (event) => {
+        const loaded = projectTaskPlaybackFrame(event, Math.max(0, selectedFrame.sequence - 1));
+        setRawEventLookup((current) => current.frameId === frameId ? {
+          frameId,
+          loading: false,
+          inspector: loaded.detail_inspector,
+          notice: loaded.raw_data.status === "omitted"
+            ? "The public response retained its summary-only boundary; raw payload remains unavailable."
+            : loaded.raw_data.notice,
+          error: "",
+        } : current);
+      },
+      (reason) => setRawEventLookup((current) => current.frameId === frameId ? {
+        frameId,
+        loading: false,
+        inspector: null,
+        notice: "",
+        error: reason instanceof Error ? reason.message : String(reason),
+      } : current),
+    );
+  };
 
   // In newestFirst mode: reverse the filtered list so newest events appear at top.
   const displayFrames = displayPlaybackFrames(filteredFrames, newestFirst);
@@ -344,6 +404,7 @@ export default function TaskPlaybackPanel({
 
   useEffect(() => {
     setAdvancedEvidenceOpenFrameId("");
+    setRawEventLookup({ frameId: "", loading: false, inspector: null, notice: "", error: "" });
     setSelectedEvidenceRef(null);
     // Do NOT clear navStack here — the user may have just navigated via a relation link
     // and we want Back to work from the new frame.
@@ -379,34 +440,52 @@ export default function TaskPlaybackPanel({
         </div>
         <div className="task-playback-head-meta">
           <span className="mono">{trace.schema_version}</span>
-          <span className={`status-badge ${statusClass(gate.status)}`}>{gate.label}</span>
+          {trace.authority_view ? (
+            <span className={`status-badge ${contractRuntimeAuthorityStatusClass(trace.authority_view.backlog_close_readiness.display_status)}`}>
+              Backlog {trace.authority_view.backlog_close_readiness.display_status}
+            </span>
+          ) : <span className="status-badge status-unknown">Current authority unavailable</span>}
         </div>
       </div>
 
       <ContractRuntimeAuthorityPanel authority={trace.authority_view} compact={compact} />
-      <CurrentSnapshotPanel snapshot={trace.current_snapshot} compact={compact} />
+      {trace.authority_view ? <CurrentSnapshotPanel snapshot={trace.current_snapshot} compact={compact} /> : null}
 
       {loading ? <div className="timeline-empty"><span className="spinner" /> Loading governed timeline data...</div> : null}
       {error ? <div className="timeline-empty timeline-error">Playback load failed: {error}</div> : null}
       {!loading && !error && trace.frames.length === 0 ? (
         <div className="timeline-empty">No governed timeline events are available for this backlog row.</div>
       ) : null}
-      {!loading && !error && gate.blocked ? (
-        <div className="task-playback-blocked">
-          <strong>Blocked close gate</strong>
-          {gate.missing_event_kinds.length > 0 ? <span>Missing event kinds: {gate.missing_event_kinds.join(", ")}</span> : null}
-          <span>{gate.reason_sentence}</span>
-          <em>{gate.next_expected_action}</em>
-        </div>
-      ) : null}
-      {!loading && !error && trace.close_gate_matrix.gatePresent ? (
-        <PlaybackGateMatrix
-          matrix={trace.close_gate_matrix}
-          frames={allFrames}
-          expanded={closeGateMatrixExpanded}
-          onToggle={() => setCloseGateMatrixExpanded((expanded) => !expanded)}
-          onJump={(frameId) => selectFrame(frameId, undefined, true)}
-        />
+      {!loading && !error && (gate.applicable || trace.close_gate_matrix.gatePresent) ? (
+        <details
+          className="task-playback-compatibility-details"
+          open={closeGateMatrixExpanded}
+          onToggle={(event) => setCloseGateMatrixExpanded(event.currentTarget.open)}
+        >
+          <summary><strong>Historical close-gate audit</strong><span>lazy advisory</span></summary>
+          {closeGateMatrixExpanded ? (
+            <>
+              {gate.blocked ? (
+                <div className="task-playback-blocked">
+                  <strong>Historical blocked close gate</strong>
+                  {gate.missing_event_kinds.length > 0 ? <span>Missing event kinds: {gate.missing_event_kinds.join(", ")}</span> : null}
+                  <span>{gate.reason_sentence}</span>
+                  <em>{gate.next_expected_action}</em>
+                </div>
+              ) : null}
+              {trace.close_gate_matrix.gatePresent ? (
+                <PlaybackGateMatrix
+                  matrix={trace.close_gate_matrix}
+                  frames={allFrames}
+                  expanded
+                  onToggle={() => undefined}
+                  onJump={(frameId) => selectFrame(frameId, undefined, true)}
+                  staticExpanded
+                />
+              ) : null}
+            </>
+          ) : null}
+        </details>
       ) : null}
 
       <div className="task-playback-summary-strip" aria-label="Playback summary">
@@ -510,7 +589,8 @@ export default function TaskPlaybackPanel({
                         <span className={`task-playback-dot status-${frame.status}`} />
                         <div>
                           <strong>{frame.title}</strong>
-                          <span>{frame.event_kind}</span>
+                          <span>{frame.event_kind} · {frame.identity_kind === "current_snapshot" ? "Snapshot — not history" : "Durable event"}</span>
+                          <span className={`task-playback-provenance provenance-${frame.provenance.kind}`}>{frame.provenance.label}</span>
                         </div>
                         <em>{formatFrameDateTime(frame)}</em>
                       </button>
@@ -576,8 +656,10 @@ export default function TaskPlaybackPanel({
               <AdvancedRawDataDetails
                 key={selectedFrame.id}
                 inspector={selectedInspector}
+                frame={selectedFrame}
+                lookup={rawEventLookup.frameId === selectedFrame.id ? rawEventLookup : null}
                 open={advancedEvidenceOpen}
-                onOpenChange={(open) => setAdvancedEvidenceOpenFrameId(open ? selectedFrameKey : "")}
+                onOpenChange={toggleAdvancedEvidence}
               />
               {selectedEvidenceRef ? (
                 <EvidenceInspectorModal projectId={trace.project_id} frame={selectedFrame} evidenceRef={selectedEvidenceRef} onClose={() => setSelectedEvidenceRef(null)} />
@@ -603,12 +685,14 @@ function PlaybackGateMatrix({
   expanded,
   onToggle,
   onJump,
+  staticExpanded = false,
 }: {
   matrix: GateMatrixProjection;
   frames: TaskPlaybackFrame[];
   expanded: boolean;
   onToggle: () => void;
   onJump: (frameId: string) => void;
+  staticExpanded?: boolean;
 }) {
   const summary = summarizeGateMatrix(matrix);
   const bodyId = "task-playback-close-gate-matrix-body";
@@ -623,16 +707,23 @@ function PlaybackGateMatrix({
   }
   return (
     <section className={`task-playback-gate-matrix${expanded ? " expanded" : " collapsed"}`} aria-label="Close gate verification checklist">
-      <button
-        type="button"
-        className="task-playback-gate-matrix-summary"
-        aria-expanded={expanded}
-        aria-controls={bodyId}
-        onClick={onToggle}
-      >
-        <span>{summary.label}</span>
-        <span className={`status-badge ${summary.statusClass}`}>{expanded ? "hide requirements" : "show requirements"}</span>
-      </button>
+      {staticExpanded ? (
+        <div className="task-playback-gate-matrix-summary">
+          <span>{summary.label}</span>
+          <span className={`status-badge ${summary.statusClass}`}>historical advisory</span>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="task-playback-gate-matrix-summary"
+          aria-expanded={expanded}
+          aria-controls={bodyId}
+          onClick={onToggle}
+        >
+          <span>{summary.label}</span>
+          <span className={`status-badge ${summary.statusClass}`}>{expanded ? "hide requirements" : "show requirements"}</span>
+        </button>
+      )}
       {expanded ? (
         <div id={bodyId} className="task-playback-gate-matrix-body">
           {!matrix.applicable ? (
@@ -1161,6 +1252,7 @@ export function EventSemanticDetail({
   frame: Pick<
     TaskPlaybackFrame,
     "headline" | "actor" | "lane_id" | "event_type" | "phase" | "source_event_id" | "summary" | "specific_facts" | "failure_diagnosis"
+    | "identity_kind" | "backlog_id" | "contract_execution_id" | "structured_view_status" | "structured_view_message" | "provenance"
   >;
 }) {
   return (
@@ -1177,7 +1269,18 @@ export function EventSemanticDetail({
         <span className="mono ref-tint">{frame.event_type}</span>
         <span className="mono ref-tint">{frame.phase}</span>
         <TruncatedHashSpan value={frame.source_event_id} mono refTint />
+        <span>{frame.identity_kind === "current_snapshot" ? "Snapshot — not history" : "Durable event"}</span>
+        <span className={`task-playback-provenance provenance-${frame.provenance.kind}`} title={frame.provenance.source}>{frame.provenance.label}</span>
       </div>
+      {frame.structured_view_status !== "supported" ? (
+        <div className="timeline-empty task-playback-renderer-fallback" role="status">
+          <strong>{frame.structured_view_status === "renderer_error" ? "Structured renderer failed" : "Unsupported structured event"}</strong>
+          <span>{frame.structured_view_message}</span>
+          <span className="mono">
+            Event {frame.source_event_id || "unavailable"} · backlog {frame.backlog_id || "unavailable"} · CEX {frame.contract_execution_id || "unavailable"}
+          </span>
+        </div>
+      ) : null}
       <div className="task-playback-chip-section">
         <strong>Event summary</strong>
         <p><StatusWordText text={frame.summary} /></p>
@@ -1438,27 +1541,43 @@ function EvidenceRawSection({ sections }: { sections: TaskPlaybackFrame["detail_
 
 function AdvancedRawDataDetails({
   inspector,
+  frame,
+  lookup,
   open,
   onOpenChange,
 }: {
   inspector: TaskPlaybackFrame["detail_inspector"] | null;
+  frame: TaskPlaybackFrame;
+  lookup: RawEventLookupState | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const rawSections = inspector?.raw_sections ?? [];
-  if (rawSections.length === 0) return null;
+  const resolvedInspector = lookup?.inspector ?? inspector;
+  const rawSections = resolvedInspector?.raw_sections ?? [];
+  const copyText = open ? rawSections.map((section) => `${section.label}\n${formatInspectorValue(section.value)}`).join("\n\n") : "";
   return (
     <details className="backlog-inspector-raw task-playback-inspector" open={open} onToggle={(event) => onOpenChange(event.currentTarget.open)}>
       <summary>Advanced raw data</summary>
-      {inspector?.redaction_count ? <ChipSection title="Raw data redactions" values={[String(inspector.redaction_count)]} /> : null}
-      <div className="backlog-inspector-json">
-        {rawSections.map((section) => (
-          <div key={section.label}>
-            <span>{section.redacted ? `${section.label} redacted` : section.label}</span>
-            <pre>{formatInspectorValue(section.value)}</pre>
+      {open ? (
+        <>
+          <div className="task-playback-raw-boundary">
+            <span>{lookup?.loading ? "Loading current-user-authorized public-safe event…" : lookup?.error ? `Retrieval error: ${lookup.error}` : lookup?.notice || frame.raw_data.notice}</span>
+            {copyText ? <button type="button" className="action-btn" onClick={() => void navigator.clipboard?.writeText(copyText)}>Copy public-safe JSON</button> : null}
           </div>
-        ))}
-      </div>
+          {resolvedInspector?.redaction_count ? <ChipSection title="Raw data redactions" values={[String(resolvedInspector.redaction_count)]} /> : null}
+          {!lookup?.loading && rawSections.length === 0 ? <div className="timeline-empty">Raw data unavailable for this event.</div> : null}
+          {rawSections.length > 0 ? (
+            <div className="backlog-inspector-json">
+              {rawSections.map((section) => (
+                <div key={section.label}>
+                  <span>{section.redacted ? `${section.label} redacted` : section.label}</span>
+                  <pre>{formatInspectorValue(section.value)}</pre>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </>
+      ) : null}
     </details>
   );
 }
@@ -2059,7 +2178,9 @@ function eventRefsText(frame: TaskPlaybackFrame): string {
 }
 
 function formatInspectorValue(value: unknown): string {
-  return typeof value === "string" ? value : JSON.stringify(value ?? {}, null, 2);
+  const rendered = typeof value === "string" ? value : JSON.stringify(value ?? {}, null, 2);
+  const limit = 65_536;
+  return rendered.length > limit ? `${rendered.slice(0, limit)}\n… [truncated at ${limit} characters]` : rendered;
 }
 
 function formatFrameDateTime(frame: TaskPlaybackFrame): string {

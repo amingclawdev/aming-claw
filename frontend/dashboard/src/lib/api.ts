@@ -28,6 +28,7 @@ import type {
   UnbindFileHintResponse,
 } from "../types";
 import { typedDagRawSecretPath } from "./taskPlayback";
+import { sanitizeTimelineInspectorValue } from "./taskTimelineSemantics";
 
 const API_ENV = import.meta.env ?? {};
 const DEFAULT_PROJECT_ID = (API_ENV.VITE_PROJECT_ID as string | undefined) || "aming-claw";
@@ -144,6 +145,11 @@ function taskTimelineSearchQuery(options: TaskTimelineSearchOptions): string {
   return query.toString();
 }
 
+export function durableTimelineEventId(value: unknown): string {
+  const text = String(value ?? "").trim();
+  return /^\d+$/.test(text) && !/^0+$/.test(text) ? text : "";
+}
+
 function backlogTimelineQuery(backlogId: string, limit: number): string {
   const query = new URLSearchParams({
     backlog_id: backlogId,
@@ -156,7 +162,7 @@ function backlogTimelineQuery(backlogId: string, limit: number): string {
   });
   if (typeof window !== "undefined") {
     const locationQuery = new URLSearchParams(window.location.search);
-    const exactEventId = locationQuery.get("playback_event")?.trim();
+    const exactEventId = durableTimelineEventId(locationQuery.get("playback_event"));
     const selectedBacklogId = locationQuery.get("playback_backlog")?.trim();
     if (exactEventId && selectedBacklogId === backlogId) {
       query.set("exact_event_id", exactEventId);
@@ -187,6 +193,18 @@ function requirePublicSafeTypedDag(response: ContractRuntimeVisualizationRespons
     );
   }
   return response;
+}
+
+function publicSafeTimelineEvent(event: TaskTimelineResponse["events"][number]): TaskTimelineResponse["events"][number] {
+  const sanitized = sanitizeTimelineInspectorValue(event);
+  const value = sanitized.value && typeof sanitized.value === "object"
+    ? sanitized.value as TaskTimelineResponse["events"][number]
+    : {} as TaskTimelineResponse["events"][number];
+  return {
+    ...value,
+    public_safe: true,
+    raw_evidence_omitted: event.raw_evidence_omitted === true,
+  };
 }
 
 function assetImpactReminderQuery(opts: { asset_kind?: string; status?: string } = {}): string {
@@ -308,7 +326,6 @@ function getPublicJSONSingleFlight<T>(path: string, signal?: AbortSignal): Promi
 }
 
 type TaskPlaybackBootstrapResponse = TaskTimelineResponse & {
-  exact_event?: TaskTimelineResponse["events"][number];
   backlog_timeline_gate?: BacklogTimelineGateResponse;
   playback_bootstrap?: Record<string, unknown>;
 };
@@ -737,7 +754,19 @@ export const api = {
       const contractRuntimeVisualization = taskTimeline.contract_runtime_visualization
         ? requirePublicSafeTypedDag(taskTimeline.contract_runtime_visualization)
         : await api.contractRuntimeVisualizationFor(projectId, backlogId, boundedLimit, signal);
-      const exactEvent = taskTimeline.exact_event;
+      const requestedExactEventId = typeof window === "undefined"
+        ? ""
+        : durableTimelineEventId(new URLSearchParams(window.location.search).get("playback_event"));
+      const rawExactEvent = taskTimeline.exact_event;
+      if (rawExactEvent && (
+        taskTimeline.project_id !== projectId
+        || String(rawExactEvent.project_id ?? taskTimeline.project_id ?? "").trim() !== projectId.trim()
+        || String(rawExactEvent.backlog_id ?? "").trim() !== backlogId.trim()
+        || (requestedExactEventId && durableTimelineEventId(rawExactEvent.id ?? rawExactEvent.event_id) !== requestedExactEventId)
+      )) {
+        throw new ApiError(502, "Exact timeline event did not match the requested project/backlog/event scope", taskTimeline.request_id ?? "");
+      }
+      const exactEvent = rawExactEvent ? publicSafeTimelineEvent(rawExactEvent) : undefined;
       const events = exactEvent && !taskTimeline.events.some((event) => String(event.event_id ?? event.id ?? "") === String(exactEvent.event_id ?? exactEvent.id ?? ""))
         ? [exactEvent, ...taskTimeline.events]
         : taskTimeline.events;
@@ -753,6 +782,57 @@ export const api = {
         },
       };
     });
+  },
+  async timelineEventRawFor(
+    projectId: string,
+    backlogId: string,
+    eventId: string | number,
+    expectedContractExecutionId = "",
+    signal?: AbortSignal,
+  ) {
+    const exactEventId = durableTimelineEventId(eventId);
+    if (!exactEventId) {
+      throw new ApiError(400, "Raw event retrieval requires a durable numeric event id", "");
+    }
+    const query = new URLSearchParams({
+      backlog_id: backlogId,
+      exact_event_id: exactEventId,
+      before_event_id: "0",
+      limit: "1",
+      view: "public",
+    });
+    const response = await getJSON<TaskTimelineResponse>(
+      `/api/task/${pidFor(projectId)}/timeline?${query.toString()}`,
+      signal,
+    );
+    if (response.project_id !== projectId || String(response.backlog_id ?? "").trim() !== backlogId.trim()) {
+      throw new ApiError(502, "Raw event response did not match the requested project/backlog scope", response.request_id ?? "");
+    }
+    const event = response.exact_event
+      ?? response.events.find((candidate) => durableTimelineEventId(candidate.id ?? candidate.event_id) === exactEventId);
+    if (!event) {
+      throw new ApiError(404, `Durable timeline event ${exactEventId} is unavailable`, response.request_id ?? "");
+    }
+    if (
+      String(event.project_id ?? response.project_id ?? "").trim() !== projectId.trim()
+      || durableTimelineEventId(event.id ?? event.event_id) !== exactEventId
+      || String(event.backlog_id ?? "").trim() !== backlogId.trim()
+    ) {
+      throw new ApiError(502, "Raw event response did not match the requested event scope", response.request_id ?? "");
+    }
+    const safeEvent = publicSafeTimelineEvent(event);
+    const safePayload = safeEvent.payload && typeof safeEvent.payload === "object" ? safeEvent.payload as Record<string, unknown> : {};
+    const safeVerification = safeEvent.verification && typeof safeEvent.verification === "object" ? safeEvent.verification as Record<string, unknown> : {};
+    const actualContractExecutionId = String(
+      safeEvent.contract_execution_id
+      ?? safePayload.contract_execution_id
+      ?? safeVerification.contract_execution_id
+      ?? "",
+    ).trim();
+    if (expectedContractExecutionId && actualContractExecutionId !== expectedContractExecutionId.trim()) {
+      throw new ApiError(502, "Raw event response did not match the selected ContractRuntime execution", response.request_id ?? "");
+    }
+    return safeEvent;
   },
   taskTimelineSearchFor(projectId: string, options: TaskTimelineSearchOptions, signal?: AbortSignal) {
     return getJSON<TaskTimelineResponse>(

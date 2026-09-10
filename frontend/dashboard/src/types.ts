@@ -729,7 +729,7 @@ export interface BacklogBug {
   priority: "P0" | "P1" | "P2" | "P3" | string;
   target_files?: string[] | string;
   test_files?: string[] | string;
-  acceptance_criteria?: string[] | string;
+  acceptance_criteria?: Array<string | BacklogAcceptanceCriterion> | string;
   details_md?: string;
   details_preview?: string;
   commit?: string;
@@ -776,6 +776,22 @@ export interface BacklogBug {
   /** True when the row is safe to display in public playback views. Defaults to true. */
   public_safe?: boolean;
   compact?: boolean;
+}
+
+export interface BacklogAcceptanceRequiredScope {
+  kind?: string;
+  files?: string[];
+  nodes?: string[];
+  dependency_id?: string;
+  [key: string]: unknown;
+}
+
+export interface BacklogAcceptanceCriterion {
+  id?: string;
+  text?: string;
+  description?: string;
+  required_scope?: BacklogAcceptanceRequiredScope;
+  [key: string]: unknown;
 }
 
 export interface BacklogAuditArchive {
@@ -911,6 +927,7 @@ export interface TaskTimelineResponse {
   backlog_id: string;
   trace_id?: string;
   events: TaskTimelineEvent[];
+  exact_event?: TaskTimelineEvent;
   count: number;
   q?: string;
   total?: number;
@@ -1107,6 +1124,7 @@ export interface ContractRuntimeVisualizationResponse {
   };
   backlog_close_readiness: {
     state: string;
+    disposition_status?: string;
     backlog_status: string;
     contract_execution_state: string;
     contract_complete_implies_backlog_close: boolean;
@@ -1250,6 +1268,7 @@ export interface TaskTimelineEvent {
   backlog_id?: string;
   mf_id?: string;
   task_id?: string;
+  contract_execution_id?: string;
   attempt_num?: number;
   event_type: string;
   phase?: string;
@@ -1270,6 +1289,31 @@ export interface TaskTimelineEvent {
   public_safe?: boolean;
   raw_evidence_omitted?: boolean;
   blocker_semantics?: TaskTimelineBlockerSemantics;
+  provenance?: {
+    schema_version?: string;
+    classification?: "authority_bound" | "agent_authored" | "system_dispatched" | "unknown" | string;
+    label?: string;
+    source?: string;
+    projection_source?: string;
+    projection_verified?: boolean;
+    authority_bound?: boolean;
+    scope?: {
+      project_id?: string;
+      backlog_id?: string;
+      task_id?: string;
+      source_event_id?: string;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+  acceptance_evidence?: Array<{
+    criterion_id?: string;
+    required_scope?: BacklogAcceptanceRequiredScope | Record<string, unknown>;
+    evidence_ref?: string;
+    authority_bound?: boolean;
+    authority_source?: string;
+    [key: string]: unknown;
+  }>;
   backlog?: Pick<BacklogBug, "bug_id"> & Partial<Pick<BacklogBug, "title" | "status" | "priority" | "commit">>;
 }
 

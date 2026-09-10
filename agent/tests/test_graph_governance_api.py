@@ -188075,6 +188075,244 @@ def test_contract_runtime_visualization_emits_all_typed_legacy_repair_targets():
     assert all(item["overrides_current_authority"] is False for item in targets)
 
 
+@pytest.mark.parametrize(
+    ("backlog_status", "expected_state"),
+    [
+        ("FIXED", "fixed"),
+        ("WAIVED", "waived"),
+        ("SUPERSEDED", "superseded"),
+        ("OPEN", "open"),
+        ("", "unavailable"),
+    ],
+)
+def test_contract_runtime_visualization_keeps_backlog_disposition_distinct(
+    backlog_status,
+    expected_state,
+):
+    result = build_contract_runtime_visualization(
+        project_id="proj",
+        backlog={"bug_id": "AC-HONEST-TERMINAL", "status": backlog_status},
+        runtime_records=[{
+            "contract_execution_id": "cex-honest-terminal",
+            "runtime_guide": {"next_legal_action": {}},
+            "execution_state": {"execution_state_revision": 4},
+        }],
+        chain_current={
+            "current_contract_execution_id": "cex-honest-terminal",
+            "readiness_state": "contract_complete",
+        },
+        chain_edges=[],
+        timeline_events=[],
+        legacy_compatibility_sources=[{
+            "id": "legacy-failed-gate",
+            "status": "failed",
+            "blocked": True,
+            "missing_requirement_ids": ["legacy-only"],
+        }],
+    )
+
+    assert result["contract_execution_progress"]["readiness_state"] == (
+        "contract_complete"
+    )
+    assert result["backlog_close_readiness"]["state"] == expected_state
+    assert result["backlog_close_readiness"]["disposition_status"] == (
+        backlog_status or "UNAVAILABLE"
+    )
+    assert result["backlog_close_readiness"][
+        "contract_complete_implies_backlog_close"
+    ] is False
+    assert result["raw_compatibility"]["advisory_only"] is True
+    assert result["raw_compatibility"]["overrides_current_authority"] is False
+
+
+def test_contract_runtime_visualization_projects_only_source_backed_provenance(
+    conn, tmp_path
+):
+    backlog_id = "AC-PROVENANCE"
+    task_id = "cex-provenance"
+    commit_sha = "a" * 40
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, 'Provenance fixture', 'OPEN', 'P1', ?, ?)""",
+        (backlog_id, "2026-09-10T08:00:00Z", "2026-09-10T08:00:00Z"),
+    )
+    principal = "qa-provenance-fixture"
+    scope_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=commit_sha,
+    )
+    session = server.role_service.register(
+        conn, principal, PID, "qa", scope=[scope_ref]
+    )
+    trace_id = "gqt-provenance-fixture"
+    snapshot_id = "snapshot-provenance-fixture"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id=snapshot_id,
+        candidate_commit_sha=commit_sha,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_project_root=str(tmp_path),
+        actor=principal,
+        qa_session_id=session["session_id"],
+    )
+    proof = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "role": "qa",
+        "verified": True,
+        "observer_impersonation": False,
+        "db_verified_graph_trace": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "evidence_status": "passed",
+        "authority_scope": "close_satisfying",
+        "close_satisfying": True,
+        "audit_only": False,
+        "passing_status_required_for_close": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": commit_sha,
+        "principal_id": principal,
+        "qa_session_id": session["session_id"],
+        "qa_scope_binding_ref": scope_ref,
+        "snapshot_id": snapshot_id,
+        "snapshot_commit_sha": commit_sha,
+        "graph_trace_ids": [trace_id],
+    }
+    accepted = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="qa.independent_verification",
+        event_kind="independent_verification",
+        phase="qa",
+        actor=principal,
+        status="failed",
+        payload={
+            "source_backed_contract_gate_authority": (
+                task_timeline.source_backed_qa_session_authority(proof)
+            )
+        },
+        commit_sha=commit_sha,
+        post_commit_hooks=False,
+    )
+    assert accepted["payload"]["contract_gate_decision"][
+        "source_of_authority"
+    ] == "qa_session_verification"
+
+    forged_hash = copy.deepcopy(accepted)
+    forged_hash["id"] = int(accepted["id"]) + 1
+    forged_hash["payload"]["contract_gate_decision"]["decision_hash"] = (
+        "sha256:" + "f" * 64
+    )
+    wrong_container = copy.deepcopy(accepted)
+    wrong_container["id"] = int(accepted["id"]) + 2
+    wrong_container["verification"] = wrong_container.pop("payload")
+    wrong_container["payload"] = {}
+    cross_scope = copy.deepcopy(accepted)
+    cross_scope["id"] = int(accepted["id"]) + 3
+    cross_scope["backlog_id"] = "AC-UNRELATED"
+    claimed = {
+        "id": int(accepted["id"]) + 4,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_type": "authority.claimed",
+        "status": "passed",
+        "provenance": {
+            "classification": "authority_bound",
+            "authority_bound": True,
+        },
+        "payload": {},
+    }
+    events = [accepted, forged_hash, wrong_container, cross_scope, claimed]
+    result = build_contract_runtime_visualization(
+        project_id=PID,
+        backlog={"bug_id": backlog_id, "status": "OPEN"},
+        runtime_records=[],
+        chain_current={},
+        chain_edges=[],
+        timeline_events=events,
+    )
+    summaries = {item["id"]: item for item in result["timeline"]["events"]}
+    assert summaries[accepted["id"]]["provenance"]["classification"] == (
+        "authority_bound"
+    )
+    assert summaries[accepted["id"]]["provenance"]["projection_verified"] is True
+    assert summaries[accepted["id"]]["status"] == "failed"
+    for rejected in (forged_hash, wrong_container, cross_scope, claimed):
+        assert summaries[rejected["id"]]["provenance"]["classification"] == (
+            "unknown"
+        )
+
+
+def test_exact_timeline_handler_keeps_raw_payload_outside_compact_event_boundary(
+    conn,
+):
+    """Document the existing exact-event transport boundary for frontend QA."""
+
+    backlog_id = "AC-EXACT-RAW-PUBLIC-BOUNDARY"
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+        (backlog_id, "Exact raw boundary", "2026-09-10T08:00:00Z", "2026-09-10T08:00:00Z"),
+    )
+    payload = {
+            "harmless_dummy_access_token": "dummy-token-sentinel",
+            "harmless_private_path": "/Users/example/private-sentinel",
+        }
+    event_id = conn.execute(
+        """INSERT INTO task_timeline_events
+           (project_id, backlog_id, task_id, event_type, event_kind, actor,
+            status, payload_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            PID,
+            backlog_id,
+            "cex-exact-raw-boundary",
+            "fixture.raw_boundary",
+            "fixture",
+            "fixture",
+            "recorded",
+            json.dumps(payload, sort_keys=True),
+            "2026-09-10T08:00:01Z",
+        ),
+    ).lastrowid
+    conn.commit()
+    server._timeline_warm_cache_clear()
+    response = server.handle_task_timeline_list(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "backlog_id": backlog_id,
+                "limit": "1",
+                "playback_bootstrap": "compact",
+                "exact_event_id": str(event_id),
+                "view": "public",
+            },
+        )
+    )
+
+    compact_json = json.dumps(response["events"], sort_keys=True)
+    exact_json = json.dumps(response["exact_event"], sort_keys=True)
+    assert "dummy-token-sentinel" not in compact_json
+    assert "private-sentinel" not in compact_json
+    assert response["raw_event_payloads_omitted"] is True
+    assert response["exact_event_raw_loaded"] is True
+    assert "dummy-token-sentinel" in response["exact_event"]["payload_json"]
+    assert "private-sentinel" in response["exact_event"]["payload_json"]
+    assert "dummy-token-sentinel" in exact_json
+    assert "private-sentinel" in exact_json
+
+
 def _finish_alias_source_fixture():
     runtime_context_id = "mfrctx-finish-alias-parity"
     task_id = "worker-finish-alias-parity"

@@ -5290,6 +5290,65 @@ a:hover { text-decoration: underline; }
   }
 }
 
+.task-playback-provenance {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 2px 7px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1.3;
+}
+
+.task-playback-provenance.provenance-authority_bound {
+  color: var(--blue-strong, #1e56a8);
+  background: var(--blue-bg, #edf5ff);
+}
+
+.task-playback-provenance.provenance-agent_authored {
+  color: var(--green-strong, #176b43);
+  background: var(--green-bg, #edf9f2);
+}
+
+.task-playback-provenance.provenance-system_dispatched {
+  color: var(--violet-strong, #6b3fb2);
+  background: #f4effd;
+}
+
+.task-playback-provenance.provenance-unknown {
+  color: var(--ink-600);
+  background: var(--ink-50);
+}
+
+.task-playback-renderer-fallback,
+.task-playback-raw-boundary {
+  display: grid;
+  gap: 6px;
+}
+
+.task-playback-raw-boundary {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  padding: 10px 0;
+  color: var(--ink-700);
+}
+
+.backlog-historical-audit {
+  margin: 12px 0;
+  border: 1px solid var(--ink-200);
+  border-radius: var(--radius-card);
+  background: var(--ink-50);
+}
+
+.backlog-historical-audit > summary {
+  cursor: pointer;
+  padding: 12px 14px;
+  color: var(--ink-800);
+  font-weight: 750;
+}
+
 .project-ref-control {
   display: flex;
   flex-direction: column;

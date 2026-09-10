@@ -7,6 +7,7 @@ import {
   normalizeTaskPlaybackDag,
   projectContractRuntimeAuthorityViewModel,
   projectContractRuntimeGateMatrix,
+  projectTaskPlaybackFrame,
   taskPlaybackCompactLedgerDisplayState,
   taskPlaybackCompactLedgerNextActionLabel,
   taskPlaybackCompactLedgerRowForBacklog,
@@ -35,6 +36,8 @@ import {
 } from "../components/TaskPlaybackPanel";
 import type {
   BacklogBug,
+  BacklogAcceptanceCriterion,
+  BacklogAcceptanceRequiredScope,
   BacklogAuditArchive,
   BacklogAuditCloseGate,
   BacklogResponse,
@@ -42,7 +45,6 @@ import type {
   BacklogQaAcceptance,
   ContentSysDemoVisualizationEvidence,
   ContractRuntimeVisualizationResponse,
-  AgentTaskContractProjection,
   MfCloseTimelineGate,
   ObserverCommandRecoveryProjection,
   TaskTimelineEvent,
@@ -57,6 +59,16 @@ type StatusFilter = "OPEN" | "CLOSED" | "ALL";
 type PriorityFilter = "ALL" | "P0" | "P1" | "P2" | "P3";
 type DetailTab = "timeline" | "contract";
 type ContractEvidenceStatus = "passed" | "missing" | "failed" | "bypassed" | "inferred" | "not_applicable";
+
+export interface BacklogAcceptanceCriterionView {
+  id: string;
+  text: string;
+  description: string;
+  required_scope: BacklogAcceptanceRequiredScope | null;
+  legacy: boolean;
+}
+
+export type AcceptanceVerificationState = "verified" | "unlinked" | "unknown";
 
 const PRIORITIES: PriorityFilter[] = ["ALL", "P0", "P1", "P2", "P3"];
 const PRIORITY_WEIGHT: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
@@ -782,7 +794,7 @@ function BacklogRow({
   onOpenDetail: () => void;
 }) {
   const files = listFrom(bug.target_files);
-  const criteria = listFrom(bug.acceptance_criteria);
+  const criteria = acceptanceCriteriaFrom(bug.acceptance_criteria);
   const runtime = bug.runtime_state || bug.chain_stage || bug.mf_type || "idle";
   const contract = bug.contract_summary;
   const projectionStatus = contract?.projection_status || (contract?.divergent ? "divergent" : contract?.stale ? "stale" : "");
@@ -822,7 +834,7 @@ function BacklogRow({
           {criteria.length > 0 ? (
             <div className="backlog-criteria">
               {criteria.slice(0, 2).map((item) => (
-                <span key={item}>{item}</span>
+                <span key={item.id}>{item.id}: {item.text}</span>
               ))}
               {criteria.length > 2 ? <em>+{criteria.length - 2}</em> : null}
             </div>
@@ -974,14 +986,10 @@ function BacklogDetailModal({
         {bug ? (
           <BacklogDetailSummary
             bug={bug}
-            gate={gate}
-            response={timeline?.gate}
-            compactLedgerRow={compactLedgerRow}
             authority={timeline?.authorityView}
           />
         ) : null}
         <ContractRuntimeAuthorityPanel authority={timeline?.authorityView} compact />
-        <ContractRuntimeCompatibilityRepairPanel authority={timeline?.authorityView} />
 
         <div className="backlog-modal-tabs" role="tablist" aria-label="Backlog detail sections">
           <button
@@ -1000,19 +1008,12 @@ function BacklogDetailModal({
             className={activeTab === "contract" ? "active" : ""}
             onClick={() => setActiveTab("contract")}
           >
-            Contract & Gate
+            Historical audit
           </button>
         </div>
 
         {activeTab === "timeline" ? (
           <div className="backlog-modal-tab-panel" role="tabpanel">
-            <CompactLedgerPanel
-              ledger={compactLedger}
-              row={compactLedgerRow}
-              backlogId={fallbackBugId}
-              canonicalAuthorityPresent={Boolean(timeline?.authorityView)}
-            />
-
             <div className="backlog-modal-section">
               <div className="backlog-modal-section-head">
                 <span>Related backlog</span>
@@ -1121,7 +1122,9 @@ function BacklogDetailModal({
             legacyMatrix={legacyGateMatrix}
             backlogId={fallbackBugId}
             projectId={projectId}
-            acceptanceCriteria={listFrom(bug?.acceptance_criteria)}
+            acceptanceCriteria={acceptanceCriteriaFrom(bug?.acceptance_criteria)}
+            compactLedger={compactLedger}
+            compactLedgerRow={compactLedgerRow}
           />
         )}
       </section>
@@ -1131,35 +1134,12 @@ function BacklogDetailModal({
 
 function BacklogDetailSummary({
   bug,
-  gate,
-  response,
-  compactLedgerRow,
   authority,
 }: {
   bug: BacklogBug;
-  gate?: MfCloseTimelineGate;
-  response?: BacklogTimelineGateResponse;
-  compactLedgerRow?: TaskPlaybackCompactLedgerRow | null;
   authority?: ContractRuntimeAuthorityViewModel;
 }) {
-  const contract = gate?.contract_gate;
-  const routeGate = gate?.route_context_gate;
-  const projection = contractProjectionForSummary(bug, gate);
-  const auditClose = buildAuditCloseState(bug, gate, response);
-  const commandProjection = bug.observer_command_projection;
-  const commandRecovery = commandProjection?.recovery;
-  const commandProjectionStatus = commandRecovery?.classification || commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "not loaded";
-  const commandDivergence = commandRecovery ? "target_session_unavailable" : commandProjection?.divergence_reason || commandProjection?.projection?.divergence_reason || "";
-  const missing = stableUnique([
-    ...(gate?.missing_event_kinds ?? []),
-    ...(contract?.missing_requirement_ids ?? []),
-    ...(routeGate?.missing_requirement_ids ?? []),
-  ]);
   const related = relatedIdsFromBug(bug, []);
-  const ledgerNextAction = taskPlaybackCompactLedgerNextActionLabel(compactLedgerRow?.next_legal_action);
-  const ledgerDisplay = taskPlaybackCompactLedgerDisplayState(compactLedgerRow);
-  const ledgerProjectionStatus = compactLedgerProjectionReadiness(compactLedgerRow);
-  const compatibilityRepairTargets = contractRuntimeCompatibilityRepairValues(authority);
   return (
     <div className="backlog-modal-summary">
       <SummaryItem label="Priority" value={normalizePriority(bug.priority)} tone={priorityTone(bug.priority)} />
@@ -1177,57 +1157,14 @@ function BacklogDetailSummary({
             value={authority.backlog_close_readiness.display_status}
             tone={statusClass(authority.backlog_close_readiness.display_status)}
           />
-          <SummaryItem
-            label="History"
-            value={authority.historical_diagnostics.truncated ? "partial; continue" : "response complete"}
-            tone={authority.historical_diagnostics.truncated ? "status-running" : "status-complete"}
-          />
         </>
       ) : null}
-      {compactLedgerRow ? (
-        <>
-          <SummaryItem label="Contract exec" value={compactLedgerRow.contract_execution_id || "none"} mono />
-          <SummaryItem label="Chain" value={compactLedgerRow.contract_chain_id || "none"} mono />
-          <SummaryItem label="Current contract" value={compactLedgerCurrentContractLabel(compactLedgerRow)} mono />
-          <SummaryItem label="Ledger projection" value={ledgerProjectionStatus} tone={compactLedgerProjectionTone(compactLedgerRow)} />
-          <SummaryItem label="Readiness" value={ledgerDisplay.readinessLabel} tone={ledgerDisplay.readinessTone} />
-          <SummaryItem label="Latest event" value={compactLedgerRow.latest_event_id ? `${compactLedgerRow.latest_event_id} ${compactLedgerRow.latest_event_kind || ""}`.trim() : "none"} mono />
-        </>
-      ) : null}
-      {compatibilityRepairTargets.length > 0 ? (
-        <SummaryItem label="Compatibility repairs" value={`${compatibilityRepairTargets.length} advisory`} tone="status-failed" />
-      ) : null}
-      <SummaryItem label="Contract" value={contract?.status || (bug.contract_summary?.has_contract ? "declared" : "not declared")} tone={contract?.passed ? "status-complete" : contract ? "status-failed" : "status-unknown"} />
-      <SummaryItem label="Projection" value={projection?.status || "not loaded"} tone={projectionTone(projection)} />
-      <SummaryItem label="Command" value={commandProjectionStatus} tone={commandProjectionTone(commandProjectionStatus, commandDivergence)} />
-      <SummaryItem label="Route context" value={routeGate?.status || (routeGate?.required ? "required" : "not required")} tone={routeGate?.passed ? "status-complete" : routeGate?.required ? "status-failed" : "status-unknown"} />
-      <SummaryItem label="Close gate" value={gate?.status || (gate ? (gate.passed ? "passed" : "blocked") : "not loaded")} tone={gate?.passed ? "status-complete" : gate ? "status-failed" : "status-unknown"} />
-      {auditClose.present ? (
-        <>
-          <SummaryItem label="Audit close" value={auditClose.accepted ? "accepted" : auditClose.status || "recorded"} tone={auditClose.accepted ? "status-complete" : "status-unknown"} />
-          <SummaryItem label="Normal close" value={auditClose.normalCloseBlocked ? "blocked" : "not claimed"} tone={auditClose.normalCloseBlocked ? "status-failed" : "status-unknown"} />
-          <SummaryItem label="QA acceptance" value={auditClose.qaPassed ? "passed" : "not recorded"} tone={auditClose.qaPassed ? "status-complete" : "status-failed"} />
-          <SummaryItem label="Evidence" value={auditClose.evidenceNotReconstructed ? "not reconstructed" : "unknown"} tone={auditClose.evidenceNotReconstructed ? "status-complete" : "status-unknown"} />
-        </>
-      ) : null}
-      <SummaryItem label="Missing" value={missing.length ? String(missing.length) : "none"} tone={missing.length ? "status-failed" : "status-complete"} />
+      {!authority ? <SummaryItem label="Current authority" value="unavailable" tone="status-unknown" /> : null}
       <DetailList label="Target files" values={listFrom(bug.target_files)} />
       <DetailList label="Tests" values={listFrom(bug.test_files)} />
       <DetailList label="Required docs" values={listFrom(bug.required_docs)} />
       <DetailList label="Provenance / related" values={related} />
-      {authority ? (
-        <DetailList label="Current legal action (ContractRuntime)" values={[contractRuntimeAuthorityActionLabel(authority)]} />
-      ) : compactLedgerRow ? (
-        <DetailList label="Next legal action" values={ledgerNextAction ? [ledgerNextAction] : []} />
-      ) : null}
-      {compatibilityRepairTargets.length > 0 ? (
-        <DetailList label="Compatibility repair targets (advisory)" values={compatibilityRepairTargets} />
-      ) : null}
-      {authority && compactLedgerRow && ledgerNextAction ? (
-        <DetailList label="Historical ledger action (advisory)" values={[ledgerNextAction]} />
-      ) : null}
-      {auditClose.present ? <DetailList label="Audit close reason" values={auditClose.reason ? [auditClose.reason] : []} /> : null}
-      {commandRecovery ? <DetailList label="Command recovery" values={commandRecoveryDetailValues(commandRecovery)} /> : null}
+      {authority ? <DetailList label="Current legal action (ContractRuntime)" values={[contractRuntimeAuthorityActionLabel(authority)]} /> : null}
     </div>
   );
 }
@@ -1254,12 +1191,10 @@ function CompactLedgerPanel({
   ledger,
   row,
   backlogId,
-  canonicalAuthorityPresent,
 }: {
   ledger?: TaskPlaybackCompactLedger;
   row?: TaskPlaybackCompactLedgerRow | null;
   backlogId: string;
-  canonicalAuthorityPresent: boolean;
 }) {
   const refs = row ? taskPlaybackLedgerRowRefs(row) : [];
   const nextAction = taskPlaybackCompactLedgerNextActionLabel(row?.next_legal_action);
@@ -1269,7 +1204,7 @@ function CompactLedgerPanel({
   return (
     <div className="backlog-modal-section">
       <div className="backlog-modal-section-head">
-        <span>{canonicalAuthorityPresent ? "Historical compact ledger (advisory)" : "Contract runtime ledger"}</span>
+        <span>Historical compact ledger (advisory)</span>
         <span className="mono">
           {ledger?.row_count ?? 0} row{ledger?.row_count === 1 ? "" : "s"} · {ledger?.source_event_count ?? 0} source event{ledger?.source_event_count === 1 ? "" : "s"}
         </span>
@@ -1310,7 +1245,7 @@ function CompactLedgerPanel({
 
           <div className={`backlog-gate-card ${nextAction ? "neutral" : "fail"}`}>
             <div className="backlog-gate-title">
-              <span>{canonicalAuthorityPresent ? "Historical action (advisory)" : "Next legal action"}</span>
+              <span>Historical action (advisory)</span>
               <span className={`status-badge ${nextAction ? "status-running" : "status-failed"}`}>{nextAction ? "available" : "missing"}</span>
             </div>
             <div className="backlog-gate-facts">
@@ -1371,11 +1306,6 @@ function CompactLedgerPanel({
   );
 }
 
-function compactLedgerCurrentContractLabel(row?: TaskPlaybackCompactLedgerRow | null): string {
-  if (!row) return "none";
-  return row.current_contract_execution_id || row.contract_execution_id || row.current_contract_id || "none";
-}
-
 function compactLedgerProjectionReadiness(row?: TaskPlaybackCompactLedgerRow | null): string {
   if (!row) return "not loaded";
   if (row.projection_degraded) return "degraded";
@@ -1424,39 +1354,6 @@ function compactLedgerProjectionFlagValues(flags: Record<string, unknown>): stri
     .filter(([, value]) => Boolean(value))
     .slice(0, 6)
     .map(([key, value]) => `${compactProjectionReason(key)}: ${compactUnknown(value)}`);
-}
-
-function contractProjectionForSummary(bug: BacklogBug, gate?: MfCloseTimelineGate): AgentTaskContractProjection | null {
-  if (gate?.contract_projection) return gate.contract_projection;
-  const summary = bug.contract_summary;
-  if (!summary?.projection_status) return null;
-  return {
-    schema_version: summary.projection_schema_version,
-    source_of_truth: summary.source_of_truth,
-    status: summary.projection_status,
-    projection_watermark: summary.projection_watermark,
-    stale: summary.stale,
-    divergent: summary.divergent,
-    contract_hash: summary.contract_hash,
-  };
-}
-
-function projectionTone(projection: AgentTaskContractProjection | null): string {
-  if (!projection) return "status-unknown";
-  if (projection.divergent || projection.status === "divergent") return "status-failed";
-  if (projection.stale || projection.status === "stale") return "status-pending";
-  if (projection.status === "current") return "status-complete";
-  return "status-unknown";
-}
-
-function commandProjectionTone(status: string, divergenceReason = ""): string {
-  const normalized = status.toLowerCase();
-  if (!status || normalized === "not loaded") return "status-unknown";
-  if (normalized === "completed" && !divergenceReason) return "status-complete";
-  if (normalized === "completed" && divergenceReason.includes("reconciled")) return "status-complete";
-  if (normalized.includes("recovery_required") || normalized === "blocked") return "status-failed";
-  if (normalized === "unresolved" || divergenceReason.startsWith("missing_")) return "status-failed";
-  return "status-pending";
 }
 
 interface AuditCloseState {
@@ -1697,29 +1594,7 @@ function EvidenceInspector({
 
   // Build a minimal frame-compatible shim so EventSemanticDetail can render the
   // shared L1/L2/L3 layered detail (AC-4: same component in both surfaces).
-  const eventSemanticFrame = event && semantic ? {
-    headline: semantic.headline,
-    actor: semantic.actor_label,
-    lane_id: semantic.lane_id,
-    event_type: event.event_type,
-    phase: semantic.phase_label,
-    source_event_id: String(event.event_id ?? event.id ?? ""),
-    summary: semantic.narrative.information,
-    specific_facts: semantic.chips.map((chip) => ({
-      kind: chip.kind,
-      label: chip.label,
-      value: chip.value,
-      source: "semantic" as const,
-    })),
-    failure_diagnosis: semantic.inspector.rows
-      .filter((row) => /block|fail|miss|error/i.test(`${row.label} ${row.value}`))
-      .map((row) => ({
-        kind: "detail",
-        label: row.label,
-        value: String(row.value ?? ""),
-        source: "semantic" as const,
-      })),
-  } : null;
+  const eventSemanticFrame = event ? projectTaskPlaybackFrame(event, 0) : null;
 
   return (
     <div className="backlog-evidence-inspector">
@@ -2100,6 +1975,8 @@ function ContractGatePanel({
   backlogId,
   projectId,
   acceptanceCriteria,
+  compactLedger,
+  compactLedgerRow,
 }: {
   audit: ContractAudit;
   response?: BacklogTimelineGateResponse;
@@ -2110,8 +1987,11 @@ function ContractGatePanel({
   legacyMatrix: GateMatrixProjection;
   backlogId: string;
   projectId: string;
-  acceptanceCriteria?: string[];
+  acceptanceCriteria?: BacklogAcceptanceCriterionView[];
+  compactLedger?: TaskPlaybackCompactLedger;
+  compactLedgerRow?: TaskPlaybackCompactLedgerRow | null;
 }) {
+  const [historicalOpen, setHistoricalOpen] = useState(false);
   const gateState = gateEvidenceState(response, audit.events);
   const closeDisplay = authority?.backlog_close_readiness.display_status ?? "UNKNOWN";
   const backlogStatus = String(authority?.backlog_close_readiness.backlog_status ?? "").toUpperCase();
@@ -2147,8 +2027,20 @@ function ContractGatePanel({
         )}
       </div>
 
-      {/* ── Historical/advisory legacy MF close-gate projection ─────────── */}
-      <div className="backlog-modal-section" data-contract-gate-authority="legacy-advisory">
+      {/* ── Acceptance criteria are row data, separate from execution verdict. */}
+      <BacklogAcceptanceCriteria criteria={acceptanceCriteria ?? []} events={audit.events} />
+
+      <details
+        className="backlog-historical-audit"
+        data-contract-gate-authority="legacy-advisory"
+        open={historicalOpen}
+        onToggle={(event) => setHistoricalOpen(event.currentTarget.open)}
+      >
+        <summary>Load historical MF gate, contract inputs and public-safe raw audit</summary>
+      {historicalOpen ? <>
+      <CompactLedgerPanel ledger={compactLedger} row={compactLedgerRow} backlogId={backlogId} />
+      <ContractRuntimeCompatibilityRepairPanel authority={authority} />
+      <div className="backlog-modal-section">
         <div className="backlog-modal-section-head">
           <span>Historical MF close gate (advisory)</span>
           <span className="status-badge status-unknown">does not override ContractRuntime</span>
@@ -2208,27 +2100,6 @@ function ContractGatePanel({
         {gate ? <RouteContextGuidancePanel gate={gate} /> : null}
       </div>
 
-      {/* ── Acceptance criteria (free-text, AC2) ───────────────────────── */}
-      {acceptanceCriteria && acceptanceCriteria.length > 0 ? (
-        <div className="backlog-modal-section">
-          <div className="backlog-modal-section-head">
-            <span>Acceptance criteria (free-text)</span>
-            <span className="mono">{acceptanceCriteria.length} criterion{acceptanceCriteria.length === 1 ? "" : "s"}</span>
-          </div>
-          <div className="backlog-contract-requirements">
-            {acceptanceCriteria.map((criterion, i) => (
-              <div key={i} className="contract-requirement-card">
-                <div className="contract-req-header">
-                  <span className="mono contract-req-id">{i + 1}</span>
-                  <span className="contract-req-text">{criterion}</span>
-                  <span className="status-badge status-unknown">not independently verified</span>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
       {/* ── Raw public-safe authority and compatibility payloads ────────── */}
       <div className="backlog-modal-section">
         <div className="backlog-modal-section-head">
@@ -2242,6 +2113,8 @@ function ContractGatePanel({
           <RawPayloadBlock label="legacy MF close gate raw (advisory)" value={response ?? { state: "not recorded" }} />
         </div>
       </div>
+      </> : null}
+      </details>
     </div>
   );
 }
@@ -2400,10 +2273,12 @@ function ContractRequirementCard({ requirement }: { requirement: ContractRequire
 }
 
 function RawPayloadBlock({ label, value }: { label: string; value: unknown }) {
+  const rendered = typeof value === "string" ? value || "missing" : JSON.stringify(value ?? { state: "missing" }, null, 2);
+  const bounded = rendered.length > 65_536 ? `${rendered.slice(0, 65_536)}\n… [truncated at 65536 characters]` : rendered;
   return (
     <div className="backlog-raw-payload">
       <span>{label}</span>
-      <pre>{typeof value === "string" ? value || "missing" : JSON.stringify(value ?? { state: "missing" }, null, 2)}</pre>
+      <pre>{bounded}</pre>
     </div>
   );
 }
@@ -2487,7 +2362,7 @@ function contractRoot(value: Record<string, unknown>): Record<string, unknown> {
 }
 
 function contractInputs(bug: BacklogBug | null, root: Record<string, unknown>, requirementCount: number): ContractInputItem[] {
-  const criteria = listFrom(bug?.acceptance_criteria);
+  const criteria = acceptanceCriteriaFrom(bug?.acceptance_criteria);
   const targetFiles = listFrom(bug?.target_files);
   const testFiles = listFrom(bug?.test_files);
   const requiredDocs = listFrom(bug?.required_docs);
@@ -4000,6 +3875,143 @@ function statusClass(status?: string): string {
   if (s === "RUNNING" || s === "CLAIMED" || s === "IN_CHAIN") return "status-running";
   if (s === "OPEN" || s === "QUEUED") return "status-pending";
   return "status-unknown";
+}
+
+export function acceptanceCriteriaFrom(
+  value?: Array<string | BacklogAcceptanceCriterion> | string,
+): BacklogAcceptanceCriterionView[] {
+  if (!value) return [];
+  let source: unknown[];
+  if (Array.isArray(value)) {
+    source = value;
+  } else {
+    const text = String(value).trim();
+    if (!text) return [];
+    try {
+      const parsed = JSON.parse(text);
+      source = Array.isArray(parsed) ? parsed : [text];
+    } catch {
+      source = text.split(/\r?\n|,\s+/).map((item) => item.trim()).filter(Boolean);
+    }
+  }
+  return source.flatMap<BacklogAcceptanceCriterionView>((item, index) => {
+    if (typeof item === "string" || typeof item === "number") {
+      const text = String(item).trim();
+      return text ? [{ id: `AC-${index + 1}`, text, description: "", required_scope: null, legacy: true }] : [];
+    }
+    const record = asRecord(item);
+    const text = firstText(record.text, record.description);
+    if (!text) return [];
+    const id = firstText(record.id) || `AC-${index + 1}`;
+    const requiredScope = asRecord(record.required_scope);
+    return [{
+      id,
+      text,
+      description: firstText(record.description),
+      required_scope: Object.keys(requiredScope).length > 0 ? requiredScope as BacklogAcceptanceRequiredScope : null,
+      legacy: false,
+    }];
+  });
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+function acceptanceScopeValues(scope: BacklogAcceptanceRequiredScope | null): string[] {
+  if (!scope) return [];
+  return [
+    scope.kind ? `kind: ${scope.kind}` : "",
+    ...(scope.files ?? []).map((file) => `file: ${file}`),
+    ...(scope.nodes ?? []).map((node) => `node: ${node}`),
+    scope.dependency_id ? `dependency: ${scope.dependency_id}` : "",
+  ].filter(Boolean);
+}
+
+export function acceptanceCriterionVerification(
+  criterion: BacklogAcceptanceCriterionView,
+  events: TaskTimelineEvent[],
+): AcceptanceVerificationState {
+  let matchingIdSeen = false;
+  for (const event of events) {
+    const provenance = asRecord(event.provenance);
+    const provenanceScope = asRecord(provenance.scope);
+    const eventId = firstText(event.id, event.event_id);
+    const eventAuthorityBound = provenance.schema_version === "contract_runtime.event_provenance.v1"
+      && provenance.projection_source === "contract_runtime_visualization._event_provenance"
+      && provenance.projection_verified === true
+      && provenance.classification === "authority_bound"
+      && provenance.authority_bound === true
+      && firstText(provenanceScope.project_id) === firstText(event.project_id)
+      && firstText(provenanceScope.backlog_id) === firstText(event.backlog_id)
+      && firstText(provenanceScope.task_id) === firstText(event.task_id)
+      && firstText(provenanceScope.source_event_id) === eventId;
+    for (const root of [asRecord(event), asRecord(event.payload), asRecord(event.verification), asRecord(event.artifact_refs)]) {
+      for (const key of ["acceptance_evidence", "acceptance_verification", "criterion_evidence"]) {
+        const raw = root[key];
+        const candidates = Array.isArray(raw) ? raw : raw && typeof raw === "object" ? [raw] : [];
+        for (const value of candidates) {
+          const item = asRecord(value);
+          if (firstText(item.criterion_id, item.acceptance_id, item.id) !== criterion.id) continue;
+          matchingIdSeen = true;
+          const scope = asRecord(item.required_scope ?? item.scope_binding);
+          const scopeMatches = !criterion.required_scope
+            || canonicalJson(scope) === canonicalJson(criterion.required_scope);
+          const ref = firstText(item.evidence_ref, item.source_ref, item.event_ref);
+          const authoritySource = firstText(item.authority_source);
+          if (
+            eventAuthorityBound
+            && item.authority_bound === true
+            && scopeMatches
+            && Boolean(ref)
+            && ["contract_runtime", "runtime_context_worker_proof", "qa_session_verification", "route_token_gate"].includes(authoritySource)
+          ) return "verified";
+        }
+      }
+    }
+  }
+  return matchingIdSeen ? "unlinked" : "unknown";
+}
+
+export function BacklogAcceptanceCriteria({
+  criteria,
+  events,
+}: {
+  criteria: BacklogAcceptanceCriterionView[];
+  events: TaskTimelineEvent[];
+}) {
+  if (criteria.length === 0) return null;
+  return (
+    <div className="backlog-modal-section">
+      <div className="backlog-modal-section-head">
+        <span>Acceptance criteria</span>
+        <span className="mono">{criteria.length} criterion{criteria.length === 1 ? "" : "s"}</span>
+      </div>
+      <div className="backlog-contract-requirements">
+        {criteria.map((criterion) => {
+          const verification = acceptanceCriterionVerification(criterion, events);
+          return (
+            <div key={criterion.id} className="contract-requirement-card">
+              <div className="contract-req-header">
+                <span className="mono contract-req-id">{criterion.id}</span>
+                <span className="contract-req-text">{criterion.text}</span>
+                <span className={`status-badge ${verification === "verified" ? "status-complete" : "status-unknown"}`}>
+                  {verification === "verified" ? "explicitly verified" : verification === "unlinked" ? "evidence unlinked" : "verification unknown"}
+                </span>
+              </div>
+              {criterion.description && criterion.description !== criterion.text ? <p>{criterion.description}</p> : null}
+              <TokenList label="required scope" values={acceptanceScopeValues(criterion.required_scope)} empty="not declared" tone="neutral" />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function listFrom(value?: string[] | string): string[] {

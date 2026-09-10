@@ -32,6 +32,15 @@ const TASK_PLAYBACK_SHARED_CACHE_MAX_ENTRIES = 64;
 export type TaskPlaybackSource = "governed" | "governed_partial" | "fallback_sample";
 export type TaskPlaybackFrameStatus = "passed" | "blocked" | "failed" | "running" | "waiting" | "missing" | "recorded" | "unknown";
 export type TaskPlaybackLaneFamily = "observer" | "worker" | "verification" | "gate" | "content_sys";
+export type TaskPlaybackEventIdentityKind = "durable_event" | "current_snapshot";
+export type TaskPlaybackStructuredViewStatus = "supported" | "unsupported" | "renderer_error";
+export type TaskPlaybackProvenanceKind = "authority_bound" | "agent_authored" | "system_dispatched" | "unknown";
+
+export interface TaskPlaybackProvenance {
+  kind: TaskPlaybackProvenanceKind;
+  label: "Authority-bound evidence" | "Agent-authored record" | "System-dispatched record" | "Provenance unknown";
+  source: string;
+}
 
 export interface TaskPlaybackEvidenceRef {
   kind:
@@ -106,6 +115,20 @@ export interface TaskPlaybackFrame {
   at: string;
   lane_id: string;
   source_event_id: string;
+  identity_kind: TaskPlaybackEventIdentityKind;
+  durable_event_id: string;
+  backlog_id: string;
+  task_id: string;
+  contract_execution_id: string;
+  structured_view_status: TaskPlaybackStructuredViewStatus;
+  structured_view_message: string;
+  provenance: TaskPlaybackProvenance;
+  raw_data: {
+    status: "available" | "omitted" | "unavailable";
+    payload_bytes: number | null;
+    truncated: boolean;
+    notice: string;
+  };
   event_type: string;
   event_kind: string;
   phase: string;
@@ -384,6 +407,8 @@ export interface RecentTimelineProjectionInput {
 
 export type ContractRuntimeAuthorityDisplayStatus =
   | "PASS"
+  | "FIXED"
+  | "SUPERSEDED"
   | "BYPASSED"
   | "WAIVED"
   | "BLOCKED"
@@ -535,13 +560,17 @@ export function contractRuntimeAuthorityDisplayStatus(
   const status = safeText(String(value ?? "")).toLowerCase();
   if (options.bypassed || status.includes("bypass")) return "BYPASSED";
   if (options.waived || status.includes("waiv")) return "WAIVED";
+  if (status.includes("supersed")) return "SUPERSEDED";
+  if (status === "fixed") return "FIXED";
+  const token = status.replace(/[\s-]+/g, "_");
+  if (token === "no_pass" || token === "terminal_no_pass" || token === "not_passed") return "FAILED";
   if (status.includes("block") || status.includes("missing")) return "BLOCKED";
   if (status.includes("fail") || status.includes("error") || status.includes("reject")) return "FAILED";
   if (status.includes("running") || status.includes("active") || status.includes("progress")) return "RUNNING";
   if (status.includes("waiting") || status.includes("pending") || status.includes("queued")) return "WAITING";
   if (status === "open") return "OPEN";
-  if (status.replace(/[-\s]+/g, "_") === "contract_complete") return "COMPLETED";
-  if (status.includes("pass") || status.includes("success") || status.includes("complete") || status === "fixed" || status === "closed") return "PASS";
+  if (token === "contract_complete" || status === "completed" || status === "complete" || status === "closed") return "COMPLETED";
+  if (["pass", "passed", "success", "succeeded"].includes(status)) return "PASS";
   if (status.includes("record") || status.includes("accept") || status.includes("acknowledg")) return "RECORDED";
   return "UNKNOWN";
 }
@@ -625,17 +654,10 @@ export function projectContractRuntimeAuthorityViewModel(
     ...line,
     display_status: contractRuntimeAuthorityDisplayStatus(line.status, { bypassed: line.bypassed }),
   }));
-  const closeAuthorityStatus = contractRuntimeAuthorityDisplayStatus(response.backlog_close_readiness.state, {
-    waived: response.backlog_close_readiness.state.toLowerCase().includes("waiv"),
-  });
   const backlogRowStatus = contractRuntimeAuthorityDisplayStatus(
     response.backlog.status || response.backlog_close_readiness.backlog_status,
   );
-  const backlogCloseDisplayStatus = backlogRowStatus === "WAIVED" || backlogRowStatus === "BYPASSED"
-    ? backlogRowStatus
-    : closeAuthorityStatus !== "UNKNOWN"
-      ? closeAuthorityStatus
-      : backlogRowStatus;
+  const backlogCloseDisplayStatus = backlogRowStatus;
 
   return {
     schema_version: "contract_runtime.authority_view_model.v1",
@@ -688,7 +710,7 @@ export function projectContractRuntimeAuthorityViewModel(
 function contractRuntimeMatrixStatus(
   status: ContractRuntimeAuthorityDisplayStatus,
 ): GateMatrixRow["status"] {
-  if (status === "PASS" || status === "COMPLETED" || status === "RECORDED") return "passed";
+  if (status === "PASS" || status === "FIXED" || status === "COMPLETED" || status === "RECORDED") return "passed";
   if (status === "BLOCKED" || status === "FAILED") return "failed";
   if (status === "BYPASSED" || status === "WAIVED") return "unknown";
   return "unknown";
@@ -843,12 +865,13 @@ export function projectContractRuntimeGateMatrix(
 
 /**
  * Public-safe next-action presentation shared by Activity Current and Playback.
- * Canonical ContractRuntime/current-chain actions lead; selected-event and
- * legacy timeline actions remain advisory and can never override the primary.
+ * Only canonical ContractRuntime/current-chain actions are returned for the
+ * ordinary Current and Playback surfaces. Historical event actions remain in
+ * the explicit event/audit inspectors and never participate in current status.
  */
 export function taskPlaybackNextLegalActionPresentations(
   trace: TaskPlaybackTrace,
-  selectedFrameId = "",
+  _selectedFrameId = "",
 ): TaskPlaybackNextLegalActionPresentation[] {
   const items: TaskPlaybackNextLegalActionPresentation[] = [];
   const authority = trace.authority_view;
@@ -934,40 +957,6 @@ export function taskPlaybackNextLegalActionPresentations(
       false,
     );
   }
-
-  if (selectedFrameId) {
-    const selectedFrame = trace.frames.find((frame) => frame.id === selectedFrameId);
-    selectedFrame?.failure_diagnosis
-      .filter((fact) => fact.kind === "next_legal_action" || fact.label.toLowerCase() === "next legal action")
-      .forEach((fact, index) => pushAction(
-        { action: fact.value, id: `selected-event-${selectedFrame.source_event_id || selectedFrame.id}-${index + 1}` },
-        `selected_event:${selectedFrame.source_event_id || selectedFrame.id}`,
-        "Selected event next legal action (advisory)",
-        true,
-      ));
-  }
-
-  if (trace.close_gate_summary.next_expected_action) {
-    pushAction(
-      { action: trace.close_gate_summary.next_expected_action, id: "close-gate-next-expected-action" },
-      "legacy_close_gate_summary",
-      "Legacy next legal action (advisory)",
-      true,
-    );
-  }
-
-  authority?.historical_diagnostics.legacy_advisories.forEach((record, index) => {
-    const raw = record.next_legal_action;
-    const action = typeof raw === "string" || typeof raw === "number"
-      ? { action: String(raw), id: safeText(String(record.id ?? "")) || `legacy-${index + 1}` }
-      : asRecord(raw);
-    pushAction(
-      action,
-      `legacy_advisory:${safeText(String(record.id ?? "")) || index + 1}`,
-      "Legacy next legal action (advisory)",
-      true,
-    );
-  });
 
   return items;
 }
@@ -2381,9 +2370,83 @@ function mergeTimelineEvents(primary: TaskTimelineEvent[], secondary: TaskTimeli
     .sort(compareTimelineEvents);
 }
 
-function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFrame {
+function taskPlaybackEventIdentity(event: TaskTimelineEvent): { kind: TaskPlaybackEventIdentityKind; durableEventId: string } {
+  const payload = asRecord(event.payload);
+  const synthetic = (
+    booleanFrom(payload.synthetic_current)
+    && booleanFrom(payload.append_only_history) === false
+  ) || ["contract_runtime.current_state", "contract_chain.current_state", "runtime_context.current_state"].includes(event.event_type);
+  if (synthetic) return { kind: "current_snapshot", durableEventId: "" };
+  const rawId = (event as { id?: unknown }).id;
+  const durableEventId = typeof rawId === "number" && Number.isInteger(rawId) && rawId > 0
+    ? String(rawId)
+    : /^\d+$/.test(safeText(event.event_id ?? "")) && Number(event.event_id) > 0
+      ? safeText(event.event_id ?? "")
+      : "";
+  return { kind: "durable_event", durableEventId };
+}
+
+function taskPlaybackEventProvenance(event: TaskTimelineEvent): TaskPlaybackProvenance {
+  const projection = asRecord(event.provenance);
+  const scope = asRecord(projection.scope);
+  const rawId = safeText(String(event.id ?? event.event_id ?? ""));
+  const scopeMatches = Boolean(rawId)
+    && safeText(String(scope.project_id ?? "")) === safeText(event.project_id ?? "")
+    && safeText(String(scope.backlog_id ?? "")) === safeText(event.backlog_id ?? "")
+    && safeText(String(scope.task_id ?? "")) === safeText(event.task_id ?? "")
+    && safeText(String(scope.source_event_id ?? "")) === rawId;
+  const classification = safeText(String(projection.classification ?? ""));
+  const verifiedProjection = projection.schema_version === "contract_runtime.event_provenance.v1"
+    && projection.projection_source === "contract_runtime_visualization._event_provenance"
+    && projection.projection_verified === true
+    && scopeMatches;
+  if (verifiedProjection && classification === "authority_bound" && projection.authority_bound === true) {
+    return { kind: "authority_bound", label: "Authority-bound evidence", source: safeText(String(projection.source ?? "server-verified authority")) };
+  }
+  if (verifiedProjection && classification === "agent_authored" && projection.authority_bound === false) {
+    return { kind: "agent_authored", label: "Agent-authored record", source: safeText(String(projection.source ?? "server-verified worker evidence")) };
+  }
+  if (verifiedProjection && classification === "system_dispatched" && projection.authority_bound === false) {
+    return { kind: "system_dispatched", label: "System-dispatched record", source: safeText(String(projection.source ?? "service-generated dispatch lineage")) };
+  }
+  return { kind: "unknown", label: "Provenance unknown", source: "no source-backed provenance binding" };
+}
+
+function fallbackSemanticProjection(event: TaskTimelineEvent, index: number): TaskTimelineSemanticProjection {
+  const projection = projectTaskTimelineEvent({
+    ...event,
+    event_type: "unsupported.timeline.event",
+    event_kind: "unsupported_event",
+    payload: {},
+    verification: {},
+    artifact_refs: {},
+  }, index);
+  return {
+    ...projection,
+    fallback: true,
+    catalog_entry_id: "fallback.renderer_error",
+    template_id: "fallback.renderer_error",
+    headline: "Timeline event retained after its structured renderer failed.",
+    title: "Unsupported timeline event",
+    detail: "The public event summary remains available. Expand raw data to inspect its sanitized payload.",
+  };
+}
+
+export function projectTaskPlaybackFrame(
+  event: TaskTimelineEvent,
+  index = 0,
+  semanticProjector: (value: TaskTimelineEvent, itemIndex?: number) => TaskTimelineSemanticProjection = projectTaskTimelineEvent,
+): TaskPlaybackFrame {
   const publicEvent = hydrateTimelineEventJson(event);
-  const semantic = projectTaskTimelineEvent(publicEvent, index);
+  let semantic: TaskTimelineSemanticProjection;
+  let structuredViewStatus: TaskPlaybackStructuredViewStatus;
+  try {
+    semantic = semanticProjector(publicEvent, index);
+    structuredViewStatus = semantic.fallback ? "unsupported" : "supported";
+  } catch {
+    semantic = fallbackSemanticProjection(publicEvent, index);
+    structuredViewStatus = "renderer_error";
+  }
   const status = timelineStatusFromEvent(publicEvent);
   const artifactRefs = artifactsFromEvent(publicEvent, semantic);
   const specificFacts = specificFactsFromEvent(publicEvent, semantic);
@@ -2391,12 +2454,45 @@ function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFr
   const eventChecklist = eventChecklistFromEvent(publicEvent, status, specificFacts, failureDiagnosis);
   const evidenceRefs = evidenceFromEvent(publicEvent, semantic);
   const evidenceLinks = evidenceLinksFromEvent(publicEvent, semantic, evidenceRefs, artifactRefs);
+  const identity = taskPlaybackEventIdentity(publicEvent);
+  const payload = asRecord(publicEvent.payload);
+  const rawOmitted = publicEvent.raw_evidence_omitted === true || booleanFrom(payload.raw_payload_omitted);
+  const payloadBytes = numberFrom(payload.payload_bytes ?? asRecord((publicEvent as unknown as Record<string, unknown>).payload_ref).payload_bytes);
+  const rawUnavailable = publicEvent.public_safe === false;
+  const contractExecutionId = firstPublicValueAtPaths(publicEvent, [
+    "contract_execution_id",
+    "payload.contract_execution_id",
+    "verification.contract_execution_id",
+    "artifact_refs.contract_execution_id",
+  ])?.value ?? "";
   return {
     id: eventIdentity(publicEvent, index),
     sequence: index + 1,
     at: publicEvent.created_at || "",
     lane_id: semantic.lane_id,
     source_event_id: eventDisplayId(publicEvent),
+    identity_kind: identity.kind,
+    durable_event_id: identity.durableEventId,
+    backlog_id: safeText(publicEvent.backlog_id ?? ""),
+    task_id: safeText(publicEvent.task_id ?? ""),
+    contract_execution_id: contractExecutionId,
+    structured_view_status: structuredViewStatus,
+    structured_view_message: structuredViewStatus === "supported"
+      ? ""
+      : structuredViewStatus === "renderer_error"
+        ? "Structured renderer failed; the event was retained as a safe read-only fallback."
+        : "Unsupported structured view; the event was retained as a safe read-only fallback.",
+    provenance: taskPlaybackEventProvenance(publicEvent),
+    raw_data: {
+      status: rawUnavailable ? "unavailable" : rawOmitted ? "omitted" : "available",
+      payload_bytes: payloadBytes ?? null,
+      truncated: Boolean((publicEvent as unknown as Record<string, unknown>).truncated),
+      notice: rawUnavailable
+        ? "Raw data unavailable for this public scope."
+        : rawOmitted
+          ? "Raw payload omitted from the summary; expand to request the current-user-authorized public-safe event."
+          : "Public-safe event data loaded.",
+    },
     event_type: semantic.event_type_label,
     event_kind: semantic.event_kind_label,
     phase: semantic.phase_label,
@@ -2419,6 +2515,10 @@ function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFr
     artifact_refs: artifactRefs,
     has_structured_detail: specificFacts.length > 0 || failureDiagnosis.length > 0 || eventChecklist.item_count > 0 || evidenceLinks.length > 1,
   };
+}
+
+function frameFromEvent(event: TaskTimelineEvent, index: number): TaskPlaybackFrame {
+  return projectTaskPlaybackFrame(event, index);
 }
 
 function hydrateTimelineEventJson(event: TaskTimelineEvent): TaskTimelineEvent {
@@ -5666,6 +5766,12 @@ export interface ActivityEventCard {
   actor: string;
   backlog_id: string;
   task_id: string;
+  contract_execution_id: string;
+  identity_kind: TaskPlaybackEventIdentityKind;
+  durable_event_id: string;
+  identity_label: "Durable event" | "Snapshot — not history";
+  provenance: TaskPlaybackProvenance;
+  structured_view_status: TaskPlaybackStructuredViewStatus;
   /** One-line semantic headline. */
   headline: string;
   /** Count of evidence_links in the projected frame. */
@@ -5684,6 +5790,8 @@ export interface ActivityEventCard {
  */
 export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard {
   const publicEvent = hydrateTimelineEventJson(event);
+  const identity = taskPlaybackEventIdentity(publicEvent);
+  const provenance = taskPlaybackEventProvenance(publicEvent);
   const rawId = (publicEvent as { id?: unknown }).id;
   const id = publicEvent.event_id && !isSensitiveEvidenceText(publicEvent.event_id, "event_id")
     ? publicEvent.event_id
@@ -5715,6 +5823,12 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
     "payload.stage_task_id",
     "verification.task_id",
     "artifact_refs.task_id",
+  ])?.value ?? "";
+  const contract_execution_id = firstPublicValueAtPaths(publicEvent, [
+    "contract_execution_id",
+    "payload.contract_execution_id",
+    "verification.contract_execution_id",
+    "artifact_refs.contract_execution_id",
   ])?.value ?? "";
   const next_legal_action = firstPublicValueAtPaths(publicEvent, [
     "next_legal_action.action",
@@ -5763,11 +5877,14 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
   // Build a headline from the semantic projection helper; fall back to compact
   // event_kind / status text when the projection is unavailable.
   let headline = "";
+  let structured_view_status: TaskPlaybackStructuredViewStatus = "supported";
   try {
     const projection = projectTaskTimelineEvent(publicEvent, 0);
     headline = projection.headline || projection.title || "";
+    structured_view_status = projection.fallback ? "unsupported" : "supported";
   } catch {
     headline = `${event_kind}${status ? ` — ${status}` : ""}`;
+    structured_view_status = "renderer_error";
   }
   if (!headline) headline = `${event_kind}${status ? ` — ${status}` : ""}`;
   // Collect evidence types from the projected frame when available.
@@ -5807,6 +5924,12 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
     actor,
     backlog_id,
     task_id,
+    contract_execution_id,
+    identity_kind: identity.kind,
+    durable_event_id: identity.durableEventId,
+    identity_label: identity.kind === "current_snapshot" ? "Snapshot — not history" : "Durable event",
+    provenance,
+    structured_view_status,
     headline,
     evidence_count,
     evidence_types,
@@ -5995,8 +6118,9 @@ export function buildPlaybackUrl(
   url.searchParams.set(PLAYBACK_URL_PARAMS.view, "activity");
   url.searchParams.set(PLAYBACK_URL_PARAMS.activity_tab, "history");
   url.searchParams.set(PLAYBACK_URL_PARAMS.playback_backlog, backlogId);
-  if (eventId != null && eventId !== "") {
-    url.searchParams.set(PLAYBACK_URL_PARAMS.playback_event, String(eventId));
+  const durableEventId = String(eventId ?? "").trim();
+  if (/^\d+$/.test(durableEventId) && !/^0+$/.test(durableEventId)) {
+    url.searchParams.set(PLAYBACK_URL_PARAMS.playback_event, durableEventId);
   } else {
     url.searchParams.delete(PLAYBACK_URL_PARAMS.playback_event);
   }
