@@ -86707,6 +86707,7 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
         finish_checkpoint = text(finish_payload.get("checkpoint_id"))
         context_head = text(getattr(context, "head_commit", "")).lower()
         context_checkpoint = text(getattr(context, "checkpoint_id", ""))
+        context_base = text(getattr(context, "base_commit", "")).lower()
         queue_head = text(getattr(item, "branch_head", "")).lower()
         if not (
             finish_head
@@ -86715,6 +86716,17 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
             and context_checkpoint == finish_checkpoint
         ):
             errors.append("rev10_runtime_queue_finish_identity_mismatch")
+            continue
+        finish_results = (
+            finish_payload.get("test_results")
+            if isinstance(finish_payload.get("test_results"), Mapping)
+            else {}
+        )
+        if not _contract_runtime_finish_test_results_consumer_acceptance(
+            finish_results,
+            expected_baseline_commit=context_base,
+        ).get("accepted"):
+            errors.append("rev10_worker_finish_attestation_mismatch")
             continue
         try:
             stored_record = _contract_runtime_store(conn).get(execution_id)
@@ -86742,9 +86754,7 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
                     "changed_files",
                 ),
                 test_results=(
-                    finish_payload.get("test_results")
-                    if isinstance(finish_payload.get("test_results"), Mapping)
-                    else {}
+                    finish_results
                 ),
                 supplied_worker_session_id=text(
                     finish_payload.get("worker_session_id")
@@ -86811,6 +86821,9 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
             record=record,
             completed_line_index=attestation_index,
             expected_line=attestation_line,
+            allow_verified_worker_finish_attestation=True,
+            expected_worker_identity=identity,
+            expected_baseline_commit=context_base,
         )
         if attestation_acceptance.get("db_verified") is not True:
             errors.append("rev10_worker_finish_attestation_not_db_accepted")
@@ -86820,6 +86833,7 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
             completed_line_index=finish_index, expected_line=finish_line,
             allow_statusless_worker_finish_gate=True,
             expected_worker_identity=identity,
+            expected_baseline_commit=context_base,
         )
         if accepted.get("db_verified") is not True:
             errors.append("rev10_worker_finish_gate_not_db_accepted")
@@ -140990,10 +141004,140 @@ def _contract_runtime_append_completed_line_correction(
     return runtime.store.get(contract_execution_id)
 
 
+def _contract_runtime_finish_test_results_consumer_acceptance(
+    value: Any,
+    *,
+    expected_baseline_commit: str = "",
+) -> dict[str, Any]:
+    """Validate finish results while retaining inherited command failures."""
+
+    if not _runtime_context_finish_attestation_test_results_accepted(value):
+        return {}
+    results = deepcopy(dict(value))
+    failure_scan = deepcopy(results)
+    complete_known_baseline = False
+    if _runtime_context_finish_attestation_no_pass_results_accepted(results):
+        commands_present = "commands" in results
+        comparison_present = "baseline_comparison" in results
+        if commands_present != comparison_present:
+            return {}
+        if commands_present:
+            commands = results.get("commands")
+            comparison = results.get("baseline_comparison")
+            expected_base = str(expected_baseline_commit or "").strip().lower()
+            if (
+                not isinstance(commands, list)
+                or len(commands) != 2
+                or not isinstance(comparison, Mapping)
+                or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_base)
+                or str(comparison.get("exact_commit") or "").strip().lower()
+                != expected_base
+                or comparison.get("error_names_match") is not True
+                or not str(comparison.get("evidence_ref") or "").strip()
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(comparison.get("sha256") or "").strip().lower(),
+                )
+                or type(comparison.get("errors")) is not int
+                or comparison.get("errors") != results.get("baseline_failed")
+                or type(comparison.get("tests")) is not int
+                or comparison.get("tests")
+                != results.get("baseline_passed") + results.get("baseline_failed")
+            ):
+                return {}
+            passing_commands: list[Mapping[str, Any]] = []
+            inherited_commands: list[Mapping[str, Any]] = []
+            for command in commands:
+                if (
+                    not isinstance(command, Mapping)
+                    or not str(command.get("command") or "").strip()
+                    or type(command.get("tests")) is not int
+                    or command.get("tests") <= 0
+                ):
+                    return {}
+                status = str(command.get("status") or "").strip().lower()
+                if status in {"pass", "passed", "ok", "succeeded", "success"}:
+                    if command.get("errors") not in (None, 0):
+                        return {}
+                    passing_commands.append(command)
+                elif (
+                    status == "failed"
+                    and str(command.get("classification") or "").strip()
+                    == "preexisting_baseline_errors"
+                    and type(command.get("errors")) is int
+                    and command.get("errors") > 0
+                ):
+                    inherited_commands.append(command)
+                else:
+                    return {}
+            if (
+                len(passing_commands) != 1
+                or len(inherited_commands) != 1
+                or passing_commands[0].get("tests")
+                != results.get("focused_passed")
+                or inherited_commands[0].get("errors")
+                != results.get("full_failed")
+                or inherited_commands[0].get("tests")
+                != results.get("full_passed") + results.get("full_failed")
+            ):
+                return {}
+            sanitized_commands = deepcopy(commands)
+            for command in sanitized_commands:
+                if str(command.get("status") or "").strip().lower() == "failed":
+                    command["status"] = "baseline_observation"
+            failure_scan["commands"] = sanitized_commands
+            complete_known_baseline = True
+    if _contract_runtime_value_reports_failed_qa(failure_scan):
+        return {}
+    return {
+        "accepted": True,
+        "complete_known_baseline": complete_known_baseline,
+        "failure_scan": failure_scan,
+    }
+
+
+def _contract_runtime_finish_test_results_failure_scan(
+    value: Any,
+    *,
+    canonical_test_results: Mapping[str, Any],
+    accepted_failure_scan: Mapping[str, Any],
+) -> Any:
+    """Replace only exact persisted copies for the recursive failure scan."""
+
+    canonical_hash = stable_sha256(canonical_test_results)
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, nested in value.items():
+            if (
+                str(key) == "test_results"
+                and isinstance(nested, Mapping)
+                and stable_sha256(nested) == canonical_hash
+            ):
+                sanitized[key] = deepcopy(dict(accepted_failure_scan))
+            else:
+                sanitized[key] = _contract_runtime_finish_test_results_failure_scan(
+                    nested,
+                    canonical_test_results=canonical_test_results,
+                    accepted_failure_scan=accepted_failure_scan,
+                )
+        return sanitized
+    if isinstance(value, list):
+        return [
+            _contract_runtime_finish_test_results_failure_scan(
+                nested,
+                canonical_test_results=canonical_test_results,
+                accepted_failure_scan=accepted_failure_scan,
+            )
+            for nested in value
+        ]
+    return deepcopy(value)
+
+
 def _contract_runtime_statusless_worker_finish_gate_acceptance(
     line: Mapping[str, Any],
     *,
     expected_worker_identity: Mapping[str, Any],
+    expected_baseline_commit: str = "",
 ) -> bool:
     """Recognize the canonical finish facade's statusless durable line.
 
@@ -141034,6 +141178,12 @@ def _contract_runtime_statusless_worker_finish_gate_acceptance(
         payload.get("test_results")
         if isinstance(payload.get("test_results"), Mapping)
         else {}
+    )
+    test_results_acceptance = (
+        _contract_runtime_finish_test_results_consumer_acceptance(
+            test_results,
+            expected_baseline_commit=expected_baseline_commit,
+        )
     )
     expected = {
         field: str(expected_worker_identity.get(field) or "").strip()
@@ -141119,9 +141269,7 @@ def _contract_runtime_statusless_worker_finish_gate_acceptance(
         and nested.get("waiting_merge") is True
         and str(payload.get("worker_status") or "") == "waiting_merge"
         and str(nested.get("worker_status") or "") == "waiting_merge"
-        and _runtime_context_finish_attestation_test_results_accepted(
-            test_results
-        )
+        and test_results_acceptance.get("accepted") is True
         and stable_sha256(test_results)
         == stable_sha256(nested.get("test_results"))
         and str(self_gate.get("schema_version") or "")
@@ -141147,7 +141295,11 @@ def _contract_runtime_statusless_worker_finish_gate_acceptance(
     ):
         return False
 
-    failure_scan = deepcopy(dict(payload))
+    failure_scan = _contract_runtime_finish_test_results_failure_scan(
+        payload,
+        canonical_test_results=test_results,
+        accepted_failure_scan=test_results_acceptance["failure_scan"],
+    )
     nested_scan = failure_scan.get("mf_subagent_finish_gate")
     sources = [failure_scan]
     if isinstance(nested_scan, dict):
@@ -141187,7 +141339,9 @@ def _contract_runtime_completed_line_acceptance(
     expected_line: Mapping[str, Any],
     allow_missing_observer_merge_status: bool = False,
     allow_statusless_worker_finish_gate: bool = False,
+    allow_verified_worker_finish_attestation: bool = False,
     expected_worker_identity: Mapping[str, Any] | None = None,
+    expected_baseline_commit: str = "",
 ) -> dict[str, Any]:
     """Resolve one completed line's server-written acceptance revision/time."""
 
@@ -141240,12 +141394,48 @@ def _contract_runtime_completed_line_acceptance(
             and _contract_runtime_statusless_worker_finish_gate_acceptance(
                 canonical_line,
                 expected_worker_identity=(expected_worker_identity or {}),
+                expected_baseline_commit=expected_baseline_commit,
             )
         )
     )
+    failure_scan_line = canonical_line
+    if (
+        allow_verified_worker_finish_attestation
+        and str(canonical_line.get("stage_id") or "").strip()
+        == "worker_attestation"
+        and str(canonical_line.get("line_id") or "").strip()
+        == "worker_finish_time_attestation"
+        and str(canonical_line.get("actor_role") or "").strip() == "mf_sub"
+        and str(canonical_line.get("evidence_kind") or "").strip()
+        == "record_finish_time_worker_attestation"
+    ):
+        attestation_results = (
+            payload.get("test_results")
+            if isinstance(payload.get("test_results"), Mapping)
+            else {}
+        )
+        results_acceptance = (
+            _contract_runtime_finish_test_results_consumer_acceptance(
+                attestation_results,
+                expected_baseline_commit=expected_baseline_commit,
+            )
+        )
+        top_results = canonical_line.get("test_results")
+        if (
+            results_acceptance.get("accepted") is True
+            and (
+                not isinstance(top_results, Mapping)
+                or stable_sha256(top_results) == stable_sha256(attestation_results)
+            )
+        ):
+            failure_scan_line = _contract_runtime_finish_test_results_failure_scan(
+                canonical_line,
+                canonical_test_results=attestation_results,
+                accepted_failure_scan=results_acceptance["failure_scan"],
+            )
     disqualifying_failed_qa = (
         _contract_runtime_line_reports_disqualifying_failed_qa(
-            canonical_line,
+            failure_scan_line,
             record=record,
         )
         and not canonical_no_pass_exception

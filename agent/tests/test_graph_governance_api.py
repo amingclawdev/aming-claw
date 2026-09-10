@@ -61741,6 +61741,7 @@ def _rev10_premerge_acceptance_derivation_case(conn, monkeypatch):
                 target_files=(owned_file,),
                 merge_queue_id=queue_id,
                 status="merge_ready",
+                base_commit="c" * 40,
                 head_commit=branch_head,
                 checkpoint_id=checkpoint_id,
             ),
@@ -61799,6 +61800,7 @@ def _rev10_premerge_acceptance_derivation_case(conn, monkeypatch):
                 "line_instance_id": f"runtime_context:{worker['runtime_context_id']}",
                 "validated_head_commit": branch_head,
                 "checkpoint_id": checkpoint_id,
+                "test_results": {"status": "passed", "passed": True},
             },
         }))
     record = {
@@ -173426,6 +173428,45 @@ def _finish_normal_mf_parallel_worker(
     return finished, finish_line
 
 
+def _complete_known_baseline_test_results(
+    test_results,
+    *,
+    runtime_context,
+    tmp_path,
+):
+    results = copy.deepcopy(test_results)
+    errors = [f"baseline-error-{index}" for index in range(results["baseline_failed"])]
+    evidence = json.dumps(
+        {"base_commit": runtime_context.base_commit, "errors": errors},
+        sort_keys=True,
+    ).encode()
+    evidence_ref = tmp_path / f"{runtime_context.task_id}-baseline-errors.json"
+    evidence_ref.write_bytes(evidence)
+    results["commands"] = [
+        {
+            "command": "python3 -m pytest focused -q",
+            "status": "passed",
+            "tests": results["focused_passed"],
+        },
+        {
+            "command": "python3 -m pytest full -q",
+            "status": "failed",
+            "tests": results["full_passed"] + results["full_failed"],
+            "errors": results["full_failed"],
+            "classification": "preexisting_baseline_errors",
+        },
+    ]
+    results["baseline_comparison"] = {
+        "exact_commit": runtime_context.base_commit,
+        "tests": results["baseline_passed"] + results["baseline_failed"],
+        "errors": results["baseline_failed"],
+        "error_names_match": True,
+        "evidence_ref": str(evidence_ref),
+        "sha256": hashlib.sha256(evidence).hexdigest(),
+    }
+    return results
+
+
 def test_statusless_finish_consumer_accepts_normal_known_baseline(
     release_conn,
     tmp_path,
@@ -173648,9 +173689,16 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
         else [passed_results, copy.deepcopy(passed_results)]
     )
     finished_workers = []
-    for (allocation_body, context), test_results in zip(
-        allocations, results_by_lane, strict=True
+    for lane_index, ((allocation_body, context), test_results) in enumerate(
+        zip(allocations, results_by_lane, strict=True)
     ):
+        if test_results.get("status") == "accepted_with_known_baseline_failure":
+            test_results = _complete_known_baseline_test_results(
+                test_results,
+                runtime_context=context,
+                tmp_path=tmp_path,
+            )
+            results_by_lane[lane_index] = test_results
         monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
         route_identity = dict(allocation_body["route_identity"])
         worker_session_id = f"session-{context.task_id}"
@@ -173730,6 +173778,20 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
         context = get_branch_context(conn, project_id, context.task_id)
         assert context is not None
         assert finish_line["payload"]["test_results"] == test_results
+        record = server._contract_runtime_store(conn).get(execution_id)
+        worker_ledgers = [
+            line["payload"]["test_results"]
+            for line in record["completed_lines"]
+            if line.get("runtime_context_id") == context.runtime_context_id
+            and line.get("line_id")
+            in {
+                "worker_implementation",
+                "worker_finish_time_attestation",
+                "worker_finish_gate",
+            }
+        ]
+        assert len(worker_ledgers) == 3
+        assert all(ledger == test_results for ledger in worker_ledgers)
         finished_workers.append((context, finished, finish_line, route_identity))
 
     queue_results = []
@@ -173944,13 +174006,16 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
     restore_contract_record()
 
     def binding_for_completed_line(line_index):
+        is_attestation = line_index == attestation_index
+        is_finish_gate = line_index == finish_index
         accepted = server._contract_runtime_completed_line_acceptance(
             conn,
             project_id=project_id,
             record=canonical_record,
             completed_line_index=line_index,
             expected_line=canonical_record["completed_lines"][line_index],
-            allow_statusless_worker_finish_gate=(line_index == finish_index),
+            allow_statusless_worker_finish_gate=is_finish_gate,
+            allow_verified_worker_finish_attestation=is_attestation,
             expected_worker_identity=(
                 {
                     field: str(getattr(selected_context, field) or "")
@@ -173963,8 +174028,13 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
                         "merge_queue_id",
                     )
                 }
-                if line_index == finish_index
+                if is_attestation or is_finish_gate
                 else None
+            ),
+            expected_baseline_commit=(
+                selected_context.base_commit
+                if is_attestation or is_finish_gate
+                else ""
             ),
         )
         assert accepted["db_verified"] is True, accepted
@@ -174077,6 +174147,139 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
     assert authority_after_restore["status"] == "satisfied", json.dumps(
         authority_after_restore, sort_keys=True
     )
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "value"),
+    [
+        ("error_names_match", False),
+        ("exact_commit", "f" * 40),
+        ("baseline_errors", 9),
+        ("full_command_classification", "candidate_regression"),
+        ("missing_baseline_comparison", None),
+    ],
+)
+def test_rev10_complete_baseline_ledger_rejects_semantic_mismatch(
+    release_conn,
+    monkeypatch,
+    tmp_path,
+    mismatch,
+    value,
+):
+    original_results = _complete_known_baseline_test_results
+    original_premerge = (
+        server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance
+    )
+
+    def mismatched_results(*args, **kwargs):
+        results = original_results(*args, **kwargs)
+        if mismatch == "baseline_errors":
+            results["baseline_comparison"]["errors"] = value
+        elif mismatch == "full_command_classification":
+            results["commands"][1]["classification"] = value
+        elif mismatch == "missing_baseline_comparison":
+            results.pop("baseline_comparison")
+        else:
+            results["baseline_comparison"][mismatch] = value
+        return results
+
+    class SemanticMismatchObserved(Exception):
+        pass
+
+    def physical_transition_count(conn, record, completed_line_index):
+        identity = {
+            "project_id": record["project_id"],
+            "backlog_id": record["backlog_id"],
+            "contract_execution_id": record["contract_execution_id"],
+            "contract_id": record["contract_id"],
+            "contract_chain_id": record["contract_chain_id"],
+            "parent_contract_execution_id": record[
+                "parent_contract_execution_id"
+            ],
+            "root_contract_execution_id": record["root_contract_execution_id"],
+        }
+        target_count = completed_line_index + 1
+        matches = []
+        for row in conn.execute(
+            "SELECT execution_state_revision, source_ref, source_hash "
+            "FROM backlog_contract_chain_bindings "
+            "WHERE project_id = ? AND contract_execution_id = ?",
+            (record["project_id"], record["contract_execution_id"]),
+        ).fetchall():
+            revision = int(row["execution_state_revision"] or 0)
+            if (
+                row["source_ref"]
+                == f"contract_runtime:{record['contract_execution_id']}:revision:{revision}"
+                and row["source_hash"]
+                == server.stable_sha256(
+                    {
+                        **identity,
+                        "execution_state_revision": revision,
+                        "completed_line_count": target_count,
+                    }
+                )
+            ):
+                matches.append(row)
+        return len(matches)
+
+    def observe_premerge(conn, *args, **kwargs):
+        record = server._contract_runtime_store(conn).get(
+            kwargs["source_contract_execution_id"]
+        )
+        context = get_branch_context(
+            conn,
+            kwargs["project_id"],
+            kwargs["task_id"],
+        )
+        assert context is not None
+        completion_indexes = {
+            line_id: [
+                index
+                for index, line in enumerate(record["completed_lines"])
+                if line.get("line_id") == line_id
+                and line.get("runtime_context_id") == context.runtime_context_id
+            ]
+            for line_id in (
+                "worker_finish_time_attestation",
+                "worker_finish_gate",
+            )
+        }
+        assert all(len(indexes) == 1 for indexes in completion_indexes.values())
+        assert all(
+            physical_transition_count(conn, record, indexes[0]) == 1
+            for indexes in completion_indexes.values()
+        )
+        durable_tables = (
+            "parallel_branch_runtime_contexts",
+            "parallel_branch_merge_queue_items",
+        )
+        before = _fresh_release_fixture_rows(conn, extra_tables=durable_tables)
+        protected, blocked = original_premerge(conn, *args, **kwargs)
+        after = _fresh_release_fixture_rows(conn, extra_tables=durable_tables)
+        assert after == before
+        assert protected is True
+        assert blocked["status"] == "blocked", blocked
+        assert blocked["reason"] == "rev10_worker_finish_attestation_mismatch"
+        raise SemanticMismatchObserved()
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_complete_known_baseline_test_results",
+        mismatched_results,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance",
+        observe_premerge,
+    )
+    with pytest.raises(SemanticMismatchObserved):
+        test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_pass(
+            release_conn,
+            monkeypatch,
+            tmp_path,
+            "runtime_drift",
+            "mixed",
+        )
 
 
 @pytest.mark.parametrize(
