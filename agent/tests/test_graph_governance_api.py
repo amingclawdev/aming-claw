@@ -188253,27 +188253,71 @@ def test_contract_runtime_visualization_projects_only_source_backed_provenance(
         )
 
 
-def test_exact_timeline_handler_keeps_raw_payload_outside_compact_event_boundary(
+def test_exact_timeline_handler_projects_public_event_before_cache_and_transport(
     conn,
 ):
-    """Document the existing exact-event transport boundary for frontend QA."""
+    """Exact-event expansion exposes one bounded public projection only."""
 
     backlog_id = "AC-EXACT-RAW-PUBLIC-BOUNDARY"
     conn.execute(
         """INSERT INTO backlog_bugs
            (bug_id, title, status, priority, created_at, updated_at)
            VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
-        (backlog_id, "Exact raw boundary", "2026-09-10T08:00:00Z", "2026-09-10T08:00:00Z"),
+        (
+            backlog_id,
+            "Exact raw boundary",
+            "2026-09-10T08:00:00Z",
+            "2026-09-10T08:00:00Z",
+        ),
+    )
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES ('AC-UNRELATED', 'Unrelated row', 'OPEN', 'P1', ?, ?)""",
+        ("2026-09-10T08:00:00Z", "2026-09-10T08:00:00Z"),
     )
     payload = {
+        "contract_execution_id": "cex-exact-raw-boundary",
+        "safe_identity": "preserve-me",
+        "nested": {
             "harmless_dummy_access_token": "dummy-token-sentinel",
             "harmless_private_path": "/Users/example/private-sentinel",
-        }
+            "route_token_ref": "rtok-copy-safe-reference",
+            "source_event_id": "event-public-identity",
+            "decision_hash": "sha256:public-decision-hash",
+            "prompt_contract_id": "rprompt-public-identity",
+            "prompt_contract_hash": "sha256:public-prompt-contract-hash",
+            "apiKey": "dummy-api-key-sentinel",
+            "accessToken": "dummy-access-token-sentinel",
+            "password": "dummy-password-sentinel",
+            "Authorization": "Bearer dummy-authorization-sentinel",
+            "Cookie": "session=dummy-cookie-sentinel",
+            "secret_ref": "secret-ref-sentinel",
+            "private_context_id": "private-context-id-sentinel",
+            "details_json": json.dumps(
+                {
+                    "safe": "nested-public-value",
+                    "token": "DUMMY_NESTED_SENTINEL",
+                    "path": "/Users/dummy/private",
+                },
+                sort_keys=True,
+            ),
+        },
+    }
+    verification = {
+        "status": "recorded",
+        "private": {"note": "verification-private-sentinel"},
+    }
+    artifact_refs = {
+        "report_ref": "artifact-public-ref",
+        "local_file": "/Users/example/artifact-private-sentinel",
+    }
     event_id = conn.execute(
         """INSERT INTO task_timeline_events
            (project_id, backlog_id, task_id, event_type, event_kind, actor,
-            status, payload_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            status, payload_json, verification_json, artifact_refs_json,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             PID,
             backlog_id,
@@ -188283,10 +188327,196 @@ def test_exact_timeline_handler_keeps_raw_payload_outside_compact_event_boundary
             "fixture",
             "recorded",
             json.dumps(payload, sort_keys=True),
+            json.dumps(verification, sort_keys=True),
+            json.dumps(artifact_refs, sort_keys=True),
             "2026-09-10T08:00:01Z",
         ),
     ).lastrowid
     conn.commit()
+    stored_before = tuple(
+        conn.execute(
+            """SELECT payload_json, verification_json, artifact_refs_json
+               FROM task_timeline_events WHERE id = ?""",
+            (event_id,),
+        ).fetchone()
+    )
+    server._timeline_warm_cache_clear()
+    query = {
+        "backlog_id": backlog_id,
+        "limit": "1",
+        "playback_bootstrap": "compact",
+        "exact_event_id": str(event_id),
+        "view": "public",
+    }
+    response = server.handle_task_timeline_list(
+        _ctx({"project_id": PID}, query=query)
+    )
+    cached = server.handle_task_timeline_list(
+        _ctx({"project_id": PID}, query=query)
+    )
+
+    compact_json = json.dumps(response["events"], sort_keys=True)
+    exact = response["exact_event"]
+    exact_json = json.dumps(exact, sort_keys=True)
+    http_handler = _bare_handler()
+    http_handler._respond(200, response)
+    http_bytes = http_handler.wfile.getvalue()
+    transported = json.loads(http_bytes)
+    assert "dummy-token-sentinel" not in compact_json
+    assert "private-sentinel" not in compact_json
+    assert response["raw_event_payloads_omitted"] is True
+    assert response["exact_event_raw_loaded"] is True
+    assert response["warm_cache"]["status"] == "miss"
+    assert cached["warm_cache"]["status"] == "hit"
+    assert cached["exact_event"] == exact
+    assert transported["exact_event"] == exact
+    assert exact["id"] == event_id
+    assert exact["project_id"] == PID
+    assert exact["backlog_id"] == backlog_id
+    assert exact["task_id"] == "cex-exact-raw-boundary"
+    assert exact["payload"]["contract_execution_id"] == (
+        "cex-exact-raw-boundary"
+    )
+    assert exact["payload"]["safe_identity"] == "preserve-me"
+    assert exact["payload"]["nested"]["route_token_ref"] == (
+        "rtok-copy-safe-reference"
+    )
+    assert exact["payload"]["nested"]["source_event_id"] == (
+        "event-public-identity"
+    )
+    assert exact["payload"]["nested"]["decision_hash"] == (
+        "sha256:public-decision-hash"
+    )
+    assert exact["payload"]["nested"]["prompt_contract_id"] == (
+        "rprompt-public-identity"
+    )
+    assert exact["payload"]["nested"]["prompt_contract_hash"] == (
+        "sha256:public-prompt-contract-hash"
+    )
+    nested_alias = json.loads(exact["payload"]["nested"]["details_json"])
+    assert nested_alias["safe"] == "nested-public-value"
+    assert nested_alias["token"] == "[private detail redacted]"
+    assert nested_alias["path"] == "[local path redacted]"
+    assert exact["artifact_refs"]["report_ref"] == "artifact-public-ref"
+    assert exact["public_safe"] is True
+    assert exact["privacy_level"] == "public"
+    assert exact["public_projection"]["status"] == "redacted"
+    assert exact["public_projection"]["redaction_count"] >= 4
+    for field in ("payload", "verification", "artifact_refs"):
+        assert json.loads(exact[f"{field}_json"]) == exact[field]
+    for sentinel in (
+        "dummy-token-sentinel",
+        "private-sentinel",
+        "verification-private-sentinel",
+        "artifact-private-sentinel",
+        "dummy-api-key-sentinel",
+        "dummy-access-token-sentinel",
+        "dummy-password-sentinel",
+        "dummy-authorization-sentinel",
+        "dummy-cookie-sentinel",
+        "secret-ref-sentinel",
+        "private-context-id-sentinel",
+        "DUMMY_NESTED_SENTINEL",
+        "/Users/dummy/private",
+    ):
+        assert sentinel not in exact_json
+        assert sentinel.encode() not in http_bytes
+    assert "[private detail redacted]" in exact_json
+    assert "[local path redacted]" in exact_json
+
+    wrong_scope = server.handle_task_timeline_list(
+        _ctx(
+            {"project_id": PID},
+            query={**query, "backlog_id": "AC-UNRELATED"},
+        )
+    )
+    assert "exact_event" not in wrong_scope
+    assert wrong_scope["backlog_id"] == "AC-UNRELATED"
+    assert all(
+        int(candidate.get("id") or 0) != event_id
+        and str(candidate.get("backlog_id") or "") == "AC-UNRELATED"
+        for candidate in wrong_scope["events"]
+    )
+    assert "dummy-token-sentinel" not in json.dumps(wrong_scope, sort_keys=True)
+
+    wrong_event = server.handle_task_timeline_list(
+        _ctx(
+            {"project_id": PID},
+            query={**query, "exact_event_id": str(event_id + 100_000)},
+        )
+    )
+    assert "exact_event" not in wrong_event
+    assert wrong_event["project_id"] == PID
+    assert wrong_event["backlog_id"] == backlog_id
+    assert "dummy-token-sentinel" not in json.dumps(wrong_event, sort_keys=True)
+
+    wrong_project = server.handle_task_timeline_list(
+        _ctx({"project_id": "unrelated-project"}, query=query)
+    )
+    assert "exact_event" not in wrong_project
+    assert wrong_project["project_id"] == "unrelated-project"
+    assert all(
+        str(candidate.get("project_id") or "") == "unrelated-project"
+        for candidate in wrong_project["events"]
+    )
+    assert "dummy-token-sentinel" not in json.dumps(wrong_project, sort_keys=True)
+
+    stored_after = tuple(
+        conn.execute(
+            """SELECT payload_json, verification_json, artifact_refs_json
+               FROM task_timeline_events WHERE id = ?""",
+            (event_id,),
+        ).fetchone()
+    )
+    assert stored_after == stored_before
+
+
+def test_exact_timeline_handler_marks_malformed_and_oversized_aliases(conn):
+    backlog_id = "AC-EXACT-RAW-BOUNDS"
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+        (
+            backlog_id,
+            "Exact raw bounds",
+            "2026-09-10T08:10:00Z",
+            "2026-09-10T08:10:00Z",
+        ),
+    )
+    oversized = json.dumps(
+        {"harmless_private_blob": "oversized-private-sentinel" * 4096},
+        sort_keys=True,
+    )
+    malformed = '{"harmless_private_note":"malformed-private-sentinel"'
+    event_id = conn.execute(
+        """INSERT INTO task_timeline_events
+           (project_id, backlog_id, task_id, event_type, event_kind, actor,
+            status, payload_json, verification_json, artifact_refs_json,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            PID,
+            backlog_id,
+            "cex-exact-bounds",
+            "fixture.raw_bounds",
+            "fixture",
+            "fixture",
+            "recorded",
+            oversized,
+            malformed,
+            json.dumps({"safe_ref": "artifact-ref"}, sort_keys=True),
+            "2026-09-10T08:10:01Z",
+        ),
+    ).lastrowid
+    conn.commit()
+    stored_before = tuple(
+        conn.execute(
+            """SELECT payload_json, verification_json, artifact_refs_json
+               FROM task_timeline_events WHERE id = ?""",
+            (event_id,),
+        ).fetchone()
+    )
     server._timeline_warm_cache_clear()
     response = server.handle_task_timeline_list(
         _ctx(
@@ -188300,17 +188530,28 @@ def test_exact_timeline_handler_keeps_raw_payload_outside_compact_event_boundary
             },
         )
     )
-
-    compact_json = json.dumps(response["events"], sort_keys=True)
-    exact_json = json.dumps(response["exact_event"], sort_keys=True)
-    assert "dummy-token-sentinel" not in compact_json
-    assert "private-sentinel" not in compact_json
-    assert response["raw_event_payloads_omitted"] is True
-    assert response["exact_event_raw_loaded"] is True
-    assert "dummy-token-sentinel" in response["exact_event"]["payload_json"]
-    assert "private-sentinel" in response["exact_event"]["payload_json"]
-    assert "dummy-token-sentinel" in exact_json
-    assert "private-sentinel" in exact_json
+    exact = response["exact_event"]
+    exact_json = json.dumps(exact, sort_keys=True)
+    assert exact["payload"]["_public_projection"]["status"] == "truncated"
+    assert exact["verification"]["_public_projection"]["status"] == "omitted"
+    assert exact["public_projection"]["status"] == "truncated"
+    assert exact["public_projection"]["serialized_aliases"] == {
+        "artifact_refs_json": "projected",
+        "payload_json": "truncated",
+        "verification_json": "omitted",
+    }
+    assert json.loads(exact["payload_json"]) == exact["payload"]
+    assert json.loads(exact["verification_json"]) == exact["verification"]
+    assert "oversized-private-sentinel" not in exact_json
+    assert "malformed-private-sentinel" not in exact_json
+    stored_after = tuple(
+        conn.execute(
+            """SELECT payload_json, verification_json, artifact_refs_json
+               FROM task_timeline_events WHERE id = ?""",
+            (event_id,),
+        ).fetchone()
+    )
+    assert stored_after == stored_before
 
 
 def _finish_alias_source_fixture():

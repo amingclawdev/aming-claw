@@ -205871,6 +205871,328 @@ def _task_playback_compact_bootstrap_requested(query: Mapping[str, Any]) -> bool
     )
 
 
+_TASK_TIMELINE_PUBLIC_EXACT_MAX_DEPTH = 8
+_TASK_TIMELINE_PUBLIC_EXACT_MAX_ITEMS = 128
+_TASK_TIMELINE_PUBLIC_EXACT_MAX_STRING_CHARS = 4096
+_TASK_TIMELINE_PUBLIC_EXACT_MAX_ALIAS_BYTES = 64 * 1024
+_TASK_TIMELINE_PUBLIC_EXACT_PRIVATE_KEY = re.compile(
+    r"(?:^|[_\-\s])(raw[_\-\s]?prompt|prompt(?:[_\-\s]?(?:text|body|payload))?"
+    r"|hidden|private|secret|token|provider[_\-\s]?(?:context|payload|config)"
+    r"|filesystem|cwd|worktree[_\-\s]?path|host[_\-\s]?(?:path|home|cwd)"
+    r"|judgment[_\-\s]?brain|private[_\-\s]?judge|judge[_\-\s]?"
+    r"(?:private|route|routing|precheck|provider|prompt|context|memory|brain|"
+    r"lineage|contract))"
+    r"(?:$|[_\-\s])",
+    re.IGNORECASE,
+)
+_TASK_TIMELINE_PUBLIC_EXACT_SAFE_KEY = re.compile(
+    r"(?:^|\.)(?:event_type|event_kind|phase|status|event_id|trace_id|request_id|"
+    r"route_id|receipt_id|upsert_id|fence_id|task_id|backlog_id|correlation_id|"
+    r"commit_sha|[^.]*_(?:hash|id|ref|redacted))$",
+    re.IGNORECASE,
+)
+_TASK_TIMELINE_PUBLIC_EXACT_ABSOLUTE_PATH = re.compile(
+    r"(^|\s)(/Users/[^\s,;:]+|/home/[^\s,;:]+|/var/folders/[^\s,;:]+|"
+    r"[A-Za-z]:\\[^\s,;:]+)"
+)
+_TASK_TIMELINE_PUBLIC_EXACT_TOKEN_VALUE = re.compile(
+    r"\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,}\b"
+)
+
+
+def _task_timeline_public_exact_key_is_private(key: str) -> bool:
+    snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key or ""))
+    normalized = re.sub(r"[^a-z0-9]+", "_", snake.lower()).strip("_")
+    if normalized in {
+        "fence_token_hash",
+        "observer_route_token_ref",
+        "prompt_contract_hash",
+        "prompt_contract_id",
+        "qa_session_token_ref",
+        "route_token_ref",
+        "session_token_ref",
+    }:
+        return False
+    if _caller_timeline_key_is_credential(key):
+        return True
+    return bool(_TASK_TIMELINE_PUBLIC_EXACT_PRIVATE_KEY.search(normalized))
+
+
+def _task_timeline_public_exact_value(
+    value: Any,
+    *,
+    path: str,
+    depth: int = 0,
+) -> tuple[Any, int, int]:
+    """Return a bounded public copy plus redaction/truncation counts."""
+
+    if depth > _TASK_TIMELINE_PUBLIC_EXACT_MAX_DEPTH:
+        return (
+            {
+                "_public_projection": {
+                    "status": "truncated",
+                    "reason": "max_depth",
+                }
+            },
+            0,
+            1,
+        )
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        redactions = 0
+        truncations = 0
+        entries = list(value.items())
+        for raw_key, child in entries[:_TASK_TIMELINE_PUBLIC_EXACT_MAX_ITEMS]:
+            key = str(raw_key)
+            child_path = f"{path}.{key}" if path else key
+            if _task_timeline_public_exact_key_is_private(key):
+                result[key] = "[private detail redacted]"
+                redactions += 1
+                continue
+            if isinstance(child, str) and key.lower().endswith("_json"):
+                child_bytes = len(child.encode("utf-8"))
+                nested_status = "projected"
+                if child_bytes > _TASK_TIMELINE_PUBLIC_EXACT_MAX_ALIAS_BYTES:
+                    nested_source: Any = {
+                        "_public_projection": {
+                            "status": "truncated",
+                            "reason": "serialized_alias_size_limit",
+                            "source_bytes": child_bytes,
+                            "max_bytes": (
+                                _TASK_TIMELINE_PUBLIC_EXACT_MAX_ALIAS_BYTES
+                            ),
+                        }
+                    }
+                    nested_status = "truncated"
+                else:
+                    try:
+                        nested_source = json.loads(child or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        nested_source = None
+                    if not isinstance(nested_source, (Mapping, list)):
+                        nested_source = {
+                            "_public_projection": {
+                                "status": "omitted",
+                                "reason": "malformed_serialized_alias",
+                            }
+                        }
+                        nested_status = "omitted"
+                nested_value, child_redactions, child_truncations = (
+                    _task_timeline_public_exact_value(
+                        nested_source,
+                        path=child_path,
+                        depth=depth + 1,
+                    )
+                )
+                result[key] = json.dumps(
+                    nested_value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                redactions += child_redactions + int(nested_status == "omitted")
+                truncations += child_truncations + int(
+                    nested_status == "truncated"
+                )
+                continue
+            projected, child_redactions, child_truncations = (
+                _task_timeline_public_exact_value(
+                    child,
+                    path=child_path,
+                    depth=depth + 1,
+                )
+            )
+            result[key] = projected
+            redactions += child_redactions
+            truncations += child_truncations
+        if len(entries) > _TASK_TIMELINE_PUBLIC_EXACT_MAX_ITEMS:
+            result["_public_projection"] = {
+                "status": "truncated",
+                "reason": "max_mapping_items",
+                "omitted_count": len(entries)
+                - _TASK_TIMELINE_PUBLIC_EXACT_MAX_ITEMS,
+            }
+            truncations += 1
+        return result, redactions, truncations
+    if isinstance(value, (list, tuple)):
+        result_list: list[Any] = []
+        redactions = 0
+        truncations = 0
+        for index, child in enumerate(
+            list(value)[:_TASK_TIMELINE_PUBLIC_EXACT_MAX_ITEMS]
+        ):
+            projected, child_redactions, child_truncations = (
+                _task_timeline_public_exact_value(
+                    child,
+                    path=f"{path}.{index}",
+                    depth=depth + 1,
+                )
+            )
+            result_list.append(projected)
+            redactions += child_redactions
+            truncations += child_truncations
+        if len(value) > _TASK_TIMELINE_PUBLIC_EXACT_MAX_ITEMS:
+            result_list.append(
+                {
+                    "_public_projection": {
+                        "status": "truncated",
+                        "reason": "max_sequence_items",
+                        "omitted_count": len(value)
+                        - _TASK_TIMELINE_PUBLIC_EXACT_MAX_ITEMS,
+                    }
+                }
+            )
+            truncations += 1
+        return result_list, redactions, truncations
+    if isinstance(value, str):
+        projected = _TASK_TIMELINE_PUBLIC_EXACT_ABSOLUTE_PATH.sub(
+            r"\1[local path redacted]",
+            value,
+        )
+        projected = _TASK_TIMELINE_PUBLIC_EXACT_TOKEN_VALUE.sub(
+            "[token redacted]",
+            projected,
+        )
+        redactions = int(projected != value)
+        if (
+            not _TASK_TIMELINE_PUBLIC_EXACT_SAFE_KEY.search(path)
+            and _TASK_TIMELINE_PUBLIC_EXACT_PRIVATE_KEY.search(projected)
+        ):
+            projected = "[private detail redacted]"
+            redactions = 1
+        truncations = 0
+        if len(projected) > _TASK_TIMELINE_PUBLIC_EXACT_MAX_STRING_CHARS:
+            projected = (
+                projected[:_TASK_TIMELINE_PUBLIC_EXACT_MAX_STRING_CHARS]
+                + "… [truncated]"
+            )
+            truncations = 1
+        return projected, redactions, truncations
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, 0, 0
+    return str(value)[:_TASK_TIMELINE_PUBLIC_EXACT_MAX_STRING_CHARS], 0, 1
+
+
+def _task_timeline_public_exact_event(
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Detach and sanitize one lazily loaded exact timeline event.
+
+    Stored timeline rows remain immutable.  Both decoded evidence containers
+    and their serialized aliases are rebuilt from the same bounded public
+    value before warm-cache storage and HTTP serialization.
+    """
+
+    identity_fields = (
+        "id",
+        "project_id",
+        "backlog_id",
+        "mf_id",
+        "task_id",
+        "attempt_num",
+        "event_type",
+        "phase",
+        "event_kind",
+        "scenario_id",
+        "parent_event_id",
+        "correlation_id",
+        "severity",
+        "decision",
+        "schema_version",
+        "actor",
+        "status",
+        "trace_id",
+        "commit_sha",
+        "created_at",
+    )
+    projected: dict[str, Any] = {}
+    redaction_count = 0
+    truncation_count = 0
+    for field in identity_fields:
+        if field not in event:
+            continue
+        value, redactions, truncations = _task_timeline_public_exact_value(
+            event.get(field),
+            path=field,
+        )
+        projected[field] = value
+        redaction_count += redactions
+        truncation_count += truncations
+
+    alias_status: dict[str, str] = {}
+    for field in ("payload", "verification", "artifact_refs"):
+        alias = f"{field}_json"
+        raw_alias = event.get(alias)
+        source = (
+            event.get(field)
+            if isinstance(event.get(field), (Mapping, list))
+            else {}
+        )
+        status = "projected"
+        if isinstance(raw_alias, str):
+            alias_bytes = len(raw_alias.encode("utf-8"))
+            if alias_bytes > _TASK_TIMELINE_PUBLIC_EXACT_MAX_ALIAS_BYTES:
+                source = {
+                    "_public_projection": {
+                        "status": "truncated",
+                        "reason": "serialized_alias_size_limit",
+                        "source_bytes": alias_bytes,
+                        "max_bytes": _TASK_TIMELINE_PUBLIC_EXACT_MAX_ALIAS_BYTES,
+                    }
+                }
+                status = "truncated"
+                truncation_count += 1
+            else:
+                try:
+                    parsed = json.loads(raw_alias or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = None
+                if isinstance(parsed, (Mapping, list)):
+                    source = parsed
+                else:
+                    source = {
+                        "_public_projection": {
+                            "status": "omitted",
+                            "reason": "malformed_serialized_alias",
+                        }
+                    }
+                    status = "omitted"
+                    redaction_count += 1
+        safe_value, redactions, truncations = _task_timeline_public_exact_value(
+            source,
+            path=field,
+        )
+        projected[field] = safe_value
+        projected[alias] = json.dumps(
+            safe_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        redaction_count += redactions
+        truncation_count += truncations
+        alias_status[alias] = status
+
+    projection_status = (
+        "truncated"
+        if truncation_count
+        else "redacted"
+        if redaction_count
+        else "public_safe"
+    )
+    projected["public_safe"] = True
+    projected["privacy_level"] = "public"
+    projected["public_projection"] = {
+        "schema_version": "task_timeline.exact_event_public_projection.v1",
+        "status": projection_status,
+        "redaction_count": redaction_count,
+        "truncation_count": truncation_count,
+        "serialized_aliases": alias_status,
+        "stored_event_unchanged": True,
+    }
+    return projected
+
+
 def _task_playback_contract_runtime_visualization_from_loaded(
     conn: sqlite3.Connection,
     *,
@@ -206399,7 +206721,9 @@ def handle_task_timeline_list(ctx: RequestContext):
                 (project_id, backlog_id, exact_event_id),
             ).fetchone()
             if exact_row is not None:
-                exact_event = task_timeline._row_to_dict(exact_row)
+                exact_event = _task_timeline_public_exact_event(
+                    task_timeline._row_to_dict(exact_row)
+                )
         compact_ledger = None
         if include_compact_ledger:
             event_ledger = task_timeline.build_compact_ledger(
