@@ -58064,6 +58064,7 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
     context: Any,
     runtime_context_id: str,
     timeline_events: Sequence[Mapping[str, Any]],
+    postmerge_qa_scope: Mapping[str, Any] | None = None,
     before_event_id: int = 0,
 ) -> dict[str, Any]:
     """Return the latest server-authenticated QA timeline verdict.
@@ -58081,6 +58082,15 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
     backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
     blocking_statuses = {"blocked", "error", "fail", "failed", "invalid", "rejected"}
     passing_statuses = {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+    scope_ticket = dict((postmerge_qa_scope or {}).get("ticket") or {})
+    scoped_postmerge = bool(
+        scope_ticket.get("verified") is True
+        and scope_ticket.get("runtime_context_id") == runtime_context_id
+        and scope_ticket.get("task_id") == task_id
+        and scope_ticket.get("parent_task_id") == str(getattr(context, "parent_task_id", "") or "")
+        and scope_ticket.get("backlog_id") == backlog_id
+        and scope_ticket.get("project_id") == str(getattr(context, "project_id", "") or "")
+    )
     latest: dict[str, Any] = {}
     for event in sorted(
         (item for item in timeline_events if isinstance(item, Mapping)),
@@ -58129,6 +58139,24 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             and str(postmerge_failed_boundary.get("parent_task_id") or "").strip()
             == str(getattr(context, "parent_task_id", "") or "").strip()
         )
+        if postmerge_failed_boundary_valid and scoped_postmerge:
+            boundary_ticket = postmerge_failed_boundary.get("postmerge_qa_authority") or {}
+            postmerge_failed_boundary_valid = bool(
+                isinstance(boundary_ticket, Mapping)
+                and boundary_ticket.get("authority_hash") == stable_sha256({
+                    key: value for key, value in boundary_ticket.items()
+                    if key != "authority_hash"
+                })
+                and all(
+                    postmerge_failed_boundary.get(field) == scope_ticket.get(field)
+                    and boundary_ticket.get(field) == scope_ticket.get(field)
+                    for field in (
+                        "project_id", "backlog_id", "contract_execution_id",
+                        "runtime_context_id", "task_id", "parent_task_id",
+                        "qa_graph_trace_task_id", "candidate_commit_sha", "target_project_root",
+                    )
+                )
+            )
         qa_scope_task_id = (
             str(
                 postmerge_failed_boundary.get("qa_graph_trace_task_id") or ""
@@ -58136,6 +58164,8 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             if postmerge_failed_boundary_valid
             else task_id
         )
+        if scoped_postmerge:
+            qa_scope_task_id = str(scope_ticket["qa_graph_trace_task_id"])
         event_task_id = str(
             event.get("task_id")
             or payload.get("task_id")
@@ -58251,6 +58281,36 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             and bool(str(source_authority.get("authority_hash") or "").strip())
             and qa_observer_impersonation_forbidden
         )
+        if scoped_postmerge:
+            authenticated = bool(
+                authenticated
+                and event_commit == scope_ticket.get("candidate_commit_sha")
+                and str(qa_proof.get("query_root") or "").strip()
+                == str(scope_ticket.get("target_project_root") or "").strip()
+                and all(
+                    not str(source.get(field) or "").strip()
+                    or str(source[field]).strip() == scope_ticket["contract_execution_id"]
+                    for source in (event, payload, verification)
+                    for field in ("contract_execution_id", "parent_task_id")
+                )
+                and all(
+                    not str(source.get("task_id") or "").strip()
+                    or str(source["task_id"]).strip() in {task_id, qa_scope_task_id}
+                    for source in (payload, verification)
+                )
+                and (
+                    status in passing_statuses
+                    or (
+                        postmerge_failed_boundary_valid
+                        and postmerge_failed_boundary.get("evidence_status") == status
+                        and postmerge_failed_boundary.get("qa_principal") == actor
+                        and postmerge_failed_boundary.get("qa_session_id") == qa_proof.get("qa_session_id")
+                        and postmerge_failed_boundary.get("qa_scope_binding_ref") == qa_proof.get("qa_scope_binding_ref")
+                        and set(postmerge_failed_boundary.get("graph_trace_ids") or [])
+                        == set(qa_proof.get("graph_trace_ids") or [])
+                    )
+                )
+            )
         if not authenticated or status not in blocking_statuses | passing_statuses:
             continue
         premerge_receipt = (
@@ -58302,7 +58362,18 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             )
             if str(value or "").strip()
         }
-        if postmerge_failed_boundary_valid:
+        if explicit_runtime_context_ids and explicit_runtime_context_ids != {runtime_context_id}:
+            continue
+        if scoped_postmerge:
+            runtime_context_binding = {
+                "schema_version": "runtime_context.timeline_runtime_binding.v1",
+                "source": "server_postmerge_qa_current_ticket",
+                "server_derived": True,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "qa_scope_task_id": qa_scope_task_id,
+            }
+        elif postmerge_failed_boundary_valid:
             runtime_context_binding = {
                 "schema_version": "runtime_context.timeline_runtime_binding.v1",
                 "source": "server_postmerge_failed_qa_boundary_authority",
@@ -58363,6 +58434,11 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
                 "server_derived"
             ],
             "runtime_context_binding": runtime_context_binding,
+            "postmerge_qa_scope_verified": scoped_postmerge,
+            "postmerge_failed_qa_boundary_authority": (
+                dict(postmerge_failed_boundary)
+                if scoped_postmerge and postmerge_failed_boundary_valid else {}
+            ),
             "premerge_candidate_receipt_only": premerge_receipt_only,
             "premerge_candidate_receipt_authority_hash": str(
                 premerge_receipt.get("authority_hash") or ""
@@ -122541,6 +122617,123 @@ def _contract_runtime_context_failed_qa_candidate_commit(
     return candidate_commits[0] if len(candidate_commits) == 1 else ""
 
 
+def _contract_runtime_postmerge_qa_timeline_scope(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any = None,
+) -> dict[str, Any]:
+    """Join final-worker and CEX QA only through the newest physical ticket."""
+
+    if not _is_mf_parallel_postmerge_revision(record):
+        return {}
+    if _contract_runtime_persisted_postmerge_qa_authority(record).get("verified") is not True:
+        return {}
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    try:
+        canonical = _contract_runtime_store(conn).get(execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    if not isinstance(canonical, Mapping) or any(
+        str(canonical.get(field) or "").strip()
+        != str(record.get(field) or "").strip()
+        for field in (
+            "project_id", "backlog_id", "contract_execution_id", "contract_id",
+            "version", "revision", "definition_hash", "contract_chain_id",
+            "parent_contract_execution_id", "root_contract_execution_id",
+        )
+    ) or str(canonical.get("project_id") or "").strip() != project_id:
+        return {}
+    dispatch = _contract_runtime_current_dispatch_authority_line(canonical)
+    supplied_dispatch = _contract_runtime_current_dispatch_authority_line(record)
+    if (
+        dispatch.get("status") != "selected"
+        or supplied_dispatch.get("status") != "selected"
+        or stable_sha256(dispatch["line"]) != stable_sha256(supplied_dispatch["line"])
+    ):
+        return {}
+    graph_lines = [
+        (index, line)
+        for index, line in enumerate(canonical.get("completed_lines") or [])
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "qa_graph_context"
+    ]
+    supplied_graphs = [
+        line for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "qa_graph_context"
+    ]
+    if not graph_lines or not supplied_graphs:
+        return {}
+    index, graph_line = graph_lines[-1]
+    if (
+        index <= int(dispatch["completed_line_index"])
+        or stable_sha256(graph_line) != stable_sha256(supplied_graphs[-1])
+    ):
+        return {}
+    identity = _contract_runtime_postmerge_qa_worker_identity_authority(
+        conn, project_id=project_id, record=canonical,
+    )
+    if identity.get("verified") is not True:
+        return {}
+    if context is not None and _contract_runtime_context_identity(context) != (
+        identity["runtime_context_id"], identity["task_id"], identity["parent_task_id"]
+    ):
+        return {}
+    acceptance = _contract_runtime_completed_line_acceptance(
+        conn, project_id=project_id, record=canonical,
+        completed_line_index=index, expected_line=graph_line,
+    )
+    if acceptance.get("db_verified") is not True:
+        return {}
+    return {
+        "ticket": _contract_runtime_persisted_postmerge_qa_authority(canonical),
+        "worker_identity": identity,
+        "canonical_record": canonical,
+        "canonical_graph_line_index": index,
+        "canonical_dispatch_line_index": int(dispatch["completed_line_index"]),
+    }
+
+
+def _contract_runtime_context_qa_timeline_events(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+) -> list[dict[str, Any]]:
+    """Retain worker history and opt in to its exact postmerge CEX QA scope."""
+
+    from . import task_timeline
+
+    events = _runtime_context_service_timeline_events(
+        conn, project_id=project_id, task_id=str(context.task_id),
+        backlog_id=str(context.backlog_id),
+    )
+    scope = _contract_runtime_postmerge_qa_timeline_scope(
+        conn, project_id=project_id, record=record, context=context,
+    )
+    if not scope:
+        return events
+    ticket = scope["ticket"]
+    joined = task_timeline.list_events(
+        conn, project_id, task_id=ticket["qa_graph_trace_task_id"],
+        backlog_id=ticket["backlog_id"], limit=1000,
+    )
+    by_id = {int(event.get("id") or 0): event for event in events}
+    for event in joined:
+        if (
+            str(event.get("project_id") or "").strip() == project_id
+            and str(event.get("backlog_id") or "").strip() == ticket["backlog_id"]
+            and str(event.get("task_id") or "").strip() == ticket["qa_graph_trace_task_id"]
+            and str(event.get("event_kind") or "").strip()
+            in {"qa_verification", "independent_verification"}
+        ):
+            by_id[int(event["id"])] = dict(event)
+    return [by_id[index] for index in sorted(by_id)]
+
+
 def _contract_runtime_authoritative_qa_projection_verdict(
     conn,
     *,
@@ -122552,11 +122745,15 @@ def _contract_runtime_authoritative_qa_projection_verdict(
 ) -> dict[str, Any]:
     """Select the one authenticated QA verdict allowed to drive projection."""
 
+    postmerge_scope = _contract_runtime_postmerge_qa_timeline_scope(
+        conn, project_id=project_id, record=record, context=context,
+    )
     latest = _runtime_context_latest_authenticated_qa_timeline_verdict(
         conn=conn,
         context=context,
         runtime_context_id=runtime_context_id,
         timeline_events=timeline_events,
+        postmerge_qa_scope=postmerge_scope,
     )
     if not latest:
         return {}
@@ -122568,14 +122765,27 @@ def _contract_runtime_authoritative_qa_projection_verdict(
             context=context,
             runtime_context_id=runtime_context_id,
             timeline_events=timeline_events,
+            postmerge_qa_scope=postmerge_scope,
             before_event_id=int(latest.get("event_id") or 0),
         )
+        while postmerge_scope and str(prior.get("status") or "") in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES:
+            prior = _runtime_context_latest_authenticated_qa_timeline_verdict(
+                conn=conn, context=context, runtime_context_id=runtime_context_id,
+                timeline_events=timeline_events, postmerge_qa_scope=postmerge_scope,
+                before_event_id=int(prior.get("event_id") or 0),
+            )
         if (
             str(prior.get("status") or "").strip().lower()
             not in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_BLOCKING_STATUSES
         ):
             return {}
-    if (
+    failed_boundary = dict(
+        (prior if latest_status in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES else latest)
+        .get("postmerge_failed_qa_boundary_authority") or {}
+    )
+    if postmerge_scope and failed_boundary:
+        expected_candidate_commit = str(postmerge_scope["ticket"]["candidate_commit_sha"])
+    elif (
         latest_status in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES
         and _is_mf_parallel_record_contract_id(
             str(record.get("contract_id") or "")
@@ -122615,6 +122825,7 @@ def _contract_runtime_authoritative_qa_projection_verdict(
         "candidate_scope_verified": True,
         "effective_status": latest_status,
         "fresh_session_pass_verified": True,
+        "postmerge_failed_qa_boundary_authority": failed_boundary,
     }
     if projected["effective_status"] in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES:
         projected["prior_no_pass_event_id"] = int(prior.get("event_id") or 0)
@@ -122636,9 +122847,179 @@ def _contract_runtime_authoritative_qa_projection_verdict(
             and str(projected.get("qa_session_id") or "").strip()
             != str(prior.get("qa_session_id") or "").strip()
         )
+        if postmerge_scope and failed_boundary:
+            failed_time = _contract_runtime_close_authority_time_order_value(str(prior.get("created_at") or ""))
+            pass_time = _contract_runtime_close_authority_time_order_value(str(latest.get("created_at") or ""))
+            projected["fresh_session_pass_verified"] = bool(
+                projected["fresh_session_pass_verified"]
+                and failed_time is not None and pass_time is not None
+                and pass_time > failed_time
+            )
         if not projected["fresh_session_pass_verified"]:
             projected["effective_status"] = "failed"
     return projected
+
+
+def _contract_runtime_postmerge_failed_qa_superseded_line_indices(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    verdict: Mapping[str, Any],
+) -> list[int]:
+    """A failed audit invalidates final QA without inventing a completed line."""
+
+    scope = _contract_runtime_postmerge_qa_timeline_scope(
+        conn, project_id=project_id, record=record, context=context,
+    )
+    boundary = verdict.get("postmerge_failed_qa_boundary_authority") or {}
+    if not scope or not boundary:
+        return []
+    ticket = scope["ticket"]
+    if (
+        boundary.get("authority_hash") != stable_sha256({
+            key: value for key, value in boundary.items() if key != "authority_hash"
+        })
+        or any(boundary.get(field) != ticket.get(field) for field in (
+            "project_id", "backlog_id", "contract_execution_id", "runtime_context_id",
+            "task_id", "parent_task_id", "qa_graph_trace_task_id", "candidate_commit_sha",
+            "target_project_root",
+        ))
+    ):
+        return []
+    canonical = scope["canonical_record"]
+    completed = list(canonical.get("completed_lines") or [])
+    supplied = list(record.get("completed_lines") or [])
+    failed_session = str(boundary.get("qa_session_id") or "")
+    failed_time = _contract_runtime_close_authority_time_order_value(str(
+        verdict.get("prior_no_pass_created_at") or verdict.get("created_at") or ""
+    ))
+    failed_revision = int(
+        verdict.get("prior_no_pass_execution_state_revision")
+        or verdict.get("execution_state_revision") or 0
+    )
+    qa_task_id = str(ticket["qa_graph_trace_task_id"])
+    runtime_context_id = str(ticket["runtime_context_id"])
+    candidate = str(ticket["candidate_commit_sha"])
+    relevant: list[int] = []
+    accepted: dict[int, Mapping[str, Any]] = {}
+    sessions: dict[int, str] = {}
+    fresh_graphs: list[int] = []
+    for index, line in enumerate(completed):
+        if not isinstance(line, Mapping) or index <= scope["canonical_dispatch_line_index"]:
+            continue
+        line_id = str(line.get("line_id") or "")
+        if line_id not in {"qa_graph_context", "qa_independent_verification", "observer_close_ready"}:
+            continue
+        if _contract_runtime_mapping_value(line, "runtime_context_id") != runtime_context_id:
+            continue
+        if str(line.get("commit_sha") or "").strip() != candidate:
+            continue
+        relevant.append(index)
+        acceptance = _contract_runtime_completed_line_acceptance(
+            conn, project_id=project_id, record=canonical,
+            completed_line_index=index, expected_line=line,
+        )
+        if acceptance.get("db_verified") is not True:
+            continue
+        accepted[index] = acceptance
+        provenance = line.get("qa_evidence_provenance") or {}
+        binding = provenance.get("authenticated_qa_binding") or {}
+        sessions[index] = str(binding.get("qa_session_id") or "")
+        if line_id != "qa_graph_context":
+            continue
+        graph = (line.get("payload") or {}).get("graph_trace_evidence") or {}
+        trace_ids = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(graph, "verified_trace_ids", "trace_ids")
+        )
+        trace_rows = []
+        if trace_ids:
+            placeholders = ",".join("?" for _ in trace_ids)
+            try:
+                trace_rows = conn.execute(
+                    f"""SELECT t.*, s.commit_sha AS snapshot_commit_sha
+                        FROM graph_query_traces t
+                        JOIN graph_snapshots s ON s.project_id = t.project_id
+                          AND s.snapshot_id = t.snapshot_id
+                        WHERE t.project_id = ? AND t.trace_id IN ({placeholders})""",
+                    (project_id, *trace_ids),
+                ).fetchall()
+            except sqlite3.Error:
+                trace_rows = []
+        # Retention validates the already accepted candidate proof, not the
+        # live HEAD used by a future sibling. New QA writes still run the full
+        # live graph/root/world guards before acquiring physical acceptance.
+        if (
+            failed_time is not None and failed_revision > 0 and failed_session
+            and int(acceptance.get("execution_state_revision") or 0) > failed_revision
+            and _contract_runtime_authenticated_qa_provenance(line)
+            and sessions[index] and sessions[index] != failed_session
+            and _contract_runtime_accepted_qa_graph_evidence(line, graph)
+            and graph.get("db_verified") is True
+            and not list(graph.get("identity_mismatches") or [])
+            and str(graph.get("qa_session_id") or "") == sessions[index]
+            and str(graph.get("runtime_context_id") or "") == runtime_context_id
+            and str(graph.get("task_id") or "") == qa_task_id
+            and str(graph.get("candidate_commit_sha") or "") == candidate
+            and len(trace_rows) == len(trace_ids)
+            and {str(row["trace_id"]) for row in trace_rows} == set(trace_ids)
+            and all(
+                str(row["backlog_id"] or "") == ticket["backlog_id"]
+                and str(row["task_id"] or "") == qa_task_id
+                and str(row["runtime_context_id"] or "") == runtime_context_id
+                and str(row["actor"] or "") == str(graph.get("qa_principal") or "")
+                and str(row["qa_session_id"] or "") == sessions[index]
+                and str(row["commit_sha"] or "") == candidate
+                and str(row["candidate_commit_sha"] or "") == candidate
+                and str(row["snapshot_commit_sha"] or "") == candidate
+                and str(row["query_source"] or "") == "qa"
+                and str(row["query_purpose"] or "") in {"qa_context_build", "qa_gate_validation", "independent_verification"}
+                and all(
+                    str(graph.get(field) or "")
+                    and str(row[field] or "") == str(graph[field])
+                    for field in (
+                        "root_identity_hash", "query_root_identity_hash",
+                        "canonical_project_identity_hash", "repository_identity_hash",
+                        "qa_scope_binding_ref",
+                    )
+                )
+                and str(row["status"] or "").lower() == "complete"
+                and (_contract_runtime_close_authority_time_order_value(
+                    str(row["created_at"] or "")
+                ) or 0.0) > failed_time
+                for row in trace_rows
+            )
+        ):
+            fresh_graphs.append(index)
+    keep: set[int] = set(fresh_graphs)
+    if (
+        str(verdict.get("effective_status") or "") in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES
+        and verdict.get("fresh_session_pass_verified") is True
+        and fresh_graphs
+    ):
+        graph_index = fresh_graphs[-1]
+        for index in relevant:
+            line = completed[index]
+            if (
+                index > graph_index
+                and str(line.get("line_id") or "") == "qa_independent_verification"
+                and int(accepted.get(index, {}).get("execution_state_revision") or 0) > failed_revision
+                and _contract_runtime_authenticated_qa_provenance(line)
+                and _contract_runtime_line_status_passes(line)
+                and sessions.get(index) == sessions[graph_index] == verdict.get("qa_session_id")
+            ):
+                keep.add(index)
+        qa_indices = [index for index in keep if completed[index].get("line_id") == "qa_independent_verification"]
+        if qa_indices:
+            keep.update(index for index in relevant if (
+                completed[index].get("line_id") == "observer_close_ready"
+                and index > max(qa_indices) and index in accepted
+            ))
+    # Return projection positions; every acceptance check above uses its physical
+    # canonical index. Worker, merge, reconcile and all stored rows stay intact.
+    obsolete_hashes = {stable_sha256(completed[index]) for index in relevant if index not in keep}
+    return [index for index, line in enumerate(supplied) if stable_sha256(line) in obsolete_hashes]
 
 
 def _contract_runtime_authoritative_qa_superseded_line_indices(
@@ -122654,6 +123035,15 @@ def _contract_runtime_authoritative_qa_superseded_line_indices(
 
     if not authoritative_qa_verdict:
         return []
+    if (
+        _is_mf_parallel_postmerge_revision(record)
+        and authoritative_qa_verdict.get("postmerge_qa_scope_verified") is True
+        and authoritative_qa_verdict.get("postmerge_failed_qa_boundary_authority")
+    ):
+        return _contract_runtime_postmerge_failed_qa_superseded_line_indices(
+            conn, project_id=project_id, record=record, context=context,
+            verdict=authoritative_qa_verdict,
+        )
     runtime_context_id, task_id, _parent_task_id = (
         _contract_runtime_context_identity(context)
     )
@@ -122892,11 +123282,8 @@ def _contract_runtime_projection_for_context(
     fence_token = str(getattr(context, "fence_token", "") or "")
     if not all((runtime_context_id, task_id, parent_task_id, backlog_id)):
         return {}
-    timeline_events = _runtime_context_service_timeline_events(
-        conn,
-        project_id=project_id,
-        task_id=task_id,
-        backlog_id=backlog_id,
+    timeline_events = _contract_runtime_context_qa_timeline_events(
+        conn, project_id=project_id, record=record, context=context,
     )
     authoritative_qa_verdict = (
         _contract_runtime_authoritative_qa_projection_verdict(
@@ -145789,18 +146176,24 @@ def _contract_runtime_reconcile_receipt_resolution(
         and isinstance(current_dispatch.get("completed_line_index"), int)
         else -1
     )
-    lines = [
-        (index, line)
-        for index, line in enumerate(record.get("completed_lines") or [])
-        if index > current_dispatch_index
-        and isinstance(line, Mapping)
-        and str(line.get("stage_id") or "").strip()
-        in {"reconcile", "observer_integration", "observer_reconcile"}
-        and str(line.get("line_id") or "").strip()
-        == "observer_reconcile"
-        and str(line.get("evidence_kind") or "").strip() == "reconcile"
-        and str(line.get("actor_role") or "").strip() == "observer"
-    ]
+
+    def receipt_lines(completed, dispatch_index):
+        return [
+            (index, line)
+            for index, line in enumerate(completed)
+            if index > dispatch_index
+            and isinstance(line, Mapping)
+            and str(line.get("stage_id") or "").strip()
+            in {"reconcile", "observer_integration", "observer_reconcile"}
+            and str(line.get("line_id") or "").strip()
+            == "observer_reconcile"
+            and str(line.get("evidence_kind") or "").strip() == "reconcile"
+            and str(line.get("actor_role") or "").strip() == "observer"
+        ]
+
+    lines = receipt_lines(
+        record.get("completed_lines") or [], current_dispatch_index
+    )
     sources: list[tuple[int, Mapping[str, Any]]] = []
     corrections: list[tuple[int, Mapping[str, Any]]] = []
     for index, line in lines:
@@ -145815,12 +146208,83 @@ def _contract_runtime_reconcile_receipt_resolution(
             sources.append((index, line))
     if len(sources) != 1 or len(corrections) > 1 or len(lines) not in {1, 2}:
         return {"status": "invalid", "reason": "receipt_cardinality"}
+    # A server projection can insert transient worker lines before this
+    # receipt. Keep its positions for phase ordering; only persisted positions
+    # identify immutable acceptance revisions and correction source refs.
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    try:
+        canonical = _contract_runtime_store(conn).get(execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {"status": "invalid", "reason": "source_acceptance"}
+    if not isinstance(canonical, Mapping):
+        return {"status": "invalid", "reason": "source_acceptance"}
+    identity_fields = (
+        "project_id", "backlog_id", "contract_execution_id", "contract_id",
+        "version", "revision", "definition_hash", "contract_chain_id",
+        "parent_contract_execution_id", "root_contract_execution_id",
+    )
+    if (
+        not execution_id
+        or str(canonical.get("project_id") or "").strip() != project_id
+        or any(
+            str(canonical.get(field) or "").strip()
+            != str(record.get(field) or "").strip()
+            for field in identity_fields
+        )
+    ):
+        return {"status": "invalid", "reason": "source_identity"}
+    canonical_completed = list(canonical.get("completed_lines") or [])
+    if any(not isinstance(line, Mapping) for line in canonical_completed):
+        return {"status": "invalid", "reason": "source_identity"}
+    canonical_dispatch = _contract_runtime_current_dispatch_authority_line(
+        canonical
+    )
+    canonical_dispatch_index = -1
+    if canonical_dispatch.get("status") == "selected":
+        if (
+            current_dispatch.get("status") != "selected"
+            or stable_sha256(canonical_dispatch["line"])
+            != stable_sha256(current_dispatch["line"])
+        ):
+            return {"status": "invalid", "reason": "source_identity"}
+        canonical_dispatch_index = int(
+            canonical_dispatch["completed_line_index"]
+        )
+    elif (
+        current_dispatch.get("status") == "selected"
+        or any(
+            str(line.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+            for line in canonical_completed
+        )
+        or stable_sha256(canonical_completed)
+        != stable_sha256(record.get("completed_lines") or [])
+    ):
+        # Historical records without a selected dispatch retain their exact
+        # stored coordinates. They cannot authorize a projection remapping.
+        return {"status": "invalid", "reason": "source_identity"}
+    canonical_lines = receipt_lines(
+        canonical_completed, canonical_dispatch_index
+    )
+    if len(canonical_lines) != len(lines):
+        return {"status": "invalid", "reason": "receipt_cardinality"}
+
+    def canonical_index(expected_line):
+        matches = [
+            index for index, line in canonical_lines
+            if stable_sha256(line) == stable_sha256(expected_line)
+        ]
+        return matches[0] if len(matches) == 1 else -1
+
     source_index, source_line = sources[0]
+    canonical_source_index = canonical_index(source_line)
+    if canonical_source_index < 0:
+        return {"status": "invalid", "reason": "source_acceptance"}
     source_acceptance = _contract_runtime_completed_line_acceptance(
         conn,
         project_id=project_id,
-        record=record,
-        completed_line_index=source_index,
+        record=canonical,
+        completed_line_index=canonical_source_index,
         expected_line=source_line,
     )
     source_receipt = _contract_runtime_close_authority_payload_mapping(
@@ -145839,6 +146303,7 @@ def _contract_runtime_reconcile_receipt_resolution(
         return {
             "status": "current",
             "line_index": source_index,
+            "canonical_line_index": canonical_source_index,
             "line": source_line,
             "acceptance": source_acceptance,
             "authority": dict(authority),
@@ -145855,25 +146320,28 @@ def _contract_runtime_reconcile_receipt_resolution(
         return {
             "status": "legacy_pending",
             "source_line_index": source_index,
+            "canonical_source_line_index": canonical_source_index,
             "source_line": source_line,
             "source_acceptance": source_acceptance,
             "authority": dict(authority),
         }
     correction_index, correction_line = corrections[0]
+    canonical_correction_index = canonical_index(correction_line)
     correction_acceptance = _contract_runtime_completed_line_acceptance(
         conn,
         project_id=project_id,
-        record=record,
-        completed_line_index=correction_index,
+        record=canonical,
+        completed_line_index=canonical_correction_index,
         expected_line=correction_line,
     )
     if not (
         correction_index == source_index + 1
+        and canonical_correction_index == canonical_source_index + 1
         and correction_acceptance.get("db_verified") is True
         and _contract_runtime_reconcile_receipt_correction_valid(
-            record=record,
+            record=canonical,
             source_line=source_line,
-            source_line_index=source_index,
+            source_line_index=canonical_source_index,
             correction_line=correction_line,
             authority=authority,
         )
@@ -145882,8 +146350,10 @@ def _contract_runtime_reconcile_receipt_resolution(
     return {
         "status": "corrected",
         "source_line_index": source_index,
+        "canonical_source_line_index": canonical_source_index,
         "source_line": source_line,
         "line_index": correction_index,
+        "canonical_line_index": canonical_correction_index,
         "line": correction_line,
         "acceptance": correction_acceptance,
         "authority": dict(authority),
@@ -146035,7 +146505,7 @@ def _contract_runtime_reconcile_receipt_correction(
     if resolution.get("status") != "legacy_pending":
         return {}
     source_line = resolution["source_line"]
-    source_index = int(resolution["source_line_index"])
+    source_index = int(resolution["canonical_source_line_index"])
     source_stage_id = str(source_line.get("stage_id") or "").strip()
     if str(write.get("stage_id") or "").strip() != source_stage_id:
         raise GovernanceError(
@@ -185155,11 +185625,41 @@ def _contract_runtime_matching_completed_line(
         item_runtime = scope_values(item, "runtime_context_id")
         item_task = scope_values(item, "task_id", "worker_task_id")
         item_parent = scope_values(item, "parent_task_id")
-        if (
-            (anchor_runtime and item_runtime and item_runtime != anchor_runtime)
-            or (anchor_task and item_task and item_task != anchor_task)
-        ):
+        if anchor_runtime and item_runtime and item_runtime != anchor_runtime:
             return False
+        if anchor_task and item_task and item_task != anchor_task:
+            # Postmerge QA files its graph/session proof on the combined CEX
+            # while retaining the final worker lane. Both task identities are
+            # truthful; only the newest frozen QA ticket may join them.
+            if not (
+                _is_mf_parallel_postmerge_revision(record)
+                and str(item.get("line_id") or "").strip()
+                in {"qa_graph_context", "qa_independent_verification"}
+                and str(item.get("actor_role") or "").strip() == "qa"
+                and _contract_runtime_authenticated_qa_provenance(item)
+            ):
+                return False
+            ticket = _contract_runtime_persisted_postmerge_qa_authority(record)
+            execution_id = str(record.get("contract_execution_id") or "").strip()
+            worker_task = str(ticket.get("task_id") or "").strip()
+            runtime_id = str(ticket.get("runtime_context_id") or "").strip()
+            candidate = str(ticket.get("candidate_commit_sha") or "").strip().lower()
+            if not (
+                ticket.get("verified") is True
+                and execution_id and worker_task and runtime_id
+                and str(ticket.get("qa_graph_trace_task_id") or "").strip()
+                == execution_id
+                and str(ticket.get("parent_task_id") or "").strip()
+                == execution_id
+                and anchor_task == {worker_task}
+                and anchor_runtime == item_runtime == {runtime_id}
+                and anchor_parent == item_parent == {execution_id}
+                and item_task <= {worker_task, execution_id}
+                and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate)
+                and candidate in commit_values(anchor)
+                and commit_values(item) == {candidate}
+            ):
+                return False
         if not anchor_parent or not item_parent or item_parent == anchor_parent:
             return True
         return bool(
@@ -185612,6 +186112,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
     event_kind: str,
     trusted_actor_role: str = "",
     trusted_qa_verification_authority: Mapping[str, Any] | None = None,
+    trusted_actor_session: Mapping[str, Any] | None = None,
     historical_route_correction: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract_execution_id = _contract_runtime_close_execution_id(body, conn=conn)
@@ -185636,6 +186137,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
         )
     except (ContractRuntimeError, ContractDefinitionError):
         return {}
+    source_record = record
     if actor_role:
         record, _ = _contract_runtime_apply_mf_parallel_context_projection(
             conn,
@@ -185800,6 +186302,38 @@ def _contract_runtime_completed_line_projection_preflight_gate(
                             "contract_runtime_line_mutated": False,
                         }
                     )
+                if (
+                    fresh_qa_authority
+                    and str(body.get("status") or "").strip().lower()
+                    in _QA_TIMELINE_AUDIT_STATUSES
+                    and _is_mf_parallel_postmerge_revision(source_record)
+                ):
+                    scope = _contract_runtime_postmerge_qa_timeline_scope(
+                        conn,
+                        project_id=str(source_record.get("project_id") or ""),
+                        record=source_record,
+                    )
+                    if not scope:
+                        raise GovernanceError(
+                            "postmerge_failed_qa_boundary_scope_mismatch",
+                            "completed final QA requires its newest accepted postmerge ticket",
+                            422,
+                            {"zero_write_rejection": True, "writes_performed": False,
+                             "fail_closed": True, "field": "postmerge_qa_authority"},
+                        )
+                    boundary_gate = _contract_runtime_postmerge_failed_qa_boundary_gate(
+                        project_id=str(source_record.get("project_id") or ""),
+                        record=source_record,
+                        body=body,
+                        event_kind=event_kind,
+                        normalized_status=str(body.get("status") or ""),
+                        trusted_qa_verification_authority=fresh_qa_authority,
+                        trusted_actor_session=trusted_actor_session,
+                        postmerge_authority=scope["ticket"],
+                        current_state=current_state,
+                    )
+                    gate.update(boundary_gate)
+                    gate["contract_runtime_completed_line_remains_authoritative"] = False
                 if not actor_role:
                     gate["actor_role_source"] = "completed_contract_runtime_line"
                     gate[
@@ -187292,6 +187826,243 @@ def _contract_runtime_premerge_candidate_atomic_lane_authority(
     return authority
 
 
+def _contract_runtime_postmerge_failed_qa_boundary_gate(
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    body: Mapping[str, Any],
+    event_kind: str,
+    normalized_status: str,
+    trusted_qa_verification_authority: Mapping[str, Any] | None,
+    trusted_actor_session: Mapping[str, Any] | None,
+    postmerge_authority: Mapping[str, Any],
+    current_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind an audit-only failure to the authenticated reconciled QA round."""
+
+    evidence_status = str(normalized_status or "").strip().lower()
+    audit_only = evidence_status in _QA_TIMELINE_AUDIT_STATUSES
+    if not (
+        audit_only
+        and _is_mf_parallel_postmerge_revision(record)
+        and postmerge_authority.get("verified") is True
+    ):
+        return {}
+    proof = dict(trusted_qa_verification_authority or {})
+    session = dict(trusted_actor_session or {})
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    contract_id = str(record.get("contract_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    commit_sha = str(body.get("commit_sha") or "").strip().lower()
+    payload = body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
+    next_line = current_state.get("next_legal_action") or {}
+    session_principal = str(session.get("principal_id") or "").strip()
+    session_id = str(session.get("session_id") or "").strip()
+    proof_principal = str(
+        proof.get("qa_principal") or proof.get("principal_id") or ""
+    ).strip()
+    proof_session_id = str(proof.get("qa_session_id") or "").strip()
+    proof_commit = str(
+        proof.get("candidate_commit_sha") or proof.get("commit_sha") or ""
+    ).strip().lower()
+    proof_query_root = str(proof.get("query_root") or "").strip()
+    postmerge_candidate = str(
+        postmerge_authority.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    postmerge_qa_task_id = str(
+        postmerge_authority.get("qa_graph_trace_task_id") or ""
+    ).strip()
+    postmerge_root = str(
+        postmerge_authority.get("target_project_root") or ""
+    ).strip()
+    postmerge_trace_ids = [
+        str(value or "").strip()
+        for value in proof.get("graph_trace_ids") or []
+        if str(value or "").strip()
+    ]
+    postmerge_mismatches: list[dict[str, Any]] = []
+
+    def require_postmerge(field: str, expected: Any, actual: Any) -> None:
+        if actual != expected:
+            postmerge_mismatches.append(
+                {"field": field, "expected": expected, "actual": actual}
+            )
+
+    for field, expected in {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "verified": True,
+        "role": "qa",
+        "db_verified_graph_trace": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "observer_impersonation": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": postmerge_qa_task_id,
+    }.items():
+        raw_actual = proof.get(field)
+        actual = (
+            raw_actual
+            if isinstance(expected, bool)
+            else str(raw_actual or "")
+        )
+        require_postmerge(f"qa_session_proof.{field}", expected, actual)
+    require_postmerge("request.task_id", postmerge_qa_task_id, task_id)
+    require_postmerge("request.commit_sha", postmerge_candidate, commit_sha)
+    require_postmerge(
+        "qa_session_proof.commit_sha", postmerge_candidate, proof_commit
+    )
+    require_postmerge(
+        "qa_session.principal", session_principal, proof_principal
+    )
+    require_postmerge("qa_session.session_id", session_id, proof_session_id)
+    require_postmerge(
+        "request.actor", session_principal, str(body.get("actor") or "").strip()
+    )
+    require_postmerge(
+        "qa_session_scope_binding_ref",
+        True,
+        bool(str(proof.get("qa_scope_binding_ref") or "").strip()),
+    )
+    require_postmerge("graph_trace_ids", True, bool(postmerge_trace_ids))
+    require_postmerge("status.audit_only", True, audit_only)
+    require_postmerge(
+        "qa_session_proof.evidence_status",
+        evidence_status,
+        str(proof.get("evidence_status") or "").strip().lower(),
+    )
+    require_postmerge(
+        "qa_session_proof.audit_only", True, proof.get("audit_only") is True
+    )
+    require_postmerge(
+        "postmerge_qa_authority.authority_hash",
+        str(postmerge_authority.get("authority_hash") or ""),
+        stable_sha256(
+            {
+                key: value
+                for key, value in postmerge_authority.items()
+                if key != "authority_hash"
+            }
+        ),
+    )
+    if postmerge_root:
+        require_postmerge(
+            "qa_session_proof.query_root",
+            str(Path(postmerge_root).resolve()),
+            str(Path(proof_query_root).resolve()) if proof_query_root else "",
+        )
+    explicit_runtime_context_id = str(
+        payload.get("runtime_context_id") or ""
+    ).strip()
+    if explicit_runtime_context_id:
+        require_postmerge(
+            "request.runtime_context_id",
+            str(postmerge_authority.get("runtime_context_id") or "").strip(),
+            explicit_runtime_context_id,
+        )
+    if postmerge_mismatches:
+        first = postmerge_mismatches[0]
+        raise GovernanceError(
+            "postmerge_failed_qa_boundary_scope_mismatch",
+            (
+                "postmerge failed QA does not match the exact reconciled "
+                "batch-child authority"
+            ),
+            422,
+            {
+                "field": first["field"],
+                "expected": first["expected"],
+                "actual": first["actual"],
+                "identity_mismatches": postmerge_mismatches,
+                "source": (
+                    "server._contract_runtime_premerge_candidate_qa_receipt_gate."
+                    "postmerge_failed_qa_boundary.v1"
+                ),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "retry_same_world_allowed": True,
+                "contract_runtime_mutated": False,
+                "runtime_context_mutated": False,
+                "timeline_mutated": False,
+                "observer_merge_written": False,
+                "fail_closed": True,
+                "public_safe": True,
+                "secret_safe": True,
+            },
+        )
+
+    boundary_authority = {
+        "schema_version": (
+            "contract_runtime.postmerge_failed_qa_boundary_authority.v1"
+        ),
+        "source": (
+            "authenticated_qa_session+rev8_postmerge_qa_authority"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": str(
+            postmerge_authority.get("runtime_context_id") or ""
+        ).strip(),
+        "task_id": str(postmerge_authority.get("task_id") or "").strip(),
+        "parent_task_id": str(
+            postmerge_authority.get("parent_task_id") or ""
+        ).strip(),
+        "qa_graph_trace_task_id": postmerge_qa_task_id,
+        "candidate_commit_sha": postmerge_candidate,
+        "target_project_root": postmerge_root,
+        "qa_principal": proof_principal,
+        "qa_session_id": proof_session_id,
+        "qa_scope_binding_ref": str(
+            proof.get("qa_scope_binding_ref") or ""
+        ).strip(),
+        "graph_trace_ids": postmerge_trace_ids,
+        "evidence_status": evidence_status,
+        "close_satisfying": False,
+        "audit_only": True,
+        "failed_qa_rework_eligible": True,
+        "observer_merge_written": False,
+        "observer_merge_bypassed": False,
+        "postmerge_qa_authority": dict(postmerge_authority),
+    }
+    boundary_authority["authority_hash"] = stable_sha256(
+        boundary_authority
+    )
+    return {
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+        "accepted": True,
+        "status": "accepted_postmerge_failed_qa_boundary",
+        "primary_decision_source": True,
+        "agent_facing_decision_source": (
+            "source_backed_postmerge_failed_qa_boundary"
+        ),
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": execution_id,
+        "contract_id": contract_id,
+        "actor_role": "qa",
+        "requested_event_kind": event_kind,
+        "stage_id": "qa_postmerge",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "next_legal_action": dict(next_line),
+        "canonical_submit_required": False,
+        "contract_runtime_mutated": False,
+        "close_satisfying": False,
+        "audit_only": True,
+        "failed_qa_rework_eligible": True,
+        "observer_merge_written": False,
+        "observer_merge_bypassed": False,
+        "timeline_append_required": True,
+        "timeline_append_authoritative": True,
+        "postmerge_failed_qa_boundary_authority": boundary_authority,
+    }
+
+
 def _contract_runtime_premerge_candidate_qa_receipt_gate(
     conn,
     *,
@@ -187465,200 +188236,17 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         else {}
     )
     if postmerge_authority.get("verified") is True:
-        postmerge_candidate = str(
-            postmerge_authority.get("candidate_commit_sha") or ""
-        ).strip().lower()
-        postmerge_qa_task_id = str(
-            postmerge_authority.get("qa_graph_trace_task_id") or ""
-        ).strip()
-        postmerge_root = str(
-            postmerge_authority.get("target_project_root") or ""
-        ).strip()
-        postmerge_trace_ids = [
-            str(value or "").strip()
-            for value in proof.get("graph_trace_ids") or []
-            if str(value or "").strip()
-        ]
-        postmerge_mismatches: list[dict[str, Any]] = []
-
-        def require_postmerge(field: str, expected: Any, actual: Any) -> None:
-            if actual != expected:
-                postmerge_mismatches.append(
-                    {"field": field, "expected": expected, "actual": actual}
-                )
-
-        for field, expected in {
-            "schema_version": "qa_session_scope_proof.v1",
-            "source": "authenticated_qa_session",
-            "verified": True,
-            "role": "qa",
-            "db_verified_graph_trace": True,
-            "query_source": "qa",
-            "query_purpose": "independent_verification",
-            "observer_impersonation": False,
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "task_id": postmerge_qa_task_id,
-        }.items():
-            raw_actual = proof.get(field)
-            actual = (
-                raw_actual
-                if isinstance(expected, bool)
-                else str(raw_actual or "")
-            )
-            require_postmerge(f"qa_session_proof.{field}", expected, actual)
-        require_postmerge("request.task_id", postmerge_qa_task_id, task_id)
-        require_postmerge("request.commit_sha", postmerge_candidate, commit_sha)
-        require_postmerge(
-            "qa_session_proof.commit_sha", postmerge_candidate, proof_commit
+        return _contract_runtime_postmerge_failed_qa_boundary_gate(
+            project_id=project_id,
+            record=record,
+            body=body,
+            event_kind=event_kind,
+            normalized_status=normalized_status,
+            trusted_qa_verification_authority=proof,
+            trusted_actor_session=session,
+            postmerge_authority=postmerge_authority,
+            current_state=current_state,
         )
-        require_postmerge(
-            "qa_session.principal", session_principal, proof_principal
-        )
-        require_postmerge("qa_session.session_id", session_id, proof_session_id)
-        require_postmerge(
-            "request.actor", session_principal, str(body.get("actor") or "").strip()
-        )
-        require_postmerge(
-            "qa_session_scope_binding_ref",
-            True,
-            bool(str(proof.get("qa_scope_binding_ref") or "").strip()),
-        )
-        require_postmerge("graph_trace_ids", True, bool(postmerge_trace_ids))
-        require_postmerge("status.audit_only", True, audit_only)
-        require_postmerge(
-            "qa_session_proof.evidence_status",
-            evidence_status,
-            str(proof.get("evidence_status") or "").strip().lower(),
-        )
-        require_postmerge(
-            "qa_session_proof.audit_only", True, proof.get("audit_only") is True
-        )
-        require_postmerge(
-            "postmerge_qa_authority.authority_hash",
-            str(postmerge_authority.get("authority_hash") or ""),
-            stable_sha256(
-                {
-                    key: value
-                    for key, value in postmerge_authority.items()
-                    if key != "authority_hash"
-                }
-            ),
-        )
-        if postmerge_root:
-            require_postmerge(
-                "qa_session_proof.query_root",
-                str(Path(postmerge_root).resolve()),
-                str(Path(proof_query_root).resolve()) if proof_query_root else "",
-            )
-        explicit_runtime_context_id = str(
-            payload.get("runtime_context_id") or ""
-        ).strip()
-        if explicit_runtime_context_id:
-            require_postmerge(
-                "request.runtime_context_id",
-                str(postmerge_authority.get("runtime_context_id") or "").strip(),
-                explicit_runtime_context_id,
-            )
-        if postmerge_mismatches:
-            first = postmerge_mismatches[0]
-            raise GovernanceError(
-                "postmerge_failed_qa_boundary_scope_mismatch",
-                (
-                    "postmerge failed QA does not match the exact reconciled "
-                    "batch-child authority"
-                ),
-                422,
-                {
-                    "field": first["field"],
-                    "expected": first["expected"],
-                    "actual": first["actual"],
-                    "identity_mismatches": postmerge_mismatches,
-                    "source": (
-                        "server._contract_runtime_premerge_candidate_qa_receipt_gate."
-                        "postmerge_failed_qa_boundary.v1"
-                    ),
-                    "zero_write_rejection": True,
-                    "writes_performed": False,
-                    "mutation_performed": False,
-                    "retry_same_world_allowed": True,
-                    "contract_runtime_mutated": False,
-                    "runtime_context_mutated": False,
-                    "timeline_mutated": False,
-                    "observer_merge_written": False,
-                    "fail_closed": True,
-                    "public_safe": True,
-                    "secret_safe": True,
-                },
-            )
-
-        boundary_authority = {
-            "schema_version": (
-                "contract_runtime.postmerge_failed_qa_boundary_authority.v1"
-            ),
-            "source": (
-                "authenticated_qa_session+rev8_postmerge_qa_authority"
-            ),
-            "server_derived": True,
-            "db_verified": True,
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "contract_execution_id": execution_id,
-            "runtime_context_id": str(
-                postmerge_authority.get("runtime_context_id") or ""
-            ).strip(),
-            "task_id": str(postmerge_authority.get("task_id") or "").strip(),
-            "parent_task_id": str(
-                postmerge_authority.get("parent_task_id") or ""
-            ).strip(),
-            "qa_graph_trace_task_id": postmerge_qa_task_id,
-            "candidate_commit_sha": postmerge_candidate,
-            "target_project_root": postmerge_root,
-            "qa_principal": proof_principal,
-            "qa_session_id": proof_session_id,
-            "qa_scope_binding_ref": str(
-                proof.get("qa_scope_binding_ref") or ""
-            ).strip(),
-            "graph_trace_ids": postmerge_trace_ids,
-            "evidence_status": evidence_status,
-            "close_satisfying": False,
-            "audit_only": True,
-            "failed_qa_rework_eligible": True,
-            "observer_merge_written": False,
-            "observer_merge_bypassed": False,
-            "postmerge_qa_authority": dict(postmerge_authority),
-        }
-        boundary_authority["authority_hash"] = stable_sha256(
-            boundary_authority
-        )
-        return {
-            "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
-            "accepted": True,
-            "status": "accepted_postmerge_failed_qa_boundary",
-            "primary_decision_source": True,
-            "agent_facing_decision_source": (
-                "source_backed_postmerge_failed_qa_boundary"
-            ),
-            "meta_contract_gate_decision_source": False,
-            "contract_execution_id": execution_id,
-            "contract_id": contract_id,
-            "actor_role": "qa",
-            "requested_event_kind": event_kind,
-            "stage_id": "qa_postmerge",
-            "line_id": "qa_independent_verification",
-            "evidence_kind": "independent_verification",
-            "next_legal_action": dict(next_line),
-            "canonical_submit_required": False,
-            "contract_runtime_mutated": False,
-            "close_satisfying": False,
-            "audit_only": True,
-            "failed_qa_rework_eligible": True,
-            "observer_merge_written": False,
-            "observer_merge_bypassed": False,
-            "timeline_append_required": True,
-            "timeline_append_authoritative": True,
-            "postmerge_failed_qa_boundary_authority": boundary_authority,
-        }
 
     context_parent_ids = {
         str(value or "").strip()
@@ -202598,6 +203186,11 @@ def _handle_task_timeline_append(ctx: RequestContext):
                     trusted_actor_role=trusted_contract_runtime_actor_role,
                     trusted_qa_verification_authority=(
                         trusted_qa_verification_authority
+                    ),
+                    trusted_actor_session=(
+                        ctx.require_auth(conn)
+                        if trusted_contract_runtime_actor_role == "qa"
+                        else None
                     ),
                     historical_route_correction=(
                         trusted_historical_route_correction
