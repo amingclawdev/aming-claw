@@ -53994,19 +53994,23 @@ def _runtime_context_contract_finish_attestation_projection(
     read_receipt_event_id: str = "",
     read_receipt_hash: str = "",
     supplied_attestation: Mapping[str, Any] | None = None,
+    canonical_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project one exact accepted ContractRuntime finish attestation."""
 
     task_id = str(getattr(context, "task_id", "") or "").strip()
-    try:
-        record = _contract_runtime_store(conn).get(contract_execution_id)
-    except (ContractRuntimeError, sqlite3.Error) as exc:
-        raise GovernanceError(
-            "contract_worker_finish_attestation_required",
-            str(exc),
-            422,
-            {"contract_execution_id": contract_execution_id},
-        ) from exc
+    if isinstance(canonical_record, Mapping):
+        record = deepcopy(dict(canonical_record))
+    else:
+        try:
+            record = _contract_runtime_store(conn).get(contract_execution_id)
+        except (ContractRuntimeError, sqlite3.Error) as exc:
+            raise GovernanceError(
+                "contract_worker_finish_attestation_required",
+                str(exc),
+                422,
+                {"contract_execution_id": contract_execution_id},
+            ) from exc
     (
         completed_lines,
         failed_qa_index,
@@ -86690,6 +86694,127 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
             errors.append("rev10_worker_finish_gate_not_unique")
             continue
         finish_index, finish_line = finish_candidates[0]
+        finish_payload = (
+            finish_line.get("payload")
+            if isinstance(finish_line.get("payload"), Mapping)
+            else {}
+        )
+        finish_head = text(
+            finish_line.get("head_commit")
+            or finish_payload.get("validated_head_commit")
+            or finish_payload.get("head_commit")
+        ).lower()
+        finish_checkpoint = text(finish_payload.get("checkpoint_id"))
+        context_head = text(getattr(context, "head_commit", "")).lower()
+        context_checkpoint = text(getattr(context, "checkpoint_id", ""))
+        queue_head = text(getattr(item, "branch_head", "")).lower()
+        if not (
+            finish_head
+            and finish_checkpoint
+            and context_head == queue_head == finish_head
+            and context_checkpoint == finish_checkpoint
+        ):
+            errors.append("rev10_runtime_queue_finish_identity_mismatch")
+            continue
+        try:
+            stored_record = _contract_runtime_store(conn).get(execution_id)
+        except (ContractRuntimeError, sqlite3.Error):
+            errors.append("rev10_worker_finish_attestation_mismatch")
+            continue
+        canonical_attestation_record = deepcopy(stored_record)
+        stored_guide = canonical_attestation_record.get("runtime_guide")
+        if isinstance(stored_guide, Mapping):
+            canonical_attestation_record["runtime_guide"] = {
+                key: value
+                for key, value in stored_guide.items()
+                if key != "completed_lines"
+            }
+        try:
+            attestation = _runtime_context_contract_finish_attestation_projection(
+                conn,
+                context=context,
+                contract_execution_id=execution_id,
+                runtime_context_id=identity["runtime_context_id"],
+                parent_task_id=identity["parent_task_id"],
+                head_commit=finish_head,
+                changed_files=_runtime_context_service_query_values(
+                    finish_payload,
+                    "changed_files",
+                ),
+                test_results=(
+                    finish_payload.get("test_results")
+                    if isinstance(finish_payload.get("test_results"), Mapping)
+                    else {}
+                ),
+                supplied_worker_session_id=text(
+                    finish_payload.get("worker_session_id")
+                ),
+                supplied_filer_principal=text(
+                    finish_payload.get("filer_principal")
+                ),
+                read_receipt_event_id=text(
+                    finish_payload.get("read_receipt_event_id")
+                ),
+                read_receipt_hash=text(
+                    finish_payload.get("read_receipt_hash")
+                ),
+                supplied_attestation=(
+                    finish_payload.get("worker_self_attestation")
+                    if isinstance(
+                        finish_payload.get("worker_self_attestation"),
+                        Mapping,
+                    )
+                    else {}
+                ),
+                canonical_record=canonical_attestation_record,
+            )
+        except GovernanceError as exc:
+            reason = {
+                "contract_worker_finish_attestation_required": (
+                    "rev10_worker_finish_attestation_required"
+                ),
+                "contract_worker_finish_attestation_mismatch": (
+                    "rev10_worker_finish_attestation_mismatch"
+                ),
+                "contract_worker_finish_attestation_ambiguous": (
+                    "rev10_worker_finish_attestation_ambiguous"
+                ),
+            }.get(exc.code, "rev10_worker_finish_attestation_invalid")
+            errors.append(reason)
+            continue
+        source_ref = text(attestation.get("contract_runtime_source_ref"))
+        source_match = re.fullmatch(
+            rf"contract_runtime:{re.escape(execution_id)}:completed_lines:(\d+)",
+            source_ref,
+        )
+        if not source_match:
+            errors.append("rev10_worker_finish_attestation_mismatch")
+            continue
+        attestation_index = int(source_match.group(1))
+        if not 0 <= attestation_index < len(completed):
+            errors.append("rev10_worker_finish_attestation_mismatch")
+            continue
+        attestation_line = completed[attestation_index]
+        stored_completed = stored_record.get("completed_lines")
+        if (
+            not isinstance(stored_completed, list)
+            or not 0 <= attestation_index < len(stored_completed)
+            or not isinstance(stored_completed[attestation_index], Mapping)
+            or stable_sha256(stored_completed[attestation_index])
+            != stable_sha256(attestation_line)
+        ):
+            errors.append("rev10_worker_finish_attestation_mismatch")
+            continue
+        attestation_acceptance = _contract_runtime_completed_line_acceptance(
+            conn,
+            project_id=project_id,
+            record=record,
+            completed_line_index=attestation_index,
+            expected_line=attestation_line,
+        )
+        if attestation_acceptance.get("db_verified") is not True:
+            errors.append("rev10_worker_finish_attestation_not_db_accepted")
+            continue
         accepted = _contract_runtime_completed_line_acceptance(
             conn, project_id=project_id, record=record,
             completed_line_index=finish_index, expected_line=finish_line,
@@ -86703,6 +86828,19 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
             **identity,
             "queue_item_id": text(item.queue_item_id),
             "owned_files": owned_files,
+            "head_commit": finish_head,
+            "checkpoint_id": finish_checkpoint,
+            "finish_attestation_acceptance": {
+                "line_id": "worker_finish_time_attestation",
+                "completed_line_ref": text(
+                    attestation_acceptance.get("completed_line_ref")
+                ),
+                "acceptance_ref": text(
+                    attestation_acceptance.get("acceptance_ref")
+                ),
+                "line_hash": stable_sha256(attestation_line),
+                "db_verified": True,
+            },
             "finish_gate_acceptance": {
                 "line_id": "worker_finish_gate",
                 "completed_line_ref": text(accepted.get("completed_line_ref")),
@@ -140981,9 +141119,9 @@ def _contract_runtime_statusless_worker_finish_gate_acceptance(
         and nested.get("waiting_merge") is True
         and str(payload.get("worker_status") or "") == "waiting_merge"
         and str(nested.get("worker_status") or "") == "waiting_merge"
-        and test_results.get("passed") is True
-        and str(test_results.get("status") or "").strip().lower()
-        == "passed"
+        and _runtime_context_finish_attestation_test_results_accepted(
+            test_results
+        )
         and stable_sha256(test_results)
         == stable_sha256(nested.get("test_results"))
         and str(self_gate.get("schema_version") or "")
