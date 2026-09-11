@@ -24,8 +24,10 @@ import urllib.error
 import urllib.parse
 import shutil
 import tempfile
+import time
 from enum import Enum
 from contextlib import closing
+from functools import wraps
 from pathlib import Path
 from collections.abc import Callable, Mapping, Sequence
 
@@ -101,6 +103,102 @@ class _DevFirstStartContext:
 _DEV_FIRST_START_CONTEXT: _DevFirstStartContext | None = None
 
 
+_DASHBOARD_READ_TIMING = threading.local()
+
+
+def dashboard_read_timing_begin(path: str) -> bool:
+    """Begin one temporary request-local Dashboard read attribution record."""
+
+    route = str(path or "").split("?", 1)[0].rstrip("/")
+    enabled = bool(
+        re.fullmatch(r"/api/backlog/[^/]+", route)
+        or re.fullmatch(r"/api/task/[^/]+/timeline(?:/recent)?", route)
+    )
+    if not enabled:
+        return False
+    _DASHBOARD_READ_TIMING.record = {
+        "schema_version": "dashboard.cached_read_attribution.v1",
+        "path": str(path or ""),
+        "request_id": "",
+        "started_ns": time.monotonic_ns(),
+        "started_thread_ns": time.thread_time_ns(),
+        "stages": {},
+        "inclusive_stage_durations": True,
+    }
+    return True
+
+
+def dashboard_read_timing_set_request_id(request_id: str) -> None:
+    record = getattr(_DASHBOARD_READ_TIMING, "record", None)
+    if isinstance(record, dict):
+        record["request_id"] = str(request_id or "")
+
+
+def _dashboard_read_timing_record(
+    stage: str,
+    elapsed_ns: int,
+    thread_ns: int,
+) -> None:
+    record = getattr(_DASHBOARD_READ_TIMING, "record", None)
+    if not isinstance(record, dict):
+        return
+    stages = record["stages"]
+    values = stages.setdefault(
+        stage,
+        {"count": 0, "elapsed_ns": 0, "thread_ns": 0},
+    )
+    values["count"] += 1
+    values["elapsed_ns"] += max(0, int(elapsed_ns))
+    values["thread_ns"] += max(0, int(thread_ns))
+
+
+def dashboard_read_timed(stage: str):
+    """Measure an existing call only while one exact Dashboard GET is active."""
+
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            if not isinstance(
+                getattr(_DASHBOARD_READ_TIMING, "record", None),
+                dict,
+            ):
+                return function(*args, **kwargs)
+            started = time.monotonic_ns()
+            thread_started = time.thread_time_ns()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _dashboard_read_timing_record(
+                    stage,
+                    time.monotonic_ns() - started,
+                    time.thread_time_ns() - thread_started,
+                )
+
+        return wrapped
+
+    return decorate
+
+
+def dashboard_read_timed_call(stage: str, function, /, *args, **kwargs):
+    return dashboard_read_timed(stage)(function)(*args, **kwargs)
+
+
+def dashboard_read_timing_finish() -> dict[str, object] | None:
+    record = getattr(_DASHBOARD_READ_TIMING, "record", None)
+    if not isinstance(record, dict):
+        return None
+    record["total_elapsed_ns"] = max(
+        0,
+        time.monotonic_ns() - int(record.pop("started_ns")),
+    )
+    record["total_thread_ns"] = max(
+        0,
+        time.thread_time_ns() - int(record.pop("started_thread_ns")),
+    )
+    _DASHBOARD_READ_TIMING.record = None
+    return record
+
+
 def _sqlite_quote_identifier(identifier: str) -> str:
     """Return one deterministic SQLite double-quoted identifier."""
     if not isinstance(identifier, str):
@@ -133,6 +231,7 @@ def _sqlite_projection_value(value: object) -> list[str]:
     raise TypeError("unsupported SQLite projection value type: " + type(value).__name__)
 
 
+@dashboard_read_timed("db.sqlite_logical_projection")
 def _sqlite_logical_projection(
     connection: sqlite3.Connection, *, exclude_tables: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
@@ -163,6 +262,7 @@ def _sqlite_logical_projection(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         ).encode("utf-8")).hexdigest()
     return projection
+@dashboard_read_timed("db.stable_health_request")
 def _stable_health_request() -> dict[str, object]:
     """Fixed read-only localhost stable health boundary."""
     try:
@@ -175,6 +275,7 @@ def _stable_health_request() -> dict[str, object]:
     return payload
 
 
+@dashboard_read_timed("db.stable_process_identity")
 def _stable_process_identity(pid: int) -> tuple[str, str, str]:
     """Read start, argv and cwd from the OS; a PID alone is never authority."""
     if not isinstance(pid, int) or pid <= 0:
@@ -363,6 +464,7 @@ def _stable_main_physical_preimage_branch(
     return old_branch
 
 
+@dashboard_read_timed("db.verified_stable_binding")
 def _verified_stable_binding() -> dict[str, object]:
     """Read-only fixed-40000 + unique stable-worktree authority for AC dev."""
     health = _stable_health_request()
@@ -382,10 +484,17 @@ def _verified_stable_binding() -> dict[str, object]:
     ):
         raise RuntimeError("AC stable authority loaded source path is invalid")
     root = _absolute_non_symlink_root(module_path.parents[2], create=False)
-    result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=5, check=False)
+    try:
+        worktree_output = _git_read_exact(
+            root, "worktree", "list", "--porcelain", timeout=5
+        ).decode()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            "AC stable authority worktree is unavailable"
+        ) from exc
     roots = []
     worktrees = []
-    for block in result.stdout.strip().split("\n\n"):
+    for block in worktree_output.strip().split("\n\n"):
         fields = dict(line.split(" ", 1) if " " in line else (line, "") for line in block.splitlines())
         worktrees.append(fields)
         if fields.get("branch") == "refs/heads/main" and fields.get("worktree"):
@@ -410,7 +519,7 @@ def _verified_stable_binding() -> dict[str, object]:
             root, stable_root, str(identity.get("commit") or ""), worktrees,
         )
         roots = [stable_root]
-    if result.returncode != 0 or len(roots) != 1:
+    if len(roots) != 1:
         raise RuntimeError("AC stable authority worktree is unavailable")
     stable_root = roots[0]
     server_command = "agent.governance.server" in command or (
@@ -422,7 +531,16 @@ def _verified_stable_binding() -> dict[str, object]:
         or not server_command
     ):
         raise RuntimeError("AC stable authority process binding is invalid")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=stable_root, capture_output=True, text=True, timeout=5, check=False).stdout.strip().lower()
+    try:
+        head = _git_read_exact(
+            stable_root, "rev-parse", "HEAD", timeout=5
+        ).decode(
+            "utf-8"
+        ).strip().lower()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            "AC stable authority worktree identity changed"
+        ) from exc
     source_path = stable_root / "agent" / "governance" / "server.py"
     source_hash = "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
     identity = health.get("runtime_plane_identity") if isinstance(health.get("runtime_plane_identity"), Mapping) else {}
@@ -449,16 +567,23 @@ def _verified_stable_binding() -> dict[str, object]:
     shared = roots[0] / "shared-volume"
     if not shared.is_dir() or shared.is_symlink() or shared.resolve(strict=True) != shared:
         raise RuntimeError("AC stable authority shared volume is invalid")
-    for args, expected in ((["symbolic-ref", "HEAD"], "refs/heads/" + expected_branch),
-                           (["status", "--porcelain"], "")):
-        probe = subprocess.run(["git", *args], cwd=stable_root, capture_output=True,
-                               text=True, timeout=5, check=False)
-        if probe.returncode or probe.stdout.strip() != expected:
-            raise RuntimeError("AC stable authority worktree identity changed")
+    try:
+        source_status = _git_worktree_status_snapshot(stable_root, timeout=5)
+    except ValueError as exc:
+        raise RuntimeError(
+            "AC stable authority worktree identity changed"
+        ) from exc
+    if (
+        source_status["branch"] != expected_branch
+        or source_status["commit"] != head
+        or source_status["dirty"]
+    ):
+        raise RuntimeError("AC stable authority worktree identity changed")
     return {"shared_volume_path": str(shared), "health": dict(health), "stable_head": head,
             "process_identity": {"pid": health["pid"], "birth": _start, "command": command, "cwd": cwd}}
 
 
+@dashboard_read_timed("db.verified_stable_database_binding")
 def verified_stable_database_binding(
     requested_shared_volume: str | None = None,
     *,
@@ -515,6 +640,7 @@ def verified_stable_database_binding(
     }
 
 
+@dashboard_read_timed("db.revalidate_stable_database_binding")
 def _revalidate_stable_database_binding(binding: Mapping[str, object]) -> None:
     """Fail before a dev root, receipt, or DB effect if the stable DB was swapped."""
     database = Path(str(binding.get("database_path") or ""))
@@ -2857,6 +2983,7 @@ def _validated_canonical_legacy_postimage_adoption(
     return root
 
 
+@dashboard_read_timed("db.dev_storage_root")
 def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = None,
                       source_identity: Mapping[str, object] | None = None,
                       allow_postimage: bool = False) -> Path:
@@ -3241,13 +3368,56 @@ def _dev_durable_completed_pre_normalization_argv_is_canonical(
     )
 
 
-def _git_read_exact(root: Path, *args: str) -> bytes:
+def _git_read_exact(root: Path, *args: str, timeout: int = 10) -> bytes:
     result = subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, timeout=10, check=False,
+        ["git", *args], cwd=root, capture_output=True, timeout=timeout, check=False,
     )
     if result.returncode != 0:
         raise ValueError("AC dev custody Git authority is unavailable")
     return result.stdout
+
+
+def _git_worktree_status_snapshot(
+    root: Path, *, timeout: int = 10
+) -> dict[str, object]:
+    """Read branch, HEAD, and the complete dirty state in one Git snapshot."""
+
+    raw = _git_read_exact(
+        root,
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "--no-ahead-behind",
+        timeout=timeout,
+    )
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ValueError("AC dev custody Git status is unreadable") from exc
+    oid_values = [
+        line.removeprefix("# branch.oid ").strip().lower()
+        for line in lines
+        if line.startswith("# branch.oid ")
+    ]
+    branch_values = [
+        line.removeprefix("# branch.head ").strip()
+        for line in lines
+        if line.startswith("# branch.head ")
+    ]
+    dirty = [line for line in lines if line and not line.startswith("# ")]
+    if (
+        len(oid_values) != 1
+        or len(branch_values) != 1
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid_values[0])
+        or not branch_values[0]
+        or branch_values[0] in {"(detached)", "(unknown)"}
+    ):
+        raise ValueError("AC dev custody Git status identity is invalid")
+    return {
+        "branch": branch_values[0],
+        "commit": oid_values[0],
+        "dirty": dirty,
+    }
 
 
 def _validate_dev_source_tip_custody(
@@ -4625,6 +4795,7 @@ def _sqlite_committed_readonly_uri(database: Path) -> str:
     return "file:" + urllib.parse.quote(str(database)) + query
 
 
+@dashboard_read_timed("db.database_logical_sha256")
 def _database_logical_sha256(database: Path) -> str:
     uri = _sqlite_committed_readonly_uri(database)
     connection = sqlite3.connect(uri, uri=True)
@@ -4723,13 +4894,18 @@ def _dev_live_world_custody_sha256(
 
 def _current_first_start_source(source_root: Path) -> dict[str, str]:
     root = source_root.expanduser().resolve(strict=True)
-    branch = _git_read_exact(root, "branch", "--show-current").decode().strip()
-    commit = _git_read_exact(root, "rev-parse", "HEAD").decode().strip().lower()
-    tree = _git_read_exact(root, "rev-parse", "HEAD^{tree}").decode().strip().lower()
-    dirty = _git_read_exact(root, "status", "--porcelain").decode()
+    identity_lines = _git_read_exact(
+        root, "rev-parse", "HEAD", "HEAD^{tree}"
+    ).decode().splitlines()
+    if len(identity_lines) != 2:
+        raise ValueError("AC dev first-start source identity is invalid")
+    commit, tree = (value.strip().lower() for value in identity_lines)
+    status = _git_worktree_status_snapshot(root)
+    branch = str(status["branch"])
     cli_path = root / "agent" / "cli.py"
     server_path = root / "agent" / "governance" / "server.py"
-    if (branch != "codex/ac-dev" or dirty or cli_path.is_symlink()
+    if (branch != "codex/ac-dev" or status["commit"] != commit
+            or status["dirty"] or cli_path.is_symlink()
             or server_path.is_symlink() or not cli_path.is_file()
             or not server_path.is_file()):
         raise ValueError("AC dev first-start source binding is invalid")
@@ -6041,6 +6217,7 @@ def _validate_dev_cow_basic_restart_writer_lease(
             )
 
 
+@dashboard_read_timed("db.validate_dev_cow_completed_basic_restart")
 def _validate_dev_cow_completed_basic_restart(
     storage_root: Path | str, *, source_identity: Mapping[str, object],
     stable_binding: Mapping[str, object],
@@ -8123,6 +8300,7 @@ def _dev_schema_authorizer(
     return sqlite3.SQLITE_OK
 
 
+@dashboard_read_timed("db.connect_existing")
 def _connect_existing(db_path: Path, *, timeout: float) -> sqlite3.Connection:
     absolute = db_path.absolute()
     before = absolute.stat(follow_symlinks=False)
@@ -8158,6 +8336,7 @@ def _connect_existing(db_path: Path, *, timeout: float) -> sqlite3.Connection:
     return conn
 
 
+@dashboard_read_timed("db.get_connection")
 def get_connection(project_id: str) -> sqlite3.Connection:
     """Get a SQLite connection for a project, creating/migrating schema if needed.
 
@@ -9122,6 +9301,7 @@ class DBContext:
         self.conn = get_connection(self.project_id)
         return self.conn
 
+    @dashboard_read_timed("db.db_context_exit")
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn:
             if exc_type is None:

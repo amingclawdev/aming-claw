@@ -224414,3 +224414,119 @@ def test_release_signoff_requires_same_project_operator_and_unchanged_queue(monk
         server.handle_project_release_operator_head_queue(ctx)
     with sqlite3.connect(fixture["stable_db"]) as conn:
         assert conn.execute("SELECT count(*) FROM release_operator_head_queue_events").fetchone()[0] == 1
+
+
+def test_dev_source_identity_batches_git_reads_and_keeps_final_dirty_guard(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "source"
+    (root / "agent/governance").mkdir(parents=True)
+    (root / "agent/cli.py").write_text("# fixture cli\n", encoding="utf-8")
+    (root / "agent/governance/server.py").write_text(
+        "# fixture server\n", encoding="utf-8"
+    )
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-q", "-b", "codex/ac-dev")
+    git("config", "user.email", "cache-fixture@example.invalid")
+    git("config", "user.name", "Cache Fixture")
+    git("add", "agent/cli.py", "agent/governance/server.py")
+    git("commit", "-qm", "seed")
+    expected_commit = git("rev-parse", "HEAD")
+    expected_tree = git("rev-parse", "HEAD^{tree}")
+
+    calls: list[tuple[tuple[str, ...], int]] = []
+    original = governance_db._git_read_exact
+
+    def counted(candidate: Path, *args: str, timeout: int = 10) -> bytes:
+        calls.append((args, timeout))
+        return original(candidate, *args, timeout=timeout)
+
+    monkeypatch.setattr(governance_db, "_git_read_exact", counted)
+    source = governance_db._current_first_start_source(root)
+    assert source["branch"] == "codex/ac-dev"
+    assert source["commit"] == expected_commit
+    assert source["tree"] == expected_tree
+    assert calls == [
+        (("rev-parse", "HEAD", "HEAD^{tree}"), 10),
+        (("status", "--porcelain=v2", "--branch", "--no-ahead-behind"), 10),
+    ]
+
+    (root / "untracked.txt").write_text("still dirty\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="first-start source binding"):
+        governance_db._current_first_start_source(root)
+    assert calls[-2:] == [
+        (("rev-parse", "HEAD", "HEAD^{tree}"), 10),
+        (("status", "--porcelain=v2", "--branch", "--no-ahead-behind"), 10),
+    ]
+
+    (root / "untracked.txt").unlink()
+    git("switch", "-q", "-c", "codex/cache-fixture-wrong")
+    with pytest.raises(ValueError, match="first-start source binding"):
+        governance_db._current_first_start_source(root)
+
+    git("switch", "-q", "codex/ac-dev")
+    git("checkout", "--detach", "-q")
+    with pytest.raises(ValueError, match="Git status identity"):
+        governance_db._current_first_start_source(root)
+
+
+@pytest.mark.parametrize(
+    "status_output",
+    [
+        b"# branch.head codex/ac-dev\n",
+        b"# branch.oid 0123456789abcdef0123456789abcdef01234567\n",
+        b"# branch.oid (initial)\n# branch.head codex/ac-dev\n",
+        (
+            b"# branch.oid 0123456789abcdef0123456789abcdef01234567\n"
+            b"# branch.head (detached)\n"
+        ),
+    ],
+)
+def test_git_status_snapshot_rejects_missing_or_nonbranch_identity(
+    monkeypatch, tmp_path, status_output
+):
+    monkeypatch.setattr(
+        governance_db,
+        "_git_read_exact",
+        lambda _root, *args, timeout=10: (
+            status_output
+            if args
+            == ("status", "--porcelain=v2", "--branch", "--no-ahead-behind")
+            else pytest.fail(f"unexpected Git call: {args}")
+        ),
+    )
+    with pytest.raises(ValueError, match="Git status identity"):
+        governance_db._git_worktree_status_snapshot(tmp_path)
+
+
+def test_verified_stable_binding_preserves_five_second_git_timeouts(
+    monkeypatch, tmp_path
+):
+    from agent.tests.test_governance_db import _install_fixed_stable_boundary
+
+    _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    calls: list[tuple[tuple[str, ...], int]] = []
+    original = governance_db._git_read_exact
+
+    def observed(root: Path, *args: str, timeout: int = 10) -> bytes:
+        calls.append((args, timeout))
+        return original(root, *args, timeout=timeout)
+
+    monkeypatch.setattr(governance_db, "_git_read_exact", observed)
+    binding = governance_db._verified_stable_binding()
+    assert Path(binding["shared_volume_path"]).is_dir()
+    assert calls == [
+        (("worktree", "list", "--porcelain"), 5),
+        (("rev-parse", "HEAD"), 5),
+        (("status", "--porcelain=v2", "--branch", "--no-ahead-behind"), 5),
+    ]

@@ -71,6 +71,11 @@ from .db import (
     BACKLOG_READ_SCHEMA_SEED_SQL as _BACKLOG_READ_SCHEMA_SEED_SQL,
     BACKLOG_READ_SCHEMA_TRIGGER_SQL as _BACKLOG_READ_SCHEMA_TRIGGER_SQL,
     _dev_runtime_root,
+    dashboard_read_timed,
+    dashboard_read_timed_call,
+    dashboard_read_timing_begin,
+    dashboard_read_timing_finish,
+    dashboard_read_timing_set_request_id,
 )
 from . import role_service
 from . import state_service
@@ -1118,7 +1123,11 @@ def _prewarm_reconcile_terminalization_schemas(
         }.issubset(timeline_columns)
     ):
         store.ensure_schema(conn)
-        task_timeline.ensure_schema(conn)
+        dashboard_read_timed_call(
+            "server.timeline_schema_verify",
+            task_timeline.ensure_schema,
+            conn,
+        )
         conn.commit()
     store.ensure_reconcile_metric_physical_identity_migration(conn)
 
@@ -3525,6 +3534,7 @@ def _ac_stable_promotion_signoff_body(body: Mapping[str, Any]) -> dict[str, Any]
     return reason
 
 
+@dashboard_read_timed("server.world_guard")
 def _guard_runtime_world_request(
     *,
     method: str,
@@ -5693,6 +5703,27 @@ def _handle_dev_external_read_only_discovery(
         ) from exc
 
 
+def _dashboard_read_profiled_request(function):
+    @wraps(function)
+    def wrapped(self, method: str):
+        active = bool(
+            str(getattr(self, "command", "")).upper() == "GET"
+            and dashboard_read_timing_begin(str(getattr(self, "path", "")))
+        )
+        try:
+            return function(self, method)
+        finally:
+            if active:
+                record = dashboard_read_timing_finish()
+                if record is not None:
+                    log.info(
+                        "dashboard_cached_read_attribution %s",
+                        json.dumps(record, sort_keys=True, separators=(",", ":")),
+                    )
+
+    return wrapped
+
+
 class GovernanceHandler(BaseHTTPRequestHandler):
     """HTTP request handler with routing and middleware."""
 
@@ -5752,6 +5783,7 @@ class GovernanceHandler(BaseHTTPRequestHandler):
         )
         return {key: item[0] if len(item) == 1 else item for key, item in values.items()}
 
+    @dashboard_read_timed("server.respond_json_headers_body")
     def _respond(self, code: int, body: dict, extra_headers: dict | None = None):
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         try:
@@ -5821,8 +5853,10 @@ class GovernanceHandler(BaseHTTPRequestHandler):
         )
         return True
 
+    @_dashboard_read_profiled_request
     def _handle(self, method: str):
         request_id = f"req-{uuid.uuid4().hex[:12]}"
+        dashboard_read_timing_set_request_id(request_id)
         handler, path_params, _ = self._find_handler(method)
         if not handler:
             if method == "GET" and self._serve_dashboard_static():
@@ -205773,6 +205807,7 @@ def _timeline_warm_cache_resource_generation(
     }
 
 
+@dashboard_read_timed("server.timeline_warm_cache_prepare")
 def _timeline_warm_cache_prepare(
     conn: sqlite3.Connection,
     *,
@@ -206804,6 +206839,7 @@ def _task_playback_compact_gate_response(
 
 @route("GET", "/api/task/{project_id}/timeline")
 @_timeline_warm_cache_endpoint
+@dashboard_read_timed("server.timeline_list_handler")
 def handle_task_timeline_list(ctx: RequestContext):
     """List append-only task implementation timeline events by query filters."""
     project_id = ctx.get_project_id()
@@ -206962,7 +206998,9 @@ def handle_task_timeline_list(ctx: RequestContext):
             (
                 playback_hot_events,
                 playback_hot_window_metrics,
-            ) = TIMELINE_READ_CACHE.load_playback(
+            ) = dashboard_read_timed_call(
+                "server.timeline_playback_cache",
+                TIMELINE_READ_CACHE.load_playback,
                 database_scope=str(cache_watermark.get("db_scope") or ""),
                 project_id=project_id,
                 backlog_id=backlog_id,
@@ -207481,6 +207519,7 @@ def _task_timeline_merge_current_stream_events(
 
 @route("GET", "/api/task/{project_id}/timeline/recent")
 @_timeline_warm_cache_endpoint
+@dashboard_read_timed("server.timeline_recent_handler")
 def handle_task_timeline_recent(ctx: RequestContext):
     """Project-wide recent timeline events, newest-first, cross-row.
 
@@ -207511,7 +207550,11 @@ def handle_task_timeline_recent(ctx: RequestContext):
     from . import task_timeline
 
     with DBContext(project_id) as conn:
-        task_timeline.ensure_schema(conn)
+        dashboard_read_timed_call(
+            "server.timeline_schema_verify",
+            task_timeline.ensure_schema,
+            conn,
+        )
 
         def load_current_rows() -> list[dict[str, Any]]:
             return [
@@ -207538,7 +207581,9 @@ def handle_task_timeline_recent(ctx: RequestContext):
             )
         )
         if cached_response is not None:
-            _, hot_window_metrics = TIMELINE_READ_CACHE.load_current(
+            _, hot_window_metrics = dashboard_read_timed_call(
+                "server.timeline_current_cache",
+                TIMELINE_READ_CACHE.load_current,
                 database_scope=str(cache_watermark.get("db_scope") or ""),
                 project_id=project_id,
                 authority_generation=int(
@@ -207548,7 +207593,9 @@ def handle_task_timeline_recent(ctx: RequestContext):
             )
             cached_response["current_hot_window"] = hot_window_metrics
             return cached_response
-        events, hot_window_metrics = TIMELINE_READ_CACHE.load_current(
+        events, hot_window_metrics = dashboard_read_timed_call(
+            "server.timeline_current_cache",
+            TIMELINE_READ_CACHE.load_current,
             database_scope=str(cache_watermark.get("db_scope") or ""),
             project_id=project_id,
             authority_generation=int(
@@ -217699,6 +217746,7 @@ def _ac_dev_backlog_read_schema_incompatible(
     )
 
 
+@dashboard_read_timed("server.backlog_schema_verify")
 def _ac_dev_verify_backlog_read_schema(conn: sqlite3.Connection) -> None:
     """Verify stable-owned backlog read objects without DDL, DML, or commit."""
 
@@ -217823,6 +217871,7 @@ def _ac_dev_verify_backlog_read_schema(conn: sqlite3.Connection) -> None:
         raise _ac_dev_backlog_read_schema_incompatible(problems)
 
 
+@dashboard_read_timed("server.backlog_read_authority")
 def _backlog_read_authority(
     conn: sqlite3.Connection,
     project_id: str,
@@ -217995,6 +218044,7 @@ def _backlog_read_cache_clear() -> None:
 
 
 @route("GET", "/api/backlog/{project_id}")
+@dashboard_read_timed("server.backlog_list_handler")
 def handle_backlog_list(ctx: RequestContext):
     """List backlog bugs.
 
@@ -218190,7 +218240,9 @@ def handle_backlog_list(ctx: RequestContext):
             result["source"] = "sqlite_legacy_full"
             return result
         if canonical_hot_window:
-            result, read_cache = BACKLOG_READ_CACHE.load_hot(
+            result, read_cache = dashboard_read_timed_call(
+                "server.backlog_hot_cache",
+                BACKLOG_READ_CACHE.load_hot,
                 project_id=pid,
                 authority_generation=authority_generation,
                 loader=load_page,
