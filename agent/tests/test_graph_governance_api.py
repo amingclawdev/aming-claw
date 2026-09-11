@@ -19098,454 +19098,159 @@ def test_stable_promotion_v2_durable_evidence_revalidates_exact_d_authorities(
 
 
 def test_stable_promotion_durable_precheck_rejects_forgery_and_signoff_replay(
-    conn, monkeypatch
+    monkeypatch,
+    tmp_path,
 ):
-    project_id = "aming-claw"
-    backlog_id = "AC-PROMOTION-DURABLE-TEST"
-    cex = "cex-promotion-durable-test"
-    stable = "c" * 40
-    candidate = "d" * 40
-    fence = ["agent/governance/server.py"]
-    diff_hash = "sha256:" + "1" * 64
-    verifier_hash = "sha256:" + "2" * 64
-    deploy = {"authorized": True, "mode": "host_supervisor", "stable_port": 40000}
-    database_identity = _promotion_database_identity()
-    previous_receipt = "sha256:" + "7" * 64
-    prior_cursor = conn.execute(
-        """INSERT INTO task_timeline_events(
-               project_id, backlog_id, task_id, event_type, phase, event_kind,
-               actor, status, payload_json, verification_json,
-               artifact_refs_json, commit_sha, created_at
-           ) VALUES (?, ?, ?, 'ac.stable_promotion_completed', 'release',
-                     'stable_promotion', 'operator', 'accepted', ?, '{}', '{}', ?, ?)""",
-        (
-            project_id,
-            "AC-PRIOR-PROMOTION",
-            "cex-prior-promotion",
-            json.dumps(
-                {
-                    "promoted_commit": stable,
-                    "promotion_receipt_hash": previous_receipt,
-                    "stable_database_identity": database_identity,
-                },
-                sort_keys=True,
-            ),
-            stable,
-            "2026-08-27T14:00:00Z",
-        ),
-    )
-    prior_event_id = int(prior_cursor.lastrowid)
-    intent = {
-        "schema_version": "ac_stable_promotion_manifest.v1",
-        "project_id": project_id,
-        "backlog_id": backlog_id,
-        "contract_execution_id": cex,
-        "stable_anchor_commit": stable,
-        "stable_branch": server.AC_STABLE_BRANCH,
-        "branch": server.AC_DEV_BRANCH,
-        "candidate_commit": candidate,
-        "file_fence": fence,
-        "diff_sha256": diff_hash,
-        "deploy": deploy,
-        "stable_database_identity": database_identity,
-    }
-    intent_hash = server.stable_sha256(intent)
-    authority = {
-        "schema_version": "source_backed_contract_gate_authority.v1",
-        "source": "server_qa_session_verification",
-        "source_of_authority": "qa_session_verification",
-        "authority_hash": "sha256:" + "3" * 64,
-        "qa_session_proof": {
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "task_id": cex,
-            "commit_sha": candidate,
-            "principal_id": "qa-principal-promotion",
-            "candidate_review_context": {
-                "candidate_commit_sha": candidate,
-                "comparison_base_commit_sha": stable,
-                "comparison_authority_required": True,
-                "candidate_diff_hash": diff_hash,
-                "changed_files": fence,
-            }
-        },
-    }
-    report_hash = "sha256:" + "4" * 64
-    qa_payload = {
-        "source_backed_contract_gate_authority": authority,
-        "contract_runtime_canonical_line": {
-            "stage_id": "qa",
-            "line_id": "qa_independent_verification",
-            "contract_execution_id": cex,
-            "runtime_guide_hash": "sha256:" + "5" * 64,
-        },
-        "stable_anchor_commit": stable,
-        "promotion_intent_sha256": intent_hash,
-        "file_fence": fence,
-        "stable_database_identity": database_identity,
-    }
-    qa_verification = {
-        "pass_synthesized": False,
-        "promotion_gate_results": {
-            "branch_service": {
-                "test_id": "branch-loopback",
-                "status": "passed",
-                "report_sha256": report_hash,
-                "runtime_plane": "dev",
-                "port": 40008,
-                "bind_host": "127.0.0.1",
-            },
-            "lanes": {
-                lane: {
-                    "test_id": f"lane-{lane}",
-                    "status": "passed",
-                    "report_sha256": report_hash,
-                }
-                for lane in ("direct_main", "mf_parallel", "mf_batch_parallel")
-            },
-        },
-    }
-    qa_cursor = conn.execute(
-        """INSERT INTO task_timeline_events(
-               project_id, backlog_id, task_id, event_type, phase, event_kind,
-               actor, status, payload_json, verification_json,
-               artifact_refs_json, commit_sha, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)""",
-        (
-            project_id,
-            backlog_id,
-            cex,
-            "qa.independent_verification",
-            "qa",
-            "independent_verification",
-            "qa-principal-promotion",
-            "passed",
-            json.dumps(qa_payload, sort_keys=True),
-            json.dumps(qa_verification, sort_keys=True),
-            candidate,
-            "2026-08-27T15:00:00Z",
-        ),
-    )
-    qa_event_id = int(qa_cursor.lastrowid)
-    qa_gate = {"timeline_event_id": qa_event_id, "status": "passed"}
-    expires = (datetime.now(timezone.utc) + timedelta(minutes=30)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-    operator_gate = {
-        "status": "approved",
-        "nonce": "6" * 32,
-        "operator_principal_id": "operator-principal-promotion",
-        "expires_at": expires,
-    }
-    prior = {
-        "kind": "timeline_receipt",
-        "timeline_event_id": prior_event_id,
-        "receipt_hash": previous_receipt,
-    }
-    signable_manifest = {
-        **intent,
-        "promotion_intent_sha256": intent_hash,
-        "prior_promotion": prior,
-        "gates": {
-            "qa_verdict": qa_gate,
-            "operator_signoff": operator_gate,
-        },
-    }
-    manifest_hash = server.stable_sha256(signable_manifest)
-    signoff = {
-        "schema_version": "ac_stable_promotion_operator_signoff.v1",
-        "nonce": operator_gate["nonce"],
-        "operator_principal_id": operator_gate["operator_principal_id"],
-        "expires_at": expires,
-        "project_id": project_id,
-        "backlog_id": backlog_id,
-        "contract_execution_id": cex,
-        "stable_anchor_commit": stable,
-        "candidate_commit": candidate,
-        "promotion_intent_sha256": intent_hash,
-        "promotion_manifest_sha256": manifest_hash,
-        "verifier_sha256": verifier_hash,
-        "diff_sha256": diff_hash,
-        "file_fence": fence,
-        "deploy": deploy,
-        "stable_database_identity": database_identity,
-    }
-    server._ensure_release_operator_head_queue_schema(conn)
-    signoff_cursor = conn.execute(
-        """INSERT INTO release_operator_head_queue_events(
-               project_id, action, backlog_id, actor, reason,
-               before_json, after_json, created_at
-           ) VALUES (?, 'reorder', '', ?, ?, ?, ?, ?)""",
-        (
-            project_id,
-            operator_gate["operator_principal_id"],
-            json.dumps(signoff, sort_keys=True, separators=(",", ":")),
-            json.dumps({"backlog_ids": [backlog_id]}, sort_keys=True),
-            json.dumps({"backlog_ids": [backlog_id]}, sort_keys=True),
-            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        ),
-    )
-    signoff_event_id = int(signoff_cursor.lastrowid)
-    operator_gate = {**operator_gate, "queue_event_id": signoff_event_id}
-    manifest = {
-        **intent,
-        "promotion_intent_sha256": intent_hash,
-        "promotion_manifest_sha256": manifest_hash,
-        "gates": {
-            "qa_verdict": qa_gate,
-            "operator_signoff": operator_gate,
-        },
-        "prior_promotion": prior,
-    }
-    conn.commit()
-    qa_event = next(
-        event
-        for event in task_timeline.list_events(
-            conn, project_id, backlog_id=backlog_id, task_id=cex
-        )
-        if event["id"] == qa_event_id
-    )
-    signoff_row = dict(
-        conn.execute(
-            "SELECT * FROM release_operator_head_queue_events WHERE id=?",
-            (signoff_event_id,),
-        ).fetchone()
-    )
-    signoff_hash = server.stable_sha256(
-        {
-            key: signoff_row.get(key)
-            for key in (
-                "id",
-                "project_id",
-                "action",
-                "backlog_id",
-                "actor",
-                "reason",
-                "before_json",
-                "after_json",
-                "created_at",
+    """Keep the original five refusals on the real current-instance consumer."""
+
+    def validate(fixture, manifest, precheck):
+        body = {
+            "promotion_manifest": manifest,
+            "precheck_receipt": precheck,
+            "precheck_receipt_hash": precheck["receipt_hash"],
+            "promotion_manifest_sha256": manifest[
+                "promotion_manifest_sha256"
+            ],
+        }
+        with sqlite3.connect(fixture["stable_db"]) as conn:
+            conn.row_factory = sqlite3.Row
+            server._validate_ac_stable_promotion_durable_evidence(
+                conn,
+                body=body,
+                project_id=manifest["project_id"],
+                backlog_id=manifest["backlog_id"],
+                contract_execution_id=manifest["contract_execution_id"],
+                candidate=manifest["candidate_commit"],
+                previous_stable=manifest["stable_anchor_commit"],
+                file_fence=manifest["file_fence"],
+                diff_sha256=manifest["diff_sha256"],
+                verifier_sha256=precheck["verifier_sha256"],
+                promotion_intent_sha256=manifest[
+                    "promotion_intent_sha256"
+                ],
+                deploy=manifest["deploy"],
+                stable_database_identity=manifest[
+                    "stable_database_identity"
+                ],
+                operator_approval_ref=precheck["operator_approval_ref"],
             )
-        }
-    )
-    precheck_core = {
-        "schema_version": "ac_stable_promotion_precheck_receipt.v1",
-        "verifier_version": "readonly_timeline_projector.v1",
-        "verifier_sha256": verifier_hash,
-        "promotion_intent_sha256": intent_hash,
-        "promotion_manifest_sha256": manifest_hash,
-        "stable_anchor_commit": stable,
-        "candidate_commit": candidate,
-        "diff_sha256": diff_hash,
-        "stable_database_identity": database_identity,
-        "previous_promotion_receipt_hash": previous_receipt,
-        "prior_promotion_event_id": prior_event_id,
-        "gate_event_ids": {
-            "qa_verdict": qa_event_id,
-            "operator_signoff": signoff_event_id,
-        },
-        "operator_approval_ref": (
-            f"release-operator-head-queue-event:{signoff_event_id}"
-        ),
-        "gate_evidence_hashes": {
-            "qa_verdict": server._ac_promotion_event_hash(qa_event),
-            "operator_signoff": signoff_hash,
-        },
-        "pass_synthesized": False,
-        "writes_performed": False,
-    }
-    precheck = {
-        **precheck_core,
-        "receipt_hash": server.stable_sha256(precheck_core),
-    }
-    request_body = {
-        "precheck_receipt": precheck,
-        "precheck_receipt_hash": precheck["receipt_hash"],
-        "promotion_manifest": manifest,
-        "promotion_manifest_sha256": manifest_hash,
-    }
-    monkeypatch.setattr(
-        task_timeline,
-        "_source_backed_qa_session_authority_valid",
-        lambda *_args, **_kwargs: True,
-    )
-    kwargs = {
-        "body": request_body,
-        "project_id": project_id,
-        "backlog_id": backlog_id,
-        "contract_execution_id": cex,
-        "candidate": candidate,
-        "previous_stable": stable,
-        "file_fence": fence,
-        "diff_sha256": diff_hash,
-        "verifier_sha256": verifier_hash,
-        "promotion_intent_sha256": intent_hash,
-        "deploy": deploy,
-        "stable_database_identity": database_identity,
-        "operator_approval_ref": precheck["operator_approval_ref"],
-    }
 
-    server._validate_ac_stable_promotion_durable_evidence(conn, **kwargs)
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path)
+    manifest = fixture["manifest"]
+    precheck = server._ac_main_binding_precheck(manifest)
+    validate(fixture, manifest, precheck)
 
-    copied_authority = conn.execute(
-        """INSERT INTO task_timeline_events(
-               project_id, backlog_id, task_id, event_type, phase, event_kind,
-               actor, status, payload_json, verification_json,
-               artifact_refs_json, commit_sha, created_at
-           ) VALUES (?, 'AC-OTHER', 'cex-other', 'observer.copied_qa',
-                     'observer', 'copied_qa', 'observer-principal', 'accepted',
-                     '{}', ?, '{}', ?, ?)""",
-        (
-            project_id,
-            json.dumps(
-                {"source_backed_contract_gate_authority": authority},
-                sort_keys=True,
+    # A copied authority in an unrelated event must make the otherwise valid
+    # current QA authority ambiguous without changing the canonical QA line.
+    with sqlite3.connect(fixture["dev_db"]) as conn:
+        cursor = conn.execute(
+            """INSERT INTO task_timeline_events(
+                   project_id, backlog_id, task_id, event_type, phase,
+                   event_kind, actor, status, payload_json,
+                   verification_json, artifact_refs_json, commit_sha,
+                   created_at
+               ) VALUES ('aming-claw', 'AC-OTHER', 'cex-other',
+                         'observer.copied_qa', 'observer', 'copied_qa',
+                         'observer-principal', 'accepted', '{}', ?, '{}', ?,
+                         ?)""",
+            (
+                json.dumps(
+                    {
+                        "source_backed_contract_gate_authority": fixture[
+                            "qa_authority"
+                        ]
+                    },
+                    sort_keys=True,
+                ),
+                fixture["candidate"],
+                "2026-09-11T00:00:00Z",
             ),
-            candidate,
-            "2026-08-27T15:01:00Z",
-        ),
-    )
-    conn.commit()
-    with pytest.raises(ValidationError, match="authority replay/ambiguity"):
-        server._validate_ac_stable_promotion_durable_evidence(conn, **kwargs)
-    conn.execute(
-        "DELETE FROM task_timeline_events WHERE id=?",
-        (int(copied_authority.lastrowid),),
-    )
-    conn.commit()
-
-    # A stable queue reorder authorized by an observer route ref records an
-    # actor ending in :route_ref.  Even if every claimed manifest/signoff field
-    # is rebuilt consistently around that actor, it is not operator approval.
-    route_principal = "observer:route_ref"
-    route_operator_base = {
-        **{
-            key: operator_gate[key]
-            for key in ("status", "nonce", "expires_at")
-        },
-        "operator_principal_id": route_principal,
-    }
-    route_manifest_hash = server.stable_sha256(
-        {
-            **intent,
-            "promotion_intent_sha256": intent_hash,
-            "prior_promotion": prior,
-            "gates": {
-                "qa_verdict": qa_gate,
-                "operator_signoff": route_operator_base,
-            },
-        }
-    )
-    route_signoff = {
-        **signoff,
-        "operator_principal_id": route_principal,
-        "promotion_manifest_sha256": route_manifest_hash,
-    }
-    route_reason = json.dumps(
-        route_signoff, sort_keys=True, separators=(",", ":")
-    )
-    conn.execute(
-        "UPDATE release_operator_head_queue_events SET actor=?, reason=? WHERE id=?",
-        (route_principal, route_reason, signoff_event_id),
-    )
-    conn.commit()
-    route_signoff_row = dict(
+        )
+        conn.commit()
+    before = _main_binding_release_durable_state(fixture)
+    with pytest.raises(
+        server.ValidationError,
+        match="durable QA authority replay/ambiguity detected",
+    ):
+        validate(fixture, manifest, precheck)
+    assert _main_binding_release_durable_state(fixture) == before
+    with sqlite3.connect(fixture["dev_db"]) as conn:
         conn.execute(
-            "SELECT * FROM release_operator_head_queue_events WHERE id=?",
-            (signoff_event_id,),
-        ).fetchone()
-    )
-    route_signoff_hash = server.stable_sha256(
-        {
-            key: route_signoff_row.get(key)
-            for key in (
-                "id",
-                "project_id",
-                "action",
-                "backlog_id",
-                "actor",
-                "reason",
-                "before_json",
-                "after_json",
-                "created_at",
-            )
-        }
-    )
-    route_manifest = {
-        **manifest,
-        "promotion_manifest_sha256": route_manifest_hash,
-        "gates": {
-            "qa_verdict": qa_gate,
-            "operator_signoff": {
-                **route_operator_base,
-                "queue_event_id": signoff_event_id,
-            },
-        },
-    }
-    route_precheck_core = {
-        **precheck_core,
-        "promotion_manifest_sha256": route_manifest_hash,
-        "gate_evidence_hashes": {
-            **precheck_core["gate_evidence_hashes"],
-            "operator_signoff": route_signoff_hash,
-        },
-    }
-    route_precheck = {
-        **route_precheck_core,
-        "receipt_hash": server.stable_sha256(route_precheck_core),
-    }
-    route_request = {
-        "precheck_receipt": route_precheck,
-        "precheck_receipt_hash": route_precheck["receipt_hash"],
-        "promotion_manifest": route_manifest,
-        "promotion_manifest_sha256": route_manifest_hash,
-    }
-    with pytest.raises(ValidationError, match="operator signoff identity"):
-        server._validate_ac_stable_promotion_durable_evidence(
-            conn,
-            **{
-                **kwargs,
-                "body": route_request,
-            },
+            "DELETE FROM task_timeline_events WHERE id=?",
+            (int(cursor.lastrowid),),
         )
-    conn.execute(
-        "UPDATE release_operator_head_queue_events SET actor=?, reason=? WHERE id=?",
-        (
-            operator_gate["operator_principal_id"],
-            signoff_row["reason"],
-            signoff_event_id,
-        ),
-    )
-    conn.commit()
+        conn.commit()
 
-    forged = copy.deepcopy(request_body)
-    forged["precheck_receipt_hash"] = "sha256:" + "0" * 64
-    with pytest.raises(ValidationError, match="precheck receipt digest"):
-        server._validate_ac_stable_promotion_durable_evidence(
-            conn, **{**kwargs, "body": forged}
+    # Rebuilding every caller-controlled field around a route-ref actor still
+    # cannot convert that actor into the real operator principal.
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path / "actor")
+    _main_binding_rebind_signoff(
+        fixture,
+        operator_principal_id="observer:route_ref",
+        actor="observer:route_ref",
+    )
+    before = _main_binding_release_durable_state(fixture)
+    with pytest.raises(
+        server.ValidationError,
+        match="durable operator signoff identity mismatch",
+    ):
+        server._ac_main_binding_precheck(fixture["manifest"])
+    assert _main_binding_release_durable_state(fixture) == before
+
+    # The real current-instance wrapper must retain its receipt digest guard.
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path / "digest")
+    precheck = server._ac_main_binding_precheck(fixture["manifest"])
+    forged = copy.deepcopy(precheck)
+    forged["receipt_hash"] = "sha256:" + "0" * 64
+    before = _main_binding_release_durable_state(fixture)
+    with pytest.raises(
+        server.ValidationError,
+        match="promotion precheck receipt digest/policy mismatch",
+    ):
+        validate(fixture, fixture["manifest"], forged)
+    assert _main_binding_release_durable_state(fixture) == before
+
+    # A real main-successor precursor still requires its physical predecessor.
+    fixture = _main_binding_release_fixture(
+        monkeypatch,
+        tmp_path / "predecessor",
+        main_preimage=True,
+    )
+    server._ac_main_binding_precheck(fixture["manifest"])
+    with sqlite3.connect(fixture["stable_db"]) as conn:
+        conn.execute(
+            "DELETE FROM task_timeline_events "
+            "WHERE event_type='ac.stable_promotion_completed'"
         )
+        conn.commit()
+    before = _main_binding_release_durable_state(fixture)
+    with pytest.raises(server.ValidationError, match="predecessor receipt"):
+        server._ac_main_binding_precheck(fixture["manifest"])
+    assert _main_binding_release_durable_state(fixture) == before
 
-    conn.execute("DELETE FROM task_timeline_events WHERE id=?", (prior_event_id,))
-    with pytest.raises(ValidationError, match="prior promotion receipt"):
-        server._validate_ac_stable_promotion_durable_evidence(conn, **kwargs)
-    conn.rollback()
-
-    conn.execute(
-        """INSERT INTO release_operator_head_queue_events(
-               project_id, action, backlog_id, actor, reason,
-               before_json, after_json, created_at
-           ) VALUES (?, 'reorder', '', ?, ?, ?, ?, ?)""",
-        (
-            project_id,
-            operator_gate["operator_principal_id"],
-            signoff_row["reason"],
-            signoff_row["before_json"],
-            signoff_row["after_json"],
-            signoff_row["created_at"],
-        ),
-    )
-    conn.commit()
-    with pytest.raises(ValidationError, match="nonce replay"):
-        server._validate_ac_stable_promotion_durable_evidence(conn, **kwargs)
+    # Replaying the normally produced nonce remains a consumer rejection.
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path / "nonce")
+    with sqlite3.connect(fixture["stable_db"]) as conn:
+        conn.row_factory = sqlite3.Row
+        row = dict(
+            conn.execute(
+                "SELECT * FROM release_operator_head_queue_events"
+            ).fetchone()
+        )
+        row.pop("id")
+        conn.execute(
+            f"INSERT INTO release_operator_head_queue_events({','.join(row)}) "
+            f"VALUES ({','.join('?' for _ in row)})",
+            tuple(row.values()),
+        )
+        conn.commit()
+    before = _main_binding_release_durable_state(fixture)
+    with pytest.raises(
+        server.ValidationError,
+        match="durable operator signoff nonce replay detected",
+    ):
+        server._ac_main_binding_precheck(fixture["manifest"])
+    assert _main_binding_release_durable_state(fixture) == before
 
 
 def test_stable_promotion_concurrent_first_completion_appends_one_receipt(
@@ -223748,7 +223453,13 @@ def test_main_release_normal_implementation_denials_are_durable_zero_write(monke
     record_property("rejection_reason", str(rejected.value))
 
 
-def _main_binding_release_fixture(monkeypatch, tmp_path, *, main_preimage=False):
+def _main_binding_release_fixture(
+    monkeypatch,
+    tmp_path,
+    *,
+    main_preimage=False,
+    create_operator_signoff=True,
+):
     """File SQLite/Git, real Rule/route/QA validators; seeded accepted prefix, not live admission."""
     from agent.tests.test_governance_db import _install_fixed_stable_boundary, _main_transition_fixture
     _install_fixed_stable_boundary(monkeypatch, tmp_path)
@@ -223881,23 +223592,563 @@ def _main_binding_release_fixture(monkeypatch, tmp_path, *, main_preimage=False)
         server._ensure_release_operator_head_queue_schema(stable_conn)
         operator_session = server.role_service.register(stable_conn, operator["operator_principal_id"], "aming-claw", "coordinator")
     signoff_body = {"action": "reorder", "backlog_ids": [], "reason": json.dumps(reason, sort_keys=True, separators=(",", ":"))}
-    with monkeypatch.context() as boundary:
-        boundary.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
-        boundary.setenv("AMING_CLAW_HOME", str(stable))
-        boundary.setenv("SHARED_VOLUME_PATH", str(stable / "shared-volume"))
-        boundary.setattr(server, "__file__", str(stable / "agent/governance/server.py"))
-        ctx = server.RequestContext(None, "POST", {"project_id": "aming-claw"}, {}, signoff_body, "fixture-signoff", operator_session["token"], "")
-        server._guard_runtime_world_request(method="POST", path="/api/projects/aming-claw/release-operator-head-queue",
-            path_params=ctx.path_params, body=signoff_body, query={}, token=ctx.token)
-        signed = server.handle_project_release_operator_head_queue(ctx)
-    assert isinstance(signed, dict) and signed.get("ok") is True, signed
-    assert signed["authorization"]["mode"] == "graph_governance_operator_session"
-    operator["queue_event_id"] = signed["event_id"]
+    if create_operator_signoff:
+        with monkeypatch.context() as boundary:
+            boundary.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+            boundary.setenv("AMING_CLAW_HOME", str(stable))
+            boundary.setenv("SHARED_VOLUME_PATH", str(stable / "shared-volume"))
+            boundary.setattr(server, "__file__", str(stable / "agent/governance/server.py"))
+            ctx = server.RequestContext(None, "POST", {"project_id": "aming-claw"}, {}, signoff_body, "fixture-signoff", operator_session["token"], "")
+            server._guard_runtime_world_request(method="POST", path="/api/projects/aming-claw/release-operator-head-queue",
+                path_params=ctx.path_params, body=signoff_body, query={}, token=ctx.token)
+            signed = server.handle_project_release_operator_head_queue(ctx)
+        assert isinstance(signed, dict) and signed.get("ok") is True, signed
+        assert signed["authorization"]["mode"] == "graph_governance_operator_session"
+        operator["queue_event_id"] = signed["event_id"]
     return {"db": db, "stable": stable, "dev": dev, "record": record, "health": health, "save": save, "git": git,
             "candidate": candidate, "instance": release, "manifest": manifest, "stable_db": stable_db,
             "old_process": old_process, "old_launch": old_launch, "implementation_id": implementation_id,
             "dev_db": dev_db, "qa_id": qa_id, "qa_authority": qa_authority,
-            "operator_token": operator_session["token"], "signoff_body": signoff_body}
+            "operator_token": operator_session["token"], "operator": operator,
+            "signoff_body": signoff_body}
+
+
+def _main_binding_release_durable_state(fixture):
+    state = {}
+    for label in ("stable_db", "dev_db"):
+        with sqlite3.connect(f"file:{fixture[label]}?mode=ro", uri=True) as conn:
+            state[label] = tuple(conn.iterdump())
+    return state
+
+
+def _main_binding_rebind_signoff(
+    fixture,
+    *,
+    operator_principal_id=None,
+    actor=None,
+    expires_at=None,
+    manifest_nonce=None,
+    stored_nonce=None,
+    created_at=None,
+):
+    manifest = fixture["manifest"]
+    operator_gate = manifest["gates"]["operator_signoff"]
+    if operator_principal_id is not None:
+        operator_gate["operator_principal_id"] = operator_principal_id
+    if expires_at is not None:
+        operator_gate["expires_at"] = expires_at
+    if manifest_nonce is not None:
+        operator_gate["nonce"] = manifest_nonce
+    intent_keys = (
+        "schema_version",
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "stable_anchor_commit",
+        "stable_branch",
+        "branch",
+        "candidate_commit",
+        "file_fence",
+        "diff_sha256",
+        "deploy",
+        "stable_database_identity",
+    )
+    signable = {
+        **{key: manifest[key] for key in intent_keys},
+        "promotion_intent_sha256": manifest["promotion_intent_sha256"],
+        "prior_promotion": manifest["prior_promotion"],
+        "gates": {
+            "qa_verdict": dict(manifest["gates"]["qa_verdict"]),
+            "operator_signoff": {
+                key: operator_gate[key]
+                for key in (
+                    "status",
+                    "nonce",
+                    "operator_principal_id",
+                    "expires_at",
+                )
+            },
+        },
+    }
+    manifest_hash = server.stable_sha256(signable)
+    manifest["promotion_manifest_sha256"] = manifest_hash
+    with sqlite3.connect(fixture["stable_db"]) as conn:
+        conn.row_factory = sqlite3.Row
+        row = dict(
+            conn.execute(
+                "SELECT * FROM release_operator_head_queue_events WHERE id=?",
+                (operator_gate["queue_event_id"],),
+            ).fetchone()
+        )
+        reason = json.loads(row["reason"])
+        reason["operator_principal_id"] = operator_gate[
+            "operator_principal_id"
+        ]
+        reason["expires_at"] = operator_gate["expires_at"]
+        reason["nonce"] = (
+            stored_nonce if stored_nonce is not None else operator_gate["nonce"]
+        )
+        reason["promotion_manifest_sha256"] = manifest_hash
+        conn.execute(
+            """UPDATE release_operator_head_queue_events
+               SET actor=?, reason=?, created_at=? WHERE id=?""",
+            (
+                actor if actor is not None else row["actor"],
+                json.dumps(reason, sort_keys=True, separators=(",", ":")),
+                created_at if created_at is not None else row["created_at"],
+                operator_gate["queue_event_id"],
+            ),
+        )
+        conn.commit()
+
+
+def _stable_release_signoff_http(body, token):
+    """Run the production dispatcher over a real loopback HTTP socket."""
+    from http.server import HTTPServer
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    with HTTPServer(("127.0.0.1", 0), server.GovernanceHandler) as httpd:
+        httpd.timeout = 20
+
+        def client():
+            request = Request(
+                (
+                    f"http://127.0.0.1:{httpd.server_port}"
+                    "/api/projects/aming-claw/release-operator-head-queue"
+                ),
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Gov-Token": token,
+                },
+                method="POST",
+            )
+            try:
+                response = urlopen(request, timeout=20)
+            except HTTPError as exc:
+                response = exc
+            with response:
+                return response.status, json.loads(response.read())
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(client)
+            httpd.handle_request()
+            return future.result(timeout=20)
+
+
+def _stable_release_seed_queue(stable_db, queue_ids):
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    with sqlite3.connect(stable_db) as conn:
+        server._ensure_release_operator_head_queue_schema(conn)
+        for position, backlog_id in enumerate(queue_ids, start=1):
+            conn.execute(
+                """INSERT INTO release_operator_head_queue(
+                       project_id, backlog_id, position, inserted_at, updated_at
+                   ) VALUES ('aming-claw', ?, ?, ?, ?)""",
+                (backlog_id, position, now, now),
+            )
+        conn.commit()
+
+
+def _stable_release_signoff_state(stable_db):
+    with sqlite3.connect(f"file:{stable_db}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        queue = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT project_id, backlog_id, position, pinned,
+                          skip_count, last_skip_reason, last_skipped_at,
+                          inserted_at, updated_at
+                   FROM release_operator_head_queue
+                   ORDER BY position, backlog_id"""
+            )
+        ]
+        events = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM release_operator_head_queue_events ORDER BY id"
+            )
+        ]
+        sessions = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM sessions ORDER BY session_id"
+            )
+        ]
+    return {"queue": queue, "events": events, "sessions": sessions}
+
+
+def _stable_release_test_world(monkeypatch, fixture, *, plane="stable"):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", plane)
+    monkeypatch.setenv("AMING_CLAW_HOME", str(fixture["stable"]))
+    monkeypatch.setenv(
+        "SHARED_VOLUME_PATH",
+        str(fixture["stable"] / "shared-volume"),
+    )
+    monkeypatch.setattr(
+        server,
+        "__file__",
+        str(fixture["stable"] / "agent/governance/server.py"),
+    )
+
+
+def test_release_signoff_real_http_dispatch_preserves_queue_and_reaches_consumer(
+    monkeypatch,
+    tmp_path,
+    record_property,
+):
+    fixture = _main_binding_release_fixture(
+        monkeypatch,
+        tmp_path,
+        create_operator_signoff=False,
+    )
+    queue_ids = ["AC-RELEASE-FIRST", "AC-RELEASE-SECOND"]
+    _stable_release_seed_queue(fixture["stable_db"], queue_ids)
+    fixture["signoff_body"]["backlog_ids"] = list(queue_ids)
+    before = _stable_release_signoff_state(fixture["stable_db"])
+    _stable_release_test_world(monkeypatch, fixture)
+    status, response = _stable_release_signoff_http(
+        fixture["signoff_body"],
+        fixture["operator_token"],
+    )
+    assert status == 200, response
+    assert response["ok"] is True
+    assert response["authorization"]["mode"] == (
+        "graph_governance_operator_session"
+    )
+    assert [
+        item["backlog_id"]
+        for item in response["release_operator_head_queue"]["items"]
+    ] == queue_ids
+
+    after = _stable_release_signoff_state(fixture["stable_db"])
+    assert [item["backlog_id"] for item in after["queue"]] == queue_ids
+    assert [item["position"] for item in after["queue"]] == [1, 2]
+    assert after["sessions"] == before["sessions"]
+    assert after["events"][:-1] == before["events"]
+    assert len(after["events"]) == len(before["events"]) + 1
+    signoff_row = after["events"][-1]
+    assert signoff_row["id"] == response["event_id"]
+    assert signoff_row["actor"] == fixture["operator"]["operator_principal_id"]
+    assert json.loads(signoff_row["before_json"]) == {"backlog_ids": queue_ids}
+    assert json.loads(signoff_row["after_json"]) == {"backlog_ids": queue_ids}
+    signoff = json.loads(signoff_row["reason"])
+    physical = governance_db.verified_stable_database_binding()
+    assert signoff["stable_database_identity"] == physical[
+        "stable_database_identity"
+    ]
+    assert signoff["stable_anchor_commit"] == physical["stable_head"]
+
+    fixture["operator"]["queue_event_id"] = response["event_id"]
+    before_consumer = _stable_release_signoff_state(fixture["stable_db"])
+    precheck = server._ac_main_binding_precheck(fixture["manifest"])
+    assert precheck["operator_approval_ref"] == (
+        f"release-operator-head-queue-event:{response['event_id']}"
+    )
+    assert _stable_release_signoff_state(fixture["stable_db"]) == before_consumer
+    record_property(
+        "stable_release_entry_control",
+        json.dumps(
+            {
+                "http_status": status,
+                "loopback_dispatcher": True,
+                "temporary_file_sqlite": True,
+                "operator_principal_id": signoff_row["actor"],
+                "queue_before": queue_ids,
+                "queue_after": queue_ids,
+                "queue_event_id": response["event_id"],
+                "stable_database_identity": signoff["stable_database_identity"],
+                "consumer_accepted": True,
+                "consumer_zero_write": True,
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+def test_release_signoff_real_http_rejections_preserve_durable_state(
+    monkeypatch,
+    tmp_path,
+    record_property,
+):
+    fixture = _main_binding_release_fixture(
+        monkeypatch,
+        tmp_path,
+        create_operator_signoff=False,
+    )
+    queue_ids = ["AC-RELEASE-FIRST", "AC-RELEASE-SECOND"]
+    _stable_release_seed_queue(fixture["stable_db"], queue_ids)
+    fixture["signoff_body"]["backlog_ids"] = list(queue_ids)
+    with sqlite3.connect(fixture["stable_db"]) as conn:
+        conn.row_factory = sqlite3.Row
+        extra_tokens = {
+            "wrong_role": server.role_service.register(
+                conn,
+                "qa-not-operator",
+                "aming-claw",
+                "qa",
+            )["token"],
+            "wrong_principal": server.role_service.register(
+                conn,
+                "different-operator",
+                "aming-claw",
+                "coordinator",
+            )["token"],
+            "foreign_project": server.role_service.register(
+                conn,
+                "operator-current-main",
+                "external-project",
+                "coordinator",
+            )["token"],
+        }
+        conn.commit()
+
+    cases = []
+    cases.append(
+        (
+            "anonymous",
+            fixture["signoff_body"],
+            "",
+            "stable",
+            400,
+            "ac_stable_project_domain_rejected",
+        )
+    )
+    cases.append(
+        (
+            "fake_token",
+            fixture["signoff_body"],
+            "gov-not-a-real-session",
+            "stable",
+            401,
+            "token_invalid",
+        )
+    )
+    cases.append(
+        (
+            "wrong_role",
+            fixture["signoff_body"],
+            extra_tokens["wrong_role"],
+            "stable",
+            403,
+            "permission_denied",
+        )
+    )
+    cases.append(
+        (
+            "wrong_principal",
+            fixture["signoff_body"],
+            extra_tokens["wrong_principal"],
+            "stable",
+            403,
+            "permission_denied",
+        )
+    )
+    cases.append(
+        (
+            "foreign_project",
+            fixture["signoff_body"],
+            extra_tokens["foreign_project"],
+            "stable",
+            403,
+            "permission_denied",
+        )
+    )
+    wrong_database = copy.deepcopy(fixture["signoff_body"])
+    wrong_database_reason = json.loads(wrong_database["reason"])
+    wrong_database_reason["stable_database_identity"]["inode"] += 1
+    wrong_database["reason"] = json.dumps(
+        wrong_database_reason,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cases.append(
+        (
+            "wrong_database",
+            wrong_database,
+            fixture["operator_token"],
+            "stable",
+            400,
+            "stable preimage differs",
+        )
+    )
+    changed_order = copy.deepcopy(fixture["signoff_body"])
+    changed_order["backlog_ids"] = list(reversed(queue_ids))
+    cases.append(
+        (
+            "changed_queue_order",
+            changed_order,
+            fixture["operator_token"],
+            "stable",
+            400,
+            "preserve the exact release queue order",
+        )
+    )
+    wrong_project = copy.deepcopy(fixture["signoff_body"])
+    wrong_project["project_id"] = "external-project"
+    cases.append(
+        (
+            "wrong_project_claim",
+            wrong_project,
+            fixture["operator_token"],
+            "stable",
+            400,
+            "ac_stable_project_domain_rejected",
+        )
+    )
+    fake_route = copy.deepcopy(fixture["signoff_body"])
+    fake_route["route_token_ref"] = "rtok-caller-string"
+    cases.append(
+        (
+            "fake_route_ref",
+            fake_route,
+            fixture["operator_token"],
+            "stable",
+            400,
+            "ac_stable_project_domain_rejected",
+        )
+    )
+    cases.append(
+        (
+            "wrong_world",
+            fixture["signoff_body"],
+            fixture["operator_token"],
+            "dev",
+            409,
+            "release_operator_head_queue_not_available_in_dev_world",
+        )
+    )
+
+    observed = {}
+    for label, body, token, plane, expected_status, expected_reason in cases:
+        before = _stable_release_signoff_state(fixture["stable_db"])
+        with monkeypatch.context() as boundary:
+            _stable_release_test_world(boundary, fixture, plane=plane)
+            status, response = _stable_release_signoff_http(body, token)
+        assert status == expected_status, (label, response)
+        response_text = json.dumps(response, sort_keys=True)
+        assert expected_reason in response_text, (label, response)
+        assert _stable_release_signoff_state(fixture["stable_db"]) == before
+        observed[label] = {
+            "status": status,
+            "reason": expected_reason,
+            "durable_state_unchanged": True,
+        }
+
+    record_property(
+        "stable_release_entry_http_rejections",
+        json.dumps(observed, sort_keys=True),
+    )
+
+
+def test_release_control_world_guard_preserves_ordinary_owner_worlds(
+    monkeypatch,
+):
+    ordinary = {
+        "method": "POST",
+        "path": "/api/task/aming-claw/timeline",
+        "path_params": {"project_id": "aming-claw"},
+        "body": {"project_id": "aming-claw"},
+        "query": {},
+        "token": "present-for-handler-authentication",
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    assert server._guard_runtime_world_request(**ordinary) is None
+
+    external = {
+        **ordinary,
+        "path": "/api/task/external-project/timeline",
+        "path_params": {"project_id": "external-project"},
+        "body": {"project_id": "external-project"},
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    assert server._guard_runtime_world_request(**external) is None
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    with pytest.raises(server.ValidationError) as rejected:
+        server._guard_runtime_world_request(**external)
+    assert rejected.value.message == "ac_dev_project_domain_rejected"
+    assert rejected.value.details["project_domain_enforced_pre_database"] is True
+    assert rejected.value.details["writes_performed"] is False
+
+
+@pytest.mark.parametrize(
+    "defect,reason",
+    [
+        ("time_order", "durable operator signoff is expired"),
+        ("genuinely_expired", "durable operator signoff is expired"),
+        ("wrong_nonce", "durable operator signoff identity mismatch"),
+        ("nonce_replay", "durable operator signoff nonce replay detected"),
+        ("manifest", "promotion manifest digest mismatch"),
+    ],
+)
+def test_release_signoff_consumer_rejects_freshness_nonce_and_manifest_drift(
+    monkeypatch,
+    tmp_path,
+    defect,
+    reason,
+):
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path)
+    if defect == "time_order":
+        with sqlite3.connect(fixture["stable_db"]) as conn:
+            conn.execute(
+                "UPDATE release_operator_head_queue_events SET created_at=?",
+                ("2999-01-01T00:00:00+00:00",),
+            )
+            conn.commit()
+    elif defect == "genuinely_expired":
+        current = datetime.now(timezone.utc).replace(microsecond=0)
+        created_at = current - timedelta(minutes=30)
+        expires_at = current - timedelta(minutes=1)
+        _main_binding_rebind_signoff(
+            fixture,
+            expires_at=expires_at.isoformat(),
+            created_at=created_at.isoformat(),
+        )
+        assert created_at < expires_at <= datetime.now(timezone.utc)
+        assert expires_at - created_at <= timedelta(hours=1)
+    elif defect == "wrong_nonce":
+        original_nonce = fixture["manifest"]["gates"]["operator_signoff"][
+            "nonce"
+        ]
+        _main_binding_rebind_signoff(
+            fixture,
+            manifest_nonce="c" * 32,
+            stored_nonce=original_nonce,
+        )
+        assert re.fullmatch(r"[0-9a-f]{32}", original_nonce)
+        assert re.fullmatch(
+            r"[0-9a-f]{32}",
+            fixture["manifest"]["gates"]["operator_signoff"]["nonce"],
+        )
+        assert original_nonce != fixture["manifest"]["gates"][
+            "operator_signoff"
+        ]["nonce"]
+    elif defect == "nonce_replay":
+        with sqlite3.connect(fixture["stable_db"]) as conn:
+            conn.row_factory = sqlite3.Row
+            row = dict(
+                conn.execute(
+                    "SELECT * FROM release_operator_head_queue_events"
+                ).fetchone()
+            )
+            row.pop("id")
+            conn.execute(
+                f"INSERT INTO release_operator_head_queue_events({','.join(row)}) "
+                f"VALUES ({','.join('?' for _ in row)})",
+                tuple(row.values()),
+            )
+            conn.commit()
+    else:
+        fixture["manifest"]["promotion_manifest_sha256"] = (
+            "sha256:" + "0" * 64
+        )
+
+    before = _stable_release_signoff_state(fixture["stable_db"])
+    with pytest.raises(server.ValidationError, match=reason):
+        server._ac_main_binding_precheck(fixture["manifest"])
+    assert _stable_release_signoff_state(fixture["stable_db"]) == before
 
 
 def test_main_binding_producer_precheck_and_durable_consumer_use_current_instance(monkeypatch, tmp_path):
