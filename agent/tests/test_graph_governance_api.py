@@ -224744,3 +224744,737 @@ def test_verified_stable_binding_preserves_five_second_git_timeouts(
         (("rev-parse", "HEAD"), 5),
         (("status", "--porcelain=v2", "--branch", "--no-ahead-behind"), 5),
     ]
+
+
+@pytest.fixture()
+def physical_successor_history_read_world(tmp_path, monkeypatch):
+    """Build the production successor chain and a valid live-basic reader."""
+
+    from agent.tests.test_governance_db import (
+        _real_cow_successor_cli_fixture,
+        _write_historical_v1_from_v2,
+    )
+
+    root, database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch,
+    )
+    created = governance_db.create_dev_cow_successor_receipt(
+        root,
+        operator_receipt=operator,
+        predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    _write_historical_v1_from_v2(created["receipt"])
+
+    stable_volume = tmp_path / "stable-volume"
+    stable_volume.mkdir()
+    stable_database = stable_volume / "governance.db"
+    stable_database.write_bytes(b"stable-fixture")
+    stable_stat = stable_database.stat(follow_symlinks=False)
+    stable_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(stable_stat.st_dev),
+        "inode": int(stable_stat.st_ino),
+        "stable_relative_path_sha256": "sha256:" + hashlib.sha256(
+            governance_db.AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
+    binding = {
+        "shared_volume_path": str(stable_volume),
+        "database_path": str(stable_database),
+        "stable_head": "a" * 40,
+        "stable_database_identity": stable_identity,
+        "process_identity": {
+            "pid": os.getpid(),
+            "birth": "fixture-birth",
+            "command": "python -m agent.governance.server",
+            "cwd": str(tmp_path),
+        },
+        "health": {
+            "status": "ok",
+            "service": "governance",
+            "port": 40000,
+            "runtime_plane": "stable",
+            "runtime_stale": False,
+            "runtime_loaded_version": "a" * 40,
+            "pid": os.getpid(),
+            "observed_at": "fixture-observation-one",
+            "elapsed_ms": 999,
+        },
+    }
+    binding_calls = []
+
+    def verified_binding():
+        binding_calls.append("verified")
+        return copy.deepcopy(binding)
+
+    monkeypatch.setattr(
+        governance_db, "verified_stable_database_binding", verified_binding,
+    )
+    monkeypatch.setattr(
+        "agent.runtime_plane.resolve_ac_dev_storage_root", lambda _stable: root,
+    )
+    monkeypatch.setenv(governance_db.AC_DEV_STORAGE_ROOT_ENV, str(root))
+    monkeypatch.setenv(
+        governance_db.AC_STABLE_SHARED_VOLUME_ENV, str(stable_volume),
+    )
+    monkeypatch.setenv(
+        governance_db.RUNTIME_PLANE_ENV, governance_db.DEV_RUNTIME_PLANE,
+    )
+    server_sha = "sha256:" + hashlib.sha256(
+        Path(governance_db.__file__).with_name("server.py").read_bytes()
+    ).hexdigest()
+    monkeypatch.setattr(
+        governance_db,
+        "_current_first_start_source",
+        lambda loaded_root: {
+            "root": str(loaded_root),
+            "branch": "codex/ac-dev",
+            "commit": "b" * 40,
+            "tree": "c" * 40,
+            "cli_sha256": "sha256:" + "d" * 64,
+            "server_sha256": server_sha,
+        },
+    )
+    governance_db.write_dev_launch_receipt(
+        root,
+        stable_shared_volume=stable_volume,
+        source_sha256=server_sha,
+        port=40008,
+    )
+    governance_db.acquire_dev_runtime_writer_lease(root)
+    governance_db._bind_dev_writer_lease_database_identity(database)
+    governance_db._dev_cow_successor_history_cache_clear()
+    binding_calls.clear()
+    try:
+        yield {
+            "root": root,
+            "database": database,
+            "receipt": Path(created["receipt"]),
+            "binding": binding,
+            "binding_calls": binding_calls,
+        }
+    finally:
+        governance_db.release_dev_runtime_writer_lease(root)
+        governance_db._dev_cow_successor_history_cache_clear()
+
+
+def test_dev_successor_history_cache_reuses_physical_reconstruction_and_live_custody(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    original_reconstruct = governance_db._reconstruct_dev_cow_successor_payload
+    original_live = governance_db._validate_dev_basic_runtime_custody
+    reconstruct_calls = []
+    live_calls = []
+
+    def reconstruct(*args, **kwargs):
+        reconstruct_calls.append(str(args[0]))
+        return original_reconstruct(*args, **kwargs)
+
+    def live(*args, **kwargs):
+        live_calls.append(str(args[0]))
+        return original_live(*args, **kwargs)
+
+    monkeypatch.setattr(
+        governance_db, "_reconstruct_dev_cow_successor_payload", reconstruct,
+    )
+    monkeypatch.setattr(
+        governance_db, "_validate_dev_basic_runtime_custody", live,
+    )
+
+    records = []
+    for path in (
+        "/api/backlog/aming-claw?view=compact",
+        "/api/task/aming-claw/timeline/recent",
+    ):
+        assert governance_db.dashboard_read_timing_begin(path) is True
+        connection = governance_db.get_connection("aming-claw")
+        connection.close()
+        records.append(governance_db.dashboard_read_timing_finish())
+
+    assert reconstruct_calls == [str(world["root"])]
+    assert live_calls == [str(world["root"]), str(world["root"])]
+    assert world["binding_calls"] == ["verified", "verified"]
+    assert records[0]["stages"][
+        "db.dev_cow_successor_history_reconstruct"
+    ]["count"] == 1
+    assert records[0]["stages"][
+        "db.dev_cow_successor_history_validate"
+    ]["count"] == 1
+    assert records[0]["stages"][
+        "db.dev_cow_successor_history_cache_miss"
+    ]["count"] == 1
+    assert records[1]["stages"][
+        "db.dev_cow_successor_history_cache_hit"
+    ]["count"] == 1
+    assert "db.dev_cow_successor_history_reconstruct" not in records[1]["stages"]
+    assert "db.dev_cow_successor_history_validate" not in records[1]["stages"]
+    assert all(
+        record["stages"]["db.dev_basic_runtime_custody"]["count"] == 1
+        for record in records
+    )
+
+    binding = world["binding"]
+    first = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=binding,
+    )
+    first["successor"]["row_count"] = -1
+    second = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=binding,
+    )
+    assert second["successor"]["row_count"] == 3603
+    assert first is not second
+    assert reconstruct_calls == [str(world["root"])]
+
+
+def test_dev_successor_history_cache_stable_key_ignores_observations_without_new_equality(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    original_reconstruct = governance_db._reconstruct_dev_cow_successor_payload
+    reconstruct_calls = []
+
+    def reconstruct(*args, **kwargs):
+        reconstruct_calls.append(str(args[0]))
+        return original_reconstruct(*args, **kwargs)
+
+    monkeypatch.setattr(
+        governance_db, "_reconstruct_dev_cow_successor_payload", reconstruct,
+    )
+    first_binding = copy.deepcopy(world["binding"])
+    first = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=first_binding,
+    )
+    observed_later = copy.deepcopy(first_binding)
+    observed_later["health"]["observed_at"] = "fixture-observation-two"
+    observed_later["health"]["elapsed_ms"] = 1
+    second = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=observed_later,
+    )
+    assert first == second
+    assert first is not second
+    assert len(reconstruct_calls) == 1
+
+    changed_stable_identity = copy.deepcopy(observed_later)
+    changed_stable_identity["stable_head"] = "f" * 40
+    third = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=changed_stable_identity,
+    )
+    assert third == second
+    # The stable identity invalidates reuse, but the unchanged historical
+    # validator adds no historical runtime_commit == current HEAD condition.
+    assert len(reconstruct_calls) == 2
+
+
+def test_dev_successor_history_cache_invalidates_metadata_membership_and_live_inode(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    original_reconstruct = governance_db._reconstruct_dev_cow_successor_payload
+    original_validate = governance_db.validate_dev_cow_successor_receipt
+    reconstruct_calls = []
+    validate_calls = []
+
+    def reconstruct(*args, **kwargs):
+        reconstruct_calls.append(str(args[0]))
+        return original_reconstruct(*args, **kwargs)
+
+    def validate(*args, **kwargs):
+        validate_calls.append(str(args[0]))
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        governance_db, "_reconstruct_dev_cow_successor_payload", reconstruct,
+    )
+    monkeypatch.setattr(
+        governance_db, "validate_dev_cow_successor_receipt", validate,
+    )
+    binding = world["binding"]
+    first = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=binding,
+    )
+    files, memberships = (
+        governance_db._dev_cow_successor_history_dependency_closure(world["root"])
+    )
+    assert len(files) == 10
+    assert {pattern for _directory, pattern, _names in memberships} == {
+        f"{governance_db.AC_DEV_COW_SUCCESSOR_PREFIX}.*.json",
+        "successor.*.json",
+        "cow-import.*.json",
+        "manifest.*.json",
+    }
+    manifest = next(
+        path for path in files
+        if path.name.startswith("manifest.")
+        and "dashboard-backlog-snapshots" in str(path)
+    )
+    original_mode = governance_db.stat.S_IMODE(
+        manifest.stat(follow_symlinks=False).st_mode
+    )
+    manifest.chmod(0o440 if original_mode != 0o440 else 0o400)
+    try:
+        second = governance_db._cached_dev_cow_successor_receipt(
+            world["root"], stable_binding=binding,
+        )
+    finally:
+        manifest.chmod(original_mode)
+    assert second == first
+    assert len(reconstruct_calls) == 2
+
+    extra = manifest.with_name("manifest." + "0" * 64 + ".json")
+    extra.write_text("{}", encoding="utf-8")
+    try:
+        with pytest.raises(ValueError, match="manifest is ambiguous"):
+            governance_db._cached_dev_cow_successor_receipt(
+                world["root"], stable_binding=binding,
+            )
+    finally:
+        extra.unlink()
+    # Snapshot membership is consumed inside the physical reconstruction.
+    assert len(validate_calls) == 3
+    assert len(reconstruct_calls) == 3
+
+    extra_v2 = world["receipt"].with_name(
+        f"{governance_db.AC_DEV_COW_SUCCESSOR_PREFIX}." + "0" * 64 + ".json"
+    )
+    extra_v2.write_text("{}", encoding="utf-8")
+    assert governance_db.dashboard_read_timing_begin(
+        "/api/backlog/aming-claw?view=compact"
+    ) is True
+    try:
+        with pytest.raises(ValueError, match="receipt is missing or ambiguous"):
+            governance_db._cached_dev_cow_successor_receipt(
+                world["root"], stable_binding=binding,
+            )
+    finally:
+        rejection_record = governance_db.dashboard_read_timing_finish()
+        extra_v2.unlink()
+    # The v2 header rejects before physical reconstruction.  Request-local
+    # attribution must keep that validation call distinct from reconstruction.
+    assert len(validate_calls) == 4
+    assert len(reconstruct_calls) == 3
+    assert rejection_record["stages"][
+        "db.dev_cow_successor_history_validate"
+    ]["count"] == 1
+    assert "db.dev_cow_successor_history_reconstruct" not in rejection_record[
+        "stages"
+    ]
+
+    replacement = world["database"].with_name("replacement.sqlite")
+    governance_db.shutil.copy2(world["database"], replacement)
+    os.replace(replacement, world["database"])
+    with pytest.raises(RuntimeError, match="writer lease binding mismatch"):
+        governance_db.get_connection("aming-claw")
+    assert len(validate_calls) == 5
+    assert len(reconstruct_calls) == 4
+
+
+def test_dev_successor_history_cache_rechecks_parent_realpath_and_symlink_safety(
+    physical_successor_history_read_world,
+):
+    world = physical_successor_history_read_world
+    binding = world["binding"]
+    first = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=binding,
+    )
+    operator_dir = world["root"] / "archive" / "operator-exceptions"
+    moved = operator_dir.with_name("operator-exceptions-real")
+    operator_dir.rename(moved)
+    operator_dir.symlink_to(moved, target_is_directory=True)
+    try:
+        with pytest.raises(ValueError, match="evidence is not canonical"):
+            governance_db._cached_dev_cow_successor_receipt(
+                world["root"], stable_binding=binding,
+            )
+    finally:
+        operator_dir.unlink()
+        moved.rename(operator_dir)
+    recovered = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=binding,
+    )
+    assert recovered == first
+
+
+def test_dev_successor_history_cache_invalidates_every_physical_dependency_class(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    original_reconstruct = governance_db._reconstruct_dev_cow_successor_payload
+    reconstruct_calls = []
+
+    def reconstruct(*args, **kwargs):
+        reconstruct_calls.append(str(args[0]))
+        return original_reconstruct(*args, **kwargs)
+
+    monkeypatch.setattr(
+        governance_db, "_reconstruct_dev_cow_successor_payload", reconstruct,
+    )
+    binding = world["binding"]
+    expected = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=binding,
+    )
+    files, _memberships = (
+        governance_db._dev_cow_successor_history_dependency_closure(world["root"])
+    )
+    assert len(files) == 10
+    for path in files:
+        original_mode = governance_db.stat.S_IMODE(
+            path.stat(follow_symlinks=False).st_mode
+        )
+        changed_mode = original_mode ^ governance_db.stat.S_IWUSR
+        path.chmod(changed_mode)
+        try:
+            actual = governance_db._cached_dev_cow_successor_receipt(
+                world["root"], stable_binding=binding,
+            )
+        finally:
+            path.chmod(original_mode)
+        assert actual == expected
+    assert len(reconstruct_calls) == 1 + len(files)
+
+
+def test_dev_successor_history_cache_hit_preserves_live_failure_owners(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    original_reconstruct = governance_db._reconstruct_dev_cow_successor_payload
+    original_source = governance_db._current_first_start_source
+    original_binding = governance_db.verified_stable_database_binding
+    reconstruct_calls = []
+
+    def reconstruct(*args, **kwargs):
+        reconstruct_calls.append(str(args[0]))
+        return original_reconstruct(*args, **kwargs)
+
+    monkeypatch.setattr(
+        governance_db, "_reconstruct_dev_cow_successor_payload", reconstruct,
+    )
+    connection = governance_db.get_connection("aming-claw")
+    connection.close()
+    assert len(reconstruct_calls) == 1
+
+    launch = world["root"] / governance_db.AC_DEV_LAUNCH_RECEIPT_NAME
+    launch_raw = launch.read_bytes()
+    launch_value = json.loads(launch_raw)
+    launch_value["source_sha256"] = "sha256:" + "0" * 64
+    launch.write_text(
+        json.dumps(launch_value, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    try:
+        with pytest.raises(ValueError, match="launch receipt mismatch"):
+            governance_db.get_connection("aming-claw")
+    finally:
+        launch.write_bytes(launch_raw)
+    assert len(reconstruct_calls) == 1
+
+    monkeypatch.setattr(
+        governance_db,
+        "_current_first_start_source",
+        lambda _root: (_ for _ in ()).throw(
+            ValueError("fixture current source is dirty")
+        ),
+    )
+    with pytest.raises(ValueError, match="current source is dirty"):
+        governance_db.get_connection("aming-claw")
+    assert len(reconstruct_calls) == 1
+    monkeypatch.setattr(
+        governance_db, "_current_first_start_source", original_source,
+    )
+
+    database_key = str(world["database"].absolute())
+    with governance_db._DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = governance_db._DEV_DATABASE_WRITER_LEASES[database_key]
+        original_owner_pid = lease["owner_pid"]
+        lease["owner_pid"] = -1
+    try:
+        with pytest.raises(ValueError, match="writer custody mismatch"):
+            governance_db.get_connection("aming-claw")
+    finally:
+        with governance_db._DEV_DATABASE_WRITER_LEASES_LOCK:
+            lease["owner_pid"] = original_owner_pid
+    assert len(reconstruct_calls) == 1
+
+    monkeypatch.setattr(
+        governance_db,
+        "verified_stable_database_binding",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("fixture stable binding rejected")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="stable binding rejected"):
+        governance_db.get_connection("aming-claw")
+    assert len(reconstruct_calls) == 1
+    monkeypatch.setattr(
+        governance_db, "verified_stable_database_binding", original_binding,
+    )
+
+
+def test_dev_successor_history_cache_coalesces_physical_concurrent_cold_reads(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    from threading import Lock
+
+    world = physical_successor_history_read_world
+    governance_db._dev_cow_successor_history_cache_clear()
+    original_reconstruct = governance_db._reconstruct_dev_cow_successor_payload
+    original_live = governance_db._validate_dev_basic_runtime_custody
+    original_timing_count = governance_db._dev_cow_successor_history_timing_count
+    entered = Event()
+    joined = Event()
+    release = Event()
+    counter_lock = Lock()
+    reconstruct_count = 0
+    live_count = 0
+
+    def reconstruct(*args, **kwargs):
+        nonlocal reconstruct_count
+        with counter_lock:
+            reconstruct_count += 1
+        entered.set()
+        assert release.wait(timeout=10)
+        return original_reconstruct(*args, **kwargs)
+
+    def live(*args, **kwargs):
+        nonlocal live_count
+        with counter_lock:
+            live_count += 1
+        return original_live(*args, **kwargs)
+
+    def timing_count(stage):
+        original_timing_count(stage)
+        if stage == "db.dev_cow_successor_history_cache_join":
+            joined.set()
+
+    monkeypatch.setattr(
+        governance_db, "_reconstruct_dev_cow_successor_payload", reconstruct,
+    )
+    monkeypatch.setattr(
+        governance_db, "_validate_dev_basic_runtime_custody", live,
+    )
+    monkeypatch.setattr(
+        governance_db, "_dev_cow_successor_history_timing_count", timing_count,
+    )
+
+    def read(path):
+        assert governance_db.dashboard_read_timing_begin(path) is True
+        connection = governance_db.get_connection("aming-claw")
+        connection.close()
+        return governance_db.dashboard_read_timing_finish()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leader = pool.submit(read, "/api/backlog/aming-claw?view=compact")
+        assert entered.wait(timeout=10)
+        follower = pool.submit(read, "/api/task/aming-claw/timeline/recent")
+        assert joined.wait(timeout=10)
+        release.set()
+        leader_record = leader.result(timeout=30)
+        follower_record = follower.result(timeout=30)
+
+    assert reconstruct_count == 1
+    assert live_count == 2
+    assert world["binding_calls"] == ["verified", "verified"]
+    assert leader_record["stages"][
+        "db.dev_cow_successor_history_reconstruct"
+    ]["count"] == 1
+    assert leader_record["stages"][
+        "db.dev_cow_successor_history_validate"
+    ]["count"] == 1
+    assert follower_record["stages"][
+        "db.dev_cow_successor_history_cache_join"
+    ]["count"] == 1
+    assert follower_record["stages"][
+        "db.dev_cow_successor_history_cache_hit"
+    ]["count"] == 1
+    assert all(
+        record["stages"]["db.dev_basic_runtime_custody"]["count"] == 1
+        for record in (leader_record, follower_record)
+    )
+
+
+def test_dev_successor_history_cache_keeps_live_sqlite_state_out_of_history_key(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    original_reconstruct = governance_db._reconstruct_dev_cow_successor_payload
+    original_live = governance_db._validate_dev_basic_runtime_custody
+    reconstruct_calls = []
+    live_calls = []
+
+    def reconstruct(*args, **kwargs):
+        reconstruct_calls.append(str(args[0]))
+        return original_reconstruct(*args, **kwargs)
+
+    def live(*args, **kwargs):
+        live_calls.append(str(args[0]))
+        return original_live(*args, **kwargs)
+
+    monkeypatch.setattr(
+        governance_db, "_reconstruct_dev_cow_successor_payload", reconstruct,
+    )
+    monkeypatch.setattr(
+        governance_db, "_validate_dev_basic_runtime_custody", live,
+    )
+
+    writer = governance_db.get_connection("aming-claw")
+    writer.execute(
+        "UPDATE backlog_bugs SET updated_at=? WHERE bug_id=?",
+        ("2026-09-11T20:00:00Z", "AC-0000"),
+    )
+    writer.commit()
+    writer.close()
+    reader = governance_db.get_connection("aming-claw")
+    assert reader.execute(
+        "SELECT updated_at FROM backlog_bugs WHERE bug_id=?",
+        ("AC-0000",),
+    ).fetchone()[0] == "2026-09-11T20:00:00Z"
+    reader.close()
+
+    assert reconstruct_calls == [str(world["root"])]
+    assert live_calls == [str(world["root"]), str(world["root"])]
+    assert world["binding_calls"] == ["verified", "verified"]
+
+
+def test_dev_successor_history_cache_discards_incomplete_and_drifting_results(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    root_key = str(world["root"])
+    physical_validate = governance_db.validate_dev_cow_successor_receipt
+    validate_calls = []
+
+    def incomplete(root):
+        validate_calls.append(str(root))
+        return {
+            "schema_version": governance_db.AC_DEV_COW_SUCCESSOR_SCHEMA,
+            "stage": "completed",
+            "project_id": governance_db.AC_PROJECT_ID,
+            "port": 40008,
+            "root": str(root),
+        }
+
+    monkeypatch.setattr(
+        governance_db, "validate_dev_cow_successor_receipt", incomplete,
+    )
+    assert governance_db.dashboard_read_timing_begin(
+        "/api/backlog/aming-claw?view=compact"
+    ) is True
+    first = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=world["binding"],
+    )
+    first_record = governance_db.dashboard_read_timing_finish()
+    second = governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=world["binding"],
+    )
+    assert first == second
+    assert len(validate_calls) == 2
+    assert root_key not in governance_db._DEV_COW_SUCCESSOR_HISTORY_CACHE
+    assert first_record["stages"][
+        "db.dev_cow_successor_history_cache_incomplete"
+    ]["count"] == 1
+
+    governance_db._dev_cow_successor_history_cache_clear()
+    original_fingerprint = governance_db._dev_cow_successor_history_fingerprint
+    changed = False
+    validate_calls.clear()
+
+    def valid_then_change(root):
+        nonlocal changed
+        validate_calls.append(str(root))
+        # Use the physical original validator, not the incomplete substitute.
+        result = physical_validate(root)
+        changed = True
+        return result
+
+    def drifting_fingerprint(root):
+        fingerprint = original_fingerprint(root)
+        return fingerprint + (("fixture-drift",),) if changed else fingerprint
+
+    monkeypatch.setattr(
+        governance_db, "validate_dev_cow_successor_receipt", valid_then_change,
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "_dev_cow_successor_history_fingerprint",
+        drifting_fingerprint,
+    )
+    assert governance_db.dashboard_read_timing_begin(
+        "/api/task/aming-claw/timeline/recent"
+    ) is True
+    governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=world["binding"],
+    )
+    drift_record = governance_db.dashboard_read_timing_finish()
+    assert root_key not in governance_db._DEV_COW_SUCCESSOR_HISTORY_CACHE
+    assert drift_record["stages"][
+        "db.dev_cow_successor_history_cache_drift"
+    ]["count"] == 1
+    governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=world["binding"],
+    )
+    assert len(validate_calls) == 2
+    assert root_key in governance_db._DEV_COW_SUCCESSOR_HISTORY_CACHE
+
+
+def test_dev_successor_history_cache_concurrent_failure_shares_no_success(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    from threading import Lock
+
+    world = physical_successor_history_read_world
+    entered = Event()
+    joined = Event()
+    release = Event()
+    lock = Lock()
+    calls = 0
+    original_timing_count = governance_db._dev_cow_successor_history_timing_count
+
+    def failing(_root):
+        nonlocal calls
+        with lock:
+            calls += 1
+            current = calls
+        if current == 1:
+            entered.set()
+            assert release.wait(timeout=10)
+        raise ValueError("fixture validator failure")
+
+    def timing_count(stage):
+        original_timing_count(stage)
+        if stage == "db.dev_cow_successor_history_cache_join":
+            joined.set()
+
+    monkeypatch.setattr(
+        governance_db, "validate_dev_cow_successor_receipt", failing,
+    )
+    monkeypatch.setattr(
+        governance_db, "_dev_cow_successor_history_timing_count", timing_count,
+    )
+
+    def read():
+        with pytest.raises(ValueError, match="fixture validator failure"):
+            governance_db._cached_dev_cow_successor_receipt(
+                world["root"], stable_binding=world["binding"],
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leader = pool.submit(read)
+        assert entered.wait(timeout=10)
+        follower = pool.submit(read)
+        assert joined.wait(timeout=10)
+        release.set()
+        leader.result(timeout=30)
+        follower.result(timeout=30)
+
+    assert calls == 2
+    assert str(world["root"]) not in governance_db._DEV_COW_SUCCESSOR_HISTORY_CACHE

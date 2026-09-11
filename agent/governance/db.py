@@ -11,6 +11,7 @@ import sys
 import sqlite3
 import stat
 import threading
+import copy
 import hashlib
 import json
 import re
@@ -65,6 +66,9 @@ _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
 _DEV_FIRST_START_CONTEXT_TOKEN = object()
+_DEV_COW_SUCCESSOR_HISTORY_CACHE_LOCK = threading.RLock()
+_DEV_COW_SUCCESSOR_HISTORY_CACHE: dict[str, tuple[object, dict[str, object]]] = {}
+_DEV_COW_SUCCESSOR_HISTORY_INFLIGHT: dict[object, threading.Event] = {}
 
 
 class _DevFirstStartContext:
@@ -3058,7 +3062,9 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
     if archive.is_dir():
         receipts = list(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"))
         if receipts:
-            receipt = validate_dev_cow_successor_receipt(root)
+            receipt = _cached_dev_cow_successor_receipt(
+                root, stable_binding=binding,
+            )
             successor = dict(receipt.get("successor") or {})
             identity = dict(successor.get("identity") or {})
             database = root / AC_DATABASE_DEV_RELATIVE_PATH
@@ -5190,6 +5196,379 @@ def _cow_successor_archive(root: Path) -> Path:
     return root / AC_DEV_COW_SUCCESSOR_ARCHIVE
 
 
+def _dev_cow_successor_history_stable_invalidation_key(
+    binding: Mapping[str, object],
+) -> tuple[object, ...]:
+    """Project only stable identity fields; this is not admission authority."""
+
+    health = (
+        dict(binding.get("health") or {})
+        if isinstance(binding.get("health"), Mapping)
+        else {}
+    )
+    runtime_identity = (
+        dict(health.get("runtime_plane_identity") or {})
+        if isinstance(health.get("runtime_plane_identity"), Mapping)
+        else {}
+    )
+    loaded_identity = (
+        dict(health.get("loaded_runtime_identity") or {})
+        if isinstance(health.get("loaded_runtime_identity"), Mapping)
+        else {}
+    )
+    process_identity = (
+        dict(binding.get("process_identity") or {})
+        if isinstance(binding.get("process_identity"), Mapping)
+        else {}
+    )
+    database_identity = (
+        dict(binding.get("stable_database_identity") or {})
+        if isinstance(binding.get("stable_database_identity"), Mapping)
+        else {}
+    )
+    # The full health payload can carry request observations.  Keep only fields
+    # that the existing verified binding already uses for identity/content.
+    return (
+        str(binding.get("shared_volume_path") or ""),
+        str(binding.get("database_path") or ""),
+        str(binding.get("stable_head") or ""),
+        tuple((name, database_identity.get(name)) for name in (
+            "schema_version", "device", "inode", "stable_relative_path_sha256",
+        )),
+        tuple((name, process_identity.get(name)) for name in (
+            "pid", "birth", "command", "cwd",
+        )),
+        tuple((name, health.get(name)) for name in (
+            "status", "service", "port", "runtime_plane", "runtime_stale",
+            "runtime_loaded_version", "pid",
+        )),
+        tuple((name, runtime_identity.get(name)) for name in (
+            "status", "plane", "world_id", "expected_branch", "worktree_dirty",
+            "worktree_root", "branch", "commit", "stable_anchor_commit",
+        )),
+        json.dumps(
+            runtime_identity.get("database_identity"),
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ),
+        json.dumps(
+            runtime_identity.get("stable_database_identity"),
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ),
+        tuple(sorted(str(item) for item in (runtime_identity.get("project_allowlist") or []))),
+        tuple(sorted(str(item) for item in (runtime_identity.get("violations") or []))),
+        tuple((name, loaded_identity.get(name)) for name in (
+            "loaded_commit", "loaded_source_path", "loaded_source_sha256",
+            "worktree_source_sha256",
+        )),
+    )
+
+
+def _dev_cow_successor_history_untrusted_mapping(path: Path) -> dict[str, object]:
+    """Read dependency references for a cache key, never as acceptance proof."""
+
+    value = json.loads(path.read_bytes())
+    if not isinstance(value, Mapping):
+        raise ValueError("AC dev COW successor dependency map is invalid")
+    return dict(value)
+
+
+def _dev_cow_successor_history_contained_path(root: Path, value: object) -> Path:
+    path = Path(str(value or "")).expanduser().absolute()
+    if path == root or root not in path.parents:
+        raise ValueError("AC dev COW successor dependency escaped its world root")
+    return path
+
+
+def _dev_cow_successor_history_dependency_closure(
+    root: Path,
+) -> tuple[tuple[Path, ...], tuple[tuple[Path, str, tuple[str, ...]], ...]]:
+    """Discover the exact immutable files and authoritative glob memberships."""
+
+    archive = _cow_successor_archive(root)
+    successor_paths = tuple(sorted(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json")))
+    legacy_paths = tuple(sorted(archive.glob("successor.*.json")))
+    if len(successor_paths) != 1 or len(legacy_paths) != 1:
+        raise ValueError("AC dev COW successor dependency membership is ambiguous")
+    receipt = _dev_cow_successor_history_untrusted_mapping(successor_paths[0])
+    operator_ref = dict(receipt.get("operator_evidence") or {})
+    predecessor_ref = dict(dict(receipt.get("predecessor") or {}).get("backup") or {})
+    history_ref = dict(receipt.get("history") or {})
+    linked_ref = dict(history_ref.get("linked_v3") or {})
+    adoption_ref = dict(history_ref.get("adoption") or {})
+    operator_path = _dev_cow_successor_history_contained_path(
+        root, operator_ref.get("path")
+    )
+    predecessor_path = _dev_cow_successor_history_contained_path(
+        root, predecessor_ref.get("path")
+    )
+    linked_path = _dev_cow_successor_history_contained_path(
+        root, linked_ref.get("path")
+    )
+    adoption_path = _dev_cow_successor_history_contained_path(
+        root, adoption_ref.get("path")
+    )
+    operator = _dev_cow_successor_history_untrusted_mapping(operator_path)
+    adoption = _dev_cow_successor_history_untrusted_mapping(adoption_path)
+    quarantine_ref = dict(adoption.get("quarantine_manifest") or {})
+    quarantine_path = _dev_cow_successor_history_contained_path(
+        root, quarantine_ref.get("path")
+    )
+    snapshot_sha = str(operator.get("snapshot_sha256") or "")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", snapshot_sha) is None:
+        raise ValueError("AC dev COW successor snapshot reference is invalid")
+    snapshot_dir = root / "archive" / "staging" / "dashboard-backlog-snapshots"
+    snapshot_path = snapshot_dir / (
+        f"snapshot.{snapshot_sha.removeprefix('sha256:')}.sqlite"
+    )
+    manifest_paths = tuple(sorted(snapshot_dir.glob("manifest.*.json")))
+    if len(manifest_paths) != 1:
+        raise ValueError("AC dev COW successor manifest membership is ambiguous")
+    files = tuple(sorted({
+        successor_paths[0], legacy_paths[0], operator_path, predecessor_path,
+        linked_path, linked_path.with_suffix(".sha256"), adoption_path,
+        quarantine_path, snapshot_path, manifest_paths[0],
+    }, key=str))
+    operator_members = tuple(
+        path.name for path in sorted(operator_path.parent.glob("cow-import.*.json"))
+    )
+    memberships = (
+        (archive, f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json",
+         tuple(path.name for path in successor_paths)),
+        (archive, "successor.*.json", tuple(path.name for path in legacy_paths)),
+        (operator_path.parent, "cow-import.*.json", operator_members),
+        (snapshot_dir, "manifest.*.json", tuple(path.name for path in manifest_paths)),
+    )
+    return files, memberships
+
+
+def _dev_cow_successor_history_path_snapshot(
+    path: Path, *, directory: bool,
+) -> tuple[object, ...]:
+    """Capture one canonical path without accepting a symlink at any component."""
+
+    absolute = path.expanduser().absolute()
+    before = absolute.stat(follow_symlinks=False)
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if (
+        absolute.is_symlink()
+        or not expected_type(before.st_mode)
+        or absolute.resolve(strict=True) != absolute
+    ):
+        raise ValueError("AC dev COW successor dependency is not canonical")
+    after = absolute.stat(follow_symlinks=False)
+    before_identity = (
+        int(before.st_dev), int(before.st_ino), int(before.st_mode),
+        int(before.st_nlink), int(before.st_size), int(before.st_mtime_ns),
+        int(before.st_ctime_ns),
+    )
+    after_identity = (
+        int(after.st_dev), int(after.st_ino), int(after.st_mode),
+        int(after.st_nlink), int(after.st_size), int(after.st_mtime_ns),
+        int(after.st_ctime_ns),
+    )
+    if before_identity != after_identity:
+        raise ValueError("AC dev COW successor dependency changed during observation")
+    return (str(absolute),) + before_identity
+
+
+def _dev_cow_successor_history_fingerprint_once(root: Path) -> tuple[object, ...]:
+    files, memberships = _dev_cow_successor_history_dependency_closure(root)
+    directories = {root}
+    for path in files:
+        parent = path.parent
+        while True:
+            directories.add(parent)
+            if parent == root:
+                break
+            if root not in parent.parents:
+                raise ValueError("AC dev COW successor dependency parent escaped")
+            parent = parent.parent
+    for directory, _pattern, _names in memberships:
+        parent = directory
+        while True:
+            directories.add(parent)
+            if parent == root:
+                break
+            if root not in parent.parents:
+                raise ValueError("AC dev COW successor membership parent escaped")
+            parent = parent.parent
+    directory_snapshots = tuple(
+        _dev_cow_successor_history_path_snapshot(path, directory=True)
+        for path in sorted(directories, key=str)
+    )
+    file_snapshots = tuple(
+        _dev_cow_successor_history_path_snapshot(path, directory=False)
+        for path in files
+    )
+    current_memberships = tuple(
+        (
+            str(directory), pattern,
+            tuple(path.name for path in sorted(directory.glob(pattern))),
+        )
+        for directory, pattern, _names in memberships
+    )
+    return directory_snapshots, file_snapshots, current_memberships
+
+
+def _dev_cow_successor_history_fingerprint(root: Path) -> tuple[object, ...]:
+    first = _dev_cow_successor_history_fingerprint_once(root)
+    second = _dev_cow_successor_history_fingerprint_once(root)
+    if first != second:
+        raise ValueError("AC dev COW successor dependencies changed during observation")
+    return first
+
+
+def _dev_cow_successor_history_current_database_key(root: Path) -> tuple[object, ...]:
+    database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+    metadata = database.stat(follow_symlinks=False)
+    if (
+        database.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or database.resolve(strict=True) != database
+    ):
+        raise ValueError("AC dev COW successor live database is not canonical")
+    return (
+        str(database), int(metadata.st_dev), int(metadata.st_ino),
+        stat.S_IFMT(metadata.st_mode), int(metadata.st_nlink),
+    )
+
+
+def _dev_cow_successor_history_cache_clear() -> None:
+    """Clear process-local successful history reuse; intended for owning tests."""
+
+    with _DEV_COW_SUCCESSOR_HISTORY_CACHE_LOCK:
+        _DEV_COW_SUCCESSOR_HISTORY_CACHE.clear()
+
+
+def _dev_cow_successor_history_timing_count(stage: str) -> None:
+    _dashboard_read_timing_record(stage, 0, 0)
+
+
+def _dev_cow_successor_history_cache_eligible(
+    root: Path, result: object,
+) -> bool:
+    """Keep incomplete validator output out of the reusable success cache."""
+
+    if not isinstance(result, Mapping):
+        return False
+    successor = result.get("successor")
+    predecessor = result.get("predecessor")
+    operator_evidence = result.get("operator_evidence")
+    history = result.get("history")
+    stable_binding = result.get("stable_binding")
+    return bool(
+        result.get("schema_version") == AC_DEV_COW_SUCCESSOR_SCHEMA
+        and result.get("stage") == "completed"
+        and result.get("project_id") == AC_PROJECT_ID
+        and result.get("port") == 40008
+        and result.get("root") == str(root)
+        and isinstance(result.get("listener"), Mapping)
+        and isinstance(result.get("genesis"), Mapping)
+        and isinstance(successor, Mapping)
+        and isinstance(successor.get("identity"), Mapping)
+        and isinstance(predecessor, Mapping)
+        and isinstance(predecessor.get("backup"), Mapping)
+        and isinstance(operator_evidence, Mapping)
+        and isinstance(operator_evidence.get("payload"), Mapping)
+        and isinstance(history, Mapping)
+        and isinstance(history.get("linked_v3"), Mapping)
+        and isinstance(history.get("adoption"), Mapping)
+        and isinstance(stable_binding, Mapping)
+    )
+
+
+@dashboard_read_timed("db.dev_cow_successor_history_cache")
+def _cached_dev_cow_successor_receipt(
+    root: Path, *, stable_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Reuse only one unchanged, fully validated immutable history proof."""
+
+    root = root.expanduser().absolute()
+    stable_key = _dev_cow_successor_history_stable_invalidation_key(stable_binding)
+    root_key = str(root)
+    while True:
+        _dev_cow_successor_history_timing_count(
+            "db.dev_cow_successor_history_cache_lookup"
+        )
+        try:
+            fingerprint = _dev_cow_successor_history_fingerprint(root)
+            database_key = _dev_cow_successor_history_current_database_key(root)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            _dev_cow_successor_history_timing_count(
+                "db.dev_cow_successor_history_cache_unkeyed_miss"
+            )
+            return dashboard_read_timed_call(
+                "db.dev_cow_successor_history_validate",
+                validate_dev_cow_successor_receipt,
+                root,
+            )
+        key = (root_key, stable_key, database_key, fingerprint)
+        with _DEV_COW_SUCCESSOR_HISTORY_CACHE_LOCK:
+            cached = _DEV_COW_SUCCESSOR_HISTORY_CACHE.get(root_key)
+            if cached is not None and cached[0] == key:
+                _dev_cow_successor_history_timing_count(
+                    "db.dev_cow_successor_history_cache_hit"
+                )
+                return copy.deepcopy(cached[1])
+            pending = _DEV_COW_SUCCESSOR_HISTORY_INFLIGHT.get(key)
+            if pending is None:
+                pending = threading.Event()
+                _DEV_COW_SUCCESSOR_HISTORY_INFLIGHT[key] = pending
+                leader = True
+                _dev_cow_successor_history_timing_count(
+                    "db.dev_cow_successor_history_cache_miss"
+                )
+            else:
+                leader = False
+                _dev_cow_successor_history_timing_count(
+                    "db.dev_cow_successor_history_cache_join"
+                )
+        if not leader:
+            pending.wait()
+            # A completed flight is not itself proof.  Re-observe every input,
+            # then consume only a matching successfully published entry.
+            continue
+        try:
+            result = dashboard_read_timed_call(
+                "db.dev_cow_successor_history_validate",
+                validate_dev_cow_successor_receipt,
+                root,
+            )
+            try:
+                after_key = (
+                    root_key,
+                    stable_key,
+                    _dev_cow_successor_history_current_database_key(root),
+                    _dev_cow_successor_history_fingerprint(root),
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                after_key = None
+            cache_eligible = _dev_cow_successor_history_cache_eligible(root, result)
+            if after_key == key and cache_eligible:
+                with _DEV_COW_SUCCESSOR_HISTORY_CACHE_LOCK:
+                    _DEV_COW_SUCCESSOR_HISTORY_CACHE[root_key] = (
+                        key, copy.deepcopy(result),
+                    )
+                _dev_cow_successor_history_timing_count(
+                    "db.dev_cow_successor_history_cache_publish"
+                )
+            elif after_key != key:
+                _dev_cow_successor_history_timing_count(
+                    "db.dev_cow_successor_history_cache_drift"
+                )
+            else:
+                _dev_cow_successor_history_timing_count(
+                    "db.dev_cow_successor_history_cache_incomplete"
+                )
+            return copy.deepcopy(result)
+        finally:
+            with _DEV_COW_SUCCESSOR_HISTORY_CACHE_LOCK:
+                current = _DEV_COW_SUCCESSOR_HISTORY_INFLIGHT.get(key)
+                if current is pending:
+                    _DEV_COW_SUCCESSOR_HISTORY_INFLIGHT.pop(key, None)
+                    pending.set()
+
+
 def create_dev_cow_successor_receipt(
     storage_root: Path | str, *, operator_receipt: Path, predecessor_backup: Path,
     linked_v3_receipt: Path,
@@ -5371,6 +5750,7 @@ def _cow_historical_backlog_snapshot(
     }, rows, columns
 
 
+@dashboard_read_timed("db.dev_cow_successor_history_reconstruct")
 def _reconstruct_dev_cow_successor_payload(
     root: Path, receipt: Mapping[str, object]
 ) -> dict[str, object]:
@@ -6312,6 +6692,7 @@ def _validate_dev_cow_completed_basic_restart(
     }
 
 
+@dashboard_read_timed("db.dev_basic_runtime_custody")
 def _validate_dev_basic_runtime_custody(
     storage_root: Path | str, *, stable_binding: Mapping[str, object],
 ) -> bool:
