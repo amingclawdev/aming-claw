@@ -12,6 +12,7 @@ import {
   acceptanceCriteriaFrom,
   acceptanceCriterionVerification,
   BacklogAcceptanceCriteria,
+  BacklogRow,
   filterBacklogHotWindowRows,
 } from "./BacklogView";
 
@@ -59,6 +60,84 @@ const stylesSource = readFileSync(new URL("../styles.css", import.meta.url), "ut
 
 function assertBacklogAuthority(condition: boolean, message: string): void {
   if (!condition) throw new Error(`Backlog authority fixture failed: ${message}`);
+}
+
+function renderBacklogRow(bug: BacklogBug): string {
+  return renderToStaticMarkup(
+    <table>
+      <tbody>
+        <BacklogRow bug={bug} projectId="aming-claw" onOpenDetail={() => undefined} />
+      </tbody>
+    </table>,
+  );
+}
+
+const unavailableCurrentRow = renderBacklogRow({
+  bug_id: "AC-CURRENT-UNAVAILABLE",
+  title: "Current unavailable control",
+  status: "OPEN",
+  priority: "P1",
+  runtime_state: "FAILED_LEGACY_RUNTIME",
+  chain_stage: "legacy-chain-stage",
+  mf_type: "legacy-mf-type",
+  contract_summary: {
+    has_contract: true,
+    template_id: "legacy-template",
+    required_evidence_count: 99,
+    projection_status: "passed",
+    projection_watermark: 188,
+    source_of_truth: "legacy-chain-trigger",
+  },
+  commit: "1234567890abcdef",
+  worktree_branch: "codex/retained-branch-fact",
+});
+assertBacklogAuthority(
+  unavailableCurrentRow.includes("Current authority unavailable")
+    && unavailableCurrentRow.includes("OPEN")
+    && unavailableCurrentRow.includes("1234567")
+    && unavailableCurrentRow.includes("codex/retained-branch-fact")
+    && !unavailableCurrentRow.includes("FAILED_LEGACY_RUNTIME")
+    && !unavailableCurrentRow.includes("legacy-chain-stage")
+    && !unavailableCurrentRow.includes("legacy-mf-type")
+    && !unavailableCurrentRow.includes("legacy-template")
+    && !unavailableCurrentRow.includes("projection passed"),
+  "a compact row without current ContractRuntime authority must show unavailable without promoting legacy runtime or contract projection",
+);
+
+const sourceBackedCommandRow = renderBacklogRow({
+  ...projectedCommandBug,
+  runtime_state: "FAILED_LEGACY_RUNTIME",
+  chain_stage: "legacy-chain-stage",
+  mf_type: "legacy-mf-type",
+  contract_summary: {
+    has_contract: true,
+    template_id: "legacy-template",
+    required_evidence_count: 99,
+    projection_status: "passed",
+  },
+});
+assertBacklogAuthority(
+  sourceBackedCommandRow.includes("Current authority unavailable")
+    && sourceBackedCommandRow.includes("FIXED")
+    && sourceBackedCommandRow.includes("command completed")
+    && sourceBackedCommandRow.includes("superseded route identity reconciled")
+    && !sourceBackedCommandRow.includes("FAILED_LEGACY_RUNTIME")
+    && !sourceBackedCommandRow.includes("legacy-template")
+    && !sourceBackedCommandRow.includes("projection passed"),
+  "source-backed command and raw backlog facts must remain visible without letting conflicting legacy runtime data become current authority",
+);
+
+for (const status of ["OPEN", "FIXED", "WAIVED", "SUPERSEDED"]) {
+  const markup = renderBacklogRow({
+    bug_id: `AC-RAW-${status}`,
+    title: `Raw ${status}`,
+    status,
+    priority: "P1",
+  });
+  assertBacklogAuthority(
+    markup.includes(`>${status}<`) && markup.includes("Current authority unavailable"),
+    `raw ${status} disposition must remain visible and distinct from unavailable current authority`,
+  );
 }
 
 assertBacklogAuthority(

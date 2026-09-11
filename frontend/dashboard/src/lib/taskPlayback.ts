@@ -1178,7 +1178,7 @@ export function normalizeTaskPlaybackDag(input: NormalizeTaskPlaybackDagInput): 
   const eventNodeIds = new Map<string, string>();
   orderedEvents.forEach((event, index) => {
     const eventId = eventIdentity(event, index);
-    const semantic = projectTaskTimelineEvent(event, index);
+    const semantic = projectTaskTimelineEvent(taskTimelineSemanticInput(event), index);
     const nodeId = addNode({
       id: `timeline-event:${safeText(eventId)}`,
       kind: "timeline_event",
@@ -1752,7 +1752,27 @@ function projectGateMatrixToRetainedFrames(
 }
 
 function projectPlaybackHotWindowTrace(trace: TaskPlaybackTrace): TaskPlaybackTrace {
-  const frames = trace.frames.slice(-TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT);
+  const latestFrames = trace.frames.slice(-TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT);
+  const locationQuery = typeof window === "undefined"
+    ? null
+    : new URLSearchParams(window.location.search);
+  const requestedProjectId = locationQuery?.get("project_id")?.trim() ?? "";
+  const requestedBacklogId = locationQuery?.get(PLAYBACK_URL_PARAMS.playback_backlog)?.trim() ?? "";
+  const requestedEventId = locationQuery?.get(PLAYBACK_URL_PARAMS.playback_event)?.trim() ?? "";
+  const requestedFrame = (!requestedProjectId || requestedProjectId === trace.project_id)
+    && requestedBacklogId === trace.backlog_id
+    && /^\d+$/.test(requestedEventId)
+    && !/^0+$/.test(requestedEventId)
+    ? trace.frames.find((frame) => (
+      frame.id === requestedEventId
+      || frame.source_event_id === requestedEventId
+      || frame.source_event_id === `#${requestedEventId}`
+      || frame.durable_event_id === requestedEventId
+    ))
+    : undefined;
+  const frames = requestedFrame && !latestFrames.includes(requestedFrame)
+    ? [requestedFrame, ...latestFrames.slice(1)]
+    : latestFrames;
   const retainedEventIds = new Set(frames.map(retainedPlaybackEventId));
   const retainedEvents: TaskTimelineEvent[] = frames.map((frame) => ({
     event_id: retainedPlaybackEventId(frame),
@@ -2378,10 +2398,12 @@ function taskPlaybackEventIdentity(event: TaskTimelineEvent): { kind: TaskPlayba
   ) || ["contract_runtime.current_state", "contract_chain.current_state", "runtime_context.current_state"].includes(event.event_type);
   if (synthetic) return { kind: "current_snapshot", durableEventId: "" };
   const rawId = (event as { id?: unknown }).id;
+  const rawEventId = (event as { event_id?: unknown }).event_id;
+  const eventIdText = String(rawEventId ?? "").trim();
   const durableEventId = typeof rawId === "number" && Number.isInteger(rawId) && rawId > 0
     ? String(rawId)
-    : /^\d+$/.test(safeText(event.event_id ?? "")) && Number(event.event_id) > 0
-      ? safeText(event.event_id ?? "")
+    : /^\d+$/.test(eventIdText) && Number(eventIdText) > 0
+      ? safeText(eventIdText)
       : "";
   return { kind: "durable_event", durableEventId };
 }
@@ -2413,14 +2435,14 @@ function taskPlaybackEventProvenance(event: TaskTimelineEvent): TaskPlaybackProv
 }
 
 function fallbackSemanticProjection(event: TaskTimelineEvent, index: number): TaskTimelineSemanticProjection {
-  const projection = projectTaskTimelineEvent({
+  const projection = projectTaskTimelineEvent(taskTimelineSemanticInput({
     ...event,
     event_type: "unsupported.timeline.event",
     event_kind: "unsupported_event",
     payload: {},
     verification: {},
     artifact_refs: {},
-  }, index);
+  }), index);
   return {
     ...projection,
     fallback: true,
@@ -2438,10 +2460,11 @@ export function projectTaskPlaybackFrame(
   semanticProjector: (value: TaskTimelineEvent, itemIndex?: number) => TaskTimelineSemanticProjection = projectTaskTimelineEvent,
 ): TaskPlaybackFrame {
   const publicEvent = hydrateTimelineEventJson(event);
+  const semanticInput = taskTimelineSemanticInput(publicEvent);
   let semantic: TaskTimelineSemanticProjection;
   let structuredViewStatus: TaskPlaybackStructuredViewStatus;
   try {
-    semantic = semanticProjector(publicEvent, index);
+    semantic = semanticProjector(semanticInput, index);
     structuredViewStatus = semantic.fallback ? "unsupported" : "supported";
   } catch {
     semantic = fallbackSemanticProjection(publicEvent, index);
@@ -5607,9 +5630,18 @@ function eventIdentity(event: TaskTimelineEvent, index: number): string {
   return String(event.event_id || event.id || event.trace_id || `${event.event_type}-${event.created_at || index}`);
 }
 
+function taskTimelineSemanticInput(event: TaskTimelineEvent): TaskTimelineEvent {
+  const rawEventId = (event as { event_id?: unknown }).event_id;
+  return typeof rawEventId === "number" && Number.isFinite(rawEventId)
+    ? { ...event, event_id: String(rawEventId) }
+    : event;
+}
+
 function eventDisplayId(event: TaskTimelineEvent): string {
   const rawId = (event as { id?: unknown }).id;
-  if (event.event_id && !isSensitiveEvidenceText(event.event_id, "event_id")) return safeText(event.event_id);
+  const rawEventId = (event as { event_id?: unknown }).event_id;
+  const eventIdText = String(rawEventId ?? "").trim();
+  if (eventIdText && !isSensitiveEvidenceText(eventIdText, "event_id")) return safeText(eventIdText);
   if (typeof rawId === "number") return `#${rawId}`;
   if (rawId != null) return safeText(String(rawId));
   if (event.trace_id && !isSensitiveEvidenceText(event.trace_id, "trace_id")) return safeText(event.trace_id);
@@ -5793,8 +5825,10 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
   const identity = taskPlaybackEventIdentity(publicEvent);
   const provenance = taskPlaybackEventProvenance(publicEvent);
   const rawId = (publicEvent as { id?: unknown }).id;
-  const id = publicEvent.event_id && !isSensitiveEvidenceText(publicEvent.event_id, "event_id")
-    ? publicEvent.event_id
+  const rawEventId = (publicEvent as { event_id?: unknown }).event_id;
+  const eventIdText = String(rawEventId ?? "").trim();
+  const id = eventIdText && !isSensitiveEvidenceText(eventIdText, "event_id")
+    ? typeof rawEventId === "number" ? rawEventId : eventIdText
     : typeof rawId === "number" && Number.isFinite(rawId)
       ? rawId
       : typeof rawId === "string"
@@ -5879,7 +5913,7 @@ export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard 
   let headline = "";
   let structured_view_status: TaskPlaybackStructuredViewStatus = "supported";
   try {
-    const projection = projectTaskTimelineEvent(publicEvent, 0);
+    const projection = projectTaskTimelineEvent(taskTimelineSemanticInput(publicEvent), 0);
     headline = projection.headline || projection.title || "";
     structured_view_status = projection.fallback ? "unsupported" : "supported";
   } catch {

@@ -33435,6 +33435,103 @@ def test_backlog_list_server_search_supports_status_priority_and_pagination(conn
     )
 
 
+def test_backlog_list_compact_preserves_typed_acceptance_summary_and_legacy_strings(
+    conn,
+):
+    server._backlog_read_cache_clear()
+    typed_acceptance = [
+        {
+            "id": f"CL188-{index:02d}",
+            "text": f"Canonical acceptance criterion {index}",
+            "required_scope": {
+                "kind": "files_and_nodes",
+                "files": ["corridor_kit/compiler.py"],
+                "nodes": ["source_pipeline_admission"],
+            },
+        }
+        for index in range(1, 7)
+    ]
+    legacy_acceptance = [
+        "Legacy compact acceptance one",
+        "Legacy compact acceptance two",
+        "Legacy compact acceptance three",
+    ]
+    rows = (
+        (
+            "AC-COMPACT-ACCEPTANCE-TYPED",
+            "Structured compact acceptance",
+            typed_acceptance,
+            "2026-09-10T23:58:02Z",
+        ),
+        (
+            "AC-COMPACT-ACCEPTANCE-LEGACY",
+            "Legacy compact acceptance",
+            legacy_acceptance,
+            "2026-09-10T23:58:01Z",
+        ),
+    )
+    conn.executemany(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, acceptance_criteria,
+            bypass_policy_json, created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'P1', ?, ?, ?, ?)""",
+        [
+            (
+                bug_id,
+                title,
+                json.dumps(criteria, sort_keys=True),
+                json.dumps({"privacy_level": "public", "public_safe": True}),
+                updated_at,
+                updated_at,
+            )
+            for bug_id, title, criteria, updated_at in rows
+        ],
+    )
+    conn.commit()
+    query = {
+        "view": "compact",
+        "q": "compact acceptance",
+        "limit": "10",
+        "include_closed": "true",
+    }
+
+    first = server.handle_backlog_list(_ctx({"project_id": PID}, query=query))
+    cached = server.handle_backlog_list(_ctx({"project_id": PID}, query=query))
+    first_by_id = {bug["bug_id"]: bug for bug in first["bugs"]}
+    typed = first_by_id["AC-COMPACT-ACCEPTANCE-TYPED"]
+    legacy = first_by_id["AC-COMPACT-ACCEPTANCE-LEGACY"]
+
+    assert first["view"] == "compact"
+    assert first["read_cache"]["miss"] is True
+    assert cached["read_cache"]["hit"] is True
+    assert cached["bugs"] == first["bugs"]
+    assert typed["acceptance_criteria"] == typed_acceptance[:2]
+    assert typed["acceptance_count"] == 6
+    assert legacy["acceptance_criteria"] == legacy_acceptance[:2]
+    assert legacy["acceptance_count"] == 3
+
+    handler = _bare_handler()
+    handler._respond(200, first)
+    transported = json.loads(handler.wfile.getvalue())
+    transported_by_id = {bug["bug_id"]: bug for bug in transported["bugs"]}
+    assert transported_by_id["AC-COMPACT-ACCEPTANCE-TYPED"][
+        "acceptance_criteria"
+    ] == typed_acceptance[:2]
+    assert transported_by_id["AC-COMPACT-ACCEPTANCE-TYPED"][
+        "acceptance_count"
+    ] == 6
+
+    detail = server.handle_backlog_get(
+        _ctx(
+            {
+                "project_id": PID,
+                "bug_id": "AC-COMPACT-ACCEPTANCE-TYPED",
+            }
+        )
+    )
+    assert json.loads(detail["acceptance_criteria"]) == typed_acceptance
+
+
 def test_backlog_hot_window_is_newest_first_bounded_and_generation_invalidated(conn):
     server._backlog_read_cache_clear()
     conn.executemany(
@@ -189345,20 +189442,52 @@ def test_exact_timeline_handler_projects_public_event_before_cache_and_transport
             "2026-09-10T08:00:01Z",
         ),
     ).lastrowid
+    sibling_id = conn.execute(
+        """INSERT INTO task_timeline_events
+           (project_id, backlog_id, task_id, event_type, event_kind, actor,
+            status, payload_json, verification_json, artifact_refs_json,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            PID,
+            backlog_id,
+            "cex-exact-raw-boundary",
+            "fixture.raw_boundary_sibling",
+            "fixture",
+            "fixture",
+            "recorded",
+            json.dumps(
+                {
+                    "contract_execution_id": "cex-exact-raw-boundary",
+                    "safe_identity": "preserve-sibling",
+                    "accessToken": "dummy-sibling-token-sentinel",
+                    "details_json": json.dumps(
+                        {"private": "dummy-sibling-private-sentinel"},
+                        sort_keys=True,
+                    ),
+                },
+                sort_keys=True,
+            ),
+            json.dumps({}, sort_keys=True),
+            json.dumps({"report_ref": "sibling-public-ref"}, sort_keys=True),
+            "2026-09-10T08:00:02Z",
+        ),
+    ).lastrowid
     conn.commit()
-    stored_before = tuple(
-        conn.execute(
+    stored_before = [
+        tuple(row)
+        for row in conn.execute(
             """SELECT payload_json, verification_json, artifact_refs_json
-               FROM task_timeline_events WHERE id = ?""",
-            (event_id,),
-        ).fetchone()
-    )
+               FROM task_timeline_events WHERE id IN (?, ?) ORDER BY id""",
+            (event_id, sibling_id),
+        ).fetchall()
+    ]
     server._timeline_warm_cache_clear()
     query = {
         "backlog_id": backlog_id,
         "limit": "1",
-        "playback_bootstrap": "compact",
-        "exact_event_id": str(event_id),
+        "exact_event_id": str(sibling_id),
+        "before_event_id": "0",
         "view": "public",
     }
     response = server.handle_task_timeline_list(
@@ -189368,21 +189497,30 @@ def test_exact_timeline_handler_projects_public_event_before_cache_and_transport
         _ctx({"project_id": PID}, query=query)
     )
 
-    compact_json = json.dumps(response["events"], sort_keys=True)
-    exact = response["exact_event"]
-    exact_json = json.dumps(exact, sort_keys=True)
+    sibling_json = json.dumps(response["events"], sort_keys=True)
+    exact = response["events"][0]
+    requested_exact = response["exact_event"]
+    projected_json = json.dumps(
+        {"events": response["events"], "exact_event": requested_exact},
+        sort_keys=True,
+    )
     http_handler = _bare_handler()
     http_handler._respond(200, response)
     http_bytes = http_handler.wfile.getvalue()
     transported = json.loads(http_bytes)
-    assert "dummy-token-sentinel" not in compact_json
-    assert "private-sentinel" not in compact_json
-    assert response["raw_event_payloads_omitted"] is True
+    assert "dummy-token-sentinel" not in sibling_json
+    assert "private-sentinel" not in sibling_json
+    assert len(response["events"]) == 1
+    assert response["events"][0]["id"] == event_id
+    assert requested_exact["id"] == sibling_id
+    assert requested_exact["payload"]["safe_identity"] == "preserve-sibling"
     assert response["exact_event_raw_loaded"] is True
     assert response["warm_cache"]["status"] == "miss"
     assert cached["warm_cache"]["status"] == "hit"
-    assert cached["exact_event"] == exact
-    assert transported["exact_event"] == exact
+    assert cached["exact_event"] == requested_exact
+    assert cached["events"] == response["events"]
+    assert transported["exact_event"] == requested_exact
+    assert transported["events"] == response["events"]
     assert exact["id"] == event_id
     assert exact["project_id"] == PID
     assert exact["backlog_id"] == backlog_id
@@ -189429,13 +189567,15 @@ def test_exact_timeline_handler_projects_public_event_before_cache_and_transport
         "dummy-cookie-sentinel",
         "secret-ref-sentinel",
         "private-context-id-sentinel",
+        "dummy-sibling-token-sentinel",
+        "dummy-sibling-private-sentinel",
         "DUMMY_NESTED_SENTINEL",
         "/Users/dummy/private",
     ):
-        assert sentinel not in exact_json
+        assert sentinel not in projected_json
         assert sentinel.encode() not in http_bytes
-    assert "[private detail redacted]" in exact_json
-    assert "[local path redacted]" in exact_json
+    assert "[private detail redacted]" in projected_json
+    assert "[local path redacted]" in projected_json
 
     wrong_scope = server.handle_task_timeline_list(
         _ctx(
@@ -189474,14 +189614,90 @@ def test_exact_timeline_handler_projects_public_event_before_cache_and_transport
     )
     assert "dummy-token-sentinel" not in json.dumps(wrong_project, sort_keys=True)
 
-    stored_after = tuple(
-        conn.execute(
-            """SELECT payload_json, verification_json, artifact_refs_json
-               FROM task_timeline_events WHERE id = ?""",
-            (event_id,),
-        ).fetchone()
+    with pytest.raises(GovernanceError) as missing_backlog:
+        server.handle_task_timeline_list(
+            _ctx(
+                {"project_id": PID},
+                query={**query, "backlog_id": "AC-MISSING-BACKLOG"},
+            )
+        )
+    assert missing_backlog.value.code == "not_found"
+    assert missing_backlog.value.status == 404
+
+    with pytest.raises(ValidationError, match="exact_event_id requires backlog_id"):
+        server.handle_task_timeline_list(
+            _ctx(
+                {"project_id": PID},
+                query={"exact_event_id": str(event_id), "view": "public"},
+            )
+        )
+
+    server._timeline_warm_cache_clear()
+    full_dispatch_bodies = []
+    for expected_cache_status in ("miss", "hit"):
+        public_handler = _bare_handler()
+        public_handler.path = (
+            f"/api/task/{PID}/timeline?{server.urlencode(query)}"
+        )
+        public_handler.do_GET()
+        public_http_bytes = public_handler.wfile.getvalue()
+        public_body = json.loads(public_http_bytes)
+        full_dispatch_bodies.append(public_body)
+        assert public_handler.sent_statuses == [200]
+        assert public_body["warm_cache"]["status"] == expected_cache_status
+        assert public_body["events"][0]["id"] == event_id
+        assert public_body["exact_event"]["id"] == sibling_id
+        for sentinel in (
+            "dummy-token-sentinel",
+            "dummy-sibling-token-sentinel",
+            "dummy-sibling-private-sentinel",
+            "DUMMY_NESTED_SENTINEL",
+            "/Users/dummy/private",
+        ):
+            assert sentinel.encode() not in public_http_bytes
+    assert full_dispatch_bodies[0]["events"] == (
+        full_dispatch_bodies[1]["events"]
     )
+    assert full_dispatch_bodies[0]["exact_event"] == (
+        full_dispatch_bodies[1]["exact_event"]
+    )
+
+    stored_after = [
+        tuple(row)
+        for row in conn.execute(
+            """SELECT payload_json, verification_json, artifact_refs_json
+               FROM task_timeline_events WHERE id IN (?, ?) ORDER BY id""",
+            (event_id, sibling_id),
+        ).fetchall()
+    ]
     assert stored_after == stored_before
+
+    # Access qualification precedes both cache lookup and event projection.
+    # The first rejection exercises a previously warm public response after
+    # the backlog becomes private; the full-dispatch rejection exercises a
+    # cold request through GovernanceHandler and its JSON serializer.
+    conn.execute(
+        "UPDATE backlog_bugs SET bypass_policy_json = ? WHERE bug_id = ?",
+        (
+            json.dumps({"privacy_level": "private", "public_safe": False}),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    with pytest.raises(PermissionDeniedError):
+        server.handle_task_timeline_list(
+            _ctx({"project_id": PID}, query=query)
+        )
+    server._timeline_warm_cache_clear()
+    private_handler = _bare_handler()
+    private_handler.path = (
+        f"/api/task/{PID}/timeline?{server.urlencode(query)}"
+    )
+    private_handler.do_GET()
+    private_http_bytes = private_handler.wfile.getvalue()
+    assert private_handler.sent_statuses == [403]
+    assert b"dummy-token-sentinel" not in private_http_bytes
+    assert b"private-sentinel" not in private_http_bytes
 
 
 def test_exact_timeline_handler_marks_malformed_and_oversized_aliases(conn):

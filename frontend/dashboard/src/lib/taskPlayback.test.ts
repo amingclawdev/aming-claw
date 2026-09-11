@@ -1208,14 +1208,27 @@ function assertFixture(condition: boolean, message: string): void {
 
 async function taskPlaybackApiSingleFlightAssertions(): Promise<string[]> {
   const originalFetch = globalThis.fetch;
+  const originalWindowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
   let fetchCount = 0;
   let requestedUrl = "";
   const bootstrapResponse = {
     ok: true,
     project_id: "aming-claw",
     backlog_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
-    events: [],
-    count: 0,
+    events: [{
+      id: 64,
+      event_id: 64,
+      project_id: "aming-claw",
+      backlog_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
+      task_id: "cex-ordinary-64",
+      event_type: "worker.implementation",
+      event_kind: "worker.implementation",
+      actor: "ordinary-worker",
+      status: "passed",
+      payload: { contract_execution_id: "cex-ordinary-64", safe_identity: "ordinary-64" },
+      created_at: "2026-09-10T22:00:00Z",
+    }],
+    count: 1,
     contract_runtime_visualization: {
       schema_version: "contract_runtime.visualization.v1",
       ok: true,
@@ -1307,11 +1320,12 @@ async function taskPlaybackApiSingleFlightAssertions(): Promise<string[]> {
       mode: "compact",
     },
   };
+  let responseBody: unknown = bootstrapResponse;
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     fetchCount += 1;
     requestedUrl = String(input);
     await Promise.resolve();
-    return new Response(JSON.stringify(bootstrapResponse), {
+    return new Response(JSON.stringify(responseBody), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -1341,10 +1355,122 @@ async function taskPlaybackApiSingleFlightAssertions(): Promise<string[]> {
         && gate.bug_id === "AC-BOOTSTRAP-SINGLE-FLIGHT",
       "the one shared GET should fan out the timeline/visualization and gate views",
     );
+    assertFixture(
+      timeline.events.length === 1
+        && (timeline.events[0] as unknown as { id: unknown }).id === 64
+        && (timeline.events[0].payload as Record<string, unknown>).contract_execution_id === "cex-ordinary-64",
+      "ordinary event #64 must remain a single native-numeric event without exact-event enrichment",
+    );
+
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: {
+          search: "?project_id=aming-claw&playback_backlog=AC-BOOTSTRAP-SINGLE-FLIGHT&playback_event=1",
+        },
+      },
+    });
+    const compactEvent = {
+      id: 1,
+      project_id: "aming-claw",
+      backlog_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
+      task_id: "cex-exact-1",
+      event_type: "fixture.unknown",
+      event_kind: "fixture.unknown",
+      actor: "compact-actor",
+      status: "recorded",
+      payload: {
+        schema_version: "task_timeline.compact_payload_ref.v1",
+        event_id: 1,
+        payload_sha256: `sha256:${"a".repeat(64)}`,
+        payload_bytes: 128,
+        raw_payload_omitted: true,
+      },
+      created_at: "2026-09-10T21:00:00Z",
+    };
+    const exactEvent = {
+      id: 1,
+      project_id: "aming-claw",
+      backlog_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
+      task_id: "cex-exact-1",
+      event_type: "fixture.unknown",
+      event_kind: "fixture.unknown",
+      actor: "exact-actor",
+      status: "recorded",
+      payload: {
+        contract_execution_id: "cex-exact-1",
+        safe_identity: "exact-identity",
+      },
+      created_at: "2026-09-10T21:00:00Z",
+      public_safe: true,
+    };
+    responseBody = {
+      ...bootstrapResponse,
+      events: [compactEvent],
+      count: 1,
+      exact_event: exactEvent,
+      exact_event_id: 1,
+    };
+    const enrichedTimeline = await api.taskTimelineFor(
+      "aming-claw",
+      "AC-BOOTSTRAP-SINGLE-FLIGHT",
+      50,
+    );
+    assertFixture(requestedUrl.includes("exact_event_id=1"), "the full Playback request must carry the selected durable event id");
+    assertFixture(
+      enrichedTimeline.events.length === 1
+        && (enrichedTimeline.events[0] as unknown as { id: unknown }).id === 1
+        && enrichedTimeline.events[0].actor === "exact-actor"
+        && (enrichedTimeline.events[0].payload as Record<string, unknown>).contract_execution_id === "cex-exact-1",
+      "same-scope compact and exact records must merge once while retaining exact CEX, actor, time, and native identity",
+    );
+    const enrichedTrace = normalizeTaskPlaybackTrace({
+      projectId: "aming-claw",
+      backlog: {
+        bug_id: "AC-BOOTSTRAP-SINGLE-FLIGHT",
+        title: "Compact bootstrap",
+        status: "OPEN",
+        priority: "P1",
+      },
+      taskTimeline: enrichedTimeline,
+      gateResponse: null,
+      source: "governed",
+    });
+    assertFixture(
+      enrichedTrace.frames.length === 1
+        && enrichedTrace.frames[0].source_event_id === "#1"
+        && enrichedTrace.frames[0].contract_execution_id === "cex-exact-1",
+      "Playback must consume the enriched event identity instead of the compact placeholder",
+    );
+
+    responseBody = {
+      ...bootstrapResponse,
+      events: [{
+        ...compactEvent,
+        payload: { contract_execution_id: "cex-unrelated" },
+      }],
+      exact_event: exactEvent,
+      exact_event_id: 1,
+    };
+    let mismatchedCexError = "";
+    try {
+      await api.taskTimelineFor("aming-claw", "AC-BOOTSTRAP-SINGLE-FLIGHT", 50);
+    } catch (error) {
+      mismatchedCexError = String(error);
+    }
+    assertFixture(
+      mismatchedCexError.includes("did not match the same scope"),
+      "an explicit compact CEX mismatch must fail closed instead of borrowing exact-event identity",
+    );
   } finally {
     globalThis.fetch = originalFetch;
+    if (originalWindowDescriptor) {
+      Object.defineProperty(globalThis, "window", originalWindowDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
   }
-  return ["compact playback API coalesces timeline/visualization/gate into one GET"];
+  return ["compact playback API coalesces requests and scope-safely enriches a same-id exact event"];
 }
 
 export const taskPlaybackApiSingleFlightSummary = await taskPlaybackApiSingleFlightAssertions();
@@ -1511,7 +1637,7 @@ async function taskPlaybackLazyRawAssertions(): Promise<string[]> {
       count: 0,
       exact_event: {
         id: 902,
-        event_id: "902",
+        event_id: 902,
         project_id: eventProject,
         backlog_id: "AC-RAW-BOUNDARY",
         task_id: "cex-raw",
@@ -1533,6 +1659,96 @@ async function taskPlaybackLazyRawAssertions(): Promise<string[]> {
         && !rendered.includes("/Users/private/raw"),
       "decoded and JSON-column raw exact data must be sanitized before renderer/copy access",
     );
+    assertFixture(
+      (event as unknown as { event_id: unknown }).event_id === 902,
+      "the API boundary must retain a native numeric timeline event_id",
+    );
+    const numericFrame = projectTaskPlaybackFrame(event);
+    const numericCard = projectEventToCard(event);
+    assertFixture(
+      numericFrame.source_event_id === "902"
+        && numericFrame.durable_event_id === "902"
+        && numericCard.durable_event_id === "902",
+      "numeric event_id must render and remain a durable Playback identity",
+    );
+
+    const neighboringEvents = Array.from({ length: TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT }, (_, index) => ({
+      id: 1000 + index,
+      event_id: 1000 + index,
+      project_id: "aming-claw",
+      backlog_id: "AC-RAW-BOUNDARY",
+      task_id: "cex-raw",
+      event_type: "fixture.hot_window",
+      event_kind: "fixture",
+      status: "recorded",
+      created_at: `2026-09-10T09:${String(index).padStart(2, "0")}:00Z`,
+    })) as unknown as TaskTimelineEvent[];
+    const exactOutsideWindow = {
+      ...event,
+      created_at: "2026-09-10T08:00:00Z",
+    };
+    const originalWindowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: {
+          search: "?project_id=aming-claw&playback_backlog=AC-RAW-BOUNDARY&playback_event=902",
+        },
+      },
+    });
+    try {
+      resetTaskPlaybackMemoryHotWindowsForTests();
+      const hydratedTrace = normalizeTaskPlaybackTrace({
+        projectId: "aming-claw",
+        backlog: {
+          bug_id: "AC-RAW-BOUNDARY",
+          title: "Raw boundary",
+          status: "OPEN",
+          priority: "P1",
+        },
+        taskTimeline: {
+          project_id: "aming-claw",
+          backlog_id: "AC-RAW-BOUNDARY",
+          events: [exactOutsideWindow, ...neighboringEvents],
+          count: neighboringEvents.length + 1,
+        },
+        gateResponse: null,
+        source: "governed",
+      });
+      const hotTrace = rememberProjectPlaybackHotWindow(
+        "aming-claw",
+        "AC-RAW-BOUNDARY",
+        hydratedTrace,
+      ).values[0];
+      assertFixture(
+        hotTrace.frames.length === TASK_PLAYBACK_CURRENT_HOT_WINDOW_LIMIT
+          && hotTrace.frames.some((frame) => frame.durable_event_id === "902")
+          && resolveInitialPlaybackFrameId(hotTrace.frames, "902") === "902",
+        "a requested durable numeric event outside the newest-50 window must remain retained and selected",
+      );
+      for (const mismatchedSearch of [
+        "?project_id=another-project&playback_backlog=AC-RAW-BOUNDARY&playback_event=902",
+        "?project_id=aming-claw&playback_backlog=AC-OTHER&playback_event=902",
+      ]) {
+        (globalThis.window as unknown as { location: { search: string } }).location.search = mismatchedSearch;
+        resetTaskPlaybackMemoryHotWindowsForTests();
+        const mismatchedHotTrace = rememberProjectPlaybackHotWindow(
+          "aming-claw",
+          "AC-RAW-BOUNDARY",
+          hydratedTrace,
+        ).values[0];
+        assertFixture(
+          !mismatchedHotTrace.frames.some((frame) => frame.durable_event_id === "902"),
+          "a delayed project/backlog selection must not pin an event from the previous scope",
+        );
+      }
+    } finally {
+      if (originalWindowDescriptor) {
+        Object.defineProperty(globalThis, "window", originalWindowDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "window");
+      }
+    }
     responseProject = "different-project";
     let scopedError = "";
     try {

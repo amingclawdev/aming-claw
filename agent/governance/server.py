@@ -206879,6 +206879,33 @@ def handle_task_timeline_list(ctx: RequestContext):
     with DBContext(project_id) as conn:
         task_timeline.ensure_schema(conn)
 
+        bootstrap_row: Mapping[str, Any] | None = None
+        if compact_playback_bootstrap and not backlog_id:
+            raise ValidationError(
+                "playback_bootstrap=compact requires backlog_id"
+            )
+        if exact_event_id > 0 and not backlog_id:
+            raise ValidationError("exact_event_id requires backlog_id")
+        if backlog_id and (compact_playback_bootstrap or exact_event_id > 0):
+            bootstrap_row = conn.execute(
+                "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+                (backlog_id,),
+            ).fetchone()
+            if not bootstrap_row:
+                raise GovernanceError(
+                    "not_found",
+                    f"Bug {backlog_id} not found",
+                    404,
+                )
+            if bootstrap_row is not None:
+                compact_backlog = _backlog_compact_bug(bootstrap_row)
+                if not compact_backlog.get("public_safe", True):
+                    raise PermissionDeniedError(
+                        "anonymous",
+                        "read_private_contract_runtime_visualization",
+                        {"backlog_id": backlog_id, "public_safe": False},
+                    )
+
         playback_hot_window_request = bool(
             compact_playback_bootstrap
             and backlog_id
@@ -206975,30 +207002,8 @@ def handle_task_timeline_list(ctx: RequestContext):
                 response,
                 cache_metadata,
             )
-        bootstrap_row: Mapping[str, Any] | None = None
         gate_events: list[dict[str, Any]] = []
         if compact_playback_bootstrap:
-            if not backlog_id:
-                raise ValidationError(
-                    "playback_bootstrap=compact requires backlog_id"
-                )
-            bootstrap_row = conn.execute(
-                "SELECT * FROM backlog_bugs WHERE bug_id = ?",
-                (backlog_id,),
-            ).fetchone()
-            if not bootstrap_row:
-                raise GovernanceError(
-                    "not_found",
-                    f"Bug {backlog_id} not found",
-                    404,
-                )
-            compact_backlog = _backlog_compact_bug(bootstrap_row)
-            if not compact_backlog.get("public_safe", True):
-                raise PermissionDeniedError(
-                    "anonymous",
-                    "read_private_contract_runtime_visualization",
-                    {"backlog_id": backlog_id, "public_safe": False},
-                )
             gate_events = task_timeline.list_backlog_gate_events(
                 conn,
                 project_id,
@@ -207039,6 +207044,11 @@ def handle_task_timeline_list(ctx: RequestContext):
                 parent_event_id=parent_event_id,
                 limit=limit,
             )
+        if exact_event_id > 0 and backlog_id and not compact_playback_bootstrap:
+            events = [
+                _task_timeline_public_exact_event(event)
+                for event in events
+            ]
         exact_event: dict[str, Any] | None = None
         if exact_event_id > 0 and backlog_id:
             exact_row = conn.execute(
@@ -217170,6 +217180,23 @@ def _string_list_field(value: Any, *, limit: int | None = None) -> list[str]:
     return values[:limit] if limit is not None else values
 
 
+def _backlog_compact_acceptance_field(
+    value: Any,
+    *,
+    limit: int = 2,
+) -> list[Any]:
+    """Keep typed acceptance mappings while retaining legacy string rows."""
+    values: list[Any] = []
+    for item in _json_list_field(value):
+        if isinstance(item, Mapping):
+            values.append(deepcopy(dict(item)))
+            continue
+        text = str(item)
+        if text.strip():
+            values.append(text)
+    return values[:limit]
+
+
 def _compact_preview(value: Any, limit: int = _BACKLOG_COMPACT_PREVIEW_CHARS) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= limit:
@@ -217224,7 +217251,7 @@ def _backlog_compact_bug(row: sqlite3.Row | dict) -> dict:
     raw = dict(row)
     target_files = _string_list_field(raw.get("target_files"), limit=3)
     test_files = _string_list_field(raw.get("test_files"), limit=3)
-    acceptance = _string_list_field(raw.get("acceptance_criteria"), limit=2)
+    acceptance = _backlog_compact_acceptance_field(raw.get("acceptance_criteria"))
     required_docs = _string_list_field(raw.get("required_docs"), limit=3)
     provenance_paths = _string_list_field(raw.get("provenance_paths"), limit=3)
     privacy_level, public_safe = _backlog_compact_bug_privacy(raw)

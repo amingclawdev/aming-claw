@@ -200,11 +200,79 @@ function publicSafeTimelineEvent(event: TaskTimelineResponse["events"][number]):
   const value = sanitized.value && typeof sanitized.value === "object"
     ? sanitized.value as TaskTimelineResponse["events"][number]
     : {} as TaskTimelineResponse["events"][number];
-  return {
+  const projected = {
     ...value,
     public_safe: true,
     raw_evidence_omitted: event.raw_evidence_omitted === true,
   };
+  const nativeId = (event as unknown as { id?: unknown }).id;
+  const nativeEventId = (event as unknown as { event_id?: unknown }).event_id;
+  if (typeof nativeId === "number" && Number.isFinite(nativeId)) {
+    (projected as unknown as { id: number }).id = nativeId;
+  }
+  if (typeof nativeEventId === "number" && Number.isFinite(nativeEventId)) {
+    (projected as unknown as { event_id: number }).event_id = nativeEventId;
+  }
+  return projected;
+}
+
+function timelineEventContractExecutionId(
+  event: TaskTimelineResponse["events"][number],
+): string {
+  const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+  const verification = event.verification && typeof event.verification === "object" ? event.verification : {};
+  const artifactRefs = event.artifact_refs && typeof event.artifact_refs === "object" ? event.artifact_refs : {};
+  return String(
+    event.contract_execution_id
+      ?? payload.contract_execution_id
+      ?? verification.contract_execution_id
+      ?? artifactRefs.contract_execution_id
+      ?? "",
+  ).trim();
+}
+
+function mergeExactTimelineEvent(
+  events: TaskTimelineResponse["events"],
+  exactEvent: TaskTimelineResponse["events"][number] | undefined,
+  projectId: string,
+  backlogId: string,
+  requestId = "",
+): TaskTimelineResponse["events"] {
+  if (!exactEvent) return events;
+  const exactEventId = durableTimelineEventId(exactEvent.id ?? exactEvent.event_id);
+  if (!exactEventId) return [exactEvent, ...events];
+  const matching = events.filter((event) => (
+    durableTimelineEventId(event.id ?? event.event_id) === exactEventId
+  ));
+  if (matching.length === 0) return [exactEvent, ...events];
+  if (matching.length > 1) {
+    throw new ApiError(502, "Timeline response contained duplicate durable event identities", requestId);
+  }
+  const compactEvent = matching[0];
+  const compactProject = String(compactEvent.project_id ?? projectId).trim();
+  const compactBacklog = String(compactEvent.backlog_id ?? backlogId).trim();
+  const compactTask = String(compactEvent.task_id ?? "").trim();
+  const exactTask = String(exactEvent.task_id ?? "").trim();
+  const compactContractExecutionId = timelineEventContractExecutionId(compactEvent);
+  const exactContractExecutionId = timelineEventContractExecutionId(exactEvent);
+  if (
+    compactProject !== projectId.trim()
+    || compactBacklog !== backlogId.trim()
+    || (compactTask && exactTask && compactTask !== exactTask)
+    || (
+      compactContractExecutionId
+      && exactContractExecutionId
+      && compactContractExecutionId !== exactContractExecutionId
+    )
+  ) {
+    throw new ApiError(502, "Compact and exact timeline events did not match the same scope", requestId);
+  }
+  const merged = { ...compactEvent, ...exactEvent };
+  return events.map((event) => (
+    durableTimelineEventId(event.id ?? event.event_id) === exactEventId
+      ? merged
+      : event
+  ));
 }
 
 function assetImpactReminderQuery(opts: { asset_kind?: string; status?: string } = {}): string {
@@ -767,9 +835,13 @@ export const api = {
         throw new ApiError(502, "Exact timeline event did not match the requested project/backlog/event scope", taskTimeline.request_id ?? "");
       }
       const exactEvent = rawExactEvent ? publicSafeTimelineEvent(rawExactEvent) : undefined;
-      const events = exactEvent && !taskTimeline.events.some((event) => String(event.event_id ?? event.id ?? "") === String(exactEvent.event_id ?? exactEvent.id ?? ""))
-        ? [exactEvent, ...taskTimeline.events]
-        : taskTimeline.events;
+      const events = mergeExactTimelineEvent(
+        taskTimeline.events,
+        exactEvent,
+        projectId,
+        backlogId,
+        taskTimeline.request_id ?? "",
+      );
       return {
         ...taskTimeline,
         events,

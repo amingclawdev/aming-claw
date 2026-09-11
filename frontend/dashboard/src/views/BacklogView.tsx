@@ -784,7 +784,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
   );
 }
 
-function BacklogRow({
+export function BacklogRow({
   bug,
   projectId,
   onOpenDetail,
@@ -795,9 +795,6 @@ function BacklogRow({
 }) {
   const files = listFrom(bug.target_files);
   const criteria = acceptanceCriteriaFrom(bug.acceptance_criteria);
-  const runtime = bug.runtime_state || bug.chain_stage || bug.mf_type || "idle";
-  const contract = bug.contract_summary;
-  const projectionStatus = contract?.projection_status || (contract?.divergent ? "divergent" : contract?.stale ? "stale" : "");
   const commandProjection = bug.observer_command_projection;
   const commandRecovery = commandProjection?.recovery;
   const commandProjectionStatus = commandRecovery?.classification || commandProjection?.command_projection_status || commandProjection?.projection?.command_projection_status || "";
@@ -855,18 +852,9 @@ function BacklogRow({
           )}
         </td>
         <td>
-          <div className="mono">{runtime}</div>
-          {contract?.has_contract ? (
-            <div className="backlog-commit mono" title="Contract evidence requirements">
-              contract {contract.template_id || contract.contract_instance_id || "declared"} · req {contract.required_evidence_count ?? 0}
-            </div>
-          ) : null}
-          {projectionStatus ? (
-            <div className="backlog-commit mono" title={`Contract projection from ${contract?.source_of_truth || "Contract/Revision/Event"}`}>
-              projection {projectionStatus}
-              {contract?.projection_watermark ? ` · ${shortProjectionWatermark(contract.projection_watermark)}` : ""}
-            </div>
-          ) : null}
+          <div className="mono" title="Current ContractRuntime authority is not included in the compact backlog row">
+            Current authority unavailable
+          </div>
           {commandProjectionStatus ? (
             <div className="backlog-commit mono" title={commandDivergence || "Observer command terminal projection"}>
               command {commandProjectionStatus}
