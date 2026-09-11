@@ -284,8 +284,30 @@ def _stable_process_identity(pid: int) -> tuple[str, str, str]:
     """Read start, argv and cwd from the OS; a PID alone is never authority."""
     if not isinstance(pid, int) or pid <= 0:
         raise RuntimeError("AC stable authority PID is invalid")
-    start = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=2, check=False).stdout.strip()
-    command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=2, check=False).stdout.strip()
+    process = subprocess.run(
+        ["ps", "-o", "lstart=,command=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    lines = process.stdout.splitlines()
+    start = lines[0][:24] if len(lines) == 1 else ""
+    command = lines[0][24:].strip() if len(lines) == 1 else ""
+    if (
+        process.returncode != 0
+        or re.fullmatch(
+            r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+            r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+            r"(?: [1-9]|[12][0-9]|3[01]) "
+            r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60) "
+            r"[0-9]{4}",
+            start,
+        )
+        is None
+        or not command
+    ):
+        raise RuntimeError("AC stable authority process identity is unavailable")
     try:
         cwd = os.readlink(f"/proc/{pid}/cwd")
     except OSError:
@@ -377,7 +399,7 @@ def _stable_main_physical_preimage_branch(
     stable_root: Path,
     stable_anchor: str,
     worktrees: Sequence[Mapping[str, str]],
-) -> str:
+) -> tuple[str, str]:
     """Verify the one physical old-branch preimage without release authority.
 
     This is deliberately independent of ContractRuntime.  It proves only that
@@ -465,7 +487,7 @@ def _stable_main_physical_preimage_branch(
                 )
             ):
                 raise RuntimeError("AC main physical preimage source identity is invalid")
-    return old_branch
+    return old_branch, stable_head
 
 
 @dashboard_read_timed("db.verified_stable_binding")
@@ -496,16 +518,22 @@ def _verified_stable_binding() -> dict[str, object]:
         raise RuntimeError(
             "AC stable authority worktree is unavailable"
         ) from exc
-    roots = []
+    roots: list[tuple[Path, str]] = []
     worktrees = []
     for block in worktree_output.strip().split("\n\n"):
         fields = dict(line.split(" ", 1) if " " in line else (line, "") for line in block.splitlines())
         worktrees.append(fields)
         if fields.get("branch") == "refs/heads/main" and fields.get("worktree"):
             try:
+                early_head = str(fields.get("HEAD") or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", early_head):
+                    raise ValueError("invalid worktree HEAD")
                 roots.append(
-                    _absolute_non_symlink_root(
-                        Path(fields["worktree"]), create=False,
+                    (
+                        _absolute_non_symlink_root(
+                            Path(fields["worktree"]), create=False,
+                        ),
+                        early_head,
                     )
                 )
             except (OSError, ValueError) as exc:
@@ -519,13 +547,13 @@ def _verified_stable_binding() -> dict[str, object]:
             )
         except (OSError, ValueError) as exc:
             raise RuntimeError("AC main physical preimage stable root is invalid") from exc
-        expected_branch = _stable_main_physical_preimage_branch(
+        expected_branch, early_head = _stable_main_physical_preimage_branch(
             root, stable_root, str(identity.get("commit") or ""), worktrees,
         )
-        roots = [stable_root]
+        roots = [(stable_root, early_head)]
     if len(roots) != 1:
         raise RuntimeError("AC stable authority worktree is unavailable")
-    stable_root = roots[0]
+    stable_root, head = roots[0]
     server_command = "agent.governance.server" in command or (
         "-m agent.cli" in command and " start " in f" {command} "
     )
@@ -535,16 +563,6 @@ def _verified_stable_binding() -> dict[str, object]:
         or not server_command
     ):
         raise RuntimeError("AC stable authority process binding is invalid")
-    try:
-        head = _git_read_exact(
-            stable_root, "rev-parse", "HEAD", timeout=5
-        ).decode(
-            "utf-8"
-        ).strip().lower()
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise RuntimeError(
-            "AC stable authority worktree identity changed"
-        ) from exc
     source_path = stable_root / "agent" / "governance" / "server.py"
     source_hash = "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
     identity = health.get("runtime_plane_identity") if isinstance(health.get("runtime_plane_identity"), Mapping) else {}
@@ -568,7 +586,7 @@ def _verified_stable_binding() -> dict[str, object]:
         and "aming-claw" not in set(identity.get("project_allowlist") or [])
     ):
         raise RuntimeError("AC stable authority source identity is invalid")
-    shared = roots[0] / "shared-volume"
+    shared = stable_root / "shared-volume"
     if not shared.is_dir() or shared.is_symlink() or shared.resolve(strict=True) != shared:
         raise RuntimeError("AC stable authority shared volume is invalid")
     try:

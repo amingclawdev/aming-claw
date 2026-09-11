@@ -224728,22 +224728,224 @@ def test_verified_stable_binding_preserves_five_second_git_timeouts(
 ):
     from agent.tests.test_governance_db import _install_fixed_stable_boundary
 
-    _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    shared = _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    source_path = shared.parent / "agent/governance/server.py"
     calls: list[tuple[tuple[str, ...], int]] = []
+    observations: list[object] = []
     original = governance_db._git_read_exact
+    original_read_bytes = Path.read_bytes
 
     def observed(root: Path, *args: str, timeout: int = 10) -> bytes:
         calls.append((args, timeout))
+        observations.append(args)
         return original(root, *args, timeout=timeout)
 
+    def observed_read_bytes(path: Path) -> bytes:
+        if path == source_path:
+            observations.append("stable-source")
+        return original_read_bytes(path)
+
     monkeypatch.setattr(governance_db, "_git_read_exact", observed)
+    monkeypatch.setattr(Path, "read_bytes", observed_read_bytes)
     binding = governance_db._verified_stable_binding()
     assert Path(binding["shared_volume_path"]).is_dir()
     assert calls == [
         (("worktree", "list", "--porcelain"), 5),
-        (("rev-parse", "HEAD"), 5),
         (("status", "--porcelain=v2", "--branch", "--no-ahead-behind"), 5),
     ]
+    assert observations == [
+        ("worktree", "list", "--porcelain"),
+        "stable-source",
+        ("status", "--porcelain=v2", "--branch", "--no-ahead-behind"),
+    ]
+
+
+def test_stable_process_identity_batches_birth_and_command_and_keeps_cwd(
+    monkeypatch,
+):
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(argv, **kwargs):
+        calls.append((list(argv), dict(kwargs)))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "Fri Sep 11 17:08:53 2026     "
+                "python -m agent.governance.server\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(governance_db.subprocess, "run", run)
+    monkeypatch.setattr(
+        governance_db.os,
+        "readlink",
+        lambda path: "/stable-root" if path == "/proc/4242/cwd" else "",
+    )
+
+    assert governance_db._stable_process_identity(4242) == (
+        "Fri Sep 11 17:08:53 2026",
+        "python -m agent.governance.server",
+        "/stable-root",
+    )
+    assert calls == [
+        (
+            ["ps", "-o", "lstart=,command=", "-p", "4242"],
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 2,
+                "check": False,
+            },
+        )
+    ]
+
+
+def test_stable_process_identity_keeps_macos_lsof_cwd_fallback(monkeypatch):
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(argv, **kwargs):
+        calls.append((list(argv), dict(kwargs)))
+        if argv[0] == "ps":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "Fri Sep 11 17:08:53 2026     "
+                    "python -m agent.governance.server\n"
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout="p4242\nn/stable-root\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(governance_db.subprocess, "run", run)
+    monkeypatch.setattr(
+        governance_db.os,
+        "readlink",
+        lambda _path: (_ for _ in ()).throw(OSError("no procfs")),
+    )
+
+    assert governance_db._stable_process_identity(4242)[2] == "/stable-root"
+    assert [argv for argv, _kwargs in calls] == [
+        ["ps", "-o", "lstart=,command=", "-p", "4242"],
+        ["lsof", "-a", "-p", "4242", "-d", "cwd", "-Fn"],
+    ]
+    assert all(kwargs["timeout"] == 2 for _argv, kwargs in calls)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [
+        (
+            1,
+            "Fri Sep 11 17:08:53 2026     python -m agent.governance.server\n",
+        ),
+        (0, ""),
+        (0, "not-a-process-record\n"),
+        (0, "Fri Sep 11 17:08:53 2026\n"),
+        (
+            0,
+            "Fri Sep 11 17:08:53 2026     python one\n"
+            "Fri Sep 11 17:08:53 2026     python two\n",
+        ),
+    ],
+)
+def test_stable_process_identity_rejects_invalid_combined_ps_result(
+    monkeypatch, returncode, stdout
+):
+    monkeypatch.setattr(
+        governance_db.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=returncode,
+            stdout=stdout,
+            stderr="fixture-error",
+        ),
+    )
+    monkeypatch.setattr(
+        governance_db.os,
+        "readlink",
+        lambda _path: pytest.fail("invalid ps must reject before cwd lookup"),
+    )
+    with pytest.raises(RuntimeError, match="process identity is unavailable"):
+        governance_db._stable_process_identity(4242)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing-head",
+        "malformed-head",
+        "ambiguous-main",
+        "wrong-root",
+        "late-head-drift",
+        "late-wrong-branch",
+        "late-dirty",
+        "source-drift",
+    ],
+)
+def test_verified_stable_binding_rejects_selected_worktree_and_late_drift(
+    monkeypatch, tmp_path, defect
+):
+    from agent.tests.test_governance_db import _install_fixed_stable_boundary
+
+    shared = _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    stable_root = shared.parent
+    source_path = stable_root / "agent/governance/server.py"
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=stable_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    other_root = tmp_path / "other-main"
+    other_root.mkdir()
+
+    def block(root: Path, oid: str, branch: str = "main") -> str:
+        return f"worktree {root}\nHEAD {oid}\nbranch refs/heads/{branch}\n"
+
+    if defect == "missing-head":
+        worktrees = f"worktree {stable_root}\nbranch refs/heads/main\n"
+    elif defect == "malformed-head":
+        worktrees = block(stable_root, "not-an-oid")
+    elif defect == "ambiguous-main":
+        worktrees = block(stable_root, head) + "\n" + block(other_root, head)
+    elif defect == "wrong-root":
+        worktrees = block(other_root, head)
+    else:
+        worktrees = block(stable_root, head)
+
+    original = governance_db._git_read_exact
+
+    def controlled(root: Path, *args: str, timeout: int = 10) -> bytes:
+        if args == ("worktree", "list", "--porcelain"):
+            return worktrees.encode("utf-8")
+        if args == (
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--no-ahead-behind",
+        ):
+            late_head = "b" * 40 if defect == "late-head-drift" else head
+            late_branch = "other" if defect == "late-wrong-branch" else "main"
+            dirty = "? untracked.txt\n" if defect == "late-dirty" else ""
+            return (
+                f"# branch.oid {late_head}\n"
+                f"# branch.head {late_branch}\n"
+                f"{dirty}"
+            ).encode("utf-8")
+        return original(root, *args, timeout=timeout)
+
+    monkeypatch.setattr(governance_db, "_git_read_exact", controlled)
+    if defect == "source-drift":
+        source_path.write_text("# changed stable source\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="stable authority"):
+        governance_db._verified_stable_binding()
 
 
 @pytest.fixture()
