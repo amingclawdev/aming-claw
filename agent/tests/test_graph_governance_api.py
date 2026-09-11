@@ -19973,7 +19973,6 @@ def _stub_current_full_reconcile(
     )
     monkeypatch.setattr(server, "_git_head_commit", lambda _root: head)
     monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: [])
-
     def fake_reconcile(_conn, project_id, root, **kwargs):
         snapshot_id = str(kwargs.get("snapshot_id") or "full-current")
         calls.append({"project_id": project_id, "root": root, **kwargs})
@@ -39304,10 +39303,15 @@ def test_append_scoped_route_ref_renewal_rejects_ambiguous_registry_successors(
 
     assert resolved == {}
     assert diagnostic["status"] == "blocked_route_renewal_lineage"
-    assert diagnostic["field"] == "route_lineage.previous_route_token_ref"
-    assert diagnostic["expected"] == "exactly_one_registered_successor"
-    assert diagnostic["actual"] == sorted(
-        [first["route_token_ref"], forged_ref]
+    assert diagnostic["field"] == "route_lineage.active_reachability"
+    assert diagnostic["expected"] == (
+        "exactly_one_active_reachable_descendant"
+    )
+    assert sorted(diagnostic["actual"]) == sorted(
+        [
+            [old_ref, first["route_token_ref"]],
+            [old_ref, forged_ref],
+        ]
     )
     assert diagnostic["writes_performed"] is False
     assert conn.total_changes == before_total_changes
@@ -103480,6 +103484,24 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
     pinned_existing,
     route_renewal,
 ):
+    durable_database = None
+    if route_renewal:
+        durable_database = tmp_path / "renewed-direct-main.sqlite3"
+        durable_conn = sqlite3.connect(durable_database)
+        durable_conn.row_factory = sqlite3.Row
+        conn.backup(durable_conn)
+        durable_conn.execute("PRAGMA foreign_keys = ON")
+        conn = durable_conn
+        monkeypatch.setattr(
+            server,
+            "get_connection",
+            lambda _project_id: _NoCloseConn(conn),
+        )
+        monkeypatch.setattr(
+            governance_db,
+            "get_connection",
+            lambda _project_id: _NoCloseConn(conn),
+        )
     backlog_id = "AC-DIRECT-MAIN-REV2-SINGLE-ADMISSION-WARRANTY"
     demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
     project_root = demo_root / "direct-main-rev2-single-admission"
@@ -103562,6 +103584,15 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
             ],
         },
     )
+    if route_renewal:
+        initial_ownership = (
+            server._operator_supervised_direct_main_persisted_world_ownership(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+            )
+        )
+        assert initial_ownership["world"] == "unbound", initial_ownership
     if pinned_existing:
         world_ref = server._operator_supervised_direct_main_world_ref(
             project_id=PID,
@@ -104331,6 +104362,49 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
         assert active_guide_authority["immutable_route_identity"] == (
             immutable_route_identity
         )
+        unrelated = observer_route_context.issue_observer_write_route_context(
+            project_id=PID,
+            backlog_id="AC-UNRELATED-DIRECT-MAIN-RENEWAL",
+            task_id="cex-unrelated-direct-main-renewal",
+            target_files=row_files,
+            allowed_actions=list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+            ttl_hours=24.0,
+            now=datetime(2099, 8, 23, 1, 1, tzinfo=timezone.utc),
+        )
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=unrelated["route_token_ref"],
+            token=unrelated["route_token"],
+        )
+        conn.commit()
+        unrelated_before = tuple(conn.iterdump())
+        unrelated_changes = conn.total_changes
+        unrelated_guide = server.handle_project_onboard_route_guide(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "role": "observer",
+                    "work_type": "operator_supervised_direct_main",
+                    "route_token_ref": unrelated["route_token_ref"],
+                },
+            )
+        )
+        assert unrelated_guide["ok"] is False
+        assert unrelated_guide["error"] == (
+            "operator_supervised_direct_main_route_binding_changed"
+        )
+        assert unrelated_guide["zero_write_rejection"] is True
+        assert conn.total_changes == unrelated_changes
+        assert tuple(conn.iterdump()) == unrelated_before
+        assert durable_database is not None
+        with sqlite3.connect(durable_database) as fresh:
+            assert tuple(fresh.iterdump()) == unrelated_before
 
     implementation_commit = _commit_test_git_files(
         project_root,
@@ -104733,6 +104807,21 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
     ] is False
 
     monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: [])
+    actual_reconcile = state_reconcile.run_state_only_full_reconcile
+    actual_reconcile_calls: list[dict[str, Any]] = []
+
+    def observed_actual_reconcile(*args, **kwargs):
+        actual_reconcile_calls.append(
+            {
+                "module": actual_reconcile.__module__,
+                "name": actual_reconcile.__name__,
+                "project_id": args[1],
+                "root": str(args[2]),
+                "run_id": kwargs.get("run_id"),
+                "snapshot_id": kwargs.get("snapshot_id"),
+            }
+        )
+        return actual_reconcile(*args, **kwargs)
 
     def fake_reconcile(_conn, project_id, _root, **kwargs):
         store.create_graph_snapshot(
@@ -104757,7 +104846,7 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
     monkeypatch.setattr(
         state_reconcile,
         "run_state_only_full_reconcile",
-        fake_reconcile,
+        observed_actual_reconcile if route_renewal else fake_reconcile,
     )
     reconcile_status, reconcile = (
         server.handle_graph_governance_current_full_reconcile(
@@ -104769,6 +104858,17 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
         )
     )
     assert reconcile_status == 201
+    if route_renewal:
+        assert actual_reconcile_calls == [
+            {
+                "module": "agent.governance.state_reconcile",
+                "name": "run_state_only_full_reconcile",
+                "project_id": PID,
+                "root": str(project_root),
+                "run_id": reconcile_body["run_id"],
+                "snapshot_id": snapshot_id,
+            }
+        ]
     assert reconcile["activated"] is True
     assert reconcile["active_snapshot_id"] == snapshot_id
     reconcile_event = conn.execute(
@@ -105251,6 +105351,22 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
     )
     assert closed["ok"] is True
     assert closed["status"] == "FIXED"
+    if durable_database is not None:
+        conn.commit()
+        with sqlite3.connect(durable_database) as fresh:
+            fresh.row_factory = sqlite3.Row
+            durable_backlog = fresh.execute(
+                'SELECT status, "commit" FROM backlog_bugs WHERE bug_id = ?',
+                (backlog_id,),
+            ).fetchone()
+            assert durable_backlog["status"] == "FIXED"
+            assert durable_backlog["commit"] == implementation_commit
+            durable_record = SQLiteContractExecutionStore(fresh).get(task_id)
+            assert durable_record["metadata"][
+                "operator_supervised_direct_main_runtime_binding"
+            ]["route_identity"] == immutable_route_identity
+            assert len(durable_record["completed_lines"]) == 8
+        conn.close()
 
 
 def _canonical_parentless_direct_main_commit_message(
@@ -212579,6 +212695,20 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
                 "world-r2-stable-pre-mutation"
             ),
         )
+        active_route_token_ref = issued["route_token_ref"]
+        if target_line == "observer_implementation":
+            renewed = observer_route_context.renew_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=issued["route_token_ref"],
+                backlog_id=backlog_id,
+                task_id=execution_id,
+                caller_role="observer",
+                evidence_refs=[f"contract_runtime:{execution_id}"],
+                project_root=workspace,
+            )
+            active_route_token_ref = renewed["route_token_ref"]
+            assert active_route_token_ref != issued["route_token_ref"]
         session_id = _insert_ac_dev_active_observer_session(
             conn,
             project_id=project_id,
@@ -212591,6 +212721,12 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
         )
         assert current["execution_state_revision"] == 4
         assert len(current["completed_lines"]) == 3
+        persisted_binding = current["metadata"][
+            "operator_supervised_direct_main_runtime_binding"
+        ]
+        assert persisted_binding["route_identity"]["route_token_ref"] == (
+            issued["route_token_ref"]
+        )
         ownership = (
             server._operator_supervised_direct_main_persisted_world_ownership(
                 conn,
@@ -212600,6 +212736,84 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
         )
         assert ownership["world"] == "stable"
         assert ownership["complete"] is True
+        if target_line == "observer_implementation":
+            active_row = conn.execute(
+                "SELECT task_id, allowed_actions_json, target_files_json, "
+                "expires_at FROM observer_route_token_refs "
+                "WHERE route_token_ref = ?",
+                (active_route_token_ref,),
+            ).fetchone()
+            assert active_row is not None
+            for column, invalid, expected_code in (
+                (
+                    "task_id",
+                    "cex-unrelated-stable-renewal",
+                    "route_token_ref_renewal_scope_mismatch",
+                ),
+                (
+                    "allowed_actions_json",
+                    json.dumps(["task_timeline_append"]),
+                    "route_token_ref_renewal_allowed_actions_mismatch",
+                ),
+                (
+                    "target_files_json",
+                    json.dumps(["foreign.py"]),
+                    "route_token_ref_renewal_target_files_mismatch",
+                ),
+                (
+                    "expires_at",
+                    "2000-01-01T00:00:00Z",
+                    "route_token_ref_expired",
+                ),
+            ):
+                conn.execute(
+                    f"UPDATE observer_route_token_refs SET {column} = ? "
+                    "WHERE route_token_ref = ?",
+                    (invalid, active_route_token_ref),
+                )
+                conn.commit()
+                rejected_before = tuple(conn.iterdump())
+                rejected_changes = conn.total_changes
+                with pytest.raises(
+                    observer_route_context.RouteTokenRefError
+                ) as rejected_route:
+                    observer_route_context.resolve_route_token_ref_renewal_descendant(
+                        conn,
+                        project_id=project_id,
+                        route_token_ref=issued["route_token_ref"],
+                    )
+                assert rejected_route.value.code == expected_code
+                rejected_ownership = (
+                    server._operator_supervised_direct_main_persisted_world_ownership(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=backlog_id,
+                    )
+                )
+                assert rejected_ownership["world"] == "", (
+                    column,
+                    rejected_ownership,
+                )
+                assert rejected_ownership["complete"] is False
+                assert tuple(conn.iterdump()) == rejected_before
+                assert conn.total_changes == rejected_changes
+                with sqlite3.connect(database) as fresh:
+                    assert tuple(fresh.iterdump()) == rejected_before
+                conn.execute(
+                    f"UPDATE observer_route_token_refs SET {column} = ? "
+                    "WHERE route_token_ref = ?",
+                    (active_row[column], active_route_token_ref),
+                )
+                conn.commit()
+            restored_ownership = (
+                server._operator_supervised_direct_main_persisted_world_ownership(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                )
+            )
+            assert restored_ownership["world"] == "stable"
+            assert restored_ownership["complete"] is True
 
         class ExistingConnectionContext:
             def __init__(self, _project_id):
@@ -212654,7 +212868,7 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
                     body={
                         "backlog_id": backlog_id,
                         "task_id": execution_id,
-                        "route_token_ref": issued["route_token_ref"],
+                        "route_token_ref": active_route_token_ref,
                         "event_type": "observer.implementation",
                         "event_kind": "implementation",
                         "phase": "implementation",
@@ -212759,7 +212973,7 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
-            route_token_ref=issued["route_token_ref"],
+            route_token_ref=active_route_token_ref,
             role=actor_role,
             work_type=(
                 "qa_verification"

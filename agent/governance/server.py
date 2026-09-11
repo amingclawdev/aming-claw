@@ -152016,16 +152016,92 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
     ).fetchone()
     if route_registry is None:
         return False
+    from . import observer_route_context
+
+    immutable_route_identity = {
+        field: str(route.get(field) or "").strip()
+        for field in _legacy_empty_stable_route_identity_keys
+    }
+    try:
+        resolved_route = (
+            observer_route_context.resolve_route_token_ref_renewal_descendant(
+                conn,
+                project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(
+                    project_id
+                ),
+                route_token_ref=immutable_route_identity["route_token_ref"],
+            )
+        )
+    except (
+        observer_route_context.RouteTokenRefError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    if not isinstance(resolved_route, Mapping):
+        return False
+    active_route_identity = {
+        field: str(resolved_route.get(field) or "").strip()
+        for field in _legacy_empty_stable_route_identity_keys
+    }
+    renewal = (
+        resolved_route.get("renewal_resolution")
+        if isinstance(resolved_route.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    if renewal:
+        requested_identity = (
+            renewal.get("requested_route_identity")
+            if isinstance(renewal.get("requested_route_identity"), Mapping)
+            else {}
+        )
+        resolved_identity = (
+            renewal.get("resolved_route_identity")
+            if isinstance(renewal.get("resolved_route_identity"), Mapping)
+            else {}
+        )
+        chain = renewal.get("route_token_ref_chain")
+        edges = renewal.get("edge_types")
+        renewal_valid = bool(
+            renewal.get("schema_version")
+            == "route_token_ref_exact_renewal_descendant_resolution.v1"
+            and renewal.get("status") == "resolved_active_descendant"
+            and renewal.get("exact_scope_verified") is True
+            and renewal.get("registry_verified") is True
+            and renewal.get("writes_performed") is False
+            and renewal.get("raw_route_token_exposed") is False
+            and dict(requested_identity) == immutable_route_identity
+            and dict(resolved_identity) == active_route_identity
+            and renewal.get("scope")
+            == {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": execution_id,
+            }
+            and isinstance(chain, list)
+            and len(chain) >= 2
+            and chain[0] == immutable_route_identity["route_token_ref"]
+            and chain[-1] == active_route_identity["route_token_ref"]
+            and isinstance(edges, list)
+            and len(edges) == len(chain) - 1
+        )
+    else:
+        renewal_valid = active_route_identity == immutable_route_identity
+    if not renewal_valid:
+        return False
     route_authority = _operator_supervised_direct_main_route_authority(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
         contract_execution_id=execution_id,
-        route_token_ref=str(route.get("route_token_ref") or ""),
+        route_token_ref=active_route_identity["route_token_ref"],
     )
     return bool(
         route_authority.get("accepted") is True
-        and dict(route_authority.get("route_identity") or {}) == dict(route)
+        and dict(route_authority.get("route_identity") or {})
+        == active_route_identity
     )
 
 
