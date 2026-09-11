@@ -572,6 +572,12 @@ export default function App() {
     } catch (e) {
       if ((e as { name?: string }).name === "AbortError") return;
       if (!isCurrentRequest()) return;
+      if (requestView === "backlog" || requestView === "activity") {
+        const msg = e instanceof ApiError ? `${e.message} ${e.body}` : (e as Error).message;
+        setError(msg);
+        setToast({ kind: "error", msg: `Load failed: ${msg}` });
+        return;
+      }
       if (shouldFallbackToProjects(e) && requestView === "projects") {
         setData(null);
         setDataScope(null);
@@ -1292,8 +1298,10 @@ export default function App() {
   const currentBacklog =
     backlogProjectId === currentProjectId ? backlogData : null;
   const activeViewReady =
-    view === "backlog" || view === "activity"
-      ? Boolean(currentBacklog)
+    view === "backlog"
+      ? true
+      : view === "activity"
+        ? Boolean(currentBacklog)
       : Boolean(viewData);
 
   if (view === "inbox") {
@@ -1549,10 +1557,13 @@ export default function App() {
               workspaceRoot={activeWorkspaceRoot}
             />
           ) : null}
-          {view === "backlog" && currentBacklog ? (
+          {view === "backlog" ? (
             <BacklogView
+              key={currentProjectId}
               backlog={currentBacklog}
               projectId={currentProjectId}
+              bootstrapPending={!currentBacklog && loading}
+              bootstrapError={error ?? ""}
             />
           ) : null}
           {view === "activity" && currentBacklog ? (

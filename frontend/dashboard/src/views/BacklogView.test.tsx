@@ -15,6 +15,7 @@ import {
   BacklogRow,
   filterBacklogHotWindowRows,
 } from "./BacklogView";
+import BacklogView from "./BacklogView";
 
 const projectedCommandBug: BacklogBug = {
   bug_id: "AC-OBSERVER-COMMAND-TERMINAL-PROJECTION-FROM-CONTRACT-20260604",
@@ -71,6 +72,40 @@ function renderBacklogRow(bug: BacklogBug): string {
     </table>,
   );
 }
+
+const pendingDeepLinkShell = renderToStaticMarkup(
+  <BacklogView backlog={null} projectId="aming-claw" bootstrapPending />,
+);
+assertBacklogAuthority(
+  pendingDeepLinkShell.includes('data-backlog-bootstrap-state="pending"')
+    && pendingDeepLinkShell.includes("Loading the recent Backlog page. Exact selected detail remains independent.")
+    && pendingDeepLinkShell.includes("recent page pending")
+    && !pendingDeepLinkShell.includes("cache miss · age 0ms"),
+  "an early Backlog shell must show honest pending page state without fabricating cache authority",
+);
+
+const commonFailureWhileListPendingShell = renderToStaticMarkup(
+  <BacklogView
+    backlog={null}
+    projectId="aming-claw"
+    bootstrapError='GET /api/projects → 503 {"error":"fixture_projects_failure"}'
+  />,
+);
+assertBacklogAuthority(
+  commonFailureWhileListPendingShell.includes('data-backlog-bootstrap-state="pending"')
+    && commonFailureWhileListPendingShell.includes("Loading the recent Backlog page. Exact selected detail remains independent.")
+    && commonFailureWhileListPendingShell.includes("Dashboard bootstrap read failed:")
+    && !commonFailureWhileListPendingShell.includes("No backlog rows match the current filters."),
+  "a common bootstrap failure must not turn an unresolved recent page into a fabricated empty result",
+);
+
+assertBacklogAuthority(
+  backlogViewSource.includes("requestScopeRef.current !== requestScope")
+    && backlogViewSource.includes("activeReadControllersRef.current")
+    && backlogViewSource.includes("controller.abort()")
+    && backlogViewSource.includes("detailErrorByBug[bugId]"),
+  "exact detail and timeline reads must reject stale project scope, abort when their mounted scope ends, and retain a bounded failure without a retry loop",
+);
 
 const unavailableCurrentRow = renderBacklogRow({
   bug_id: "AC-CURRENT-UNAVAILABLE",

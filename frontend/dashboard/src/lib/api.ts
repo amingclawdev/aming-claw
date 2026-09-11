@@ -328,6 +328,39 @@ function rememberBacklogHotWindow(projectId: string, response: BacklogHotWindowR
   return response;
 }
 
+/**
+ * A mount seed is reusable only when it is the canonical recent page for the
+ * same project and carries the authority generation used by the read cache.
+ * Empty UI placeholders and historical/search pages deliberately fail this
+ * check, so they can never suppress the first governed list read.
+ */
+export function backlogInitialPageMatches(
+  projectId: string,
+  response: BacklogHotWindowResponse | null | undefined,
+): response is BacklogHotWindowResponse {
+  const key = projectId.trim() || DEFAULT_PROJECT_ID;
+  return Boolean(
+    response
+      && response.scope?.project_id === key
+      && response.scope?.pagination === "hot_window"
+      && response.scope?.view === "compact"
+      && response.hot_limit === BACKLOG_HOT_WINDOW_LIMIT
+      && response.limit === BACKLOG_HOT_WINDOW_LIMIT
+      && !response.q
+      && !response.cursor
+      && Number.isFinite(response.generation)
+      && String(response.authority_generation || "").trim(),
+  );
+}
+
+function backlogInitialPageGenerationMatches(
+  left: BacklogHotWindowResponse,
+  right: BacklogHotWindowResponse,
+): boolean {
+  return left.generation === right.generation
+    && left.authority_generation === right.authority_generation;
+}
+
 function backlogSearchCursorFor(projectId: string, options: BacklogSearchOptions): string {
   if (options.cursor?.trim()) return options.cursor.trim();
   const offset = Math.max(0, options.offset ?? 0);
@@ -781,6 +814,24 @@ export const api = {
   },
   backlogRevalidateFor(projectId: string, signal?: AbortSignal) {
     return loadBacklogHotWindow(projectId, signal);
+  },
+  backlogInitialPageFor(
+    projectId: string,
+    supplied: BacklogHotWindowResponse | null | undefined,
+    signal?: AbortSignal,
+  ) {
+    const key = projectId.trim() || DEFAULT_PROJECT_ID;
+    const memory = projectBacklogHotWindows.get(key);
+    const memoryMatches = backlogInitialPageMatches(key, memory);
+    const suppliedMatches = backlogInitialPageMatches(key, supplied);
+    if (memoryMatches && (!suppliedMatches || backlogInitialPageGenerationMatches(memory, supplied))) {
+      return awaitPublicRead(Promise.resolve(memory), signal);
+    }
+    if (suppliedMatches && !memory) {
+      rememberBacklogHotWindow(key, supplied);
+      return awaitPublicRead(Promise.resolve(supplied), signal);
+    }
+    return loadBacklogHotWindow(key, signal);
   },
   backlogMemoryFor(projectId: string) {
     return projectBacklogHotWindows.get(projectId.trim() || DEFAULT_PROJECT_ID);

@@ -40,7 +40,6 @@ import type {
   BacklogAcceptanceRequiredScope,
   BacklogAuditArchive,
   BacklogAuditCloseGate,
-  BacklogResponse,
   BacklogTimelineGateResponse,
   BacklogQaAcceptance,
   ContentSysDemoVisualizationEvidence,
@@ -51,8 +50,10 @@ import type {
 } from "../types";
 
 interface Props {
-  backlog: BacklogResponse;
+  backlog: BacklogHotWindowResponse | null;
   projectId: string;
+  bootstrapPending?: boolean;
+  bootstrapError?: string;
 }
 
 type StatusFilter = "OPEN" | "CLOSED" | "ALL";
@@ -302,16 +303,25 @@ function timelineLoadErrorMessage(error: unknown): string {
   return String(error);
 }
 
-export default function BacklogView({ backlog, projectId }: Props) {
-  const bugs = backlog.bugs ?? [];
+const EMPTY_BACKLOG_PAGE: BacklogHotWindowResponse = { bugs: [], count: 0 };
+
+export default function BacklogView({
+  backlog,
+  projectId,
+  bootstrapPending = false,
+  bootstrapError = "",
+}: Props) {
+  const visibleBootstrap = backlog ?? EMPTY_BACKLOG_PAGE;
+  const bugs = visibleBootstrap.bugs ?? [];
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("OPEN");
   const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>("ALL");
   const [query, setQuery] = useState("");
   const [historyCursor, setHistoryCursor] = useState("");
   const [historyCursorTrail, setHistoryCursorTrail] = useState<string[]>([]);
-  const [serverBacklog, setServerBacklog] = useState<BacklogHotWindowResponse>(
+  const [serverBacklog, setServerBacklog] = useState<BacklogHotWindowResponse | null>(
     () => api.backlogMemoryFor(projectId) ?? backlog,
   );
+  const [initialPageError, setInitialPageError] = useState("");
   const [serverSearchLoading, setServerSearchLoading] = useState(false);
   const [serverSearchError, setServerSearchError] = useState("");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
@@ -322,14 +332,23 @@ export default function BacklogView({ backlog, projectId }: Props) {
   const [detailErrorByBug, setDetailErrorByBug] = useState<Record<string, string>>({});
   const [modalTrail, setModalTrail] = useState<string[]>([]);
   const timelineByBugRef = useRef<Record<string, TimelineState>>({});
+  const activeReadControllersRef = useRef(new Set<AbortController>());
+  const requestScopeRef = useRef({ projectId });
+  const queryRef = useRef(query);
+  const historyCursorRef = useRef(historyCursor);
+  if (requestScopeRef.current.projectId !== projectId) requestScopeRef.current = { projectId };
+  queryRef.current = query;
+  historyCursorRef.current = historyCursor;
+  const visibleBacklog = serverBacklog ?? visibleBootstrap;
+  const initialPageState = serverBacklog ? "ready" : initialPageError ? "failed" : "pending";
 
   useEffect(() => {
     timelineByBugRef.current = timelineByBug;
   }, [timelineByBug]);
 
   const stats = useMemo(() => {
-    if (backlog.summary) {
-      const summaryClosed = Object.entries(backlog.summary.by_status ?? {}).reduce(
+    if (visibleBootstrap.summary) {
+      const summaryClosed = Object.entries(visibleBootstrap.summary.by_status ?? {}).reduce(
         (total, [status, count]) => total + (CLOSED_STATUSES.has(normalizeStatus(status)) ? Number(count || 0) : 0),
         0,
       );
@@ -338,31 +357,31 @@ export default function BacklogView({ backlog, projectId }: Props) {
       ).length;
       const closed = summaryClosed + loadedAuditClosedWithoutClosedStatus;
       return {
-        total: backlog.summary.total,
-        open: Math.max(0, backlog.summary.total - closed),
+        total: visibleBootstrap.summary.total,
+        open: Math.max(0, visibleBootstrap.summary.total - closed),
         closed,
         urgent: Math.max(
           0,
-          backlog.summary.urgent_open - bugs.filter((b) => isAuditClosedBug(b) && ["P0", "P1"].includes(normalizePriority(b.priority))).length,
+          visibleBootstrap.summary.urgent_open - bugs.filter((b) => isAuditClosedBug(b) && ["P0", "P1"].includes(normalizePriority(b.priority))).length,
         ),
       };
     }
     const open = bugs.filter(isOpenBug);
     return {
-      total: backlog.total_count ?? bugs.length,
+      total: visibleBootstrap.total_count ?? bugs.length,
       open: open.length,
       closed: bugs.filter(isClosedBug).length,
       urgent: open.filter((b) => ["P0", "P1"].includes(normalizePriority(b.priority))).length,
     };
-  }, [backlog.summary, backlog.total_count, bugs]);
+  }, [visibleBootstrap.summary, visibleBootstrap.total_count, bugs]);
 
-  const serverBugs = serverBacklog.bugs ?? bugs;
+  const serverBugs = visibleBacklog.bugs ?? bugs;
   const rows = useMemo(() => {
     return filterBacklogHotWindowRows(serverBugs, statusFilter, priorityFilter);
   }, [priorityFilter, serverBugs, statusFilter]);
 
-  const filteredCount = serverBacklog.filtered_count ?? stats.total;
-  const pageNote = serverBacklog.has_more ? " · more in indexed history" : "";
+  const filteredCount = visibleBacklog.filtered_count ?? stats.total;
+  const pageNote = visibleBacklog.has_more ? " · more in indexed history" : "";
   const browsingDatabase = Boolean(query.trim() || historyCursor);
   const syncCommands = [
     `aming-claw backlog export --project-id ${projectId} --output backlog.json`,
@@ -372,6 +391,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
 
   useEffect(() => {
     setServerBacklog(api.backlogMemoryFor(projectId) ?? backlog);
+    setInitialPageError("");
     setHistoryCursor("");
     setHistoryCursorTrail([]);
     setServerSearchLoading(false);
@@ -383,6 +403,11 @@ export default function BacklogView({ backlog, projectId }: Props) {
     setModalTrail([]);
   }, [projectId]);
 
+  useEffect(() => () => {
+    for (const controller of activeReadControllersRef.current) controller.abort();
+    activeReadControllersRef.current.clear();
+  }, []);
+
   useEffect(() => {
     setHistoryCursor("");
     setHistoryCursorTrail([]);
@@ -391,19 +416,30 @@ export default function BacklogView({ backlog, projectId }: Props) {
   useEffect(() => {
     const controller = new AbortController();
     const unsubscribe = api.subscribeBacklogHotWindow(projectId, (response) => {
-      if (!controller.signal.aborted && !query.trim() && !historyCursor) setServerBacklog(response);
+      if (!controller.signal.aborted && !queryRef.current.trim() && !historyCursorRef.current) setServerBacklog(response);
     });
     const memory = api.backlogMemoryFor(projectId);
-    if (memory && !query.trim() && !historyCursor) setServerBacklog(memory);
-    api.backlogRevalidateFor(projectId, controller.signal)
+    if (memory && !queryRef.current.trim() && !historyCursorRef.current) setServerBacklog(memory);
+    api.backlogInitialPageFor(projectId, backlog, controller.signal)
       .then((response) => {
-        if (!controller.signal.aborted && !query.trim() && !historyCursor) setServerBacklog(response);
+        if (!controller.signal.aborted && !queryRef.current.trim() && !historyCursorRef.current) {
+          setServerBacklog(response);
+          setInitialPageError("");
+        }
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) setInitialPageError(timelineLoadErrorMessage(error));
+      });
     return () => {
       unsubscribe();
       controller.abort();
     };
+  }, [backlog, projectId]);
+
+  useEffect(() => {
+    if (query.trim() || historyCursor) return;
+    const memory = api.backlogMemoryFor(projectId);
+    if (memory) setServerBacklog(memory);
   }, [historyCursor, projectId, query]);
 
   useEffect(() => {
@@ -478,11 +514,16 @@ export default function BacklogView({ backlog, projectId }: Props) {
 
     if (!shouldFetch) return;
 
+    const controller = new AbortController();
+    const requestScope = requestScopeRef.current;
+    activeReadControllersRef.current.add(controller);
+
     Promise.allSettled([
-      api.backlogTimelineGateFor(projectId, bugId, BACKLOG_DETAIL_TIMELINE_LIMIT),
-      api.taskTimelineFor(projectId, bugId, BACKLOG_DETAIL_TIMELINE_LIMIT),
+      api.backlogTimelineGateFor(projectId, bugId, BACKLOG_DETAIL_TIMELINE_LIMIT, controller.signal),
+      api.taskTimelineFor(projectId, bugId, BACKLOG_DETAIL_TIMELINE_LIMIT, controller.signal),
     ])
       .then(([gateResult, compactResult]) => {
+        if (controller.signal.aborted || requestScopeRef.current !== requestScope) return;
         const gate = gateResult.status === "fulfilled" ? gateResult.value : undefined;
         const compactTimeline = compactResult.status === "fulfilled" ? compactResult.value : undefined;
         const compactLedger = compactLedgerFromResponses(projectId, compactTimeline, gate);
@@ -519,6 +560,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
         });
       })
       .catch((error) => {
+        if (controller.signal.aborted || requestScopeRef.current !== requestScope) return;
         const msg = error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
         setTimelineByBug((states) => {
           const existing = states[bugId];
@@ -538,25 +580,36 @@ export default function BacklogView({ backlog, projectId }: Props) {
             },
           };
         });
+      })
+      .finally(() => {
+        activeReadControllersRef.current.delete(controller);
       });
   }, [projectId]);
 
   const fetchBugDetail = useCallback((bugId: string) => {
-    if (detailByBug[bugId] || detailLoadingByBug[bugId]) return;
+    if (detailByBug[bugId] || detailLoadingByBug[bugId] || detailErrorByBug[bugId]) return;
+    const controller = new AbortController();
+    const requestScope = requestScopeRef.current;
+    activeReadControllersRef.current.add(controller);
     setDetailLoadingByBug((states) => ({ ...states, [bugId]: true }));
     setDetailErrorByBug((states) => ({ ...states, [bugId]: "" }));
-    api.backlogBugFor(projectId, bugId)
+    api.backlogBugFor(projectId, bugId, controller.signal)
       .then((bug) => {
+        if (controller.signal.aborted || requestScopeRef.current !== requestScope) return;
         setDetailByBug((states) => ({ ...states, [bugId]: bug }));
       })
       .catch((error) => {
+        if (controller.signal.aborted || requestScopeRef.current !== requestScope) return;
         const msg = error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
         setDetailErrorByBug((states) => ({ ...states, [bugId]: msg }));
       })
       .finally(() => {
-        setDetailLoadingByBug((states) => ({ ...states, [bugId]: false }));
+        activeReadControllersRef.current.delete(controller);
+        if (!controller.signal.aborted && requestScopeRef.current === requestScope) {
+          setDetailLoadingByBug((states) => ({ ...states, [bugId]: false }));
+        }
       });
-  }, [detailByBug, detailLoadingByBug, projectId]);
+  }, [detailByBug, detailErrorByBug, detailLoadingByBug, projectId]);
 
   const openDetail = useCallback((bugId: string, mode: "push" | "replace" = "push", keepTrail = false) => {
     setModalTrail((trail) => {
@@ -608,10 +661,12 @@ export default function BacklogView({ backlog, projectId }: Props) {
     <div
       className="view"
       data-backlog-local-facets="status,priority"
-      data-backlog-hot-window-count={serverBacklog.hot_count ?? (browsingDatabase ? 0 : serverBugs.length)}
-      data-backlog-cache-source={serverBacklog.source ?? "bootstrap"}
-      data-backlog-cache-hit={serverBacklog.read_cache?.hit ? "true" : "false"}
-      data-backlog-generation={serverBacklog.generation ?? 0}
+      data-backlog-hot-window-count={visibleBacklog.hot_count ?? (browsingDatabase ? 0 : serverBugs.length)}
+      data-backlog-cache-source={visibleBacklog.source ?? "pending"}
+      data-backlog-cache-hit={visibleBacklog.read_cache?.hit ? "true" : "false"}
+      data-backlog-generation={visibleBacklog.generation ?? 0}
+      data-backlog-bootstrap-state={initialPageState}
+      data-dashboard-bootstrap-pending={bootstrapPending ? "true" : "false"}
     >
       <div className="view-head">
         <h2 className="view-title">Backlog</h2>
@@ -677,7 +732,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
       <div
         className="backlog-guidance backlog-hot-window-meta"
         data-server-search-results="backlog"
-        data-server-search-next-cursor={serverBacklog.next_cursor ?? ""}
+        data-server-search-next-cursor={visibleBacklog.next_cursor ?? ""}
         aria-live="polite"
       >
         <div>
@@ -688,13 +743,19 @@ export default function BacklogView({ backlog, projectId }: Props) {
               ? `${rows.length} local facet rows from this stable-keyset database page.`
               : `${rows.length} rows after local status/priority facets; facet changes do not refetch the server.`}
           {serverSearchError ? ` Search error: ${serverSearchError}` : ""}
-          {!browsingDatabase && serverBacklog.history_available
+          {!browsingDatabase && visibleBacklog.history_available
             ? " Older rows remain available through indexed history."
             : ""}
-          <span className="backlog-cache-observability">
-            {" "}cache {serverBacklog.read_cache?.hit ? "hit" : "miss"} · age {serverBacklog.read_cache?.age_ms ?? 0}ms
-            {" "}· evictions {serverBacklog.read_cache?.eviction_count ?? 0}
-          </span>
+          {serverBacklog ? (
+            <span className="backlog-cache-observability">
+              {" "}cache {visibleBacklog.read_cache?.hit ? "hit" : "miss"} · age {visibleBacklog.read_cache?.age_ms ?? 0}ms
+              {" "}· evictions {visibleBacklog.read_cache?.eviction_count ?? 0}
+            </span>
+          ) : (
+            <span className="backlog-cache-observability"> recent page pending</span>
+          )}
+          {initialPageError ? ` Recent Backlog page failed: ${initialPageError}` : ""}
+          {bootstrapError ? ` Dashboard bootstrap read failed: ${bootstrapError}` : ""}
         </div>
         <div className="backlog-guidance-actions">
           <button
@@ -712,11 +773,11 @@ export default function BacklogView({ backlog, projectId }: Props) {
           <button
             type="button"
             className="action-btn"
-            disabled={!serverBacklog.next_cursor || serverSearchLoading}
+            disabled={!visibleBacklog.next_cursor || serverSearchLoading}
             onClick={() => {
-              if (!serverBacklog.next_cursor) return;
+              if (!visibleBacklog.next_cursor) return;
               setHistoryCursorTrail((trail) => [...trail, historyCursor]);
-              setHistoryCursor(serverBacklog.next_cursor ?? "");
+              setHistoryCursor(visibleBacklog.next_cursor ?? "");
             }}
           >
             Next indexed page
@@ -732,7 +793,13 @@ export default function BacklogView({ backlog, projectId }: Props) {
               : "read-only local facets over the unified newest-first recent-250 window"}
           </span>
         </div>
-        {rows.length === 0 ? (
+        {!serverBacklog ? (
+          <div className="empty">
+            {initialPageError
+              ? "Recent Backlog page unavailable. Exact selected detail remains independent."
+              : "Loading the recent Backlog page. Exact selected detail remains independent."}
+          </div>
+        ) : rows.length === 0 ? (
           <div className="empty">
             No backlog rows match the current filters.
             <div className="empty-hint">
