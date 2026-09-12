@@ -568,7 +568,7 @@ class _DarwinReadOnlyProbePopen(subprocess.Popen):
 def _run_readonly_authority_probe(
     argv: Sequence[str],
     *,
-    cwd: Path | None = None,
+    cwd: Path | str | None = None,
     text: bool,
     timeout: int,
 ) -> subprocess.CompletedProcess:

@@ -225664,6 +225664,288 @@ def test_darwin_readonly_probe_reaps_child_after_post_spawn_cleanup_failure(
         os.waitpid(child_pids[0], os.WNOHANG)
 
 
+def _root_resolver_probe_git_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    stable = (tmp_path / "root-resolver-stable").resolve()
+    shared = stable / "shared-volume"
+    shared.mkdir(parents=True)
+    (stable / ".gitignore").write_text("/shared-volume/\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=stable,
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=stable, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "AC Test"], cwd=stable, check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=stable, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "root resolver fixture"],
+        cwd=stable, check=True,
+    )
+    return stable, shared
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_root_resolver_uses_two_logical_native_git_probes_per_fresh_call(
+    monkeypatch, tmp_path,
+):
+    from agent import runtime_plane
+
+    _stable, shared = _root_resolver_probe_git_fixture(tmp_path)
+    logical_calls = []
+    native_attempts = []
+    original_probe = governance_db._run_readonly_authority_probe
+    api = governance_db._DARWIN_READONLY_PROBE_SPAWN_API
+    original_spawn = type(api).spawn
+
+    def probe(argv, **kwargs):
+        logical_calls.append((list(argv), dict(kwargs)))
+        return original_probe(argv, **kwargs)
+
+    def spawn(self, executable, argv, attr, actions):
+        status, pid = original_spawn(self, executable, argv, attr, actions)
+        native_attempts.append((status, pid))
+        return status, pid
+
+    monkeypatch.setattr(governance_db, "_run_readonly_authority_probe", probe)
+    monkeypatch.setattr(type(api), "spawn", spawn)
+    first = runtime_plane.resolve_ac_dev_storage_root(shared)
+    second = runtime_plane.resolve_ac_dev_storage_root(shared)
+    assert first == second == shared.parent.parent / ".aming-claw-dev-worlds" / "aming-claw"
+    assert not first.exists()
+    expected = []
+    for _index in range(2):
+        for argument in ("--show-toplevel", "--git-common-dir"):
+            expected.append((
+                ["git", "rev-parse", "--path-format=absolute", argument],
+                {"cwd": str(shared), "text": True, "timeout": 10},
+            ))
+    assert logical_calls == expected
+    # PATH search may attempt more than one executable. Each logical probe,
+    # however, must create exactly one successful child.
+    assert sum(status == 0 for status, _pid in native_attempts) == 4
+    assert len(native_attempts) >= 4
+
+
+@pytest.mark.parametrize("import_order", ["runtime-first", "db-first"])
+def test_root_resolver_local_import_is_safe_in_both_module_orders(
+    tmp_path, import_order,
+):
+    repo = Path(__file__).resolve().parents[2]
+    _stable, shared = _root_resolver_probe_git_fixture(tmp_path)
+    script = r"""
+import json,sys
+if sys.argv[1] == 'runtime-first':
+    from agent import runtime_plane
+    from agent.governance import db
+else:
+    from agent.governance import db
+    from agent import runtime_plane
+calls=[]
+original=db._run_readonly_authority_probe
+def probe(argv, **kwargs):
+    calls.append([list(argv), dict(kwargs)])
+    return original(argv, **kwargs)
+db._run_readonly_authority_probe=probe
+first=runtime_plane.resolve_ac_dev_storage_root(sys.argv[2])
+second=runtime_plane.resolve_ac_dev_storage_root(sys.argv[2])
+assert first == second and not first.exists()
+assert len(calls) == 4
+assert all(call[1] == {'cwd':sys.argv[2], 'text':True, 'timeout':10} for call in calls)
+print(json.dumps({'root':str(first),'calls':calls},sort_keys=True))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, import_order, str(shared)],
+        cwd=repo, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert [call[0][-1] for call in payload["calls"]] == [
+        "--show-toplevel", "--git-common-dir",
+        "--show-toplevel", "--git-common-dir",
+    ]
+
+
+def test_root_resolver_opt_in_does_not_migrate_worktree_identity_git_reads(
+    monkeypatch, tmp_path,
+):
+    from agent import runtime_plane
+
+    stable, _shared = _root_resolver_probe_git_fixture(tmp_path)
+    original_run = runtime_plane.subprocess.run
+    original_calls = []
+
+    def run(argv, **kwargs):
+        original_calls.append((list(argv), dict(kwargs)))
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(
+        governance_db,
+        "_run_readonly_authority_probe",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unrelated _git_path consumer used resolver-only probe"
+        ),
+    )
+    monkeypatch.setattr(runtime_plane.subprocess, "run", run)
+    identity = runtime_plane.bind_git_worktree_identity(
+        str(stable), "fixture-root-resolver-unrelated-consumer",
+    )
+    assert identity.workspace.root == str(stable)
+    assert [call[0][-1] for call in original_calls] == [
+        "--show-toplevel", "--git-common-dir", "--git-dir",
+    ]
+    assert all(call[1] == {
+        "cwd": str(stable), "capture_output": True, "text": True,
+        "timeout": 10, "check": False,
+    } for call in original_calls)
+
+
+@pytest.mark.parametrize("defect", ["nonzero", "empty", "oserror", "timeout"])
+def test_root_resolver_probe_errors_keep_original_mapping_and_zero_mutation(
+    monkeypatch, tmp_path, defect,
+):
+    from agent import runtime_plane
+
+    stable, shared = _root_resolver_probe_git_fixture(tmp_path)
+    candidate = stable.parent / runtime_plane.AC_DEV_STORAGE_NAMESPACE
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    def probe(argv, **kwargs):
+        if defect == "oserror":
+            raise OSError(errno.EACCES, "fixture denied", "git")
+        if defect == "timeout":
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return subprocess.CompletedProcess(
+            argv, 7 if defect == "nonzero" else 0,
+            "" if defect == "empty" else str(stable) + "\n", "fixture stderr",
+        )
+
+    monkeypatch.setattr(governance_db, "_run_readonly_authority_probe", probe)
+    with pytest.raises(ValueError, match="workspace is not a readable Git worktree") as rejected:
+        runtime_plane.resolve_ac_dev_storage_root(shared)
+    if defect in {"oserror", "timeout"}:
+        assert isinstance(
+            rejected.value.__cause__,
+            OSError if defect == "oserror" else subprocess.TimeoutExpired,
+        )
+    assert not candidate.exists()
+    assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")) == before
+
+
+@pytest.mark.parametrize("defect", ["symlink-git-path", "cross-world"])
+def test_root_resolver_probe_keeps_physical_and_world_refusals_without_mutation(
+    monkeypatch, tmp_path, defect,
+):
+    from agent import runtime_plane
+
+    stable, shared = _root_resolver_probe_git_fixture(tmp_path)
+    target = tmp_path / "physical-target"
+    target.mkdir()
+    alias = tmp_path / "git-alias"
+    alias.symlink_to(target, target_is_directory=True)
+    if defect == "symlink-git-path":
+        outputs = [alias, alias]
+    else:
+        derived = stable.parent / runtime_plane.AC_DEV_STORAGE_NAMESPACE / "aming-claw"
+        derived.mkdir(parents=True)
+        outputs = [stable, derived]
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    def probe(argv, **_kwargs):
+        value = outputs[0] if argv[-1] == "--show-toplevel" else outputs[1]
+        return subprocess.CompletedProcess(argv, 0, str(value) + "\n", "")
+
+    monkeypatch.setattr(governance_db, "_run_readonly_authority_probe", probe)
+    reason = (
+        "workspace Git path must be an existing physical directory"
+        if defect == "symlink-git-path"
+        else "AC dev storage root must be outside stable Git checkout"
+    )
+    with pytest.raises(ValueError, match=reason):
+        runtime_plane.resolve_ac_dev_storage_root(shared)
+    assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")) == before
+
+
+def test_normal_basic_runtime_keeps_both_fresh_root_resolver_checks(
+    monkeypatch, tmp_path,
+):
+    from agent import runtime_plane
+    from agent.tests.test_governance_db import _install_fixed_stable_boundary
+
+    shared = _install_fixed_stable_boundary(monkeypatch, tmp_path)
+    root = runtime_plane.resolve_ac_dev_storage_root(shared)
+    root.mkdir(parents=True)
+    database = root / governance_db.AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE fixture(value)")
+    server_sha = "sha256:" + hashlib.sha256(
+        Path(governance_db.__file__).with_name("server.py").read_bytes()
+    ).hexdigest()
+    governance_db.write_dev_launch_receipt(
+        root, stable_shared_volume=shared, source_sha256=server_sha, port=40008,
+    )
+    governance_db.acquire_dev_runtime_writer_lease(root)
+    governance_db._bind_dev_writer_lease_database_identity(database)
+    archive = root / governance_db.AC_DEV_COW_SUCCESSOR_ARCHIVE
+    archive.mkdir(parents=True)
+    (archive / f"{governance_db.AC_DEV_COW_SUCCESSOR_PREFIX}.fixture.json").write_text(
+        "{}", encoding="utf-8",
+    )
+    binding = governance_db.verified_stable_database_binding()
+    monkeypatch.setenv(governance_db.AC_DEV_STORAGE_ROOT_ENV, str(root))
+    monkeypatch.setenv(governance_db.AC_STABLE_SHARED_VOLUME_ENV, str(shared))
+    monkeypatch.setattr(
+        governance_db, "_cached_dev_cow_successor_receipt",
+        lambda *_args, **_kwargs: {
+            "successor": {"identity": {
+                "device": int(database.stat().st_dev),
+                "inode": int(database.stat().st_ino),
+            }},
+        },
+    )
+    monkeypatch.setattr(governance_db, "_validate_dev_first_start_context", lambda _root: False)
+    monkeypatch.setattr(
+        governance_db, "_current_first_start_source",
+        lambda loaded_root: {
+            "root": str(loaded_root), "branch": "codex/ac-dev",
+            "commit": "a" * 40, "tree": "b" * 40,
+            "cli_sha256": "sha256:" + "c" * 64,
+            "server_sha256": server_sha,
+        },
+    )
+    logical_calls = []
+    original_probe = governance_db._run_readonly_authority_probe
+
+    def probe(argv, **kwargs):
+        if list(argv[:3]) == [
+            "git", "rev-parse", "--path-format=absolute",
+        ]:
+            logical_calls.append((list(argv), dict(kwargs)))
+        return original_probe(argv, **kwargs)
+
+    monkeypatch.setattr(governance_db, "_run_readonly_authority_probe", probe)
+    try:
+        assert governance_db._dev_storage_root(create=False) == root
+    finally:
+        governance_db.release_dev_runtime_writer_lease(root)
+    assert [call[0][-1] for call in logical_calls] == [
+        "--show-toplevel", "--git-common-dir",
+        "--show-toplevel", "--git-common-dir",
+    ]
+    assert all(call[1] == {
+        "cwd": str(shared), "text": True, "timeout": 10,
+    } for call in logical_calls)
+    assert binding["shared_volume_path"] == str(shared)
+
+
 @pytest.mark.parametrize(
     "defect",
     [

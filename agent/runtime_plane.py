@@ -33,17 +33,32 @@ def graph_activation_policy(runtime_plane: str) -> dict[str, object]:
     }
 
 
-def _git_path(workspace_root: str, argument: str) -> str:
+def _git_path(
+    workspace_root: str,
+    argument: str,
+    *,
+    dev_storage_resolver_probe: bool = False,
+) -> str:
     """Resolve one Git-owned path from an existing physical workspace."""
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--path-format=absolute", argument],
-            cwd=workspace_root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+        argv = ["git", "rev-parse", "--path-format=absolute", argument]
+        if dev_storage_resolver_probe:
+            # Import only for the AC dev resolver. Other project-plane Git
+            # consumers retain their original subprocess path and dependency.
+            from agent.governance.db import _run_readonly_authority_probe
+
+            proc = _run_readonly_authority_probe(
+                argv, cwd=workspace_root, text=True, timeout=10,
+            )
+        else:
+            proc = subprocess.run(
+                argv,
+                cwd=workspace_root,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError("workspace is not a readable Git worktree") from exc
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -83,8 +98,12 @@ def resolve_ac_dev_storage_root(stable_shared_volume: str | Path) -> Path:
     stable = candidate.resolve(strict=True)
     if stable != candidate:
         raise ValueError("canonical stable shared volume identity mismatch")
-    git_root = Path(_git_path(str(stable), "--show-toplevel"))
-    git_common_dir = Path(_git_path(str(stable), "--git-common-dir"))
+    git_root = Path(_git_path(
+        str(stable), "--show-toplevel", dev_storage_resolver_probe=True,
+    ))
+    git_common_dir = Path(_git_path(
+        str(stable), "--git-common-dir", dev_storage_resolver_probe=True,
+    ))
     parent = git_root.parent
     if parent.is_symlink() or parent.resolve(strict=True) != parent:
         raise ValueError("canonical stable Git parent identity mismatch")
