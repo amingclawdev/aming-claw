@@ -17,6 +17,7 @@ import json
 import os
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -225027,7 +225028,7 @@ def test_stable_process_identity_batches_birth_and_command_and_keeps_cwd(
             stderr="",
         )
 
-    monkeypatch.setattr(governance_db.subprocess, "run", run)
+    monkeypatch.setattr(governance_db, "_run_readonly_authority_probe", run)
     monkeypatch.setattr(
         governance_db.os,
         "readlink",
@@ -225043,10 +225044,8 @@ def test_stable_process_identity_batches_birth_and_command_and_keeps_cwd(
         (
             ["ps", "-o", "lstart=,command=", "-p", "4242"],
             {
-                "capture_output": True,
                 "text": True,
                 "timeout": 2,
-                "check": False,
             },
         )
     ]
@@ -225072,7 +225071,7 @@ def test_stable_process_identity_keeps_macos_lsof_cwd_fallback(monkeypatch):
             stderr="",
         )
 
-    monkeypatch.setattr(governance_db.subprocess, "run", run)
+    monkeypatch.setattr(governance_db, "_run_readonly_authority_probe", run)
     monkeypatch.setattr(
         governance_db.os,
         "readlink",
@@ -225108,8 +225107,8 @@ def test_stable_process_identity_rejects_invalid_combined_ps_result(
     monkeypatch, returncode, stdout
 ):
     monkeypatch.setattr(
-        governance_db.subprocess,
-        "run",
+        governance_db,
+        "_run_readonly_authority_probe",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=returncode,
             stdout=stdout,
@@ -225123,6 +225122,546 @@ def test_stable_process_identity_rejects_invalid_combined_ps_result(
     )
     with pytest.raises(RuntimeError, match="process identity is unavailable"):
         governance_db._stable_process_identity(4242)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_darwin_readonly_probe_preserves_output_cwd_stdin_and_fd_isolation(
+    monkeypatch, tmp_path,
+):
+    native_calls = []
+    original_spawn = governance_db._DarwinReadOnlyProbeSpawnAPI.spawn
+
+    def observed_spawn(self, *args):
+        native_calls.append(args[0])
+        return original_spawn(self, *args)
+
+    monkeypatch.setattr(
+        governance_db._DarwinReadOnlyProbeSpawnAPI, "spawn", observed_spawn,
+    )
+    left, right = socket.socketpair()
+    try:
+        right.set_inheritable(True)
+        parent_stdin_open = True
+        try:
+            os.fstat(0)
+        except OSError as exc:
+            assert exc.errno == errno.EBADF
+            parent_stdin_open = False
+        code = (
+            "import json,os,sys\n"
+            "try:\n os.fstat(int(sys.argv[1])); leaked=True\n"
+            "except OSError:\n leaked=False\n"
+            "try:\n os.fstat(0); stdin_open=True\n"
+            "except OSError:\n stdin_open=False\n"
+            "sys.stdout.write(json.dumps({'cwd':os.getcwd(),"
+            "'leaked':leaked,'stdin_open':stdin_open}))\n"
+            "sys.stderr.write('fixture-stderr')\n"
+        )
+        binary = governance_db._run_readonly_authority_probe(
+            [sys.executable, "-c", code, str(right.fileno())],
+            cwd=tmp_path,
+            text=False,
+            timeout=2,
+        )
+        assert binary.returncode == 0
+        assert binary.stderr == b"fixture-stderr"
+        payload = json.loads(binary.stdout)
+        assert payload == {
+            "cwd": str(tmp_path),
+            "leaked": False,
+            "stdin_open": parent_stdin_open,
+        }
+        text_result = governance_db._run_readonly_authority_probe(
+            [sys.executable, "-c", "print('fixture-text')"],
+            text=True,
+            timeout=2,
+        )
+        assert text_result.returncode == 0
+        assert text_result.stdout == "fixture-text\n"
+        assert text_result.stderr == ""
+        nonzero = governance_db._run_readonly_authority_probe(
+            [
+                sys.executable, "-c",
+                "import sys; print('failed-out'); "
+                "print('failed-err', file=sys.stderr); sys.exit(7)",
+            ],
+            text=True,
+            timeout=2,
+        )
+        assert (nonzero.returncode, nonzero.stdout, nonzero.stderr) == (
+            7, "failed-out\n", "failed-err\n",
+        )
+        assert len(native_calls) == 3
+    finally:
+        left.close()
+        right.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_darwin_readonly_probe_preserves_python_path_and_c_environment_views(
+    tmp_path,
+):
+    python_path = tmp_path / "python-path"
+    c_path = tmp_path / "c-path"
+    python_path.mkdir()
+    c_path.mkdir()
+    executable = python_path / "probe-view"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os\n"
+        "print(json.dumps({'selected':'python-path','child_path':os.getenv('PATH')}))\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    repo = Path(__file__).resolve().parents[2]
+    script = (
+        "import json,os\n"
+        "from agent.governance import db\n"
+        f"os.environ['PATH']={str(python_path)!r}\n"
+        f"os.putenv('PATH',{str(c_path)!r})\n"
+        "import ctypes\n"
+        "getenv=ctypes.CDLL(None).getenv\n"
+        "getenv.argtypes=[ctypes.c_char_p]\n"
+        "getenv.restype=ctypes.c_char_p\n"
+        f"assert os.environ['PATH']=={str(python_path)!r}\n"
+        f"assert getenv(b'PATH').decode()=={str(c_path)!r}\n"
+        "result=db._run_readonly_authority_probe("
+        "['probe-view'],text=True,timeout=2)\n"
+        "payload=json.loads(result.stdout)\n"
+        f"assert payload == {{'selected':'python-path','child_path':{str(c_path)!r}}}\n"
+        "print('path-views-preserved')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=repo,
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "path-views-preserved\n"
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_darwin_readonly_probe_audit_fallback_and_audited_failure_are_single(
+    tmp_path,
+):
+    repo = Path(__file__).resolve().parents[2]
+    script = f"""
+import errno
+import sys
+from agent.governance import db
+
+events=[]
+spawn_calls=[]
+base_prepare=db._DarwinReadOnlyProbeSpawnAPI.prepare
+base_spawn=db._DarwinReadOnlyProbeSpawnAPI.spawn
+
+def audit(event,args):
+    if event == 'subprocess.Popen' and args[1] and args[1][-1] == 'probe-audit':
+        events.append(tuple(args[1]))
+        if args[1][1] == 'deny':
+            raise RuntimeError('fixture audit denial')
+
+sys.addaudithook(audit)
+
+def counted_spawn(self,*args):
+    spawn_calls.append(args[0])
+    return base_spawn(self,*args)
+
+db._DarwinReadOnlyProbeSpawnAPI.spawn=counted_spawn
+ok=db._run_readonly_authority_probe(
+    [{sys.executable!r},'-c','pass','probe-audit'],text=False,timeout=2)
+assert ok.returncode == 0 and len(events) == 1 and len(spawn_calls) == 1
+
+def failed_prepare(self,**kwargs):
+    raise OSError(errno.ENOSYS,'fixture pre-audit setup unavailable')
+
+db._DarwinReadOnlyProbeSpawnAPI.prepare=failed_prepare
+fallback=db._run_readonly_authority_probe(
+    [{sys.executable!r},'-c','pass','probe-audit'],text=False,timeout=2)
+assert fallback.returncode == 0 and len(events) == 2 and len(spawn_calls) == 1
+db._DarwinReadOnlyProbeSpawnAPI.prepare=base_prepare
+
+saved_api=db._DARWIN_READONLY_PROBE_SPAWN_API
+db._DARWIN_READONLY_PROBE_SPAWN_API=None
+fallback=db._run_readonly_authority_probe(
+    [{sys.executable!r},'-c','pass','probe-audit'],text=False,timeout=2)
+assert fallback.returncode == 0 and len(events) == 3 and len(spawn_calls) == 1
+db._DARWIN_READONLY_PROBE_SPAWN_API=saved_api
+
+saved_platform=db.sys.platform
+db.sys.platform='fixture-unsupported'
+fallback=db._run_readonly_authority_probe(
+    [{sys.executable!r},'-c','pass','probe-audit'],text=False,timeout=2)
+assert fallback.returncode == 0 and len(events) == 4 and len(spawn_calls) == 1
+db.sys.platform=saved_platform
+
+def failed_spawn(self,*args):
+    spawn_calls.append(args[0])
+    return errno.EACCES,0
+
+db._DarwinReadOnlyProbeSpawnAPI.spawn=failed_spawn
+try:
+    db._run_readonly_authority_probe(
+        [{sys.executable!r},'-c','pass','probe-audit'],text=False,timeout=2)
+except OSError as exc:
+    assert exc.errno == errno.EACCES
+else:
+    raise AssertionError('audited native creation failure was hidden')
+assert len(events) == 5 and len(spawn_calls) == 2
+
+try:
+    db._run_readonly_authority_probe(
+        [{sys.executable!r},'deny','probe-audit'],text=False,timeout=2)
+except RuntimeError as exc:
+    assert str(exc) == 'fixture audit denial'
+else:
+    raise AssertionError('audit rejection was bypassed')
+assert len(events) == 6 and len(spawn_calls) == 2
+print('audit-boundary-preserved')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=repo,
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "audit-boundary-preserved\n"
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_darwin_readonly_probe_unsearchable_cwd_preserves_original_error(
+    tmp_path,
+):
+    repo = Path(__file__).resolve().parents[2]
+    script = f"""
+import errno
+import os
+import subprocess
+import sys
+from pathlib import Path
+from agent.governance import db
+
+root=Path(sys.argv[1])/'unsearchable-cwd'
+root.mkdir()
+root.chmod(0o400)
+probe_argv=[{sys.executable!r},'-c','pass','cwd-fallback-probe']
+git_argv=['git','rev-parse','HEAD']
+
+def capture(function):
+    try:
+        function()
+    except OSError as exc:
+        return type(exc).__name__,exc.errno,os.fspath(exc.filename)
+    raise AssertionError('expected real chdir refusal')
+
+try:
+    original_probe=capture(lambda: subprocess.run(
+        probe_argv,cwd=root,capture_output=True,text=False,timeout=2,
+        check=False))
+    original_git=capture(lambda: subprocess.run(
+        git_argv,cwd=root,capture_output=True,text=False,timeout=5,
+        check=False))
+
+    events=[]
+    native=[]
+    state={{'deny':False}}
+    real_spawn=db._DarwinReadOnlyProbeSpawnAPI.spawn
+
+    def audit(event,args):
+        if event == 'subprocess.Popen' and list(args[1]) in (
+            probe_argv,git_argv,
+        ):
+            events.append((args[0],list(args[1]),args[2],args[3]))
+            if state['deny']:
+                raise RuntimeError('cwd-fallback-audit-denied')
+
+    def counted_spawn(self,*args):
+        native.append(args[0])
+        return real_spawn(self,*args)
+
+    sys.addaudithook(audit)
+    db._DarwinReadOnlyProbeSpawnAPI.spawn=counted_spawn
+
+    candidate_probe=capture(lambda: db._run_readonly_authority_probe(
+        probe_argv,cwd=root,text=False,timeout=2))
+    candidate_git=capture(lambda: db._git_read_exact(
+        root,'rev-parse','HEAD',timeout=5))
+    expected=('PermissionError',errno.EACCES,str(root))
+    assert original_probe == candidate_probe == expected
+    assert original_git == candidate_git == expected
+    assert len(events) == 2 and native == []
+
+    state['deny']=True
+    try:
+        db._run_readonly_authority_probe(
+            probe_argv,cwd=root,text=False,timeout=2)
+    except RuntimeError as exc:
+        assert str(exc) == 'cwd-fallback-audit-denied'
+    else:
+        raise AssertionError('fallback audit denial was bypassed')
+    assert len(events) == 3 and native == []
+
+    state['deny']=False
+    root.chmod(0o700)
+    valid=db._run_readonly_authority_probe(
+        probe_argv,cwd=root,text=False,timeout=2)
+    assert valid.returncode == 0
+    assert len(events) == 4 and len(native) == 1
+finally:
+    root.chmod(0o700)
+
+print('cwd-error-audit-native-boundaries-preserved')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)], cwd=repo,
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "cwd-error-audit-native-boundaries-preserved\n"
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="private Popen interface guard is Darwin-specific",
+)
+def test_darwin_readonly_probe_loader_rejects_private_popen_signature_drift(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        governance_db.inspect,
+        "signature",
+        lambda _function: SimpleNamespace(parameters={"self": object()}),
+    )
+    assert governance_db._load_darwin_readonly_probe_spawn_api() is None
+
+
+def test_readonly_probe_unsupported_path_delegates_with_original_run_shape(
+    monkeypatch, tmp_path,
+):
+    calls = []
+    completed = subprocess.CompletedProcess(
+        ["fixture-probe"], 0, b"fixture-out", b"fixture-err",
+    )
+
+    def run(argv, **kwargs):
+        calls.append((list(argv), dict(kwargs)))
+        return completed
+
+    monkeypatch.setattr(governance_db, "_DARWIN_READONLY_PROBE_SPAWN_API", None)
+    monkeypatch.setattr(governance_db.subprocess, "run", run)
+    assert governance_db._run_readonly_authority_probe(
+        ["fixture-probe"], cwd=tmp_path, text=False, timeout=5,
+    ) is completed
+    assert calls == [
+        (
+            ["fixture-probe"],
+            {
+                "cwd": tmp_path,
+                "capture_output": True,
+                "text": False,
+                "timeout": 5,
+                "check": False,
+            },
+        )
+    ]
+
+
+def test_git_read_exact_keeps_bytes_timeout_and_nonzero_refusal(
+    monkeypatch, tmp_path,
+):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((list(argv), dict(kwargs)))
+        return subprocess.CompletedProcess(
+            argv,
+            0 if argv[-1] == "ok" else 7,
+            b"fixture-git-bytes\n",
+            b"fixture-git-error\n",
+        )
+
+    monkeypatch.setattr(governance_db, "_run_readonly_authority_probe", run)
+    assert governance_db._git_read_exact(tmp_path, "fixture", "ok", timeout=5) == (
+        b"fixture-git-bytes\n"
+    )
+    with pytest.raises(ValueError, match="custody Git authority"):
+        governance_db._git_read_exact(tmp_path, "fixture", "fail", timeout=10)
+    assert calls == [
+        (
+            ["git", "fixture", "ok"],
+            {"cwd": tmp_path, "text": False, "timeout": 5},
+        ),
+        (
+            ["git", "fixture", "fail"],
+            {"cwd": tmp_path, "text": False, "timeout": 10},
+        ),
+    ]
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_darwin_readonly_probe_preserves_path_errno_and_bad_cwd(
+    monkeypatch, tmp_path,
+):
+    noexec_dir = tmp_path / "noexec"
+    empty_dir = tmp_path / "empty"
+    noexec_dir.mkdir()
+    empty_dir.mkdir()
+    noexec = noexec_dir / "fixture-probe"
+    noexec.write_text("echo no-shebang\n", encoding="utf-8")
+    noexec.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(noexec_dir), str(empty_dir))))
+    with pytest.raises(OSError) as rejected:
+        governance_db._run_readonly_authority_probe(
+            ["fixture-probe"], text=False, timeout=2,
+        )
+    assert rejected.value.errno == errno.ENOEXEC
+    assert rejected.value.filename == "fixture-probe"
+
+    missing_cwd = tmp_path / "missing-cwd"
+    with pytest.raises(OSError) as bad_cwd:
+        governance_db._run_readonly_authority_probe(
+            [sys.executable, "-c", "pass"], cwd=missing_cwd,
+            text=False, timeout=2,
+        )
+    assert bad_cwd.value.errno in {errno.ENOENT, errno.ENOTDIR}
+    assert Path(bad_cwd.value.filename) == missing_cwd
+
+    with pytest.raises(ValueError, match="embedded null byte"):
+        governance_db._run_readonly_authority_probe(
+            [sys.executable, "-c", "pass"],
+            cwd=Path(str(tmp_path) + "\0truncated"),
+            text=False,
+            timeout=2,
+        )
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    with pytest.raises(ValueError, match="custody Git authority"):
+        governance_db._git_read_exact(
+            tmp_path, "definitely-not-a-git-subcommand", timeout=5,
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_darwin_readonly_probe_preserves_closed_stdin_and_timeout_reap(
+    tmp_path,
+):
+    repo = Path(__file__).resolve().parents[2]
+    child_code = (
+        "import os\n"
+        "try:\n os.fstat(0)\n"
+        "except OSError:\n print('closed')\n"
+        "else:\n print('open')\n"
+    )
+    stdin_script = (
+        "import fcntl,os,sys\n"
+        "from agent.governance import db\n"
+        "os.close(0)\n"
+        "if sys.argv[1] == 'cloexec':\n"
+        " fd=os.open('/dev/null',os.O_RDONLY)\n"
+        " assert fd == 0\n"
+        " fcntl.fcntl(0,fcntl.F_SETFD,fcntl.FD_CLOEXEC)\n"
+        f"child={child_code!r}\n"
+        "result=db._run_readonly_authority_probe("
+        f"[{sys.executable!r},'-c',child],text=True,timeout=2)\n"
+        "assert result.returncode == 0 and result.stdout == 'closed\\n'\n"
+        "print(sys.argv[1]+'-stdin-preserved')\n"
+    )
+    for mode in ("closed", "cloexec"):
+        closed = subprocess.run(
+            [sys.executable, "-c", stdin_script, mode], cwd=repo,
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        assert closed.returncode == 0, closed.stderr
+        assert closed.stdout == f"{mode}-stdin-preserved\n"
+
+    code = (
+        "import os,sys,time\n"
+        "print(os.getpid(),flush=True)\n"
+        "print('partial-error',file=sys.stderr,flush=True)\n"
+        "time.sleep(10)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired) as timed_out:
+        governance_db._run_readonly_authority_probe(
+            [sys.executable, "-c", code], text=False, timeout=0.1,
+        )
+    assert timed_out.value.stdout
+    child_pid = int(timed_out.value.stdout.splitlines()[0])
+    assert b"partial-error" in (timed_out.value.stderr or b"")
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child_pid, os.WNOHANG)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_darwin_readonly_probe_concurrent_calls_have_private_spawn_state():
+    def call(index: int) -> tuple[int, str]:
+        result = governance_db._run_readonly_authority_probe(
+            [sys.executable, "-c", f"print({index!r})"],
+            text=True,
+            timeout=2,
+        )
+        return result.returncode, result.stdout
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(call, range(12)))
+    assert results == [(0, f"{index}\n") for index in range(12)]
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin"
+    or governance_db._DARWIN_READONLY_PROBE_SPAWN_API is None,
+    reason="bounded native probe adapter requires Darwin spawn primitives",
+)
+def test_darwin_readonly_probe_reaps_child_after_post_spawn_cleanup_failure(
+    monkeypatch,
+):
+    child_pids = []
+    original_close = subprocess.Popen._close_pipe_fds
+
+    def fail_after_close(self, *descriptors):
+        original_close(self, *descriptors)
+        child_pids.append(self.pid)
+        raise RuntimeError("fixture post-spawn cleanup failure")
+
+    monkeypatch.setattr(
+        governance_db._DarwinReadOnlyProbePopen,
+        "_close_pipe_fds",
+        fail_after_close,
+    )
+    with pytest.raises(RuntimeError, match="post-spawn cleanup failure"):
+        governance_db._run_readonly_authority_probe(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            text=False,
+            timeout=2,
+        )
+    assert len(child_pids) == 1
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child_pids[0], os.WNOHANG)
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,8 @@ Manages:
 
 import os
 import sys
+import ctypes
+import inspect
 import sqlite3
 import stat
 import threading
@@ -24,6 +26,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import shutil
+import signal
 import tempfile
 import time
 from enum import Enum
@@ -204,6 +207,398 @@ def dashboard_read_timing_finish() -> dict[str, object] | None:
     return record
 
 
+_DARWIN_PROBE_SPAWN_CLOEXEC_DEFAULT = 0x4000
+_DARWIN_PROBE_SPAWN_SETSIGDEF = 0x0004
+_DARWIN_PROBE_EXECUTE_CHILD_PARAMETERS = (
+    "self", "args", "executable", "preexec_fn", "close_fds", "pass_fds",
+    "cwd", "env", "startupinfo", "creationflags", "shell", "p2cread",
+    "p2cwrite", "c2pread", "c2pwrite", "errread", "errwrite",
+    "restore_signals", "gid", "gids", "uid", "umask",
+    "start_new_session", "process_group",
+)
+
+
+class _DarwinReadOnlyProbeSpawnAPI:
+    """Darwin primitives for the three bounded read-only authority probes."""
+
+    __slots__ = (
+        "addchdir", "addclose", "adddup2", "addinherit", "actions_destroy",
+        "actions_init", "attr_destroy", "attr_init", "attr_setflags",
+        "attr_setsigdefault", "get_environ", "posix_spawn", "sigaddset",
+        "sigemptyset",
+    )
+
+    def __init__(self) -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        void_pp = ctypes.POINTER(ctypes.c_void_p)
+        char_pp = ctypes.POINTER(ctypes.c_char_p)
+
+        self.actions_init = libc.posix_spawn_file_actions_init
+        self.actions_init.argtypes = [void_pp]
+        self.actions_init.restype = ctypes.c_int
+        self.actions_destroy = libc.posix_spawn_file_actions_destroy
+        self.actions_destroy.argtypes = [void_pp]
+        self.actions_destroy.restype = ctypes.c_int
+        self.addclose = libc.posix_spawn_file_actions_addclose
+        self.addclose.argtypes = [void_pp, ctypes.c_int]
+        self.addclose.restype = ctypes.c_int
+        self.adddup2 = libc.posix_spawn_file_actions_adddup2
+        self.adddup2.argtypes = [void_pp, ctypes.c_int, ctypes.c_int]
+        self.adddup2.restype = ctypes.c_int
+        self.addinherit = libc.posix_spawn_file_actions_addinherit_np
+        self.addinherit.argtypes = [void_pp, ctypes.c_int]
+        self.addinherit.restype = ctypes.c_int
+        self.addchdir = libc.posix_spawn_file_actions_addchdir_np
+        self.addchdir.argtypes = [void_pp, ctypes.c_char_p]
+        self.addchdir.restype = ctypes.c_int
+
+        self.attr_init = libc.posix_spawnattr_init
+        self.attr_init.argtypes = [void_pp]
+        self.attr_init.restype = ctypes.c_int
+        self.attr_destroy = libc.posix_spawnattr_destroy
+        self.attr_destroy.argtypes = [void_pp]
+        self.attr_destroy.restype = ctypes.c_int
+        self.attr_setflags = libc.posix_spawnattr_setflags
+        self.attr_setflags.argtypes = [void_pp, ctypes.c_short]
+        self.attr_setflags.restype = ctypes.c_int
+        self.attr_setsigdefault = libc.posix_spawnattr_setsigdefault
+        self.attr_setsigdefault.argtypes = [
+            void_pp, ctypes.POINTER(ctypes.c_uint32),
+        ]
+        self.attr_setsigdefault.restype = ctypes.c_int
+        self.sigemptyset = libc.sigemptyset
+        self.sigemptyset.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        self.sigemptyset.restype = ctypes.c_int
+        self.sigaddset = libc.sigaddset
+        self.sigaddset.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.c_int]
+        self.sigaddset.restype = ctypes.c_int
+
+        self.posix_spawn = libc.posix_spawn
+        self.posix_spawn.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, void_pp, void_pp,
+            char_pp, char_pp,
+        ]
+        self.posix_spawn.restype = ctypes.c_int
+        self.get_environ = libc._NSGetEnviron
+        self.get_environ.argtypes = []
+        self.get_environ.restype = ctypes.POINTER(char_pp)
+
+    @staticmethod
+    def _raise_status(status: int, operation: str) -> None:
+        if status:
+            raise OSError(status, os.strerror(status), operation)
+
+    def prepare(
+        self,
+        *,
+        cwd: object,
+        p2cwrite: int,
+        c2pread: int,
+        errread: int,
+        p2cread: int,
+        c2pwrite: int,
+        errwrite: int,
+    ) -> tuple[ctypes.c_void_p, ctypes.c_void_p]:
+        """Build all fallible spawn state before the subprocess audit event."""
+
+        attr = ctypes.c_void_p()
+        actions = ctypes.c_void_p()
+        attr_ready = False
+        actions_ready = False
+        try:
+            self._raise_status(self.attr_init(ctypes.byref(attr)), "spawnattr_init")
+            attr_ready = True
+            flags = (
+                _DARWIN_PROBE_SPAWN_CLOEXEC_DEFAULT
+                | _DARWIN_PROBE_SPAWN_SETSIGDEF
+            )
+            self._raise_status(
+                self.attr_setflags(ctypes.byref(attr), flags),
+                "spawnattr_setflags",
+            )
+            defaults = ctypes.c_uint32()
+            if self.sigemptyset(ctypes.byref(defaults)) != 0:
+                error = ctypes.get_errno() or errno.EINVAL
+                raise OSError(error, os.strerror(error), "sigemptyset")
+            for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+                number = getattr(signal, name, None)
+                if number is not None and self.sigaddset(
+                    ctypes.byref(defaults), int(number),
+                ) != 0:
+                    error = ctypes.get_errno() or errno.EINVAL
+                    raise OSError(error, os.strerror(error), "sigaddset")
+            self._raise_status(
+                self.attr_setsigdefault(ctypes.byref(attr), ctypes.byref(defaults)),
+                "spawnattr_setsigdefault",
+            )
+
+            self._raise_status(
+                self.actions_init(ctypes.byref(actions)), "file_actions_init",
+            )
+            actions_ready = True
+            for descriptor in (p2cwrite, c2pread, errread):
+                if descriptor != -1:
+                    self._raise_status(
+                        self.addclose(ctypes.byref(actions), descriptor),
+                        "file_actions_addclose",
+                    )
+            for descriptor, target in (
+                (p2cread, 0), (c2pwrite, 1), (errwrite, 2),
+            ):
+                if descriptor != -1:
+                    self._raise_status(
+                        self.adddup2(ctypes.byref(actions), descriptor, target),
+                        "file_actions_adddup2",
+                    )
+                    if descriptor != target:
+                        self._raise_status(
+                            self.addclose(ctypes.byref(actions), descriptor),
+                            "file_actions_addclose",
+                        )
+
+            internal = {
+                descriptor for descriptor in (
+                    p2cwrite, c2pread, errread, p2cread, c2pwrite, errwrite,
+                ) if descriptor != -1
+            }
+            if 0 not in internal:
+                try:
+                    stdin_flags = fcntl.fcntl(0, fcntl.F_GETFD)
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:
+                        raise
+                else:
+                    if not stdin_flags & fcntl.FD_CLOEXEC:
+                        self._raise_status(
+                            self.addinherit(ctypes.byref(actions), 0),
+                            "file_actions_addinherit",
+                        )
+            if cwd is not None:
+                encoded_cwd = os.fsencode(cwd)
+                if b"\0" in encoded_cwd:
+                    raise ValueError("embedded null byte")
+                self._raise_status(
+                    self.addchdir(ctypes.byref(actions), encoded_cwd),
+                    "file_actions_addchdir",
+                )
+            return attr, actions
+        except BaseException:
+            if actions_ready:
+                self.actions_destroy(ctypes.byref(actions))
+            if attr_ready:
+                self.attr_destroy(ctypes.byref(attr))
+            raise
+
+    def destroy(
+        self, attr: ctypes.c_void_p, actions: ctypes.c_void_p,
+    ) -> None:
+        self.actions_destroy(ctypes.byref(actions))
+        self.attr_destroy(ctypes.byref(attr))
+
+    def spawn(
+        self,
+        executable: bytes,
+        argv: ctypes.Array,
+        attr: ctypes.c_void_p,
+        actions: ctypes.c_void_p,
+    ) -> tuple[int, int]:
+        child = ctypes.c_int()
+        status = self.posix_spawn(
+            ctypes.byref(child), executable, ctypes.byref(actions),
+            ctypes.byref(attr), argv, self.get_environ()[0],
+        )
+        return int(status), int(child.value)
+
+
+def _load_darwin_readonly_probe_spawn_api(
+) -> _DarwinReadOnlyProbeSpawnAPI | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        parameters = tuple(
+            inspect.signature(subprocess.Popen._execute_child).parameters
+        )
+    except (TypeError, ValueError):
+        return None
+    if parameters != _DARWIN_PROBE_EXECUTE_CHILD_PARAMETERS:
+        return None
+    try:
+        return _DarwinReadOnlyProbeSpawnAPI()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+_DARWIN_READONLY_PROBE_SPAWN_API = _load_darwin_readonly_probe_spawn_api()
+
+
+def _darwin_readonly_probe_cwd_is_searchable(cwd: object) -> bool:
+    """Use native chdir only when its error attribution stays unambiguous."""
+
+    if cwd is None:
+        return True
+    try:
+        return os.access(cwd, os.X_OK, effective_ids=True)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+class _DarwinReadOnlyProbePopen(subprocess.Popen):
+    """Popen lifecycle with Darwin creation for one exact probe shape."""
+
+    def __init__(self, *args, spawn_api, **kwargs) -> None:
+        self._probe_spawn_api = spawn_api
+        super().__init__(*args, **kwargs)
+
+    def _execute_child(
+        self, args, executable, preexec_fn, close_fds, pass_fds, cwd, env,
+        startupinfo, creationflags, shell, p2cread, p2cwrite, c2pread,
+        c2pwrite, errread, errwrite, restore_signals, gid, gids, uid, umask,
+        start_new_session, process_group,
+    ) -> None:
+        api = self._probe_spawn_api
+        supported = bool(
+            sys.platform == "darwin"
+            and isinstance(api, _DarwinReadOnlyProbeSpawnAPI)
+            and isinstance(args, (list, tuple))
+            and args
+            and all(isinstance(value, (str, bytes, os.PathLike)) for value in args)
+            and executable is None
+            and preexec_fn is None
+            and close_fds
+            and not pass_fds
+            and env is None
+            and startupinfo is None
+            and creationflags == 0
+            and not shell
+            and _darwin_readonly_probe_cwd_is_searchable(cwd)
+            and p2cread == -1
+            and p2cwrite == -1
+            and c2pread != -1
+            and c2pwrite > 2
+            and errread != -1
+            and errwrite > 2
+            and restore_signals
+            and gid is None
+            and gids is None
+            and uid is None
+            and umask < 0
+            and not start_new_session
+            and process_group == -1
+        )
+        if not supported:
+            return super()._execute_child(
+                args, executable, preexec_fn, close_fds, pass_fds, cwd, env,
+                startupinfo, creationflags, shell, p2cread, p2cwrite,
+                c2pread, c2pwrite, errread, errwrite, restore_signals, gid,
+                gids, uid, umask, start_new_session, process_group,
+            )
+
+        try:
+            attr, actions = api.prepare(
+                cwd=cwd, p2cwrite=p2cwrite, c2pread=c2pread, errread=errread,
+                p2cread=p2cread, c2pwrite=c2pwrite, errwrite=errwrite,
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            return super()._execute_child(
+                args, executable, preexec_fn, close_fds, pass_fds, cwd, env,
+                startupinfo, creationflags, shell, p2cread, p2cwrite,
+                c2pread, c2pwrite, errread, errwrite, restore_signals, gid,
+                gids, uid, umask, start_new_session, process_group,
+            )
+
+        original_executable = args[0]
+        try:
+            # Keep CPython's observable authorization boundary: rejection here
+            # creates no child and never falls through to another Popen path.
+            sys.audit("subprocess.Popen", original_executable, list(args), cwd, env)
+
+            encoded_args = [os.fsencode(value) for value in args]
+            if any(b"\0" in value for value in encoded_args):
+                raise ValueError("embedded null byte")
+            argv = (ctypes.c_char_p * (len(encoded_args) + 1))(
+                *encoded_args, None,
+            )
+            encoded_executable = encoded_args[0]
+            if os.path.dirname(encoded_executable):
+                candidates = [encoded_executable]
+            else:
+                candidates = [
+                    os.path.join(os.fsencode(directory), encoded_executable)
+                    for directory in os.get_exec_path(None)
+                ]
+
+            saved_error: OSError | None = None
+            last_error: OSError | None = None
+            for candidate in candidates:
+                status, child = api.spawn(candidate, argv, attr, actions)
+                if status == 0:
+                    self.pid = child
+                    self._child_created = True
+                    try:
+                        self._close_pipe_fds(
+                            p2cread, p2cwrite, c2pread, c2pwrite,
+                            errread, errwrite,
+                        )
+                    except BaseException:
+                        try:
+                            self.kill()
+                        finally:
+                            self.wait()
+                        raise
+                    return
+                if cwd is not None and not os.path.isdir(cwd):
+                    raise OSError(status, os.strerror(status), cwd)
+                failure = OSError(
+                    status, os.strerror(status), original_executable,
+                )
+                last_error = failure
+                if status not in {errno.ENOENT, errno.ENOTDIR} and saved_error is None:
+                    saved_error = failure
+            if saved_error is not None:
+                raise saved_error
+            if last_error is not None:
+                raise last_error
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), original_executable,
+            )
+        finally:
+            api.destroy(attr, actions)
+
+
+def _run_readonly_authority_probe(
+    argv: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    text: bool,
+    timeout: int,
+) -> subprocess.CompletedProcess:
+    """Run one bounded read-only Git/ps/lsof probe with Popen semantics."""
+
+    api = _DARWIN_READONLY_PROBE_SPAWN_API
+    if api is None:
+        return subprocess.run(
+            list(argv), cwd=cwd, capture_output=True, text=text,
+            timeout=timeout, check=False,
+        )
+    with _DarwinReadOnlyProbePopen(
+        list(argv), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=text, close_fds=True, spawn_api=api,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        except BaseException:
+            process.kill()
+            raise
+        returncode = process.poll()
+    return subprocess.CompletedProcess(
+        process.args, returncode, stdout, stderr,
+    )
+
+
 def _sqlite_quote_identifier(identifier: str) -> str:
     """Return one deterministic SQLite double-quoted identifier."""
     if not isinstance(identifier, str):
@@ -285,12 +680,10 @@ def _stable_process_identity(pid: int) -> tuple[str, str, str]:
     """Read start, argv and cwd from the OS; a PID alone is never authority."""
     if not isinstance(pid, int) or pid <= 0:
         raise RuntimeError("AC stable authority PID is invalid")
-    process = subprocess.run(
+    process = _run_readonly_authority_probe(
         ["ps", "-o", "lstart=,command=", "-p", str(pid)],
-        capture_output=True,
         text=True,
         timeout=2,
-        check=False,
     )
     lines = process.stdout.splitlines()
     start = lines[0][:24] if len(lines) == 1 else ""
@@ -316,12 +709,10 @@ def _stable_process_identity(pid: int) -> tuple[str, str, str]:
         # for a process's current directory; do not weaken this to a PID-only
         # check when procfs is absent.
         try:
-            lsof = subprocess.run(
+            lsof = _run_readonly_authority_probe(
                 ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-                capture_output=True,
                 text=True,
                 timeout=2,
-                check=False,
             )
             cwd = next(
                 (line[1:] for line in lsof.stdout.splitlines() if line.startswith("n")),
@@ -3394,8 +3785,8 @@ def _dev_durable_completed_pre_normalization_argv_is_canonical(
 
 
 def _git_read_exact(root: Path, *args: str, timeout: int = 10) -> bytes:
-    result = subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, timeout=timeout, check=False,
+    result = _run_readonly_authority_probe(
+        ["git", *args], cwd=root, text=False, timeout=timeout,
     )
     if result.returncode != 0:
         raise ValueError("AC dev custody Git authority is unavailable")
