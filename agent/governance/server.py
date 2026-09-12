@@ -141167,6 +141167,88 @@ def _contract_runtime_finish_test_results_failure_scan(
     return deepcopy(value)
 
 
+def _contract_runtime_worker_implementation_known_baseline_scan_candidate(
+    line: Mapping[str, Any],
+    *,
+    expected_worker_identity: Mapping[str, Any],
+    expected_baseline_commit: str,
+) -> dict[str, Any]:
+    """Validate the retained implementation ledger before a local scan view.
+
+    This result is only a candidate.  The caller must still establish the
+    canonical completed-line identity and its unique durable acceptance before
+    using ``failure_scan`` to classify the persisted evidence.
+    """
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    test_results = (
+        payload.get("test_results")
+        if isinstance(payload.get("test_results"), Mapping)
+        else {}
+    )
+    acceptance = _contract_runtime_finish_test_results_consumer_acceptance(
+        test_results,
+        expected_baseline_commit=expected_baseline_commit,
+    )
+    commands = test_results.get("commands")
+    tests_alias = payload.get("tests")
+    top_results = line.get("test_results")
+    identity_fields = (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_id",
+        "worker_slot_id",
+        "merge_queue_id",
+    )
+    line_identity_fields = identity_fields[:-1]
+    expected = {
+        field: str(expected_worker_identity.get(field) or "").strip()
+        for field in identity_fields
+    }
+    if not (
+        str(line.get("stage_id") or "").strip() == "worker_implementation"
+        and str(line.get("line_id") or "").strip() == "worker_implementation"
+        and str(line.get("actor_role") or "").strip() == "mf_sub"
+        and str(line.get("evidence_kind") or "").strip() == "implementation"
+        and all(expected.values())
+        and all(
+            str(source.get(field) or "").strip() == expected[field]
+            for source in (line, payload)
+            for field in line_identity_fields
+        )
+        and str(line.get("line_instance_id") or "").strip()
+        == f"runtime_context:{expected['runtime_context_id']}"
+        and acceptance.get("accepted") is True
+        and acceptance.get("complete_known_baseline") is True
+        and isinstance(commands, list)
+        and isinstance(tests_alias, list)
+        and stable_sha256(tests_alias) == stable_sha256(commands)
+        and (
+            "test_results" not in line
+            or (
+                isinstance(top_results, Mapping)
+                and stable_sha256(top_results) == stable_sha256(test_results)
+            )
+        )
+    ):
+        return {}
+    failure_scan = _contract_runtime_finish_test_results_failure_scan(
+        line,
+        canonical_test_results=test_results,
+        accepted_failure_scan=acceptance["failure_scan"],
+    )
+    failure_payload = (
+        failure_scan.get("payload")
+        if isinstance(failure_scan.get("payload"), dict)
+        else {}
+    )
+    failure_payload["tests"] = deepcopy(
+        acceptance["failure_scan"]["commands"]
+    )
+    return {"accepted": True, "failure_scan": failure_scan}
+
+
 def _contract_runtime_statusless_worker_finish_gate_acceptance(
     line: Mapping[str, Any],
     *,
@@ -141374,6 +141456,7 @@ def _contract_runtime_completed_line_acceptance(
     allow_missing_observer_merge_status: bool = False,
     allow_statusless_worker_finish_gate: bool = False,
     allow_verified_worker_finish_attestation: bool = False,
+    allow_verified_worker_implementation_known_baseline: bool = False,
     expected_worker_identity: Mapping[str, Any] | None = None,
     expected_baseline_commit: str = "",
 ) -> dict[str, Any]:
@@ -141433,6 +141516,15 @@ def _contract_runtime_completed_line_acceptance(
         )
     )
     failure_scan_line = canonical_line
+    deferred_implementation_scan: dict[str, Any] = {}
+    if allow_verified_worker_implementation_known_baseline:
+        deferred_implementation_scan = (
+            _contract_runtime_worker_implementation_known_baseline_scan_candidate(
+                canonical_line,
+                expected_worker_identity=(expected_worker_identity or {}),
+                expected_baseline_commit=expected_baseline_commit,
+            )
+        )
     if (
         allow_verified_worker_finish_attestation
         and str(canonical_line.get("stage_id") or "").strip()
@@ -141476,7 +141568,7 @@ def _contract_runtime_completed_line_acceptance(
     )
     if (
         not _contract_runtime_line_status_passes(canonical_line)
-        or disqualifying_failed_qa
+        or (disqualifying_failed_qa and not deferred_implementation_scan)
         or str(canonical_line.get("status") or "").strip().lower()
         in {"waived", "bypassed"}
         or (
@@ -141564,6 +141656,17 @@ def _contract_runtime_completed_line_acceptance(
     expected_ref = f"contract_runtime:{execution_id}:revision:{accepted_revision}"
     accepted_at = str(acceptance["created_at"] or "").strip()
     if _contract_runtime_close_authority_time_order_value(accepted_at) is None:
+        return {}
+    # Only the exact canonical line's unique durable transition makes the
+    # validated historical ledger eligible for a local failure-scan view.
+    # The stored line and binding hashes remain untouched.
+    if deferred_implementation_scan and (
+        _contract_runtime_line_reports_disqualifying_failed_qa(
+            deferred_implementation_scan["failure_scan"],
+            record=record,
+        )
+        and not canonical_no_pass_exception
+    ):
         return {}
     completed_line_ref = (
         f"contract_runtime:{execution_id}:completed_lines:{completed_line_index}"
@@ -194529,6 +194632,11 @@ def _contract_runtime_close_ready_worker_set_authority(
 ) -> dict[str, Any]:
     """Bind contract-scoped close-ready to every current worker lane."""
 
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        get_merge_queue_item_for_branch_context,
+    )
+
     if conn is None or not _is_mf_parallel_postmerge_revision(record):
         return {}
     required_count = _contract_runtime_mf_parallel_current_generation_worker_count(
@@ -194610,6 +194718,33 @@ def _contract_runtime_close_ready_worker_set_authority(
                 return {}
             values.add(value)
         runtime_context_id = identity["runtime_context_id"]
+        context = get_branch_context(conn, project_id, identity["task_id"])
+        queue_item = get_merge_queue_item_for_branch_context(
+            conn,
+            project_id,
+            identity["task_id"],
+            merge_queue_id=identity["merge_queue_id"],
+        )
+        context_identity = (
+            {
+                field: str(getattr(context, field, "") or "").strip()
+                for field in identity
+            }
+            if context is not None
+            else {}
+        )
+        expected_baseline_commit = str(
+            getattr(context, "base_commit", "") or ""
+        ).strip().lower()
+        if (
+            context_identity != identity
+            or queue_item is None
+            or not re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                expected_baseline_commit,
+            )
+        ):
+            return {}
         line_instance_id = f"runtime_context:{runtime_context_id}"
         line_authorities: list[dict[str, Any]] = []
         for line_id in required_line_ids:
@@ -194642,6 +194777,37 @@ def _contract_runtime_close_ready_worker_set_authority(
             if len(candidates) != 1:
                 return {}
             index, line = candidates[0]
+            if line_id == "worker_finish_gate":
+                finish_payload = (
+                    line.get("payload")
+                    if isinstance(line.get("payload"), Mapping)
+                    else {}
+                )
+                finish_head = str(
+                    line.get("head_commit")
+                    or finish_payload.get("validated_head_commit")
+                    or finish_payload.get("head_commit")
+                    or ""
+                ).strip().lower()
+                finish_checkpoint = str(
+                    finish_payload.get("checkpoint_id") or ""
+                ).strip()
+                context_head = str(
+                    getattr(context, "head_commit", "") or ""
+                ).strip().lower()
+                context_checkpoint = str(
+                    getattr(context, "checkpoint_id", "") or ""
+                ).strip()
+                queue_head = str(
+                    getattr(queue_item, "branch_head", "") or ""
+                ).strip().lower()
+                if not (
+                    finish_head
+                    and finish_checkpoint
+                    and context_head == queue_head == finish_head
+                    and context_checkpoint == finish_checkpoint
+                ):
+                    return {}
             acceptance = _contract_runtime_completed_line_acceptance(
                 conn,
                 project_id=project_id,
@@ -194654,7 +194820,11 @@ def _contract_runtime_close_ready_worker_set_authority(
                 allow_statusless_worker_finish_gate=(
                     line_id == "worker_finish_gate"
                 ),
+                allow_verified_worker_implementation_known_baseline=(
+                    line_id == "worker_implementation"
+                ),
                 expected_worker_identity=identity,
+                expected_baseline_commit=expected_baseline_commit,
             )
             if acceptance.get("db_verified") is not True:
                 return {}

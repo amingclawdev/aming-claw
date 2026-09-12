@@ -14293,6 +14293,13 @@ def _insert_exact_qa_graph_query_trace(
             canonical_project_root=canonical_root,
             candidate_commit_sha=candidate_commit_sha,
             comparison_base_commit_sha=comparison_base_commit_sha,
+            registered_allocator_worktree_paths=(
+                server._qa_registered_allocator_worktree_paths(
+                    conn,
+                    project_id=project_id,
+                    canonical_project_root=canonical_root,
+                )
+            ),
             **comparison_options,
         )
     else:
@@ -14454,16 +14461,18 @@ def _write_exact_runtime_context_qa_graph_line(
     activate_snapshot: bool = True,
     graph_task_id: str = "",
     resolve_runtime_comparison: bool = False,
+    project_id: str = PID,
 ) -> dict[str, Any]:
     session = server.role_service.register(
         conn,
         principal,
-        PID,
+        project_id,
         "qa",
         scope=scope,
     )
     _insert_exact_qa_graph_query_trace(
         conn,
+        project_id=project_id,
         trace_id=trace_id,
         snapshot_id=f"scope-{trace_id}",
         candidate_commit_sha=candidate_commit_sha,
@@ -14500,7 +14509,7 @@ def _write_exact_runtime_context_qa_graph_line(
     }
     ctx = _ctx_with_role(
         {
-            "project_id": PID,
+            "project_id": project_id,
             "contract_execution_id": contract_execution_id,
         },
         "qa",
@@ -14527,7 +14536,7 @@ def _write_exact_runtime_context_qa_graph_line(
     )
     acceptance = server._contract_runtime_completed_line_acceptance(
         conn,
-        project_id=PID,
+        project_id=project_id,
         record=record,
         completed_line_index=line_index,
         expected_line=record["completed_lines"][line_index],
@@ -111707,6 +111716,12 @@ def _accept_close_ready_worker_set_line(
     expected_line,
     **kwargs,
 ):
+    if expected_line["line_id"] != "observer_dispatch_bounded_workers":
+        assert kwargs["expected_baseline_commit"] == "1" * 40
+    if expected_line["line_id"] == "worker_implementation":
+        assert kwargs[
+            "allow_verified_worker_implementation_known_baseline"
+        ] is True
     if expected_line["line_id"] == "worker_finish_gate":
         assert kwargs["allow_statusless_worker_finish_gate"] is True
         identity = kwargs["expected_worker_identity"]
@@ -111727,6 +111742,61 @@ def _accept_close_ready_worker_set_line(
         ),
         "execution_state_revision": completed_line_index + 2,
     }
+
+
+def _install_standalone_close_ready_runtime_contexts(
+    monkeypatch,
+    record,
+):
+    workers = record["completed_lines"][0]["payload"]["bounded_workers"]
+    finish_lines = {
+        line["task_id"]: line
+        for line in record["completed_lines"]
+        if line.get("line_id") == "worker_finish_gate"
+    }
+    contexts = {
+        worker["task_id"]: SimpleNamespace(
+            **{
+                field: worker[field]
+                for field in (
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                    "worker_id",
+                    "worker_slot_id",
+                    "merge_queue_id",
+                )
+            },
+            base_commit="1" * 40,
+            head_commit=str(
+                finish_lines[worker["task_id"]]["head_commit"]
+            ),
+            checkpoint_id=str(
+                finish_lines[worker["task_id"]]["payload"]["checkpoint_id"]
+            ),
+        )
+        for worker in workers
+    }
+    queue_items = {
+        worker["task_id"]: SimpleNamespace(
+            branch_head=contexts[worker["task_id"]].head_commit,
+        )
+        for worker in workers
+    }
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context",
+        lambda _conn, project_id, task_id: (
+            contexts.get(task_id) if project_id == PID else None
+        ),
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_merge_queue_item_for_branch_context",
+        lambda _conn, project_id, task_id, **_kwargs: (
+            queue_items.get(task_id) if project_id == PID else None
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -111804,6 +111874,7 @@ def test_close_ready_worker_set_pairs_distinct_commits_with_same_lane_finish(
     record["runtime_guide"]["completed_lines"] = copy.deepcopy(
         record["completed_lines"]
     )
+    _install_standalone_close_ready_runtime_contexts(monkeypatch, record)
     monkeypatch.setattr(
         server,
         "_contract_runtime_completed_line_acceptance",
@@ -111960,6 +112031,7 @@ def test_standalone_close_ready_worker_set_drift_is_zero_write(
     mutator,
 ):
     record, write = _standalone_close_ready_worker_set_fixture()
+    _install_standalone_close_ready_runtime_contexts(monkeypatch, record)
     monkeypatch.setattr(
         server,
         "_contract_runtime_completed_line_acceptance",
@@ -111989,6 +112061,7 @@ def test_standalone_close_ready_worker_set_requires_exact_lane_history(
     case,
 ):
     record, write = _standalone_close_ready_worker_set_fixture()
+    _install_standalone_close_ready_runtime_contexts(monkeypatch, record)
     if case == "missing":
         record["completed_lines"].pop(3)
     elif case == "duplicate":
@@ -112022,6 +112095,7 @@ def test_standalone_close_ready_actual_facades_bind_worker_set_then_submit(
     monkeypatch,
 ):
     record, body = _standalone_close_ready_worker_set_fixture()
+    _install_standalone_close_ready_runtime_contexts(monkeypatch, record)
     execution_id = record["contract_execution_id"]
 
     class Store:
@@ -173223,6 +173297,14 @@ def _normal_mf_parallel_finish_precursor(
         "graph_trace_ids": [graph_trace_id], "test_results": test_results,
         "summary": "normal source-backed worker test precursor",
     }
+    if isinstance(test_results.get("commands"), list):
+        # The retained CS implementation evidence carries the exact command
+        # ledger through both canonical test_results and its legacy tests
+        # alias.  Exercise that normal producer shape instead of hand-writing
+        # a completed ContractRuntime line.
+        implementation_body["tests"] = copy.deepcopy(
+            test_results["commands"]
+        )
     implementation_response = server.handle_graph_governance_runtime_context_implementation_evidence(
         _ctx_with_role(path, "mf_sub", method="POST", body=implementation_body)
     )
@@ -173493,12 +173575,636 @@ def test_statusless_finish_consumer_accepts_normal_known_baseline(
     ) is False
 
 
+def _complete_rev10_two_lane_close_ready_through_normal_facades(
+    conn,
+    *,
+    monkeypatch,
+    request,
+    tmp_path,
+    case,
+    finished_workers,
+    queue_results,
+    worker_credentials,
+):
+    """Advance the real two-lane producer through merge, QA, and close."""
+
+    project_id = case["project_id"]
+    backlog_id = case["backlog_id"]
+    execution_id = case["execution_id"]
+    canonical_root = Path(case["world"]["target_project_root"])
+    if subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/main"],
+        cwd=canonical_root,
+        check=False,
+    ).returncode != 0:
+        subprocess.run(
+            ["git", "branch", "main", "HEAD"],
+            cwd=canonical_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=canonical_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    release_routes = {}
+    merged_heads = []
+    for context, _finished, _finish_line, _route_identity in finished_workers:
+        # Allocation launches the worker in its own checkout.  The normal
+        # merge consumer is bound to the canonical target repository.
+        context = upsert_branch_context(
+            conn,
+            replace(context, target_project_root=str(canonical_root)),
+        )
+        queue_item = next(
+            result["queue_item"]
+            for result in queue_results
+            if result["queue_item"]["task_id"] == context.task_id
+        )
+        target_head_before = batch_jobs.git_commit(canonical_root)
+        subprocess.run(
+            ["git", "merge", "--no-edit", context.head_commit],
+            cwd=canonical_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        target_head_after = batch_jobs.git_commit(canonical_root)
+        merged_heads.append(target_head_after)
+        release_route = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=context.task_id,
+            target_files=list(context.owned_files),
+            project_root=canonical_root,
+            allowed_actions=[
+                "merge_result",
+                "task_timeline_append",
+                "graph_current_full_reconcile",
+            ],
+        )
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=server._route_registry_storage_project_id(
+                project_id
+            ),
+            route_token_ref=release_route["route_token_ref"],
+            token=release_route["route_token"],
+        )
+        conn.commit()
+        release_routes[context.task_id] = release_route
+        merge_result = server.handle_graph_governance_parallel_branch_merge_result(
+            _ctx_with_role(
+                {"project_id": project_id},
+                "observer",
+                method="POST",
+                body={
+                    "merge_queue_id": context.merge_queue_id,
+                    "queue_item_id": queue_item["queue_item_id"],
+                    "task_id": context.task_id,
+                    "status": "merged",
+                    "merge_commit": target_head_after,
+                    "target_head_before_merge": target_head_before,
+                    "target_head_after_merge": target_head_after,
+                    "target_ref": queue_item["target_ref"],
+                    "repo_root_path": str(canonical_root),
+                    "fence_token": worker_credentials[context.task_id][
+                        "fence_token"
+                    ],
+                    "route_token_ref": release_route["route_token_ref"],
+                },
+            )
+        )
+        assert merge_result["ok"] is True, merge_result
+        merge_event = server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": project_id},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": context.task_id,
+                    "event_type": "parallel.live_merge",
+                    "event_kind": "merge",
+                    "phase": "merge",
+                    "actor": "observer-principal",
+                    "status": "passed",
+                    "commit_sha": target_head_after,
+                    "route_token_ref": release_route["route_token_ref"],
+                    "payload": {
+                        "contract_execution_id": execution_id,
+                        "runtime_context_id": context.runtime_context_id,
+                        "parent_task_id": context.parent_task_id,
+                        "merge_queue_id": context.merge_queue_id,
+                        "merge_commit": target_head_after,
+                        "target_head_before_merge": target_head_before,
+                        "target_head_after_merge": target_head_after,
+                    },
+                },
+            )
+        )
+        assert merge_event["status"] == "passed"
+        conn.commit()
+        merge_current = server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": project_id,
+                    "contract_execution_id": execution_id,
+                },
+                "observer",
+            )
+        )
+        assert merge_current["next_legal_action"]["line_id"] == "observer_merge"
+        merge_writer = merge_current["next_legal_action"][
+            "writer_role_safe_copy_payload"
+        ]["copy_payload"]
+        written_merge = server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {
+                    "project_id": project_id,
+                    "contract_execution_id": execution_id,
+                },
+                "observer",
+                method="POST",
+                body={
+                    **merge_writer,
+                    "commit_sha": target_head_after,
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": context.parent_task_id,
+                    "payload": {
+                        **dict(merge_writer.get("payload") or {}),
+                        "merge_event_ref": f"timeline:{merge_event['id']}",
+                        "merge_commit": target_head_after,
+                        "merge_queue_id": context.merge_queue_id,
+                    },
+                },
+            )
+        )
+        assert written_merge["ok"] is True, written_merge
+
+    final_head = merged_heads[-1]
+    reconcile_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": project_id, "contract_execution_id": execution_id},
+            "observer",
+        )
+    )
+    assert reconcile_current["next_legal_action"]["line_id"] == (
+        "observer_reconcile"
+    )
+    reconcile_writer = reconcile_current["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    reconcile_runtime_context_id = server._contract_runtime_mapping_value(
+        reconcile_writer, "runtime_context_id"
+    )
+    if not reconcile_runtime_context_id:
+        reconcile_record = server._contract_runtime_store(conn).get(
+            execution_id
+        )
+        aggregate_merge = (
+            server._contract_runtime_rev8_two_worker_merge_projection(
+                reconcile_record,
+                required_worker_count=2,
+                conn=conn,
+                project_id=project_id,
+            )
+        )
+        selected_reconcile = (
+            server._contract_runtime_rev8_selected_reconcile_lane_projection(
+                conn,
+                project_id=project_id,
+                record=reconcile_record,
+                aggregate_merge=aggregate_merge,
+            )
+        )
+        reconcile_runtime_context_id = str(
+            selected_reconcile.get("runtime_context_id") or ""
+        )
+    assert reconcile_runtime_context_id
+    reconcile_context = next(
+        context
+        for context, *_rest in finished_workers
+        if context.runtime_context_id == reconcile_runtime_context_id
+    )
+    reconcile_context = get_branch_context(
+        conn, project_id, reconcile_context.task_id
+    )
+    assert reconcile_context is not None
+    reconcile_queue = next(
+        result["queue_item"]
+        for result in queue_results
+        if result["queue_item"]["task_id"] == reconcile_context.task_id
+    )
+    reconcile_session = case["observer_session_id"]
+    reconcile_lease = server._acquire_pid_lock(
+        lock_dir=tmp_path / f"reconcile-{execution_id}",
+        lock_timeout_seconds=0.1,
+        prior_pid_timeout_seconds=0.1,
+        poll_interval_seconds=0.005,
+    )
+    request.addfinalizer(reconcile_lease.release)
+    certificates = server._certify_governance_manager_generation(
+        reconcile_lease,
+        project_ids=[project_id],
+    )
+    with monkeypatch.context() as manager_context:
+        manager_context.setattr(
+            server, "_GOVERNANCE_SINGLETON_LEASE", reconcile_lease
+        )
+        manager_context.setattr(
+            server, "_GOVERNANCE_MANAGER_CERTIFICATES", certificates
+        )
+        reconcile_status, reconcile_result = (
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx_with_role(
+                    {"project_id": project_id},
+                    "observer",
+                    method="POST",
+                    body={
+                        "project_root": str(canonical_root),
+                        "target_commit_sha": final_head,
+                        "backlog_id": backlog_id,
+                        "task_id": reconcile_context.task_id,
+                        "contract_execution_id": execution_id,
+                        "runtime_context_id": (
+                            reconcile_context.runtime_context_id
+                        ),
+                        "parent_task_id": reconcile_context.parent_task_id,
+                        "merge_queue_id": reconcile_context.merge_queue_id,
+                        "queue_item_id": reconcile_queue["queue_item_id"],
+                        "observer_session_id": reconcile_session,
+                        "observer_route_token_ref": release_routes[
+                            reconcile_context.task_id
+                        ]["route_token_ref"],
+                        "activate": True,
+                        "require_clean": True,
+                        "run_id": f"run-{execution_id}",
+                        "snapshot_id": f"full-{execution_id}",
+                    },
+                )
+            )
+        )
+    assert reconcile_status == 201, reconcile_result
+    assert reconcile_result["ok"] is True, reconcile_result
+    reconcile_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": project_id, "contract_execution_id": execution_id},
+            "observer",
+        )
+    )
+    canonical_reconcile = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": project_id, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body=reconcile_current["next_legal_action"][
+                "writer_role_safe_copy_payload"
+            ]["copy_payload"],
+        )
+    )
+    assert canonical_reconcile["ok"] is True, canonical_reconcile
+
+    postmerge_authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        conn,
+        project_id=project_id,
+        record=server._contract_runtime_store(conn).get(execution_id),
+    )
+    assert postmerge_authority.get("verified") is True, postmerge_authority
+
+    qa_principal = f"qa:{execution_id}"
+    qa_trace_id = f"gqt-{execution_id}-qa"
+    qa_scope_ref = server._qa_scope_binding_ref(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        commit_sha=final_head,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{execution_id}",
+        f"task:{reconcile_context.task_id}",
+        f"commit:{final_head}",
+        qa_scope_ref,
+    ]
+    before_qa_revision = int(
+        server._contract_runtime_store(conn)
+        .get(execution_id)["execution_state_revision"]
+    )
+    qa_session = _write_exact_runtime_context_qa_graph_line(
+        conn,
+        contract_execution_id=execution_id,
+        backlog_id=backlog_id,
+        runtime_context=reconcile_context,
+        candidate_commit_sha=final_head,
+        target_project_root=str(canonical_root),
+        canonical_project_root=str(canonical_root),
+        scope=qa_scope,
+        principal=qa_principal,
+        trace_id=qa_trace_id,
+        created_at="2026-09-12T14:00:00Z",
+        after_revision=before_qa_revision,
+        activate_snapshot=False,
+        graph_task_id=execution_id,
+        resolve_runtime_comparison=True,
+        project_id=project_id,
+    )
+    qa_body = {
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "event_type": "qa.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "qa",
+        "actor": qa_principal,
+        "status": "passed",
+        "commit_sha": final_head,
+        "payload": {
+            "contract_execution_id": execution_id,
+            "runtime_context_id": reconcile_context.runtime_context_id,
+            "graph_trace_ids": [qa_trace_id],
+            "observer_impersonation": False,
+        },
+        "verification": {
+            "tests_run": [
+                "pytest -q agent/tests/test_graph_governance_api.py"
+            ],
+            "diff_check": {"unexpected_files": []},
+        },
+    }
+    qa_context = _ctx_with_role(
+        {"project_id": project_id},
+        "qa",
+        method="POST",
+        body=qa_body,
+    )
+    qa_context._session.update(
+        {
+            "session_id": qa_session["session_id"],
+            "principal_id": qa_principal,
+            "scope": qa_scope,
+        }
+    )
+    qa_result = server.handle_task_timeline_append(qa_context)
+    assert qa_result["contract_runtime_close_evidence_gate"]["accepted"] is True
+    close_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": project_id, "contract_execution_id": execution_id},
+            "observer",
+        )
+    )
+    assert close_current["next_legal_action"]["line_id"] == (
+        "observer_close_ready"
+    )
+    close_body = close_current["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    before_close = copy.deepcopy(server._contract_runtime_store(conn).get(execution_id))
+    close_worker_set = server._contract_runtime_close_ready_worker_set_authority(
+        conn,
+        project_id=project_id,
+        record=before_close,
+    )
+    assert close_worker_set["db_verified"] is True, close_worker_set
+    assert close_worker_set["required_worker_count"] == 2
+    assert len(close_worker_set["workers"]) == 2
+
+    def rejected_close_precheck(role="observer"):
+        changes_before = conn.total_changes
+        result = server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {
+                    "project_id": project_id,
+                    "contract_execution_id": execution_id,
+                },
+                role,
+                method="POST",
+                body=close_body,
+            )
+        )
+        assert result["ok"] is False, result
+        assert conn.total_changes == changes_before
+        return result
+
+    rejected_close_precheck("qa")
+    assert server._contract_runtime_store(conn).get(execution_id) == before_close
+
+    drift_context = get_branch_context(
+        conn, project_id, finished_workers[0][0].task_id
+    )
+    assert drift_context is not None
+    for field, drifted_value in (
+        ("head_commit", "e" * 40),
+        ("checkpoint_id", "checkpoint-after-final-qa"),
+    ):
+        upsert_branch_context(
+            conn,
+            replace(drift_context, **{field: drifted_value}),
+        )
+        rejected_close_precheck()
+        assert server._contract_runtime_store(conn).get(execution_id) == before_close
+        upsert_branch_context(conn, drift_context)
+
+    selected_finish = next(
+        line
+        for line in close_worker_set["workers"][0][
+            "completed_line_authorities"
+        ]
+        if line["line_id"] == "worker_finish_gate"
+    )
+    finish_binding = conn.execute(
+        "SELECT * FROM backlog_contract_chain_bindings "
+        "WHERE project_id = ? AND contract_execution_id = ? "
+        "AND source_ref = ?",
+        (
+            project_id,
+            execution_id,
+            selected_finish["acceptance_ref"],
+        ),
+    ).fetchone()
+    assert finish_binding is not None
+    conn.execute(
+        "DELETE FROM backlog_contract_chain_bindings WHERE id = ?",
+        (finish_binding["id"],),
+    )
+    conn.commit()
+    rejected_close_precheck()
+    binding_columns = list(finish_binding.keys())
+    conn.execute(
+        f"INSERT INTO backlog_contract_chain_bindings "
+        f"({', '.join(binding_columns)}) VALUES "
+        f"({', '.join('?' for _ in binding_columns)})",
+        tuple(finish_binding[column] for column in binding_columns),
+    )
+    conn.commit()
+
+    max_revision = int(
+        conn.execute(
+            "SELECT MAX(execution_state_revision) FROM "
+            "backlog_contract_chain_bindings WHERE project_id = ? "
+            "AND contract_execution_id = ?",
+            (project_id, execution_id),
+        ).fetchone()[0]
+    )
+    finish_index = int(
+        selected_finish["completed_line_ref"].rsplit(":", 1)[1]
+    )
+    binding_identity = {
+        field: before_close[field]
+        for field in (
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "contract_id",
+            "contract_chain_id",
+            "parent_contract_execution_id",
+            "root_contract_execution_id",
+        )
+    }
+    duplicate_keys = []
+    for offset, completed_line_count in enumerate(
+        (finish_index, finish_index + 1), start=1
+    ):
+        revision = max_revision + offset
+        idempotency_key = f"test:eligible-duplicate-acceptance:{revision}"
+        duplicate_keys.append(idempotency_key)
+        conn.execute(
+            """
+            INSERT INTO backlog_contract_chain_bindings (
+                idempotency_key, project_id, backlog_id, contract_chain_id,
+                root_contract_execution_id, contract_execution_id,
+                parent_contract_execution_id, contract_id, binding_kind,
+                generation, execution_state_revision, source_ref, source_hash,
+                degraded_flags_json, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', ?)
+            """,
+            (
+                idempotency_key,
+                project_id,
+                before_close["backlog_id"],
+                before_close["contract_chain_id"],
+                before_close["root_contract_execution_id"],
+                execution_id,
+                before_close["parent_contract_execution_id"],
+                before_close["contract_id"],
+                "contract_runtime_state",
+                1,
+                revision,
+                f"contract_runtime:{execution_id}:revision:{revision}",
+                server.stable_sha256(
+                    {
+                        **binding_identity,
+                        "execution_state_revision": revision,
+                        "completed_line_count": completed_line_count,
+                    }
+                ),
+                "2026-09-12T14:00:00Z",
+            ),
+        )
+    conn.commit()
+    rejected_close_precheck()
+    conn.executemany(
+        "DELETE FROM backlog_contract_chain_bindings WHERE idempotency_key = ?",
+        [(key,) for key in duplicate_keys],
+    )
+    conn.commit()
+
+    execution_row = conn.execute(
+        "SELECT record_json FROM contract_runtime_executions "
+        "WHERE contract_execution_id = ?",
+        (execution_id,),
+    ).fetchone()
+    assert execution_row is not None
+    original_record_json = execution_row["record_json"]
+    outside_failure = json.loads(original_record_json)
+    selected_implementation = next(
+        line
+        for line in close_worker_set["workers"][0][
+            "completed_line_authorities"
+        ]
+        if line["line_id"] == "worker_implementation"
+    )
+    implementation_index = int(
+        selected_implementation["completed_line_ref"].rsplit(":", 1)[1]
+    )
+    outside_failure["completed_lines"][implementation_index]["payload"][
+        "current_validation"
+    ] = {"status": "failed"}
+    conn.execute(
+        "UPDATE contract_runtime_executions SET record_json = ? "
+        "WHERE contract_execution_id = ?",
+        (
+            json.dumps(outside_failure, sort_keys=True, separators=(",", ":")),
+            execution_id,
+        ),
+    )
+    conn.commit()
+    rejected_close_precheck()
+    conn.execute(
+        "UPDATE contract_runtime_executions SET record_json = ? "
+        "WHERE contract_execution_id = ?",
+        (original_record_json, execution_id),
+    )
+    conn.commit()
+    assert server._contract_runtime_store(conn).get(execution_id) == before_close
+
+    precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {
+                "project_id": project_id,
+                "contract_execution_id": execution_id,
+            },
+            "observer",
+            method="POST",
+            body=close_body,
+        )
+    )
+    assert precheck["ok"] is True, precheck
+    assert precheck["would_mutate_completed_lines"] is False
+    assert server._contract_runtime_store(conn).get(execution_id) == before_close
+    submitted = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": project_id, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body=close_body,
+        )
+    )
+    assert submitted["ok"] is True, submitted
+    after_close = server._contract_runtime_store(conn).get(execution_id)
+    assert after_close["completed_lines"][:-1] == before_close["completed_lines"]
+    assert len(after_close["completed_lines"]) == len(
+        before_close["completed_lines"]
+    ) + 1
+    close_line = after_close["completed_lines"][-1]
+    assert close_line["line_id"] == "observer_close_ready"
+    envelope = close_line["payload"]["retained_contract_envelope"]
+    assert envelope["server_derived"] is True
+    assert envelope["required_worker_count"] == 2
+    assert len(envelope["workers"]) == 2
+    return {
+        "before_close": before_close,
+        "after_close": after_close,
+        "close_line": close_line,
+        "close_body": close_body,
+    }
+
+
 @pytest.mark.parametrize("tamper", ["runtime_drift"])
-@pytest.mark.parametrize("result_mode", ["mixed", "all_passed"])
+@pytest.mark.parametrize(
+    "result_mode",
+    ["mixed", "mixed_reversed", "all_passed"],
+)
 def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_pass(
     release_conn,
     monkeypatch,
     tmp_path,
+    request,
     tamper,
     result_mode,
 ):
@@ -173602,12 +174308,14 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
         "baseline_passed": 215,
         "overall_release_pass_claimed": False,
     }
-    results_by_lane = (
-        [known_baseline_results, passed_results]
-        if result_mode == "mixed"
-        else [passed_results, copy.deepcopy(passed_results)]
-    )
+    if result_mode == "mixed":
+        results_by_lane = [known_baseline_results, passed_results]
+    elif result_mode == "mixed_reversed":
+        results_by_lane = [passed_results, known_baseline_results]
+    else:
+        results_by_lane = [passed_results, copy.deepcopy(passed_results)]
     finished_workers = []
+    worker_credentials = {}
     for lane_index, ((allocation_body, context), test_results) in enumerate(
         zip(allocations, results_by_lane, strict=True)
     ):
@@ -173650,6 +174358,9 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
             )
         )
         assert joined["ok"] is True, joined
+        worker_credentials[context.task_id] = {
+            "fence_token": joined["fence_token"],
+        }
         # The Direct entry/allocation and custody join above exercise the
         # isolated fixture's normal dev route. Worker evidence stays in the
         # isolated SQLite/Git fixture and does not claim the host's dev DB.
@@ -173711,6 +174422,255 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
         ]
         assert len(worker_ledgers) == 3
         assert all(ledger == test_results for ledger in worker_ledgers)
+        implementation_index, implementation_line = next(
+            (index, line)
+            for index, line in enumerate(record["completed_lines"])
+            if line.get("runtime_context_id") == context.runtime_context_id
+            and line.get("line_id") == "worker_implementation"
+        )
+        implementation_alias = implementation_line["payload"].get("tests")
+        if test_results.get("status") == (
+            "accepted_with_known_baseline_failure"
+        ):
+            assert implementation_alias == test_results["commands"]
+            expected_implementation_identity = {
+                field: str(getattr(context, field) or "")
+                for field in (
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                    "worker_id",
+                    "worker_slot_id",
+                    "merge_queue_id",
+                )
+            }
+            implementation_scan = server._contract_runtime_worker_implementation_known_baseline_scan_candidate(
+                implementation_line,
+                expected_worker_identity=expected_implementation_identity,
+                expected_baseline_commit=context.base_commit,
+            )
+            complete_ledger = server._contract_runtime_finish_test_results_consumer_acceptance(
+                test_results,
+                expected_baseline_commit=context.base_commit,
+            )
+            assert bool(implementation_scan) is bool(
+                complete_ledger.get("accepted") is True
+                and complete_ledger.get("complete_known_baseline") is True
+            ), {
+                "line_identity": {
+                    key: implementation_line.get(key)
+                    for key in expected_implementation_identity
+                },
+                "payload_identity": {
+                    key: implementation_line["payload"].get(key)
+                    for key in expected_implementation_identity
+                },
+                "expected_identity": expected_implementation_identity,
+                "stage_id": implementation_line.get("stage_id"),
+                "line_id": implementation_line.get("line_id"),
+                "actor_role": implementation_line.get("actor_role"),
+                "evidence_kind": implementation_line.get("evidence_kind"),
+                "line_instance_id": implementation_line.get("line_instance_id"),
+                "top_results_match": server.stable_sha256(
+                    implementation_line.get("test_results")
+                ) == server.stable_sha256(test_results),
+            }
+            if not implementation_scan:
+                # The semantic-mismatch harness intentionally creates an
+                # invalid ledger and must continue to its original premerge
+                # rejection point.  It never receives the local scan view.
+                finished_workers.append(
+                    (context, finished, finish_line, route_identity)
+                )
+                continue
+            assert server._contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=implementation_index,
+                expected_line=implementation_line,
+                allow_verified_worker_implementation_known_baseline=True,
+                expected_worker_identity=expected_implementation_identity,
+                expected_baseline_commit=context.base_commit,
+            )["db_verified"] is True
+            assert not server._contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=implementation_index,
+                expected_line=implementation_line,
+                allow_verified_worker_implementation_known_baseline=True,
+                expected_worker_identity=expected_implementation_identity,
+                expected_baseline_commit="f" * 40,
+            )
+            wrong_identity = {
+                **expected_implementation_identity,
+                "task_id": "foreign-worker-task",
+            }
+            assert not server._contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=implementation_index,
+                expected_line=implementation_line,
+                allow_verified_worker_implementation_known_baseline=True,
+                expected_worker_identity=wrong_identity,
+                expected_baseline_commit=context.base_commit,
+            )
+            mismatched_alias = copy.deepcopy(implementation_line)
+            mismatched_alias["payload"]["tests"][1]["errors"] += 1
+            assert not server._contract_runtime_worker_implementation_known_baseline_scan_candidate(
+                mismatched_alias,
+                expected_worker_identity=expected_implementation_identity,
+                expected_baseline_commit=context.base_commit,
+            )
+            mismatched_copy = copy.deepcopy(implementation_line)
+            mismatched_copy["test_results"] = {
+                **test_results,
+                "candidate_new_failures": 1,
+            }
+            assert not server._contract_runtime_worker_implementation_known_baseline_scan_candidate(
+                mismatched_copy,
+                expected_worker_identity=expected_implementation_identity,
+                expected_baseline_commit=context.base_commit,
+            )
+            outside_failure = copy.deepcopy(implementation_line)
+            outside_failure["payload"]["current_validation"] = {
+                "status": "failed",
+            }
+            outside_scan = server._contract_runtime_worker_implementation_known_baseline_scan_candidate(
+                outside_failure,
+                expected_worker_identity=expected_implementation_identity,
+                expected_baseline_commit=context.base_commit,
+            )
+            assert outside_scan["accepted"] is True
+            assert server._contract_runtime_line_reports_disqualifying_failed_qa(
+                outside_scan["failure_scan"],
+                record=record,
+            ) is True
+
+            execution_row = conn.execute(
+                "SELECT record_json FROM contract_runtime_executions "
+                "WHERE contract_execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+            assert execution_row is not None
+            original_record_json = execution_row["record_json"]
+            for case_name, mutation in (
+                (
+                    "tests_alias_mismatch",
+                    lambda line: line["payload"]["tests"][1].update(
+                        {"errors": 9}
+                    ),
+                ),
+                (
+                    "top_test_results_mismatch",
+                    lambda line: line.update(
+                        {
+                            "test_results": {
+                                **test_results,
+                                "candidate_new_failures": 1,
+                            }
+                        }
+                    ),
+                ),
+                (
+                    "outside_ledger_current_failure",
+                    lambda line: line["payload"].update(
+                        {"current_validation": {"status": "failed"}}
+                    ),
+                ),
+            ):
+                tampered_record = copy.deepcopy(record)
+                mutation(tampered_record["completed_lines"][implementation_index])
+                conn.execute(
+                    "UPDATE contract_runtime_executions SET record_json = ? "
+                    "WHERE contract_execution_id = ?",
+                    (
+                        json.dumps(
+                            tampered_record,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        execution_id,
+                    ),
+                )
+                conn.commit()
+                stored_tamper = server._contract_runtime_store(conn).get(
+                    execution_id
+                )
+                tampered_line = stored_tamper["completed_lines"][
+                    implementation_index
+                ]
+                before_tampered_read = _fresh_release_fixture_rows(conn)
+                assert not server._contract_runtime_completed_line_acceptance(
+                    conn,
+                    project_id=project_id,
+                    record=stored_tamper,
+                    completed_line_index=implementation_index,
+                    expected_line=tampered_line,
+                    allow_verified_worker_implementation_known_baseline=True,
+                    expected_worker_identity=expected_implementation_identity,
+                    expected_baseline_commit=context.base_commit,
+                ), case_name
+                assert _fresh_release_fixture_rows(conn) == before_tampered_read
+                conn.execute(
+                    "UPDATE contract_runtime_executions SET record_json = ? "
+                    "WHERE contract_execution_id = ?",
+                    (original_record_json, execution_id),
+                )
+                conn.commit()
+                record = server._contract_runtime_store(conn).get(execution_id)
+                implementation_line = record["completed_lines"][
+                    implementation_index
+                ]
+
+            implementation_acceptance = server._contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=implementation_index,
+                expected_line=implementation_line,
+                allow_verified_worker_implementation_known_baseline=True,
+                expected_worker_identity=expected_implementation_identity,
+                expected_baseline_commit=context.base_commit,
+            )
+            binding = conn.execute(
+                "SELECT * FROM backlog_contract_chain_bindings "
+                "WHERE project_id = ? AND contract_execution_id = ? "
+                "AND execution_state_revision = ?",
+                (
+                    project_id,
+                    execution_id,
+                    implementation_acceptance["execution_state_revision"],
+                ),
+            ).fetchone()
+            assert binding is not None
+            conn.execute(
+                "DELETE FROM backlog_contract_chain_bindings WHERE id = ?",
+                (binding["id"],),
+            )
+            conn.commit()
+            state_before_missing_binding = _fresh_release_fixture_rows(conn)
+            assert not server._contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=project_id,
+                record=record,
+                completed_line_index=implementation_index,
+                expected_line=implementation_line,
+                allow_verified_worker_implementation_known_baseline=True,
+                expected_worker_identity=expected_implementation_identity,
+                expected_baseline_commit=context.base_commit,
+            )
+            assert _fresh_release_fixture_rows(conn) == state_before_missing_binding
+            binding_columns = list(binding.keys())
+            conn.execute(
+                "INSERT INTO backlog_contract_chain_bindings "
+                f"({', '.join(binding_columns)}) VALUES "
+                f"({', '.join('?' for _ in binding_columns)})",
+                tuple(binding[column] for column in binding_columns),
+            )
+            conn.commit()
         finished_workers.append((context, finished, finish_line, route_identity))
 
     queue_results = []
@@ -173803,13 +174763,28 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
         context.task_id: batch_jobs.git_commit(Path(context.worktree_path))
         for context, _, _, _ in finished_workers
     } == branch_heads_before
-    if result_mode == "mixed":
-        assert results_by_lane[0]["no_pass"] is True
-        assert results_by_lane[0]["overall_release_pass_claimed"] is False
+    if result_mode in {"mixed", "mixed_reversed"}:
+        known_baseline_lane = next(
+            result
+            for result in results_by_lane
+            if result.get("status") == "accepted_with_known_baseline_failure"
+        )
+        assert known_baseline_lane["no_pass"] is True
+        assert known_baseline_lane["overall_release_pass_claimed"] is False
     else:
         assert all(result["passed"] is True for result in results_by_lane)
 
     if result_mode != "mixed":
+        _complete_rev10_two_lane_close_ready_through_normal_facades(
+            conn,
+            monkeypatch=monkeypatch,
+            request=request,
+            tmp_path=tmp_path,
+            case=case,
+            finished_workers=finished_workers,
+            queue_results=queue_results,
+            worker_credentials=worker_credentials,
+        )
         return
 
     def assert_read_only_block(expected_reason):
@@ -174066,6 +175041,16 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
     assert authority_after_restore["status"] == "satisfied", json.dumps(
         authority_after_restore, sort_keys=True
     )
+    _complete_rev10_two_lane_close_ready_through_normal_facades(
+        conn,
+        monkeypatch=monkeypatch,
+        request=request,
+        tmp_path=tmp_path,
+        case=case,
+        finished_workers=finished_workers,
+        queue_results=queue_results,
+        worker_credentials=worker_credentials,
+    )
 
 
 @pytest.mark.parametrize(
@@ -174082,6 +175067,7 @@ def test_rev10_complete_baseline_ledger_rejects_semantic_mismatch(
     release_conn,
     monkeypatch,
     tmp_path,
+    request,
     mismatch,
     value,
 ):
@@ -174196,6 +175182,7 @@ def test_rev10_complete_baseline_ledger_rejects_semantic_mismatch(
             release_conn,
             monkeypatch,
             tmp_path,
+            request,
             "runtime_drift",
             "mixed",
         )
