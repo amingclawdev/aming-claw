@@ -225680,3 +225680,471 @@ def test_dev_successor_history_cache_concurrent_failure_shares_no_success(
 
     assert calls == 2
     assert str(world["root"]) not in governance_db._DEV_COW_SUCCESSOR_HISTORY_CACHE
+
+
+def test_dev_writer_lease_keeps_legacy_public_identity_and_private_native_baseline(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "writer-identity-root"
+    (root / "governance/aming-claw").mkdir(parents=True)
+    legacy = "sha256:" + "1" * 64
+    native = "sha256:" + "2" * 64
+    legacy_calls = []
+    native_calls = []
+
+    def legacy_identity():
+        legacy_calls.append("ps")
+        return legacy
+
+    def native_identity():
+        native_calls.append("native")
+        return native
+
+    monkeypatch.setattr(
+        governance_db, "_writer_process_start_identity", legacy_identity,
+    )
+    monkeypatch.setattr(
+        governance_db, "_native_writer_process_start_identity", native_identity,
+    )
+    try:
+        public = governance_db.acquire_dev_runtime_writer_lease(root)
+        database_key = str(
+            (root / governance_db.AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+        )
+        with governance_db._DEV_DATABASE_WRITER_LEASES_LOCK:
+            private = governance_db._DEV_DATABASE_WRITER_LEASES[database_key]
+            assert private["owner_start_identity"] == legacy
+            assert private[
+                governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY
+            ] == native
+        assert public["owner_start_identity"] == legacy
+        assert governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY not in public
+        assert "handle" not in public
+        assert legacy_calls == ["ps"]
+        assert native_calls == ["native"]
+
+        repeated = governance_db.acquire_dev_runtime_writer_lease(root)
+        assert repeated == public
+        assert legacy_calls == ["ps", "ps"]
+        assert native_calls == ["native"]
+    finally:
+        governance_db.release_dev_runtime_writer_lease(root)
+
+
+def test_dev_writer_lease_native_initialization_failure_keeps_original_shape(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "writer-identity-fallback-root"
+    (root / "governance/aming-claw").mkdir(parents=True)
+    monkeypatch.setattr(
+        governance_db,
+        "_writer_process_start_identity",
+        lambda: "sha256:" + "1" * 64,
+    )
+    monkeypatch.setattr(
+        governance_db, "_native_writer_process_start_identity", lambda: "",
+    )
+    try:
+        public = governance_db.acquire_dev_runtime_writer_lease(root)
+        database_key = str(
+            (root / governance_db.AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+        )
+        with governance_db._DEV_DATABASE_WRITER_LEASES_LOCK:
+            private = governance_db._DEV_DATABASE_WRITER_LEASES[database_key]
+            assert governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY not in private
+        assert governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY not in public
+        assert "handle" not in public
+    finally:
+        governance_db.release_dev_runtime_writer_lease(root)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_start"),
+    [
+        (
+            "123 (python worker) "
+            + " ".join(["S", *("0" for _ in range(18)), "424242"]),
+            "424242",
+        ),
+        ("123 python worker S 0 0", ""),
+        (
+            "123 (python worker) "
+            + " ".join(["S", *("0" for _ in range(18)), "not-digits"]),
+            "",
+        ),
+        (
+            "123 (python worker) "
+            + " ".join(["S", *("0" for _ in range(18)), "٤٢"]),
+            "",
+        ),
+    ],
+)
+def test_native_writer_process_start_identity_parses_linux_or_returns_unavailable(
+    monkeypatch, raw, expected_start,
+):
+    class ProcStat:
+        def __init__(self, value):
+            assert value == f"/proc/{os.getpid()}/stat"
+
+        def is_file(self):
+            return True
+
+        def read_text(self, *, encoding):
+            assert encoding == "utf-8"
+            return raw
+
+    monkeypatch.setattr(governance_db, "Path", ProcStat)
+    monkeypatch.setattr(governance_db.sys, "platform", "linux")
+    actual = governance_db._native_writer_process_start_identity()
+    if not expected_start:
+        assert actual == ""
+        return
+    exact = (
+        f"linux-proc-start.v1\0{os.getpid()}\0{expected_start}"
+    ).encode("ascii")
+    assert actual == "sha256:" + hashlib.sha256(exact).hexdigest()
+
+
+def test_linux_nonascii_start_ticks_use_exact_legacy_fallback(monkeypatch):
+    class ProcStat:
+        def __init__(self, value):
+            assert value == f"/proc/{os.getpid()}/stat"
+
+        def is_file(self):
+            return True
+
+        def read_text(self, *, encoding):
+            assert encoding == "utf-8"
+            return (
+                f"{os.getpid()} (python worker) "
+                + " ".join(["S", *("0" for _ in range(18)), "٤٢"])
+            )
+
+    legacy = "sha256:" + "1" * 64
+    ps_calls = []
+    monkeypatch.setattr(governance_db, "Path", ProcStat)
+    monkeypatch.setattr(governance_db.sys, "platform", "linux")
+    monkeypatch.setattr(
+        governance_db,
+        "_writer_process_start_identity",
+        lambda: ps_calls.append("ps") or legacy,
+    )
+    assert governance_db._writer_lease_process_start_identity_matches(
+        {
+            "owner_start_identity": legacy,
+            governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY:
+                "sha256:" + "2" * 64,
+        }
+    ) is True
+    assert ps_calls == ["ps"]
+
+
+@pytest.mark.parametrize("start_usec", [0, 999_999, 1_000_000])
+def test_darwin_native_start_microseconds_boundary_uses_legacy_fallback(
+    monkeypatch, start_usec,
+):
+    import ctypes
+    import ctypes.util
+
+    class ProcStat:
+        def __init__(self, _value):
+            pass
+
+        def is_file(self):
+            return False
+
+    class Native:
+        def __call__(self, pid, _flavor, _arg, pointer, size):
+            pointer._obj.pbi_pid = pid
+            pointer._obj.pbi_start_tvsec = 1_770_000_000
+            pointer._obj.pbi_start_tvusec = start_usec
+            return size
+
+    monkeypatch.setattr(governance_db, "Path", ProcStat)
+    monkeypatch.setattr(governance_db.sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes.util, "find_library", lambda _name: "fixture-libproc")
+    monkeypatch.setattr(
+        ctypes, "CDLL", lambda _name: SimpleNamespace(proc_pidinfo=Native()),
+    )
+    legacy = "sha256:" + "1" * 64
+    valid_usec = min(start_usec, 999_999)
+    exact = (
+        f"darwin-proc-start.v1\0{os.getpid()}\0{1_770_000_000}"
+        f"\0{valid_usec}"
+    ).encode("ascii")
+    expected_native = "sha256:" + hashlib.sha256(exact).hexdigest()
+    ps_calls = []
+    monkeypatch.setattr(
+        governance_db,
+        "_writer_process_start_identity",
+        lambda: ps_calls.append("ps") or legacy,
+    )
+    observed = governance_db._native_writer_process_start_identity()
+    matched = governance_db._writer_lease_process_start_identity_matches(
+        {
+            "owner_start_identity": legacy,
+            governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY: expected_native,
+        }
+    )
+    if start_usec < 1_000_000:
+        assert observed == expected_native
+        assert matched is True
+        assert ps_calls == []
+    else:
+        assert observed == ""
+        assert matched is True
+        assert ps_calls == ["ps"]
+
+
+def test_writer_process_start_identity_preserves_raw_ps_bytes_and_timeout(
+    monkeypatch,
+):
+    raw = "  Fri Sep 11 17:08:53 2026  \n"
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((list(argv), dict(kwargs)))
+        return SimpleNamespace(returncode=0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(governance_db.subprocess, "run", run)
+    expected = "sha256:" + hashlib.sha256(
+        f"{os.getpid()}\0".encode("utf-8") + raw.encode("utf-8")
+    ).hexdigest()
+    assert governance_db._writer_process_start_identity() == expected
+    assert calls == [
+        (
+            ["ps", "-o", "lstart=", "-p", str(os.getpid())],
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 2,
+                "check": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [(1, "nonzero-but-not-empty\n"), (0, ""), (0, "   \n")],
+)
+def test_writer_process_start_identity_keeps_original_rejections(
+    monkeypatch, returncode, stdout,
+):
+    monkeypatch.setattr(
+        governance_db.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=returncode, stdout=stdout, stderr="fixture-error",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="start identity is unavailable"):
+        governance_db._writer_process_start_identity()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.TimeoutExpired(cmd="ps", timeout=2),
+        OSError("fixture ps failure"),
+    ],
+)
+def test_writer_process_start_identity_keeps_original_errors(
+    monkeypatch, failure,
+):
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(governance_db.subprocess, "run", fail)
+    with pytest.raises(type(failure), match=str(failure).split(":", 1)[0]):
+        governance_db._writer_process_start_identity()
+
+
+@pytest.mark.parametrize(
+    ("expected_native", "current_native", "expected", "legacy_calls"),
+    [
+        ("sha256:" + "2" * 64, "sha256:" + "2" * 64, True, 0),
+        ("sha256:" + "2" * 64, "sha256:" + "3" * 64, False, 0),
+        ("sha256:" + "2" * 64, "", True, 1),
+        ("", "sha256:" + "2" * 64, True, 1),
+        ("not-a-native-identity", "sha256:" + "2" * 64, True, 1),
+    ],
+)
+def test_writer_lease_native_identity_match_has_exact_legacy_fallback(
+    monkeypatch, expected_native, current_native, expected, legacy_calls,
+):
+    legacy = "sha256:" + "1" * 64
+    calls = []
+    lease = {"owner_start_identity": legacy}
+    if expected_native:
+        lease[governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY] = (
+            expected_native
+        )
+    monkeypatch.setattr(
+        governance_db,
+        "_native_writer_process_start_identity",
+        lambda: current_native,
+    )
+
+    def legacy_identity():
+        calls.append("ps")
+        return legacy
+
+    monkeypatch.setattr(
+        governance_db, "_writer_process_start_identity", legacy_identity,
+    )
+    assert governance_db._writer_lease_process_start_identity_matches(lease) is expected
+    assert len(calls) == legacy_calls
+
+
+def test_dev_basic_read_uses_two_fresh_native_writer_identity_checks(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    database_key = str(world["database"].absolute())
+    native = "sha256:" + "4" * 64
+    with governance_db._DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = governance_db._DEV_DATABASE_WRITER_LEASES[database_key]
+        lease[governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY] = native
+    native_calls = []
+
+    def current_native():
+        native_calls.append(get_ident())
+        return native
+
+    monkeypatch.setattr(
+        governance_db, "_native_writer_process_start_identity", current_native,
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "_writer_process_start_identity",
+        lambda: pytest.fail("native-supported hot read must not launch ps"),
+    )
+    connection = governance_db.get_connection("aming-claw")
+    connection.close()
+    assert native_calls == [get_ident(), get_ident()]
+
+
+@pytest.mark.parametrize("fallback", ["missing-baseline", "native-unavailable"])
+def test_dev_basic_read_falls_back_at_both_writer_identity_checkpoints(
+    physical_successor_history_read_world,
+    monkeypatch,
+    fallback,
+):
+    world = physical_successor_history_read_world
+    database_key = str(world["database"].absolute())
+    with governance_db._DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = governance_db._DEV_DATABASE_WRITER_LEASES[database_key]
+        legacy = str(lease["owner_start_identity"])
+        if fallback == "missing-baseline":
+            lease.pop(governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY, None)
+            current_native = "sha256:" + "5" * 64
+        else:
+            lease[governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY] = (
+                "sha256:" + "5" * 64
+            )
+            current_native = ""
+    native_calls = []
+    legacy_calls = []
+
+    def native_identity():
+        native_calls.append("native")
+        return current_native
+
+    def legacy_identity():
+        legacy_calls.append("ps")
+        return legacy
+
+    monkeypatch.setattr(
+        governance_db, "_native_writer_process_start_identity", native_identity,
+    )
+    monkeypatch.setattr(
+        governance_db, "_writer_process_start_identity", legacy_identity,
+    )
+    connection = governance_db.get_connection("aming-claw")
+    connection.close()
+    assert native_calls == ["native", "native"]
+    assert legacy_calls == ["ps", "ps"]
+
+
+def test_dev_basic_read_rejects_second_native_mismatch_before_sqlite_open(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    world = physical_successor_history_read_world
+    database_key = str(world["database"].absolute())
+    native = "sha256:" + "6" * 64
+    with governance_db._DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = governance_db._DEV_DATABASE_WRITER_LEASES[database_key]
+        lease[governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY] = native
+    # Warm only the immutable history result before observing the open boundary.
+    governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=world["binding"],
+    )
+    observations = iter([native, "sha256:" + "7" * 64])
+    monkeypatch.setattr(
+        governance_db,
+        "_native_writer_process_start_identity",
+        lambda: next(observations),
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "_writer_process_start_identity",
+        lambda: pytest.fail("valid native mismatch must not fall back to ps"),
+    )
+    monkeypatch.setattr(
+        governance_db.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail(
+            "second native mismatch must reject before SQLite open"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="writer lease binding mismatch"):
+        governance_db.get_connection("aming-claw")
+
+
+def test_concurrent_dev_basic_readers_take_independent_native_observations(
+    physical_successor_history_read_world,
+    monkeypatch,
+):
+    from threading import Lock
+
+    world = physical_successor_history_read_world
+    database_key = str(world["database"].absolute())
+    native = "sha256:" + "8" * 64
+    with governance_db._DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = governance_db._DEV_DATABASE_WRITER_LEASES[database_key]
+        lease[governance_db._DEV_WRITER_NATIVE_START_IDENTITY_KEY] = native
+    # Remove immutable-history work from the concurrent identity observation.
+    governance_db._cached_dev_cow_successor_receipt(
+        world["root"], stable_binding=world["binding"],
+    )
+    observed = []
+    lock = Lock()
+
+    def current_native():
+        with lock:
+            observed.append(get_ident())
+        return native
+
+    monkeypatch.setattr(
+        governance_db, "_native_writer_process_start_identity", current_native,
+    )
+    monkeypatch.setattr(
+        governance_db,
+        "_writer_process_start_identity",
+        lambda: pytest.fail("concurrent native checks must not launch ps"),
+    )
+
+    def read():
+        connection = governance_db.get_connection("aming-claw")
+        connection.close()
+        return get_ident()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reader_threads = [future.result(timeout=30) for future in (
+            pool.submit(read), pool.submit(read),
+        )]
+    assert len(set(reader_threads)) == 2
+    assert sorted(observed) == sorted(reader_threads * 2)

@@ -65,6 +65,7 @@ AC_DEV_COW_SUCCESSOR_PREFIX = "successor-v2"
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
+_DEV_WRITER_NATIVE_START_IDENTITY_KEY = "_owner_native_start_identity"
 _DEV_FIRST_START_CONTEXT_TOKEN = object()
 _DEV_COW_SUCCESSOR_HISTORY_CACHE_LOCK = threading.RLock()
 _DEV_COW_SUCCESSOR_HISTORY_CACHE: dict[str, tuple[object, dict[str, object]]] = {}
@@ -3774,6 +3775,107 @@ def _writer_process_start_identity() -> str:
     ).hexdigest()
 
 
+def _native_writer_process_start_identity() -> str:
+    """Read the current process start identity directly from the host kernel."""
+
+    pid = os.getpid()
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.is_file():
+        try:
+            raw = proc_stat.read_text(encoding="utf-8")
+            close_paren = raw.rfind(")")
+            if close_paren <= 0:
+                return ""
+            # Fields after comm begin at Linux proc field 3. Start time is 22.
+            fields = raw[close_paren + 2 :].split()
+            start_ticks = fields[19]
+            if not start_ticks.isascii() or not start_ticks.isdigit():
+                return ""
+        except (OSError, IndexError, UnicodeError, ValueError):
+            return ""
+        exact = f"linux-proc-start.v1\0{pid}\0{start_ticks}".encode("ascii")
+        return "sha256:" + hashlib.sha256(exact).hexdigest()
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            import ctypes.util
+
+            class _ProcBSDInfo(ctypes.Structure):
+                _fields_ = [
+                    ("pbi_flags", ctypes.c_uint32),
+                    ("pbi_status", ctypes.c_uint32),
+                    ("pbi_xstatus", ctypes.c_uint32),
+                    ("pbi_pid", ctypes.c_uint32),
+                    ("pbi_ppid", ctypes.c_uint32),
+                    ("pbi_uid", ctypes.c_uint32),
+                    ("pbi_gid", ctypes.c_uint32),
+                    ("pbi_ruid", ctypes.c_uint32),
+                    ("pbi_rgid", ctypes.c_uint32),
+                    ("pbi_svuid", ctypes.c_uint32),
+                    ("pbi_svgid", ctypes.c_uint32),
+                    ("rfu_1", ctypes.c_uint32),
+                    ("pbi_comm", ctypes.c_char * 16),
+                    ("pbi_name", ctypes.c_char * 32),
+                    ("pbi_nfiles", ctypes.c_uint32),
+                    ("pbi_pgid", ctypes.c_uint32),
+                    ("pbi_pjobc", ctypes.c_uint32),
+                    ("e_tdev", ctypes.c_uint32),
+                    ("e_tpgid", ctypes.c_uint32),
+                    ("pbi_nice", ctypes.c_int32),
+                    ("pbi_start_tvsec", ctypes.c_uint64),
+                    ("pbi_start_tvusec", ctypes.c_uint64),
+                ]
+
+            library_name = ctypes.util.find_library("proc")
+            if not library_name:
+                return ""
+            library = ctypes.CDLL(library_name)
+            proc_pidinfo = library.proc_pidinfo
+            proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            proc_pidinfo.restype = ctypes.c_int
+            info = _ProcBSDInfo()
+            size = ctypes.sizeof(info)
+            returned = proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+            if (
+                returned != size
+                or int(info.pbi_pid) != pid
+                or int(info.pbi_start_tvsec) <= 0
+                or not 0 <= int(info.pbi_start_tvusec) < 1_000_000
+            ):
+                return ""
+            exact = (
+                f"darwin-proc-start.v1\0{pid}\0{int(info.pbi_start_tvsec)}"
+                f"\0{int(info.pbi_start_tvusec)}"
+            ).encode("ascii")
+            return "sha256:" + hashlib.sha256(exact).hexdigest()
+        except (AttributeError, OSError, TypeError, ValueError):
+            return ""
+    return ""
+
+
+def _writer_lease_process_start_identity_matches(
+    lease: Mapping[str, object],
+) -> bool:
+    """Compare one fresh native identity, preserving the legacy ps fallback."""
+
+    current_native = _native_writer_process_start_identity()
+    expected_native = str(
+        lease.get(_DEV_WRITER_NATIVE_START_IDENTITY_KEY) or ""
+    )
+    if (
+        re.fullmatch(r"sha256:[0-9a-f]{64}", expected_native)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", current_native)
+    ):
+        return current_native == expected_native
+    return lease.get("owner_start_identity") == _writer_process_start_identity()
+
+
 def _current_custody_start_identity() -> str:
     result = subprocess.run(
         ["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True,
@@ -3806,8 +3908,12 @@ def acquire_dev_runtime_writer_lease(storage_root: Path | str) -> dict[str, obje
                 or getattr(existing.get("handle"), "closed", True)
             ):
                 raise RuntimeError("AC dev governance writer lease owner mismatch")
-            return {name: value for name, value in existing.items() if name != "handle"}
+            return {
+                name: value for name, value in existing.items()
+                if name not in {"handle", _DEV_WRITER_NATIVE_START_IDENTITY_KEY}
+            }
         handle = _exclusive_writer_file_lease(database)
+        owner_native_start = _native_writer_process_start_identity()
         receipt: dict[str, object] = {
             "schema_version": "ac_dev_runtime_writer_lease.v1",
             "world_id": AC_DEV_WORLD_ID,
@@ -3822,8 +3928,13 @@ def acquire_dev_runtime_writer_lease(storage_root: Path | str) -> dict[str, obje
             "owner_start_identity": owner_start,
             "handle": handle,
         }
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", owner_native_start):
+            receipt[_DEV_WRITER_NATIVE_START_IDENTITY_KEY] = owner_native_start
         _DEV_DATABASE_WRITER_LEASES[key] = receipt
-        return {name: value for name, value in receipt.items() if name != "handle"}
+        return {
+            name: value for name, value in receipt.items()
+            if name not in {"handle", _DEV_WRITER_NATIVE_START_IDENTITY_KEY}
+        }
 
 
 def release_dev_runtime_writer_lease(storage_root: Path | str) -> None:
@@ -6729,7 +6840,7 @@ def _validate_dev_basic_runtime_custody(
         if (
             getattr(lease.get("handle"), "closed", True)
             or int(lease.get("owner_pid") or 0) != os.getpid()
-            or lease.get("owner_start_identity") != _writer_process_start_identity()
+            or not _writer_lease_process_start_identity_matches(lease)
             or (lease.get("database_device"), lease.get("database_inode"))
             != (int(metadata.st_dev), int(metadata.st_ino))
         ):
@@ -8715,7 +8826,7 @@ def _connect_existing(db_path: Path, *, timeout: float) -> sqlite3.Connection:
             raise RuntimeError("AC dev governance database writer lease is not held")
         if (
             int(receipt.get("owner_pid") or 0) != os.getpid()
-            or receipt.get("owner_start_identity") != _writer_process_start_identity()
+            or not _writer_lease_process_start_identity_matches(receipt)
             or (receipt.get("database_device"), receipt.get("database_inode"))
             != (int(before.st_dev), int(before.st_ino))
         ):
