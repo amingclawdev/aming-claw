@@ -224694,6 +224694,257 @@ def test_dev_source_identity_batches_git_reads_and_keeps_final_dirty_guard(
         governance_db._current_first_start_source(root)
 
 
+def test_dev_source_identity_records_exact_request_local_operation_order(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "source"
+    cli_path = root / "agent/cli.py"
+    server_path = root / "agent/governance/server.py"
+    server_path.parent.mkdir(parents=True)
+    cli_bytes = b"# fixture cli\n"
+    server_bytes = b"# fixture server\n"
+    cli_path.write_bytes(cli_bytes)
+    server_path.write_bytes(server_bytes)
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-q", "-b", "codex/ac-dev")
+    git("config", "user.email", "source-stage-fixture@example.invalid")
+    git("config", "user.name", "Source Stage Fixture")
+    git("add", "agent/cli.py", "agent/governance/server.py")
+    git("commit", "-qm", "seed")
+    expected_commit = git("rev-parse", "HEAD")
+    expected_tree = git("rev-parse", "HEAD^{tree}")
+
+    operations: list[object] = []
+    original_git_read = governance_db._git_read_exact
+    original_read_bytes = Path.read_bytes
+    original_sha256 = governance_db.hashlib.sha256
+
+    def observed_git_read(candidate: Path, *args: str, timeout: int = 10) -> bytes:
+        operations.append(args)
+        return original_git_read(candidate, *args, timeout=timeout)
+
+    def observed_read_bytes(path: Path) -> bytes:
+        if path in {cli_path, server_path}:
+            operations.append(("read", path.name))
+        return original_read_bytes(path)
+
+    def observed_sha256(payload=b""):
+        if payload == cli_bytes:
+            operations.append(("hash", "cli.py"))
+        elif payload == server_bytes:
+            operations.append(("hash", "server.py"))
+        return original_sha256(payload)
+
+    monkeypatch.setattr(governance_db, "_git_read_exact", observed_git_read)
+    monkeypatch.setattr(Path, "read_bytes", observed_read_bytes)
+    monkeypatch.setattr(governance_db.hashlib, "sha256", observed_sha256)
+
+    expected = {
+        "root": str(root),
+        "branch": "codex/ac-dev",
+        "commit": expected_commit,
+        "tree": expected_tree,
+        "cli_sha256": "sha256:" + original_sha256(cli_bytes).hexdigest(),
+        "server_sha256": "sha256:" + original_sha256(server_bytes).hexdigest(),
+    }
+    expected_operations = [
+        ("rev-parse", "HEAD", "HEAD^{tree}"),
+        ("status", "--porcelain=v2", "--branch", "--no-ahead-behind"),
+        ("read", "cli.py"),
+        ("hash", "cli.py"),
+        ("read", "server.py"),
+        ("hash", "server.py"),
+    ]
+
+    assert governance_db._current_first_start_source(root) == expected
+    assert operations == expected_operations
+    assert governance_db.dashboard_read_timing_finish() is None
+
+    operations.clear()
+    assert governance_db.dashboard_read_timing_begin(
+        "/api/backlog/aming-claw?view=compact"
+    ) is True
+    try:
+        assert governance_db._current_first_start_source(root) == expected
+    finally:
+        timing = governance_db.dashboard_read_timing_finish()
+    assert operations == expected_operations
+    assert timing is not None
+    expected_stages = {
+        "db.dev_source_rev_parse",
+        "db.dev_source_status",
+        "db.dev_source_cli_read",
+        "db.dev_source_cli_hash",
+        "db.dev_source_server_read",
+        "db.dev_source_server_hash",
+    }
+    assert set(timing["stages"]) == expected_stages
+    for stage in expected_stages:
+        assert timing["stages"][stage]["count"] == 1
+        assert timing["stages"][stage]["elapsed_ns"] >= 0
+        assert timing["stages"][stage]["thread_ns"] >= 0
+
+
+@pytest.mark.parametrize("failed_path", ["cli.py", "server.py"])
+def test_dev_source_identity_timing_preserves_source_read_errors_and_order(
+    monkeypatch, tmp_path, failed_path
+):
+    root = tmp_path / "source"
+    cli_path = root / "agent/cli.py"
+    server_path = root / "agent/governance/server.py"
+    server_path.parent.mkdir(parents=True)
+    cli_path.write_bytes(b"# fixture cli\n")
+    server_path.write_bytes(b"# fixture server\n")
+    commit = "a" * 40
+    tree = "b" * 40
+    operations: list[object] = []
+
+    def git_read(_root: Path, *args: str, timeout: int = 10) -> bytes:
+        operations.append(args)
+        if args == ("rev-parse", "HEAD", "HEAD^{tree}"):
+            return f"{commit}\n{tree}\n".encode()
+        if args == (
+            "status", "--porcelain=v2", "--branch", "--no-ahead-behind",
+        ):
+            return (
+                f"# branch.oid {commit}\n# branch.head codex/ac-dev\n"
+            ).encode()
+        pytest.fail(f"unexpected Git call: {args}")
+
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes(path: Path) -> bytes:
+        if path in {cli_path, server_path}:
+            operations.append(("read", path.name))
+            if path.name == failed_path:
+                raise OSError(f"fixture {failed_path} read failure")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(governance_db, "_git_read_exact", git_read)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    assert governance_db.dashboard_read_timing_begin(
+        "/api/task/aming-claw/timeline?backlog_id=fixture"
+    ) is True
+    try:
+        with pytest.raises(OSError, match=f"fixture {re.escape(failed_path)}"):
+            governance_db._current_first_start_source(root)
+    finally:
+        timing = governance_db.dashboard_read_timing_finish()
+    assert timing is not None
+    assert operations[:2] == [
+        ("rev-parse", "HEAD", "HEAD^{tree}"),
+        ("status", "--porcelain=v2", "--branch", "--no-ahead-behind"),
+    ]
+    expected_stages = {
+        "db.dev_source_rev_parse",
+        "db.dev_source_status",
+        "db.dev_source_cli_read",
+    }
+    if failed_path == "server.py":
+        expected_stages.update(
+            {"db.dev_source_cli_hash", "db.dev_source_server_read"}
+        )
+        assert operations == [
+            ("rev-parse", "HEAD", "HEAD^{tree}"),
+            ("status", "--porcelain=v2", "--branch", "--no-ahead-behind"),
+            ("read", "cli.py"),
+            ("read", "server.py"),
+        ]
+    else:
+        assert operations == [
+            ("rev-parse", "HEAD", "HEAD^{tree}"),
+            ("status", "--porcelain=v2", "--branch", "--no-ahead-behind"),
+            ("read", "cli.py"),
+        ]
+    assert set(timing["stages"]) == expected_stages
+    assert all(timing["stages"][stage]["count"] == 1 for stage in expected_stages)
+
+
+@pytest.mark.parametrize("failed_hash", ["cli.py", "server.py"])
+def test_dev_source_identity_timing_preserves_hash_errors_and_order(
+    monkeypatch, tmp_path, failed_hash
+):
+    root = tmp_path / "source"
+    cli_path = root / "agent/cli.py"
+    server_path = root / "agent/governance/server.py"
+    server_path.parent.mkdir(parents=True)
+    cli_bytes = b"# fixture cli\n"
+    server_bytes = b"# fixture server\n"
+    cli_path.write_bytes(cli_bytes)
+    server_path.write_bytes(server_bytes)
+    commit = "a" * 40
+    tree = "b" * 40
+    operations: list[object] = []
+
+    def git_read(_root: Path, *args: str, timeout: int = 10) -> bytes:
+        operations.append(args)
+        if args == ("rev-parse", "HEAD", "HEAD^{tree}"):
+            return f"{commit}\n{tree}\n".encode()
+        if args == (
+            "status", "--porcelain=v2", "--branch", "--no-ahead-behind",
+        ):
+            return (
+                f"# branch.oid {commit}\n# branch.head codex/ac-dev\n"
+            ).encode()
+        pytest.fail(f"unexpected Git call: {args}")
+
+    original_read_bytes = Path.read_bytes
+    original_sha256 = governance_db.hashlib.sha256
+
+    def read_bytes(path: Path) -> bytes:
+        if path in {cli_path, server_path}:
+            operations.append(("read", path.name))
+        return original_read_bytes(path)
+
+    def sha256(payload=b""):
+        name = "cli.py" if payload == cli_bytes else "server.py"
+        operations.append(("hash", name))
+        if name == failed_hash:
+            raise ValueError(f"fixture {name} hash failure")
+        return original_sha256(payload)
+
+    monkeypatch.setattr(governance_db, "_git_read_exact", git_read)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(governance_db.hashlib, "sha256", sha256)
+    assert governance_db.dashboard_read_timing_begin(
+        "/api/task/aming-claw/timeline?backlog_id=fixture"
+    ) is True
+    try:
+        with pytest.raises(ValueError, match=f"fixture {re.escape(failed_hash)}"):
+            governance_db._current_first_start_source(root)
+    finally:
+        timing = governance_db.dashboard_read_timing_finish()
+    assert timing is not None
+    expected_stages = {
+        "db.dev_source_rev_parse",
+        "db.dev_source_status",
+        "db.dev_source_cli_read",
+        "db.dev_source_cli_hash",
+    }
+    expected_operations = [
+        ("rev-parse", "HEAD", "HEAD^{tree}"),
+        ("status", "--porcelain=v2", "--branch", "--no-ahead-behind"),
+        ("read", "cli.py"),
+        ("hash", "cli.py"),
+    ]
+    if failed_hash == "server.py":
+        expected_stages.update(
+            {"db.dev_source_server_read", "db.dev_source_server_hash"}
+        )
+        expected_operations.extend(
+            [("read", "server.py"), ("hash", "server.py")]
+        )
+    assert operations == expected_operations
+    assert set(timing["stages"]) == expected_stages
+    assert all(timing["stages"][stage]["count"] == 1 for stage in expected_stages)
+
+
 @pytest.mark.parametrize(
     "status_output",
     [

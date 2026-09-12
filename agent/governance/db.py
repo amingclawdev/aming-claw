@@ -5029,13 +5029,22 @@ def _dev_live_world_custody_sha256(
 
 def _current_first_start_source(source_root: Path) -> dict[str, str]:
     root = source_root.expanduser().resolve(strict=True)
-    identity_lines = _git_read_exact(
-        root, "rev-parse", "HEAD", "HEAD^{tree}"
+    identity_lines = dashboard_read_timed_call(
+        "db.dev_source_rev_parse",
+        _git_read_exact,
+        root,
+        "rev-parse",
+        "HEAD",
+        "HEAD^{tree}",
     ).decode().splitlines()
     if len(identity_lines) != 2:
         raise ValueError("AC dev first-start source identity is invalid")
     commit, tree = (value.strip().lower() for value in identity_lines)
-    status = _git_worktree_status_snapshot(root)
+    status = dashboard_read_timed_call(
+        "db.dev_source_status",
+        _git_worktree_status_snapshot,
+        root,
+    )
     branch = str(status["branch"])
     cli_path = root / "agent" / "cli.py"
     server_path = root / "agent" / "governance" / "server.py"
@@ -5044,10 +5053,28 @@ def _current_first_start_source(source_root: Path) -> dict[str, str]:
             or server_path.is_symlink() or not cli_path.is_file()
             or not server_path.is_file()):
         raise ValueError("AC dev first-start source binding is invalid")
+    cli_bytes = dashboard_read_timed_call(
+        "db.dev_source_cli_read",
+        cli_path.read_bytes,
+    )
+    cli_sha256 = dashboard_read_timed_call(
+        "db.dev_source_cli_hash",
+        lambda payload: "sha256:" + hashlib.sha256(payload).hexdigest(),
+        cli_bytes,
+    )
+    server_bytes = dashboard_read_timed_call(
+        "db.dev_source_server_read",
+        server_path.read_bytes,
+    )
+    server_sha256 = dashboard_read_timed_call(
+        "db.dev_source_server_hash",
+        lambda payload: "sha256:" + hashlib.sha256(payload).hexdigest(),
+        server_bytes,
+    )
     return {
         "root": str(root), "branch": branch, "commit": commit, "tree": tree,
-        "cli_sha256": "sha256:" + hashlib.sha256(cli_path.read_bytes()).hexdigest(),
-        "server_sha256": "sha256:" + hashlib.sha256(server_path.read_bytes()).hexdigest(),
+        "cli_sha256": cli_sha256,
+        "server_sha256": server_sha256,
     }
 
 
