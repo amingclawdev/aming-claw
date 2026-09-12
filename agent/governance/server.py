@@ -23959,6 +23959,19 @@ def _parallel_branch_allocate_identity_mismatches(
         # mismatch.  Other identity fields retain their existing comparison
         # semantics.
         "fence_token": explicit_fence,
+        "project_id": _text(body.get("project_id")),
+        "backlog_id": _text(body.get("backlog_id")),
+        "contract_execution_id": _text(body.get("contract_execution_id")),
+        "task_id": _text(body.get("task_id")),
+        "parent_task_id": _text(body.get("parent_task_id")),
+        "root_task_id": _text(body.get("root_task_id")),
+        "runtime_context_id": _text(body.get("runtime_context_id")),
+        "worker_id": _text(body.get("worker_id")),
+        "worker_slot_id": _text(body.get("worker_slot_id")),
+        "agent_id": _text(body.get("agent_id")),
+        "branch_ref": _text(body.get("branch_ref")),
+        "ref_name": _text(body.get("ref_name")),
+        "target_project_root": _path_text(body.get("target_project_root")),
         "worktree_path": _path_text(
             explicit_worktree or getattr(planned, "worktree_path", "")
         ),
@@ -23974,6 +23987,26 @@ def _parallel_branch_allocate_identity_mismatches(
     }
     persisted = {
         "fence_token": _text(getattr(existing, "fence_token", "")),
+        "project_id": _text(getattr(existing, "project_id", "")),
+        "backlog_id": _text(getattr(existing, "backlog_id", "")),
+        "contract_execution_id": _runtime_context_mf_sub_parent_task_id(existing),
+        "task_id": _text(getattr(existing, "task_id", "")),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(existing),
+        "root_task_id": _text(getattr(existing, "root_task_id", "")),
+        "runtime_context_id": _text(
+            getattr(existing, "runtime_context_id", "")
+        ),
+        "worker_id": _text(getattr(existing, "worker_id", "")),
+        "worker_slot_id": _text(getattr(existing, "worker_slot_id", "")),
+        "agent_id": _text(
+            getattr(existing, "agent_id", "")
+            or getattr(existing, "worker_id", "")
+        ),
+        "branch_ref": _text(getattr(existing, "branch_ref", "")),
+        "ref_name": _text(getattr(existing, "ref_name", "")),
+        "target_project_root": _path_text(
+            _runtime_context_effective_target_project_root(existing)
+        ),
         "worktree_path": _path_text(getattr(existing, "worktree_path", "")),
         "base_commit": _text(getattr(existing, "base_commit", "")),
         "head_commit": _text(getattr(existing, "head_commit", "")),
@@ -23989,6 +24022,94 @@ def _parallel_branch_allocate_identity_mismatches(
         for field, requested_value in requested.items()
         if requested_value and persisted.get(field) and requested_value != persisted[field]
     ]
+
+
+def _parallel_branch_allocate_materialized_revision_candidate(
+    existing: Any,
+    *,
+    project_id: str,
+    task_id: str,
+    body: Mapping[str, Any],
+) -> bool:
+    """Recognize a copy-safe request that still requires the revision validator.
+
+    This predicate grants no runtime authority. It only permits the existing
+    materialized-authority validator to run before a strict rev10 request is
+    rejected for omitting a fresh-allocation receipt. Every public identity
+    field emitted by the scope-insufficiency disposition must bind the same
+    persisted lane, and the request must carry one complete scope expansion.
+    """
+
+    from .parallel_branch_runtime import is_materialized_branch_context
+
+    if existing is None or not is_materialized_branch_context(existing):
+        return False
+    if _query_bool(body, "create_worktree", False):
+        return False
+
+    requested_owned = _runtime_context_public_file_values(
+        _runtime_context_service_query_values(body, "owned_files")
+    )
+    requested_target = _runtime_context_public_file_values(
+        _runtime_context_service_query_values(body, "target_files")
+    )
+    active_owned = _runtime_context_public_file_values(
+        list(getattr(existing, "owned_files", ()) or ())
+        or list(getattr(existing, "target_files", ()) or ())
+    )
+    if (
+        "owned_files" not in body
+        or "target_files" not in body
+        or not requested_owned
+        or requested_owned != requested_target
+        or requested_owned == active_owned
+        or not set(active_owned).issubset(requested_owned)
+    ):
+        return False
+
+    def _text(value: Any) -> str:
+        return str(value or "").strip()
+
+    def _path(value: Any) -> str:
+        text = _text(value)
+        return os.path.normpath(text) if text else ""
+
+    expected_parent = _runtime_context_mf_sub_parent_task_id(existing)
+    expected = {
+        "project_id": project_id,
+        "backlog_id": _text(getattr(existing, "backlog_id", "")),
+        "contract_execution_id": expected_parent,
+        "task_id": task_id,
+        "parent_task_id": expected_parent,
+        "target_project_root": _path(
+            _runtime_context_effective_target_project_root(existing)
+        ),
+        "worktree_path": _path(getattr(existing, "worktree_path", "")),
+        "merge_queue_id": _text(getattr(existing, "merge_queue_id", "")),
+    }
+    supplied = {
+        "project_id": _text(body.get("project_id") or project_id),
+        "backlog_id": _text(body.get("backlog_id")),
+        "contract_execution_id": _text(body.get("contract_execution_id")),
+        "task_id": _text(body.get("task_id")),
+        "parent_task_id": _text(body.get("parent_task_id")),
+        "target_project_root": _path(body.get("target_project_root")),
+        "worktree_path": _path(body.get("worktree_path")),
+        "merge_queue_id": _text(body.get("merge_queue_id")),
+    }
+    if any(
+        not expected[field] or supplied[field] != expected[field]
+        for field in expected
+    ):
+        return False
+    if not _text(body.get("base_commit")) or not _text(
+        body.get("target_head_commit")
+    ):
+        return False
+    return all(
+        _text(body.get(field))
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    )
 
 
 def _parallel_branch_allocate_branch_name(branch_ref: str) -> str:
@@ -24241,6 +24362,176 @@ def _parallel_branch_allocate_materialized_authority_revision(
     runtime_context_id = str(existing.runtime_context_id or "").strip()
     task_id = str(existing.task_id or "").strip()
     if scope_changed:
+        sibling_owned_files: dict[str, list[str]] = {}
+        dispatch_custody_errors: list[dict[str, str]] = []
+        execution_id = _runtime_context_mf_sub_parent_task_id(existing)
+        try:
+            runtime_record = _contract_runtime_read(
+                conn,
+                contract_execution_id=execution_id,
+                actor_role="observer",
+            )
+        except (ContractRuntimeError, StalePinnedContractExecutionError, sqlite3.Error):
+            runtime_record = {}
+        current_dispatch = (
+            _contract_runtime_current_dispatch_authority_line(runtime_record)
+            if runtime_record
+            else {}
+        )
+        current_dispatch_selected = current_dispatch.get("status") == "selected"
+        bounded_workers = (
+            _contract_runtime_mf_parallel_bounded_workers(
+                {"payload": current_dispatch.get("payload") or {}}
+            )
+            if current_dispatch_selected
+            else []
+        )
+        selected_workers = [
+            worker
+            for worker in bounded_workers
+            if str(worker.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(worker.get("task_id") or "").strip() == task_id
+        ]
+        exact_mf_parallel_dispatch = bool(
+            runtime_record
+            and _is_mf_parallel_record_contract_id(
+                str(runtime_record.get("contract_id") or "")
+            )
+        )
+        if exact_mf_parallel_dispatch and not current_dispatch_selected:
+            dispatch_custody_errors.append(
+                {
+                    "field": "current_dispatch",
+                    "expected": "one selected current dispatch",
+                    "actual": str(current_dispatch.get("status") or "missing"),
+                }
+            )
+        if exact_mf_parallel_dispatch and len(selected_workers) != 1:
+            dispatch_custody_errors.append(
+                {
+                    "field": "selected_worker",
+                    "expected": "one exact runtime_context_id/task_id lane",
+                    "actual": str(len(selected_workers)),
+                }
+            )
+        if exact_mf_parallel_dispatch and len(selected_workers) == 1:
+            from .parallel_branch_runtime import (
+                get_branch_context_by_runtime_context_id,
+                is_materialized_branch_context,
+            )
+
+            for worker in bounded_workers:
+                sibling_runtime_context_id = str(
+                    worker.get("runtime_context_id") or ""
+                ).strip()
+                sibling_task_id = str(worker.get("task_id") or "").strip()
+                if (
+                    not sibling_runtime_context_id
+                    or sibling_runtime_context_id == runtime_context_id
+                ):
+                    if not sibling_runtime_context_id:
+                        dispatch_custody_errors.append(
+                            {
+                                "field": "sibling_runtime_context_id",
+                                "expected": "non-empty current dispatch identity",
+                                "actual": "missing",
+                            }
+                        )
+                    continue
+                sibling = get_branch_context_by_runtime_context_id(
+                    conn,
+                    project_id,
+                    sibling_runtime_context_id,
+                )
+                if sibling is None:
+                    dispatch_custody_errors.append(
+                        {
+                            "field": "sibling_runtime_context",
+                            "expected": sibling_runtime_context_id,
+                            "actual": "missing",
+                        }
+                    )
+                    continue
+                sibling_mismatches = [
+                    field
+                    for field, expected, actual in (
+                        (
+                            "materialized",
+                            "true",
+                            "true"
+                            if is_materialized_branch_context(sibling)
+                            else "false",
+                        ),
+                        (
+                            "task_id",
+                            sibling_task_id,
+                            str(sibling.task_id or "").strip(),
+                        ),
+                        (
+                            "parent_task_id",
+                            execution_id,
+                            _runtime_context_mf_sub_parent_task_id(sibling),
+                        ),
+                        (
+                            "backlog_id",
+                            str(existing.backlog_id or "").strip(),
+                            str(sibling.backlog_id or "").strip(),
+                        ),
+                    )
+                    if expected != actual
+                ]
+                if sibling_mismatches:
+                    dispatch_custody_errors.append(
+                        {
+                            "field": "sibling_runtime_context",
+                            "expected": sibling_runtime_context_id,
+                            "actual": "mismatched:" + ",".join(sibling_mismatches),
+                        }
+                    )
+                    continue
+                overlap = sorted(
+                    set(planned_owned).intersection(
+                        set(sibling.owned_files or sibling.target_files or ())
+                    )
+                )
+                if overlap:
+                    sibling_owned_files[sibling_runtime_context_id] = overlap
+        if dispatch_custody_errors:
+            raise GovernanceError(
+                "runtime_context_authority_revision_dispatch_custody_invalid",
+                (
+                    "materialized runtime scope revision requires every exact "
+                    "current dispatched worker lane to match durable custody"
+                ),
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "contract_execution_id": execution_id,
+                    "dispatch_custody_errors": dispatch_custody_errors,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
+        if sibling_owned_files:
+            raise GovernanceError(
+                "runtime_context_authority_revision_sibling_file_overlap",
+                (
+                    "materialized runtime scope revision must remain disjoint "
+                    "from every other current dispatched worker lane"
+                ),
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "contract_execution_id": execution_id,
+                    "requested_owned_files": planned_owned,
+                    "sibling_overlap_by_runtime_context_id": sibling_owned_files,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
         implementation_events = [
             event
             for event in _runtime_context_service_timeline_events(
@@ -27004,6 +27295,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     batch_route_resolved = False
     batch_target_authority: dict[str, Any] = {}
     allocation_precheck_verification: dict[str, Any] = {}
+    strict_rev10_prefill = False
+    failed_qa_rework_intent = False
+    materialized_revision_precheck_deferred = False
     allocation_ref_name = str(
         ctx.body.get("ref_name") or ctx.body.get("target_branch") or "main"
     )
@@ -27122,30 +27416,39 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     and allocation_precheck_verification.get("verified")
                     is not True
                 ):
-                    raise GovernanceError(
-                        "parallel_branch_allocate_precheck_receipt_required",
-                        (
-                            "fresh mf_parallel rev10 allocation requires the "
-                            "exact server-signed precheck receipt"
-                        ),
-                        409,
-                        {
-                            "contract_execution_id": str(
-                                rev8_allocation_record.get(
-                                    "contract_execution_id"
-                                )
-                                or ""
-                            ),
-                            "precheck_status": str(
-                                allocation_precheck_verification.get("status")
-                                or ""
-                            ),
-                            "zero_write_rejection": True,
-                            "public_safe": True,
-                            "writes_performed": False,
-                            "mutation_performed": False,
-                        },
+                    materialized_revision_precheck_deferred = (
+                        _parallel_branch_allocate_materialized_revision_candidate(
+                            get_branch_context(conn, project_id, task_id),
+                            project_id=project_id,
+                            task_id=task_id,
+                            body=ctx.body or {},
+                        )
                     )
+                    if not materialized_revision_precheck_deferred:
+                        raise GovernanceError(
+                            "parallel_branch_allocate_precheck_receipt_required",
+                            (
+                                "fresh mf_parallel rev10 allocation requires the "
+                                "exact server-signed precheck receipt"
+                            ),
+                            409,
+                            {
+                                "contract_execution_id": str(
+                                    rev8_allocation_record.get(
+                                        "contract_execution_id"
+                                    )
+                                    or ""
+                                ),
+                                "precheck_status": str(
+                                    allocation_precheck_verification.get("status")
+                                    or ""
+                                ),
+                                "zero_write_rejection": True,
+                                "public_safe": True,
+                                "writes_performed": False,
+                                "mutation_performed": False,
+                            },
+                        )
             cardinality_policy = (
                 _contract_runtime_mf_parallel_worker_cardinality_policy(
                     conn,
@@ -27700,7 +28003,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         if rev8_allocation_record:
             canonical_profile, canonical_retry = (
                 _parallel_branch_allocate_require_dispatch_authority(
-                    effective_body
+                    effective_body,
+                    allow_missing_defaults=(
+                        materialized_revision_precheck_deferred
+                    ),
                 )
             )
             effective_body = {
@@ -27822,6 +28128,34 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                             workspace_root=workspace_root,
                         )
                     )
+                    if (
+                        materialized_revision_precheck_deferred
+                        and not authority_revision
+                    ):
+                        raise GovernanceError(
+                            "parallel_branch_allocate_precheck_receipt_required",
+                            (
+                                "fresh mf_parallel rev10 allocation requires the "
+                                "exact server-signed precheck receipt"
+                            ),
+                            409,
+                            {
+                                "contract_execution_id": str(
+                                    rev8_allocation_record.get(
+                                        "contract_execution_id"
+                                    )
+                                    or ""
+                                ),
+                                "precheck_status": str(
+                                    allocation_precheck_verification.get("status")
+                                    or ""
+                                ),
+                                "zero_write_rejection": True,
+                                "public_safe": True,
+                                "writes_performed": False,
+                                "mutation_performed": False,
+                            },
+                        )
                 else:
                     context = preserve_materialized_context_for_allocation(
                         existing,
@@ -210580,6 +210914,283 @@ def _contract_runtime_dispatch_ticket_authority(
     }
 
 
+def _contract_runtime_materialized_scope_revision_ticket_authority(
+    conn,
+    *,
+    project_id: str,
+    contract_execution_id: str,
+    requested_runtime_context_id: str,
+    requested_task_id: str,
+    dispatch_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebind one dispatch ticket to its verified materialized scope revision.
+
+    The completed dispatch line remains the worker identity authority.  A later
+    pre-implementation allocation revision may replace only the mutable file,
+    Git-boundary, and registered route fields after all of its persisted
+    identities still match that exact dispatched worker.
+    """
+
+    if (
+        dispatch_authority.get("status") != "projected"
+        or not requested_runtime_context_id
+        or not requested_task_id
+    ):
+        return dict(dispatch_authority)
+
+    from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        requested_runtime_context_id,
+    )
+    if context is None or str(context.task_id or "").strip() != requested_task_id:
+        return dict(dispatch_authority)
+    action = (
+        dict(dispatch_authority.get("next_legal_action") or {})
+        if isinstance(dispatch_authority.get("next_legal_action"), Mapping)
+        else {}
+    )
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    immutable_identity = {
+        "runtime_context_id": str(context.runtime_context_id or "").strip(),
+        "task_id": str(context.task_id or "").strip(),
+        "parent_task_id": parent_task_id,
+        "worker_id": str(context.worker_id or "").strip(),
+        "worker_slot_id": str(
+            context.worker_slot_id or context.worker_id or ""
+        ).strip(),
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "worktree_path": str(context.worktree_path or "").strip(),
+        "branch_ref": str(context.branch_ref or "").strip(),
+        "merge_queue_id": str(context.merge_queue_id or "").strip(),
+    }
+    if any(
+        not expected
+        or str(action.get(field) or "").strip() != expected
+        for field, expected in immutable_identity.items()
+    ):
+        return dict(dispatch_authority)
+
+    revision = _runtime_context_latest_contract_revision_payload(conn, context)
+    payload = (
+        revision.get("payload")
+        if isinstance(revision.get("payload"), Mapping)
+        else {}
+    )
+    revision_authority = (
+        payload.get("authority_revision")
+        if isinstance(payload.get("authority_revision"), Mapping)
+        else {}
+    )
+    if not (
+        str(revision.get("route_evidence_type") or "").strip()
+        == "parallel_branch_allocate_authority_revision"
+        and str(revision_authority.get("schema_version") or "").strip()
+        == "runtime_context.scope_target_authority_revision.v1"
+        and str(revision_authority.get("source") or "").strip()
+        == "parallel_branch_allocate_explicit_authority_revision"
+        and revision_authority.get("scope_changed") is True
+        and str(revision.get("runtime_context_id") or "").strip()
+        == immutable_identity["runtime_context_id"]
+        and str(revision.get("task_id") or "").strip()
+        == immutable_identity["task_id"]
+        and str(revision.get("parent_task_id") or "").strip()
+        == immutable_identity["parent_task_id"]
+        and str(revision.get("backlog_id") or "").strip()
+        == str(context.backlog_id or "").strip()
+        and str(payload.get("contract_execution_id") or "").strip()
+        == str(contract_execution_id or "").strip()
+    ):
+        return dict(dispatch_authority)
+
+    active_owned_files = sorted(
+        _runtime_context_service_query_values(
+            revision_authority,
+            "active_owned_files",
+        )
+    )
+    revision_owned_files = sorted(
+        _runtime_context_service_query_values(payload, "owned_files", "target_files")
+    )
+    context_owned_files = sorted(set(context.owned_files or ()))
+    mutable_identity = {
+        "base_commit": str(context.base_commit or "").strip(),
+        "target_head_commit": str(context.target_head_commit or "").strip(),
+    }
+    if not (
+        active_owned_files
+        and active_owned_files == revision_owned_files == context_owned_files
+        and all(
+            expected
+            and str(payload.get(field) or "").strip() == expected
+            for field, expected in mutable_identity.items()
+        )
+        and str(revision_authority.get("new_base_commit") or "").strip()
+        == mutable_identity["base_commit"]
+        and str(revision_authority.get("new_target_head_commit") or "").strip()
+        == mutable_identity["target_head_commit"]
+        and str(revision_authority.get("worker_head_commit") or "").strip()
+        == str(context.head_commit or "").strip()
+    ):
+        return dict(dispatch_authority)
+
+    route_identity = _runtime_context_worker_projected_route_identity(
+        conn,
+        context,
+        revision_payload=revision,
+    )
+    if any(
+        not str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        return dict(dispatch_authority)
+
+    action.update(mutable_identity)
+    action["owned_files"] = context_owned_files
+    action.update(
+        {
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+    )
+    result = dict(dispatch_authority)
+    result["next_legal_action"] = action
+    result["materialized_scope_revision_authority"] = {
+        "schema_version": (
+            "contract_runtime.materialized_scope_revision_ticket_authority.v1"
+        ),
+        "status": "projected",
+        "source": "parallel_branch_runtime_contract_revisions",
+        "runtime_context_id": immutable_identity["runtime_context_id"],
+        "task_id": immutable_identity["task_id"],
+        "revision_id": str(revision.get("revision_id") or "").strip(),
+        "original_dispatch_source_ref": str(
+            dispatch_authority.get("source_ref") or ""
+        ).strip(),
+        "original_dispatch_identity_preserved": True,
+    }
+    return result
+
+
+def _observer_runtime_text_materialized_revision_request_mismatches(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    resolved_context: Mapping[str, Any],
+    contract_runtime_current_state: Mapping[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Preflight an existing materialized revision before route persistence.
+
+    ``None`` means this is not the narrow materialized-revision continuation.
+    Such ordinary prepares retain their existing child-route issuance path.
+    """
+
+    from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+
+    runtime_context_id = str(
+        resolved_context.get("runtime_context_id")
+        or body.get("runtime_context_id")
+        or ""
+    ).strip()
+    task_id = str(resolved_context.get("task_id") or body.get("task_id") or "").strip()
+    if not runtime_context_id or not task_id:
+        return None
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None or str(context.task_id or "").strip() != task_id:
+        return None
+    revision = _runtime_context_latest_contract_revision_payload(conn, context)
+    revision_payload = (
+        revision.get("payload")
+        if isinstance(revision.get("payload"), Mapping)
+        else {}
+    )
+    revision_authority = revision_payload.get("authority_revision")
+    if not (
+        str(revision.get("route_evidence_type") or "").strip()
+        == "parallel_branch_allocate_authority_revision"
+        or isinstance(revision_authority, Mapping)
+    ):
+        return None
+
+    action = (
+        contract_runtime_current_state.get("next_legal_action")
+        if isinstance(
+            contract_runtime_current_state.get("next_legal_action"), Mapping
+        )
+        else {}
+    )
+
+    def supplied_text(field: str, *aliases: str) -> str:
+        return next(
+            (
+                str(source.get(name) or "").strip()
+                for source in (body, resolved_context)
+                for name in (field, *aliases)
+                if str(source.get(name) or "").strip()
+            ),
+            "",
+        )
+
+    comparisons: list[tuple[str, Any, Any]] = [
+        (
+            "project_id",
+            str(contract_runtime_current_state.get("project_id") or "").strip(),
+            str(body.get("project_id") or project_id).strip(),
+        ),
+        (
+            "backlog_id",
+            str(contract_runtime_current_state.get("backlog_id") or "").strip(),
+            supplied_text("backlog_id"),
+        ),
+        (
+            "contract_execution_id",
+            str(
+                contract_runtime_current_state.get("contract_execution_id") or ""
+            ).strip(),
+            supplied_text("contract_execution_id"),
+        ),
+    ]
+    aliases = {
+        "runtime_context_id": (),
+        "task_id": (),
+        "parent_task_id": (),
+        "target_project_root": ("project_root", "repo_root"),
+        "worktree_path": ("worker_worktree_path", "assigned_worktree"),
+        "branch_ref": ("branch",),
+        "base_commit": (),
+        "target_head_commit": (),
+        "merge_queue_id": (),
+        **{field: () for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS},
+    }
+    for field, field_aliases in aliases.items():
+        expected = str(action.get(field) or "").strip()
+        if expected:
+            comparisons.append(
+                (field, expected, supplied_text(field, *field_aliases))
+            )
+    expected_owned = sorted(
+        _runtime_context_service_query_values(action, "owned_files", "target_files")
+    )
+    supplied_owned = sorted(
+        _runtime_context_service_query_values(body, "owned_files", "target_files")
+    )
+    comparisons.append(("owned_files", expected_owned, supplied_owned))
+    return [
+        {"field": field, "expected": expected, "actual": actual}
+        for field, expected, actual in comparisons
+        if not expected or expected != actual
+    ]
+
+
 def _contract_runtime_qa_ticket_authority(
     record: Mapping[str, Any],
     current_state: Mapping[str, Any],
@@ -210809,6 +211420,16 @@ def _observer_runtime_text_contract_runtime_authority(
         current_state,
         requested_runtime_context_id=requested_runtime_context_id,
         requested_task_id=requested_task_id,
+    )
+    dispatch_authority = (
+        _contract_runtime_materialized_scope_revision_ticket_authority(
+            conn,
+            project_id=project_id,
+            contract_execution_id=execution_id,
+            requested_runtime_context_id=requested_runtime_context_id,
+            requested_task_id=requested_task_id,
+            dispatch_authority=dispatch_authority,
+        )
     )
     qa_line_id = str(
         (current_state.get("next_legal_action") or {}).get("line_id")
@@ -211201,6 +211822,37 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
                     "issue_allowed": False,
                     "source_of_authority": "ContractRuntime",
                     "errors": [ticket_authority_error],
+                    "raw_credentials_persisted": False,
+                    "raw_route_token_persisted": False,
+                    "raw_private_context_persisted": False,
+                },
+                "writes_performed": False,
+                "mutation_performed": False,
+            }
+        materialized_revision_mismatches = (
+            _observer_runtime_text_materialized_revision_request_mismatches(
+                conn,
+                project_id=project_id,
+                body=body,
+                resolved_context=resolved_context,
+                contract_runtime_current_state=contract_runtime_current_state,
+            )
+        )
+        if materialized_revision_mismatches:
+            return {
+                "ok": False,
+                "status": "rejected",
+                "runtime_context_id": resolved_runtime_context_id,
+                "contract_runtime_current_state": contract_runtime_current_state,
+                "execution_ticket": {
+                    "schema_version": "cli_agent_execution_ticket.v1",
+                    "status": "rejected",
+                    "issue_allowed": False,
+                    "source_of_authority": "ContractRuntime",
+                    "errors": [
+                        "launch identity does not match current ContractRuntime action"
+                    ],
+                    "identity_mismatches": materialized_revision_mismatches,
                     "raw_credentials_persisted": False,
                     "raw_route_token_persisted": False,
                     "raw_private_context_persisted": False,

@@ -9073,8 +9073,16 @@ def test_materialized_authority_revision_rejects_explicit_identity_conflicts() -
         project_id=PID,
         task_id="scope-explicit-conflicts",
         runtime_context_id="mfrctx-scope-explicit-conflicts",
+        backlog_id="AC-SCOPE-EXPLICIT-CONFLICTS",
+        parent_task_id="cex-scope-explicit-conflicts",
+        root_task_id="cex-scope-explicit-conflicts",
+        worker_id="worker-scope-explicit-conflicts",
+        worker_slot_id="slot-scope-explicit-conflicts",
+        agent_id="worker-scope-explicit-conflicts",
         branch_ref="refs/heads/codex/scope-explicit-conflicts",
+        ref_name="main",
         status=STATE_WORKTREE_READY,
+        target_project_root="/repo",
         worktree_path="/repo/.worktrees/scope-explicit-conflicts",
         base_commit="a" * 40,
         head_commit="b" * 40,
@@ -9096,6 +9104,19 @@ def test_materialized_authority_revision_rejects_explicit_identity_conflicts() -
         planned,
         {
             "fence_token": "other-fence",
+            "project_id": "foreign-project",
+            "backlog_id": "AC-FOREIGN",
+            "contract_execution_id": "cex-foreign",
+            "task_id": "foreign-task",
+            "parent_task_id": "cex-foreign",
+            "root_task_id": "cex-foreign",
+            "runtime_context_id": "mfrctx-foreign",
+            "worker_id": "worker-foreign",
+            "worker_slot_id": "slot-foreign",
+            "agent_id": "agent-foreign",
+            "branch_ref": "refs/heads/codex/foreign",
+            "ref_name": "foreign-target",
+            "target_project_root": "/foreign/repo",
             "worktree_path": planned.worktree_path,
             "base_commit": planned.base_commit,
             "head_commit": "f" * 40,
@@ -9106,6 +9127,19 @@ def test_materialized_authority_revision_rejects_explicit_identity_conflicts() -
 
     assert {item["field"] for item in mismatches} == {
         "fence_token",
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "task_id",
+        "parent_task_id",
+        "root_task_id",
+        "runtime_context_id",
+        "worker_id",
+        "worker_slot_id",
+        "agent_id",
+        "branch_ref",
+        "ref_name",
+        "target_project_root",
         "worktree_path",
         "base_commit",
         "head_commit",
@@ -34903,6 +34937,7 @@ def test_parallel_branch_allocate_rejects_explicit_ref_identity_conflict_before_
             "parallel_branch_allocate",
             "task_timeline_append",
         ],
+        target_files=["owned.py", "missing.py"],
     )
     body = _ref_only_parallel_allocate_body(
         tmp_path,
@@ -96115,12 +96150,16 @@ def test_scope_insufficiency_copy_safe_revision_replay_validates_persisted_ident
         backlog_id=backlog_id,
         contract_execution_id=contract_execution_id,
         route_token_ref=route_token_ref,
-        allowed_actions=["parallel_branch_allocate"],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        target_files=["owned.py", "missing.py"],
     )
     route_identity = {
         "route_id": f"route-{route_token_ref}",
         "route_context_hash": _fake_sha(f"{route_token_ref}:context"),
-        "prompt_contract_id": f"prompt-{route_token_ref}",
+        "prompt_contract_id": f"rprompt-{route_token_ref}",
         "prompt_contract_hash": _fake_sha(f"{route_token_ref}:prompt"),
         "visible_injection_manifest_hash": _fake_sha(
             f"{route_token_ref}:manifest"
@@ -174193,6 +174232,808 @@ def _complete_rev10_two_lane_close_ready_through_normal_facades(
         "close_line": close_line,
         "close_body": close_body,
     }
+
+
+def test_rev10_materialized_scope_revision_preserves_finished_sibling_and_worker_identity(
+    release_conn,
+    monkeypatch,
+    tmp_path,
+):
+    """Replay the public scope revision against a real rev10 two-lane runtime."""
+
+    conn = release_conn
+    graph_events.ensure_schema(conn)
+    graph_correction_patches.ensure_schema(conn)
+    conn.commit()
+    monkeypatch.setattr(
+        store,
+        "_graph_activation_policy_for_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "active_graph_activation_allowed": True,
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "port": 40008,
+            "cow_successor_verified": True,
+            "source_checkout_verified": True,
+            "live_runtime_custody_verified": True,
+        },
+    )
+    case = _prepare_ac_dev_entered_parallel_lane_routes(
+        conn,
+        monkeypatch,
+        tmp_path,
+        target_files=[
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+    )
+    subprocess.run(
+        ["git", "branch", "-f", "main", case["world"]["target_head_commit"]],
+        cwd=case["world"]["target_project_root"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    project_id = case["project_id"]
+    execution_id = case["execution_id"]
+    recipe = case["recipe"]
+    children = []
+    for body in recipe["request_bodies"]:
+        issued = server.handle_observer_route_context_issue(
+            _ctx({"project_id": project_id}, method="POST", body=body)
+        )
+        if isinstance(issued, tuple):
+            issued = issued[1]
+        assert issued["ok"] is True, issued
+        children.append(issued)
+    precheck_body = copy.deepcopy(
+        recipe["atomic_precheck"]["request_body_template"]
+    )
+    for binding, child in zip(
+        recipe["route_token_ref_bindings"], children, strict=True
+    ):
+        precheck_body["lanes"][binding["lane_index"]]["route_token_ref"] = (
+            child["route_token_ref"]
+        )
+    prechecked = server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx({"project_id": project_id}, method="POST", body=precheck_body)
+    )
+    allocations = []
+    for body in prechecked["copy_safe_allocation_bodies"]:
+        status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+            _ctx({"project_id": project_id}, method="POST", body=body)
+        )
+        assert status == 201 and allocated["ok"] is True, allocated
+        context = get_branch_context(conn, project_id, body["task_id"])
+        assert context is not None
+        allocations.append((body, context))
+
+    dispatch_record = server._contract_runtime_read(
+        conn,
+        contract_execution_id=execution_id,
+        actor_role="observer",
+    )
+    dispatch_body = dispatch_record["runtime_guide"]["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    dispatched = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": project_id, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body=dispatch_body,
+        )
+    )
+    assert dispatched["ok"] is True, dispatched
+
+    def join_worker(allocation_body, context):
+        monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+        worker_session_id = f"session-{context.task_id}"
+        joined = (
+            server.handle_graph_governance_runtime_context_session_token_initial_join(
+                _ctx_with_role(
+                    {
+                        "project_id": project_id,
+                        "runtime_context_id": context.runtime_context_id,
+                    },
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "task_id": context.task_id,
+                        "parent_task_id": execution_id,
+                        "contract_execution_id": execution_id,
+                        "target_project_root": context.target_project_root,
+                        "worker_id": context.worker_id,
+                        "worker_slot_id": context.worker_slot_id,
+                        "agent_id": context.worker_id,
+                        "actual_host_worker_id": context.worker_id,
+                        "worker_session_id": worker_session_id,
+                        "host_session_id": worker_session_id,
+                        "host_startup_id": f"startup-{context.task_id}",
+                        **allocation_body["route_identity"],
+                        "ttl_seconds": 3600,
+                        "reason": "Exercise one real rev10 lane session.",
+                    },
+                )
+            )
+        )
+        assert joined["ok"] is True, joined
+        monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE")
+        return joined
+
+    sibling_body, sibling = allocations[0]
+    sibling_join = join_worker(sibling_body, sibling)
+    passed_results = {
+        "status": "passed",
+        "passed": True,
+        "commands": [
+            {"command": "python3 -m pytest lane-owned -q", "status": "passed"}
+        ],
+    }
+    sibling_root = Path(sibling.worktree_path)
+    sibling_successor, sibling, sibling_head, evidence, startup = (
+        _normal_mf_parallel_finish_precursor(
+            conn,
+            tmp_path,
+            backlog_id=case["backlog_id"],
+            worker_task_id=sibling.task_id,
+            worker_token=sibling_join["session_token"],
+            worker_fence=sibling_join["fence_token"],
+            worker_root=sibling_root,
+            graph_trace_id=f"gqt-{sibling.task_id}",
+            test_results=passed_results,
+            project_id=project_id,
+            prepared={
+                "successor": {"contract_execution_id": execution_id},
+                "runtime_context": sibling,
+                "route_identity": dict(sibling_body["route_identity"]),
+            },
+        )
+    )
+    _finish_normal_mf_parallel_worker(
+        conn,
+        project_id=project_id,
+        successor=sibling_successor,
+        runtime_context=sibling,
+        head_commit=sibling_head,
+        evidence_events=evidence,
+        startup=startup,
+        worker_token=sibling_join["session_token"],
+        worker_fence=sibling_join["fence_token"],
+        worker_root=sibling_root,
+        test_results=passed_results,
+    )
+    sibling_before = get_branch_context(conn, project_id, sibling.task_id)
+    assert sibling_before is not None
+    sibling_lines_before = copy.deepcopy(
+        server._contract_runtime_store(conn).get(execution_id)["completed_lines"]
+    )
+
+    target_body, target = allocations[1]
+    target_join = join_worker(target_body, target)
+    missing_file = "agent/governance/parallel_branch_runtime.py"
+    scope = server.handle_graph_governance_runtime_context_scope_insufficiency_request(
+        _ctx_with_role(
+            {
+                "project_id": project_id,
+                "runtime_context_id": target.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "project_id": project_id,
+                "runtime_context_id": target.runtime_context_id,
+                "backlog_id": case["backlog_id"],
+                "task_id": target.task_id,
+                "parent_task_id": execution_id,
+                "target_project_root": target.target_project_root,
+                "session_token": target_join["session_token"],
+                "fence_token": target_join["fence_token"],
+                "missing_files": [missing_file],
+                "requested_files": [*target.owned_files, missing_file],
+                "blocked_acceptance_ids": ["MR1"],
+                "reason": "The worker consumer requires the materialized runtime module.",
+                "graph_refs": [f"graph-query:gqt-{target.task_id}"],
+                **target_body["route_identity"],
+            },
+        )
+    )
+    canonical_body = scope["observer_disposition"]["copy_safe_next_request"][
+        "body"
+    ]
+    requested_files = canonical_body["owned_files"]
+    before_unaccepted_scope = tuple(conn.iterdump())
+    before_unaccepted_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as unaccepted_scope:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=canonical_body,
+            )
+        )
+    assert unaccepted_scope.value.code == "acceptance_file_fence_closure_failed"
+    assert conn.total_changes == before_unaccepted_changes
+    assert tuple(conn.iterdump()) == before_unaccepted_scope
+
+    foreign_body = {
+        **canonical_body,
+        "contract_execution_id": "cex-foreign-runtime-scope-revision",
+        "parent_task_id": "cex-foreign-runtime-scope-revision",
+    }
+    before_foreign = tuple(conn.iterdump())
+    with pytest.raises(GovernanceError) as foreign:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=foreign_body,
+            )
+        )
+    assert foreign.value.code == "parallel_branch_allocate_route_action_scope_invalid"
+    assert tuple(conn.iterdump()) == before_foreign
+
+    row = conn.execute(
+        "SELECT target_files, test_files FROM backlog_bugs WHERE bug_id = ?",
+        (case["backlog_id"],),
+    ).fetchone()
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                sorted(
+                    set(json.loads(row["target_files"]))
+                    | set(json.loads(row["test_files"]))
+                    | {missing_file}
+                )
+            ),
+            case["backlog_id"],
+        ),
+    )
+    conn.commit()
+
+    revision_route = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id,
+        backlog_id=case["backlog_id"],
+        task_id=execution_id,
+        target_files=requested_files,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        parent_route_identity=case["plan"]["parent_route_binding"][
+            "route_identity"
+        ],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=server._route_registry_storage_project_id(project_id),
+        route_token_ref=revision_route["route_token_ref"],
+        token=revision_route["route_token"],
+    )
+    conn.commit()
+    revision_route_identity = {
+        field: revision_route["route_token"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    revision_route_identity["route_token_ref"] = revision_route[
+        "route_token_ref"
+    ]
+    canonical_body = {**canonical_body, **revision_route_identity}
+
+    sibling_requested_files = [*sibling.owned_files, missing_file]
+    sibling_revision_route = (
+        observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=case["backlog_id"],
+            task_id=execution_id,
+            target_files=sibling_requested_files,
+            allowed_actions=[
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ],
+            parent_route_identity=case["plan"]["parent_route_binding"][
+                "route_identity"
+            ],
+        )
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=server._route_registry_storage_project_id(project_id),
+        route_token_ref=sibling_revision_route["route_token_ref"],
+        token=sibling_revision_route["route_token"],
+    )
+    conn.commit()
+    sibling_revision_route_identity = {
+        field: sibling_revision_route["route_token"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    sibling_revision_route_identity["route_token_ref"] = (
+        sibling_revision_route["route_token_ref"]
+    )
+    finished_sibling_revision = {
+        **canonical_body,
+        **sibling_revision_route_identity,
+        "task_id": sibling.task_id,
+        "target_project_root": sibling.target_project_root,
+        "worktree_path": sibling.worktree_path,
+        "owned_files": sibling_requested_files,
+        "target_files": sibling_requested_files,
+        "base_commit": sibling.base_commit,
+        "target_head_commit": sibling.target_head_commit,
+        "merge_queue_id": sibling.merge_queue_id,
+    }
+    before_finished_sibling = tuple(conn.iterdump())
+    with pytest.raises(GovernanceError) as finished_sibling:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=finished_sibling_revision,
+            )
+        )
+    assert finished_sibling.value.code == (
+        "runtime_context_scope_revision_after_implementation"
+    )
+    assert tuple(conn.iterdump()) == before_finished_sibling
+
+    overlap_files = sorted(set(requested_files) | set(sibling.owned_files))
+    overlap_route = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id,
+        backlog_id=case["backlog_id"],
+        task_id=execution_id,
+        target_files=overlap_files,
+        allowed_actions=["parallel_branch_allocate", "task_timeline_append"],
+        parent_route_identity=case["plan"]["parent_route_binding"][
+            "route_identity"
+        ],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=server._route_registry_storage_project_id(project_id),
+        route_token_ref=overlap_route["route_token_ref"],
+        token=overlap_route["route_token"],
+    )
+    conn.commit()
+    overlap_route_identity = {
+        field: overlap_route["route_token"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    overlap_route_identity["route_token_ref"] = overlap_route["route_token_ref"]
+    overlap_body = {
+        **canonical_body,
+        **overlap_route_identity,
+        "owned_files": overlap_files,
+        "target_files": overlap_files,
+    }
+    before_overlap = tuple(conn.iterdump())
+    before_overlap_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as overlap:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=overlap_body,
+            )
+        )
+    assert overlap.value.code == (
+        "runtime_context_authority_revision_sibling_file_overlap"
+    )
+    assert conn.total_changes == before_overlap_changes
+    assert tuple(conn.iterdump()) == before_overlap
+
+    sibling_row = dict(
+        conn.execute(
+            """
+            SELECT * FROM parallel_branch_runtime_contexts
+            WHERE project_id = ? AND runtime_context_id = ?
+            """,
+            (project_id, sibling.runtime_context_id),
+        ).fetchone()
+    )
+    sibling_columns = list(sibling_row)
+    sibling_insert = (
+        "INSERT INTO parallel_branch_runtime_contexts ("
+        + ", ".join(sibling_columns)
+        + ") VALUES ("
+        + ", ".join("?" for _ in sibling_columns)
+        + ")"
+    )
+    for custody_mutation in ("missing", "parent", "task"):
+        if custody_mutation == "missing":
+            conn.execute(
+                """
+                DELETE FROM parallel_branch_runtime_contexts
+                WHERE project_id = ? AND runtime_context_id = ?
+                """,
+                (project_id, sibling.runtime_context_id),
+            )
+        elif custody_mutation == "parent":
+            conn.execute(
+                """
+                UPDATE parallel_branch_runtime_contexts
+                SET parent_task_id = ?
+                WHERE project_id = ? AND runtime_context_id = ?
+                """,
+                (
+                    "cex-foreign-parent",
+                    project_id,
+                    sibling.runtime_context_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE parallel_branch_runtime_contexts
+                SET task_id = ?
+                WHERE project_id = ? AND runtime_context_id = ?
+                """,
+                (
+                    "worker-foreign-task",
+                    project_id,
+                    sibling.runtime_context_id,
+                ),
+            )
+        conn.commit()
+        before_invalid_custody = tuple(conn.iterdump())
+        before_invalid_custody_changes = conn.total_changes
+        with pytest.raises(GovernanceError) as invalid_custody:
+            server.handle_graph_governance_parallel_branch_allocate(
+                _ctx(
+                    {"project_id": project_id},
+                    method="POST",
+                    body=overlap_body,
+                )
+            )
+        assert invalid_custody.value.code == (
+            "runtime_context_authority_revision_dispatch_custody_invalid"
+        )
+        assert conn.total_changes == before_invalid_custody_changes
+        assert tuple(conn.iterdump()) == before_invalid_custody
+        conn.execute(
+            """
+            DELETE FROM parallel_branch_runtime_contexts
+            WHERE project_id = ? AND runtime_context_id = ?
+            """,
+            (project_id, sibling.runtime_context_id),
+        )
+        conn.execute(
+            sibling_insert,
+            tuple(sibling_row[column] for column in sibling_columns),
+        )
+        conn.commit()
+
+    target_worktree = Path(target.worktree_path)
+    dirty_path = target_worktree / target.owned_files[0]
+    dirty_path.parent.mkdir(parents=True, exist_ok=True)
+    dirty_path.write_text("uncommitted scope revision\n", encoding="utf-8")
+    before_dirty = tuple(conn.iterdump())
+    with pytest.raises(GovernanceError) as dirty:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=canonical_body,
+            )
+        )
+    assert dirty.value.code == "runtime_context_authority_revision_dirty_worktree"
+    assert tuple(conn.iterdump()) == before_dirty
+    dirty_path.unlink()
+
+    sibling_durable_before = _fresh_release_fixture_rows(
+        conn,
+        extra_tables=(
+            "parallel_branch_runtime_contexts",
+            "parallel_branch_runtime_contract_revisions",
+        ),
+    )
+    status, revised = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body=canonical_body,
+        )
+    )
+    assert status == 201 and revised["ok"] is True, revised
+    assert revised["authority_revision"]["scope_changed"] is True
+    assert revised["context"]["runtime_context_id"] == target.runtime_context_id
+    assert revised["context"]["owned_files"] == requested_files
+    assert "same_owner_worker_session" not in revised
+    target_revision_rows_before = sibling_durable_before[
+        "parallel_branch_runtime_contract_revisions"
+    ]
+
+    sibling_after = get_branch_context(conn, project_id, sibling.task_id)
+    assert sibling_after is not None
+    assert sibling_after == sibling_before
+    lines_after = server._contract_runtime_store(conn).get(execution_id)[
+        "completed_lines"
+    ]
+    assert lines_after == sibling_lines_before
+    durable_after = _fresh_release_fixture_rows(
+        conn,
+        extra_tables=(
+            "parallel_branch_runtime_contexts",
+            "parallel_branch_runtime_contract_revisions",
+        ),
+    )
+    for table in (
+        "contract_runtime_executions",
+        "backlog_contract_chain_bindings",
+        "observer_command_queue",
+    ):
+        assert durable_after[table] == sibling_durable_before[table]
+    assert len(
+        durable_after["parallel_branch_runtime_contract_revisions"]
+    ) == len(target_revision_rows_before) + 1
+
+    before_unchanged = tuple(conn.iterdump())
+    with pytest.raises(GovernanceError) as unchanged:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=canonical_body,
+            )
+        )
+    assert unchanged.value.code == "parallel_branch_allocate_precheck_receipt_required"
+    assert tuple(conn.iterdump()) == before_unchanged
+
+    current_target = get_branch_context(conn, project_id, target.task_id)
+    worker_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": project_id,
+                    "runtime_context_id": target.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": target.task_id,
+                    "parent_task_id": execution_id,
+                    "fence_token": target_join["fence_token"],
+                    "session_token": target_join["session_token"],
+                    "session_token_ref": runtime_context_session_token_ref(
+                        current_target
+                    ),
+                    "target_project_root": target.target_project_root,
+                    **revision_route_identity,
+                },
+            )
+        )
+    )
+    assert worker_guide["runtime_context_id"] == target.runtime_context_id
+    assert worker_guide["task_id"] == target.task_id
+    assert worker_guide["parent_task_id"] == execution_id
+    assert worker_guide["owned_files"] == requested_files
+    worker_action = worker_guide["canonical_executable_action"]
+    assert worker_action["mcp_tool"] == "observer_runtime_text_prepare"
+    valid_prepare_body = copy.deepcopy(worker_action["copy_safe_body"])
+    for field, value in (
+        ("route_token_ref", "rtok-independent-foreign"),
+        ("target_project_root", str(tmp_path / "foreign-target")),
+    ):
+        rejected_body = {**valid_prepare_body, field: value}
+        before_rejected_prepare = tuple(conn.iterdump())
+        before_rejected_prepare_changes = conn.total_changes
+        rejected_prepare = server.handle_observer_runtime_text_prepare(
+            _ctx_with_role(
+                {"project_id": project_id},
+                "observer",
+                method="POST",
+                body=rejected_body,
+            )
+        )
+        assert rejected_prepare["ok"] is False, rejected_prepare
+        assert rejected_prepare["execution_ticket"]["status"] == "rejected"
+        assert rejected_prepare["writes_performed"] is False
+        assert conn.total_changes == before_rejected_prepare_changes
+        assert tuple(conn.iterdump()) == before_rejected_prepare
+
+    revision_row = conn.execute(
+        """
+        SELECT * FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ?
+        ORDER BY created_at DESC, revision_id DESC
+        LIMIT 1
+        """,
+        (project_id, target.runtime_context_id),
+    ).fetchone()
+    assert revision_row is not None
+    revision_row = dict(revision_row)
+    original_revision_payload_json = revision_row["payload_json"]
+    original_revision_parent = revision_row["parent_task_id"]
+    original_route_evidence_type = revision_row["route_evidence_type"]
+    for mutation in ("source", "base", "parent", "fence", "evidence_type"):
+        revision_payload = json.loads(original_revision_payload_json)
+        if mutation == "source":
+            revision_payload["authority_revision"]["source"] = "caller_projection"
+        elif mutation == "base":
+            revision_payload["base_commit"] = "f" * 40
+        elif mutation == "fence":
+            revision_payload["owned_files"] = ["agent/foreign.py"]
+            revision_payload["target_files"] = ["agent/foreign.py"]
+        if mutation == "parent":
+            conn.execute(
+                """
+                UPDATE parallel_branch_runtime_contract_revisions
+                SET parent_task_id = ?
+                WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+                """,
+                (
+                    "cex-foreign-parent",
+                    project_id,
+                    target.runtime_context_id,
+                    revision_row["revision_id"],
+                ),
+            )
+        elif mutation == "evidence_type":
+            conn.execute(
+                """
+                UPDATE parallel_branch_runtime_contract_revisions
+                SET route_evidence_type = ?
+                WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+                """,
+                (
+                    "caller_projection",
+                    project_id,
+                    target.runtime_context_id,
+                    revision_row["revision_id"],
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE parallel_branch_runtime_contract_revisions
+                SET payload_json = ?
+                WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+                """,
+                (
+                    json.dumps(revision_payload, sort_keys=True),
+                    project_id,
+                    target.runtime_context_id,
+                    revision_row["revision_id"],
+                ),
+            )
+        conn.commit()
+        before_rejected_prepare = tuple(conn.iterdump())
+        before_rejected_prepare_changes = conn.total_changes
+        rejected_prepare = server.handle_observer_runtime_text_prepare(
+            _ctx_with_role(
+                {"project_id": project_id},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(valid_prepare_body),
+            )
+        )
+        assert rejected_prepare["ok"] is False, {
+            "mutation": mutation,
+            "prepared": rejected_prepare,
+        }
+        assert rejected_prepare["execution_ticket"]["status"] == "rejected"
+        assert rejected_prepare["writes_performed"] is False
+        assert conn.total_changes == before_rejected_prepare_changes
+        assert tuple(conn.iterdump()) == before_rejected_prepare
+        conn.execute(
+            """
+            UPDATE parallel_branch_runtime_contract_revisions
+            SET payload_json = ?, parent_task_id = ?, route_evidence_type = ?
+            WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+            """,
+            (
+                original_revision_payload_json,
+                original_revision_parent,
+                original_route_evidence_type,
+                project_id,
+                target.runtime_context_id,
+                revision_row["revision_id"],
+            ),
+        )
+        conn.commit()
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx_with_role(
+            {"project_id": project_id},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(valid_prepare_body),
+        )
+    )
+    assert prepared["ok"] is True, json.dumps({
+        "status": prepared.get("status"),
+        "execution_ticket_errors": (prepared.get("execution_ticket") or {}).get(
+            "errors"
+        ),
+        "ticket_authority_status": (
+            prepared.get("contract_runtime_current_state") or {}
+        ).get("ticket_authority_status"),
+        "ticket_authority_error": (
+            prepared.get("contract_runtime_current_state") or {}
+        ).get("ticket_authority_error"),
+        "identity_mismatches": (prepared.get("execution_ticket") or {}).get(
+            "identity_mismatches"
+        ),
+    }, sort_keys=True)
+    assert prepared["runtime_context_id"] == target.runtime_context_id
+    execution_ticket = prepared["execution_ticket"]
+    assert execution_ticket["status"] == "issued"
+    dispatch_identity = execution_ticket["dispatch_identity"]
+    assert dispatch_identity["owned_files"] == sorted(requested_files)
+    assert {
+        field: dispatch_identity[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == revision_route_identity
+
+    receipt_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": project_id,
+                    "runtime_context_id": target.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": target.task_id,
+                    "parent_task_id": execution_id,
+                    "fence_token": target_join["fence_token"],
+                    "session_token": target_join["session_token"],
+                    "session_token_ref": runtime_context_session_token_ref(
+                        get_branch_context(conn, project_id, target.task_id)
+                    ),
+                    "target_project_root": target.target_project_root,
+                    **revision_route_identity,
+                },
+            )
+        )
+    )
+    receipt_action = receipt_guide["canonical_executable_action"]
+    assert receipt_action["mcp_tool"] == "runtime_context_read_receipt"
+    receipt_body = copy.deepcopy(receipt_action["copy_safe_body"])
+    receipt_body.update(
+        {
+            "session_token": target_join["session_token"],
+            "fence_token": target_join["fence_token"],
+            **revision_route_identity,
+        }
+    )
+    receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": project_id,
+                "runtime_context_id": target.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=receipt_body,
+        )
+    )
+    assert receipt["ok"] is True, receipt
+    assert receipt["runtime_context_id"] == target.runtime_context_id
+    assert receipt["task_id"] == target.task_id
+    assert receipt["same_context_startup_resume"]["parent_task_id"] == execution_id
 
 
 @pytest.mark.parametrize("tamper", ["runtime_drift"])
