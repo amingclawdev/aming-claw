@@ -201,23 +201,18 @@ def _pair_similarity(a: FeatureNode, b: FeatureNode, adapter: Any) -> float:
 
 
 def _resolve_adapter(language_adapter: Any, feature_nodes: Sequence[FeatureNode]) -> Any:
-    """Pick PythonAdapter when most files look Python; otherwise FileTreeAdapter (AC13)."""
+    """Select one registered adapter, or conservative fallback for mixed inputs."""
     if language_adapter is not None:
         return language_adapter
 
     # Local imports keep this module import-cheap.
-    from ..language_adapters.filetree_adapter import FileTreeAdapter
-    from ..language_adapters.python_adapter import PythonAdapter
-
-    py = PythonAdapter()
+    from ..language_adapters.registry import adapter_for_paths
     sample_files: List[str] = []
     for fn in feature_nodes:
         sample_files.extend(fn.primary_files or [])
         if len(sample_files) >= 8:
             break
-    if sample_files and any(py.supports(f) for f in sample_files):
-        return py
-    return FileTreeAdapter()
+    return adapter_for_paths(sample_files)
 
 
 # ---------------------------------------------------------------------------

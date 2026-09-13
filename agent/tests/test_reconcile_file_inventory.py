@@ -353,6 +353,88 @@ def test_inventory_uses_shared_language_policy_for_mixed_js_ts_fixture(tmp_path)
     assert "coverage/lcov.info" not in rows_by_path
 
 
+def test_inventory_classifies_macos_c_family_assets_without_architecture_promotion(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "Sources" / "plain.c"), "int plain(void) { return 1; }\n")
+    _write(str(project / "Sources" / "legacy.C"), "int legacy() { return 2; }\n")
+    _write(str(project / "Sources" / "overlay.mm"), "int overlay() { return 3; }\n")
+    _write(str(project / "Sources" / "overlay.hh"), "int overlay();\n")
+    _write(str(project / "Sources" / "detail.inc"), "#define DETAIL 1\n")
+    _write(str(project / "tests" / "overlay_test.cc"), "int main() { return 0; }\n")
+    _write(str(project / "docs" / "overlay.md"), "# Overlay\n")
+    _write(str(project / "config" / "build.yaml"), "platform: macos\n")
+    _write(str(project / "config" / "bindings.json"), '{"governance_hints": []}\n')
+    _git(project, "init")
+    _git(project, "config", "user.email", "test@example.com")
+    _git(project, "config", "user.name", "Test User")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "macOS C-family fixture")
+
+    rows = build_file_inventory(
+        project_root=str(project),
+        run_id="macos-c-family",
+        nodes=[{"node_id": "overlay", "primary_file": "Sources/overlay.mm"}],
+        feature_clusters=[],
+    )
+    by_path = _by_path(rows)
+    assert by_path["Sources/plain.c"]["language"] == "c"
+    assert by_path["Sources/legacy.C"]["language"] == "cpp"
+    assert by_path["Sources/overlay.mm"]["language"] == "objective-cpp"
+    assert by_path["Sources/overlay.hh"]["file_kind"] == "dependency"
+    assert by_path["Sources/overlay.hh"]["language"] == "unknown"
+    assert by_path["Sources/overlay.hh"]["graph_status"] == "support"
+    assert by_path["Sources/detail.inc"]["file_kind"] == "dependency"
+    assert by_path["tests/overlay_test.cc"]["file_kind"] == "test"
+    assert by_path["docs/overlay.md"]["file_kind"] == "doc"
+    assert by_path["config/build.yaml"]["file_kind"] == "config"
+    assert by_path["config/bindings.json"]["file_kind"] == "config"
+    assert by_path["config/bindings.json"]["effective_binding_status"] == "unbound"
+
+    from agent.governance.project_profile import discover_project_profile
+    from agent.governance.graph_generator import scan_codebase
+    from agent.governance.reconcile_phases.phase_z_v2 import append_filetree_fallback_source_nodes
+
+    profile = discover_project_profile(str(project))
+    assert profile.is_production_source_path("Sources/overlay.hh") is False
+    legacy_paths = {item["path"] for item in scan_codebase(str(project))}
+    assert {
+        "Sources/plain.c", "Sources/legacy.C", "Sources/overlay.mm",
+        "Sources/overlay.hh", "Sources/detail.inc", "tests/overlay_test.cc",
+        "docs/overlay.md", "config/build.yaml", "config/bindings.json",
+    } <= legacy_paths & set(by_path)
+
+    architecture_nodes = []
+    added = append_filetree_fallback_source_nodes(
+        str(project),
+        architecture_nodes,
+        profile=profile,
+    )
+    primaries = {node["primary_file"] for node in added}
+    assert "Sources/plain.c" in primaries
+    assert "Sources/legacy.C" in primaries
+    assert "Sources/overlay.mm" in primaries
+    assert "Sources/overlay.hh" not in primaries
+    assert "Sources/detail.inc" not in primaries
+    assert "tests/overlay_test.cc" not in primaries
+    assert "docs/overlay.md" not in primaries
+    assert "config/build.yaml" not in primaries
+
+
+def test_config_inside_test_tree_uses_shared_config_precedence(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "tests" / "settings.json"), '{"enabled": true}\n')
+
+    from agent.governance.graph_generator import scan_codebase
+
+    legacy = {item["path"]: item["type"] for item in scan_codebase(str(project))}
+    inventory = {
+        item["path"]: item["file_kind"]
+        for item in build_file_inventory(project_root=str(project), run_id="config-precedence")
+    }
+    assert legacy["tests/settings.json"] == "config"
+    assert inventory["tests/settings.json"] == "config"
+
+
 def test_inventory_persists_to_governance_table(tmp_path):
     project = tmp_path / "project"
     _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")

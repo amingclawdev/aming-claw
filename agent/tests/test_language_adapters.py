@@ -31,6 +31,9 @@ from agent.governance.language_adapters import (  # noqa: E402
     LanguageAdapter,
     PythonAdapter,
     RubyAdapter,
+    adapter_for_path,
+    adapter_for_paths,
+    capability_for_path,
 )
 
 
@@ -279,3 +282,53 @@ def test_adapters_are_stateless_and_import_safe():
     fb = FileTreeAdapter()
     assert fa.supports("anything.go") == fb.supports("anything.go") is True
     assert fa.collect_decorators(None) == fb.collect_decorators(None) == []
+
+
+def test_c_family_registry_separates_discovery_configuration_and_semantics():
+    source = capability_for_path("Sources/Overlay.mm")
+    assert source.recognized is True
+    assert source.language == "objective-cpp"
+    assert source.configuration_selected is False
+    assert source.parser_available is False
+    assert source.semantic_available is False
+    assert source.status == "unconfigured"
+
+    header = capability_for_path(
+        "Sources/Overlay.hpp",
+        compilation_context={
+            "language": "objective-cpp",
+            "compilation_profile": "macos-debug",
+            "platform": "macos-arm64",
+            "macro_conditions": ["TARGET_OS_OSX=1"],
+            "provenance": ["compile_commands.json:7"],
+        },
+    )
+    assert header.language == "objective-cpp"
+    assert header.configuration_selected is True
+    assert header.parser_available is False
+    assert header.semantic_available is False
+    assert header.status == "unsupported"
+    assert header.as_dict()["macro_conditions"] == ["TARGET_OS_OSX=1"]
+    assert capability_for_path("Sources/Overlay.h").language == "unknown"
+
+    assert isinstance(adapter_for_path("Sources/Overlay.mm"), FileTreeAdapter)
+    assert isinstance(adapter_for_paths(["src/a.py", "src/b.py"]), PythonAdapter)
+    assert isinstance(adapter_for_paths(["src/a.py", "src/b.mm"]), FileTreeAdapter)
+
+
+def test_c_family_case_sensitive_suffix_and_future_platform_contracts():
+    assert capability_for_path("legacy.c").language == "c"
+    assert capability_for_path("legacy.C").language == "cpp"
+    linux = capability_for_path(
+        "future.cc",
+        compilation_context={"compilation_profile": "linux-release", "platform": "linux-x86_64"},
+    )
+    assert linux.recognized is True
+    assert linux.status == "unsupported"
+    assert linux.semantic_available is False
+
+    from agent.governance.reconcile_phases.cluster_grouper import _resolve_adapter
+    from agent.governance.reconcile_phases.phase_z_v2 import _adapter_for_source_file
+
+    assert isinstance(_adapter_for_source_file("Sources/overlay.mm"), FileTreeAdapter)
+    assert isinstance(_resolve_adapter(None, []), FileTreeAdapter)

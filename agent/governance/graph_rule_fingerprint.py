@@ -21,6 +21,8 @@ SCHEMA_VERSION = 1
 
 ALGORITHM_INPUT_PATHS: tuple[str, ...] = (
     "agent/governance/reconcile_phases/phase_z_v2.py",
+    "agent/governance/language_policy.py",
+    "agent/governance/language_adapters/registry.py",
     "agent/governance/reconcile_file_inventory.py",
     "agent/governance/reconcile_semantic_config.py",
     "agent/governance/graph_hint_projection.py",

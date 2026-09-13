@@ -169,3 +169,31 @@ def test_project_profile_respects_graph_ignore_globs(tmp_path):
     assert profile.is_production_source_path("src/app.ts")
     assert profile.is_excluded_path("src/client.generated.ts")
     assert not profile.is_production_source_path("src/client.generated.ts")
+
+
+def test_project_profile_discovers_macos_c_family_without_promoting_headers(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "CMakeLists.txt"), "project(Overlay LANGUAGES C CXX OBJCXX)\n")
+    _write(str(project / "Sources" / "plain.c"), "int plain(void) { return 1; }\n")
+    _write(str(project / "Sources" / "legacy.C"), "int legacy() { return 2; }\n")
+    _write(str(project / "Sources" / "overlay.mm"), "int overlay() { return 3; }\n")
+    _write(str(project / "Sources" / "overlay.hpp"), "int overlay();\n")
+    _write(str(project / "Include" / "public.hh"), "int public_value();\n")
+
+    profile = discover_project_profile(str(project))
+
+    assert {"c", "cpp", "objective-cpp"} <= set(profile.languages)
+    assert "Sources" in profile.source_roots
+    assert "Include" in profile.source_roots
+    assert profile.is_production_source_path("Sources/plain.c")
+    assert profile.is_production_source_path("Sources/legacy.C")
+    assert profile.is_production_source_path("Sources/overlay.mm")
+    assert not profile.is_production_source_path("Sources/overlay.hpp")
+    assert not profile.is_production_source_path("Include/public.hh")
+    assert profile.language_capability("Sources/overlay.hpp")["language"] == "unknown"
+    contextual = profile.language_capability(
+        "Sources/overlay.hpp",
+        compilation_context={"language": "objective-cpp", "compilation_profile": "macos"},
+    )
+    assert contextual["language"] == "objective-cpp"
+    assert contextual["semantic_available"] is False

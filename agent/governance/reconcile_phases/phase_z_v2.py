@@ -22,10 +22,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from agent.governance.language_adapters import (
     FileTreeAdapter,
-    JavaScriptTypescriptAdapter,
     LanguageAdapter,
     PythonAdapter,
-    RubyAdapter,
+    adapter_for_path,
 )
 from agent.governance.asset_binding_proposals import (
     doc_binding_candidates,
@@ -42,12 +41,6 @@ EXCLUDE_DIRS: frozenset[str] = frozenset(DEFAULT_LANGUAGE_POLICY.exclude_roots)
 
 # Default production directories to scan
 DEFAULT_PROD_DIRS: Tuple[str, ...] = ("agent", "scripts")
-_GRAPH_LANGUAGE_ADAPTERS: Tuple[LanguageAdapter, ...] = (
-    PythonAdapter(),
-    JavaScriptTypescriptAdapter(),
-    RubyAdapter(),
-)
-_FILETREE_ADAPTER = FileTreeAdapter()
 _IMPORT_RESOLUTION_SUFFIXES: Tuple[str, ...] = (
     ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
     ".rb", ".rake",
@@ -497,10 +490,7 @@ def _path_to_module(path: str, root: str) -> str:
 
 
 def _adapter_for_source_file(file_path: str) -> LanguageAdapter:
-    for adapter in _GRAPH_LANGUAGE_ADAPTERS:
-        if adapter.supports(file_path):
-            return adapter
-    return _FILETREE_ADAPTER
+    return adapter_for_path(file_path)
 
 
 def _parse_python_module(fpath: str, mod_name: str, source: str) -> Optional[ModuleInfo]:

@@ -21,6 +21,9 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
+from agent.governance.language_adapters.registry import capability_for_path
+
 log = logging.getLogger(__name__)
 
 # Safety limits
@@ -59,6 +62,12 @@ _DEFAULT_EXCLUDE = {
     "target", ".next", ".nuxt", "coverage", ".eggs", "*.egg-info",
     ".claude", ".worktrees", "shared-volume", "runtime",
 }
+
+
+class _ScanCodebaseResult(list):
+    """List-compatible scan result carrying traversal completeness."""
+
+    scan_truncated: bool = False
 
 
 def _normalize_path(p: str) -> str:
@@ -149,6 +158,8 @@ def detect_language(workspace_path: str) -> str:
         return "javascript"
     if (ws / "Gemfile").exists() or any(ws.glob("*.gemspec")):
         return "ruby"
+    if (ws / "compile_commands.json").exists() or (ws / "CMakeLists.txt").exists():
+        return "cpp"
     return "unknown"
 
 
@@ -159,7 +170,9 @@ def scan_codebase(
 ) -> List[Dict[str, Any]]:
     """Walk directory tree up to scan_depth, returning file metadata.
 
-    Each entry: {"path": "relative/posix/path", "type": "source|test|config|entrypoint"}
+    Each entry includes a classified ``type`` and the scan-wide
+    ``scan_truncated`` flag.  The returned value remains list-compatible and
+    also carries ``scan_truncated`` for empty scans.
 
     Args:
         workspace_path: Root directory to scan.
@@ -171,9 +184,11 @@ def scan_codebase(
     if exclude_patterns:
         excludes.update(exclude_patterns)
 
-    files: List[Dict[str, Any]] = []
+    files: List[Dict[str, Any]] = _ScanCodebaseResult()
+    scan_truncated = False
 
     def _walk(current: Path, depth: int):
+        nonlocal scan_truncated
         if depth > scan_depth:
             return
         try:
@@ -192,28 +207,53 @@ def scan_codebase(
                 continue
 
             if entry.is_dir():
-                _walk(entry, depth + 1)
+                if depth >= scan_depth:
+                    scan_truncated = True
+                else:
+                    _walk(entry, depth + 1)
             elif entry.is_file():
-                _, ext = os.path.splitext(name)
-                # Only include source-like files
-                if ext not in {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs",
-                               ".rb", ".rake",
-                               ".yaml", ".yml", ".json", ".toml", ".ini", ".cfg",
-                               ".md", ".sh"} and name not in {"Gemfile", "Rakefile", "config.ru"}:
+                recognized = DEFAULT_LANGUAGE_POLICY.is_recognized_path(rel)
+                doc_asset = (
+                    DEFAULT_LANGUAGE_POLICY.is_doc_path(rel)
+                    or DEFAULT_LANGUAGE_POLICY.source_suffix(rel) in DEFAULT_LANGUAGE_POLICY.doc_extensions
+                    or DEFAULT_LANGUAGE_POLICY.is_index_doc_path(rel)
+                )
+                classified_asset = any((
+                    DEFAULT_LANGUAGE_POLICY.is_config_path(rel),
+                    doc_asset,
+                    DEFAULT_LANGUAGE_POLICY.is_script_path(rel),
+                    DEFAULT_LANGUAGE_POLICY.is_generated_path(rel),
+                ))
+                if not recognized and not classified_asset:
                     continue
 
-                if _is_test_file(name):
-                    ftype = "test"
-                elif _is_config_file(rel, name):
+                if DEFAULT_LANGUAGE_POLICY.is_generated_path(rel):
+                    ftype = "generated"
+                elif DEFAULT_LANGUAGE_POLICY.is_config_path(rel):
                     ftype = "config"
+                elif DEFAULT_LANGUAGE_POLICY.is_test_path(rel):
+                    ftype = "test"
+                elif doc_asset:
+                    ftype = "doc"
+                elif DEFAULT_LANGUAGE_POLICY.is_dependency_path(rel):
+                    ftype = "dependency"
                 elif _is_entrypoint(name):
                     ftype = "entrypoint"
                 else:
                     ftype = "source"
 
-                files.append({"path": rel, "type": ftype, "name": name})
+                files.append({
+                    "path": rel,
+                    "type": ftype,
+                    "name": name,
+                    "language": DEFAULT_LANGUAGE_POLICY.language_for_path(rel, ftype),
+                    "capability": capability_for_path(rel).as_dict(),
+                })
 
     _walk(ws, 0)
+    for item in files:
+        item["scan_truncated"] = scan_truncated
+    files.scan_truncated = scan_truncated
     return files
 
 
@@ -282,19 +322,14 @@ def _group_files_into_nodes(
             layers.add(layer)
             if f["type"] == "test":
                 test_files.append(f["path"])
-            elif f["type"] == "config":
+            elif f["type"] in {"config", "doc", "dependency"}:
                 secondary.append(f["path"])
-            else:
+            elif f["type"] in {"source", "entrypoint"}:
                 primary.append(f["path"])
 
-        if not primary and not secondary:
-            # Test-only directories — attach tests but still create node
-            if test_files:
-                primary = test_files
-                test_files = []
-                layers = {"L4"}
-
-        if not primary and not secondary and not test_files:
+        # Architecture nodes are production-source owned.  Tests, documents,
+        # configurations and dependency headers remain attached inventory.
+        if not primary:
             continue
 
         # Determine predominant layer
@@ -507,6 +542,7 @@ def generate_graph(
 
     language = detect_language(workspace_path)
     files = scan_codebase(workspace_path, scan_depth, exclude_patterns)
+    scan_truncated = bool(getattr(files, "scan_truncated", False))
     raw_nodes = _group_files_into_nodes(files)
 
     warning = None
@@ -567,6 +603,7 @@ def generate_graph(
         "layers": layers,
         "code_doc_map": code_doc_map,
         "inferred_docs": inferred_docs,
+        "scan_truncated": scan_truncated,
     }
     if warning:
         result["warning"] = warning

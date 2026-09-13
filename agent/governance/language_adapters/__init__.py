@@ -10,6 +10,7 @@ from .filetree_adapter import FileTreeAdapter
 from .javascript_typescript_adapter import JavaScriptTypescriptAdapter
 from .python_adapter import PythonAdapter
 from .ruby_adapter import RubyAdapter
+from .registry import LanguageCapability, adapter_for_path, adapter_for_paths, capability_for_path
 
 __all__ = [
     "LanguageAdapter",
@@ -17,4 +18,8 @@ __all__ = [
     "JavaScriptTypescriptAdapter",
     "RubyAdapter",
     "FileTreeAdapter",
+    "LanguageCapability",
+    "adapter_for_path",
+    "adapter_for_paths",
+    "capability_for_path",
 ]

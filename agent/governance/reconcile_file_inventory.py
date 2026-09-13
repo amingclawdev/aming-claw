@@ -284,6 +284,8 @@ def classify_file_kind(profile: ProjectProfile, rel_path: str) -> str:
         return "index_doc"
     if profile.is_doc_path(rel) or suffix in DOC_EXTENSIONS:
         return "doc"
+    if DEFAULT_LANGUAGE_POLICY.is_dependency_path(rel):
+        return "dependency"
     if profile.is_production_source_path(rel):
         return "source"
     if suffix in SCRIPT_EXTENSIONS or rel.startswith("scripts/"):
@@ -504,11 +506,11 @@ def build_file_inventory_with_observability(
             decision = "keep"
             graph_status = "support"
             reason = "test support file; audited as non-feature-specific support"
-        elif kind == "type_contract":
+        elif kind in {"type_contract", "dependency"}:
             scan_status = "support"
             decision = "keep"
             graph_status = "support"
-            reason = "TypeScript declaration contract; audited as non-runtime support"
+            reason = f"{kind} file; audited as non-runtime support"
         elif kind in {"doc", "index_doc"} and is_archive_doc_path(rel):
             scan_status = "archive"
             decision = "keep"

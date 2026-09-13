@@ -22,6 +22,99 @@ from governance.graph_generator import (
     _is_test_file,
     MAX_NODES,
 )
+from governance.graph_rule_fingerprint import ALGORITHM_INPUT_PATHS
+
+
+def test_macos_c_family_scan_is_classified_and_explicitly_truncated(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text("project(Overlay LANGUAGES CXX OBJCXX)\n")
+    sources = tmp_path / "Sources"
+    tests = tmp_path / "tests"
+    docs = tmp_path / "docs"
+    nested = tmp_path / "nested" / "deeper"
+    for directory in (sources, tests, docs, nested):
+        directory.mkdir(parents=True)
+    (sources / "overlay.mm").write_text("int overlay() { return 1; }\n")
+    (sources / "overlay.cc").write_text("int helper() { return 2; }\n")
+    (sources / "overlay.hpp").write_text("int overlay();\n")
+    (tests / "overlay_test.cc").write_text("int main() { return 0; }\n")
+    (docs / "overlay.md").write_text("# Overlay\n")
+    (tmp_path / "README.md").write_text("# Project\n")
+    (nested / "hidden.mm").write_text("int hidden() { return 0; }\n")
+
+    files = scan_codebase(str(tmp_path), scan_depth=1)
+    by_path = {item["path"]: item for item in files}
+    assert by_path["Sources/overlay.mm"]["type"] == "source"
+    assert by_path["Sources/overlay.mm"]["language"] == "objective-cpp"
+    assert by_path["Sources/overlay.mm"]["capability"]["status"] == "unconfigured"
+    assert by_path["Sources/overlay.mm"]["capability"]["semantic_available"] is False
+    assert by_path["Sources/overlay.hpp"]["type"] == "dependency"
+    assert by_path["Sources/overlay.hpp"]["language"] == "unknown"
+    assert by_path["tests/overlay_test.cc"]["type"] == "test"
+    assert by_path["docs/overlay.md"]["type"] == "doc"
+    assert by_path["README.md"]["type"] == "doc"
+    assert by_path["CMakeLists.txt"]["type"] == "config"
+    assert all(item["scan_truncated"] is True for item in files)
+    assert "nested/deeper/hidden.mm" not in by_path
+
+    generated = generate_graph(str(tmp_path), scan_depth=1)
+    primary = {
+        path
+        for node_id in generated["graph"].list_nodes()
+        for path in generated["graph"].get_node(node_id).get("primary", [])
+    }
+    assert "Sources/overlay.mm" in primary
+    assert "Sources/overlay.hpp" not in primary
+    assert "tests/overlay_test.cc" not in primary
+    assert "docs/overlay.md" not in primary
+    assert "README.md" not in primary
+    assert generated["scan_truncated"] is True
+
+    empty_root = tmp_path / "empty-root"
+    (empty_root / "nested").mkdir(parents=True)
+    assert generate_graph(str(empty_root), scan_depth=0)["scan_truncated"] is True
+
+
+def test_c_family_policy_and_registry_are_graph_fingerprint_inputs(tmp_path, monkeypatch):
+    assert "agent/governance/language_policy.py" in ALGORITHM_INPUT_PATHS
+    assert "agent/governance/language_adapters/registry.py" in ALGORITHM_INPUT_PATHS
+    import governance.graph_rule_fingerprint as fingerprint_module
+
+    for rel in ALGORITHM_INPUT_PATHS:
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"baseline:{rel}\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(fingerprint_module, "_repo_root", lambda: tmp_path)
+    before = fingerprint_module.build_graph_rule_fingerprint(
+        project,
+        include_source_hints=False,
+    )
+    (tmp_path / "agent/governance/language_policy.py").write_text("changed policy\n")
+    after = fingerprint_module.build_graph_rule_fingerprint(
+        project,
+        include_source_hints=False,
+    )
+    assert before["components"]["algorithm"]["fingerprint"] != after["components"]["algorithm"]["fingerprint"]
+
+
+def test_shared_policy_preserves_go_test_role_and_source_only_nodes(tmp_path):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "sum.go").write_text("package sum\nfunc Sum() int { return 1 }\n")
+    (package / "sum_test.go").write_text("package sum\nfunc TestSum() {}\n")
+
+    scanned = {item["path"]: item for item in scan_codebase(str(tmp_path))}
+    assert scanned["pkg/sum.go"]["type"] == "source"
+    assert scanned["pkg/sum_test.go"]["type"] == "test"
+    graph = generate_graph(str(tmp_path))["graph"]
+    primary = {
+        path
+        for node_id in graph.list_nodes()
+        for path in graph.get_node(node_id).get("primary", [])
+    }
+    assert "pkg/sum.go" in primary
+    assert "pkg/sum_test.go" not in primary
 
 
 @pytest.fixture

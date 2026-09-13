@@ -69,6 +69,19 @@ class ProjectProfile:
             and not self.is_doc_path(rel)
         )
 
+    def language_capability(
+        self,
+        path: str,
+        *,
+        compilation_context: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        from agent.governance.language_adapters.registry import capability_for_path
+
+        return capability_for_path(
+            self.normalize_relpath(path),
+            compilation_context=compilation_context,
+        ).as_dict()
+
 
 def discover_project_profile(
     project_root: str,
@@ -120,7 +133,10 @@ def _discover_languages(root: Path, manifests: Iterable[str]) -> List[str]:
     }
     for path in _iter_files(root):
         language = DEFAULT_LANGUAGE_POLICY.language_for_path(str(path))
-        if language in {"python", "javascript", "typescript", "go", "rust", "cpp", "ruby"}:
+        if language in {
+            "python", "javascript", "typescript", "go", "rust", "c", "cpp",
+            "objective-c", "objective-cpp", "ruby",
+        }:
             langs.add(language)
     return sorted(langs)
 
@@ -216,7 +232,7 @@ def _contains_root_source_file(root: Path) -> bool:
             continue
         if child.name in DEFAULT_EXCLUDE_ROOTS:
             continue
-        if DEFAULT_LANGUAGE_POLICY.is_source_path(str(child)):
+        if DEFAULT_LANGUAGE_POLICY.is_recognized_path(str(child)):
             return True
     return False
 
@@ -229,7 +245,7 @@ def _contains_source_file(path: Path, root: Path, exclude_roots: List[str] | Non
         parts = [p.lower() for p in rel.split("/") if p]
         if any(part in TEST_DIR_NAMES or part in DOC_DIR_NAMES for part in parts):
             continue
-        if DEFAULT_LANGUAGE_POLICY.is_source_path(str(file_path)):
+        if DEFAULT_LANGUAGE_POLICY.is_recognized_path(str(file_path)):
             return True
     return False
 

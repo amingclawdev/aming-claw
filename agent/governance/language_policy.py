@@ -24,12 +24,15 @@ class LanguagePolicy:
         ".js", ".jsx", ".mjs", ".cjs",
         ".ts", ".tsx",
         ".go", ".rs",
-        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
+        ".c", ".C", ".cc", ".cpp", ".cxx", ".m", ".mm",
         # Ruby: .rb is the canonical source extension; .rake is used for
         # Rake task files that ship inside lib/ or tasks/ alongside .rb.
         ".rb", ".rake",
     })
     python_extensions: frozenset[str] = frozenset({".py", ".pyi"})
+    dependency_extensions: frozenset[str] = frozenset({
+        ".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tpp",
+    })
     declaration_suffixes: tuple[str, ...] = (".d.ts", ".d.mts", ".d.cts")
     test_dir_names: frozenset[str] = frozenset({"test", "tests", "__tests__", "spec"})
     doc_dir_names: frozenset[str] = frozenset({"doc", "docs", "documentation"})
@@ -70,12 +73,13 @@ class LanguagePolicy:
         ".rb": "ruby",
         ".rake": "ruby",
         ".gemspec": "ruby",
-        ".c": "cpp",
+        ".c": "c",
+        ".C": "cpp",
         ".cc": "cpp",
         ".cpp": "cpp",
         ".cxx": "cpp",
-        ".h": "cpp",
-        ".hpp": "cpp",
+        ".m": "objective-c",
+        ".mm": "objective-cpp",
         ".sh": "shell",
         ".bash": "shell",
         ".ps1": "powershell",
@@ -175,7 +179,7 @@ class LanguagePolicy:
         name = parts[-1] if parts else ""
         if set(parts) & set(self.test_dir_names):
             return True
-        if name.startswith("test_") or name.endswith(("_test.py", "_test.rb", "_spec.rb")):
+        if name.startswith("test_") or name.endswith(("_test.py", "_test.go", "_test.rb", "_spec.rb")):
             return True
         if ".test." in name or ".spec." in name:
             return True
@@ -183,9 +187,20 @@ class LanguagePolicy:
 
     def is_source_path(self, rel_path: str) -> bool:
         return (
-            Path(str(rel_path or "")).suffix.lower() in self.source_extensions
+            self.source_suffix(rel_path) in self.source_extensions
             and not self.is_declaration_path(rel_path)
         )
+
+    def source_suffix(self, rel_path: str) -> str:
+        """Return uppercase ``.C`` distinctly and normalize other suffixes."""
+        suffix = Path(str(rel_path or "")).suffix
+        return suffix if suffix == ".C" else suffix.lower()
+
+    def is_dependency_path(self, rel_path: str) -> bool:
+        return self.source_suffix(rel_path) in self.dependency_extensions
+
+    def is_recognized_path(self, rel_path: str) -> bool:
+        return self.is_source_path(rel_path) or self.is_dependency_path(rel_path)
 
     def is_declaration_path(self, rel_path: str) -> bool:
         rel = str(rel_path or "").replace("\\", "/").strip("/").lower()
@@ -232,7 +247,9 @@ class LanguagePolicy:
     def language_for_path(self, rel_path: str, kind: str = "") -> str:
         if self.is_declaration_path(rel_path):
             return "typescript"
-        suffix = Path(str(rel_path or "")).suffix.lower()
+        suffix = self.source_suffix(rel_path)
+        if suffix in self.dependency_extensions:
+            return "unknown"
         language = self.extension_languages.get(suffix, "")
         if language:
             return language
@@ -315,8 +332,9 @@ class LanguagePolicy:
 
     def strip_source_suffix(self, rel_path: str) -> str:
         rel = str(rel_path or "").replace("\\", "/").strip("/")
-        for suffix in sorted(self.source_extensions, key=len, reverse=True):
-            if rel.lower().endswith(suffix):
+        suffixes = self.source_extensions | self.dependency_extensions
+        for suffix in sorted(suffixes, key=len, reverse=True):
+            if rel.endswith(suffix) or (suffix != ".C" and rel.lower().endswith(suffix)):
                 return rel[: -len(suffix)]
         return rel
 
