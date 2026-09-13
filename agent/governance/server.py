@@ -87287,6 +87287,398 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
         conn.close()
 
 
+def _contract_runtime_mf_parallel_accepted_scope_revision_authority(
+    conn,
+    *,
+    project_id: str,
+    contract_execution_id: str,
+    context: Any,
+    dispatch_worker: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return one server-produced, accepted scope revision for a dispatched lane."""
+
+    from . import batch_jobs
+
+    runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    rows = conn.execute(
+        """
+        SELECT revision_id, task_id, parent_task_id, backlog_id,
+               contract_version, payload_json, route_identity_json,
+               route_gate_json, route_evidence_type, actor, created_at
+        FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ?
+          AND route_evidence_type = 'parallel_branch_allocate_authority_revision'
+        """,
+        (project_id, runtime_context_id),
+    ).fetchall()
+    if len(rows) != 1:
+        return {"reason": "authority_revision_not_unique"}
+    row = rows[0]
+    try:
+        payload = json.loads(str(row["payload_json"] or "{}"))
+        stored_route_identity = json.loads(
+            str(row["route_identity_json"] or "{}")
+        )
+        route_gate = json.loads(str(row["route_gate_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"reason": "authority_revision_json_invalid"}
+    if not all(
+        isinstance(value, Mapping)
+        for value in (payload, stored_route_identity, route_gate)
+    ):
+        return {"reason": "authority_revision_shape_invalid"}
+    revision_authority = (
+        payload.get("authority_revision")
+        if isinstance(payload.get("authority_revision"), Mapping)
+        else {}
+    )
+    effective_files = sorted(_runtime_context_public_file_values(
+        revision_authority.get("active_owned_files") or []
+    ))
+    context_files = sorted(_runtime_context_public_file_values(
+        list(getattr(context, "owned_files", ()) or ())
+    ))
+    revision_files = sorted(_runtime_context_public_file_values(
+        payload.get("owned_files") or payload.get("target_files") or []
+    ))
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    revision_worker_head = str(
+        revision_authority.get("worker_head_commit") or ""
+    ).strip()
+    current_worker_head = str(getattr(context, "head_commit", "") or "").strip()
+    context_worktree_path = str(
+        getattr(context, "worktree_path", "") or ""
+    ).strip()
+    payload_worktree_path = str(payload.get("worktree_path") or "").strip()
+    dispatch_worktree_path = str(
+        dispatch_worker.get("worktree_path") or ""
+    ).strip()
+    revision_old_base = str(
+        revision_authority.get("old_base_commit") or ""
+    ).strip()
+    revision_new_base = str(
+        revision_authority.get("new_base_commit") or ""
+    ).strip()
+    revision_old_target = str(
+        revision_authority.get("old_target_head_commit") or ""
+    ).strip()
+    revision_new_target = str(
+        revision_authority.get("new_target_head_commit") or ""
+    ).strip()
+    revision_target_moved = revision_authority.get("target_head_moved")
+    revision_validation = (
+        revision_authority.get("validation")
+        if isinstance(revision_authority.get("validation"), Mapping)
+        else {}
+    )
+    revision_worker_files = sorted(_runtime_context_public_file_values(
+        revision_authority.get("worker_authored_files") or []
+    ))
+    revision_inherited_files = sorted(_runtime_context_public_file_values(
+        revision_authority.get("inherited_target_head_files") or []
+    ))
+    persisted_revision_commits = (
+        revision_old_base,
+        revision_new_base,
+        revision_old_target,
+        revision_new_target,
+        revision_worker_head,
+    )
+    commit_pattern = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+    revision_git_evidence_valid = False
+    try:
+        revision_head_is_ancestor = bool(
+            revision_worker_head
+            and current_worker_head
+            and _git_commit_is_ancestor(
+                Path(context_worktree_path),
+                revision_worker_head,
+                current_worker_head,
+            )
+        )
+        if (
+            context_worktree_path
+            and all(commit_pattern.fullmatch(value) for value in persisted_revision_commits)
+        ):
+            resolved_commits = tuple(
+                batch_jobs.git_commit(context_worktree_path, ref=value)
+                for value in persisted_revision_commits
+            )
+            derived_inherited_files = sorted(batch_jobs.git_changed_files(
+                context_worktree_path,
+                base_ref=revision_old_base,
+                head_ref=revision_new_base,
+            ))
+            derived_worker_files = sorted(batch_jobs.git_changed_files(
+                context_worktree_path,
+                base_ref=revision_new_base,
+                head_ref=revision_worker_head,
+            ))
+            revision_git_evidence_valid = bool(
+                resolved_commits == persisted_revision_commits
+                and revision_target_moved
+                is (revision_new_target != revision_old_target)
+                and revision_new_base
+                == (
+                    revision_new_target
+                    if revision_target_moved is True
+                    else revision_old_base
+                )
+                and _git_commit_is_ancestor(
+                    Path(context_worktree_path),
+                    revision_old_base,
+                    revision_new_base,
+                )
+                and _git_commit_is_ancestor(
+                    Path(context_worktree_path),
+                    revision_new_base,
+                    revision_worker_head,
+                )
+                and derived_inherited_files == revision_inherited_files
+                and derived_worker_files == revision_worker_files
+                and set(revision_worker_files).issubset(effective_files)
+                and all(
+                    revision_validation.get(field) is True
+                    for field in (
+                        "worktree_clean",
+                        "old_base_ancestor_of_new_base",
+                        "new_base_ancestor_of_worker_head",
+                        "worker_authored_files_inside_active_fence",
+                    )
+                )
+                and revision_authority.get("raw_token_persisted") is False
+            )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        revision_head_is_ancestor = False
+        revision_git_evidence_valid = False
+    identity_checks = {
+        "task": str(row["task_id"] or "").strip() == task_id,
+        "parent": str(row["parent_task_id"] or "").strip()
+        == parent_task_id == str(contract_execution_id or "").strip(),
+        "backlog": str(row["backlog_id"] or "").strip()
+        == str(getattr(context, "backlog_id", "") or "").strip(),
+        "actor": str(row["actor"] or "").strip()
+        == "parallel_branch_allocate",
+        "payload_schema": str(payload.get("schema_version") or "").strip()
+        == "parallel_branch_allocate_contract_revision.v1",
+        "payload_source": str(payload.get("source") or "").strip()
+        == "parallel_branch_allocate",
+        "execution": str(payload.get("contract_execution_id") or "").strip()
+        == str(contract_execution_id or "").strip(),
+        "authority_schema": str(
+            revision_authority.get("schema_version") or ""
+        ).strip() == "runtime_context.scope_target_authority_revision.v1",
+        "authority_source": str(revision_authority.get("source") or "").strip()
+        == "parallel_branch_allocate_explicit_authority_revision",
+        "scope_changed": revision_authority.get("scope_changed") is True,
+        "files": bool(effective_files)
+        and effective_files == revision_files == context_files,
+        "worktree": bool(context_worktree_path)
+        and payload_worktree_path
+        == context_worktree_path
+        == dispatch_worktree_path,
+        "payload_base": str(payload.get("base_commit") or "").strip()
+        == str(getattr(context, "base_commit", "") or "").strip(),
+        "payload_target": str(payload.get("target_head_commit") or "").strip()
+        == str(getattr(context, "target_head_commit", "") or "").strip(),
+        "authority_base": str(
+            revision_authority.get("new_base_commit") or ""
+        ).strip() == str(getattr(context, "base_commit", "") or "").strip(),
+        "authority_target": str(
+            revision_authority.get("new_target_head_commit") or ""
+        ).strip() == str(
+            getattr(context, "target_head_commit", "") or ""
+        ).strip(),
+        "authority_old_base": revision_old_base
+        == str(dispatch_worker.get("base_commit") or "").strip(),
+        "authority_old_target": revision_old_target
+        == str(dispatch_worker.get("target_head_commit") or "").strip(),
+        "authority_git_evidence": revision_git_evidence_valid,
+        "revision_head_ancestor": revision_head_is_ancestor,
+    }
+    if not all(identity_checks.values()):
+        return {
+            "reason": "authority_revision_identity_invalid:"
+            + ",".join(
+                key for key, accepted in identity_checks.items() if not accepted
+            )
+        }
+
+    revision_id = str(row["revision_id"] or "").strip()
+    receipt = (
+        payload.get("revision_receipt")
+        if isinstance(payload.get("revision_receipt"), Mapping)
+        else {}
+    )
+    previous_revision_hash = str(
+        receipt.get("previous_revision_hash") or ""
+    ).strip()
+    if not (
+        revision_id
+        and str(receipt.get("schema_version") or "").strip()
+        == "agent_task_contract_revision_receipt.v1"
+        and str(receipt.get("source_of_truth") or "").strip()
+        == "Contract/Revision/Event"
+        and str(receipt.get("canonical_visible_contract_text_hash") or "").strip()
+        == revision_id
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", previous_revision_hash)
+    ):
+        return {"reason": "authority_revision_receipt_invalid"}
+    from .parallel_branch_runtime import (
+        _canonical_contract_hash,
+        _contract_revision_receipt_material,
+    )
+
+    receipt_payload = dict(payload)
+    receipt_payload.pop("revision_receipt", None)
+    receipt_material = _contract_revision_receipt_material(
+        context=context,
+        runtime_context_id=runtime_context_id,
+        revision_id="",
+        explicit_revision_id=False,
+        contract_version=str(row["contract_version"] or ""),
+        payload=receipt_payload,
+        route_identity=stored_route_identity,
+        previous_revision_hash=previous_revision_hash,
+    )
+    if _canonical_contract_hash(receipt_material) != revision_id:
+        return {"reason": "authority_revision_receipt_hash_invalid"}
+    previous = conn.execute(
+        """
+        SELECT task_id, parent_task_id, backlog_id, route_identity_json
+        FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+        """,
+        (project_id, runtime_context_id, previous_revision_hash),
+    ).fetchone()
+    if previous is None:
+        return {"reason": "authority_revision_predecessor_missing"}
+    try:
+        previous_route = json.loads(str(previous["route_identity_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"reason": "authority_revision_predecessor_json_invalid"}
+    dispatch_route = {
+        field: str(dispatch_worker.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not (
+        str(previous["task_id"] or "").strip() == task_id
+        and str(previous["parent_task_id"] or "").strip() == parent_task_id
+        and str(previous["backlog_id"] or "").strip()
+        == str(getattr(context, "backlog_id", "") or "").strip()
+        and isinstance(previous_route, Mapping)
+        and {
+            field: str(previous_route.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        == dispatch_route
+    ):
+        return {"reason": "authority_revision_predecessor_identity_invalid"}
+
+    revision_route = {
+        field: str(stored_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if (
+        any(not value for value in revision_route.values())
+        or str(route_gate.get("source") or "").strip()
+        != "parallel_branch_allocate"
+        or str(route_gate.get("decision") or "").strip() != "allocated"
+        or str(route_gate.get("caller_role") or "").strip() != "observer"
+        or str(route_gate.get("allowed_action") or "").strip()
+        != "parallel_branch_allocate"
+        or any(
+            str(route_gate.get(field) or "").strip() != value
+            for field, value in revision_route.items()
+        )
+    ):
+        return {"reason": "authority_revision_route_identity_invalid"}
+    original_dispatch_files = sorted(_runtime_context_public_file_values(
+        dispatch_worker.get("owned_files") or []
+    ))
+    candidates: list[dict[str, Any]] = []
+    for event in _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=str(getattr(context, "backlog_id", "") or "").strip(),
+    ):
+        if (
+            str(event.get("event_kind") or "").strip()
+            != "bounded_implementation_worker_dispatch"
+            or str(event.get("status") or "").strip().lower()
+            not in {"accepted", "passed"}
+        ):
+            continue
+        event_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        marker = (
+            event_payload.get("bounded_implementation_worker_dispatch")
+            if isinstance(
+                event_payload.get("bounded_implementation_worker_dispatch"),
+                Mapping,
+            )
+            else {}
+        )
+        marker_route = {
+            field: str(marker.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        marker_files = sorted(_runtime_context_public_file_values(
+            marker.get("owned_files") or []
+        ))
+        fresh_route_revision_dispatch = (
+            marker_route == revision_route
+            and marker_files == effective_files
+        )
+        same_route_original_dispatch = (
+            revision_route == dispatch_route
+            and marker_route == dispatch_route
+            and marker_files == original_dispatch_files
+        )
+        if (
+            str(event.get("actor") or "").strip() == "observer"
+            and event_payload.get("service_generated") is True
+            and str(event_payload.get("source") or "").strip()
+            == "parallel_branch_allocate"
+            and str(marker.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(marker.get("task_id") or "").strip() == task_id
+            and str(marker.get("parent_task_id") or "").strip()
+            == parent_task_id
+            and (
+                fresh_route_revision_dispatch
+                or same_route_original_dispatch
+            )
+        ):
+            candidates.append(dict(event))
+    if len(candidates) != 1:
+        return {"reason": "authority_revision_dispatch_event_invalid"}
+    return {
+        "schema_version": (
+            "contract_runtime.accepted_scope_revision_premerge_authority.v1"
+        ),
+        "status": "accepted",
+        "source": (
+            "parallel_branch_runtime_contract_revisions+"
+            "bounded_implementation_worker_dispatch"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "revision_id": revision_id,
+        "revision_receipt_verified": True,
+        "accepted_dispatch_event_id": candidates[0].get("id"),
+        "original_dispatch_identity_preserved": True,
+        "owned_files": effective_files,
+    }
+
+
 def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
     conn,
     *,
@@ -87405,9 +87797,12 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
         "runtime_context_id", "task_id", "parent_task_id", "worker_id",
         "worker_slot_id", "merge_queue_id",
     )
+    custody_fields = ("target_project_root", "worktree_path", "branch_ref")
     for worker in sorted(workers, key=lambda item: text(item.get("runtime_context_id"))):
         identity = {field: text(worker.get(field)) for field in identity_fields}
-        owned_files = _runtime_context_public_file_values(worker.get("owned_files") or [])
+        owned_files = sorted(_runtime_context_public_file_values(
+            worker.get("owned_files") or []
+        ))
         plan_lane = plan_lanes.get(identity["task_id"], {})
         context = get_branch_context(conn, project_id, identity["task_id"])
         item = get_merge_queue_item_for_branch_context(
@@ -87421,23 +87816,71 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
             }
             if context is not None else {}
         )
-        context_files = _runtime_context_public_file_values(
+        worker_custody = {
+            field: text(worker.get(field))
+            for field in custody_fields
+        }
+        context_custody = (
+            {
+                "target_project_root": text(
+                    _runtime_context_effective_target_project_root(context)
+                ),
+                "worktree_path": text(getattr(context, "worktree_path", "")),
+                "branch_ref": text(getattr(context, "branch_ref", "")),
+            }
+            if context is not None else {}
+        )
+        context_files = sorted(_runtime_context_public_file_values(
             list(context.owned_files or context.target_files or ())
-        ) if context is not None else []
+        )) if context is not None else []
         if not (
             all(identity.values()) and identity["parent_task_id"] == execution_id
             and plan_lane
             and identity["worker_id"] == text(plan_lane.get("worker_id"))
             and identity["worker_slot_id"] == text(plan_lane.get("worker_slot_id"))
-            and owned_files == _runtime_context_public_file_values(
+            and owned_files == sorted(_runtime_context_public_file_values(
                 plan_lane.get("owned_files") or []
+            ))
+            and context_identity == identity
+            and (
+                (
+                    not any(worker_custody.values())
+                    and not any(context_custody.values())
+                )
+                or (
+                    all(worker_custody.values())
+                    and context_custody == worker_custody
+                )
             )
-            and context_identity == identity and context_files == owned_files
             and item is not None and item.backlog_id == backlog_id
             and item.branch_ref == text(worker.get("branch_ref"))
         ):
             errors.append("rev10_runtime_queue_dispatch_identity_mismatch")
             continue
+        scope_revision_authority: dict[str, Any] = {}
+        effective_owned_files = owned_files
+        if context_files != owned_files:
+            scope_revision_authority = (
+                _contract_runtime_mf_parallel_accepted_scope_revision_authority(
+                    conn,
+                    project_id=project_id,
+                    contract_execution_id=execution_id,
+                    context=context,
+                    dispatch_worker=worker,
+                )
+            )
+            effective_owned_files = sorted(_runtime_context_public_file_values(
+                scope_revision_authority.get("owned_files") or []
+            ))
+            if not (
+                scope_revision_authority.get("db_verified") is True
+                and effective_owned_files == context_files
+            ):
+                errors.append(
+                    "rev10_accepted_scope_revision_invalid:"
+                    + text(scope_revision_authority.get("reason"))
+                )
+                continue
 
         instance_id = f"runtime_context:{identity['runtime_context_id']}"
         finish_candidates = [
@@ -87603,7 +88046,8 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
         lane = {
             **identity,
             "queue_item_id": text(item.queue_item_id),
-            "owned_files": owned_files,
+            "owned_files": effective_owned_files,
+            "original_dispatch_owned_files": owned_files,
             "head_commit": finish_head,
             "checkpoint_id": finish_checkpoint,
             "finish_attestation_acceptance": {
@@ -87625,13 +88069,24 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
                 "db_verified": True,
             },
         }
+        if scope_revision_authority:
+            lane["materialized_scope_revision_authority"] = (
+                scope_revision_authority
+            )
         lane_authorities.append(lane)
-        lane_files.append(owned_files)
+        lane_files.append(effective_owned_files)
         if item.queue_item_id == selected.queue_item_id and item.task_id == selected.task_id:
             selected_identity = {
                 field: text(lane.get(field))
                 for field in (*identity_fields, "queue_item_id")
             }
+    effective_lane_errors = _contract_runtime_mf_parallel_atomic_lane_errors(
+        lane_authorities,
+        distinct_fields=(
+            "runtime_context_id", "task_id", "worker_id", "worker_slot_id",
+        ),
+    )
+    errors.extend(effective_lane_errors)
     if errors or len(lane_authorities) != worker_count or not selected_identity:
         return blocked("; ".join(sorted(set(errors))) or "rev10_lane_incomplete")
 
@@ -87647,7 +88102,9 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
     if not (
         not acceptance_errors and current_closure.get("accepted") is True
         and stable_sha256(criteria) == stable_sha256(frozen_criteria)
-        and owned_union == _runtime_context_public_file_values(plan.get("row_owned_files") or [])
+        and owned_union == _runtime_context_public_file_values(
+            current_closure.get("row_declared_files") or []
+        )
     ):
         return blocked("rev10_frozen_backlog_acceptance_scope_not_fully_covered")
 
