@@ -14222,6 +14222,7 @@ def _qa_checkout_root_identity(
     require_query_review_head: bool = True,
     registered_allocator_worktree_paths: Sequence[str] = (),
     exact_snapshot_materialization_provenance: Mapping[str, Any] | None = None,
+    landed_candidate_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from .checkout_provenance import describe_checkout
 
@@ -14246,6 +14247,43 @@ def _qa_checkout_root_identity(
         if isinstance(exact_snapshot_materialization_provenance, Mapping)
         else {}
     )
+    landed_authority = (
+        dict(landed_candidate_authority)
+        if isinstance(landed_candidate_authority, Mapping)
+        else {}
+    )
+    landed_authority_hash = str(
+        landed_authority.get("authority_hash") or ""
+    ).strip().lower()
+    landed_authority_body = {
+        key: value
+        for key, value in landed_authority.items()
+        if key != "authority_hash"
+    }
+    landed_candidate_verified = bool(
+        landed_authority
+        and landed_authority.get("schema_version")
+        == "qa_exact_candidate.landed_snapshot_authority.v1"
+        and landed_authority.get("verified") is True
+        and landed_authority.get("server_derived") is True
+        and landed_authority.get("caller_claims_trusted") is False
+        and str(landed_authority.get("project_id") or "").strip()
+        == project_id
+        and str(landed_authority.get("candidate_commit_sha") or "")
+        .strip()
+        .lower()
+        == candidate_commit_sha
+        and landed_authority.get("candidate_is_ancestor") is True
+        and landed_authority_hash == stable_sha256(landed_authority_body)
+    )
+    if landed_authority and not landed_candidate_verified:
+        _qa_overlay_fail(
+            "landed_candidate_authority_invalid",
+            "landed candidate compatibility requires exact server-derived authority",
+        )
+    landed_canonical_head = str(
+        landed_authority.get("canonical_head_commit_sha") or ""
+    ).strip().lower()
     snapshot_execution_root_verified = False
     if snapshot_provenance:
         snapshot_git = (
@@ -14313,7 +14351,11 @@ def _qa_checkout_root_identity(
         )
         _record_snapshot_mismatch(
             "snapshot_query_root_head",
-            candidate_commit_sha,
+            (
+                landed_canonical_head
+                if landed_candidate_verified
+                else candidate_commit_sha
+            ),
             query_head,
         )
         _record_snapshot_mismatch(
@@ -14385,7 +14427,11 @@ def _qa_checkout_root_identity(
             canonical_head_commit=canonical_head,
         )
     accepted_query_heads = (
-        {candidate_commit_sha}
+        (
+            {landed_canonical_head}
+            if landed_candidate_verified
+            else {candidate_commit_sha}
+        )
         if require_query_candidate_head
         else {base_commit_sha, candidate_commit_sha}
     )
@@ -14472,7 +14518,7 @@ def _qa_checkout_root_identity(
             )
         tree = _qa_git_bytes(
             query_root,
-            ["rev-parse", "--verify", f"{candidate_commit_sha}^{{tree}}"],
+            ["rev-parse", "--verify", f"{query_head}^{{tree}}"],
         )
         query_root_tree_sha = tree.stdout.decode(
             "ascii", errors="ignore"
@@ -14483,6 +14529,22 @@ def _qa_checkout_root_identity(
             _qa_overlay_fail(
                 "exact_candidate_query_root_tree_unavailable",
                 "exact candidate review requires the candidate Git tree identity",
+                query_root=str(query_root),
+                candidate_commit_sha=candidate_commit_sha,
+            )
+        candidate_tree = _qa_git_bytes(
+            query_root,
+            ["rev-parse", "--verify", f"{candidate_commit_sha}^{{tree}}"],
+        )
+        candidate_tree_sha = candidate_tree.stdout.decode(
+            "ascii", errors="ignore"
+        ).strip().lower()
+        if candidate_tree.returncode != 0 or not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_tree_sha
+        ):
+            _qa_overlay_fail(
+                "exact_candidate_tree_unavailable",
+                "exact candidate review requires the immutable candidate tree",
                 query_root=str(query_root),
                 candidate_commit_sha=candidate_commit_sha,
             )
@@ -14541,6 +14603,7 @@ def _qa_checkout_root_identity(
                 "query_root_clean": query_root_clean is True,
                 "query_root_status_hash": query_root_status_hash,
                 "query_root_tree_sha": query_root_tree_sha,
+                "immutable_candidate_tree_sha": candidate_tree_sha,
                 "query_root_untracked_files_checked": True,
                 "query_root_ignored_demo_control_metadata_paths": (
                     ignored_demo_control_metadata_paths
@@ -14550,6 +14613,18 @@ def _qa_checkout_root_identity(
                 ),
             }
         )
+    if landed_candidate_verified:
+        if (
+            landed_authority.get("candidate_tree_sha")
+            != identity.get("immutable_candidate_tree_sha")
+            or landed_authority.get("canonical_head_tree_sha")
+            != identity.get("query_root_tree_sha")
+        ):
+            _qa_overlay_fail(
+                "landed_candidate_tree_identity_mismatch",
+                "landed candidate authority must match current and immutable Git trees",
+            )
+        identity["landed_candidate_authority"] = landed_authority
     return identity
 
 
@@ -15711,6 +15786,7 @@ def _qa_exact_candidate_context(
     comparison_authority_required: bool = False,
     registered_allocator_worktree_paths: Sequence[str] = (),
     exact_snapshot_materialization_provenance: Mapping[str, Any] | None = None,
+    landed_candidate_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from . import graph_query_trace
 
@@ -15735,6 +15811,7 @@ def _qa_exact_candidate_context(
         exact_snapshot_materialization_provenance=(
             exact_snapshot_materialization_provenance
         ),
+        landed_candidate_authority=landed_candidate_authority,
     )
     comparison_base_commit_sha = str(
         comparison_base_commit_sha or ""
@@ -18258,6 +18335,229 @@ def _qa_exact_candidate_post_merge_provenance(
     return verified_provenance, mismatches
 
 
+def _qa_exact_candidate_landed_snapshot_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    snapshot: Mapping[str, Any],
+    canonical_project_root: Path,
+    candidate_commit_sha: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Verify one superseded full snapshot whose candidate is already landed."""
+
+    from .checkout_provenance import describe_checkout
+    from . import graph_snapshot_store
+
+    candidate = str(candidate_commit_sha or "").strip().lower()
+    canonical_root = Path(canonical_project_root).resolve()
+    snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+    mismatches: list[dict[str, Any]] = []
+
+    def mismatch(field: str, expected: Any, actual: Any) -> None:
+        mismatches.append(
+            {"field": field, "expected": expected, "actual": actual}
+        )
+
+    if str(snapshot.get("project_id") or "").strip() != project_id:
+        mismatch(
+            "snapshot_project_id",
+            project_id,
+            str(snapshot.get("project_id") or "").strip(),
+        )
+    if str(snapshot.get("snapshot_kind") or "").strip() != "full":
+        mismatch(
+            "snapshot_kind",
+            "full",
+            str(snapshot.get("snapshot_kind") or "").strip(),
+        )
+    if str(snapshot.get("status") or "").strip().lower() != "superseded":
+        mismatch(
+            "snapshot_status",
+            "superseded",
+            str(snapshot.get("status") or "").strip().lower(),
+        )
+    if str(snapshot.get("commit_sha") or "").strip().lower() != candidate:
+        mismatch(
+            "snapshot_commit_sha",
+            candidate,
+            str(snapshot.get("commit_sha") or "").strip().lower(),
+        )
+    candidate_materializations = [
+        {
+            "snapshot_id": str(row["snapshot_id"] or "").strip(),
+            "status": str(row["status"] or "").strip().lower(),
+        }
+        for row in conn.execute(
+            """
+            SELECT snapshot_id, status FROM graph_snapshots
+            WHERE project_id=? AND commit_sha=? AND snapshot_kind='full'
+            ORDER BY snapshot_id
+            """,
+            (project_id, candidate),
+        ).fetchall()
+    ]
+    if candidate_materializations != [
+        {"snapshot_id": snapshot_id, "status": "superseded"}
+    ]:
+        mismatch(
+            "candidate_snapshot_cardinality",
+            [{"snapshot_id": snapshot_id, "status": "superseded"}],
+            candidate_materializations,
+        )
+
+    materialization = graph_snapshot_store.snapshot_materialization_provenance(
+        dict(snapshot)
+    )
+    materialization_git = (
+        materialization.get("git")
+        if isinstance(materialization.get("git"), Mapping)
+        else {}
+    )
+    materialization_project = (
+        materialization.get("canonical_project_identity")
+        if isinstance(
+            materialization.get("canonical_project_identity"), Mapping
+        )
+        else {}
+    )
+    current = describe_checkout(canonical_root, project_id=project_id)
+    current_git = current.get("git") if isinstance(current.get("git"), Mapping) else {}
+    canonical_head = str(current.get("commit_sha") or "").strip().lower()
+    identity_checks = (
+        (
+            "snapshot_execution_root",
+            str(canonical_root),
+            str(Path(str(materialization.get("execution_root") or "")).resolve())
+            if str(materialization.get("execution_root") or "").strip()
+            else "",
+        ),
+        (
+            "snapshot_execution_root_role",
+            "execution_root",
+            str(materialization.get("execution_root_role") or "").strip(),
+        ),
+        (
+            "snapshot_worktree_root",
+            str(canonical_root),
+            str(Path(str(materialization_git.get("worktree_root") or "")).resolve())
+            if str(materialization_git.get("worktree_root") or "").strip()
+            else "",
+        ),
+        (
+            "snapshot_project_identity_type",
+            "git",
+            str(materialization_project.get("type") or "").strip(),
+        ),
+        (
+            "snapshot_project_id",
+            project_id,
+            str(materialization_project.get("project_id") or "").strip(),
+        ),
+        (
+            "snapshot_candidate_commit",
+            candidate,
+            str(materialization_project.get("commit_sha") or "").strip().lower(),
+        ),
+        (
+            "snapshot_git_common_dir",
+            str(Path(str(current_git.get("git_common_dir") or "")).resolve())
+            if str(current_git.get("git_common_dir") or "").strip()
+            else "",
+            str(Path(str(materialization_git.get("git_common_dir") or "")).resolve())
+            if str(materialization_git.get("git_common_dir") or "").strip()
+            else "",
+        ),
+        (
+            "snapshot_git_remote_url",
+            str(current_git.get("remote_url") or ""),
+            str(materialization_git.get("remote_url") or ""),
+        ),
+    )
+    for field, expected, actual in identity_checks:
+        if expected != actual:
+            mismatch(field, expected, actual)
+
+    status = _qa_git_bytes(
+        canonical_root,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    if status.returncode != 0:
+        mismatch("canonical_status", "available clean status", "unavailable")
+    elif status.stdout:
+        mismatch("canonical_status", "clean", "dirty")
+
+    candidate_tree_result = _qa_git_bytes(
+        canonical_root,
+        ["rev-parse", "--verify", f"{candidate}^{{tree}}"],
+    )
+    candidate_tree = candidate_tree_result.stdout.decode(
+        "ascii", errors="ignore"
+    ).strip().lower()
+    canonical_tree_result = _qa_git_bytes(
+        canonical_root,
+        ["rev-parse", "--verify", f"{canonical_head}^{{tree}}"],
+    )
+    canonical_tree = canonical_tree_result.stdout.decode(
+        "ascii", errors="ignore"
+    ).strip().lower()
+    for field, result, value in (
+        ("candidate_tree_sha", candidate_tree_result, candidate_tree),
+        ("canonical_head_tree_sha", canonical_tree_result, canonical_tree),
+    ):
+        if result.returncode != 0 or not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", value
+        ):
+            mismatch(field, "available full Git tree", value or "unavailable")
+
+    post_merge: dict[str, Any] = {}
+    if not mismatches:
+        post_merge, post_merge_mismatches = (
+            _qa_exact_candidate_post_merge_provenance(
+                conn,
+                project_id=project_id,
+                row={
+                    "trace_id": "",
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+                canonical_project_root=canonical_root,
+                candidate_commit_sha=candidate,
+                canonical_head_commit=canonical_head,
+            )
+        )
+        mismatches.extend(post_merge_mismatches)
+    if mismatches or not post_merge:
+        return {}, mismatches
+
+    authority = {
+        "schema_version": "qa_exact_candidate.landed_snapshot_authority.v1",
+        "verified": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "snapshot_id": snapshot_id,
+        "snapshot_status": "superseded",
+        "candidate_materialization_count": 1,
+        "candidate_commit_sha": candidate,
+        "candidate_tree_sha": candidate_tree,
+        "canonical_head_commit_sha": canonical_head,
+        "canonical_head_tree_sha": canonical_tree,
+        "candidate_is_ancestor": True,
+        "snapshot_materialization_hash": stable_sha256(materialization),
+        "post_merge_provenance": dict(post_merge),
+        "post_merge_provenance_hash": stable_sha256(post_merge),
+        "canonical_status_hash": (
+            "sha256:" + hashlib.sha256(status.stdout).hexdigest()
+        ),
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority, []
+
+
 def _qa_reverify_candidate_trace_context(
     conn,
     *,
@@ -18444,6 +18744,54 @@ def _qa_reverify_candidate_trace_context(
                     }
                 )
                 return review_context, mismatches
+        persisted_landed_authority = (
+            root_identity.get("landed_candidate_authority")
+            if isinstance(
+                root_identity.get("landed_candidate_authority"), Mapping
+            )
+            else {}
+        )
+        fresh_landed_authority: dict[str, Any] = {}
+        if persisted_landed_authority:
+            (
+                fresh_landed_authority,
+                landed_mismatches,
+            ) = _qa_exact_candidate_landed_snapshot_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=str(row["backlog_id"] or "").strip(),
+                task_id=str(row["task_id"] or "").strip(),
+                snapshot=snapshot,
+                canonical_project_root=Path(canonical_root),
+                candidate_commit_sha=review_context["candidate_commit_sha"],
+            )
+            if landed_mismatches:
+                mismatches.extend(
+                    {
+                        "trace_id": trace_id,
+                        **item,
+                    }
+                    for item in landed_mismatches
+                )
+            if not fresh_landed_authority or stable_sha256(
+                dict(persisted_landed_authority)
+            ) != stable_sha256(fresh_landed_authority):
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "landed_candidate_authority",
+                        "expected": stable_sha256(
+                            dict(persisted_landed_authority)
+                        ),
+                        "actual": (
+                            stable_sha256(fresh_landed_authority)
+                            if fresh_landed_authority
+                            else "unavailable"
+                        ),
+                    }
+                )
+            if mismatches:
+                return review_context, mismatches
         try:
             recomputed = _qa_exact_candidate_context(
                 Path(query_root_raw),
@@ -18488,6 +18836,11 @@ def _qa_reverify_candidate_trace_context(
                 exact_snapshot_materialization_provenance=(
                     snapshot_materialization
                     if snapshot_execution_root_authoritative
+                    else None
+                ),
+                landed_candidate_authority=(
+                    fresh_landed_authority
+                    if fresh_landed_authority
                     else None
                 ),
             )
@@ -18592,6 +18945,10 @@ def _qa_reverify_candidate_trace_context(
                     for key, value in post_merge_provenance.items()
                     if key != "trace_id"
                 }
+        if fresh_landed_authority and not mismatches:
+            review_context["post_merge_provenance"] = dict(
+                fresh_landed_authority.get("post_merge_provenance") or {}
+            )
         return review_context, mismatches
 
     if review_context.get("graph_basis") != "canonical_base_plus_candidate_diff":
@@ -19640,10 +19997,42 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                         snapshot
                     )
                 )
+                landed_candidate_authority: dict[str, Any] = {}
                 snapshot_execution_root = str(
                     snapshot_materialization.get("execution_root") or ""
                 ).strip()
-                if snapshot_execution_root:
+                if (
+                    str(snapshot.get("status") or "").strip().lower()
+                    == "superseded"
+                ):
+                    (
+                        landed_candidate_authority,
+                        landed_candidate_mismatches,
+                    ) = _qa_exact_candidate_landed_snapshot_authority(
+                        conn,
+                        project_id=ctx.get_project_id(),
+                        backlog_id=str(proof.get("backlog_id") or ""),
+                        task_id=str(proof.get("task_id") or ""),
+                        snapshot=snapshot,
+                        canonical_project_root=Path(canonical_root),
+                        candidate_commit_sha=str(
+                            review_context.get("candidate_commit_sha") or ""
+                        ),
+                    )
+                    if (
+                        not landed_candidate_authority
+                        or landed_candidate_mismatches
+                    ):
+                        _qa_overlay_fail(
+                            "landed_candidate_snapshot_unverified",
+                            (
+                                "superseded exact-candidate review requires "
+                                "current server-verified landed ancestry"
+                            ),
+                            identity_mismatches=landed_candidate_mismatches,
+                        )
+                    query_root = Path(canonical_root).resolve()
+                elif snapshot_execution_root:
                     query_root = Path(snapshot_execution_root).resolve()
                 escalation = graph_query_trace.latest_qa_graph_basis_escalation(
                     conn,
@@ -19727,6 +20116,11 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                             exact_snapshot_materialization_provenance=(
                                 snapshot_materialization
                                 if snapshot_execution_root
+                                else None
+                            ),
+                            landed_candidate_authority=(
+                                landed_candidate_authority
+                                if landed_candidate_authority
                                 else None
                             ),
                         ),
@@ -94002,6 +94396,21 @@ def handle_graph_governance_query(ctx: RequestContext):
                             exact_snapshot
                         )
                     )
+                    persisted_root_identity = (
+                        qa_proof.get("root_identity")
+                        if isinstance(qa_proof.get("root_identity"), Mapping)
+                        else {}
+                    )
+                    persisted_landed_authority = (
+                        persisted_root_identity.get("landed_candidate_authority")
+                        if isinstance(
+                            persisted_root_identity.get(
+                                "landed_candidate_authority"
+                            ),
+                            Mapping,
+                        )
+                        else None
+                    )
                     recomputed_exact = _qa_exact_candidate_context(
                         Path(root),
                         project_id=project_id,
@@ -94086,6 +94495,9 @@ def handle_graph_governance_query(ctx: RequestContext):
                                 "execution_root"
                             )
                             else None
+                        ),
+                        landed_candidate_authority=(
+                            persisted_landed_authority
                         ),
                     )
                     exact_mismatches = [
@@ -97649,6 +98061,8 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
     candidate_selection = _onboard_direct_qa_graph_snapshot_selection(
         conn,
         project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
         candidate_commit=target_commit,
         target_project_root=target_root_text,
     )
@@ -150863,6 +151277,8 @@ def _onboard_direct_qa_graph_snapshot_selection(
     conn,
     *,
     project_id: str,
+    backlog_id: str,
+    task_id: str,
     candidate_commit: str,
     target_project_root: str,
 ) -> dict[str, Any]:
@@ -150935,14 +151351,36 @@ def _onboard_direct_qa_graph_snapshot_selection(
             (project_id, candidate),
         ).fetchall()
     ]
-    if len(candidate_rows) != 1:
+    if len(candidate_rows) > 1:
         return {
             **blocked,
             "reason": "candidate_snapshot_cardinality",
             "candidate_snapshot_count": len(candidate_rows),
         }
-
-    snapshot = candidate_rows[0]
+    landed_candidate_authority: dict[str, Any] = {}
+    if candidate_rows:
+        snapshot = candidate_rows[0]
+    else:
+        superseded_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM graph_snapshots
+                WHERE project_id = ? AND commit_sha = ?
+                  AND snapshot_kind = 'full' AND status = 'superseded'
+                ORDER BY created_at DESC, snapshot_id DESC
+                """,
+                (project_id, candidate),
+            ).fetchall()
+        ]
+        if len(superseded_rows) != 1:
+            return {
+                **blocked,
+                "reason": "candidate_snapshot_cardinality",
+                "candidate_snapshot_count": 0,
+                "landed_superseded_snapshot_count": len(superseded_rows),
+            }
+        snapshot = superseded_rows[0]
     notes = _json_loads(snapshot.get("notes"), {})
     checkout = (
         notes.get("checkout_provenance")
@@ -150987,17 +151425,46 @@ def _onboard_direct_qa_graph_snapshot_selection(
             "candidate_snapshot_count": 1,
             "identity_mismatch_fields": identity_mismatches,
         }
+    if not candidate_rows:
+        landed_candidate_authority, landed_mismatches = (
+            _qa_exact_candidate_landed_snapshot_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                snapshot=snapshot,
+                canonical_project_root=Path(expected_root),
+                candidate_commit_sha=candidate,
+            )
+        )
+        if not landed_candidate_authority or landed_mismatches:
+            return {
+                **blocked,
+                "reason": "landed_candidate_snapshot_unverified",
+                "candidate_snapshot_count": 0,
+                "landed_superseded_snapshot_count": 1,
+                "identity_mismatches": landed_mismatches,
+            }
     return {
         "status": "selected",
         "accepted": True,
         "snapshot_id": str(snapshot.get("snapshot_id") or ""),
         "resolved_snapshot_id": str(snapshot.get("snapshot_id") or ""),
         "snapshot_commit_sha": candidate,
-        "selection_source": "unique_full_candidate_snapshot",
+        "selection_source": (
+            "verified_landed_superseded_full_snapshot"
+            if landed_candidate_authority
+            else "unique_full_candidate_snapshot"
+        ),
         "project_id": project_id,
         "target_project_root": expected_root,
         "read_only": True,
         "writes_performed": False,
+        **(
+            {"landed_candidate_authority": landed_candidate_authority}
+            if landed_candidate_authority
+            else {}
+        ),
     }
 
 
@@ -151101,6 +151568,8 @@ def _onboard_selected_qa_contract_runtime_guidance(
         graph_selection = _onboard_direct_qa_graph_snapshot_selection(
             conn,
             project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=execution_id,
             candidate_commit=str(body.get("commit_sha") or ""),
             target_project_root=str(binding.get("target_project_root") or ""),
         )

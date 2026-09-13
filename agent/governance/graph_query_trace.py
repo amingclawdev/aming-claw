@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import sqlite3
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1023,10 +1026,93 @@ def _normalize_candidate_review_context(
             raise ValueError(
                 "exact candidate query root tree must be a full git object id"
             )
-        if (
-            str(root_identity.get("query_root_head_commit") or "").strip().lower()
-            != context["candidate_commit_sha"]
-        ):
+        query_root_head = str(
+            root_identity.get("query_root_head_commit") or ""
+        ).strip().lower()
+        landed_authority = (
+            root_identity.get("landed_candidate_authority")
+            if isinstance(
+                root_identity.get("landed_candidate_authority"), Mapping
+            )
+            else {}
+        )
+        if landed_authority:
+            authority_hash = str(
+                landed_authority.get("authority_hash") or ""
+            ).strip().lower()
+            authority_body = {
+                key: value
+                for key, value in landed_authority.items()
+                if key != "authority_hash"
+            }
+            landed_mismatches = []
+
+            def landed_mismatch(field: str, expected: Any, actual: Any) -> None:
+                if actual != expected:
+                    landed_mismatches.append(
+                        {"field": field, "expected": expected, "actual": actual}
+                    )
+
+            landed_mismatch(
+                "schema_version",
+                "qa_exact_candidate.landed_snapshot_authority.v1",
+                str(landed_authority.get("schema_version") or ""),
+            )
+            landed_mismatch("verified", True, landed_authority.get("verified"))
+            landed_mismatch(
+                "server_derived", True, landed_authority.get("server_derived")
+            )
+            landed_mismatch(
+                "caller_claims_trusted",
+                False,
+                landed_authority.get("caller_claims_trusted"),
+            )
+            landed_mismatch(
+                "candidate_is_ancestor",
+                True,
+                landed_authority.get("candidate_is_ancestor"),
+            )
+            landed_mismatch(
+                "candidate_commit_sha",
+                context["candidate_commit_sha"],
+                str(landed_authority.get("candidate_commit_sha") or "")
+                .strip()
+                .lower(),
+            )
+            landed_mismatch(
+                "canonical_head_commit_sha",
+                query_root_head,
+                str(landed_authority.get("canonical_head_commit_sha") or "")
+                .strip()
+                .lower(),
+            )
+            landed_mismatch(
+                "canonical_head_tree_sha",
+                tree_sha,
+                str(landed_authority.get("canonical_head_tree_sha") or "")
+                .strip()
+                .lower(),
+            )
+            landed_mismatch(
+                "candidate_tree_sha",
+                str(root_identity.get("immutable_candidate_tree_sha") or "")
+                .strip()
+                .lower(),
+                str(landed_authority.get("candidate_tree_sha") or "")
+                .strip()
+                .lower(),
+            )
+            landed_mismatch(
+                "authority_hash",
+                stable_sha256(authority_body),
+                authority_hash,
+            )
+            if landed_mismatches:
+                _raise_candidate_review_identity_mismatches(
+                    "landed candidate snapshot authority is invalid",
+                    landed_mismatches,
+                )
+        elif query_root_head != context["candidate_commit_sha"]:
             raise ValueError(
                 "exact candidate query root head must match candidate_commit_sha"
             )
@@ -2548,6 +2634,185 @@ def _query_search_docs(conn: sqlite3.Connection, project_id: str, snapshot_id: s
     return {"query": query, **grep, "count": len(grep.get("matches") or [])}
 
 
+def _immutable_git_path(value: Any) -> str:
+    path = str(value or "").strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    if (
+        not path
+        or "\x00" in path
+        or path.startswith("/")
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise ValueError("immutable candidate source path is invalid")
+    return path
+
+
+def _immutable_git_blob(
+    project_root: str | Path | None,
+    *,
+    commit_sha: str,
+    path: str,
+    max_bytes: int | None = None,
+) -> str | None:
+    root = Path(project_root).resolve() if project_root is not None else None
+    commit = str(commit_sha or "").strip().lower()
+    relative = _immutable_git_path(path)
+    if root is None or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise ValueError("immutable candidate source identity is unavailable")
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{commit}:{relative}"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+            timeout=20,
+            env=env,
+        )
+    except Exception as exc:
+        raise ValueError(f"immutable candidate source read failed: {exc}") from exc
+    if result.returncode != 0:
+        return None
+    if max_bytes is not None and len(result.stdout) > max_bytes:
+        return None
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _query_file_excerpt_at_commit(
+    args: dict[str, Any],
+    project_root: str | Path | None,
+    *,
+    commit_sha: str,
+) -> dict[str, Any]:
+    path = _immutable_git_path(args.get("path") or args.get("rel_path"))
+    source = _immutable_git_blob(
+        project_root,
+        commit_sha=commit_sha,
+        path=path,
+    )
+    if source is None:
+        return {"ok": False, "error": "path_not_found_or_out_of_scope", "path": path}
+    lines = source.splitlines()
+    line_start = args.get("line_start")
+    if line_start is None:
+        line_start = args.get("start_line")
+    line_end = args.get("line_end")
+    if line_end is None:
+        line_end = args.get("end_line")
+    start = max(1, int(line_start or 1))
+    max_lines = max(1, int(args.get("max_lines") or 80))
+    end = (
+        min(len(lines), start + max_lines - 1)
+        if line_end is None
+        else min(len(lines), max(start, int(line_end)), start + max_lines - 1)
+    )
+    numbered = [
+        f"{line_no}: {lines[line_no - 1]}"
+        for line_no in range(start, end + 1)
+    ]
+    max_chars = max(1, int(args.get("max_chars") or 8000))
+    excerpt = "\n".join(numbered)
+    return {
+        "ok": True,
+        "path": path,
+        "line_start": start,
+        "line_end": end,
+        "excerpt": excerpt[:max_chars],
+        "line_count": len(lines),
+        "immutable_source_commit_sha": commit_sha,
+    }
+
+
+def _query_search_docs_at_commit(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    args: dict[str, Any],
+    project_root: str | Path | None,
+    *,
+    commit_sha: str,
+) -> dict[str, Any]:
+    query = str(args.get("query") or args.get("q") or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    if len(query) > reconcile_feedback.MAX_GREP_PATTERN_CHARS:
+        return {"ok": False, "error": "pattern_too_long", "matches": []}
+    limit = max(1, min(int(args.get("limit") or 20), 100))
+    case_sensitive = _bool_arg(args, "case_sensitive")
+    regex = _bool_arg(args, "regex")
+    matcher = None
+    needle = query if case_sensitive else query.lower()
+    if regex:
+        try:
+            matcher = re.compile(query, 0 if case_sensitive else re.IGNORECASE)
+        except re.error as exc:
+            return {
+                "query": query,
+                "ok": False,
+                "error": f"invalid_regex: {exc}",
+                "matches": [],
+                "count": 0,
+            }
+    files = store.list_graph_snapshot_files(
+        conn, project_id, snapshot_id, limit=1000,
+    ).get("files", [])
+    doc_paths = [
+        _immutable_git_path(row.get("path"))
+        for row in files
+        if str(row.get("file_kind") or "") in {"doc", "index_doc"}
+        and str(row.get("path") or "").strip()
+    ]
+    matches: list[dict[str, Any]] = []
+    scanned_paths: list[str] = []
+    for path in doc_paths:
+        if len(matches) >= limit:
+            break
+        source = _immutable_git_blob(
+            project_root,
+            commit_sha=commit_sha,
+            path=path,
+            max_bytes=reconcile_feedback.MAX_GREP_FILE_BYTES,
+        )
+        if source is None:
+            continue
+        scanned_paths.append(path)
+        for line_no, line in enumerate(source.splitlines(), start=1):
+            haystack = line if case_sensitive else line.lower()
+            found = bool(matcher.search(line)) if matcher else needle in haystack
+            if not found:
+                continue
+            matches.append(
+                {
+                    "path": path,
+                    "line_no": line_no,
+                    "line": reconcile_feedback._truncate_text(
+                        line.strip(), 600
+                    ),
+                }
+            )
+            if len(matches) >= limit:
+                break
+    max_chars = max(1, int(args.get("max_chars") or 8000))
+    return {
+        "query": query,
+        "ok": True,
+        "pattern": query,
+        "regex": regex,
+        "case_sensitive": case_sensitive,
+        "scanned_paths": scanned_paths,
+        "matches": matches,
+        "match_count": len(matches),
+        "truncated": len(matches) >= limit,
+        "matches_excerpt": reconcile_feedback._truncate_text(
+            _json(matches), max_chars
+        ),
+        "count": len(matches),
+        "immutable_source_commit_sha": commit_sha,
+    }
+
+
 def _files_for_node(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any], key: str) -> dict[str, Any]:
     node_id = str(args.get("node_id") or args.get("id") or "").strip()
     if not node_id:
@@ -2709,6 +2974,7 @@ def _run_base_tool(
     tool: str,
     args: dict[str, Any] | None = None,
     project_root: str | Path | None = None,
+    immutable_source_commit_sha: str = "",
 ) -> dict[str, Any]:
     ensure_schema(conn)
     tool = str(tool or "").strip().lower()
@@ -2742,6 +3008,15 @@ def _run_base_tool(
     if tool == "search_semantic":
         return _with_graph_contract(tool, _query_search_semantic(conn, project_id, snapshot_id, args))
     if tool == "search_docs":
+        if immutable_source_commit_sha:
+            return _query_search_docs_at_commit(
+                conn,
+                project_id,
+                snapshot_id,
+                args,
+                project_root,
+                commit_sha=immutable_source_commit_sha,
+            )
         return _query_search_docs(conn, project_id, snapshot_id, args, project_root)
     if tool == "get_docs":
         return _files_for_node(conn, project_id, snapshot_id, args, "secondary_files")
@@ -2754,6 +3029,12 @@ def _run_base_tool(
     if tool == "list_low_health_nodes":
         return _query_list_low_health_nodes(conn, project_id, snapshot_id, args)
     if tool == "get_file_excerpt":
+        if immutable_source_commit_sha:
+            return _query_file_excerpt_at_commit(
+                args,
+                project_root,
+                commit_sha=immutable_source_commit_sha,
+            )
         return _query_file_excerpt(args, project_root)
     if tool in {"query_schema", "list_tools"}:
         return _query_schema()
@@ -3024,6 +3305,7 @@ def run_tool(
     project_root: str | Path | None = None,
     candidate_overlay: Mapping[str, Any] | None = None,
     candidate_sources: Mapping[str, Any] | None = None,
+    immutable_source_commit_sha: str = "",
 ) -> dict[str, Any]:
     normalized_tool = str(tool or "").strip().lower()
     normalized_args = dict(args or {})
@@ -3054,6 +3336,7 @@ def run_tool(
                 tool=normalized_tool,
                 args=normalized_args,
                 project_root=project_root,
+                immutable_source_commit_sha=immutable_source_commit_sha,
             )
     else:
         base_result = _run_base_tool(
@@ -3063,6 +3346,7 @@ def run_tool(
             tool=normalized_tool,
             args=normalized_args,
             project_root=project_root,
+            immutable_source_commit_sha=immutable_source_commit_sha,
         )
     if not candidate_overlay:
         return base_result
@@ -3313,6 +3597,23 @@ def traced_query(
     args = normalized_args
     result: dict[str, Any]
     error = ""
+    trace_root_identity = (
+        trace.get("root_identity")
+        if isinstance(trace.get("root_identity"), Mapping)
+        else {}
+    )
+    landed_candidate_authority = (
+        trace_root_identity.get("landed_candidate_authority")
+        if isinstance(
+            trace_root_identity.get("landed_candidate_authority"), Mapping
+        )
+        else {}
+    )
+    immutable_source_commit_sha = (
+        str(trace.get("candidate_commit_sha") or "").strip().lower()
+        if landed_candidate_authority
+        else ""
+    )
     try:
         result = run_tool(
             conn,
@@ -3323,6 +3624,7 @@ def traced_query(
             project_root=project_root,
             candidate_overlay=candidate_overlay,
             candidate_sources=candidate_sources,
+            immutable_source_commit_sha=immutable_source_commit_sha,
         )
         result.setdefault("ok", True)
     except Exception as exc:

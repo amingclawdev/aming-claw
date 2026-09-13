@@ -1957,6 +1957,7 @@ def _strict_direct_main_comparison_world(
     successor: bool = False,
     declared_files: list[str] | None = None,
     actual_files: list[str] | None = None,
+    file_inventory: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a real rev3 Direct Main round through its public facades."""
 
@@ -2084,6 +2085,7 @@ def _strict_direct_main_comparison_world(
         commit_sha=candidate_commit,
         snapshot_kind="full",
         graph_json=_graph(),
+        file_inventory=file_inventory,
         status="candidate",
         created_by="qa-fixture",
         notes=json.dumps(
@@ -2120,6 +2122,58 @@ def _strict_direct_main_comparison_world(
         "candidate_snapshot_id": candidate_snapshot_id,
         "trace_id": trace_id,
     }
+
+
+def _land_strict_direct_qa_candidate(conn, world) -> str:
+    """Advance the canonical root while retaining the exact candidate graph."""
+
+    project_root = world["project_root"]
+    (project_root / "landed-successor.txt").write_text(
+        "canonical successor\n", encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "landed-successor.txt"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "land exact Direct QA candidate"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    canonical_head = batch_jobs.git_commit(project_root)
+    conn.execute(
+        "UPDATE graph_snapshots SET status='superseded' "
+        "WHERE project_id=? AND snapshot_id=?",
+        (PID, world["candidate_snapshot_id"]),
+    )
+    _activate_basic_graph(
+        conn,
+        "full-direct-qa-landed-canonical",
+        project_id=PID,
+        commit_sha=canonical_head,
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO project_version
+          (project_id, chain_version, updated_at, updated_by, git_head,
+           dirty_files, git_synced_at)
+        VALUES (?, ?, ?, 'test', ?, '[]', ?)
+        """,
+        (
+            PID,
+            canonical_head,
+            "2026-09-12T20:00:00Z",
+            canonical_head,
+            "2026-09-12T20:00:00Z",
+        ),
+    )
+    conn.commit()
+    return canonical_head
 
 
 def test_direct_qa_selected_facade_has_exact_identity_and_managed_envelope(
@@ -2308,7 +2362,14 @@ def test_direct_qa_guide_fails_closed_without_one_exact_candidate_graph(
     assert conn.total_changes == changes_before
 
 
-def _direct_qa_facade_http_session(conn, world):
+def _direct_qa_facade_http_session(
+    conn,
+    world,
+    *,
+    activate_candidate=True,
+    graph_tool="",
+    graph_args=None,
+):
     """Real GovernanceHandler/router/HTTP, with QA credentials only in memory."""
     from http.server import HTTPServer
     from urllib.error import HTTPError
@@ -2352,8 +2413,12 @@ def _direct_qa_facade_http_session(conn, world):
     selected = guide["selected_role_guidance"]
     registered = api(selected["managed_qa_session_envelope"]["http_request"])
     qa_token = registered["token"]
-    _activate_basic_graph(conn, "full-direct-qa-facade", project_id=PID, commit_sha=world["candidate_commit"])
+    if activate_candidate:
+        _activate_basic_graph(conn, "full-direct-qa-facade", project_id=PID, commit_sha=world["candidate_commit"])
     graph_request = copy.deepcopy(selected["ordered_steps"][1]["http_request"])
+    if graph_tool:
+        graph_request["body"]["tool"] = graph_tool
+        graph_request["body"]["args"] = dict(graph_args or {})
     queried = api(graph_request, qa_token)
     assert queried["trace_id"]
     request = copy.deepcopy(guide["next_legal_action"]["http_request"])
@@ -2365,7 +2430,266 @@ def _direct_qa_facade_http_session(conn, world):
         return api({**request, "body": body}, token_override or qa_token)
 
     append.qa_session_id = registered["session_id"]
+    append.graph_query_response = queried
     return append, body, guide
+
+
+def test_direct_qa_http_continues_verified_landed_superseded_snapshot(
+    conn, monkeypatch, tmp_path,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="QA-LANDED-ANCESTOR",
+    )
+    canonical_head = _land_strict_direct_qa_candidate(conn, world)
+    snapshots_before = tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id=? "
+            "ORDER BY snapshot_id",
+            (PID,),
+        ).fetchall()
+    )
+    guide_before = conn.total_changes
+    guide, selected, graph_body = _direct_qa_selected_graph_request(conn, world)
+    selection = selected["graph_snapshot_selection"]
+    assert selection["selection_source"] == (
+        "verified_landed_superseded_full_snapshot"
+    )
+    assert selection["snapshot_id"] == world["candidate_snapshot_id"]
+    assert selection["landed_candidate_authority"][
+        "canonical_head_commit_sha"
+    ] == canonical_head
+    assert graph_body["snapshot_id"] == world["candidate_snapshot_id"]
+    assert graph_body["commit_sha"] == world["candidate_commit"]
+    assert conn.total_changes == guide_before
+
+    append, body, _guide = _direct_qa_facade_http_session(
+        conn, world, activate_candidate=False,
+    )
+    queried = append.graph_query_response
+    assert queried["ok"] is True
+    assert queried["graph_query_identity"]["snapshot_id"] == (
+        world["candidate_snapshot_id"]
+    )
+    assert queried["graph_query_identity"]["commit_sha"] == (
+        world["candidate_commit"]
+    )
+    trace = conn.execute(
+        "SELECT * FROM graph_query_traces WHERE project_id=? "
+        "AND backlog_id=? AND task_id=? AND query_source='qa' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (PID, world["backlog_id"], world["task_id"]),
+    ).fetchone()
+    assert trace is not None
+    root_identity = json.loads(trace["root_identity_json"])
+    landed = root_identity["landed_candidate_authority"]
+    assert root_identity["query_root_head_commit"] == canonical_head
+    assert root_identity["immutable_candidate_tree_sha"] == landed[
+        "candidate_tree_sha"
+    ]
+    assert landed["candidate_commit_sha"] == world["candidate_commit"]
+    assert landed["post_merge_provenance"]["verified"] is True
+    accepted = append(copy.deepcopy(body))
+    assert accepted["payload"]["source_backed_contract_gate_authority"][
+        "close_satisfying"
+    ] is True
+    assert conn.execute(
+        "SELECT status FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (PID, world["candidate_snapshot_id"]),
+    ).fetchone()[0] == "superseded"
+    assert store.get_active_graph_snapshot(conn, PID)["commit_sha"] == canonical_head
+    assert tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id=? "
+            "ORDER BY snapshot_id",
+            (PID,),
+        ).fetchall()
+    ) == snapshots_before
+
+
+@pytest.mark.parametrize("source_tool", ("get_file_excerpt", "search_docs"))
+def test_direct_qa_landed_source_reads_immutable_candidate_git_objects(
+    conn, monkeypatch, tmp_path, source_tool,
+):
+    suffix = f"QA-LANDED-SOURCE-{source_tool}"
+    source_path = (
+        "agent/governance/server.py"
+        if source_tool == "get_file_excerpt"
+        else "docs/dev/proposal.md"
+    )
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=suffix,
+        declared_files=[source_path],
+        actual_files=[source_path],
+        file_inventory=[{"path": source_path, "file_kind": "doc"}],
+    )
+    candidate_text = (world["project_root"] / source_path).read_text()
+    (world["project_root"] / source_path).write_text(
+        "ONLY_NEW_CANONICAL_SENTINEL = True\n", encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "--", source_path],
+        cwd=world["project_root"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _land_strict_direct_qa_candidate(conn, world)
+    graph_args = (
+        {"path": source_path, "line_start": 1, "line_end": 1}
+        if source_tool == "get_file_excerpt"
+        else {"query": candidate_text.strip(), "limit": 10}
+    )
+    append, _body, _guide = _direct_qa_facade_http_session(
+        conn,
+        world,
+        activate_candidate=False,
+        graph_tool=source_tool,
+        graph_args=graph_args,
+    )
+    queried = append.graph_query_response
+    assert queried["ok"] is True
+    assert queried["result"]["immutable_source_commit_sha"] == (
+        world["candidate_commit"]
+    )
+    assert "ONLY_NEW_CANONICAL_SENTINEL" not in json.dumps(queried)
+    if source_tool == "get_file_excerpt":
+        assert queried["result"]["excerpt"] == f"1: {candidate_text.strip()}"
+    else:
+        assert queried["result"]["count"] == 1
+        assert queried["result"]["matches"][0]["path"] == source_path
+        assert candidate_text.strip() in queried["result"]["matches"][0]["line"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("duplicate_snapshot", "dirty_root", "wrong_materialization_root"),
+)
+def test_direct_qa_landed_snapshot_selection_rejects_unverified_custody(
+    conn, monkeypatch, tmp_path, mutation,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix=f"QA-LANDED-{mutation}",
+    )
+    _land_strict_direct_qa_candidate(conn, world)
+    if mutation == "duplicate_snapshot":
+        source = conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, world["candidate_snapshot_id"]),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO graph_snapshots
+              (project_id, snapshot_id, commit_sha, parent_snapshot_id,
+               snapshot_kind, ref_name, branch_ref, graph_sha256,
+               inventory_sha256, drift_sha256, status, created_at,
+               created_by, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source["project_id"], f"{source['snapshot_id']}-duplicate",
+                source["commit_sha"], source["parent_snapshot_id"],
+                source["snapshot_kind"], source["ref_name"],
+                source["branch_ref"], source["graph_sha256"],
+                source["inventory_sha256"], source["drift_sha256"],
+                source["status"], "2099-01-01T00:00:00Z",
+                source["created_by"], source["notes"],
+            ),
+        )
+        conn.commit()
+    elif mutation == "dirty_root":
+        (world["project_root"] / "untracked-after-land.txt").write_text(
+            "not canonical\n", encoding="utf-8",
+        )
+    else:
+        row = conn.execute(
+            "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, world["candidate_snapshot_id"]),
+        ).fetchone()
+        notes = json.loads(row["notes"])
+        notes["checkout_provenance"]["execution_root"] = str(
+            tmp_path / "unrelated-root"
+        )
+        conn.execute(
+            "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+            (json.dumps(notes, sort_keys=True), PID, world["candidate_snapshot_id"]),
+        )
+        conn.commit()
+
+    changes_before = conn.total_changes
+    _guide, selected, graph_body = _direct_qa_selected_graph_request(conn, world)
+    assert selected["status"] == "blocked"
+    assert selected["executable"] is False
+    assert selected["blocker"]["id"] == (
+        "qa_direct_candidate_graph_identity_unavailable"
+    )
+    assert graph_body == {}
+    assert conn.total_changes == changes_before
+
+
+@pytest.mark.parametrize("late_mutation", ("newer_head", "duplicate_snapshot"))
+def test_direct_qa_landed_trace_reverification_rejects_newer_head_zero_write(
+    conn, monkeypatch, tmp_path, late_mutation,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="QA-LANDED-LATE-HEAD",
+    )
+    _land_strict_direct_qa_candidate(conn, world)
+    append, body, _guide = _direct_qa_facade_http_session(
+        conn, world, activate_candidate=False,
+    )
+    if late_mutation == "newer_head":
+        project_root = world["project_root"]
+        (project_root / "post-query-head.txt").write_text(
+            "changed after persisted query trace\n", encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "add", "post-query-head.txt"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "advance after QA graph query"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        source = dict(
+            conn.execute(
+                "SELECT * FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+                (PID, world["candidate_snapshot_id"]),
+            ).fetchone()
+        )
+        source["snapshot_id"] = f"{source['snapshot_id']}-late-duplicate"
+        conn.execute(
+            f"INSERT INTO graph_snapshots ({','.join(source)}) "
+            f"VALUES ({','.join('?' for _ in source)})",
+            list(source.values()),
+        )
+        conn.commit()
+    changes_before = conn.total_changes
+    timeline_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE project_id=? AND backlog_id=?",
+        (PID, world["backlog_id"]),
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as exc:
+        append(copy.deepcopy(body))
+    assert exc.value.code == "qa_graph_trace_mismatch"
+    assert conn.total_changes == changes_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE project_id=? AND backlog_id=?",
+        (PID, world["backlog_id"]),
+    ).fetchone()[0] == timeline_before
 
 
 @pytest.mark.parametrize("container", ["payload", "verification", "artifact_refs"])
