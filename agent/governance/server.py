@@ -155965,9 +155965,32 @@ def _operator_supervised_direct_main_facade_action_projection(
         snapshot_placeholder = (
             "<replace with the active current-HEAD full reconcile snapshot id>"
         )
+        closing_commit = str(
+            reconcile_authority.get("target_commit_sha") or ""
+        ).strip().lower()
         snapshot_id = str(
             reconcile_authority.get("active_snapshot_id") or ""
         ).strip()
+        authority_matches_current_head = bool(
+            reconcile_authority.get("server_derived") is True
+            and reconcile_authority.get("caller_claims_trusted") is False
+            and reconcile_authority.get("db_verified") is True
+            and reconcile_authority.get("current_full_reconcile") is True
+            and reconcile_authority.get("canonical_head_verified") is True
+            and reconcile_authority.get("active_snapshot_verified") is True
+            and closing_commit
+            and snapshot_id
+            and closing_commit
+            == str(
+                reconcile_authority.get("canonical_head_commit") or ""
+            ).strip().lower()
+            == str(
+                reconcile_authority.get("active_snapshot_commit") or ""
+            ).strip().lower()
+        )
+        if not authority_matches_current_head:
+            closing_commit = ""
+            snapshot_id = ""
 
         def replace_exact(value: Any) -> Any:
             if isinstance(value, Mapping):
@@ -155976,8 +155999,8 @@ def _operator_supervised_direct_main_facade_action_projection(
                 }
             if isinstance(value, list):
                 return [replace_exact(item) for item in value]
-            if value == close_commit_placeholder and implementation_commit:
-                return implementation_commit
+            if value == close_commit_placeholder and closing_commit:
+                return closing_commit
             if value == snapshot_placeholder and snapshot_id:
                 return snapshot_id
             return value
@@ -155989,8 +156012,18 @@ def _operator_supervised_direct_main_facade_action_projection(
                 **dict(body["payload"]),
             }
         missing = ["verification.test_results.commands"]
-        if not implementation_commit:
-            missing.append("commit_sha")
+        if not closing_commit:
+            missing.extend(
+                [
+                    "commit_sha",
+                    "verification.runtime_sync.commit_sha",
+                    "verification.governance_redeploy.commit_sha",
+                    "verification.live_regression.commit_sha",
+                    "verification.test_results.commit_sha",
+                    "verification.full_reconcile_snapshot.commit_sha",
+                    "payload.close_commit",
+                ]
+            )
         if not snapshot_id:
             missing.extend(
                 [
@@ -156191,6 +156224,24 @@ def _operator_supervised_direct_main_facade_action_projection(
             if implementation_commit
             else {}
         )
+        if not reconcile_authority:
+            return {
+                **base_projection,
+                "facade_tool": "",
+                "action_input": {},
+                "copy_safe_body": {},
+                "action_input_ready": False,
+                "action_input_missing_fields": [
+                    "current_full_reconcile_authority"
+                ],
+                "replace_before_submit": [],
+                "current_full_reconcile_authority": {},
+                "consumes_contract_runtime_lines": [
+                    "observer_close_ready"
+                ],
+                "reconcile_line_materialized_by_close_facade": False,
+                "status": "blocked_current_full_reconcile_authority",
+            }
         return close_ready_projection(
             reconcile_authority,
             consumes_lines=["observer_close_ready"],

@@ -2713,6 +2713,91 @@ def test_direct_landed_qa_reconciles_same_active_head_once_and_replays_zero_writ
     assert conn.total_changes == before_replay_changes
     assert tuple(conn.iterdump()) == before_replay
 
+    def assert_generated_close_body_uses_current_head(
+        action, *, reconcile_line_materialized,
+    ):
+        assert action["mcp_tool"] == "task_timeline_append"
+        assert action["copy_safe_body"]["event_kind"] == "close_ready"
+        body = action["copy_safe_body"]
+        verification = body["verification"]
+        assert body["commit_sha"] == canonical_head
+        assert verification["runtime_sync"]["commit_sha"] == canonical_head
+        assert verification["governance_redeploy"]["commit_sha"] == (
+            canonical_head
+        )
+        assert verification["live_regression"]["commit_sha"] == (
+            canonical_head
+        )
+        assert verification["test_results"]["commit_sha"] == canonical_head
+        assert verification["full_reconcile_snapshot"] == {
+            "snapshot_id": snapshot_id,
+            "commit_sha": canonical_head,
+            "active": True,
+            "snapshot_kind": "full",
+        }
+        assert body["payload"]["close_commit"] == canonical_head
+        assert body["payload"]["full_reconcile_snapshot_id"] == snapshot_id
+        projection = action["facade_action_projection"]
+        assert projection["current_full_reconcile_authority"][
+            "target_commit_sha"
+        ] == canonical_head
+        assert projection["current_full_reconcile_authority"][
+            "implementation_commit_sha"
+        ] == world["candidate_commit"]
+        assert projection["current_full_reconcile_authority"][
+            "qa_snapshot_commit"
+        ] == world["candidate_commit"]
+        assert projection[
+            "reconcile_line_materialized_by_close_facade"
+        ] is reconcile_line_materialized
+        assert action["action_input_ready"] is False
+        assert action["action_input_missing_fields"] == [
+            "verification.test_results.commands"
+        ]
+
+    guide_before_observer_reconcile = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": world["backlog_id"],
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": world["route_token_ref"],
+                "observer_session_id": observer_session_id,
+            },
+        )
+    )
+    action_before_observer_reconcile = guide_before_observer_reconcile[
+        "next_legal_action"
+    ]
+    assert action_before_observer_reconcile["line_id"] == (
+        "observer_reconcile"
+    )
+    assert_generated_close_body_uses_current_head(
+        action_before_observer_reconcile,
+        reconcile_line_materialized=True,
+    )
+    completed_before_observer_reconcile = server._contract_runtime(conn).current_record(
+        world["task_id"], actor_role="observer"
+    )["completed_lines"]
+    immutable_candidate_custody = [
+        copy.deepcopy(line)
+        for line in completed_before_observer_reconcile
+        if line["line_id"] in {
+            "observer_implementation",
+            "qa_graph_context",
+            "qa_independent_verification",
+        }
+    ]
+    implementation_line = next(
+        line
+        for line in immutable_candidate_custody
+        if line["line_id"] == "observer_implementation"
+    )
+    assert implementation_line["commit_sha"] == world["candidate_commit"]
+
     new_run_body = {
         **reconcile_body,
         "run_id": "current-full-direct-landed-forbidden-new-run",
@@ -2772,32 +2857,57 @@ def test_direct_landed_qa_reconciles_same_active_head_once_and_replays_zero_writ
     assert reconcile_authority[
         "landed_ancestor_current_head_verified"
     ] is True
-
-    close_body = {
-        **append_base,
-        "event_type": "observer.close_ready",
-        "event_kind": "close_ready",
-        "phase": "close_ready",
-        "status": "passed",
-        "actor": "observer",
-        "commit_sha": canonical_head,
-        "verification": {
-            "governance_redeploy": {"status": "passed"},
-            "graph_reconciled": True,
-            "preflight_ok": True,
-            "live_regression": {"status": "passed"},
-            "test_results": (
-                _canonical_parentless_direct_main_test_results(
-                    canonical_head
-                )
-            ),
-        },
-        "payload": {
-            **world["route_identity"],
-            "graph_reconciled": True,
-            "close_commit": canonical_head,
-        },
-    }
+    guide_after_observer_reconcile = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": world["backlog_id"],
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": world["route_token_ref"],
+                "observer_session_id": observer_session_id,
+            },
+        )
+    )
+    action_after_observer_reconcile = guide_after_observer_reconcile[
+        "next_legal_action"
+    ]
+    assert action_after_observer_reconcile["line_id"] == (
+        "observer_close_ready"
+    )
+    assert_generated_close_body_uses_current_head(
+        action_after_observer_reconcile,
+        reconcile_line_materialized=False,
+    )
+    assert [
+        line
+        for line in server._contract_runtime(conn).current_record(
+            world["task_id"], actor_role="observer"
+        )["completed_lines"]
+        if line["line_id"] in {
+            "observer_implementation",
+            "qa_graph_context",
+            "qa_independent_verification",
+        }
+    ] == immutable_candidate_custody
+    generated_close_body = copy.deepcopy(
+        action_after_observer_reconcile["copy_safe_body"]
+    )
+    close_body = copy.deepcopy(generated_close_body)
+    close_body["verification"]["test_results"]["commands"] = (
+        _canonical_parentless_direct_main_test_results(canonical_head)[
+            "commands"
+        ]
+    )
+    expected_consumed_body = copy.deepcopy(generated_close_body)
+    expected_consumed_body["verification"]["test_results"]["commands"] = (
+        _canonical_parentless_direct_main_test_results(canonical_head)[
+            "commands"
+        ]
+    )
+    assert close_body == expected_consumed_body
     normalized_kind, normalized_status, normalized_payload = (
         task_timeline.validate_and_normalize_mf_read_receipt_append(
             event_type=close_body["event_type"],
@@ -2910,6 +3020,208 @@ def _direct_landed_same_active_ready(
     assert preflight["passed"] is True, preflight
     assert preflight["landed_ancestor_current_head_verified"] is True
     return world, canonical_head, active, body
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_reconcile",
+        "wrong_snapshot_binding",
+        "stale_reconcile",
+        "foreign_cex_binding",
+        "qa_binding_drift",
+        "head_drift",
+        "graph_drift",
+        "caller_claims",
+    ),
+)
+def test_direct_landed_close_guide_refuses_noncurrent_head_authority(
+    conn, monkeypatch, tmp_path, mutation,
+):
+    world, canonical_head, active, reconcile_body = (
+        _direct_landed_same_active_ready(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=f"LANDED-GUIDE-{mutation.upper()}",
+        )
+    )
+    status, reconciled = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=copy.deepcopy(reconcile_body),
+        )
+    )
+    assert status == 201, reconciled
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": world["backlog_id"],
+                "task_id": world["task_id"],
+                "route_token_ref": world["route_token_ref"],
+                "event_type": "observer.reconcile",
+                "event_kind": "reconcile",
+                "phase": "reconcile",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": canonical_head,
+                "payload": {
+                    **world["route_identity"],
+                    "graph_reconciled": True,
+                    "current_full_reconcile": True,
+                },
+            },
+        )
+    )
+    provenance = dict(
+        conn.execute(
+            "SELECT * FROM graph_current_full_reconcile_provenance "
+            "WHERE project_id=? AND target_commit_sha=? "
+            "ORDER BY reconcile_event_id DESC LIMIT 1",
+            (PID, canonical_head),
+        ).fetchone()
+    )
+    if mutation in {"missing_reconcile", "caller_claims"}:
+        conn.execute(
+            "DELETE FROM graph_current_full_reconcile_provenance "
+            "WHERE project_id=? AND provenance_id=?",
+            (PID, provenance["provenance_id"]),
+        )
+    elif mutation == "wrong_snapshot_binding":
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET snapshot_id=? WHERE project_id=? AND provenance_id=?",
+            (
+                world["candidate_snapshot_id"],
+                PID,
+                provenance["provenance_id"],
+            ),
+        )
+    elif mutation == "stale_reconcile":
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET target_commit_sha=? WHERE project_id=? AND provenance_id=?",
+            (
+                world["candidate_commit"],
+                PID,
+                provenance["provenance_id"],
+            ),
+        )
+    elif mutation == "foreign_cex_binding":
+        conn.execute(
+            "UPDATE task_timeline_events SET task_id=? "
+            "WHERE project_id=? AND id=?",
+            (
+                f"{world['task_id']}-foreign",
+                PID,
+                provenance["reconcile_event_id"],
+            ),
+        )
+    elif mutation == "qa_binding_drift":
+        record = server._contract_runtime(conn).store.get(world["task_id"])
+        qa_line = next(
+            line
+            for line in record["completed_lines"]
+            if line["line_id"] == "qa_independent_verification"
+        )
+        qa_line["payload"]["qa_authority"]["authority_hash"] = _fake_sha(
+            "guide-qa-binding-drift"
+        )
+        server._contract_runtime(conn).store.update(world["task_id"], record)
+    elif mutation == "head_drift":
+        drift_path = world["project_root"] / "head-drift.txt"
+        drift_path.write_text("new HEAD after reconcile\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "head-drift.txt"],
+            cwd=world["project_root"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "advance HEAD after reconcile"],
+            cwd=world["project_root"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        conn.execute(
+            "UPDATE graph_snapshots SET commit_sha=? "
+            "WHERE project_id=? AND snapshot_id=?",
+            (world["candidate_commit"], PID, active["snapshot_id"]),
+        )
+    conn.commit()
+
+    changes_before_guide = conn.total_changes
+    guide_body = {
+        "backlog_id": world["backlog_id"],
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+        "route_token_ref": world["route_token_ref"],
+    }
+    if mutation == "caller_claims":
+        guide_body.update(
+            {
+                "commit_sha": canonical_head,
+                "status": "passed",
+                "verification": {
+                    "graph_reconciled": True,
+                    "preflight_ok": True,
+                    "full_reconcile_snapshot": {
+                        "snapshot_id": active["snapshot_id"],
+                        "commit_sha": canonical_head,
+                    },
+                },
+                "payload": {
+                    "close_commit": canonical_head,
+                    "full_reconcile_snapshot_id": active["snapshot_id"],
+                },
+            }
+        )
+        with pytest.raises(GovernanceError) as rejected_claims:
+            server.handle_project_onboard_route_guide(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=guide_body,
+                )
+            )
+        assert rejected_claims.value.code == (
+            "ac_onboard_runtime_world_ownership_unresolved"
+        )
+        assert rejected_claims.value.details["zero_write_rejection"] is True
+        assert rejected_claims.value.details["writes_performed"] is False
+        assert conn.total_changes == changes_before_guide
+        return
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=guide_body,
+        )
+    )
+    action = guide["next_legal_action"]
+    assert action["line_id"] == "observer_close_ready"
+    assert action["action_input_ready"] is False
+    assert action["mcp_tool"] == ""
+    assert action["copy_safe_body"] == {}
+    assert action["action_input_missing_fields"] == [
+        "current_full_reconcile_authority"
+    ]
+    assert action["facade_action_projection"]["status"] == (
+        "blocked_current_full_reconcile_authority"
+    )
+    assert action["facade_action_projection"][
+        "current_full_reconcile_authority"
+    ] == {}
+    assert conn.total_changes == changes_before_guide
 
 
 @pytest.mark.parametrize("mutation", ("wrong_cas", "pending", "companion"))
@@ -109451,9 +109763,28 @@ def _strict_direct_main_close_ready_completion_world(conn, monkeypatch, tmp_path
     action = guide["next_legal_action"]
     assert action["mcp_tool"] == "task_timeline_append"
     assert action["line_id"] == "observer_reconcile"
-    body = copy.deepcopy(action["copy_safe_body"])
-    body["verification"]["test_results"] = (
-        _canonical_parentless_direct_main_test_results(world["candidate_commit"])
+    generated_body = action["copy_safe_body"]
+    generated_verification = generated_body["verification"]
+    assert {
+        generated_body["commit_sha"],
+        generated_verification["runtime_sync"]["commit_sha"],
+        generated_verification["governance_redeploy"]["commit_sha"],
+        generated_verification["live_regression"]["commit_sha"],
+        generated_verification["test_results"]["commit_sha"],
+        generated_verification["full_reconcile_snapshot"]["commit_sha"],
+        generated_body["payload"]["close_commit"],
+    } == {world["candidate_commit"]}
+    assert generated_verification["full_reconcile_snapshot"][
+        "snapshot_id"
+    ] == snapshot_id
+    assert generated_body["payload"][
+        "full_reconcile_snapshot_id"
+    ] == snapshot_id
+    body = copy.deepcopy(generated_body)
+    body["verification"]["test_results"]["commands"] = (
+        _canonical_parentless_direct_main_test_results(
+            world["candidate_commit"]
+        )["commands"]
     )
     body["payload"].update({"no_pass_claim": True, "overall_release_pass": False})
     runtime = server._contract_runtime(conn)
