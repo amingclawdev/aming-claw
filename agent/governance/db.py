@@ -1929,6 +1929,50 @@ def _graph_query_trace_schema_inventory() -> list[tuple[str, str, str, str]]:
 _GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING = frozenset(
     {"idx_pending_scope_branch", "idx_pending_scope_status"}
 )
+_GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_MISSING = frozenset({
+    "graph_c_family_compilation_actions",
+    "idx_graph_c_family_actions_file",
+    "graph_c_family_symbols",
+    "idx_graph_c_family_symbols_name",
+    "graph_c_family_occurrences",
+    "idx_graph_c_family_occurrences_symbol",
+    "graph_c_family_relations",
+    "idx_graph_c_family_relations_endpoint",
+    "graph_c_family_diagnostics",
+    "idx_graph_c_family_diagnostics_action",
+})
+_GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_TABLES = frozenset({
+    "graph_c_family_compilation_actions",
+    "graph_c_family_symbols",
+    "graph_c_family_occurrences",
+    "graph_c_family_relations",
+    "graph_c_family_diagnostics",
+})
+_GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_IMPLICIT = frozenset({
+    "sqlite_autoindex_graph_c_family_compilation_actions_1",
+    "sqlite_autoindex_graph_c_family_symbols_1",
+    "sqlite_autoindex_graph_c_family_occurrences_1",
+    "sqlite_autoindex_graph_c_family_relations_1",
+    "sqlite_autoindex_graph_c_family_diagnostics_1",
+})
+_GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_STATE = (
+    "c_family_companion_predecessor"
+)
+
+
+def _graph_materialization_startup_compatible(
+    owner_states: Mapping[str, object],
+) -> bool:
+    """Recognize exact owners plus the one startup-only C-family predecessor."""
+
+    return bool(owner_states) and all(
+        state == "exact"
+        or (
+            owner == "graph_snapshot_store"
+            and state == _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_STATE
+        )
+        for owner, state in owner_states.items()
+    )
 
 
 def classify_graph_materialization_preimage(
@@ -1937,8 +1981,9 @@ def classify_graph_materialization_preimage(
     """Classify graph schema ownership without DDL or data writes.
 
     Each source owner may be wholly absent or SQL-exact.  The snapshot owner
-    additionally admits one bounded predecessor that differs only by the two
-    source-defined pending-scope indexes.  No prefix-wide allowlist is used.
+    additionally admits two separately named bounded predecessors: the older
+    pending-scope index predecessor and the current schema immediately before
+    the C-family companion tables.  No prefix-wide allowlist is used.
     """
 
     actual = _graph_materialization_inventory(conn)
@@ -1970,14 +2015,45 @@ def classify_graph_materialization_preimage(
             continue
         if owner == "graph_snapshot_store":
             missing = [row for row in canonical if row not in managed]
+            missing_names = {row[1] for row in missing}
+            predecessor_state = ""
+            predecessor_plan = missing
             if (
-                {row[1] for row in missing}
-                == _GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING
+                missing_names == _GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING
                 and all(row[0] == "index" for row in missing)
+            ):
+                predecessor_state = "pending_scope_index_predecessor"
+            elif (
+                missing_names
+                == (
+                    _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_MISSING
+                    | _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_IMPLICIT
+                )
+                and all(
+                    row[3] == ""
+                    for row in missing
+                    if row[1]
+                    in _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_IMPLICIT
+                )
+            ):
+                predecessor_state = (
+                    _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_STATE
+                )
+                predecessor_plan = sorted(
+                    (
+                        row
+                        for row in missing
+                        if row[1]
+                        in _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_MISSING
+                    ),
+                    key=lambda row: (row[0] != "table", row[1]),
+                )
+            if (
+                predecessor_state
                 and managed == [row for row in canonical if row not in missing]
             ):
-                owner_states[owner] = "pending_scope_index_predecessor"
-                planned.extend(missing)
+                owner_states[owner] = predecessor_state
+                planned.extend(predecessor_plan)
                 continue
         raise ValueError(
             f"AC dev graph materialization owner preimage is not absent or exact: {owner}"
@@ -4730,7 +4806,24 @@ def authority_projection_schema_inventory() -> dict[str, object]:
     with closing(_migration_capable_source_schema_memory()) as memory:
         for statement in _authority_projection_schema_statements():
             memory.execute(statement)
-        return backlog_read_schema_inventory(memory)
+        # The C-family companion schema is a graph-owner overlay.  It is not a
+        # new generation/authority baseline: retaining it here would silently
+        # change the fixed completed-generation receipt from 308 to 323 catalog
+        # objects merely because migration v34 imports the current graph SQL.
+        inventory = tuple(
+            row for row in _sqlite_master_inventory(memory)
+            if row[1] not in (
+                _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_MISSING
+                | _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_IMPLICIT
+            )
+        )
+        encoded = json.dumps(
+            inventory, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")
+        return {
+            "inventory": [list(item) for item in inventory],
+            "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+        }
 
 
 def authority_projection_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
@@ -4938,7 +5031,7 @@ def backlog_read_schema_protected_inventory(conn: sqlite3.Connection) -> dict[st
 def _completed_generation_schema_projections(
     conn: sqlite3.Connection,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Project exact structural and semantic overlays out of generation bindings."""
+    """Project accepted structural and semantic overlays out of generation bindings."""
 
     authority = _authority_projection_inventory_in_managed_world(conn)
     protected = backlog_read_schema_protected_inventory(conn)
@@ -4962,17 +5055,22 @@ def _completed_generation_schema_projections(
     graph_exact = all(
         owner_states[owner] == "exact" for owner in required_owners
     )
+    graph_startup_compatible = _graph_materialization_startup_compatible(
+        owner_states
+    )
     semantic_exact = semantic["owner_state"] == "exact"
     trace_exact = trace["owner_state"] == "exact"
-    if semantic_exact and not graph_exact:
+    if semantic_exact and not graph_startup_compatible:
         raise ValueError(
-            "AC dev completed generation semantic schema requires exact graph owners"
+            "AC dev completed generation semantic schema requires exact graph owners "
+            "or the named startup-compatible predecessor"
         )
-    if trace_exact and not (graph_exact and semantic_exact):
+    if trace_exact and not (graph_startup_compatible and semantic_exact):
         raise ValueError(
-            "AC dev completed generation trace schema requires exact graph and semantic owners"
+            "AC dev completed generation trace schema requires exact graph and semantic owners "
+            "or the named graph startup-compatible predecessor"
         )
-    if not graph_exact:
+    if not graph_startup_compatible:
         return authority, protected
 
     overlay_rows: set[tuple[str, str, str, str]] = set()
@@ -4981,6 +5079,15 @@ def _completed_generation_schema_projections(
             (kind, name, table, _backlog_read_normalized_sql(sql))
             for _owner, _ensure_schema, inventory in registry
             for kind, name, table, sql in inventory
+        )
+    else:
+        actual = _graph_materialization_inventory(conn)
+        overlay_rows.update(
+            (kind, name, table, _backlog_read_normalized_sql(sql))
+            for _owner, _ensure_schema, inventory in registry
+            for kind, name, table, sql in _graph_materialization_managed_inventory(
+                actual, inventory,
+            )
         )
     if semantic_exact:
         overlay_rows.update(
@@ -5183,15 +5290,21 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         owner_state_values
         and all(state == "exact" for state in owner_state_values)
     )
-    if semantic_exact and not graph_overlay_exact:
+    graph_startup_compatible = (
+        isinstance(graph_owner_states, dict)
+        and _graph_materialization_startup_compatible(graph_owner_states)
+    )
+    if semantic_exact and not graph_startup_compatible:
         raise ValueError(
             "AC dev source schema inventory mismatch: "
-            "semantic state requires all graph owners SQL-exact"
+            "semantic state requires all graph owners SQL-exact or the named "
+            "startup-compatible predecessor"
         )
-    if trace_exact and not (graph_overlay_exact and semantic_exact):
+    if trace_exact and not (graph_startup_compatible and semantic_exact):
         raise ValueError(
             "AC dev source schema inventory mismatch: "
-            "graph-query trace requires graph and semantic owners SQL-exact"
+            "graph-query trace requires graph and semantic owners SQL-exact or "
+            "the named graph startup-compatible predecessor"
         )
     graph_known_names = {
         row[1]
@@ -5214,22 +5327,30 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             if row[1] in graph_known_names or row[2] in graph_known_tables
         ]
     graph_baseline_exact = actual_graph_inventory == baseline_graph_inventory
-    if not (graph_overlay_exact or graph_baseline_exact):
+    if not (
+        graph_overlay_exact
+        or graph_baseline_exact
+        or graph_startup_compatible
+    ):
         raise ValueError(
             "AC dev source schema inventory mismatch: "
             "graph owners must equal baseline or all be SQL-exact"
         )
-    graph_exact_inventory = {
-        row
-        for _owner, _ensure_schema, canonical in graph_registry
-        for row in canonical
+    graph_accepted_inventory = (
+        {
+            row
+            for _owner, _ensure_schema, canonical in graph_registry
+            for row in canonical
+        }
         if graph_overlay_exact
+        else set(actual_graph_inventory) if graph_startup_compatible else set()
+    )
+    graph_accepted_objects = {
+        (kind, name, table)
+        for kind, name, table, _sql in graph_accepted_inventory
     }
-    graph_exact_objects = {
-        (kind, name, table) for kind, name, table, _sql in graph_exact_inventory
-    }
-    graph_exact_tables = {
-        name for kind, name, _table, _sql in graph_exact_inventory
+    graph_accepted_tables = {
+        name for kind, name, _table, _sql in graph_accepted_inventory
         if kind == "table"
     }
     semantic_exact_objects = {
@@ -5267,12 +5388,21 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             managed_exact = False
     unknown = sorted(
         (actual - allowed)
-        - graph_exact_tables
+        - graph_accepted_tables
         - semantic_exact_tables
         - trace_exact_tables
         - ({managed_table} if managed_exact else set())
     )
-    missing = sorted(required - actual)
+    startup_compatible_missing_tables = (
+        _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_TABLES
+        if (
+            isinstance(graph_owner_states, dict)
+            and graph_owner_states.get("graph_snapshot_store")
+            == _GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_STATE
+        )
+        else frozenset()
+    )
+    missing = sorted(required - actual - startup_compatible_missing_tables)
     optional = allowed - required
     unknown_objects = sorted(
         item
@@ -5280,7 +5410,7 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
             actual_objects
             - source_objects
             - accepted_overlay
-            - graph_exact_objects
+            - graph_accepted_objects
             - semantic_exact_objects
             - trace_exact_objects
         )

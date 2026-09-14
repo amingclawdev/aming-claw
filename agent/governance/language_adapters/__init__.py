@@ -6,6 +6,7 @@ and downstream consumers.
 from __future__ import annotations
 
 from .base import LanguageAdapter
+from .c_family_adapter import CFamilyAdapter
 from .filetree_adapter import FileTreeAdapter
 from .javascript_typescript_adapter import JavaScriptTypescriptAdapter
 from .python_adapter import PythonAdapter
@@ -14,6 +15,7 @@ from .registry import LanguageCapability, adapter_for_path, adapter_for_paths, c
 
 __all__ = [
     "LanguageAdapter",
+    "CFamilyAdapter",
     "PythonAdapter",
     "JavaScriptTypescriptAdapter",
     "RubyAdapter",

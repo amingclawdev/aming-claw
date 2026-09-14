@@ -7,6 +7,7 @@ from typing import Iterable, Mapping
 from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 
 from .filetree_adapter import FileTreeAdapter
+from .c_family_adapter import CFamilyAdapter
 from .javascript_typescript_adapter import JavaScriptTypescriptAdapter
 from .python_adapter import PythonAdapter
 from .ruby_adapter import RubyAdapter
@@ -49,15 +50,38 @@ class LanguageCapability:
         }
 
 
-def adapter_for_path(file_path: str):
+def adapter_for_path(
+    file_path: str,
+    *,
+    compilation_context: Mapping[str, object] | None = None,
+):
     for adapter in _SEMANTIC_ADAPTERS:
+        if adapter.supports(file_path):
+            return adapter
+    context = compilation_context or {}
+    language = str(context.get("language") or DEFAULT_LANGUAGE_POLICY.language_for_path(file_path))
+    helper_path = str(context.get("helper_path") or "")
+    if (
+        language in _C_FAMILY_LANGUAGES
+        and context.get("compilation_action_id")
+        and helper_path
+    ):
+        adapter = CFamilyAdapter(context, helper_path=helper_path, clang_path=str(context.get("clang_path") or ""))
         if adapter.supports(file_path):
             return adapter
     return _FILETREE_ADAPTER
 
 
-def adapter_for_paths(file_paths: Iterable[str]):
-    adapters = [adapter_for_path(path) for path in file_paths if path]
+def adapter_for_paths(
+    file_paths: Iterable[str],
+    *,
+    compilation_contexts: Mapping[str, Mapping[str, object]] | None = None,
+):
+    contexts = compilation_contexts or {}
+    adapters = [
+        adapter_for_path(path, compilation_context=contexts.get(path))
+        for path in file_paths if path
+    ]
     if adapters and all(type(item) is type(adapters[0]) for item in adapters):
         return adapters[0]
     return _FILETREE_ADAPTER
@@ -76,13 +100,17 @@ def capability_for_path(
     if DEFAULT_LANGUAGE_POLICY.is_dependency_path(file_path):
         language = configured_language if configured_language in _C_FAMILY_LANGUAGES else "unknown"
 
-    adapter = adapter_for_path(file_path)
+    adapter = adapter_for_path(file_path, compilation_context=context)
     adapter_name = adapter.language() or "filetree"
-    parser_available = adapter_name in {"python", "javascript_typescript", "ruby"}
+    parser_available = adapter_name in {"python", "javascript_typescript", "ruby", "c", "cpp", "objective-c", "objective-cpp"}
     configuration_selected = parser_available or bool(
         context.get("compilation_profile") or configured_language
     )
-    semantic_available = parser_available
+    semantic_available = parser_available and adapter_name not in _C_FAMILY_LANGUAGES or (
+        adapter_name in _C_FAMILY_LANGUAGES
+        and bool(context.get("helper_path"))
+        and bool(context.get("compilation_action_id"))
+    )
     if not recognized:
         status = "unrecognized"
     elif semantic_available:

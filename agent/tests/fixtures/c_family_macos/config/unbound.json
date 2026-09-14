@@ -1,0 +1,14 @@
+{
+  "governance_hints": {
+    "schema_version": "governance_hints.v1",
+    "asset_binding_events": [
+      {
+        "schema_version": "asset_binding_event.v1",
+        "operation": "bind",
+        "path": ".",
+        "role": "config",
+        "target_module": "missing.fixture.target"
+      }
+    ]
+  }
+}

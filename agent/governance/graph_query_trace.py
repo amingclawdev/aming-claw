@@ -205,6 +205,17 @@ GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
         "summary": "Rank functions by caller/callee counts.",
         "args": {"metric": {"enum": ["fan_in", "fan_out", "total"], "default": "total"}},
     },
+    "c_family_occurrences": {
+        "required_args": [],
+        "summary": "Read exact snapshot-bound C-family declaration and definition occurrences.",
+        "optional_args": ["symbol_id", "limit"],
+    },
+    "c_family_relations": {
+        "required_args": [],
+        "summary": "Read exact snapshot-bound C-family calls, references, includes, and type relations.",
+        "optional_args": ["symbol_id", "relation_type", "direction", "limit"],
+        "args": {"direction": {"enum": ["in", "out"], "default": "out"}},
+    },
     "search_semantic": {
         "required_args": ["query"],
         "summary": "Search node semantics, node metadata, and current edge semantic projection.",
@@ -3005,6 +3016,28 @@ def _run_base_tool(
         return _query_function_calls(conn, project_id, snapshot_id, args, direction="callers")
     if tool == "high_function_degree":
         return _query_high_function_degree(conn, project_id, snapshot_id, args)
+    if tool in {"c_family_occurrences", "c_family_relations"}:
+        direction = str(args.get("direction") or "out").strip().lower()
+        if direction not in {"in", "out"}:
+            raise ValueError("direction must be in or out")
+        table = "occurrences" if tool == "c_family_occurrences" else "relations"
+        rows = store.query_c_family_analysis(
+            conn,
+            project_id,
+            snapshot_id,
+            table=table,
+            symbol_id=str(args.get("symbol_id") or ""),
+            relation_type=str(args.get("relation_type") or ""),
+            direction=direction,
+            limit=int(args.get("limit") or 100),
+        )
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "direction": direction,
+            table: rows,
+            "count": len(rows),
+        }
     if tool == "search_semantic":
         return _with_graph_contract(tool, _query_search_semantic(conn, project_id, snapshot_id, args))
     if tool == "search_docs":

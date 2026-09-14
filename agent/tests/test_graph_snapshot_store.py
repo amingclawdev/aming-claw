@@ -66,6 +66,75 @@ def _file_connection(path) -> sqlite3.Connection:
     return connection
 
 
+def test_c_family_snapshot_companion_indexes_only_successful_action_facts(conn):
+    analysis = {
+        "schema_version": "graph.c_family_analysis.v1",
+        "status": "partial",
+        "actions": [
+            {"compilation_action_id": "a-ok", "translation_unit_id": "tu-ok", "profile_id": "p", "file": "src/a.cc", "language": "cpp"},
+            {"compilation_action_id": "a-ok-2", "translation_unit_id": "tu-ok-2", "profile_id": "p2", "file": "src/a.cc", "language": "cpp"},
+            {"compilation_action_id": "a-failed", "translation_unit_id": "tu-failed", "profile_id": "p", "file": "src/b.mm", "language": "objective-cpp"},
+        ],
+        "results": [
+            {"status": "ok", "action": {"compilation_action_id": "a-ok"}},
+            {"status": "ok", "action": {"compilation_action_id": "a-ok-2"}},
+            {"status": "failed", "action": {"compilation_action_id": "a-failed"}},
+        ],
+        "macro_analysis": [{"compilation_action_id": "a-ok", "state": "collected"}],
+        "symbols": [
+            {"symbol_id": "s1", "compilation_action_id": "a-ok", "profile_id": "p", "name": "f", "qualified_name": "n::f", "kind": "FunctionDecl", "signature": "int ()", "file": "src/a.cc", "lineno": 2, "is_definition": True},
+            {"symbol_id": "s1", "compilation_action_id": "a-ok-2", "profile_id": "p2", "name": "f", "qualified_name": "n::f", "kind": "FunctionDecl", "signature": "int ()", "file": "src/a.cc", "lineno": 2, "is_definition": True},
+        ],
+        "occurrences": [
+            {"occurrence_id": "o1", "symbol_id": "s1", "compilation_action_id": "a-ok", "role": "definition", "file": "src/a.cc", "line": 2, "column": 1},
+            {"occurrence_id": "o2", "symbol_id": "s1", "compilation_action_id": "a-ok-2", "role": "definition", "file": "src/a.cc", "line": 2, "column": 1},
+        ],
+        "relations": [{"relation_id": "r1", "compilation_action_id": "a-ok", "relation_type": "calls", "source_symbol_id": "s1", "target_symbol_id": "s2", "source_file": "src/a.cc", "target_file": "", "direction": "out", "resolution": "external", "condition_ref": ""}],
+        "diagnostics": [{"compilation_action_id": "a-failed", "analysis_status": "failed", "severity": "error", "file": "src/b.mm", "line": 1, "message": "SDK unavailable"}],
+    }
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id="c-family-snapshot", commit_sha="abc", snapshot_kind="full", c_family_analysis=analysis
+    )
+    counts = store.index_c_family_analysis(conn, PID, snapshot["snapshot_id"], analysis)
+    conn.commit()
+    persisted = store.get_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    assert store.validate_snapshot_companion_integrity(persisted)["valid"] is True
+    assert counts == {"actions": 3, "symbols": 2, "occurrences": 2, "relations": 1, "diagnostics": 1}
+    assert store.query_c_family_analysis(conn, PID, snapshot["snapshot_id"], table="occurrences", symbol_id="s1") == analysis["occurrences"]
+    assert store.query_c_family_analysis(conn, PID, snapshot["snapshot_id"], table="relations", symbol_id="s2", direction="in") == [analysis["relations"][0]]
+    assert conn.execute("SELECT status FROM graph_c_family_compilation_actions WHERE compilation_action_id='a-failed'").fetchone()[0] == "failed"
+    assert conn.execute("SELECT COUNT(*) FROM graph_c_family_symbols WHERE compilation_action_id='a-failed'").fetchone()[0] == 0
+
+
+def test_c_family_snapshot_queries_keep_same_named_internal_symbols_distinct(conn):
+    actions = [
+        {"compilation_action_id": "a", "translation_unit_id": "tu-a", "profile_id": "p", "file": "a.cc", "language": "cpp"},
+        {"compilation_action_id": "b", "translation_unit_id": "tu-b", "profile_id": "p", "file": "b.cc", "language": "cpp"},
+    ]
+    analysis = {
+        "actions": actions,
+        "results": [{"status": "ok", "action": action} for action in actions],
+        "symbols": [
+            {"symbol_id": "helper-a", "compilation_action_id": "a", "profile_id": "p", "name": "helper", "qualified_name": "helper", "kind": "FunctionDecl", "signature": "int ()", "file": "a.cc", "lineno": 1, "is_definition": True},
+            {"symbol_id": "helper-b", "compilation_action_id": "b", "profile_id": "p", "name": "helper", "qualified_name": "helper", "kind": "FunctionDecl", "signature": "int ()", "file": "b.cc", "lineno": 1, "is_definition": True},
+        ],
+        "occurrences": [],
+        "relations": [
+            {"relation_id": "call-a", "compilation_action_id": "a", "relation_type": "calls", "source_symbol_id": "from-a", "target_symbol_id": "helper-a", "source_file": "a.cc", "target_file": "", "direction": "out", "resolution": "resolved", "condition_ref": ""},
+            {"relation_id": "call-b", "compilation_action_id": "b", "relation_type": "calls", "source_symbol_id": "from-b", "target_symbol_id": "helper-b", "source_file": "b.cc", "target_file": "", "direction": "out", "resolution": "resolved", "condition_ref": ""},
+        ],
+        "diagnostics": [],
+    }
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id="internal-symbols", commit_sha="abc", snapshot_kind="full", c_family_analysis=analysis,
+    )
+    store.index_c_family_analysis(conn, PID, snapshot["snapshot_id"], analysis)
+    conn.commit()
+    assert store.query_c_family_analysis(
+        conn, PID, snapshot["snapshot_id"], table="relations", symbol_id="helper-a", direction="in",
+    ) == [analysis["relations"][0]]
+
+
 def test_schema_migration_is_idempotent(conn):
     _ensure_schema(conn)
     _ensure_schema(conn)
@@ -3084,6 +3153,26 @@ def test_reconcile_run_metrics_terminal_history_vm_steps_stay_bounded(
         )
     ]
     assert approximate_vm_steps < 5000
+
+
+def test_reconcile_run_metrics_read_initializes_missing_schema():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        assert store.list_reconcile_run_metrics(connection, PID, limit=1) == []
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert {
+            "reconcile_run_metrics",
+            "graph_reconcile_run_terminalizations",
+            "graph_c_family_compilation_actions",
+        }.issubset(tables)
+    finally:
+        connection.close()
 
 
 def test_reconcile_run_metrics_50k_window_bounds_cardinality_vm_memory_and_cursor(

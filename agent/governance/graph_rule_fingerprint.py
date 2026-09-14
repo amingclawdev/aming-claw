@@ -23,6 +23,9 @@ ALGORITHM_INPUT_PATHS: tuple[str, ...] = (
     "agent/governance/reconcile_phases/phase_z_v2.py",
     "agent/governance/language_policy.py",
     "agent/governance/language_adapters/registry.py",
+    "agent/governance/language_adapters/c_family_adapter.py",
+    "agent/governance/compilation_context.py",
+    "tools/clang-indexer/main.cc",
     "agent/governance/reconcile_file_inventory.py",
     "agent/governance/reconcile_semantic_config.py",
     "agent/governance/graph_hint_projection.py",
@@ -145,6 +148,25 @@ def _governance_binding_hint_component(project_root: Path) -> dict[str, Any]:
     }
 
 
+def _c_family_compilation_component(project_root: Path) -> dict[str, Any]:
+    try:
+        from agent.governance.compilation_context import load_compilation_actions
+
+        actions = [action.as_dict() for action in load_compilation_actions(project_root)]
+    except Exception as exc:
+        return {
+            "fingerprint": _json_hash({"error": type(exc).__name__}),
+            "action_count": 0,
+            "actions": [],
+            "error": type(exc).__name__,
+        }
+    return {
+        "fingerprint": _json_hash(actions),
+        "action_count": len(actions),
+        "actions": actions,
+    }
+
+
 def build_graph_rule_fingerprint(
     project_root: str | Path,
     *,
@@ -158,6 +180,7 @@ def build_graph_rule_fingerprint(
     components = {
         "algorithm": _algorithm_component(),
         "semantic_enrichment_config": _semantic_config_component(root, semantic_config_path),
+        "c_family_compilation": _c_family_compilation_component(root),
     }
     if include_source_hints:
         components["source_hints"] = _hint_component(root, hint_index)
@@ -179,7 +202,7 @@ def build_graph_rule_fingerprint(
         }
     rebuild_components = {
         key: components[key]
-        for key in ("algorithm", "semantic_enrichment_config")
+        for key in ("algorithm", "semantic_enrichment_config", "c_family_compilation")
     }
     return {
         "schema_version": SCHEMA_VERSION,

@@ -844,7 +844,14 @@ def test_graph_native_queries_search_edge_projection_and_neighbor_semantics(conn
     assert edge["edge_semantic"]["semantic"]["semantic_label"] == "server_helper_cache_dependency"
 
 
-def test_query_schema_exposes_tools_and_enums(conn, tmp_path):
+def test_query_schema_exposes_tools_and_enums(conn, tmp_path, monkeypatch):
+    from agent.governance import db
+    monkeypatch.setattr(db, "classify_graph_activation_connection", lambda _conn: {
+        "runtime_plane": "stable",
+        "active_graph_activation_allowed": True,
+        "project_id": PID,
+        "classification_reason": "test_verified_stable_connection",
+    })
     snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
     result = graph_query_trace.traced_query(
         conn,
@@ -879,31 +886,87 @@ def test_query_schema_exposes_tools_and_enums(conn, tmp_path):
     list_features = result["result"]["tools"]["list_features"]
     assert list_features["args"]["compact"]["default"] is True
     assert "include_semantic" in list_features["optional_args"]
-    assert result["result"]["tools"]["get_node"]["optional_args"][:2] == [
-        "compact",
-        "include_semantic",
-    ]
-    assert result["result"]["tools"]["get_neighbors"]["args"]["direction"]["enum"] == [
-        "in",
-        "out",
-        "both",
-    ]
-    assert result["result"]["tools"]["search_semantic"]["args"]["scope"]["enum"] == [
-        "all",
-        "nodes",
-        "edges",
-    ]
+    assert result["result"]["tools"]["get_node"]["optional_args"][:2] == ["compact", "include_semantic"]
+    assert result["result"]["tools"]["get_neighbors"]["args"]["direction"]["enum"] == ["in", "out", "both"]
+    assert result["result"]["tools"]["search_semantic"]["args"]["scope"]["enum"] == ["all", "nodes", "edges"]
     assert "timeout_ms" in result["result"]["tools"]["function_callees"]["optional_args"]
     contract_policy = result["result"]["graph_contract_policy"]
-    assert set(contract_policy["direct_tools"]) >= {
-        "get_node",
-        "get_neighbors",
-        "find_node_by_path",
-        "degree_summary",
-        "high_degree_nodes",
-        "search_semantic",
-    }
+    assert set(contract_policy["direct_tools"]) >= {"get_node", "get_neighbors", "find_node_by_path", "degree_summary", "high_degree_nodes", "search_semantic"}
     assert "query_schema" in contract_policy["caller_envelope_tools"]
+
+
+def test_c_family_query_tools_preserve_exact_snapshot_endpoints_and_direction(conn, tmp_path, monkeypatch):
+    from agent.governance import db
+    monkeypatch.setattr(db, "classify_graph_activation_connection", lambda _conn: {
+        "runtime_plane": "stable", "active_graph_activation_allowed": True,
+        "project_id": PID, "classification_reason": "test_verified_stable_connection",
+    })
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    analysis = {
+        "actions": [{"compilation_action_id": "a1", "translation_unit_id": "tu1", "profile_id": "p1", "file": "overlay.cc", "language": "cpp"}],
+        "results": [{"status": "ok", "action": {"compilation_action_id": "a1"}}],
+        "symbols": [],
+        "occurrences": [{"occurrence_id": "o1", "symbol_id": "source", "compilation_action_id": "a1", "role": "definition", "file": "overlay.cc", "line": 1, "column": 1}],
+        "relations": [{"relation_id": "r1", "compilation_action_id": "a1", "relation_type": "calls", "source_symbol_id": "source", "target_symbol_id": "target", "source_file": "overlay.cc", "target_file": "", "direction": "out", "resolution": "resolved", "condition_ref": "macro-1"}],
+        "diagnostics": [],
+    }
+    store.index_c_family_analysis(conn, PID, snapshot_id, analysis)
+    conn.commit()
+
+    outgoing = graph_query_trace.traced_query(
+        conn, PID, snapshot_id, actor="observer", query_source="observer",
+        query_purpose="prompt_context_build", tool="c_family_relations",
+        args={"symbol_id": "source", "direction": "out", "relation_type": "calls"},
+        project_root=project_root,
+    )
+    incoming = graph_query_trace.traced_query(
+        conn, PID, snapshot_id, actor="observer", query_source="observer",
+        query_purpose="prompt_context_build", tool="c_family_relations",
+        args={"symbol_id": "target", "direction": "in"}, project_root=project_root,
+    )
+    occurrences = graph_query_trace.traced_query(
+        conn, PID, snapshot_id, actor="observer", query_source="observer",
+        query_purpose="prompt_context_build", tool="c_family_occurrences",
+        args={"symbol_id": "source"}, project_root=project_root,
+    )
+    assert outgoing["result"]["relations"] == incoming["result"]["relations"] == analysis["relations"]
+    assert occurrences["result"]["occurrences"] == analysis["occurrences"]
+    assert outgoing["result"]["snapshot_id"] == snapshot_id
+
+
+def test_c_family_query_does_not_join_same_named_translation_unit_local_endpoints(conn, tmp_path, monkeypatch):
+    from agent.governance import db
+    monkeypatch.setattr(db, "classify_graph_activation_connection", lambda _conn: {
+        "runtime_plane": "stable", "active_graph_activation_allowed": True,
+        "project_id": PID, "classification_reason": "test_verified_stable_connection",
+    })
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    analysis = {
+        "actions": [
+            {"compilation_action_id": "a", "translation_unit_id": "tu-a", "profile_id": "p", "file": "a.cc", "language": "cpp"},
+            {"compilation_action_id": "b", "translation_unit_id": "tu-b", "profile_id": "p", "file": "b.cc", "language": "cpp"},
+        ],
+        "results": [
+            {"status": "ok", "action": {"compilation_action_id": "a"}},
+            {"status": "ok", "action": {"compilation_action_id": "b"}},
+        ],
+        "symbols": [],
+        "occurrences": [],
+        "relations": [
+            {"relation_id": "call-a", "compilation_action_id": "a", "relation_type": "calls", "source_symbol_id": "from-a", "target_symbol_id": "helper-a", "source_file": "a.cc", "target_file": "", "direction": "out", "resolution": "resolved", "condition_ref": ""},
+            {"relation_id": "call-b", "compilation_action_id": "b", "relation_type": "calls", "source_symbol_id": "from-b", "target_symbol_id": "helper-b", "source_file": "b.cc", "target_file": "", "direction": "out", "resolution": "resolved", "condition_ref": ""},
+        ],
+        "diagnostics": [],
+    }
+    store.index_c_family_analysis(conn, PID, snapshot_id, analysis)
+    conn.commit()
+    result = graph_query_trace.traced_query(
+        conn, PID, snapshot_id, actor="observer", query_source="observer",
+        query_purpose="prompt_context_build", tool="c_family_relations",
+        args={"symbol_id": "helper-a", "direction": "in", "relation_type": "calls"},
+        project_root=project_root,
+    )
+    assert result["result"]["relations"] == [analysis["relations"][0]]
 
 
 def test_qa_independent_verification_graph_query_is_first_class(conn, tmp_path):

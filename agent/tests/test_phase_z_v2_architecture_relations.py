@@ -1,10 +1,19 @@
 """Architecture typed-relation extraction for Phase Z v2."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
 
+from agent.governance import db
+from agent.governance import graph_events
+from agent.governance import graph_query_trace
+from agent.governance import graph_snapshot_store as snapshot_store
 from agent.governance.reconcile_phases.phase_z_v2 import (
+    _c_family_modules,
     apply_dependency_patches,
     build_candidate_coverage_ledger,
     build_rebase_candidate_graph,
@@ -19,6 +28,264 @@ def _write(path, content):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
+
+
+def test_c_family_full_chain_keeps_compile_identity_and_attaches_non_architecture_assets(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[2]
+    project = tmp_path / "c-family-project"
+    shutil.copytree(root / "agent" / "tests" / "fixtures" / "c_family_macos", project)
+    sdk = Path("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
+    clang = Path("/Library/Developer/CommandLineTools/usr/bin/clang")
+    clangxx = Path("/Library/Developer/CommandLineTools/usr/bin/clang++")
+    template = (project / "compile_commands.json.in").read_text(encoding="utf-8")
+    (project / "compile_commands.json").write_text(
+        template.replace("@FIXTURE_ROOT@", str(project))
+        .replace("@CLANGXX@", str(clangxx))
+        .replace("@SDKROOT@", str(sdk)),
+        encoding="utf-8",
+    )
+    helper = tmp_path / "aming-claw-clang-indexer"
+    subprocess.run(
+        [str(clangxx), "-std=c++17", "-isysroot", str(sdk), str(root / "tools" / "clang-indexer" / "main.cc"), "-o", str(helper)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setenv("AC_CFAMILY_CLANG_INDEXER", str(helper))
+    monkeypatch.setenv("AC_CFAMILY_CLANG", str(clang))
+
+    result = build_graph_v2_from_symbols(str(project), dry_run=True, scratch_dir=str(tmp_path / "scratch"))
+    analysis = result["c_family_analysis"]
+    assert analysis["status"] == "partial"  # the deliberate SDK failure remains structured
+    assert len(analysis["actions"]) == 5
+    assert any(row["analysis_status"] == "failed" for row in analysis["diagnostics"])
+    overlay_node = next(node for node in result["nodes"] if node["primary_file"] == "overlay.cc")
+    assert overlay_node["source_kind"] == "clang_ast"
+    assert overlay_node["node_id"] == "overlay"
+    assert len(overlay_node["c_family_compilation_identities"]) == 1
+    assert all(
+        identity[key]
+        for identity in overlay_node["c_family_compilation_identities"]
+        for key in ("compilation_action_id", "translation_unit_id", "profile_id")
+    )
+    assert len([name for name in overlay_node["functions"] if "::render" in name]) == 2
+    assert "overlay_test.cc" in overlay_node["test_coverage"]["test_files"]
+    assert all(node["primary_file"] not in {"overlay_test.cc", "unbound_test.cc"} for node in result["nodes"])
+    assert any(row["test_file"] == "unbound_test.cc" for row in result["c_family_test_bindings"]["unbound"])
+    assert any(row["relation_type"] == "calls" and row["target_name"] == "selected_feature" for row in analysis["relations"])
+    assert not any(row["relation_type"] == "includes" and row["target_name"] == "inactive_only.h" for row in analysis["relations"])
+
+    monkeypatch.setattr(db, "_governance_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(db, "classify_graph_activation_connection", lambda _conn: {
+        "runtime_plane": "stable",
+        "active_graph_activation_allowed": True,
+        "project_id": "c-family-full-chain",
+        "classification_reason": "test_verified_stable_connection",
+    })
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db._ensure_schema(conn)
+    graph_events.ensure_schema(conn)
+    snapshot_store.ensure_schema(conn)
+    graph_query_trace.ensure_schema(conn)
+    snapshot = snapshot_store.create_graph_snapshot(
+        conn,
+        "c-family-full-chain",
+        snapshot_id="c-family-full-chain",
+        commit_sha="fixture-candidate",
+        snapshot_kind="full",
+        graph_json=result,
+        file_inventory=[],
+        c_family_analysis=analysis,
+    )
+    snapshot_store.index_c_family_analysis(
+        conn, "c-family-full-chain", snapshot["snapshot_id"], analysis,
+    )
+    snapshot_store.activate_graph_snapshot(
+        conn, "c-family-full-chain", snapshot["snapshot_id"],
+    )
+    conn.commit()
+
+    selected_symbols = [row for row in analysis["symbols"] if row["name"] == "selected_feature"]
+    selected_id = selected_symbols[0]["symbol_id"]
+    occurrence_query = graph_query_trace.traced_query(
+        conn,
+        "c-family-full-chain",
+        snapshot["snapshot_id"],
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="c_family_occurrences",
+        args={"symbol_id": selected_id},
+        project_root=project,
+    )
+    assert {row["role"] for row in occurrence_query["result"]["occurrences"]} == {"declaration", "definition"}
+    assert {Path(row["file"]).name for row in occurrence_query["result"]["occurrences"]} == {"overlay.h", "overlay.cc"}
+
+    selected_call = next(
+        row for row in analysis["relations"]
+        if row["relation_type"] == "calls" and row["target_symbol_id"] == selected_id
+    )
+    outgoing = graph_query_trace.traced_query(
+        conn,
+        "c-family-full-chain",
+        snapshot["snapshot_id"],
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="c_family_relations",
+        args={"symbol_id": selected_call["source_symbol_id"], "direction": "out", "relation_type": "calls"},
+        project_root=project,
+    )
+    incoming = graph_query_trace.traced_query(
+        conn,
+        "c-family-full-chain",
+        snapshot["snapshot_id"],
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="c_family_relations",
+        args={"symbol_id": selected_id, "direction": "in", "relation_type": "calls"},
+        project_root=project,
+    )
+    assert selected_call in outgoing["result"]["relations"]
+    assert selected_call in incoming["result"]["relations"]
+    external = next(row for row in analysis["relations"] if row["relation_type"] == "inherits")
+    external_query = graph_query_trace.traced_query(
+        conn,
+        "c-family-full-chain",
+        snapshot["snapshot_id"],
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="c_family_relations",
+        args={"symbol_id": external["source_symbol_id"], "direction": "out", "relation_type": "inherits"},
+        project_root=project,
+    )
+    assert external_query["result"]["relations"][0]["resolution"] == "external"
+    assert any(row["resolution"] == "potential" for row in analysis["relations"] if row["relation_type"] == "overrides")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_c_family_compilation_actions WHERE status='failed'"
+    ).fetchone()[0] == 1
+    conn.close()
+
+    candidate = build_rebase_candidate_graph(str(project), result)
+    graph_nodes = candidate["deps_graph"]["nodes"]
+    overlay_graph_node = next(node for node in graph_nodes if "overlay.cc" in node.get("primary", []))
+    assert "overlay_test.cc" in overlay_graph_node["test"]
+    assert "docs/overlay.md" in overlay_graph_node["secondary"]
+    assert {"config/build.yaml", "config/settings.json"}.issubset(set(overlay_graph_node["config"]))
+    assert "docs/unbound.md" not in overlay_graph_node["secondary"]
+    assert "config/unbound.json" not in overlay_graph_node["config"]
+    assert not any("overlay_test.cc" in node.get("primary", []) for node in graph_nodes)
+
+
+def test_c_family_modules_keep_extension_identity_and_merge_same_file_actions(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    header = project / "overlay.h"
+    source = project / "overlay.cc"
+    header.write_text("int render(int);\n", encoding="utf-8")
+    source.write_text("int render(int value) { return value; }\n", encoding="utf-8")
+
+    def result(path: Path, action_id: str, symbol_id: str):
+        return {
+            "status": "ok",
+            "action": {"file": str(path), "language": "cpp", "compilation_action_id": action_id},
+            "files": [{"file": str(path), "role": "source"}],
+            "symbols": [{
+                "compilation_action_id": action_id,
+                "symbol_id": symbol_id,
+                "name": "render",
+                "kind": "FunctionDecl",
+                "signature": "int (int)",
+                "lineno": 1,
+                "end_lineno": 1,
+                "is_definition": path.suffix == ".cc",
+            }],
+            "relations": [],
+        }
+
+    modules = _c_family_modules(str(project), {
+        "results": [
+            result(header, "header-action", "header-symbol"),
+            result(source, "source-action-a", "source-symbol"),
+            result(source, "source-action-b", "source-symbol"),
+        ],
+    })
+    assert set(modules) == {"overlay__h", "overlay__cc"}
+    assert {
+        row["compilation_action_id"]
+        for row in modules["overlay__cc"].adapter_symbols
+    } == {"source-action-a", "source-action-b"}
+
+
+def test_c_family_test_binding_uses_exact_qualified_symbol(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[2]
+    project = tmp_path / "exact-test-binding"
+    project.mkdir()
+    sources = {
+        "a.cc": "namespace A { int render(int value){return value;} }\n",
+        "b.cc": "namespace B { int render(int value){return value + 1;} }\n",
+        "a_test.cc": "namespace A { int render(int); }\nint test_a(){return A::render(1);}\n",
+        "both_test.cc": (
+            "namespace A { int render(int); }\n"
+            "namespace B { int render(int); }\n"
+            "int test_both(){return A::render(1) + B::render(2);}\n"
+        ),
+    }
+    for name, source in sources.items():
+        (project / name).write_text(source, encoding="utf-8")
+    clang = Path("/Library/Developer/CommandLineTools/usr/bin/clang")
+    clangxx = Path("/Library/Developer/CommandLineTools/usr/bin/clang++")
+    sdk = Path("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
+    (project / "compile_commands.json").write_text(json.dumps([
+        {
+            "directory": str(project),
+            "file": str(project / name),
+            "arguments": [str(clangxx), "-std=c++17", "-isysroot", str(sdk), "-c", str(project / name)],
+        }
+        for name in sources
+    ]), encoding="utf-8")
+    helper = tmp_path / "aming-claw-clang-indexer"
+    subprocess.run(
+        [str(clangxx), "-std=c++17", "-isysroot", str(sdk), str(root / "tools" / "clang-indexer" / "main.cc"), "-o", str(helper)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setenv("AC_CFAMILY_CLANG_INDEXER", str(helper))
+    monkeypatch.setenv("AC_CFAMILY_CLANG", str(clang))
+
+    result = build_graph_v2_from_symbols(str(project), dry_run=True, scratch_dir=str(tmp_path / "scratch-exact"))
+    a_node = next(node for node in result["nodes"] if node["primary_file"] == "a.cc")
+    b_node = next(node for node in result["nodes"] if node["primary_file"] == "b.cc")
+    assert a_node["test_coverage"]["test_files"] == ["a_test.cc", "both_test.cc"]
+    assert "a_test.cc" not in b_node.get("test_coverage", {}).get("test_files", [])
+    assert "both_test.cc" in b_node["test_coverage"]["test_files"]
+    binding = next(row for row in result["c_family_test_bindings"]["bound"] if row["test_file"] == "a_test.cc")
+    a_render = next(
+        symbol for symbol in result["c_family_analysis"]["symbols"]
+        if symbol["qualified_name"] == "A::render" and symbol["is_definition"]
+    )
+    assert binding["node_id"] == a_node["node_id"]
+    assert binding["target_symbol_id"] == a_render["symbol_id"]
+    multi_target = [
+        row for row in result["c_family_test_bindings"]["bound"]
+        if row["test_file"] == "both_test.cc"
+    ]
+    b_render = next(
+        symbol for symbol in result["c_family_analysis"]["symbols"]
+        if symbol["qualified_name"] == "B::render" and symbol["is_definition"]
+    )
+    assert {
+        (row["node_id"], row["target_symbol_id"])
+        for row in multi_target
+    } == {
+        (a_node["node_id"], a_render["symbol_id"]),
+        (b_node["node_id"], b_render["symbol_id"]),
+    }
+    assert all(row["relation_id"] and row["source_symbol_id"] for row in multi_target)
 
 
 def test_extracts_state_route_task_event_and_artifact_relations(tmp_path):

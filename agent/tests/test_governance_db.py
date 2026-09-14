@@ -856,8 +856,24 @@ def test_completed_projection_trace_owner_legal_profiles_bind_both_hashes(
     for statement in db._authority_projection_schema_statements():
         conn.execute(statement)
     conn.commit()
-    expected_authority = db._authority_projection_inventory_in_managed_world(conn)
-    expected_protected = db.backlog_read_schema_protected_inventory(conn)
+    if profile in {"graph_only", "graph_semantic", "all_exact"}:
+        expected_conn = db._migration_capable_source_schema_memory()
+        _remove_c_family_companion_schema_for_preimage_test(db, expected_conn)
+        for statement in db._authority_projection_schema_statements():
+            expected_conn.execute(statement)
+        expected_conn.commit()
+        expected_authority = db._authority_projection_inventory_in_managed_world(
+            expected_conn
+        )
+        expected_protected = db.backlog_read_schema_protected_inventory(
+            expected_conn
+        )
+        expected_conn.close()
+    else:
+        expected_authority = db._authority_projection_inventory_in_managed_world(
+            conn
+        )
+        expected_protected = db.backlog_read_schema_protected_inventory(conn)
     _install_post_structural_profile(db, conn, profile)
     before = db._sqlite_master_inventory(conn)
     changes = conn.total_changes
@@ -907,6 +923,46 @@ def _install_all_graph_owners_for_inventory_test(db, conn):
         asset_impact.ensure_schema,
     ):
         _install_graph_owner_for_preimage_test(db, conn, ensure_schema)
+
+
+def _remove_c_family_companion_schema_for_preimage_test(db, conn):
+    snapshot_inventory = {
+        row[1]: row
+        for owner, _ensure_schema, inventory in db._graph_schema_owner_registry()
+        if owner == "graph_snapshot_store"
+        for row in inventory
+        if row[1] in db._GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_MISSING
+    }
+    assert set(snapshot_inventory) == set(
+        db._GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_MISSING
+    )
+    for kind in ("index", "table"):
+        for name, row in sorted(snapshot_inventory.items()):
+            if row[0] == kind:
+                conn.execute(f'DROP {kind.upper()} "{name}"')
+    return snapshot_inventory
+
+
+def _historical_graph_snapshot_schema_sql_for_generation_receipt(db):
+    inventory = next(
+        inventory
+        for owner, _ensure_schema, inventory in db._graph_schema_owner_registry()
+        if owner == "graph_snapshot_store"
+    )
+    order = {"table": 0, "index": 1, "view": 2, "trigger": 3}
+    retained = sorted(
+        (
+            row for row in inventory
+            if row[3]
+            and row[1]
+            not in (
+                db._GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_MISSING
+                | db._GRAPH_SNAPSHOT_STORE_PREDECESSOR_MISSING
+            )
+        ),
+        key=lambda row: (order[row[0]], row[1]),
+    )
+    return ";\n".join(row[3] for row in retained) + ";\n"
 
 
 @pytest.mark.parametrize("owner", ["asset_projection", "asset_impact"])
@@ -1056,6 +1112,84 @@ def test_ac_dev_graph_admission_creates_projection_and_impact_atomically(
     rollback_conn.close()
 
 
+def test_ac_dev_graph_admission_repairs_c_family_predecessor_atomically(
+    monkeypatch,
+):
+    from agent.governance import db, graph_events
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "active_graph_activation_allowed": False,
+        },
+    )
+
+    def predecessor_connection():
+        candidate = sqlite3.connect(":memory:")
+        candidate.row_factory = sqlite3.Row
+        _install_all_graph_owners_for_inventory_test(db, candidate)
+        _remove_c_family_companion_schema_for_preimage_test(db, candidate)
+        candidate.execute(
+            "INSERT INTO graph_snapshots "
+            "(project_id,snapshot_id,commit_sha,snapshot_kind,status,created_at) "
+            "VALUES ('aming-claw','preserved','a' || printf('%039d',0),"
+            "'full','active','2026-09-14T00:00:00Z')"
+        )
+        candidate.commit()
+        return candidate
+
+    conn = predecessor_connection()
+    db.admit_ac_dev_graph_materialization_schema(
+        conn, project_id="aming-claw",
+    )
+    assert set(
+        db.classify_graph_materialization_preimage(conn)["owner_states"].values()
+    ) == {"exact"}
+    assert conn.execute(
+        "SELECT snapshot_id FROM graph_snapshots WHERE project_id='aming-claw'"
+    ).fetchone()[0] == "preserved"
+
+    rollback_conn = predecessor_connection()
+    original_graph_events_ensure = graph_events.ensure_schema
+
+    def fail_after_snapshot_repair(candidate):
+        original_graph_events_ensure(candidate)
+        if candidate is rollback_conn:
+            raise RuntimeError("C-family admission rollback sentinel")
+
+    monkeypatch.setattr(
+        graph_events, "ensure_schema", fail_after_snapshot_repair,
+    )
+    before_inventory = db._graph_materialization_inventory(rollback_conn)
+    with pytest.raises(RuntimeError, match="C-family admission rollback sentinel"):
+        db.admit_ac_dev_graph_materialization_schema(
+            rollback_conn, project_id="aming-claw",
+        )
+    assert db._graph_materialization_inventory(rollback_conn) == before_inventory
+    assert rollback_conn.execute(
+        "SELECT snapshot_id FROM graph_snapshots WHERE project_id='aming-claw'"
+    ).fetchone()[0] == "preserved"
+    assert db.classify_graph_materialization_preimage(rollback_conn)[
+        "owner_states"
+    ]["graph_snapshot_store"] == "c_family_companion_predecessor"
+    conn.close()
+    rollback_conn.close()
+
+
 @pytest.mark.parametrize("owner", ["asset_projection", "asset_impact"])
 def test_stable_asset_owner_ensure_preserves_executescript_without_dev_verify(
     monkeypatch,
@@ -1131,6 +1265,140 @@ def test_graph_materialization_preimage_classifier_accepts_only_exact_predecesso
     repaired = db.classify_graph_materialization_preimage(conn)
     assert repaired["owner_states"]["graph_snapshot_store"] == "exact"
     assert repaired["planned_objects"] == []
+    conn.close()
+
+
+def test_c_family_graph_predecessor_is_named_sql_exact_and_zero_write():
+    from agent.governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_all_graph_owners_for_inventory_test(db, conn)
+    expected = _remove_c_family_companion_schema_for_preimage_test(db, conn)
+    conn.commit()
+    before_inventory = db._graph_materialization_inventory(conn)
+    before_changes = conn.total_changes
+
+    result = db.classify_graph_materialization_preimage(conn)
+
+    assert result["owner_states"]["graph_snapshot_store"] == (
+        "c_family_companion_predecessor"
+    )
+    assert set(result["planned_objects"]) == set(expected)
+    assert len(result["planned_objects"]) == 10
+    assert set(result["planned_ddl"]) == {row[3] for row in expected.values()}
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    with pytest.raises(db.DevRuntimeSchemaVerificationError):
+        db.verify_graph_materialization_schema(conn)
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
+    for sql in result["planned_ddl"]:
+        conn.execute(sql)
+    assert set(
+        db.classify_graph_materialization_preimage(conn)["owner_states"].values()
+    ) == {"exact"}
+    conn.close()
+
+
+def test_c_family_graph_predecessor_allows_zero_write_startup_and_completed_projection(
+    monkeypatch,
+):
+    from agent.governance import db, graph_query_trace
+    from agent.governance import reconcile_semantic_enrichment as semantic
+
+    conn = db._migration_capable_source_schema_memory()
+    _remove_c_family_companion_schema_for_preimage_test(db, conn)
+    for statement in db._authority_projection_schema_statements():
+        conn.execute(statement)
+    conn.commit()
+    expected_authority = db._authority_projection_inventory_in_managed_world(conn)
+    expected_protected = db.backlog_read_schema_protected_inventory(conn)
+    _install_all_graph_owners_for_inventory_test(db, conn)
+    _remove_c_family_companion_schema_for_preimage_test(db, conn)
+    db.execute_graph_schema_sql(conn, semantic.SEMANTIC_STATE_SCHEMA_SQL)
+    db.execute_graph_schema_sql(conn, graph_query_trace.GRAPH_QUERY_TRACE_SCHEMA_SQL)
+    conn.commit()
+    before_inventory = db._sqlite_master_inventory(conn)
+    before_changes = conn.total_changes
+
+    db._verify_dev_world_schema_inventory(conn)
+    authority, protected = db._completed_generation_schema_projections(conn)
+
+    assert authority == expected_authority
+    assert protected == expected_protected
+    assert db.classify_graph_materialization_preimage(conn)["owner_states"][
+        "graph_snapshot_store"
+    ] == "c_family_companion_predecessor"
+    assert conn.total_changes == before_changes
+    assert db._sqlite_master_inventory(conn) == before_inventory
+
+    monkeypatch.setenv(db.RUNTIME_PLANE_ENV, db.DEV_RUNTIME_PLANE)
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn, *_args: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    db.admit_ac_dev_graph_materialization_schema(
+        conn, project_id="aming-claw",
+    )
+    assert set(
+        db.classify_graph_materialization_preimage(conn)["owner_states"].values()
+    ) == {"exact"}
+    assert db._completed_generation_schema_projections(conn) == (
+        expected_authority, expected_protected,
+    )
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "drift", ["fewer_missing", "additional_missing", "altered", "extra"],
+)
+def test_c_family_graph_predecessor_rejects_neighboring_drift_zero_write(drift):
+    from agent.governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _install_all_graph_owners_for_inventory_test(db, conn)
+    removed = _remove_c_family_companion_schema_for_preimage_test(db, conn)
+    if drift == "fewer_missing":
+        conn.execute(removed["graph_c_family_diagnostics"][3])
+        conn.execute(removed["idx_graph_c_family_diagnostics_action"][3])
+    elif drift == "additional_missing":
+        conn.execute("DROP INDEX idx_graph_snapshots_status")
+    elif drift == "altered":
+        conn.execute("DROP INDEX idx_graph_snapshots_status")
+        conn.execute(
+            "CREATE INDEX idx_graph_snapshots_status "
+            "ON graph_snapshots(project_id, commit_sha)"
+        )
+    else:
+        conn.execute(
+            "CREATE TABLE graph_c_family_unknown_authority(value TEXT)"
+        )
+    conn.commit()
+    before_inventory = db._graph_materialization_inventory(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(ValueError, match="preimage|unknown graph authority"):
+        db.classify_graph_materialization_preimage(conn)
+
+    assert conn.total_changes == before_changes
+    assert db._graph_materialization_inventory(conn) == before_inventory
     conn.close()
 
 
@@ -4083,7 +4351,10 @@ def test_dev_issuance_ancestry_anchor_fails_closed_on_chain_drift(tmp_path, tamp
         db.dev_issuance_ancestry_anchor_commit(root)
 
 
-def _phase_z_cow_prestart_fixture(tmp_path, monkeypatch, *, source_root=None):
+def _phase_z_cow_prestart_fixture(
+    tmp_path, monkeypatch, *, source_root=None,
+    rebuild_successor_from_final_predecessor=False,
+):
     """Build one real COW successor whose issuance meta is externally sealed."""
     from agent.governance import db
 
@@ -4148,6 +4419,30 @@ def _phase_z_cow_prestart_fixture(tmp_path, monkeypatch, *, source_root=None):
         )
         connection.commit()
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+    if rebuild_successor_from_final_predecessor:
+        # A historical successor is reconstructed from the final sealed
+        # predecessor.  Build this fixture by that same normal producer order
+        # so SQLite page allocation is part of the real immutable identity,
+        # rather than manufacturing receipt identity fields to fit a database
+        # assembled in a different order.
+        database.unlink()
+        shutil.copy2(backup, database)
+        connection = sqlite3.connect(database, isolation_level=None)
+        connection.execute("BEGIN IMMEDIATE")
+        db.admit_missing_backlog_read_schema(connection, commit=False)
+        connection.executemany(
+            "INSERT INTO backlog_bugs(bug_id,created_at,updated_at,status) "
+            "VALUES (?,?,?,?)",
+            (
+                (f"AC-{index:04d}", "2026-08-31", "2026-08-31", "OPEN")
+                for index in range(3603)
+            ),
+        )
+        connection.commit()
+        assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (
+            0, 0, 0,
+        )
         connection.close()
     adoption = next(
         (root / "archive" / "canonical-legacy-postimage-adoption").glob(
@@ -5632,10 +5927,25 @@ def test_cow_generation_phase_selector_is_closed_for_first_and_completed(
 def test_cow_completed_generation_accepts_exact_graph_overlay_read_only(
     tmp_path, monkeypatch, semantic_overlay,
 ):
-    from agent.governance import db, reconcile_semantic_enrichment as semantic
+    from agent.governance import db, graph_snapshot_store
+    from agent.governance import reconcile_semantic_enrichment as semantic
 
+    current_snapshot_schema = graph_snapshot_store.GRAPH_SNAPSHOT_SCHEMA_SQL
+    monkeypatch.setattr(
+        graph_snapshot_store,
+        "GRAPH_SNAPSHOT_SCHEMA_SQL",
+        _historical_graph_snapshot_schema_sql_for_generation_receipt(db),
+    )
     root, database, linked, source, _process, receipt = (
-        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+        _phase_z_cow_prestart_fixture(
+            tmp_path, monkeypatch,
+            rebuild_successor_from_final_predecessor=True,
+        )
+    )
+    monkeypatch.setattr(
+        graph_snapshot_store,
+        "GRAPH_SNAPSHOT_SCHEMA_SQL",
+        current_snapshot_schema,
     )
     completed_source = _advance_cow_to_completed_generation(
         database, root, source,
@@ -5665,9 +5975,20 @@ def test_cow_completed_generation_accepts_exact_graph_overlay_read_only(
     canonical_authority_rows = {
         tuple(row) for row in db.authority_projection_schema_inventory()["inventory"]
     }
-    assert len(canonical_graph_rows) == 104
-    assert len(canonical_graph_rows & canonical_authority_rows) == 86
-    assert len(canonical_graph_rows - canonical_authority_rows) == 18
+    c_family_companion_names = (
+        db._GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_MISSING
+        | db._GRAPH_SNAPSHOT_STORE_C_FAMILY_PREDECESSOR_IMPLICIT
+    )
+    historical_graph_rows = {
+        row for row in canonical_graph_rows if row[1] not in c_family_companion_names
+    }
+    assert len(canonical_graph_rows) == 119
+    assert len(historical_graph_rows) == 104
+    assert {
+        row[1] for row in canonical_graph_rows - historical_graph_rows
+    } == c_family_companion_names
+    assert len(historical_graph_rows & canonical_authority_rows) == 86
+    assert len(historical_graph_rows - canonical_authority_rows) == 18
     logical_before = db._sqlite_logical_projection(connection)
     connection.close()
     bytes_before = database.read_bytes()

@@ -30,6 +30,7 @@ from agent.governance.graph_snapshot_store import (
     get_graph_snapshot,
     graph_payload_edges,
     graph_payload_stats,
+    index_c_family_analysis,
     index_graph_snapshot,
     list_graph_snapshot_files,
     list_pending_scope_reconcile,
@@ -3151,6 +3152,9 @@ def run_state_only_full_reconcile(
             graph_json=candidate_graph,
             file_inventory=file_inventory,
             drift_ledger=[],
+            c_family_analysis=phase_result.get("c_family_analysis")
+            if isinstance(phase_result.get("c_family_analysis"), dict)
+            else None,
             status=SNAPSHOT_STATUS_CANDIDATE,
             created_by=created_by,
             notes=json.dumps(notes, ensure_ascii=False, sort_keys=True),
@@ -3161,6 +3165,14 @@ def run_state_only_full_reconcile(
             sid,
             nodes=nodes,
             edges=edges,
+        )
+        c_family_index_counts = index_c_family_analysis(
+            conn,
+            project_id,
+            sid,
+            phase_result.get("c_family_analysis")
+            if isinstance(phase_result.get("c_family_analysis"), dict)
+            else None,
         )
         governance_index_summary = persist_governance_index(
             conn,
@@ -3184,6 +3196,9 @@ def run_state_only_full_reconcile(
         notes["graph_correction_patch_report"]["migration_count"] = migration_count
         notes["graph_correction_patch_report"]["patch_apply_counts"] = patch_apply_counts
         notes["governance_index"] = governance_index_summary
+        if snapshot.get("c_family_analysis_sha256"):
+            notes["c_family_analysis_sha256"] = snapshot["c_family_analysis_sha256"]
+        notes["c_family_index_counts"] = c_family_index_counts
         conn.execute(
             "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
             (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),

@@ -145,6 +145,59 @@ CREATE TABLE IF NOT EXISTS graph_edges_index (
 CREATE INDEX IF NOT EXISTS idx_graph_edges_dst
   ON graph_edges_index(project_id, snapshot_id, dst);
 
+CREATE TABLE IF NOT EXISTS graph_c_family_compilation_actions (
+  project_id TEXT NOT NULL, snapshot_id TEXT NOT NULL,
+  compilation_action_id TEXT NOT NULL, translation_unit_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL, file TEXT NOT NULL, language TEXT NOT NULL,
+  status TEXT NOT NULL, action_json TEXT NOT NULL, macro_analysis_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY(project_id, snapshot_id, compilation_action_id)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_c_family_actions_file
+  ON graph_c_family_compilation_actions(project_id, snapshot_id, file);
+
+CREATE TABLE IF NOT EXISTS graph_c_family_symbols (
+  project_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, symbol_id TEXT NOT NULL,
+  compilation_action_id TEXT NOT NULL, profile_id TEXT NOT NULL,
+  name TEXT NOT NULL, qualified_name TEXT NOT NULL, kind TEXT NOT NULL,
+  signature TEXT NOT NULL, file TEXT NOT NULL, line INTEGER NOT NULL,
+  is_definition INTEGER NOT NULL, payload_json TEXT NOT NULL,
+  PRIMARY KEY(project_id, snapshot_id, symbol_id, compilation_action_id)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_c_family_symbols_name
+  ON graph_c_family_symbols(project_id, snapshot_id, name, signature);
+
+CREATE TABLE IF NOT EXISTS graph_c_family_occurrences (
+  project_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, occurrence_id TEXT NOT NULL,
+  symbol_id TEXT NOT NULL, compilation_action_id TEXT NOT NULL,
+  role TEXT NOT NULL, file TEXT NOT NULL, line INTEGER NOT NULL, column_no INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY(project_id, snapshot_id, occurrence_id, compilation_action_id)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_c_family_occurrences_symbol
+  ON graph_c_family_occurrences(project_id, snapshot_id, symbol_id, role);
+
+CREATE TABLE IF NOT EXISTS graph_c_family_relations (
+  project_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, relation_id TEXT NOT NULL,
+  compilation_action_id TEXT NOT NULL, relation_type TEXT NOT NULL,
+  source_symbol_id TEXT NOT NULL, target_symbol_id TEXT NOT NULL,
+  source_file TEXT NOT NULL, target_file TEXT NOT NULL, direction TEXT NOT NULL,
+  resolution TEXT NOT NULL, condition_ref TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY(project_id, snapshot_id, relation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_c_family_relations_endpoint
+  ON graph_c_family_relations(project_id, snapshot_id, source_symbol_id, target_symbol_id, relation_type);
+
+CREATE TABLE IF NOT EXISTS graph_c_family_diagnostics (
+  project_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, diagnostic_id TEXT NOT NULL,
+  compilation_action_id TEXT NOT NULL, analysis_status TEXT NOT NULL,
+  severity TEXT NOT NULL, file TEXT NOT NULL, line INTEGER NOT NULL,
+  message TEXT NOT NULL, payload_json TEXT NOT NULL,
+  PRIMARY KEY(project_id, snapshot_id, diagnostic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_c_family_diagnostics_action
+  ON graph_c_family_diagnostics(project_id, snapshot_id, compilation_action_id, severity);
+
 CREATE TABLE IF NOT EXISTS graph_drift_ledger (
   project_id TEXT NOT NULL,
   snapshot_id TEXT NOT NULL,
@@ -1402,6 +1455,7 @@ def write_companion_files(
     graph_json: dict[str, Any] | None = None,
     file_inventory: list[dict[str, Any]] | None = None,
     drift_ledger: list[dict[str, Any]] | None = None,
+    c_family_analysis: dict[str, Any] | None = None,
     created_at: str = "",
 ) -> dict[str, str]:
     base_dir = _snapshot_root(project_id, snapshot_id)
@@ -1425,18 +1479,29 @@ def write_companion_files(
             ) from exc
         raise
 
+    if c_family_analysis is None:
+        try:
+            existing_c_family = json.loads((base_dir / "c-family-analysis.v1.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            existing_c_family = None
+        if isinstance(existing_c_family, dict):
+            c_family_analysis = existing_c_family
     graph_bytes = _json(graph_json or {}).encode("utf-8")
     inventory_bytes = _json(file_inventory or []).encode("utf-8")
     drift_bytes = _json(drift_ledger or []).encode("utf-8")
+    c_family_bytes = _json(c_family_analysis or {}).encode("utf-8")
 
     graph_sha = _sha256_bytes(graph_bytes)
     inventory_sha = _sha256_bytes(inventory_bytes)
     drift_sha = _sha256_bytes(drift_bytes)
+    c_family_sha = _sha256_bytes(c_family_bytes)
 
     try:
         (base_dir / "graph.json").write_bytes(graph_bytes)
         (base_dir / "file_inventory.json").write_bytes(inventory_bytes)
         (base_dir / "drift_ledger.json").write_bytes(drift_bytes)
+        if c_family_analysis is not None:
+            (base_dir / "c-family-analysis.v1.json").write_bytes(c_family_bytes)
     except OSError as exc:
         import errno as _errno
         if exc.errno == _errno.ENOSPC:
@@ -1476,13 +1541,18 @@ def write_companion_files(
         "drift_sha256": drift_sha,
         "created_at": manifest_created_at,
     }
+    if c_family_analysis is not None:
+        manifest["c_family_analysis_sha256"] = c_family_sha
     manifest_path.write_text(_json(manifest), encoding="utf-8")
-    return {
+    result = {
         "graph_sha256": graph_sha,
         "inventory_sha256": inventory_sha,
         "drift_sha256": drift_sha,
         "path": str(base_dir),
     }
+    if c_family_analysis is not None:
+        result["c_family_analysis_sha256"] = c_family_sha
+    return result
 
 
 def validate_snapshot_companion_integrity(
@@ -1556,6 +1626,29 @@ def validate_snapshot_companion_integrity(
         "drift_sha256": str(snapshot.get("drift_sha256") or "").strip(),
         "created_at": str(snapshot.get("created_at") or "").strip(),
     }
+    try:
+        snapshot_notes = json.loads(str(snapshot.get("notes") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        snapshot_notes = {}
+    expected_c_family_sha = str(
+        snapshot_notes.get("c_family_analysis_sha256") or ""
+    ) if isinstance(snapshot_notes, Mapping) else ""
+    if expected_c_family_sha:
+        expected_manifest["c_family_analysis_sha256"] = expected_c_family_sha
+        c_family_path = base_dir / "c-family-analysis.v1.json"
+        try:
+            c_family_bytes = c_family_path.read_bytes()
+        except FileNotFoundError:
+            return {"valid": False, "error": "current_full_candidate_c_family_companion_missing", "files": files}
+        actual_c_family_sha = _sha256_bytes(c_family_bytes)
+        files["c_family_analysis"] = {
+            "artifact": "c-family-analysis.v1.json",
+            "expected_sha256": expected_c_family_sha,
+            "actual_sha256": actual_c_family_sha,
+            "matches": actual_c_family_sha == expected_c_family_sha,
+        }
+        if actual_c_family_sha != expected_c_family_sha:
+            return {"valid": False, "error": "current_full_candidate_c_family_companion_hash_mismatch", "files": files}
     if not isinstance(manifest, Mapping) or set(manifest) != set(expected_manifest):
         actual_keys = (
             sorted(str(key) for key in manifest)
@@ -2612,6 +2705,7 @@ def create_graph_snapshot(
     graph_json: dict[str, Any] | None = None,
     file_inventory: list[dict[str, Any]] | None = None,
     drift_ledger: list[dict[str, Any]] | None = None,
+    c_family_analysis: dict[str, Any] | None = None,
     status: str = SNAPSHOT_STATUS_CANDIDATE,
     created_by: str = "",
     notes: str = "",
@@ -2633,8 +2727,19 @@ def create_graph_snapshot(
         graph_json=graph_json,
         file_inventory=file_inventory,
         drift_ledger=drift_ledger,
+        c_family_analysis=c_family_analysis,
         created_at=now,
     )
+    notes_value = notes
+    if shas.get("c_family_analysis_sha256"):
+        try:
+            notes_payload = json.loads(str(notes or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            notes_payload = {}
+        if not isinstance(notes_payload, dict):
+            notes_payload = {}
+        notes_payload["c_family_analysis_sha256"] = shas["c_family_analysis_sha256"]
+        notes_value = _json(notes_payload)
     conn.execute(
         """
         INSERT INTO graph_snapshots
@@ -2657,10 +2762,10 @@ def create_graph_snapshot(
             status,
             now,
             created_by,
-            notes,
+            notes_value,
         ),
     )
-    return {
+    result = {
         "project_id": project_id,
         "snapshot_id": sid,
         "commit_sha": commit_sha,
@@ -2674,6 +2779,9 @@ def create_graph_snapshot(
         "inventory_sha256": shas["inventory_sha256"],
         "drift_sha256": shas["drift_sha256"],
     }
+    if shas.get("c_family_analysis_sha256"):
+        result["c_family_analysis_sha256"] = shas["c_family_analysis_sha256"]
+    return result
 
 
 def index_graph_snapshot(
@@ -2738,6 +2846,145 @@ def index_graph_snapshot(
         )
         edge_count += 1
     return {"nodes": node_count, "edges": edge_count}
+
+
+def index_c_family_analysis(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    analysis: Mapping[str, Any] | None,
+) -> dict[str, int]:
+    """Persist bounded C-family facts without treating partial analysis as success."""
+    ensure_schema(conn)
+    payload = analysis if isinstance(analysis, Mapping) else {}
+    counts = {"actions": 0, "symbols": 0, "occurrences": 0, "relations": 0, "diagnostics": 0}
+    macro_by_action = {
+        str(row.get("compilation_action_id") or ""): row
+        for row in (payload.get("macro_analysis") or [])
+        if isinstance(row, Mapping)
+    }
+    result_by_action = {
+        str((row.get("action") or {}).get("compilation_action_id") or ""): row
+        for row in (payload.get("results") or [])
+        if isinstance(row, Mapping) and isinstance(row.get("action"), Mapping)
+    }
+    for action in payload.get("actions") or []:
+        if not isinstance(action, Mapping):
+            continue
+        action_id = str(action.get("compilation_action_id") or "")
+        if not action_id:
+            continue
+        status = str((result_by_action.get(action_id) or {}).get("status") or "not_run")
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_c_family_compilation_actions "
+            "(project_id,snapshot_id,compilation_action_id,translation_unit_id,profile_id,file,language,status,action_json,macro_analysis_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (project_id, snapshot_id, action_id, str(action.get("translation_unit_id") or ""),
+             str(action.get("profile_id") or ""), str(action.get("file") or ""),
+             str(action.get("language") or ""), status, _json(action), _json(macro_by_action.get(action_id) or {})),
+        )
+        counts["actions"] += 1
+    successful_actions = {
+        action_id for action_id, result in result_by_action.items()
+        if result.get("status") == "ok"
+    }
+    for symbol in payload.get("symbols") or []:
+        if not isinstance(symbol, Mapping) or str(symbol.get("compilation_action_id") or "") not in successful_actions:
+            continue
+        symbol_id = str(symbol.get("symbol_id") or "")
+        if not symbol_id:
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_c_family_symbols VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (project_id, snapshot_id, symbol_id, str(symbol.get("compilation_action_id") or ""),
+             str(symbol.get("profile_id") or ""), str(symbol.get("name") or ""),
+             str(symbol.get("qualified_name") or ""), str(symbol.get("kind") or ""),
+             str(symbol.get("signature") or ""), str(symbol.get("file") or ""),
+             int(symbol.get("lineno") or 0), 1 if symbol.get("is_definition") else 0, _json(symbol)),
+        )
+        counts["symbols"] += 1
+    for occurrence in payload.get("occurrences") or []:
+        if not isinstance(occurrence, Mapping) or str(occurrence.get("compilation_action_id") or "") not in successful_actions:
+            continue
+        occurrence_id = str(occurrence.get("occurrence_id") or "")
+        if not occurrence_id:
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_c_family_occurrences VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (project_id, snapshot_id, occurrence_id, str(occurrence.get("symbol_id") or ""),
+             str(occurrence.get("compilation_action_id") or ""), str(occurrence.get("role") or ""),
+             str(occurrence.get("file") or ""), int(occurrence.get("line") or 0),
+             int(occurrence.get("column") or 0), _json(occurrence)),
+        )
+        counts["occurrences"] += 1
+    for relation in payload.get("relations") or []:
+        if not isinstance(relation, Mapping) or str(relation.get("compilation_action_id") or "") not in successful_actions:
+            continue
+        relation_id = str(relation.get("relation_id") or "")
+        if not relation_id:
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_c_family_relations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (project_id, snapshot_id, relation_id, str(relation.get("compilation_action_id") or ""),
+             str(relation.get("relation_type") or ""), str(relation.get("source_symbol_id") or ""),
+             str(relation.get("target_symbol_id") or ""), str(relation.get("source_file") or ""),
+             str(relation.get("target_file") or ""), str(relation.get("direction") or ""),
+             str(relation.get("resolution") or ""), str(relation.get("condition_ref") or ""), _json(relation)),
+        )
+        counts["relations"] += 1
+    for diagnostic in payload.get("diagnostics") or []:
+        if not isinstance(diagnostic, Mapping):
+            continue
+        raw = _json(diagnostic)
+        diagnostic_id = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_c_family_diagnostics VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (project_id, snapshot_id, diagnostic_id, str(diagnostic.get("compilation_action_id") or ""),
+             str(diagnostic.get("analysis_status") or ""), str(diagnostic.get("severity") or ""),
+             str(diagnostic.get("file") or ""), int(diagnostic.get("line") or 0),
+             str(diagnostic.get("message") or ""), raw),
+        )
+        counts["diagnostics"] += 1
+    return counts
+
+
+def query_c_family_analysis(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    table: str,
+    symbol_id: str = "",
+    relation_type: str = "",
+    direction: str = "out",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Read exact snapshot-bound C-family occurrence or relation payloads."""
+    ensure_schema(conn)
+    bounded = max(1, min(int(limit or 100), 500))
+    if table == "occurrences":
+        clauses = ["project_id=?", "snapshot_id=?"]
+        params: list[Any] = [project_id, snapshot_id]
+        if symbol_id:
+            clauses.append("symbol_id=?")
+            params.append(symbol_id)
+        sql = "SELECT payload_json FROM graph_c_family_occurrences WHERE " + " AND ".join(clauses) + " ORDER BY file,line,column_no,occurrence_id LIMIT ?"
+    elif table == "relations":
+        clauses = ["project_id=?", "snapshot_id=?"]
+        params = [project_id, snapshot_id]
+        if symbol_id:
+            endpoint = "target_symbol_id" if direction == "in" else "source_symbol_id"
+            clauses.append(f"{endpoint}=?")
+            params.append(symbol_id)
+        if relation_type:
+            clauses.append("relation_type=?")
+            params.append(relation_type)
+        sql = "SELECT payload_json FROM graph_c_family_relations WHERE " + " AND ".join(clauses) + " ORDER BY relation_type,source_file,relation_id LIMIT ?"
+    else:
+        raise ValueError("unsupported C-family fact table")
+    params.append(bounded)
+    rows = conn.execute(sql, params).fetchall()
+    return [json.loads(str(row[0])) for row in rows]
 
 
 def activate_graph_snapshot(
@@ -7804,6 +8051,29 @@ def _project_reconcile_run_metric_with_overlay(
     return {**projected, **status}
 
 
+def _ensure_reconcile_run_metrics_read_schema(conn: sqlite3.Connection) -> None:
+    """Retain schema initialization without replaying unrelated DDL on reads."""
+    from . import db
+
+    if db.dev_runtime_verify_only():
+        ensure_schema(conn)
+        return
+    try:
+        conn.execute(
+            """
+            SELECT m.*, t.replacement_proof_kind
+            FROM reconcile_run_metrics AS m
+            LEFT JOIN graph_reconcile_run_terminalizations AS t
+              ON t.project_id=m.project_id
+             AND t.source_run_id=m.run_id
+             AND t.source_snapshot_id=m.snapshot_id
+            LIMIT 0
+            """
+        )
+    except sqlite3.DatabaseError:
+        ensure_schema(conn)
+
+
 def list_reconcile_run_metrics_window(
     conn: sqlite3.Connection,
     project_id: str,
@@ -7820,7 +8090,7 @@ def list_reconcile_run_metrics_window(
     opaque, scope-bound continuation cursor. No exact remaining count is
     computed because that would turn a queue read into unbounded DB work.
     """
-    ensure_schema(conn)
+    _ensure_reconcile_run_metrics_read_schema(conn)
     params: list[Any] = [project_id]
     where_sql = "m.project_id=?"
     if strategy:
@@ -8742,6 +9012,7 @@ __all__ = [
     "graph_governance_status",
     "graph_payload_edges",
     "index_graph_snapshot",
+    "index_c_family_analysis",
     "list_reconcile_run_metrics",
     "list_reconcile_run_metrics_window",
     "manager_generation_certificate_public_receipt",
@@ -8749,6 +9020,7 @@ __all__ = [
     "list_graph_snapshot_files",
     "list_graph_snapshot_nodes",
     "list_graph_snapshots",
+    "query_c_family_analysis",
     "list_graph_ref_events",
     "list_graph_drift",
     "normalize_pending_scope_identity",

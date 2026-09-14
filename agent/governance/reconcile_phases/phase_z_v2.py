@@ -21,11 +21,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from agent.governance.language_adapters import (
+    CFamilyAdapter,
     FileTreeAdapter,
     LanguageAdapter,
     PythonAdapter,
     adapter_for_path,
 )
+from agent.governance.compilation_context import load_compilation_actions
 from agent.governance.asset_binding_proposals import (
     doc_binding_candidates,
     trusted_doc_files,
@@ -491,6 +493,273 @@ def _path_to_module(path: str, root: str) -> str:
 
 def _adapter_for_source_file(file_path: str) -> LanguageAdapter:
     return adapter_for_path(file_path)
+
+
+def _analyze_c_family_project(project_root: str) -> Dict[str, Any]:
+    """Run each configured C-family translation unit once and retain its facts."""
+    actions = load_compilation_actions(project_root)
+    helper_path = str(os.environ.get("AC_CFAMILY_CLANG_INDEXER") or "")
+    clang_path = str(os.environ.get("AC_CFAMILY_CLANG") or "")
+    analyses: List[Dict[str, Any]] = []
+    for action in actions:
+        analyses.append(CFamilyAdapter(
+            action,
+            helper_path=helper_path,
+            clang_path=clang_path,
+        ).analyze_action())
+    return {
+        "schema_version": "graph.c_family_analysis.v1",
+        "status": "complete" if analyses and all(row.get("status") == "ok" for row in analyses) else "partial" if analyses else "not_configured",
+        "extractor_schema_version": "aming_claw.cfamily_clang_index.v1",
+        "actions": [action.as_dict() for action in actions],
+        "files": [item for row in analyses for item in (row.get("files") or []) if isinstance(item, dict)],
+        "symbols": [item for row in analyses for item in (row.get("symbols") or []) if isinstance(item, dict)],
+        "occurrences": [item for row in analyses for item in (row.get("occurrences") or []) if isinstance(item, dict)],
+        "relations": [item for row in analyses for item in (row.get("relations") or []) if isinstance(item, dict)],
+        "macro_analysis": [
+            {
+                "compilation_action_id": str((row.get("action") or {}).get("compilation_action_id") or ""),
+                **dict(row.get("macro_analysis") or {}),
+            }
+            for row in analyses
+        ],
+        "diagnostics": [
+            {
+                "compilation_action_id": str((row.get("action") or {}).get("compilation_action_id") or ""),
+                "analysis_status": str(row.get("status") or ""),
+                **item,
+            }
+            for row in analyses
+            for item in (row.get("diagnostics") or [])
+            if isinstance(item, dict)
+        ],
+        "results": analyses,
+    }
+
+
+def _c_family_modules(project_root: str, analysis: Mapping[str, Any]) -> Dict[str, ModuleInfo]:
+    """Convert successful production actions to ordinary Phase-Z source nodes."""
+    modules: Dict[str, ModuleInfo] = {}
+    source_paths_by_base: Dict[str, set[str]] = {}
+    for result in analysis.get("results") or []:
+        if not isinstance(result, Mapping) or result.get("status") != "ok":
+            continue
+        file_rows = [row for row in (result.get("files") or []) if isinstance(row, Mapping)]
+        action = result.get("action") if isinstance(result.get("action"), Mapping) else {}
+        source_path = str(action.get("file") or "")
+        if not file_rows or file_rows[0].get("role") != "source" or not source_path:
+            continue
+        source_paths_by_base.setdefault(_path_to_module(source_path, project_root), set()).add(source_path)
+    for result in analysis.get("results") or []:
+        if not isinstance(result, Mapping) or result.get("status") != "ok":
+            continue
+        file_rows = [row for row in (result.get("files") or []) if isinstance(row, Mapping)]
+        if not file_rows or file_rows[0].get("role") != "source":
+            continue
+        action = result.get("action") if isinstance(result.get("action"), Mapping) else {}
+        source_path = str(action.get("file") or "")
+        if not source_path:
+            continue
+        rel_path = _repo_relpath(project_root, source_path)
+        base_module_name = _path_to_module(source_path, project_root)
+        source_suffix = Path(source_path).suffix.lower().lstrip(".").replace("+", "p")
+        module_name = (
+            f"{base_module_name}__{source_suffix}"
+            if source_suffix and len(source_paths_by_base.get(base_module_name, set())) > 1
+            else base_module_name
+        )
+        try:
+            source = Path(source_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            source = ""
+        symbols = [dict(row) for row in (result.get("symbols") or []) if isinstance(row, Mapping)]
+        calls_by_source: Dict[str, List[str]] = {}
+        adapter_relations: List[Dict[str, Any]] = []
+        for row in result.get("relations") or []:
+            if not isinstance(row, Mapping):
+                continue
+            relation = dict(row)
+            relation.setdefault("target", str(row.get("target_file") or row.get("target_name") or ""))
+            relation.setdefault("target_kind", "file" if row.get("relation_type") == "includes" else "symbol")
+            adapter_relations.append(relation)
+            if row.get("relation_type") == "calls" and row.get("source_symbol_id"):
+                calls_by_source.setdefault(str(row.get("source_symbol_id")), []).append(str(row.get("target_name") or ""))
+        functions: List[FunctionMeta] = []
+        symbols_by_id: Dict[str, Dict[str, Any]] = {}
+        for symbol in symbols:
+            symbol_id = str(symbol.get("symbol_id") or "")
+            existing = symbols_by_id.get(symbol_id)
+            if existing is None or (symbol.get("is_definition") and not existing.get("is_definition")):
+                symbols_by_id[symbol_id] = symbol
+        for symbol in symbols_by_id.values():
+            name = str(symbol.get("name") or "")
+            if not name or str(symbol.get("kind") or "") not in {
+                "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl",
+                "CXXDestructorDecl", "ObjCMethodDecl",
+            }:
+                continue
+            signature = str(symbol.get("signature") or "")
+            unique_name = f"{name} [{signature}]" if signature else name
+            functions.append(FunctionMeta(
+                module=module_name,
+                name=name,
+                qualified_name=f"{module_name}::{unique_name}",
+                lineno=int(symbol.get("lineno") or 1),
+                end_lineno=int(symbol.get("end_lineno") or symbol.get("lineno") or 1),
+                calls=sorted({value for value in calls_by_source.get(str(symbol.get("symbol_id") or ""), []) if value}),
+                is_entry=name == "main",
+            ))
+        candidate = ModuleInfo(
+            path=rel_path,
+            module_name=module_name,
+            functions=functions,
+            source=source,
+            language=str(action.get("language") or ""),
+            source_kind="clang_ast",
+            adapter_symbols=symbols,
+            adapter_relations=adapter_relations,
+        )
+        existing_module = modules.get(module_name)
+        if existing_module is None:
+            modules[module_name] = candidate
+            continue
+
+        # Multiple compile actions for one translation-unit path are separate
+        # indexed facts, but they must not overwrite the Phase-Z source node.
+        function_by_name = {
+            function.qualified_name: function
+            for function in [*existing_module.functions, *candidate.functions]
+        }
+        symbol_by_identity = {
+            (
+                str(symbol.get("compilation_action_id") or ""),
+                str(symbol.get("symbol_id") or ""),
+                str(symbol.get("file") or ""),
+                int(symbol.get("lineno") or 0),
+                int(symbol.get("column") or 0),
+                bool(symbol.get("is_definition")),
+            ): symbol
+            for symbol in [*existing_module.adapter_symbols, *candidate.adapter_symbols]
+        }
+        relation_by_identity = {
+            str(relation.get("relation_id") or json.dumps(relation, sort_keys=True, default=str)): relation
+            for relation in [*existing_module.adapter_relations, *candidate.adapter_relations]
+        }
+        existing_module.functions = sorted(function_by_name.values(), key=lambda function: function.qualified_name)
+        existing_module.adapter_symbols = list(symbol_by_identity.values())
+        existing_module.adapter_relations = list(relation_by_identity.values())
+    return modules
+
+
+def _attach_c_family_compilation_identity(
+    project_root: str,
+    nodes: List[Dict[str, Any]],
+    analysis: Mapping[str, Any],
+) -> None:
+    """Expose each compilation action identity on its owning source node."""
+    nodes_by_file = {
+        _repo_relpath(project_root, str(node.get("primary_file") or "")): node
+        for node in nodes
+    }
+    for action in analysis.get("actions") or []:
+        if not isinstance(action, Mapping):
+            continue
+        node = nodes_by_file.get(_repo_relpath(project_root, str(action.get("file") or "")))
+        if node is None:
+            continue
+        identity = {
+            "compilation_action_id": str(action.get("compilation_action_id") or ""),
+            "translation_unit_id": str(action.get("translation_unit_id") or ""),
+            "profile_id": str(action.get("profile_id") or ""),
+        }
+        identities = node.setdefault("c_family_compilation_identities", [])
+        if identity not in identities:
+            identities.append(identity)
+            identities.sort(key=lambda row: (
+                row["compilation_action_id"],
+                row["translation_unit_id"],
+                row["profile_id"],
+            ))
+
+
+def _attach_c_family_test_bindings(
+    project_root: str,
+    nodes: List[Dict[str, Any]],
+    analysis: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Attach test compilation facts without creating architecture nodes."""
+    nodes_by_file = {
+        _repo_relpath(project_root, str(node.get("primary_file") or "")): node
+        for node in nodes
+    }
+    source_action_nodes: Dict[str, Dict[str, Any]] = {}
+    for result in analysis.get("results") or []:
+        if not isinstance(result, Mapping) or result.get("status") != "ok":
+            continue
+        files = [row for row in (result.get("files") or []) if isinstance(row, Mapping)]
+        action = result.get("action") if isinstance(result.get("action"), Mapping) else {}
+        if not files or files[0].get("role") != "source":
+            continue
+        node = nodes_by_file.get(_repo_relpath(project_root, str(action.get("file") or "")))
+        if node is not None:
+            source_action_nodes[str(action.get("compilation_action_id") or "")] = node
+    source_nodes_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for symbol in analysis.get("symbols") or []:
+        if not isinstance(symbol, Mapping) or not symbol.get("is_definition"):
+            continue
+        node = source_action_nodes.get(str(symbol.get("compilation_action_id") or ""))
+        symbol_id = str(symbol.get("symbol_id") or "")
+        if node is not None and symbol_id and node not in source_nodes_by_symbol.setdefault(symbol_id, []):
+            source_nodes_by_symbol[symbol_id].append(node)
+    bound: List[Dict[str, Any]] = []
+    unbound: List[Dict[str, Any]] = []
+    test_actions = {
+        str(row.get("compilation_action_id") or ""): row
+        for row in (analysis.get("files") or [])
+        if isinstance(row, Mapping) and row.get("role") == "test"
+    }
+    relations_by_action: Dict[str, List[Mapping[str, Any]]] = {}
+    for relation in analysis.get("relations") or []:
+        if isinstance(relation, Mapping):
+            relations_by_action.setdefault(str(relation.get("compilation_action_id") or ""), []).append(relation)
+    for action_id, file_row in test_actions.items():
+        test_file = _repo_relpath(project_root, str(file_row.get("file") or ""))
+        matched_bindings: List[tuple[Dict[str, Any], Mapping[str, Any]]] = []
+        for relation in relations_by_action.get(action_id, []):
+            if relation.get("relation_type") != "calls":
+                continue
+            candidates = source_nodes_by_symbol.get(str(relation.get("target_symbol_id") or ""), [])
+            if len(candidates) != 1:
+                continue
+            binding = (candidates[0], relation)
+            if not any(
+                existing_node is binding[0]
+                and str(existing_relation.get("relation_id") or "")
+                == str(relation.get("relation_id") or "")
+                for existing_node, existing_relation in matched_bindings
+            ):
+                matched_bindings.append(binding)
+        if not matched_bindings:
+            unbound.append({"test_file": test_file, "reason": "no_production_symbol_match", "compilation_action_id": action_id})
+            continue
+        for node, relation in matched_bindings:
+            coverage = node.setdefault("test_coverage", {"test_files": [], "covered_lines": 0})
+            coverage.setdefault("test_files", [])
+            if test_file not in coverage["test_files"]:
+                coverage["test_files"].append(test_file)
+                coverage["test_files"].sort()
+            evidence = {
+                "test_file": test_file,
+                "compilation_action_id": action_id,
+                "binding": "clang_call_to_source_symbol",
+                "relation_id": str(relation.get("relation_id") or ""),
+                "source_symbol_id": str(relation.get("source_symbol_id") or ""),
+                "target_symbol_id": str(relation.get("target_symbol_id") or ""),
+                "execution_proven": False,
+            }
+            coverage.setdefault("c_family_bindings", []).append(evidence)
+            bound.append({"node_id": node.get("node_id"), **evidence})
+    return {"bound": bound, "unbound": unbound}
 
 
 def _parse_python_module(fpath: str, mod_name: str, source: str) -> Optional[ModuleInfo]:
@@ -3627,6 +3896,7 @@ def append_filetree_fallback_source_nodes(
     project_root: str,
     nodes: List[Dict[str, Any]],
     profile: Optional[Any] = None,
+    exclude_paths: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Add source files not covered by the symbol parser as file-tree nodes."""
     try:
@@ -3650,11 +3920,12 @@ def append_filetree_fallback_source_nodes(
         return []
 
     added: List[Dict[str, Any]] = []
+    excluded = {_repo_relpath(project_root, path) for path in (exclude_paths or set())}
     for row in inventory:
         if row.get("file_kind") != "source":
             continue
         rel = str(row.get("path") or "")
-        if not rel or rel in existing:
+        if not rel or rel in existing or rel in excluded:
             continue
         module = DEFAULT_LANGUAGE_POLICY.strip_source_suffix(rel).replace("/", ".").replace("\\", ".")
         node = {
@@ -5667,6 +5938,22 @@ def build_graph_v2_from_symbols(
         project_root,
         profile=profile,
     )
+    c_family_analysis = _analyze_c_family_project(project_root)
+    c_family_test_files = {
+        _repo_relpath(project_root, str(row.get("file") or ""))
+        for row in (c_family_analysis.get("files") or [])
+        if isinstance(row, Mapping) and row.get("role") == "test"
+    }
+    c_family_action_files = {
+        _repo_relpath(project_root, str(row.get("file") or ""))
+        for row in (c_family_analysis.get("actions") or [])
+        if isinstance(row, Mapping) and row.get("file")
+    }
+    modules = {
+        name: module for name, module in modules.items()
+        if _repo_relpath(project_root, module.path) not in c_family_action_files
+    }
+    modules.update(_c_family_modules(project_root, c_family_analysis))
     _record_phase_step(
         phase_trace,
         "production_module_parsing",
@@ -5680,6 +5967,8 @@ def build_graph_v2_from_symbols(
             "parallelized": bool(production_parse_observability.get("parallelized")),
             "fallback_reason": str(production_parse_observability.get("fallback_reason") or ""),
             "parallel_executor": production_parse_observability,
+            "c_family_action_count": len(c_family_analysis.get("actions") or []),
+            "c_family_status": str(c_family_analysis.get("status") or ""),
         },
     )
 
@@ -5752,6 +6041,7 @@ def build_graph_v2_from_symbols(
         )
 
     nodes = aggregate_functions_into_nodes(modules, layer_scores)
+    _attach_c_family_compilation_identity(project_root, nodes, c_family_analysis)
     _record_phase_step(
         phase_trace,
         "dfs_coloring",
@@ -5800,6 +6090,11 @@ def build_graph_v2_from_symbols(
         test_consumer_fanin,
         graph_enrich_config_rules=graph_enrich_config_rules,
     )
+    c_family_test_bindings = _attach_c_family_test_bindings(
+        project_root,
+        nodes,
+        c_family_analysis,
+    )
 
     feature_clusters = synthesize_feature_clusters(
         project_root=project_root,
@@ -5812,7 +6107,12 @@ def build_graph_v2_from_symbols(
         node for node in nodes
         if node.get("source_kind") == "filetree_fallback"
     ]
-    fallback_nodes = append_filetree_fallback_source_nodes(project_root, nodes, profile=profile)
+    fallback_nodes = append_filetree_fallback_source_nodes(
+        project_root,
+        nodes,
+        profile=profile,
+        exclude_paths=c_family_action_files,
+    )
     all_fallback_nodes = adapter_fallback_nodes + fallback_nodes
     _attach_test_consumer_fanin_to_nodes(
         project_root,
@@ -5975,6 +6275,8 @@ def build_graph_v2_from_symbols(
             "diff_report": diff_report,
             "phase_trace": phase_trace,
             "phase_timing": _phase_timing_summary(phase_trace),
+            "c_family_analysis": c_family_analysis,
+            "c_family_test_bindings": c_family_test_bindings,
         }
         if include_parsed_modules:
             result["_parsed_modules"] = modules
@@ -6016,6 +6318,8 @@ def build_graph_v2_from_symbols(
             "diff_report": diff_report,
             "phase_trace": phase_trace,
             "phase_timing": _phase_timing_summary(phase_trace),
+            "c_family_analysis": c_family_analysis,
+            "c_family_test_bindings": c_family_test_bindings,
         }
         if include_parsed_modules:
             result["_parsed_modules"] = modules

@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(aming_claw_clang_indexer LANGUAGES CXX)
+add_executable(aming-claw-clang-indexer main.cc)
+target_compile_features(aming-claw-clang-indexer PRIVATE cxx_std_17)
+target_compile_options(aming-claw-clang-indexer PRIVATE -Wall -Wextra -pedantic)

@@ -1,0 +1,27 @@
+[
+  {
+    "directory": "@FIXTURE_ROOT@",
+    "file": "@FIXTURE_ROOT@/overlay.cc",
+    "arguments": ["@CLANGXX@", "-std=c++17", "-DOVERLAY_FEATURE=1", "-I@FIXTURE_ROOT@", "-c", "@FIXTURE_ROOT@/overlay.cc"]
+  },
+  {
+    "directory": "@FIXTURE_ROOT@",
+    "file": "@FIXTURE_ROOT@/overlay_mac.mm",
+    "arguments": ["@CLANGXX@", "-x", "objective-c++", "-std=c++17", "-DOVERLAY_FEATURE=1", "-I@FIXTURE_ROOT@", "-isysroot", "@SDKROOT@", "-c", "@FIXTURE_ROOT@/overlay_mac.mm"]
+  },
+  {
+    "directory": "@FIXTURE_ROOT@",
+    "file": "@FIXTURE_ROOT@/overlay_test.cc",
+    "arguments": ["@CLANGXX@", "-std=c++17", "-DOVERLAY_FEATURE=1", "-I@FIXTURE_ROOT@", "-c", "@FIXTURE_ROOT@/overlay_test.cc"]
+  },
+  {
+    "directory": "@FIXTURE_ROOT@",
+    "file": "@FIXTURE_ROOT@/unbound_test.cc",
+    "arguments": ["@CLANGXX@", "-std=c++17", "-I@FIXTURE_ROOT@", "-c", "@FIXTURE_ROOT@/unbound_test.cc"]
+  },
+  {
+    "directory": "@FIXTURE_ROOT@",
+    "file": "@FIXTURE_ROOT@/sdk_failure.mm",
+    "arguments": ["@CLANGXX@", "-x", "objective-c++", "-std=c++17", "-isysroot", "@FIXTURE_ROOT@/missing-sdk", "-c", "@FIXTURE_ROOT@/sdk_failure.mm"]
+  }
+]
