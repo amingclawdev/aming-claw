@@ -163829,6 +163829,7 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
     project_id: str,
     backlog_id: str,
     task_id: str,
+    contract_runtime_primary_authoritative: bool = False,
 ) -> bool:
     """Accept one canonical, server-gated observer Direct Main implementation."""
 
@@ -164120,6 +164121,10 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         and (
             decision_source == "route_token_gate"
             or route_action_scope_lineage_authoritative
+            or (
+                decision_source == "contract_runtime"
+                and contract_runtime_primary_authoritative
+            )
         )
         and decision.get("primary_decision_source") is True
         and decision.get("meta_contract_gate_decision_source") is False
@@ -164135,6 +164140,240 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         and str(route_scope.get("project_id") or "").strip() == project_id
         and str(route_scope.get("backlog_id") or "").strip() == backlog_id
         and str(route_scope.get("task_id") or "").strip() == task_id
+    )
+
+
+def _qa_exact_candidate_direct_main_contract_runtime_primary_is_authoritative(
+    conn,
+    event: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+) -> bool:
+    """Match a ContractRuntime-primary timeline projection to its exact line."""
+
+    payload = (
+        event.get("payload")
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    decision = (
+        payload.get("contract_gate_decision")
+        if isinstance(payload.get("contract_gate_decision"), Mapping)
+        else {}
+    )
+    runtime_gate = (
+        payload.get("contract_runtime_close_evidence_gate")
+        if isinstance(
+            payload.get("contract_runtime_close_evidence_gate"), Mapping
+        )
+        else {}
+    )
+    lineage = (
+        payload.get("direct_contract_runtime_lineage")
+        if isinstance(
+            payload.get("direct_contract_runtime_lineage"), Mapping
+        )
+        else {}
+    )
+    raw_projection_actions = decision.get("projection_actions") or []
+    projection_actions = [
+        item
+        for item in (
+            raw_projection_actions
+            if isinstance(raw_projection_actions, (list, tuple))
+            else []
+        )
+        if isinstance(item, Mapping)
+    ]
+    lineage_hash = str(lineage.get("lineage_hash") or "").strip()
+    if not (
+        str(decision.get("source_of_authority") or "").strip()
+        == "contract_runtime"
+        and str(decision.get("gate_id") or "").strip()
+        == "task_timeline_append:contract_runtime"
+        and str(decision.get("gate_type") or "").strip()
+        == "timeline_projection"
+        and any(
+            str(item.get("action") or "").strip()
+            == "record_timeline_event"
+            and str(item.get("source_of_authority") or "").strip()
+            == "contract_runtime"
+            for item in projection_actions
+        )
+        and runtime_gate.get("schema_version")
+        == _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+        and runtime_gate.get("accepted") is True
+        and str(runtime_gate.get("status") or "").strip()
+        == "validated_submission"
+        and runtime_gate.get("primary_decision_source") is True
+        and runtime_gate.get("meta_contract_gate_decision_source") is False
+        and str(runtime_gate.get("contract_execution_id") or "").strip()
+        == task_id
+        and str(runtime_gate.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(runtime_gate.get("actor_role") or "").strip() == "observer"
+        and str(runtime_gate.get("requested_event_kind") or "").strip()
+        == "implementation"
+        and str(runtime_gate.get("stage_id") or "").strip()
+        == "implementation"
+        and str(runtime_gate.get("line_id") or "").strip()
+        == "observer_implementation"
+        and str(runtime_gate.get("evidence_kind") or "").strip()
+        == "implementation"
+        and runtime_gate.get("contract_runtime_precheck_only") is True
+        and runtime_gate.get("zero_contract_runtime_write") is True
+        and runtime_gate.get("zero_timeline_write") is True
+        and runtime_gate.get("completed_line_mutated") is False
+        and runtime_gate.get("writes_performed") is False
+        and str(lineage.get("schema_version") or "").strip()
+        == "operator_supervised_direct_main.timeline_runtime_lineage.v1"
+        and str(lineage.get("source_of_authority") or "").strip()
+        == "ContractRuntime"
+        and str(lineage.get("contract_execution_id") or "").strip()
+        == task_id
+        and lineage.get("timeline_facade_adapter") is True
+        and lineage.get("pass_synthesized") is False
+        and lineage_hash
+        and lineage_hash
+        == stable_sha256(
+            {key: value for key, value in lineage.items() if key != "lineage_hash"}
+        )
+    ):
+        return False
+
+    try:
+        record = _contract_runtime(conn).store.get(task_id)
+    except (ContractRuntimeError, KeyError, sqlite3.Error):
+        return False
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    binding_hash = str(binding.get("binding_hash") or "").strip()
+    raw_completed_lines = record.get("completed_lines") or []
+    completed_lines = [
+        item
+        for item in (
+            raw_completed_lines
+            if isinstance(raw_completed_lines, (list, tuple))
+            else []
+        )
+        if isinstance(item, Mapping)
+    ]
+    implementation_lines = [
+        item
+        for item in completed_lines
+        if str(item.get("stage_id") or "").strip() == "implementation"
+        and str(item.get("line_id") or "").strip()
+        == "observer_implementation"
+        and str(item.get("evidence_kind") or "").strip()
+        == "implementation"
+        and str(item.get("actor_role") or "").strip() == "observer"
+    ]
+    if len(implementation_lines) != 1:
+        return False
+    implementation_line = implementation_lines[0]
+    line_payload = (
+        implementation_line.get("payload")
+        if isinstance(implementation_line.get("payload"), Mapping)
+        else {}
+    )
+    expected_line_payload = {
+        key: value
+        for key, value in payload.items()
+        if key != "direct_contract_runtime_lineage"
+    }
+    actual_line_payload = {
+        key: value
+        for key, value in line_payload.items()
+        if key != "schema_version"
+    }
+    raw_lineage_refs = lineage.get("completed_line_refs") or []
+    lineage_refs = [
+        dict(item)
+        for item in (
+            raw_lineage_refs
+            if isinstance(raw_lineage_refs, (list, tuple))
+            else []
+        )
+        if isinstance(item, Mapping)
+    ]
+    runtime_guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    try:
+        runtime_revision = int(record.get("execution_state_revision") or 0)
+        lineage_revision = int(lineage.get("execution_state_revision") or 0)
+    except (TypeError, ValueError):
+        return False
+    common_rule_join = (
+        record.get("authoritative_common_rule_join")
+        if isinstance(record.get("authoritative_common_rule_join"), Mapping)
+        else {}
+    )
+    return bool(
+        str(record.get("project_id") or "").strip() == project_id
+        and str(record.get("backlog_id") or "").strip() == backlog_id
+        and str(record.get("contract_execution_id") or "").strip()
+        == task_id
+        and str(record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        and binding.get("strict_runtime_binding_required") is True
+        and binding.get("server_derived") is True
+        and binding.get("caller_claims_trusted") is False
+        and str(binding.get("project_id") or "").strip() == project_id
+        and str(binding.get("backlog_id") or "").strip() == backlog_id
+        and str(binding.get("contract_execution_id") or "").strip()
+        == task_id
+        and binding_hash
+        and binding_hash
+        == stable_sha256(
+            {key: value for key, value in binding.items() if key != "binding_hash"}
+        )
+        and str(payload.get("direct_runtime_binding_hash") or "").strip()
+        == binding_hash
+        and str(implementation_line.get("commit_sha") or "").strip().lower()
+        == str(event.get("commit_sha") or "").strip().lower()
+        and stable_sha256(actual_line_payload)
+        == stable_sha256(expected_line_payload)
+        and runtime_revision == lineage_revision
+        and lineage_refs
+        == [
+            {
+                "stage_id": "implementation",
+                "line_id": "observer_implementation",
+                "evidence_kind": "implementation",
+                "execution_state_revision": runtime_revision,
+            }
+        ]
+        and str(lineage.get("definition_hash") or "").strip()
+        == str(record.get("definition_hash") or "").strip()
+        and str(lineage.get("definition_source_sha256") or "").strip()
+        == str(record.get("definition_source_sha256") or "").strip()
+        and str(lineage.get("instruction_bundle_hash") or "").strip()
+        == str(record.get("instruction_bundle_hash") or "").strip()
+        and stable_sha256(lineage.get("authoritative_common_rule_join") or {})
+        == stable_sha256(common_rule_join)
+        and common_rule_join.get("declared") is True
+        and common_rule_join.get("join_state") == "resolved"
+        and common_rule_join.get("authoritative") is True
+        and str(lineage.get("runtime_guide_hash") or "").strip()
+        == str(runtime_guide.get("runtime_guide_hash") or "").strip()
     )
 
 
@@ -164184,12 +164423,24 @@ def _qa_exact_candidate_direct_main_implementation_is_authoritative(
             )
             observer_event = {**dict(event), "payload": bootstrap_payload}
 
+    contract_runtime_primary_authoritative = (
+        _qa_exact_candidate_direct_main_contract_runtime_primary_is_authoritative(
+            conn,
+            observer_event,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    )
     return _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         observer_event,
         direct_event=direct_event,
         project_id=project_id,
         backlog_id=backlog_id,
         task_id=task_id,
+        contract_runtime_primary_authoritative=(
+            contract_runtime_primary_authoritative
+        ),
     )
 
 

@@ -1958,6 +1958,7 @@ def _strict_direct_main_comparison_world(
     declared_files: list[str] | None = None,
     actual_files: list[str] | None = None,
     file_inventory: list[dict[str, Any]] | None = None,
+    contract_runtime_primary: bool = False,
 ) -> dict[str, Any]:
     """Create a real rev3 Direct Main round through its public facades."""
 
@@ -2061,20 +2062,48 @@ def _strict_direct_main_comparison_world(
         text=True,
     )
     candidate_commit = batch_jobs.git_commit(project_root)
-    server.handle_task_timeline_append(
+    implementation_body = _canonical_parentless_direct_main_implementation_body(
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+        route_identity=route_identity,
+        commit_sha=candidate_commit,
+        changed_files=actual_files,
+        allowed_files=declared_files,
+    )
+    if contract_runtime_primary:
+        implementation_guide = server.handle_project_onboard_route_guide(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "role": "observer",
+                    "work_type": "operator_supervised_direct_main",
+                    "route_token_ref": route_token_ref,
+                    "response_view": "compact",
+                },
+            )
+        )
+        next_action = implementation_guide["next_legal_action"]
+        assert next_action["line_id"] == "observer_implementation"
+        copy_safe_body = next_action["copy_safe_body"]
+        assert copy_safe_body["task_id"] == task_id
+        runtime_record = server._contract_runtime(conn).store.get(task_id)
+        runtime_binding = runtime_record["metadata"][
+            "operator_supervised_direct_main_runtime_binding"
+        ]
+        implementation_body["contract_execution_id"] = task_id
+        implementation_body["payload"]["direct_runtime_binding_hash"] = (
+            runtime_binding["binding_hash"]
+        )
+    implementation = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
             method="POST",
-            body=_canonical_parentless_direct_main_implementation_body(
-                backlog_id=backlog_id,
-                task_id=task_id,
-                route_token_ref=route_token_ref,
-                route_identity=route_identity,
-                commit_sha=candidate_commit,
-                changed_files=actual_files,
-                allowed_files=declared_files,
-            ),
+            body=implementation_body,
         )
     )
     candidate_snapshot_id = f"full-direct-qa-{suffix.lower()}"
@@ -2121,6 +2150,7 @@ def _strict_direct_main_comparison_world(
         "candidate_commit": candidate_commit,
         "candidate_snapshot_id": candidate_snapshot_id,
         "trace_id": trace_id,
+        "implementation": implementation,
     }
 
 
@@ -3851,6 +3881,63 @@ def test_strict_direct_main_rev3_comparison_authority_persists_exact_diff(
         monkeypatch,
         tmp_path,
         suffix="R3-EXACT",
+        contract_runtime_primary=True,
+    )
+    implementation = world["implementation"]
+    implementation_payload = implementation["payload"]
+    decision = implementation_payload["contract_gate_decision"]
+    assert decision["source_of_authority"] == "contract_runtime"
+    assert decision["primary_decision_source"] is True
+    assert decision["meta_contract_gate_decision_source"] is False
+    assert "route_action_scope_lineage" not in implementation_payload
+    assert implementation_payload[
+        "direct_main_implementation_commit_prewrite_authority"
+    ]["passed"] is True
+    assert task_timeline._source_backed_route_gate_authority_valid(
+        implementation_payload["source_backed_contract_gate_authority"]
+    )
+    lineage = implementation_payload["direct_contract_runtime_lineage"]
+    assert lineage["source_of_authority"] == "ContractRuntime"
+    assert lineage["contract_execution_id"] == world["task_id"]
+    assert lineage["completed_line_refs"] == [
+        {
+            "stage_id": "implementation",
+            "line_id": "observer_implementation",
+            "evidence_kind": "implementation",
+            "execution_state_revision": 5,
+        }
+    ]
+    assert lineage["lineage_hash"] == server.stable_sha256(
+        {key: value for key, value in lineage.items() if key != "lineage_hash"}
+    )
+    runtime_record = server._contract_runtime(conn).store.get(world["task_id"])
+    runtime_line = next(
+        item
+        for item in runtime_record["completed_lines"]
+        if item.get("line_id") == "observer_implementation"
+    )
+    runtime_binding = runtime_record["metadata"][
+        "operator_supervised_direct_main_runtime_binding"
+    ]
+    actual_line_payload = {
+        key: value
+        for key, value in runtime_line["payload"].items()
+        if key != "schema_version"
+    }
+    expected_line_payload = {
+        key: value
+        for key, value in implementation_payload.items()
+        if key != "direct_contract_runtime_lineage"
+    }
+    assert runtime_binding["binding_hash"] == server.stable_sha256(
+        {
+            key: value
+            for key, value in runtime_binding.items()
+            if key != "binding_hash"
+        }
+    )
+    assert server.stable_sha256(actual_line_payload) == server.stable_sha256(
+        expected_line_payload
     )
     proof = {
         "backlog_id": world["backlog_id"],
@@ -3941,6 +4028,109 @@ def test_strict_direct_main_rev3_comparison_authority_persists_exact_diff(
     assert trace["root_identity"]["comparison_base_commit_sha"] == (
         world["base_commit"]
     )
+
+
+def test_strict_direct_main_contract_runtime_primary_rejects_unbound_candidate(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="CONTRACT-RUNTIME-UNBOUND",
+        contract_runtime_primary=True,
+    )
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=100,
+    )
+    direct_event = next(
+        event
+        for event in events
+        if event["event_kind"] == "observer_direct_implementation_exception"
+    )
+    implementation = next(
+        event for event in events if event["event_kind"] == "implementation"
+    )
+
+    forged_binding = copy.deepcopy(implementation)
+    forged_binding["payload"]["direct_runtime_binding_hash"] = (
+        "sha256:" + "f" * 64
+    )
+    forged_lineage = copy.deepcopy(implementation)
+    forged_lineage_payload = forged_lineage["payload"][
+        "direct_contract_runtime_lineage"
+    ]
+    forged_lineage_payload["definition_hash"] = "sha256:" + "f" * 64
+    forged_lineage_payload["lineage_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in forged_lineage_payload.items()
+            if key != "lineage_hash"
+        }
+    )
+    wrong_execution = copy.deepcopy(implementation)
+    wrong_execution["payload"]["contract_runtime_close_evidence_gate"][
+        "contract_execution_id"
+    ] = "cex-direct-main-cross-scope"
+    malformed_lineage = copy.deepcopy(implementation)
+    malformed_lineage["payload"]["direct_contract_runtime_lineage"][
+        "execution_state_revision"
+    ] = "not-an-integer"
+    malformed_lineage_payload = malformed_lineage["payload"][
+        "direct_contract_runtime_lineage"
+    ]
+    malformed_lineage_payload["lineage_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in malformed_lineage_payload.items()
+            if key != "lineage_hash"
+        }
+    )
+
+    before_changes = conn.total_changes
+    for candidate in (
+        forged_binding,
+        forged_lineage,
+        wrong_execution,
+        malformed_lineage,
+    ):
+        assert not server._qa_exact_candidate_direct_main_implementation_is_authoritative(
+            conn,
+            candidate,
+            direct_event=direct_event,
+            project_id=PID,
+            backlog_id=world["backlog_id"],
+            task_id=world["task_id"],
+        )
+    assert conn.total_changes == before_changes
+
+    runtime = server._contract_runtime(conn)
+    # This fixture-owned corruption verifies the read path fails closed; it
+    # does not model or grant arbitrary access to an external runtime store.
+    record = runtime.store.get(world["task_id"])
+    implementation_line = next(
+        line
+        for line in record["completed_lines"]
+        if line.get("line_id") == "observer_implementation"
+    )
+    implementation_line["payload"]["unbound_test_field"] = True
+    runtime.store.update(world["task_id"], record)
+    before_changes = conn.total_changes
+    assert not server._qa_exact_candidate_direct_main_implementation_is_authoritative(
+        conn,
+        implementation,
+        direct_event=direct_event,
+        project_id=PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+    )
+    assert conn.total_changes == before_changes
 
 
 def test_strict_direct_main_rev3_comparison_authority_accepts_actual_subset(
