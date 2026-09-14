@@ -2798,6 +2798,9 @@ def index_graph_snapshot(
         node_id = str(node.get("id") or node.get("node_id") or "")
         if not node_id:
             continue
+        metadata = dict(node.get("metadata") or {})
+        if "config" in node:
+            metadata["config_files"] = json.loads(_json_list(node.get("config")))
         conn.execute(
             """
             INSERT OR REPLACE INTO graph_nodes_index
@@ -2815,7 +2818,7 @@ def index_graph_snapshot(
                 _json_list(node.get("primary") or node.get("primary_files")),
                 _json_list(node.get("secondary") or node.get("secondary_files")),
                 _json_list(node.get("test") or node.get("test_files")),
-                _json(node.get("metadata") or {}),
+                _json(metadata),
             ),
         )
         node_count += 1

@@ -2666,6 +2666,42 @@ def test_create_index_and_activate_snapshot(conn, tmp_path):
     assert json.loads(node["metadata_json"])["kind"] == "state_store"
 
 
+def test_index_graph_snapshot_prefers_explicit_config_without_mutating_nodes(conn):
+    _ensure_schema(conn)
+    nodes = [
+        {
+            "id": "L7.config",
+            "config": ["config/build.yaml", "config/settings.json"],
+            "metadata": {"config_files": [], "kind": "state_store"},
+        },
+        {
+            "id": "L7.empty-config",
+            "config": [],
+            "metadata": {"config_files": ["config/stale.json"]},
+        },
+        {
+            "id": "L7.legacy-config",
+            "metadata": {"config_files": ["config/legacy.json"]},
+        },
+    ]
+
+    store.index_graph_snapshot(conn, PID, "full-config-index", nodes=nodes)
+
+    rows = conn.execute(
+        "SELECT node_id, metadata_json FROM graph_nodes_index "
+        "WHERE project_id=? AND snapshot_id=? ORDER BY node_id",
+        (PID, "full-config-index"),
+    ).fetchall()
+    indexed = {row["node_id"]: json.loads(row["metadata_json"]) for row in rows}
+    assert indexed["L7.config"]["config_files"] == [
+        "config/build.yaml", "config/settings.json",
+    ]
+    assert indexed["L7.empty-config"]["config_files"] == []
+    assert indexed["L7.legacy-config"]["config_files"] == ["config/legacy.json"]
+    assert nodes[0]["metadata"]["config_files"] == []
+    assert nodes[1]["metadata"]["config_files"] == ["config/stale.json"]
+
+
 def test_activate_snapshot_compare_and_swap_rejects_stale_writer(conn):
     _ensure_schema(conn)
     first = store.create_graph_snapshot(

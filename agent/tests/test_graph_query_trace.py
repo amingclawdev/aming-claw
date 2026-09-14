@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent.governance import graph_events
+from agent.governance import governance_hints
 from agent.governance import graph_query_trace
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
@@ -407,6 +408,101 @@ def test_query_tools_reuse_graph_files_and_search_docs(conn, tmp_path):
     assert trace["query_purpose"] == "inspect_node"
     assert trace["status"] == "complete"
     assert trace["usage"]["file_excerpt_chars"] > 0
+
+
+def test_resolved_yaml_and_json_config_hints_survive_snapshot_and_traced_query(conn, tmp_path):
+    project_root = tmp_path / "resolver-chain"
+    (project_root / "agent" / "governance").mkdir(parents=True)
+    (project_root / "agent" / "tests").mkdir(parents=True)
+    (project_root / "docs").mkdir(parents=True)
+    (project_root / "config").mkdir(parents=True)
+    (project_root / "agent" / "governance" / "server.py").write_text(
+        "def serve():\n    return 'ok'\n", encoding="utf-8",
+    )
+    (project_root / "agent" / "tests" / "test_server.py").write_text(
+        "def test_serve():\n    assert True\n", encoding="utf-8",
+    )
+    (project_root / "docs" / "architecture.md").write_text(
+        "Governance server architecture.\n", encoding="utf-8",
+    )
+    (project_root / "config" / "build.yaml").write_text(
+        '# governance-hint {"binding":{"role":"config","path":".","target_node_id":"L7.1"}}\n'
+        "build: true\n",
+        encoding="utf-8",
+    )
+    (project_root / "config" / "settings.json").write_text(
+        json.dumps({
+            "enabled": True,
+            "governance_hints": {
+                "schema_version": "governance_hints.v1",
+                "asset_binding_events": [{
+                    "schema_version": "asset_binding_event.v1",
+                    "operation": "bind",
+                    "path": ".",
+                    "role": "config",
+                    "target_node_id": "L7.1",
+                }],
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (project_root / "config" / "unbound.json").write_text("{}\n", encoding="utf-8")
+    nodes = [{
+        "id": "L7.1",
+        "layer": "L7",
+        "title": "Governance Server",
+        "primary": ["agent/governance/server.py"],
+        "secondary": ["docs/architecture.md"],
+        "test": ["agent/tests/test_server.py"],
+        "config": [],
+        "metadata": {"config_files": []},
+    }]
+
+    resolved = governance_hints.apply_binding_hints_to_graph_nodes(project_root, nodes)
+    assert resolved["applied_count"] == 2
+    assert nodes[0]["config"] == ["config/build.yaml", "config/settings.json"]
+    assert "config/unbound.json" not in nodes[0]["config"]
+    assert {
+        (entry["path"], entry["source_path"])
+        for entry in nodes[0]["metadata"]["governance_hint_bindings"]
+    } == {
+        ("config/build.yaml", "config/build.yaml"),
+        ("config/settings.json", "config/settings.json"),
+    }
+
+    graph = {"deps_graph": {"nodes": nodes, "edges": []}}
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-resolver-config-query",
+        commit_sha="resolver-config-query",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(conn, PID, snapshot["snapshot_id"], nodes=nodes)
+    conn.commit()
+
+    config = graph_query_trace.traced_query(
+        conn, PID, snapshot["snapshot_id"],
+        actor="observer", query_source="api_debug", query_purpose="api_debug",
+        tool="get_config", args={"node_id": "L7.1"}, project_root=project_root,
+    )
+    tests = graph_query_trace.traced_query(
+        conn, PID, snapshot["snapshot_id"],
+        actor="observer", query_source="api_debug", query_purpose="api_debug",
+        tool="get_tests", args={"node_id": "L7.1"}, project_root=project_root,
+    )
+    docs = graph_query_trace.traced_query(
+        conn, PID, snapshot["snapshot_id"],
+        actor="observer", query_source="api_debug", query_purpose="api_debug",
+        tool="get_docs", args={"node_id": "L7.1"}, project_root=project_root,
+    )
+
+    assert config["result"]["files"] == ["config/build.yaml", "config/settings.json"]
+    assert config["result"]["count"] == 2
+    assert "config/unbound.json" not in config["result"]["files"]
+    assert tests["result"]["files"] == ["agent/tests/test_server.py"]
+    assert docs["result"]["files"] == ["docs/architecture.md"]
 
 
 def test_one_shot_query_finishes_failed_trace_on_error(conn, tmp_path):
