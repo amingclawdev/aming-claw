@@ -749,6 +749,62 @@ def operator_supervised_direct_main_runtime_binding_errors(
                 "active_snapshot_commit",
             )
         }
+        implementation_commit = (
+            next(iter(implementation_commits))
+            if len(implementation_commits) == 1
+            else ""
+        )
+        target_commit = str(
+            authority.get("target_commit_sha") or ""
+        ).strip().lower()
+        authority_implementation_commit = str(
+            authority.get("implementation_commit_sha") or ""
+        ).strip().lower()
+        if not authority_implementation_commit and target_commit == implementation_commit:
+            # Authorities persisted before landed-candidate support projected
+            # one commit in every field and had no separate implementation
+            # field.  Keep that exact-current shape valid without permitting a
+            # missing field for the new C != H authority.
+            authority_implementation_commit = target_commit
+        landed_authority = (
+            authority.get("landed_qa_current_head_authority")
+            if isinstance(
+                authority.get("landed_qa_current_head_authority"), Mapping
+            )
+            else {}
+        )
+        landed_authority_hash = str(
+            landed_authority.get("authority_hash") or ""
+        ).strip()
+        landed_pair = bool(
+            implementation_commit
+            and implementation_commit != target_commit
+            and authority.get("landed_ancestor_current_head_verified") is True
+            and landed_authority.get("verified") is True
+            and landed_authority.get("server_derived") is True
+            and landed_authority.get("caller_claims_trusted") is False
+            and str(landed_authority.get("candidate_commit_sha") or "")
+            .strip()
+            .lower()
+            == implementation_commit
+            and str(
+                landed_authority.get("canonical_head_commit_sha") or ""
+            )
+            .strip()
+            .lower()
+            == target_commit
+            and landed_authority.get("candidate_is_ancestor") is True
+            and landed_authority.get("no_newer_descendant_after_qa") is True
+            and landed_authority_hash
+            and landed_authority_hash
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in landed_authority.items()
+                    if key != "authority_hash"
+                }
+            )
+        )
         route_evidence = (
             authority.get("route_evidence")
             if isinstance(authority.get("route_evidence"), Mapping)
@@ -825,7 +881,9 @@ def operator_supervised_direct_main_runtime_binding_errors(
             and str(authority.get("contract_execution_id") or "").strip()
             == str(execution_state.get("contract_execution_id") or "").strip()
             and len(implementation_commits) == 1
-            and commit_fields == implementation_commits
+            and commit_fields == {target_commit}
+            and authority_implementation_commit == implementation_commit
+            and (target_commit == implementation_commit or landed_pair)
             and str(authority.get("active_snapshot_id") or "").strip()
             and int(authority.get("qa_event_id") or 0) > 0
             and int(authority.get("qa_event_id") or 0)
@@ -865,7 +923,22 @@ def operator_supervised_direct_main_runtime_binding_errors(
             and str(qa_preflight.get("target_commit_sha") or "")
             .strip()
             .lower()
-            in implementation_commits
+            == target_commit
+            and (
+                str(qa_preflight.get("implementation_commit_sha") or "")
+                .strip()
+                .lower()
+                or (
+                    target_commit
+                    if target_commit == implementation_commit
+                    else ""
+                )
+            )
+            == implementation_commit
+            and bool(
+                qa_preflight.get("landed_ancestor_current_head_verified")
+            )
+            == landed_pair
             and int(qa_preflight.get("qa_event_id") or 0)
             == int(authority.get("qa_event_id") or 0)
             and str(qa_preflight.get("qa_event_ref") or "").strip()

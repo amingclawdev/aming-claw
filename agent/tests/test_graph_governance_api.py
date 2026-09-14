@@ -2508,6 +2508,735 @@ def test_direct_qa_http_continues_verified_landed_superseded_snapshot(
     ) == snapshots_before
 
 
+def test_direct_landed_qa_reconciles_same_active_head_once_and_replays_zero_write(
+    conn, monkeypatch, tmp_path,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="LANDED-SAME-ACTIVE-RECONCILE",
+    )
+    canonical_head = _land_strict_direct_qa_candidate(conn, world)
+    append_qa, qa_body, _guide = _direct_qa_facade_http_session(
+        conn, world, activate_candidate=False,
+    )
+    accepted_qa = append_qa(copy.deepcopy(qa_body))
+    qa_proof = accepted_qa["payload"][
+        "source_backed_contract_gate_authority"
+    ]["qa_session_proof"]
+    assert qa_proof["commit_sha"] == world["candidate_commit"]
+    assert qa_proof["post_merge_provenance"][
+        "canonical_head_commit_sha"
+    ] == canonical_head
+    landed = server._operator_supervised_direct_main_landed_qa_authority(
+        conn,
+        project_id=PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        proof=qa_proof,
+        target_commit=canonical_head,
+    )
+    assert landed, json.dumps(qa_proof, sort_keys=True, indent=2)
+
+    observer_session_id = "obs-direct-landed-same-active-reconcile"
+    _insert_active_observer_session_ref(
+        conn, session_id=observer_session_id,
+    )
+    active = store.get_active_graph_snapshot(conn, PID)
+    snapshot_id = active["snapshot_id"]
+    run_id = "current-full-direct-landed-same-active-prior"
+    observer_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": world["backlog_id"],
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": world["route_token_ref"],
+                "observer_session_id": observer_session_id,
+            },
+        )
+    )
+    advertised_action = observer_guide["next_legal_action"]
+    assert advertised_action["mcp_tool"] == "graph_current_full_reconcile"
+    assert advertised_action["copy_safe_body"]["target_commit_sha"] == (
+        canonical_head
+    )
+    assert advertised_action["action_input_ready"] is True
+    reconcile_body = copy.deepcopy(advertised_action["copy_safe_body"])
+    reconcile_body.pop("project_id", None)
+    run_id = reconcile_body["run_id"]
+    assert reconcile_body["snapshot_id"] == snapshot_id
+    assert reconcile_body["expected_old_snapshot_id"] == snapshot_id
+    assert reconcile_body["backlog_id"] == world["backlog_id"]
+    assert reconcile_body["task_id"] == world["task_id"]
+    assert reconcile_body["observer_session_id"] == observer_session_id
+    assert reconcile_body["observer_route_token_ref"] == world["route_token_ref"]
+    before_event_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    before_provenance_count = conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance"
+    ).fetchone()[0]
+    before_metric_count = conn.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics"
+    ).fetchone()[0]
+
+    status, reconciled = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=reconcile_body)
+    )
+
+    assert status == 201, json.dumps(reconciled, sort_keys=True, indent=2)
+    assert reconciled["ok"] is True
+    assert reconciled["snapshot_id"] == snapshot_id
+    assert reconciled["active_snapshot_id"] == snapshot_id
+    assert reconciled["target_commit_sha"] == canonical_head
+    assert reconciled["graph_delta_mode"] == "same_active_current_full"
+    assert reconciled["same_active_current_full"] is True
+    assert reconciled["rebuild_skipped"] is True
+    assert reconciled["activation"]["previous_snapshot_id"] == snapshot_id
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_event_count + 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance"
+    ).fetchone()[0] == before_provenance_count + 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics"
+    ).fetchone()[0] == before_metric_count + 1
+
+    def terminal_rows(selected_run_id):
+        metric = dict(
+            conn.execute(
+                "SELECT * FROM reconcile_run_metrics WHERE project_id=? "
+                "AND run_id=? AND snapshot_id=?",
+                (PID, selected_run_id, snapshot_id),
+            ).fetchone()
+        )
+        evidence = json.loads(metric["evidence_json"])
+        provenance = dict(
+            conn.execute(
+                "SELECT * FROM graph_current_full_reconcile_provenance "
+                "WHERE project_id=? AND provenance_id=?",
+                (PID, evidence["provenance_id"]),
+            ).fetchone()
+        )
+        event = dict(
+            conn.execute(
+                "SELECT * FROM task_timeline_events WHERE project_id=? AND id=?",
+                (PID, evidence["reconcile_event_id"]),
+            ).fetchone()
+        )
+        return metric, evidence, provenance, event
+
+    current_rows = terminal_rows(run_id)
+    _metric, evidence, provenance, _event = current_rows
+    terminal = store.current_full_active_terminal_tuple(
+        conn,
+        project_id=PID,
+        run_id=run_id,
+        target_commit_sha=canonical_head,
+        expected_scope=evidence["idempotency_scope"],
+        snapshot_id=snapshot_id,
+    )
+    assert terminal["valid"] is True, terminal
+    historical_state = store.current_full_reconcile_state(
+        conn,
+        PID,
+        world["candidate_commit"],
+        current_canonical_commit_sha=canonical_head,
+        reconcile_target_commit_sha=canonical_head,
+        reconcile_event_id=evidence["reconcile_event_id"],
+        reconcile_event_created_at=provenance[
+            "reconcile_event_created_at"
+        ],
+        allow_taskless=True,
+    )
+    assert historical_state["provenance_verified"] is True
+    assert historical_state["current_full_reconcile_provenance"][
+        "provenance_id"
+    ] == evidence["provenance_id"]
+    latest_state = store.current_full_reconcile_state(
+        conn,
+        PID,
+        world["candidate_commit"],
+        current_canonical_commit_sha=canonical_head,
+        allow_taskless=True,
+    )
+    assert latest_state["provenance_verified"] is True
+    assert latest_state["current_full_reconcile_provenance"][
+        "provenance_id"
+    ] == current_rows[1]["provenance_id"]
+
+    before_replay = tuple(conn.iterdump())
+    before_replay_changes = conn.total_changes
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID}, method="POST",
+            body=copy.deepcopy(reconcile_body),
+        )
+    )
+    assert replay_status == 200, json.dumps(replay, sort_keys=True, indent=2)
+    assert replay["idempotent_replay"] is True
+    assert replay["graph_delta_mode"] == "same_active_current_full"
+    assert replay["same_active_current_full"] is True
+    assert conn.total_changes == before_replay_changes
+    assert tuple(conn.iterdump()) == before_replay
+
+    new_run_body = {
+        **reconcile_body,
+        "run_id": "current-full-direct-landed-forbidden-new-run",
+    }
+    before_new_run = tuple(conn.iterdump())
+    before_new_run_changes = conn.total_changes
+    new_run_status, new_run = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=new_run_body)
+        )
+    )
+    assert new_run_status == 409
+    assert new_run["error"] == (
+        "direct_landed_same_active_new_run_replay_forbidden"
+    )
+    assert new_run["writes_performed"] is False
+    assert conn.total_changes == before_new_run_changes
+    assert tuple(conn.iterdump()) == before_new_run
+
+    append_base = {
+        "backlog_id": world["backlog_id"],
+        "task_id": world["task_id"],
+        "route_token_ref": world["route_token_ref"],
+    }
+    recorded_reconcile = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "observer.reconcile",
+                "event_kind": "reconcile",
+                "phase": "reconcile",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": canonical_head,
+                "payload": {
+                    **world["route_identity"],
+                    "graph_reconciled": True,
+                    "current_full_reconcile": True,
+                },
+            },
+        )
+    )
+    reconcile_line = server._contract_runtime(conn).current_record(
+        world["task_id"], actor_role="observer",
+    )["completed_lines"][-1]
+    assert reconcile_line["line_id"] == "observer_reconcile"
+    reconcile_authority = reconcile_line["payload"][
+        "direct_current_full_reconcile_authority"
+    ]
+    assert reconcile_authority["implementation_commit_sha"] == (
+        world["candidate_commit"]
+    )
+    assert reconcile_authority["target_commit_sha"] == canonical_head
+    assert reconcile_authority[
+        "landed_ancestor_current_head_verified"
+    ] is True
+
+    close_body = {
+        **append_base,
+        "event_type": "observer.close_ready",
+        "event_kind": "close_ready",
+        "phase": "close_ready",
+        "status": "passed",
+        "actor": "observer",
+        "commit_sha": canonical_head,
+        "verification": {
+            "governance_redeploy": {"status": "passed"},
+            "graph_reconciled": True,
+            "preflight_ok": True,
+            "live_regression": {"status": "passed"},
+            "test_results": (
+                _canonical_parentless_direct_main_test_results(
+                    canonical_head
+                )
+            ),
+        },
+        "payload": {
+            **world["route_identity"],
+            "graph_reconciled": True,
+            "close_commit": canonical_head,
+        },
+    }
+    normalized_kind, normalized_status, normalized_payload = (
+        task_timeline.validate_and_normalize_mf_read_receipt_append(
+            event_type=close_body["event_type"],
+            event_kind=close_body["event_kind"],
+            actor=close_body["actor"],
+            status=close_body["status"],
+            payload=close_body["payload"],
+        )
+    )
+    before_close_precheck = tuple(conn.iterdump())
+    before_close_precheck_changes = conn.total_changes
+    close_precheck = (
+        server._contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
+            conn,
+            project_id=PID,
+            body=close_body,
+            event_kind=normalized_kind,
+            normalized_status=normalized_status,
+            normalized_payload=normalized_payload,
+        )
+    )
+    assert close_precheck["passed"] is True, json.dumps(
+        close_precheck, sort_keys=True, indent=2,
+    )
+    assert conn.total_changes == before_close_precheck_changes
+    assert tuple(conn.iterdump()) == before_close_precheck
+
+    close_ready = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=close_body,
+        )
+    )
+    assert close_ready["commit_sha"] == canonical_head
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": world["backlog_id"]},
+            query={"close_commit": canonical_head},
+        )
+    )
+    close_projection = precheck["timeline_gate"][
+        "contract_runtime_close_authority_projection"
+    ]
+    direct_gate = close_projection[
+        "operator_supervised_direct_main_close_authority_gate"
+    ]
+    assert direct_gate["passed"] is True, json.dumps(
+        direct_gate, sort_keys=True, indent=2,
+    )
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": world["backlog_id"]},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": canonical_head,
+                "contract_execution_id": world["task_id"],
+                "route_token_ref": world["route_token_ref"],
+            },
+        )
+    )
+    assert closed["status"] == "FIXED"
+
+
+def _direct_landed_same_active_ready(
+    conn, monkeypatch, tmp_path, *, suffix,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix=suffix,
+    )
+    canonical_head = _land_strict_direct_qa_candidate(conn, world)
+    append_qa, qa_body, _guide = _direct_qa_facade_http_session(
+        conn, world, activate_candidate=False,
+    )
+    append_qa(copy.deepcopy(qa_body))
+    observer_session_id = f"obs-{suffix.lower()}"
+    _insert_active_observer_session_ref(
+        conn, session_id=observer_session_id,
+    )
+    active = store.get_active_graph_snapshot(conn, PID)
+    body = {
+        "target_commit_sha": canonical_head,
+        "snapshot_id": active["snapshot_id"],
+        "expected_old_snapshot_id": active["snapshot_id"],
+        "run_id": f"run-{suffix.lower()}",
+        "activate": True,
+        "semantic_enrich": False,
+        "backlog_id": world["backlog_id"],
+        "task_id": world["task_id"],
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": world["route_token_ref"],
+    }
+    preflight = (
+        server._operator_supervised_direct_main_reconcile_qa_preflight_authority(
+            conn,
+            project_id=PID,
+            target_commit=canonical_head,
+            current_full_auth={
+                "route_token_ref": world["route_token_ref"],
+                "route_token_scope": {
+                    "project_id": PID,
+                    "backlog_id": world["backlog_id"],
+                    "task_id": world["task_id"],
+                },
+            },
+        )
+    )
+    assert preflight["passed"] is True, preflight
+    assert preflight["landed_ancestor_current_head_verified"] is True
+    return world, canonical_head, active, body
+
+
+@pytest.mark.parametrize("mutation", ("wrong_cas", "pending", "companion"))
+def test_direct_landed_same_active_reconcile_final_boundary_failures_are_zero_write(
+    conn, monkeypatch, tmp_path, mutation,
+):
+    world, canonical_head, active, body = _direct_landed_same_active_ready(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"LANDED-FINAL-{mutation.upper()}",
+    )
+    if mutation == "wrong_cas":
+        body["expected_old_snapshot_id"] = "full-foreign-cas"
+    elif mutation == "pending":
+        store.queue_pending_scope_reconcile(
+            conn,
+            PID,
+            commit_sha=canonical_head,
+            parent_commit_sha=world["candidate_commit"],
+            ref_name="active",
+            branch_ref="refs/heads/main",
+            worktree_id="pending-direct-landed",
+            worktree_path=str(world["project_root"]),
+        )
+        conn.commit()
+    else:
+        companion_path = (
+            store.snapshot_companion_dir(PID, active["snapshot_id"])
+            / "graph.json"
+        )
+        companion_path.write_text("{}\n", encoding="utf-8")
+
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    status, rejected = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert status == 409, rejected
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("mutation", ("missing", "ambiguous", "forged"))
+def test_direct_landed_same_active_reconcile_rejects_nonunique_qa_zero_write(
+    conn, monkeypatch, tmp_path, mutation,
+):
+    world, _canonical_head, _active, body = _direct_landed_same_active_ready(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"LANDED-QA-{mutation.upper()}",
+    )
+    qa_rows = []
+    for row in conn.execute(
+        "SELECT * FROM task_timeline_events WHERE project_id=? "
+        "AND backlog_id=? AND task_id=? ORDER BY id",
+        (PID, world["backlog_id"], world["task_id"]),
+    ).fetchall():
+        payload = json.loads(row["payload_json"])
+        if (
+            str(row["event_kind"] or "").strip().lower()
+            in server._QA_TIMELINE_VERIFICATION_EVENT_KINDS
+            and isinstance(
+                payload.get("source_backed_contract_gate_authority"), dict
+            )
+        ):
+            qa_rows.append((dict(row), payload))
+    assert len(qa_rows) == 1
+    qa_row, qa_payload = qa_rows[0]
+    if mutation == "missing":
+        conn.execute(
+            "DELETE FROM task_timeline_events WHERE project_id=? AND id=?",
+            (PID, qa_row["id"]),
+        )
+    elif mutation == "ambiguous":
+        columns = [
+            key for key in qa_row if key != "id"
+        ]
+        conn.execute(
+            "INSERT INTO task_timeline_events ("
+            + ",".join(columns)
+            + ") VALUES ("
+            + ",".join("?" for _ in columns)
+            + ")",
+            tuple(qa_row[key] for key in columns),
+        )
+    else:
+        qa_payload["source_backed_contract_gate_authority"][
+            "authority_hash"
+        ] = "sha256:" + "f" * 64
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json=? "
+            "WHERE project_id=? AND id=?",
+            (
+                json.dumps(qa_payload, sort_keys=True, separators=(",", ":")),
+                PID,
+                qa_row["id"],
+            ),
+        )
+    conn.commit()
+
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    status, rejected = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert status == 409, rejected
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "metric_mode",
+        "metric_scope",
+        "provenance_marker",
+        "timeline_mode",
+    ),
+)
+def test_direct_landed_same_active_terminal_tamper_rejects_replay_zero_write(
+    conn, monkeypatch, tmp_path, mutation,
+):
+    _world, canonical_head, active, body = _direct_landed_same_active_ready(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"LANDED-TERMINAL-{mutation.upper()}",
+    )
+    status, completed = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert status == 201, completed
+    metric = dict(
+        conn.execute(
+            "SELECT * FROM reconcile_run_metrics WHERE project_id=? "
+            "AND run_id=? AND snapshot_id=?",
+            (PID, body["run_id"], active["snapshot_id"]),
+        ).fetchone()
+    )
+    evidence = json.loads(metric["evidence_json"])
+    if mutation == "metric_mode":
+        conn.execute(
+            "UPDATE reconcile_run_metrics SET graph_delta_mode='full_rebuild' "
+            "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+            (PID, body["run_id"], active["snapshot_id"]),
+        )
+    elif mutation == "metric_scope":
+        evidence["idempotency_scope"] = {
+            **evidence["idempotency_scope"],
+            "backlog_id": "damaged-as-if-foreign",
+        }
+        conn.execute(
+            "UPDATE reconcile_run_metrics SET evidence_json=? "
+            "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+            (
+                json.dumps(
+                    evidence, sort_keys=True, separators=(",", ":")
+                ),
+                PID,
+                body["run_id"],
+                active["snapshot_id"],
+            ),
+        )
+    elif mutation == "provenance_marker":
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance SET marker_json='{}' "
+            "WHERE project_id=? AND provenance_id=?",
+            (PID, evidence["provenance_id"]),
+        )
+    else:
+        row = conn.execute(
+            "SELECT payload_json FROM task_timeline_events "
+            "WHERE project_id=? AND id=?",
+            (PID, evidence["reconcile_event_id"]),
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        payload["graph_reconcile_result"]["graph_delta_mode"] = (
+            "full_rebuild"
+        )
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json=? "
+            "WHERE project_id=? AND id=?",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                PID,
+                evidence["reconcile_event_id"],
+            ),
+        )
+    conn.commit()
+
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=copy.deepcopy(body))
+    )
+    assert replay_status == 409, replay
+    assert replay["writes_performed"] is False
+    assert replay["mutation_performed"] is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+    new_run = {
+        **body,
+        "run_id": f"{body['run_id']}-must-not-repair-tamper",
+    }
+    new_run_status, new_run_rejection = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=new_run)
+        )
+    )
+    assert new_run_status == 409, new_run_rejection
+    assert new_run_rejection["error"] == (
+        "direct_landed_same_active_new_run_replay_forbidden"
+    )
+    assert new_run_rejection["writes_performed"] is False
+    assert new_run_rejection["mutation_performed"] is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+def test_direct_landed_same_active_allows_verified_foreign_prior_history(
+    conn, monkeypatch, tmp_path,
+):
+    world, canonical_head, active, body = _direct_landed_same_active_ready(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="LANDED-VERIFIED-FOREIGN-PRIOR",
+    )
+    ctx = _ctx({"project_id": PID}, method="POST", body=body)
+    auth = server._require_current_full_reconcile_auth(
+        ctx,
+        conn,
+        "graph-governance.reconcile.current-full",
+        route_ref_renew_within_seconds=0,
+    )
+    qa = server._operator_supervised_direct_main_reconcile_qa_preflight_authority(
+        conn,
+        project_id=PID,
+        target_commit=canonical_head,
+        current_full_auth=auth,
+    )
+    current_scope = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=PID,
+        body=body,
+        auth=auth,
+        target_commit_sha=canonical_head,
+        candidate_only=False,
+        source_free_reconcile_authority={},
+    )
+    foreign_scope = {
+        **current_scope,
+        "backlog_id": f"{world['backlog_id']}-foreign",
+        "task_id": f"{world['task_id']}-foreign",
+        "contract_execution_id": f"{world['task_id']}-foreign",
+    }
+    foreign_run_id = "current-full-verified-foreign-prior"
+    foreign_route = server._current_full_reconcile_route_evidence(
+        auth,
+        runtime_context_scope=foreign_scope,
+    )
+    foreign_route["direct_main_qa_preflight_authority"] = dict(qa)
+    foreign_route.update(
+        reconcile_run_id=foreign_run_id,
+        idempotency_scope=server._current_full_reconcile_idempotency_scope(
+            foreign_route
+        ),
+    )
+    foreign_terminal_scope = (
+        server._current_full_reconcile_idempotency_scope(foreign_route)
+    )
+    foreign_body = {
+        **body,
+        "backlog_id": foreign_scope["backlog_id"],
+        "task_id": foreign_scope["task_id"],
+        "contract_execution_id": foreign_scope["contract_execution_id"],
+        "run_id": foreign_run_id,
+    }
+    activation = store.activate_graph_snapshot(
+        conn,
+        PID,
+        active["snapshot_id"],
+        expected_old_snapshot_id=active["snapshot_id"],
+    )
+    foreign_result = {
+        "ok": True,
+        "status": "complete",
+        "snapshot_id": active["snapshot_id"],
+        "active_snapshot_id": active["snapshot_id"],
+        "snapshot_status": "active",
+        "target_commit_sha": canonical_head,
+        "strategy": "current_full_reconcile",
+        "scope_reconcile_strategy": "current_full_reconcile",
+        "graph_delta_mode": "full_rebuild",
+        "scope_graph_delta_mode": "full_rebuild",
+        "activated": True,
+        "activation": activation,
+        "activation_verification": {
+            "verified": True,
+            "active_snapshot_id": active["snapshot_id"],
+            "active_graph_commit": canonical_head,
+        },
+        "operation_trace": {"run_id": foreign_run_id},
+        "elapsed_ms": 0,
+    }
+    server._record_current_full_atomic_evidence(
+        conn,
+        store,
+        project_id=PID,
+        body=foreign_body,
+        result=foreign_result,
+        run_id=foreign_run_id,
+        snapshot_id=active["snapshot_id"],
+        target_commit=canonical_head,
+        route_evidence=foreign_route,
+        runtime_context_scope=foreign_scope,
+        request_id="req-verified-foreign-prior",
+        request_started_at="2026-09-14T11:50:00Z",
+        graph_delta_mode="full_rebuild",
+        declared_actor_role="observer",
+        route_bound=True,
+    )
+    conn.commit()
+    foreign_terminal = store.current_full_active_terminal_tuple(
+        conn,
+        project_id=PID,
+        run_id=foreign_run_id,
+        target_commit_sha=canonical_head,
+        expected_scope=foreign_terminal_scope,
+        snapshot_id=active["snapshot_id"],
+    )
+    assert foreign_terminal["valid"] is True, foreign_terminal
+
+    status, completed = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=copy.deepcopy(body))
+    )
+    assert status == 201, completed
+    assert completed["same_active_current_full"] is True
+    assert completed["run_id"] == body["run_id"]
+    foreign_after = store.current_full_active_terminal_tuple(
+        conn,
+        project_id=PID,
+        run_id=foreign_run_id,
+        target_commit_sha=canonical_head,
+        expected_scope=foreign_terminal_scope,
+        snapshot_id=active["snapshot_id"],
+    )
+    assert foreign_after["valid"] is True, foreign_after
+
+
 @pytest.mark.parametrize("source_tool", ("get_file_excerpt", "search_docs"))
 def test_direct_qa_landed_source_reads_immutable_candidate_git_objects(
     conn, monkeypatch, tmp_path, source_tool,
@@ -108547,6 +109276,108 @@ def _strict_direct_main_close_ready_completion_world(conn, monkeypatch, tmp_path
     ]
     conn.commit()
     return {**world, "close_body": body, "qa_event": qa_event, "runtime": runtime}
+
+
+def test_strict_direct_rev3_exact_current_persisted_authority_without_landed_fields_remains_valid(
+    conn, monkeypatch, tmp_path,
+):
+    world = _strict_direct_main_close_ready_completion_world(
+        conn, monkeypatch, tmp_path,
+    )
+    active = store.get_active_graph_snapshot(conn, PID)
+    notes = json.loads(active["notes"])
+    marker = notes["current_full_reconcile"]
+    provenance_id = marker["provenance_id"]
+    provenance = dict(
+        conn.execute(
+            "SELECT * FROM graph_current_full_reconcile_provenance "
+            "WHERE project_id=? AND provenance_id=?",
+            (PID, provenance_id),
+        ).fetchone()
+    )
+    route_evidence = json.loads(provenance["route_evidence_json"])
+    qa_preflight = route_evidence["direct_main_qa_preflight_authority"]
+    qa_preflight.pop("implementation_commit_sha", None)
+    qa_preflight.pop("landed_ancestor_current_head_verified", None)
+    qa_preflight.pop("landed_qa_current_head_authority", None)
+    qa_preflight["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in qa_preflight.items()
+            if key != "authority_hash"
+        }
+    )
+    marker["route_evidence"] = route_evidence
+    marker["provenance_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in marker.items()
+            if key != "provenance_hash"
+        }
+    )
+    notes["current_full_reconcile"] = marker
+    canonical_json = lambda value: json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    conn.execute(
+        "UPDATE graph_snapshots SET notes=? "
+        "WHERE project_id=? AND snapshot_id=?",
+        (canonical_json(notes), PID, active["snapshot_id"]),
+    )
+    conn.execute(
+        "UPDATE graph_current_full_reconcile_provenance "
+        "SET route_evidence_json=?, marker_json=?, provenance_hash=? "
+        "WHERE project_id=? AND provenance_id=?",
+        (
+            canonical_json(route_evidence),
+            canonical_json(marker),
+            marker["provenance_hash"],
+            PID,
+            provenance_id,
+        ),
+    )
+    conn.commit()
+
+    record = world["runtime"].store.get(world["task_id"])
+    authority = (
+        server._operator_supervised_direct_main_current_full_reconcile_authority(
+            conn,
+            project_id=PID,
+            backlog_id=world["backlog_id"],
+            contract_execution_id=world["task_id"],
+            record=record,
+        )
+    )
+    assert authority["implementation_commit_sha"] == world["candidate_commit"]
+    assert authority["target_commit_sha"] == world["candidate_commit"]
+    assert authority["landed_ancestor_current_head_verified"] is False
+
+    legacy_authority = copy.deepcopy(authority)
+    legacy_authority.pop("implementation_commit_sha")
+    legacy_authority.pop("landed_ancestor_current_head_verified")
+    legacy_authority.pop("landed_qa_current_head_authority")
+    legacy_authority["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in legacy_authority.items()
+            if key != "authority_hash"
+        }
+    )
+    errors = contract_write_gate.operator_supervised_direct_main_runtime_binding_errors(
+        server._operator_supervised_direct_main_fresh_definition(),
+        record,
+        {
+            "line_id": "observer_reconcile",
+            "commit_sha": world["candidate_commit"],
+            "payload": {
+                "direct_current_full_reconcile_authority": legacy_authority,
+                "direct_runtime_binding_hash": record["metadata"][
+                    "operator_supervised_direct_main_runtime_binding"
+                ]["binding_hash"],
+            },
+        },
+    )
+    assert errors == []
 
 
 def test_strict_direct_close_ready_rejects_nested_failure_before_immutable_write(

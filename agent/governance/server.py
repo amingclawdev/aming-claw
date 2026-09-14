@@ -99026,6 +99026,9 @@ def _record_pending_scope_reconcile_contract_event(
                     "operation_trace",
                     "activation_verification",
                     "activated",
+                    "bind_only_preimplementation_provenance",
+                    "same_active_current_full",
+                    "rebuild_skipped",
                 }
             },
         },
@@ -99267,6 +99270,481 @@ def _dev_direct_bind_current_full_provenance(
         f"/api/graph-governance/{project_id}/reconcile/current-full", "POST"
     )
     return 201, {**result, "writes_performed": True, "mutation_performed": True}
+
+
+def _operator_supervised_direct_main_post_qa_same_active_reconcile(
+    ctx: RequestContext,
+    conn,
+    store,
+    *,
+    root: Path,
+    project_id: str,
+    body: Mapping[str, Any],
+    route_evidence: Mapping[str, Any],
+    runtime_context_scope: Mapping[str, Any],
+    target_commit: str,
+    head_commit: str,
+    request_started_at: str,
+    request_total_changes_before: int,
+) -> tuple[int, dict[str, Any]]:
+    """Atomically bind post-merge QA to the already-current full snapshot."""
+
+    from . import task_timeline
+    from .db import sqlite_write_lock
+
+    run_id = str(body.get("run_id") or "").strip()
+    snapshot_id = str(body.get("snapshot_id") or "").strip()
+    expected_old_snapshot_id = str(
+        body.get("expected_old_snapshot_id") or ""
+    ).strip()
+    event: dict[str, Any] = {}
+    result: dict[str, Any] = {}
+
+    store.ensure_schema(conn)
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+    with sqlite_write_lock():
+        conn.execute("BEGIN IMMEDIATE")
+        locked_auth = _require_current_full_reconcile_auth(
+            ctx,
+            conn,
+            "graph-governance.reconcile.current-full",
+            route_ref_renew_within_seconds=0,
+        )
+        locked_qa = (
+            _operator_supervised_direct_main_reconcile_qa_preflight_authority(
+                conn,
+                project_id=project_id,
+                target_commit=target_commit,
+                current_full_auth=locked_auth,
+            )
+        )
+        locked_scope = _current_full_reconcile_runtime_context_scope(
+            conn,
+            project_id=project_id,
+            body=body,
+            auth=locked_auth,
+            target_commit_sha=target_commit,
+            candidate_only=False,
+            source_free_reconcile_authority={},
+        )
+        locked_route = _current_full_reconcile_route_evidence(
+            locked_auth,
+            runtime_context_scope=locked_scope,
+        )
+        locked_route["direct_main_qa_preflight_authority"] = dict(locked_qa)
+        locked_route.update(
+            reconcile_run_id=run_id,
+            idempotency_scope=_current_full_reconcile_idempotency_scope(
+                locked_route
+            ),
+        )
+        active = store.get_active_graph_snapshot(conn, project_id) or {}
+        active_snapshot_id = str(active.get("snapshot_id") or "").strip()
+        active_commit = str(active.get("commit_sha") or "").strip().lower()
+        try:
+            companion_integrity = store.validate_snapshot_companion_integrity(
+                active
+            )
+        except Exception:
+            companion_integrity = {"valid": False}
+        pending_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM pending_scope_reconcile "
+                "WHERE project_id=? AND status IN (?,?,?)",
+                (
+                    project_id,
+                    store.PENDING_STATUS_QUEUED,
+                    store.PENDING_STATUS_RUNNING,
+                    store.PENDING_STATUS_FAILED,
+                ),
+            ).fetchone()[0]
+        )
+        if not (
+            run_id
+            and snapshot_id
+            and snapshot_id == active_snapshot_id == expected_old_snapshot_id
+            and str(active.get("snapshot_kind") or "").strip() == "full"
+            and str(active.get("status") or "").strip() == "active"
+            and active_commit == target_commit == head_commit
+            and _git_head_commit(root).strip().lower() == head_commit
+            and locked_scope == runtime_context_scope
+            and stable_sha256(locked_route) == stable_sha256(route_evidence)
+            and locked_qa.get("passed") is True
+            and locked_qa.get("qa_passed") is True
+            and locked_qa.get("close_satisfying") is True
+            and locked_qa.get("landed_ancestor_current_head_verified") is True
+            and companion_integrity.get("valid") is True
+            and pending_count == 0
+        ):
+            conn.rollback()
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "direct_landed_same_active_authority_changed",
+                "writes_performed": False,
+                "mutation_performed": False,
+                "rebuild_started": False,
+                "fail_closed": True,
+            }
+
+        identity = store.current_full_run_snapshot_identity_check(
+            conn,
+            project_id,
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            commit_sha=target_commit,
+            idempotency_scope=_current_full_reconcile_idempotency_scope(
+                locked_route
+            ),
+        )
+        if identity.get("conflict"):
+            conn.rollback()
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "current_full_run_snapshot_identity_conflict",
+                "run_identity": identity,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "rebuild_started": False,
+                "fail_closed": True,
+            }
+        terminal = _current_full_reconcile_existing_run(
+            conn,
+            store,
+            project_id=project_id,
+            run_id=run_id,
+            target_commit_sha=target_commit,
+            route_evidence=locked_route,
+            requested_snapshot_id=snapshot_id,
+        )
+        if terminal.get("status") == "complete":
+            conn.rollback()
+            response = _current_full_reconcile_idempotent_response(
+                terminal,
+                project_id=project_id,
+                target_commit_sha=target_commit,
+                head_commit=head_commit,
+            )
+            response["same_active_current_full"] = True
+            response["historical_terminal_projection_replay"] = False
+            return 200, response
+        if terminal.get("status") not in {"missing"}:
+            conn.rollback()
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": terminal.get("reason")
+                or "direct_landed_same_active_terminal_conflict",
+                "terminal_tuple": _current_full_safe_terminal_tuple(
+                    terminal.get("terminal_tuple")
+                ),
+                "writes_performed": False,
+                "mutation_performed": False,
+                "rebuild_started": False,
+                "fail_closed": True,
+            }
+
+        expected_terminal_scope = _current_full_reconcile_idempotency_scope(
+            locked_route
+        )
+        prior_same_scope_runs: list[str] = []
+        prior_unclassified_runs: list[str] = []
+        for row in conn.execute(
+            "SELECT DISTINCT run_id,evidence_json "
+            "FROM reconcile_run_metrics "
+            "WHERE project_id=? AND snapshot_id=? AND commit_sha=? "
+            "AND status='complete' AND run_id<>?",
+            (project_id, snapshot_id, target_commit, run_id),
+        ).fetchall():
+            prior_run_id = str(row["run_id"] or "").strip()
+            try:
+                prior_evidence = json.loads(
+                    str(row["evidence_json"] or "")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                prior_evidence = {}
+            prior_scope = (
+                prior_evidence.get("idempotency_scope")
+                if isinstance(prior_evidence, Mapping)
+                and isinstance(
+                    prior_evidence.get("idempotency_scope"), Mapping
+                )
+                else {}
+            )
+            prior_terminal = store.current_full_active_terminal_tuple(
+                conn,
+                project_id=project_id,
+                run_id=prior_run_id,
+                target_commit_sha=target_commit,
+                expected_scope=dict(prior_scope),
+                snapshot_id=snapshot_id,
+            )
+            if prior_terminal.get("valid") is True:
+                # A complete terminal tuple with a different intact scope is
+                # independently owned history and cannot occupy this CEX.
+                if dict(prior_scope) == expected_terminal_scope:
+                    prior_same_scope_runs.append(prior_run_id)
+                continue
+
+            provenance_id = str(
+                (
+                    prior_evidence.get("provenance_id")
+                    if isinstance(prior_evidence, Mapping)
+                    else ""
+                )
+                or ""
+            ).strip()
+            try:
+                reconcile_event_id = int(
+                    (
+                        prior_evidence.get("reconcile_event_id")
+                        if isinstance(prior_evidence, Mapping)
+                        else 0
+                    )
+                    or 0
+                )
+            except (TypeError, ValueError):
+                reconcile_event_id = 0
+            provenance_row = (
+                conn.execute(
+                    "SELECT * FROM graph_current_full_reconcile_provenance "
+                    "WHERE project_id=? AND provenance_id=? "
+                    "AND snapshot_id=? AND target_commit_sha=?",
+                    (
+                        project_id,
+                        provenance_id,
+                        snapshot_id,
+                        target_commit,
+                    ),
+                ).fetchone()
+                if provenance_id
+                else None
+            )
+            provenance = dict(provenance_row) if provenance_row else {}
+            try:
+                provenance_route = json.loads(
+                    str(provenance.get("route_evidence_json") or "")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                provenance_route = {}
+            provenance_scope = (
+                _current_full_reconcile_idempotency_scope(provenance_route)
+                if isinstance(provenance_route, Mapping)
+                else {}
+            )
+            timeline_row = (
+                conn.execute(
+                    "SELECT * FROM task_timeline_events "
+                    "WHERE project_id=? AND id=?",
+                    (project_id, reconcile_event_id),
+                ).fetchone()
+                if reconcile_event_id > 0
+                else None
+            )
+            timeline = dict(timeline_row) if timeline_row else {}
+            try:
+                timeline_payload = json.loads(
+                    str(timeline.get("payload_json") or "")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                timeline_payload = {}
+            timeline_runtime_scope = (
+                timeline_payload.get("runtime_context_scope")
+                if isinstance(timeline_payload, Mapping)
+                and isinstance(
+                    timeline_payload.get("runtime_context_scope"), Mapping
+                )
+                else {}
+            )
+            timeline_scope = {
+                key: str(value or "").strip()
+                for key, value in {
+                    "project_id": project_id,
+                    "backlog_id": timeline.get("backlog_id"),
+                    "task_id": timeline.get("task_id"),
+                    **{
+                        key: timeline_runtime_scope.get(key)
+                        for key in (
+                            "parent_task_id",
+                            "runtime_context_id",
+                            "merge_queue_id",
+                            "contract_execution_id",
+                        )
+                    },
+                }.items()
+                if str(value or "").strip()
+            }
+            event_result = (
+                timeline_payload.get("graph_reconcile_result")
+                if isinstance(timeline_payload, Mapping)
+                and isinstance(
+                    timeline_payload.get("graph_reconcile_result"), Mapping
+                )
+                else {}
+            )
+            operation_trace = (
+                event_result.get("operation_trace")
+                if isinstance(event_result, Mapping)
+                and isinstance(event_result.get("operation_trace"), Mapping)
+                else {}
+            )
+            linked_lineage_exact = bool(
+                provenance
+                and timeline
+                and str(provenance.get("request_id") or "")
+                == str(prior_evidence.get("request_id") or "")
+                and int(provenance.get("reconcile_event_id") or 0)
+                == reconcile_event_id
+                and str(
+                    provenance.get("reconcile_event_created_at") or ""
+                )
+                == str(timeline.get("created_at") or "")
+                and str(provenance_route.get("reconcile_run_id") or "")
+                == prior_run_id
+                and str(timeline.get("event_type") or "")
+                == "graph.reconcile"
+                and str(timeline.get("event_kind") or "") == "reconcile"
+                and str(timeline.get("phase") or "") == "reconcile"
+                and str(timeline.get("status") or "") == "passed"
+                and str(timeline.get("commit_sha") or "") == target_commit
+                and str(timeline_payload.get("target_commit_sha") or "")
+                == target_commit
+                and str(timeline_payload.get("snapshot_id") or "")
+                == snapshot_id
+                and str(timeline_payload.get("active_snapshot_id") or "")
+                == snapshot_id
+                and str(operation_trace.get("run_id") or "")
+                == prior_run_id
+            )
+            # A damaged completion from this exact CEX scope is still a
+            # completion conflict.  Provenance and timeline are independent
+            # custody links, so corrupting only the metric scope cannot make
+            # that completion appear to be foreign history.
+            if (
+                dict(prior_scope) == expected_terminal_scope
+                or (
+                    linked_lineage_exact
+                    and provenance_scope == expected_terminal_scope
+                    and timeline_scope == expected_terminal_scope
+                )
+            ):
+                prior_same_scope_runs.append(prior_run_id)
+            else:
+                # Only a fully verified terminal tuple is admitted as foreign
+                # history above.  An unclassifiable damaged row fails closed.
+                prior_unclassified_runs.append(prior_run_id)
+        if prior_same_scope_runs or prior_unclassified_runs:
+            conn.rollback()
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "direct_landed_same_active_new_run_replay_forbidden",
+                "existing_run_ids": sorted(prior_same_scope_runs),
+                "unclassified_prior_run_ids": sorted(
+                    prior_unclassified_runs
+                ),
+                "writes_performed": False,
+                "mutation_performed": False,
+                "rebuild_started": False,
+                "fail_closed": True,
+            }
+
+        activation = store.activate_graph_snapshot(
+            conn,
+            project_id,
+            snapshot_id,
+            expected_old_snapshot_id=snapshot_id,
+            ref_name="active",
+            actor=str(body.get("actor") or "codex-observer"),
+            auto_rebuild_projection=False,
+            schema_ready=True,
+            post_commit_hooks=False,
+        )
+        active_after = store.get_active_graph_snapshot(conn, project_id) or {}
+        if not (
+            str(active_after.get("snapshot_id") or "").strip() == snapshot_id
+            and str(active_after.get("commit_sha") or "").strip().lower()
+            == target_commit
+            and str(activation.get("previous_snapshot_id") or "").strip()
+            == snapshot_id
+        ):
+            conn.rollback()
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "direct_landed_same_active_cas_not_verified",
+                "writes_performed": False,
+                "mutation_performed": False,
+                "rebuild_started": False,
+                "fail_closed": True,
+            }
+        result = {
+            "ok": True,
+            "project_id": project_id,
+            "status": "complete",
+            "run_id": run_id,
+            "snapshot_id": snapshot_id,
+            "active_snapshot_id": snapshot_id,
+            "snapshot_status": "active",
+            "target_commit_sha": target_commit,
+            "head_commit": head_commit,
+            "active_graph_commit": target_commit,
+            "current_full_reconcile": True,
+            "strategy": "current_full_reconcile",
+            "scope_reconcile_strategy": "current_full_reconcile",
+            "graph_delta_mode": "same_active_current_full",
+            "scope_graph_delta_mode": "same_active_current_full",
+            "same_active_current_full": True,
+            "activated": True,
+            "activation": activation,
+            "activation_verification": {
+                "verified": True,
+                "active_snapshot_id": snapshot_id,
+                "active_graph_commit": target_commit,
+                "same_active_cas": True,
+            },
+            "rebuild_skipped": True,
+            "rebuild_started": False,
+            "snapshot_materialized": False,
+            "elapsed_ms": 0,
+            "operation_trace": {"run_id": run_id},
+        }
+        event, _provenance = _record_current_full_atomic_evidence(
+            conn,
+            store,
+            project_id=project_id,
+            body=body,
+            result=result,
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            target_commit=target_commit,
+            route_evidence=locked_route,
+            runtime_context_scope=locked_scope,
+            request_id=str(ctx.request_id),
+            request_started_at=request_started_at,
+            graph_delta_mode="same_active_current_full",
+            declared_actor_role="observer",
+            route_bound=True,
+        )
+        conn.commit()
+
+    if event:
+        task_timeline.run_post_commit_hooks(conn, event)
+        conn.commit()
+    _emit_dashboard_changed(
+        f"/api/graph-governance/{project_id}/reconcile/current-full", "POST"
+    )
+    result["writes_performed"] = True
+    result["mutation_performed"] = True
+    return 201, _current_full_reconcile_bounded_http_response(
+        result,
+        request_id=str(ctx.request_id),
+        db_total_changes_delta=max(
+            0, int(conn.total_changes) - request_total_changes_before
+        ),
+    )
 
 
 @route("POST", "/api/graph-governance/{project_id}/index")
@@ -100301,6 +100779,14 @@ def _current_full_reconcile_idempotent_response(
         if isinstance(existing.get("timeline_event"), Mapping)
         else {}
     )
+    metric = (
+        existing.get("metric")
+        if isinstance(existing.get("metric"), Mapping)
+        else {}
+    )
+    graph_delta_mode = str(
+        metric.get("graph_delta_mode") or "full_rebuild"
+    ).strip()
     reconcile_event_id = int(timeline_event.get("id") or 0)
     return {
         "ok": True,
@@ -100315,8 +100801,8 @@ def _current_full_reconcile_idempotent_response(
         "current_full_reconcile": True,
         "strategy": "current_full_reconcile",
         "scope_reconcile_strategy": "current_full_reconcile",
-        "graph_delta_mode": "full_rebuild",
-        "scope_graph_delta_mode": "full_rebuild",
+        "graph_delta_mode": graph_delta_mode,
+        "scope_graph_delta_mode": graph_delta_mode,
         "activated": True,
         "idempotent_replay": True,
         "rebuild_skipped": True,
@@ -100955,6 +101441,29 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 runtime_context_scope=runtime_context_scope,
                 target_commit=target_commit, head_commit=head_commit,
                 request_started_at=request_started_at,
+            )
+        if (
+            direct_graph_bootstrap_request
+            and activate_requested
+            and direct_main_qa_preflight_authority.get("passed") is True
+            and direct_main_qa_preflight_authority.get(
+                "landed_ancestor_current_head_verified"
+            )
+            is True
+        ):
+            return _operator_supervised_direct_main_post_qa_same_active_reconcile(
+                ctx,
+                conn,
+                store,
+                root=root,
+                project_id=project_id,
+                body=body,
+                route_evidence=route_evidence,
+                runtime_context_scope=runtime_context_scope,
+                target_commit=target_commit,
+                head_commit=head_commit,
+                request_started_at=request_started_at,
+                request_total_changes_before=request_total_changes_before,
             )
         explicit_snapshot_id = str(body.get("snapshot_id") or "").strip()
         snapshot_identity = _current_full_requested_snapshot_identity(
@@ -155171,6 +155680,7 @@ def _operator_supervised_direct_main_facade_action_projection(
     record: Mapping[str, Any],
     runtime_next: Mapping[str, Any],
     active_route_identity: Mapping[str, Any],
+    observer_session_id: str = "",
 ) -> dict[str, Any]:
     """Project the existing public facade for one strict Direct rev2 line.
 
@@ -155526,6 +156036,100 @@ def _operator_supervised_direct_main_facade_action_projection(
         commit_value = implementation_commit or (
             "<replace with the exact Direct implementation commit>"
         )
+        landed_same_active: dict[str, Any] = {}
+        if implementation_commit:
+            target_root = Path(
+                str(
+                    binding.get("target_project_root")
+                    or binding.get("worktree_path")
+                    or ""
+                )
+            )
+            canonical_head = (
+                _git_head_commit(target_root).strip().lower()
+                if str(target_root) not in {"", "."}
+                else ""
+            )
+            if canonical_head and canonical_head != implementation_commit:
+                guide_auth = {
+                    "route_token_scope": {
+                        "project_id": project_id,
+                        "backlog_id": backlog_id,
+                        "task_id": contract_execution_id,
+                    },
+                    "route_token_ref": route_token_ref,
+                }
+                qa_preflight = (
+                    _operator_supervised_direct_main_reconcile_qa_preflight_authority(
+                        conn,
+                        project_id=project_id,
+                        target_commit=canonical_head,
+                        current_full_auth=guide_auth,
+                    )
+                )
+                from . import graph_snapshot_store as _graph_store
+
+                active = (
+                    _graph_store.get_active_graph_snapshot(conn, project_id)
+                    or {}
+                )
+                try:
+                    companion = _graph_store.validate_snapshot_companion_integrity(
+                        active
+                    )
+                except Exception:
+                    companion = {"valid": False}
+                pending_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM pending_scope_reconcile "
+                        "WHERE project_id=? AND status IN (?,?,?)",
+                        (
+                            project_id,
+                            _graph_store.PENDING_STATUS_QUEUED,
+                            _graph_store.PENDING_STATUS_RUNNING,
+                            _graph_store.PENDING_STATUS_FAILED,
+                        ),
+                    ).fetchone()[0]
+                )
+                active_snapshot_id = str(
+                    active.get("snapshot_id") or ""
+                ).strip()
+                if (
+                    qa_preflight.get("passed") is True
+                    and qa_preflight.get("qa_passed") is True
+                    and qa_preflight.get("close_satisfying") is True
+                    and qa_preflight.get(
+                        "landed_ancestor_current_head_verified"
+                    )
+                    is True
+                    and active_snapshot_id
+                    and str(active.get("commit_sha") or "").strip().lower()
+                    == canonical_head
+                    and str(active.get("snapshot_kind") or "").strip()
+                    == "full"
+                    and str(active.get("status") or "").strip() == "active"
+                    and companion.get("valid") is True
+                    and pending_count == 0
+                ):
+                    landed_same_active = {
+                        "target_commit_sha": canonical_head,
+                        "snapshot_id": active_snapshot_id,
+                        "expected_old_snapshot_id": active_snapshot_id,
+                        "run_id": (
+                            "current-full-direct-landed-"
+                            f"{canonical_head[:7]}-"
+                            + stable_sha256(
+                                [
+                                    project_id,
+                                    backlog_id,
+                                    contract_execution_id,
+                                    canonical_head,
+                                ]
+                            ).removeprefix("sha256:")[:12]
+                        ),
+                        "qa_preflight_authority": dict(qa_preflight),
+                    }
+                    commit_value = canonical_head
         body = {
             "project_id": project_id,
             "target_commit_sha": commit_value,
@@ -155536,12 +156140,23 @@ def _operator_supervised_direct_main_facade_action_projection(
             "task_id": contract_execution_id,
             "contract_execution_id": contract_execution_id,
             "observer_session_id": (
-                "<copy the active observer_session_id>"
+                str(observer_session_id or "").strip()
+                or "<copy the active observer_session_id>"
             ),
             "observer_route_token_ref": route_token_ref,
             "response_view": "compact",
         }
-        missing = ["observer_session_id"]
+        if landed_same_active:
+            body.update(
+                {
+                    key: value
+                    for key, value in landed_same_active.items()
+                    if key != "qa_preflight_authority"
+                }
+            )
+        missing = [] if str(observer_session_id or "").strip() else [
+            "observer_session_id"
+        ]
         if not implementation_commit:
             missing.append("target_commit_sha")
         return {
@@ -155553,6 +156168,14 @@ def _operator_supervised_direct_main_facade_action_projection(
             "action_input_missing_fields": missing,
             "replace_before_submit": missing,
             "requires_current_runtime_qa_position": True,
+            "landed_ancestor_current_head_verified": bool(
+                landed_same_active
+            ),
+            "implementation_commit_sha": implementation_commit,
+            "closing_commit_sha": commit_value,
+            "direct_main_qa_preflight_authority": dict(
+                landed_same_active.get("qa_preflight_authority") or {}
+            ),
             "consumes_contract_runtime_lines": ["observer_reconcile"],
         }
 
@@ -156058,6 +156681,9 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                         )
                         else {}
                     ),
+                    observer_session_id=str(
+                        (request_body or {}).get("observer_session_id") or ""
+                    ).strip(),
                 )
             )
             facade_tool = str(
@@ -159724,6 +160350,114 @@ def _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
     )
 
 
+def _operator_supervised_direct_main_landed_qa_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    proof: Mapping[str, Any],
+    target_commit: str,
+) -> dict[str, Any]:
+    """Reverify a QA-proven immutable candidate inside current canonical HEAD."""
+
+    candidate_commit = str(
+        proof.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    target_commit = str(target_commit or "").strip().lower()
+    stored = (
+        proof.get("post_merge_provenance")
+        if isinstance(proof.get("post_merge_provenance"), Mapping)
+        else {}
+    )
+    proof_trace_ids = _runtime_context_service_dedupe(
+        [
+            str(value or "").strip()
+            for value in (
+                [proof.get("trace_id")]
+                + list(proof.get("graph_trace_ids") or [])
+            )
+            if str(value or "").strip()
+        ]
+    )
+    trace_id = proof_trace_ids[0] if len(proof_trace_ids) == 1 else ""
+    if not (
+        candidate_commit
+        and candidate_commit != target_commit
+        and trace_id
+        and stored.get("schema_version")
+        == "qa_exact_candidate.direct_main_post_merge_provenance.v1"
+        and stored.get("verified") is True
+        and stored.get("server_derived") is True
+        and stored.get("caller_claims_trusted") is False
+        and stored.get("qa_performed_post_merge") is True
+        and stored.get("candidate_is_ancestor") is True
+        and stored.get("canonical_head_graph_current") is True
+        and stored.get("canonical_head_runtime_current") is True
+        and str(stored.get("project_id") or "").strip() == project_id
+        and str(stored.get("backlog_id") or "").strip() == backlog_id
+        and str(stored.get("task_id") or "").strip() == task_id
+        and str(stored.get("candidate_commit_sha") or "").strip().lower()
+        == candidate_commit
+        and str(stored.get("canonical_head_commit_sha") or "")
+        .strip()
+        .lower()
+        == target_commit
+    ):
+        return {}
+    rows = conn.execute(
+        "SELECT * FROM graph_query_traces "
+        "WHERE project_id = ? AND trace_id = ? LIMIT 2",
+        (project_id, trace_id),
+    ).fetchall()
+    if len(rows) != 1:
+        return {}
+    try:
+        project_root = Path(
+            project_service.resolve_project_root(
+                project_id, None, fallback_self=True,
+            )
+        ).resolve()
+    except Exception:
+        return {}
+    fresh, mismatches = _qa_exact_candidate_post_merge_provenance(
+        conn,
+        project_id=project_id,
+        row=rows[0],
+        canonical_project_root=project_root,
+        candidate_commit_sha=candidate_commit,
+        canonical_head_commit=target_commit,
+    )
+    comparable_fresh = {**fresh, "trace_id": ""}
+    comparable_fresh["authority_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in comparable_fresh.items()
+            if key != "authority_hash"
+        }
+    )
+    if mismatches or stable_sha256(comparable_fresh) != stable_sha256(stored):
+        return {}
+    authority = {
+        "schema_version": (
+            "operator_supervised_direct_main."
+            "landed_qa_current_head_authority.v1"
+        ),
+        "verified": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "candidate_commit_sha": candidate_commit,
+        "canonical_head_commit_sha": target_commit,
+        "qa_trace_id": trace_id,
+        "post_merge_provenance_hash": stable_sha256(stored),
+        "fresh_reverification_hash": stable_sha256(comparable_fresh),
+        "candidate_is_ancestor": True,
+        "no_newer_descendant_after_qa": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _operator_supervised_direct_main_active_route_authority(
     conn,
     *,
@@ -160470,9 +161204,6 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
             == "observer_implementation"
         ]
     )
-    if implementation_commits != [target_commit]:
-        missing.append("exact_direct_implementation_commit")
-
     completed_lines = [
         line
         for line in record.get("completed_lines") or []
@@ -160500,10 +161231,6 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
     if not (
         len(qa_graph_lines) == 1
         and len(qa_verdict_lines) == 1
-        and str(qa_verdict_lines[0].get("commit_sha") or "")
-        .strip()
-        .lower()
-        == target_commit
         and str(qa_verdict_lines[0].get("status") or "")
         .strip()
         .lower()
@@ -160539,10 +161266,30 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
             if isinstance(authority.get("qa_session_proof"), Mapping)
             else {}
         )
+        candidate_commit = str(
+            proof.get("candidate_commit_sha") or ""
+        ).strip().lower()
+        landed_authority = (
+            _operator_supervised_direct_main_landed_qa_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                proof=proof,
+                target_commit=target_commit,
+            )
+        )
+        qa_target_matches = bool(
+            _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+                proof,
+                target_commit=target_commit,
+            )
+            or landed_authority.get("verified") is True
+        )
         if not (
             task_timeline._event_passed(event)
             and str(event.get("commit_sha") or "").strip().lower()
-            == target_commit
+            == candidate_commit
             and task_timeline._source_backed_qa_session_authority_valid(
                 authority,
                 conn=conn,
@@ -160551,12 +161298,9 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
             and str(proof.get("backlog_id") or "").strip() == backlog_id
             and str(proof.get("task_id") or "").strip() == task_id
             and str(proof.get("commit_sha") or "").strip().lower()
-            == target_commit
+            == candidate_commit
             and str(proof.get("snapshot_id") or "").strip()
-            and _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
-                proof,
-                target_commit=target_commit,
-            )
+            and qa_target_matches
         ):
             continue
         qa_candidates.append(
@@ -160570,6 +161314,8 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
                 "qa_authority_hash": str(
                     authority.get("authority_hash") or ""
                 ).strip(),
+                "candidate_commit_sha": candidate_commit,
+                "landed_qa_current_head_authority": dict(landed_authority),
             }
         )
     if len(qa_candidates) != 1:
@@ -160598,6 +161344,19 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
         == {str(qa_candidate.get("qa_authority_hash") or "").strip()}
     ):
         missing.append("contract_runtime_qa_authority_exact")
+    qa_candidate_commit = str(
+        qa_candidate.get("candidate_commit_sha") or target_commit
+    ).strip().lower()
+    if implementation_commits != [qa_candidate_commit]:
+        missing.append("exact_direct_implementation_commit")
+    if not (
+        len(qa_verdict_lines) == 1
+        and str(qa_verdict_lines[0].get("commit_sha") or "")
+        .strip()
+        .lower()
+        == qa_candidate_commit
+    ):
+        missing.append("contract_runtime_qa_commit_exact")
     qa_graph_line_hash = (
         stable_sha256(dict(qa_graph_lines[0]))
         if len(qa_graph_lines) == 1
@@ -160656,6 +161415,13 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
         "backlog_id": backlog_id,
         "contract_execution_id": task_id,
         "target_commit_sha": target_commit,
+        "implementation_commit_sha": qa_candidate_commit,
+        "landed_ancestor_current_head_verified": bool(
+            qa_candidate.get("landed_qa_current_head_authority", {}).get(
+                "verified"
+            )
+            is True
+        ),
         "active_route_authority": active_route_authority,
         **qa_candidate,
         "qa_candidate_count": len(qa_candidates),
@@ -160736,7 +161502,21 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
     except Exception:
         return {}
     canonical_head = _git_head_commit(project_root).strip().lower()
-    if canonical_head != implementation_commit:
+    if not canonical_head:
+        return {}
+    active_snapshot = graph_snapshot_store.get_active_graph_snapshot(
+        conn, project_id
+    ) or {}
+    active_marker = graph_snapshot_store._snapshot_notes(
+        active_snapshot
+    ).get("current_full_reconcile")
+    active_marker = (
+        dict(active_marker) if isinstance(active_marker, Mapping) else {}
+    )
+    active_provenance_id = str(
+        active_marker.get("provenance_id") or ""
+    ).strip()
+    if not active_provenance_id:
         return {}
     qa_candidates: list[dict[str, Any]] = []
     for event in task_timeline.list_events(
@@ -160763,6 +161543,16 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             if isinstance(authority.get("qa_session_proof"), Mapping)
             else {}
         )
+        landed_authority = (
+            _operator_supervised_direct_main_landed_qa_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=contract_execution_id,
+                proof=proof,
+                target_commit=canonical_head,
+            )
+        )
         if not (
             task_timeline._event_passed(event)
             and str(event.get("commit_sha") or "").strip().lower()
@@ -160778,9 +161568,12 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             and str(proof.get("commit_sha") or "").strip().lower()
             == implementation_commit
             and str(proof.get("snapshot_id") or "").strip()
-            and _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
-                proof,
-                target_commit=implementation_commit,
+            and (
+                _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+                    proof,
+                    target_commit=implementation_commit,
+                )
+                or landed_authority.get("verified") is True
             )
         ):
             continue
@@ -160798,6 +161591,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 "authority_hash": str(
                     authority.get("authority_hash") or ""
                 ).strip(),
+                "landed_qa_current_head_authority": dict(landed_authority),
             }
         )
     qa_authority = qa_candidates[0] if len(qa_candidates) == 1 else {}
@@ -160830,10 +161624,11 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             SELECT *
               FROM graph_current_full_reconcile_provenance
              WHERE project_id = ? AND target_commit_sha = ?
+               AND provenance_id = ?
              ORDER BY reconcile_event_id DESC, created_at DESC,
                       provenance_id DESC
             """,
-            (project_id, implementation_commit),
+            (project_id, canonical_head, active_provenance_id),
         ).fetchall()
     except sqlite3.Error:
         return {}
@@ -160905,7 +161700,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 project_id=project_id,
                 backlog_id=backlog_id,
                 contract_execution_id=contract_execution_id,
-                target_commit=implementation_commit,
+                target_commit=canonical_head,
                 record=record,
                 binding=binding,
                 active_route_authority=reconcile_active_route_authority,
@@ -161000,6 +161795,14 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             ).strip()
             == "observer_reconcile"
             and not list(qa_preflight.get("missing_requirement_ids") or [])
+            and bool(
+                qa_preflight.get("landed_ancestor_current_head_verified")
+            )
+            == bool(
+                qa_authority.get(
+                    "landed_qa_current_head_authority", {}
+                ).get("verified")
+            )
         )
         if not (
             reconcile_event_id > 0
@@ -161044,6 +161847,13 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             and str(qa_preflight.get("target_commit_sha") or "")
             .strip()
             .lower()
+            == canonical_head
+            and (
+                str(qa_preflight.get("implementation_commit_sha") or "")
+                .strip()
+                .lower()
+                or canonical_head
+            )
             == implementation_commit
             and str(
                 qa_preflight.get(
@@ -161075,7 +161885,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             and marker.get("activate") is True
             and marker.get("normal_update_path") is True
             and str(marker.get("target_commit_sha") or "").strip().lower()
-            == implementation_commit
+            == canonical_head
         ):
             continue
         route_scope = (
@@ -161111,7 +161921,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             and str(event.get("status") or "").strip().lower()
             in {"accepted", "ok", "passed", "succeeded"}
             and str(event.get("commit_sha") or "").strip().lower()
-            == implementation_commit
+            == canonical_head
         ):
             continue
         snapshot_id = str(provenance.get("snapshot_id") or "").strip()
@@ -161126,7 +161936,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
         if not (
             len(snapshot_rows) == 1
             and str(snapshot_rows[0]["commit_sha"] or "").strip().lower()
-            == implementation_commit
+            == canonical_head
             and str(snapshot_rows[0]["status"] or "").strip().lower()
             == "active"
             and str(marker.get("snapshot_id") or "").strip()
@@ -161138,6 +161948,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 conn,
                 project_id,
                 dict(snapshot_rows[0]),
+                provenance_id=str(provenance.get("provenance_id") or ""),
             )
         )
         if not (
@@ -161164,10 +161975,11 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             "project_id": project_id,
             "backlog_id": backlog_id,
             "contract_execution_id": contract_execution_id,
-            "target_commit_sha": implementation_commit,
+            "target_commit_sha": canonical_head,
+            "implementation_commit_sha": implementation_commit,
             "canonical_head_commit": canonical_head,
             "active_snapshot_id": snapshot_id,
-            "active_snapshot_commit": implementation_commit,
+            "active_snapshot_commit": canonical_head,
             "reconcile_event_ref": f"timeline:{reconcile_event_id}",
             "reconcile_event_id": reconcile_event_id,
             "reconcile_event_created_at": str(
@@ -161194,6 +162006,22 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             ),
             "qa_snapshot_commit": (
                 implementation_commit if qa_mode_valid else ""
+            ),
+            "landed_ancestor_current_head_verified": bool(
+                qa_mode_valid
+                and qa_authority.get(
+                    "landed_qa_current_head_authority", {}
+                ).get("verified")
+                is True
+            ),
+            "landed_qa_current_head_authority": (
+                dict(
+                    qa_authority.get(
+                        "landed_qa_current_head_authority", {}
+                    )
+                )
+                if qa_mode_valid
+                else {}
             ),
             "qa_session_id": (
                 str(qa_authority.get("qa_session_id") or "")
@@ -161446,9 +162274,21 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
         .lower()
         for line_id in commit_line_ids
     }
+    implementation_commit = line_commits.get("observer_implementation", "")
+    landed_close_pair = bool(
+        implementation_commit
+        and implementation_commit != close_commit
+        and line_commits.get("qa_independent_verification")
+        == implementation_commit
+        and line_commits.get("observer_reconcile") == close_commit
+        and line_commits.get("observer_close_ready") == close_commit
+    )
     if not (
         re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", close_commit)
-        and set(line_commits.values()) == {close_commit}
+        and (
+            set(line_commits.values()) == {close_commit}
+            or landed_close_pair
+        )
     ):
         missing.append("exact_close_commit_across_direct_lines")
 
@@ -161529,6 +162369,31 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
             "authoritative_pass_synthesized"
         )
         is False
+        and (
+            not landed_close_pair
+            or (
+                current_reconcile_authority.get(
+                    "landed_ancestor_current_head_verified"
+                )
+                is True
+                and str(
+                    current_reconcile_authority.get(
+                        "implementation_commit_sha"
+                    )
+                    or ""
+                )
+                .strip()
+                .lower()
+                == implementation_commit
+                and str(
+                    current_reconcile_authority.get("target_commit_sha")
+                    or ""
+                )
+                .strip()
+                .lower()
+                == close_commit
+            )
+        )
     ):
         missing.append("current_full_reconcile_qa_pass_close_authority")
 
@@ -161626,7 +162491,10 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
         "checks": {
             "exact_completed_lines": actual_lines == expected_lines,
             "runtime_binding_revalidated": not line_binding_errors,
-            "close_commit_exact": set(line_commits.values()) == {close_commit},
+            "close_commit_exact": bool(
+                set(line_commits.values()) == {close_commit}
+                or landed_close_pair
+            ),
             "runtime_complete": not bool(current_state.get("next_legal_action")),
             "current_full_reconcile_still_current": bool(
                 current_reconcile_authority

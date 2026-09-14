@@ -3594,6 +3594,8 @@ def _current_full_snapshot_provenance_binding(
     conn: sqlite3.Connection,
     project_id: str,
     snapshot: Mapping[str, Any],
+    *,
+    provenance_id: str = "",
 ) -> dict[str, Any]:
     """Verify one snapshot's own durable current-full provenance.
 
@@ -3611,7 +3613,10 @@ def _current_full_snapshot_provenance_binding(
     snapshot_kind = str(snapshot.get("snapshot_kind") or "").strip()
     marker = _snapshot_notes(snapshot).get("current_full_reconcile")
     marker = dict(marker) if isinstance(marker, Mapping) else {}
-    provenance_id = str(marker.get("provenance_id") or "").strip()
+    requested_provenance_id = str(provenance_id or "").strip()
+    provenance_id = requested_provenance_id or str(
+        marker.get("provenance_id") or ""
+    ).strip()
     provenance_row = None
     if provenance_id and snapshot_id and snapshot_commit:
         provenance_rows = conn.execute(
@@ -3638,6 +3643,12 @@ def _current_full_snapshot_provenance_binding(
         )
     except (TypeError, ValueError, json.JSONDecodeError):
         stored_marker = {}
+    if requested_provenance_id and isinstance(stored_marker, Mapping):
+        # One active full snapshot can carry several immutable current-full
+        # completions.  Its notes point at the newest completion, while an
+        # exact replay must validate the marker stored with the requested
+        # provenance row.
+        marker = dict(stored_marker)
     try:
         route_evidence = json.loads(
             str(provenance.get("route_evidence_json") or "{}")
@@ -4111,7 +4122,7 @@ def current_full_active_terminal_tuple(
             dict(decoded_route) if isinstance(decoded_route, Mapping) else {}
         )
         provenance_binding = _current_full_snapshot_provenance_binding(
-            conn, project_id, snapshot
+            conn, project_id, snapshot, provenance_id=provenance_id
         )
 
     timeline_event = {}
@@ -4168,15 +4179,21 @@ def current_full_active_terminal_tuple(
     if not metric:
         errors.append("terminal_metric_missing")
     else:
+        metric_mode = str(metric.get("graph_delta_mode") or "")
         for field, expected in (
             ("status", "complete"),
             ("commit_sha", target_commit_sha),
             ("snapshot_kind", "full"),
             ("strategy", "current_full_reconcile"),
-            ("graph_delta_mode", "full_rebuild"),
         ):
             if str(metric.get(field) or "") != expected:
                 errors.append(f"terminal_metric_{field}_mismatch")
+        if metric_mode not in {
+            "full_rebuild",
+            "bind_only_existing_full",
+            "same_active_current_full",
+        }:
+            errors.append("terminal_metric_graph_delta_mode_mismatch")
     if not isinstance(evidence_value, Mapping):
         errors.append("terminal_metric_evidence_malformed")
     else:
@@ -4240,6 +4257,47 @@ def current_full_active_terminal_tuple(
                 or str(event_trace.get("run_id") or "") != run_id
             ):
                 errors.append("terminal_timeline_payload_mismatch")
+            if str(event_result.get("graph_delta_mode") or "") != str(
+                metric.get("graph_delta_mode") or ""
+            ):
+                errors.append("terminal_timeline_metric_mode_mismatch")
+            metric_mode = str(metric.get("graph_delta_mode") or "")
+            activation_verification = (
+                event_result.get("activation_verification")
+                if isinstance(
+                    event_result.get("activation_verification"), Mapping
+                )
+                else {}
+            )
+            qa_preflight = (
+                provenance_route_evidence.get(
+                    "direct_main_qa_preflight_authority"
+                )
+                if isinstance(
+                    provenance_route_evidence.get(
+                        "direct_main_qa_preflight_authority"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            if metric_mode == "bind_only_existing_full" and not (
+                event_result.get("bind_only_preimplementation_provenance")
+                is True
+                and activation_verification.get("verified") is True
+            ):
+                errors.append("terminal_bind_only_mode_evidence_mismatch")
+            if metric_mode == "same_active_current_full" and not (
+                event_result.get("same_active_current_full") is True
+                and event_result.get("rebuild_skipped") is True
+                and activation_verification.get("verified") is True
+                and activation_verification.get("same_active_cas") is True
+                and qa_preflight.get(
+                    "landed_ancestor_current_head_verified"
+                )
+                is True
+            ):
+                errors.append("terminal_same_active_mode_evidence_mismatch")
             for key, value in expected_scope.items():
                 if key in {"project_id", "backlog_id", "task_id"}:
                     continue
@@ -5421,6 +5479,14 @@ def current_full_reconcile_state(
         stored_marker = json.loads(str(provenance.get("marker_json") or "{}"))
     except (TypeError, ValueError, json.JSONDecodeError):
         stored_marker = {}
+    if requested_reconcile_event_id > 0 and isinstance(stored_marker, Mapping):
+        # Historical terminal readers are bound by the immutable event and
+        # provenance row.  A later completion may update the snapshot's notes
+        # marker without invalidating this earlier exact record.
+        marker = dict(stored_marker)
+        marker_target_commit = str(
+            marker.get("target_commit_sha") or ""
+        ).strip().lower()
     try:
         stored_route_evidence = json.loads(
             str(provenance.get("route_evidence_json") or "{}")
