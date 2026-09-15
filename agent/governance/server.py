@@ -149490,6 +149490,11 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
     "backlog_close",
     "merge",
 )
+_OPERATOR_SUPERVISED_DIRECT_MAIN_STABLE_GUIDE_ISSUE_ACTIONS = (
+    *_OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS,
+    "contract_runtime_current",
+    "contract_runtime_bypass_line",
+)
 _OPERATOR_SOURCE_FREE_ACTIONS = (
     "observer_session_register",
     "observer_session_heartbeat",
@@ -149503,7 +149508,7 @@ _OPERATOR_SOURCE_FREE_ACTIONS = (
 # do not invalidate an otherwise exact durable root route solely because it
 # preserves the action that was legal when the route was issued.
 _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS = (
-    *_OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS,
+    *_OPERATOR_SUPERVISED_DIRECT_MAIN_STABLE_GUIDE_ISSUE_ACTIONS,
     # Older root-route issuers included the read-only route-context surface in
     # the durable action set.  It is not part of newly issued full-round
     # routes, but must remain valid when rechecking that exact immutable root
@@ -155148,7 +155153,22 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
     expected_actions = sorted(
         _OPERATOR_SOURCE_FREE_ACTIONS
         if source_free_operation
-        else _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        else (
+            _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            if _runtime_plane() == "dev"
+            else _OPERATOR_SUPERVISED_DIRECT_MAIN_STABLE_GUIDE_ISSUE_ACTIONS
+        )
+    )
+    legacy_stable_actions = sorted(
+        _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
+    action_set_matches = bool(
+        allowed_actions == expected_actions
+        or (
+            not source_free_operation
+            and _runtime_plane() != "dev"
+            and allowed_actions == legacy_stable_actions
+        )
     )
     target_files = sorted(
         {
@@ -155178,7 +155198,7 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
     accepted = bool(
         route
         and str(route.get("caller_role") or "").strip() == "observer"
-        and allowed_actions == expected_actions
+        and action_set_matches
         and (not row_files if source_free_operation else bool(row_files))
         and target_files == row_files
         and owned_files == row_files
@@ -156605,7 +156625,11 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "allowed_actions": list(
             _OPERATOR_SOURCE_FREE_ACTIONS
             if source_free_operation
-            else _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            else (
+                _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+                if dev_world
+                else _OPERATOR_SUPERVISED_DIRECT_MAIN_STABLE_GUIDE_ISSUE_ACTIONS
+            )
         ),
         "evidence_refs": [
             f"backlog:{backlog_id}",

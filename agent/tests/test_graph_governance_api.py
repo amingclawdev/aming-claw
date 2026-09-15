@@ -210698,8 +210698,8 @@ def _prepare_ac_dev_recovered_parallel_before_prefill(conn, monkeypatch, tmp_pat
     runtime = server._contract_runtime(conn)
     source_id = case["execution_id"]
     source = runtime.store.get(source_id)
-    # The old execution and its accepted prefill are historical input. Nothing
-    # is seeded for the new recovery execution, route, or first prefill.
+    # The old execution and its accepted prefill are historical input. Recovery
+    # creates its own child route; no line or first prefill is copied forward.
     source["definition_hash"] = "sha256:stale-rev10-recovery-fixture"
     runtime.store.update(source_id, source)
     conn.commit()
@@ -210707,12 +210707,16 @@ def _prepare_ac_dev_recovered_parallel_before_prefill(conn, monkeypatch, tmp_pat
         "SELECT route_token_ref FROM observer_route_token_refs WHERE task_id=?",
         (source_id,),
     ).fetchone()[0]
+    session_id = conn.execute(
+        "SELECT session_id FROM observer_sessions"
+    ).fetchone()[0]
     recovered = server.handle_project_contract_runtime_recover(_ctx_with_role(
         {"project_id": case["project_id"]}, "observer", method="POST", body={
             "backlog_id": case["backlog_id"],
             "stale_contract_execution_id": source_id,
             "recovery_policy": "start_new_execution",
             "route_token_ref": source_route_ref,
+            "observer_session_id": session_id,
         },
     ))
     assert recovered["ok"] is True, recovered
@@ -210723,17 +210727,29 @@ def _prepare_ac_dev_recovered_parallel_before_prefill(conn, monkeypatch, tmp_pat
     assert conn.execute(
         "SELECT COUNT(*) FROM observer_route_token_refs WHERE task_id=?",
         (recovery_id,),
-    ).fetchone()[0] == 0
-    session_id = conn.execute("SELECT session_id FROM observer_sessions").fetchone()[0]
+    ).fetchone()[0] == 1
+    recovery_route_ref = recovered["route_token_ref"]
+    assert recovery_route_ref != source_route_ref
+    assert observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=case["project_id"],
+        storage_project_id=server._route_registry_storage_project_id(
+            case["project_id"]
+        ),
+        backlog_id=case["backlog_id"],
+        task_id=recovery_id,
+        route_token_ref=recovery_route_ref,
+    )["scope"]["task_id"] == recovery_id
     case.update({
         "source_id": source_id, "source_record": copy.deepcopy(source),
         "source_route_ref": source_route_ref, "recovery_id": recovery_id,
+        "recovery_route_ref": recovery_route_ref,
         "recovery": recovered, "observer_session_id": session_id,
         "guide_body": {
             "backlog_id": case["backlog_id"], "role": "observer",
             "work_type": "continue_contract_chain", "response_view": "compact",
             "task_id": recovery_id, "observer_session_id": session_id,
-            "route_token_ref": source_route_ref,
+            "route_token_ref": recovery_route_ref,
             "target_project_root": case["world"]["target_project_root"],
             "target_head_commit": case["world"]["target_head_commit"],
             "target_ref": "refs/heads/codex/ac-dev",
@@ -210774,7 +210790,7 @@ def test_ac_dev_recovered_parallel_continues_through_issuer_to_first_prefill(
     assert case["recovery"]["next_legal_action"]["mcp_tool"] == "onboard_route_guide"
     recovery_onboard_body = case["recovery"]["next_legal_action"]["copy_safe_body"]
     assert recovery_onboard_body["task_id"] == recovery_id
-    assert recovery_onboard_body["route_token_ref"] == case["source_route_ref"]
+    assert recovery_onboard_body["route_token_ref"] == case["recovery_route_ref"]
     assert guide["host_precursor_required"] is True
     precursor = guide["host_precursor_action"]
     assert precursor["mcp_tool"] == "observer_route_context_issue"
@@ -210786,7 +210802,9 @@ def test_ac_dev_recovered_parallel_continues_through_issuer_to_first_prefill(
     })  # Existing observer_route_context_issue MCP fields.
     assert body["task_id"] == recovery_id
     assert body["target_files"] == body["owned_files"] == sorted(case["target_files"])
-    assert body["parent_route_identity"]["route_token_ref"] == case["source_route_ref"]
+    assert body["parent_route_identity"]["route_token_ref"] == case[
+        "recovery_route_ref"
+    ]
     issued = server.handle_observer_route_context_issue(_ctx(
         {"project_id": project_id}, method="POST", body=body,
     ))
@@ -216582,18 +216600,26 @@ def test_dg_r6_stable_owned_chain_precedes_global_dev_source_claims_zero_write(
 
 
 @pytest.mark.parametrize(
-    "target_line",
-    ["observer_implementation", "qa_graph_context"],
+    ("target_line", "legacy_route"),
+    [
+        ("observer_implementation", False),
+        ("qa_graph_context", False),
+        ("observer_implementation", True),
+    ],
 )
 def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
     monkeypatch,
     tmp_path,
     target_line,
+    legacy_route,
 ):
     from agent.tests.test_governance_db import _install_fixed_stable_boundary
 
     project_id = "world-r2-external"
-    backlog_id = f"WORLD-R2-STABLE-BYPASS-{target_line.upper()}"
+    backlog_id = (
+        f"WORLD-R2-STABLE-BYPASS-{target_line.upper()}"
+        + ("-LEGACY-ROUTE" if legacy_route else "")
+    )
     workspace = tmp_path / "external-project"
     workspace.mkdir()
     (workspace / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -216698,25 +216724,72 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
             backlog_id,
             revision="rev3",
         )
-        issued = observer_route_context.issue_observer_write_route_context(
+        first_guide = server.handle_project_onboard_route_guide(_ctx(
+            {"project_id": project_id},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "task_id": execution_id,
+                "target_project_root": str(workspace),
+                "target_ref": "refs/heads/main",
+                "target_head_commit": subprocess.check_output(
+                    ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+                    text=True,
+                ).strip(),
+                "response_view": "full",
+            },
+        ))
+        issue_body = first_guide["observer_route_context_issue"]["copy_safe_body"]
+        assert issue_body == first_guide["next_legal_action"]["copy_safe_body"]
+        assert issue_body["allowed_actions"] == list(
+            server._OPERATOR_SUPERVISED_DIRECT_MAIN_STABLE_GUIDE_ISSUE_ACTIONS
+        )
+        assert {
+            "contract_runtime_current",
+            "contract_runtime_bypass_line",
+        }.issubset(issue_body["allowed_actions"])
+        legacy_allowed_actions = [
+            "observer_session_register",
+            "graph_query",
+            "observer_direct_mutation_exception",
+            "task_timeline_append",
+            "run_tests",
+            "git_diff",
+            "graph_current_full_reconcile",
+            "backlog_close",
+            "merge",
+        ]
+        if legacy_route:
+            issued = observer_route_context.issue_observer_write_route_context(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=execution_id,
+                target_files=issue_body["target_files"],
+                allowed_actions=legacy_allowed_actions,
+                evidence_refs=issue_body["evidence_refs"],
+            )
+            observer_route_context.persist_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=issued["route_token_ref"],
+                token=issued["route_token"],
+            )
+        else:
+            issued = server.handle_observer_route_context_issue(_ctx(
+                {"project_id": project_id}, method="POST", body=issue_body,
+            ))
+        assert issued["ok"] is True
+        resolved_issued = observer_route_context.resolve_route_token_ref(
+            conn,
             project_id=project_id,
             backlog_id=backlog_id,
             task_id=execution_id,
-            target_files=["app.py"],
-            allowed_actions=list(
-                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
-            ),
-            evidence_refs=[
-                f"backlog:{backlog_id}",
-                f"contract_runtime:{execution_id}",
-                "contract_definition:operator_supervised_direct_main.v1.rev3",
-            ],
-        )
-        observer_route_context.persist_route_token_ref(
-            conn,
-            project_id=project_id,
             route_token_ref=issued["route_token_ref"],
-            token=issued["route_token"],
+        )
+        assert resolved_issued["allowed_actions"] == (
+            legacy_allowed_actions if legacy_route else issue_body["allowed_actions"]
         )
         server._operator_supervised_direct_main_start_runtime(
             conn,
@@ -216768,11 +216841,22 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
             )
             active_route_token_ref = renewed["route_token_ref"]
             assert active_route_token_ref != issued["route_token_ref"]
-        session_id = _insert_ac_dev_active_observer_session(
-            conn,
-            project_id=project_id,
-            session_id="obs-world-r2-stable",
-        )
+            if legacy_route:
+                assert renewed["allowed_actions"] == legacy_allowed_actions
+        conn.commit()
+        session_status, session = server.handle_observer_session_register(_ctx(
+            {"project_id": project_id},
+            method="POST",
+            body={
+                "project_id": project_id,
+                "route_token_ref": active_route_token_ref,
+                "backlog_id": backlog_id,
+                "task_id": execution_id,
+                "cex_id": execution_id,
+            },
+        ))
+        assert session_status == 201, session
+        session_id = session["observer_session_id"]
         conn.commit()
         current = server._contract_runtime(conn).current_record(
             execution_id,
@@ -217028,32 +217112,172 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
             }
             actor_role = "qa"
 
-        guide = server._onboard_operator_supervised_direct_main_runtime_response(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            route_token_ref=active_route_token_ref,
-            role=actor_role,
-            work_type=(
-                "qa_verification"
-                if actor_role == "qa"
-                else "operator_supervised_direct_main"
-            ),
-            response_view="full",
-            request_body={
-                "task_id": execution_id,
-                **(
-                    {"observer_session_id": session_id}
-                    if actor_role == "observer"
-                    else {}
-                ),
-            },
-        )
+        if actor_role == "observer":
+            def read_observer_guide(selected_route_token_ref):
+                return server.handle_project_onboard_route_guide(_ctx(
+                    {"project_id": project_id},
+                    method="POST",
+                    body={
+                    "backlog_id": backlog_id,
+                    "role": "observer",
+                    "work_type": "operator_supervised_direct_main",
+                    "task_id": execution_id,
+                    "observer_session_id": session_id,
+                    "route_token_ref": selected_route_token_ref,
+                    "target_project_root": str(workspace),
+                    "target_ref": "refs/heads/main",
+                    "target_head_commit": subprocess.check_output(
+                        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+                        text=True,
+                    ).strip(),
+                    "response_view": "full",
+                    },
+                ))
+
+            guide_db_before = tuple(conn.iterdump())
+            guide_changes_before = conn.total_changes
+            guide = read_observer_guide(active_route_token_ref)
+            if legacy_route:
+                assert guide["route_authority"]["accepted"] is True
+                assert guide["route_authority"]["allowed_actions"] == sorted(
+                    legacy_allowed_actions
+                )
+                assert guide["observer_route_context_issue"]["required"] is False
+                assert guide["observer_route_context_issue"][
+                    "copy_safe_body"
+                ]["allowed_actions"] == issue_body[
+                    "allowed_actions"
+                ]
+                assert guide["next_legal_action"]["line_id"] == target_line
+                assert tuple(conn.iterdump()) == guide_db_before
+                assert conn.total_changes == guide_changes_before
+                fresh_issue_body = guide["observer_route_context_issue"][
+                    "copy_safe_body"
+                ]
+                assert fresh_issue_body == {
+                    "project_id": project_id,
+                    "caller_role": "observer",
+                    "backlog_id": backlog_id,
+                    "task_id": execution_id,
+                    "target_files": issue_body["target_files"],
+                    "owned_files": issue_body["owned_files"],
+                    "allowed_actions": issue_body["allowed_actions"],
+                    "evidence_refs": issue_body["evidence_refs"],
+                }
+                conn.commit()
+                fresh_issued = server.handle_observer_route_context_issue(_ctx(
+                    {"project_id": project_id},
+                    method="POST",
+                    body=fresh_issue_body,
+                ))
+                assert fresh_issued["ok"] is True, fresh_issued
+                fresh_token = fresh_issued["route_token"]
+                assert fresh_token["scope"] == {
+                    "project_id": fresh_issue_body["project_id"],
+                    "backlog_id": fresh_issue_body["backlog_id"],
+                    "task_id": fresh_issue_body["task_id"],
+                }
+                assert fresh_token["scope"]["task_id"] == execution_id
+                assert fresh_token["target_files"] == fresh_issue_body[
+                    "target_files"
+                ]
+                assert fresh_token["owned_files"] == fresh_issue_body[
+                    "owned_files"
+                ]
+                assert fresh_token["allowed_actions"] == fresh_issue_body[
+                    "allowed_actions"
+                ]
+                assert fresh_token["evidence_refs"] == [
+                    f"route:{fresh_token['route_id']}",
+                    *fresh_issue_body["evidence_refs"],
+                ]
+                fresh_resolved = observer_route_context.resolve_route_token_ref(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=execution_id,
+                    route_token_ref=fresh_issued["route_token_ref"],
+                )
+                assert fresh_resolved["scope"] == fresh_token["scope"]
+                assert fresh_resolved["target_files"] == fresh_token[
+                    "target_files"
+                ]
+                assert fresh_resolved["owned_files"] == fresh_token[
+                    "owned_files"
+                ]
+                assert fresh_resolved["allowed_actions"] == fresh_token[
+                    "allowed_actions"
+                ]
+                for field in (
+                    "route_id",
+                    "route_context_hash",
+                    "prompt_contract_id",
+                    "prompt_contract_hash",
+                    "visible_injection_manifest_hash",
+                ):
+                    assert fresh_resolved[field] == fresh_token[field]
+                    if field in fresh_issued:
+                        assert fresh_issued[field] == fresh_token[field]
+                for legacy_ref in (
+                    issued["route_token_ref"],
+                    active_route_token_ref,
+                ):
+                    legacy_row = conn.execute(
+                        "SELECT allowed_actions_json "
+                        "FROM observer_route_token_refs "
+                        "WHERE route_token_ref = ?",
+                        (legacy_ref,),
+                    ).fetchone()
+                    assert json.loads(legacy_row["allowed_actions_json"]) == (
+                        legacy_allowed_actions
+                    )
+                fresh_session_status, fresh_session = (
+                    server.handle_observer_session_register(_ctx(
+                        {"project_id": project_id},
+                        method="POST",
+                        body={
+                            "project_id": project_id,
+                            "route_token_ref": fresh_issued["route_token_ref"],
+                            "backlog_id": backlog_id,
+                            "task_id": execution_id,
+                            "cex_id": execution_id,
+                        },
+                    ))
+                )
+                assert fresh_session_status == 201, fresh_session
+                active_route_token_ref = fresh_issued["route_token_ref"]
+                session_id = fresh_session["observer_session_id"]
+                conn.commit()
+            current = server.handle_project_contract_runtime_current_state(_ctx(
+                {
+                    "project_id": project_id,
+                    "contract_execution_id": execution_id,
+                },
+                query={
+                    "observer_session_id": session_id,
+                    "observer_route_token_ref": active_route_token_ref,
+                },
+            ))
+        else:
+            guide = server._onboard_operator_supervised_direct_main_runtime_response(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                route_token_ref=active_route_token_ref,
+                role=actor_role,
+                work_type="qa_verification",
+                response_view="full",
+                request_body={"task_id": execution_id},
+            )
         assert guide["contract_execution_id"] == execution_id
         assert guide["next_legal_action"]["line_id"] == target_line
-        runtime_guide = server._contract_runtime_guide_for_response(
-            current,
-            actor_role=actor_role,
+        runtime_guide = (
+            current["runtime_guide"]
+            if actor_role == "observer"
+            else server._contract_runtime_guide_for_response(
+                current,
+                actor_role=actor_role,
+            )
         )
         bypass = copy.deepcopy(
             runtime_guide["line_bypass_guidance"]["create_new_copy_safe_body"]
@@ -217065,11 +217289,23 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
                 "decision": "record one audited no-PASS continuation",
                 "evidence_refs": [f"backlog:{backlog_id}"],
                 "task_id": execution_id,
+                **(
+                    {
+                        "observer_session_id": session_id,
+                        "observer_route_token_ref": active_route_token_ref,
+                    }
+                    if actor_role == "observer"
+                    else {}
+                ),
             }
         )
-        bypass.pop("observer_session_id", None)
-        bypass.pop("observer_route_token_ref", None)
-        bypass.pop("route_token_ref", None)
+        if actor_role == "qa":
+            bypass.pop("observer_session_id", None)
+            bypass.pop("observer_route_token_ref", None)
+            bypass.pop("route_token_ref", None)
+        else:
+            assert bypass["observer_session_id"] == session_id
+            assert bypass["observer_route_token_ref"] == active_route_token_ref
 
         request_context = _ctx_with_role(
             {
@@ -217082,6 +217318,17 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
         )
         if request_session is not None:
             request_context._session = request_session
+        before_completed_lines = copy.deepcopy(
+            server._contract_runtime(conn).current_record(
+                execution_id,
+                actor_role=actor_role,
+            )["completed_lines"]
+        )
+        before_generation = conn.execute(
+            "SELECT generation FROM backlog_contract_chain_current "
+            "WHERE project_id=? AND backlog_id=?",
+            (project_id, backlog_id),
+        ).fetchone()[0]
         business_before = tuple(conn.iterdump())
         changes_before_rejections = conn.total_changes
         for case, expected_error in (
@@ -217119,12 +217366,57 @@ def test_stable_external_direct_bypass_uses_positive_world_before_dev_accessor(
             request_context
         )
         assert accepted["ok"] is True
+        assert accepted["idempotent"] is False
         assert accepted["written_line"]["status"] == "waived"
+        assert accepted["written_line"]["no_pass_claim"] is True
+        assert accepted["decision"]["no_pass_claim"] is True
         assert accepted["written_line"]["payload"]["no_pass_generation"][
             "authoritative_pass_synthesized"
         ] is False
         assert accepted["diagnostic_status"] == "OPEN"
         assert len(accepted["timeline_events"]) == 2
+        diagnostic_id = accepted["diagnostic_backlog_id"]
+        diagnostic = conn.execute(
+            "SELECT status, chain_trigger_json FROM backlog_bugs WHERE bug_id=?",
+            (diagnostic_id,),
+        ).fetchone()
+        assert diagnostic["status"] == "OPEN"
+        diagnostic_link = json.loads(diagnostic["chain_trigger_json"])
+        assert diagnostic_link["source_backlog_id"] == backlog_id
+        assert diagnostic_link["contract_execution_id"] == execution_id
+        assert diagnostic_link["line_id"] == bypass["line_id"]
+        durable = server.handle_project_contract_runtime_current_state(_ctx(
+            {
+                "project_id": project_id,
+                "contract_execution_id": execution_id,
+            },
+            query={
+                "observer_session_id": session_id,
+                "observer_route_token_ref": active_route_token_ref,
+            },
+        ))
+        assert durable["execution_state_revision"] == (
+            current["execution_state_revision"] + 1
+        )
+        assert durable["next_legal_action"]["line_id"] == (
+            "qa_graph_context"
+            if target_line == "observer_implementation"
+            else "qa_independent_verification"
+        )
+        durable_record = server._contract_runtime(conn).current_record(
+            execution_id,
+            actor_role=actor_role,
+        )
+        assert durable_record["execution_state_revision"] == durable[
+            "execution_state_revision"
+        ]
+        assert durable_record["completed_lines"][:-1] == before_completed_lines
+        assert durable_record["completed_lines"][-1]["status"] == "waived"
+        assert conn.execute(
+            "SELECT generation FROM backlog_contract_chain_current "
+            "WHERE project_id=? AND backlog_id=?",
+            (project_id, backlog_id),
+        ).fetchone()[0] == before_generation + 1
         changes = conn.total_changes
         replay_context = _ctx_with_role(
             {
@@ -220180,6 +220472,7 @@ def _prepare_ac_dev_cross_plane_line_bypass(
     *,
     backlog_id: str,
     public_open_backlog: bool = False,
+    legacy_nine_action_route: bool = False,
 ):
     prepared = _prepare_ac_dev_direct_route_bootstrap(
         conn,
@@ -220189,9 +220482,53 @@ def _prepare_ac_dev_cross_plane_line_bypass(
         public_open_backlog=public_open_backlog,
     )
     project_id = prepared["project_id"]
-    issued = server.handle_observer_route_context_issue(
-        _ctx({"project_id": project_id}, method="POST", body=prepared["issue_body"])
-    )
+    legacy_allowed_actions = [
+        "observer_session_register",
+        "graph_query",
+        "observer_direct_mutation_exception",
+        "task_timeline_append",
+        "run_tests",
+        "git_diff",
+        "graph_current_full_reconcile",
+        "backlog_close",
+        "merge",
+    ]
+    if legacy_nine_action_route:
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=prepared["task_id"],
+            target_files=prepared["issue_body"]["target_files"],
+            allowed_actions=legacy_allowed_actions,
+            evidence_refs=prepared["issue_body"]["evidence_refs"],
+        )
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=server._route_registry_storage_project_id(
+                project_id
+            ),
+            route_token_ref=issued["route_token_ref"],
+            token=issued["route_token"],
+        )
+        server._operator_supervised_direct_main_start_runtime(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=prepared["task_id"],
+            route_token_ref=issued["route_token_ref"],
+            world_ref=server._operator_supervised_direct_main_world_ref(
+                project_id=project_id
+            ),
+        )
+    else:
+        issued = server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=prepared["issue_body"],
+            )
+        )
     session_id = _insert_ac_dev_active_observer_session(
         conn, project_id=project_id, session_id=f"obs-{backlog_id.lower()}"
     )
@@ -220223,6 +220560,7 @@ def _prepare_ac_dev_cross_plane_line_bypass(
         "route_token_ref": issued["route_token_ref"],
         "session_id": session_id,
         "body": body,
+        "legacy_allowed_actions": legacy_allowed_actions,
     }
 
 
@@ -220335,7 +220673,23 @@ def test_ac_dev_cross_plane_line_bypass_accepts_exact_renewed_route(
     case = _prepare_ac_dev_cross_plane_line_bypass(
         conn, monkeypatch, tmp_path,
         backlog_id="AC-DEV-CROSS-PLANE-RENEWED-ROUTE",
+        legacy_nine_action_route=True,
     )
+    root = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=case["project_id"],
+        storage_project_id=server._route_registry_storage_project_id(
+            case["project_id"]
+        ),
+        backlog_id=case["guide"]["backlog_id"],
+        task_id=case["execution_id"],
+        route_token_ref=case["route_token_ref"],
+    )
+    assert root["allowed_actions"] == case["legacy_allowed_actions"]
+    assert not {
+        "contract_runtime_current",
+        "contract_runtime_bypass_line",
+    }.intersection(root["allowed_actions"])
     renewed = observer_route_context.renew_route_token_ref(
         conn, project_id=case["project_id"],
         storage_project_id=server._route_registry_storage_project_id(
@@ -220345,6 +220699,7 @@ def test_ac_dev_cross_plane_line_bypass_accepts_exact_renewed_route(
         task_id=case["execution_id"], caller_role="observer",
         project_root=tmp_path,
     )
+    assert renewed["allowed_actions"] == case["legacy_allowed_actions"]
     body = {
         **case["body"],
         "observer_route_token_ref": renewed["route_token_ref"],
