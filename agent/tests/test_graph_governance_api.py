@@ -1959,6 +1959,8 @@ def _strict_direct_main_comparison_world(
     actual_files: list[str] | None = None,
     file_inventory: list[dict[str, Any]] | None = None,
     contract_runtime_primary: bool = False,
+    immutable_revision_chain: bool = False,
+    chain_mutation: str = "",
 ) -> dict[str, Any]:
     """Create a real rev3 Direct Main round through its public facades."""
 
@@ -2031,37 +2033,209 @@ def _strict_direct_main_comparison_world(
             ),
         )
     )
-    for relative_path in actual_files:
-        changed_path = project_root / relative_path
-        changed_path.parent.mkdir(parents=True, exist_ok=True)
-        changed_path.write_text(
-            f"DIRECT_MAIN_COMPARISON = {suffix!r}\n",
-            encoding="utf-8",
-        )
-    subprocess.run(
-        ["git", "add", "--", *actual_files],
-        cwd=project_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
+    revision_commits: list[str] = []
+    revision_steps = (
         [
-            "git",
-            "commit",
-            "-m",
-            _canonical_parentless_direct_main_commit_message(
-                backlog_id=backlog_id,
-                task_id=task_id,
-                parent_commit=base_commit,
-            ),
-        ],
-        cwd=project_root,
-        check=True,
-        capture_output=True,
-        text=True,
+            list(actual_files),
+            [actual_files[0]],
+            [actual_files[-1]],
+            [actual_files[-1]],
+        ]
+        if immutable_revision_chain
+        else [list(actual_files)]
     )
-    candidate_commit = batch_jobs.git_commit(project_root)
+    revision_parent = base_commit
+    for revision_index, revision_files in enumerate(revision_steps, start=1):
+        if chain_mutation == "merge" and revision_index == 2:
+            branch_name = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "checkout", "-q", "-b", "revision-side"],
+                cwd=project_root,
+                check=True,
+            )
+            side_path = project_root / actual_files[0]
+            side_path.write_text("side revision\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "-A"], cwd=project_root, check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-q",
+                    "-m",
+                    _canonical_parentless_direct_main_commit_message(
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        parent_commit=revision_parent,
+                    ),
+                ],
+                cwd=project_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "-q", branch_name],
+                cwd=project_root,
+                check=True,
+            )
+            main_path = project_root / actual_files[-1]
+            main_path.write_text("main revision\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "-A"], cwd=project_root, check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-q",
+                    "-m",
+                    _canonical_parentless_direct_main_commit_message(
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        parent_commit=revision_parent,
+                    ),
+                ],
+                cwd=project_root,
+                check=True,
+            )
+            main_parent = batch_jobs.git_commit(project_root)
+            subprocess.run(
+                [
+                    "git",
+                    "merge",
+                    "-q",
+                    "--no-ff",
+                    "revision-side",
+                    "-m",
+                    _canonical_parentless_direct_main_commit_message(
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        parent_commit=main_parent,
+                    ),
+                ],
+                cwd=project_root,
+                check=True,
+            )
+            revision_parent = batch_jobs.git_commit(project_root)
+            revision_commits.append(revision_parent)
+            break
+        for relative_path in revision_files:
+            changed_path = project_root / relative_path
+            changed_path.parent.mkdir(parents=True, exist_ok=True)
+            changed_path.write_text(
+                (
+                    f"DIRECT_MAIN_COMPARISON = {suffix!r}\n"
+                    f"IMMUTABLE_REVISION = {revision_index}\n"
+                ),
+                encoding="utf-8",
+            )
+        escape_path = project_root / "outside-admitted-scope.py"
+        if chain_mutation == "escape_revert" and revision_index == 2:
+            escape_path.write_text("escaped scope\n", encoding="utf-8")
+        elif chain_mutation == "escape_revert" and revision_index == 3:
+            escape_path.unlink()
+        whitespace_escape_path = project_root / (
+            "agent/governance/server.py "
+        )
+        if (
+            chain_mutation == "whitespace_escape_revert"
+            and revision_index == 2
+        ):
+            whitespace_escape_path.write_text(
+                "whitespace-distinct scope\n", encoding="utf-8"
+            )
+        elif (
+            chain_mutation == "whitespace_escape_revert"
+            and revision_index == 3
+        ):
+            whitespace_escape_path.unlink()
+        if chain_mutation == "rename_escape_revert" and revision_index == 2:
+            subprocess.run(
+                [
+                    "git",
+                    "mv",
+                    actual_files[0],
+                    "outside-admitted-scope.py",
+                ],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        elif (
+            chain_mutation == "rename_escape_revert"
+            and revision_index == 3
+        ):
+            subprocess.run(
+                [
+                    "git",
+                    "mv",
+                    "outside-admitted-scope.py",
+                    actual_files[0],
+                ],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        backslash_alias = "agent/governance\\server.py"
+        if (
+            chain_mutation == "backslash_rename_revert"
+            and revision_index == 2
+        ):
+            subprocess.run(
+                ["git", "mv", actual_files[0], backslash_alias],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        elif (
+            chain_mutation == "backslash_rename_revert"
+            and revision_index == 3
+        ):
+            subprocess.run(
+                ["git", "mv", backslash_alias, actual_files[0]],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit_message = _canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_commit=revision_parent,
+        )
+        if chain_mutation == "foreign_provenance" and revision_index == 2:
+            commit_message = "foreign intermediate without Chain provenance"
+        subprocess.run(
+            [
+                "git",
+                "commit",
+                "-m",
+                commit_message,
+            ],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        revision_parent = batch_jobs.git_commit(project_root)
+        revision_commits.append(revision_parent)
+    candidate_commit = revision_commits[-1]
     implementation_body = _canonical_parentless_direct_main_implementation_body(
         backlog_id=backlog_id,
         task_id=task_id,
@@ -2148,6 +2322,7 @@ def _strict_direct_main_comparison_world(
         "route_identity": route_identity,
         "base_commit": base_commit,
         "candidate_commit": candidate_commit,
+        "revision_commits": revision_commits,
         "candidate_snapshot_id": candidate_snapshot_id,
         "trace_id": trace_id,
         "implementation": implementation,
@@ -4340,6 +4515,355 @@ def test_strict_direct_main_rev3_comparison_authority_persists_exact_diff(
     assert trace["root_identity"]["comparison_base_commit_sha"] == (
         world["base_commit"]
     )
+
+
+def test_strict_direct_main_first_admission_proves_immutable_revision_chain(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    """Admit B->C1->C2->C3->C4 once and compare QA from B to C4."""
+
+    declared_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="FIRST-ADMISSION-REVISION-CHAIN",
+        declared_files=declared_files,
+        actual_files=declared_files,
+        contract_runtime_primary=True,
+        immutable_revision_chain=True,
+    )
+    assert len(world["revision_commits"]) == 4
+    implementation = world["implementation"]
+    authority = implementation["payload"][
+        "direct_main_implementation_commit_prewrite_authority"
+    ]
+    assert authority["expected_runtime_base_commit"] == world["base_commit"]
+    assert authority["implementation_parent_commit"] == world[
+        "revision_commits"
+    ][-2]
+    assert authority["verified_changed_files"] == declared_files
+    assert authority["chain_commit_count"] == 4
+    assert authority["chain_complete"] is True
+    assert authority["chain_truncated"] is False
+    assert authority["chain_commits"] == world["revision_commits"]
+    assert all(
+        not step["commit_trailer_mismatches"]
+        for step in authority["chain_steps"]
+    )
+    assert authority["chain_all_touched_files"] == declared_files
+    assert implementation["payload"]["dirty_scope_check"][
+        "changed_files"
+    ] == declared_files
+    assert authority["authority_hash"] == server.stable_sha256(
+        {
+            key: value
+            for key, value in authority.items()
+            if key != "authority_hash"
+        }
+    )
+    runtime_record = server._contract_runtime(conn).store.get(world["task_id"])
+    assert sum(
+        line.get("line_id") == "observer_implementation"
+        for line in runtime_record["completed_lines"]
+    ) == 1
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=world["backlog_id"],
+            task_id=world["task_id"],
+            event_kind="implementation",
+            limit=10,
+        )
+    ) == 1
+
+    comparison = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+        },
+    )
+    assert comparison == {
+        "commit_sha": world["base_commit"],
+        "source": server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        "lineage_source": server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+    }
+
+    _activate_basic_graph(
+        conn,
+        "full-direct-main-first-admission-revision-chain",
+        commit_sha=world["candidate_commit"],
+    )
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        commit_sha=world["candidate_commit"],
+    )
+    qa_scope = [
+        f"backlog:{world['backlog_id']}",
+        f"task:{world['task_id']}",
+        f"commit:{world['candidate_commit']}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:strict-direct-main-first-admission-chain",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    query_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+            "project_root": str(world["project_root"]),
+        },
+    )
+    query_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:strict-direct-main-first-admission-chain",
+            "scope": qa_scope,
+        }
+    )
+    queried = server.handle_graph_governance_query(query_ctx)
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": queried["trace_id"]})
+    )["trace"]
+    identity = trace["graph_query_identity"]
+    assert identity["candidate_commit_sha"] == world["candidate_commit"]
+    assert identity["comparison_base_commit_sha"] == world["base_commit"]
+    assert identity["changed_files"] == declared_files
+
+
+@pytest.mark.parametrize(
+    ("chain_mutation", "missing_requirement"),
+    [
+        (
+            "foreign_provenance",
+            "implementation_commit_chain_trailers_exact",
+        ),
+        ("escape_revert", "implementation_chain_changed_files_within_scope"),
+        (
+            "rename_escape_revert",
+            "implementation_chain_changed_files_within_scope",
+        ),
+        ("truncated", "implementation_chain_bounded_traversal_complete"),
+        ("merge", "implementation_commit_single_parent"),
+        (
+            "whitespace_escape_revert",
+            "implementation_chain_changed_files_within_scope",
+        ),
+        (
+            "backslash_rename_revert",
+            "implementation_chain_changed_files_within_scope",
+        ),
+    ],
+)
+def test_strict_direct_main_first_admission_rejects_unproved_revision_chain(
+    conn,
+    monkeypatch,
+    tmp_path,
+    chain_mutation,
+    missing_requirement,
+):
+    declared_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    if chain_mutation == "truncated":
+        monkeypatch.setattr(
+            server,
+            "_DIRECT_MAIN_IMMUTABLE_REVISION_MAX_COMMITS",
+            3,
+        )
+    suffix = f"FIRST-ADMISSION-{chain_mutation.upper()}"
+    with pytest.raises(GovernanceError) as rejected:
+        _strict_direct_main_comparison_world(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            declared_files=declared_files,
+            actual_files=declared_files,
+            contract_runtime_primary=True,
+            immutable_revision_chain=True,
+            chain_mutation=(
+                "" if chain_mutation == "truncated" else chain_mutation
+            ),
+        )
+
+    authority = rejected.value.details["commit_prewrite_authority"]
+    assert missing_requirement in authority["missing_requirement_ids"]
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    backlog_id = f"AC-DIRECT-MAIN-COMPARISON-{suffix}"
+    records = server._operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    assert len(records) == 1
+    assert [
+        line["line_id"] for line in records[0]["completed_lines"]
+    ] == [
+        "observer_bind_direct_scope",
+        "observer_graph_context",
+        "observer_direct_implementation_exception",
+    ]
+    assert not task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=records[0]["contract_execution_id"],
+        event_kind="implementation",
+        limit=10,
+    )
+
+
+def _strip_direct_main_chain_projection_from_accepted_evidence(conn, world):
+    """Model an immutable b905-era accepted prewrite authority."""
+
+    chain_fields = {
+        "chain_complete",
+        "chain_truncated",
+        "chain_max_commits",
+        "chain_commit_count",
+        "chain_commits",
+        "chain_steps",
+        "chain_all_touched_files",
+        "chain_unexpected_touched_files",
+    }
+    implementation = next(
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=world["backlog_id"],
+            task_id=world["task_id"],
+            limit=100,
+        )
+        if event["event_kind"] == "implementation"
+    )
+    event_payload = copy.deepcopy(implementation["payload"])
+    legacy_authority = event_payload[
+        "direct_main_implementation_commit_prewrite_authority"
+    ]
+    for field in chain_fields:
+        legacy_authority.pop(field, None)
+    legacy_authority["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in legacy_authority.items()
+            if key != "authority_hash"
+        }
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+        (json.dumps(event_payload, sort_keys=True), implementation["id"]),
+    )
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(world["task_id"])
+    implementation_line = next(
+        line
+        for line in record["completed_lines"]
+        if line.get("line_id") == "observer_implementation"
+    )
+    implementation_line["payload"][
+        "direct_main_implementation_commit_prewrite_authority"
+    ] = copy.deepcopy(legacy_authority)
+    runtime.store.update(world["task_id"], record)
+    conn.commit()
+
+
+def test_strict_direct_main_comparison_accepts_legacy_direct_child_authority(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="LEGACY-DIRECT-CHILD-AUTHORITY",
+        contract_runtime_primary=True,
+    )
+    _strip_direct_main_chain_projection_from_accepted_evidence(conn, world)
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+        },
+    )
+
+    assert authority == {
+        "commit_sha": world["base_commit"],
+        "source": server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        "lineage_source": server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+    }
+
+
+def test_strict_direct_main_comparison_rejects_multicommit_without_chain_authority(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    declared_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="MISSING-MULTICOMMIT-CHAIN-AUTHORITY",
+        declared_files=declared_files,
+        actual_files=declared_files,
+        contract_runtime_primary=True,
+        immutable_revision_chain=True,
+    )
+    _strip_direct_main_chain_projection_from_accepted_evidence(conn, world)
+    before_changes = conn.total_changes
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+        },
+    )
+
+    assert authority["machine_reason"] == (
+        "exact_candidate_direct_main_file_fence_mismatch"
+    )
+    assert authority["zero_write_rejection"] is True
+    assert authority["writes_performed"] is False
+    assert conn.total_changes == before_changes
 
 
 def test_strict_direct_main_contract_runtime_primary_rejects_unbound_candidate(
@@ -105915,12 +106439,12 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
     assert wrong_parent_rejected.value.code == (
         "parentless_direct_main_implementation_test_evidence_incomplete"
     )
-    assert "implementation_parent_matches_runtime_base" in (
+    assert "implementation_commit_chain_trailers_exact" in (
         wrong_parent_rejected.value.details["commit_prewrite_authority"][
             "missing_requirement_ids"
         ]
     )
-    assert "implementation_parent_matches_runtime_base" in (
+    assert "implementation_chain_changed_files_within_scope" in (
         wrong_parent_rejected.value.details["missing_requirement_ids"]
     )
     assert conn.total_changes == wrong_parent_changes
@@ -107807,7 +108331,7 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
             "parentless_direct_main_implementation_prewrite_gate"
         ),
         "changed_files_source": (
-            "server_git_single_parent_to_implementation_diff_name_status_z_m"
+            "server_git_runtime_base_to_implementation_diff_name_status_z_m"
         ),
         "allowed_files": ["agent/governance/server.py"],
         "changed_files": ["agent/governance/server.py"],
@@ -109740,7 +110264,7 @@ def test_parentless_direct_main_dirty_scope_normalizes_order_as_exact_set(
         row_declared_files=canonical_files,
         verified_changed_files=list(reversed(canonical_files)),
         verified_changed_files_source=(
-            "server_git_single_parent_to_implementation_diff_name_status_z_m"
+            "server_git_runtime_base_to_implementation_diff_name_status_z_m"
         ),
     )
     assert equivalent["passed"] is True

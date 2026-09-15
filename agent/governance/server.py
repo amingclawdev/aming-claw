@@ -14921,6 +14921,389 @@ def _qa_exact_candidate_direct_main_comparison_failure(
     }
 
 
+_DIRECT_MAIN_IMMUTABLE_REVISION_MAX_COMMITS = 256
+
+
+def _direct_main_parse_exact_name_status_z(
+    raw: bytes,
+) -> list[dict[str, Any]]:
+    """Parse Git paths without aliasing literal backslashes or whitespace."""
+
+    fields = raw.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    changes: list[dict[str, Any]] = []
+    index = 0
+
+    def exact_path(value: bytes) -> str:
+        try:
+            path = value.decode("utf-8")
+        except UnicodeDecodeError:
+            _qa_overlay_fail(
+                "non_utf8_git_path_requires_exact_candidate_snapshot",
+                "Direct Main chain contains a non-UTF-8 Git path",
+            )
+        components = path.split("/")
+        if (
+            not path
+            or path.startswith("/")
+            or any(component in {"", ".", ".."} for component in components)
+        ):
+            _qa_overlay_fail(
+                "unsafe_git_path_requires_exact_candidate_snapshot",
+                "Direct Main chain contains an unsafe repository path",
+                path=path,
+            )
+        return path
+
+    while index < len(fields):
+        try:
+            status_token = fields[index].decode("ascii")
+        except UnicodeDecodeError:
+            _qa_overlay_fail(
+                "invalid_git_status_requires_exact_candidate_snapshot",
+                "Direct Main chain diff status is not ASCII",
+            )
+        index += 1
+        status = status_token[:1]
+        if status not in {"A", "M", "D", "R"}:
+            _qa_overlay_fail(
+                "unsupported_git_status_requires_exact_candidate_snapshot",
+                "Direct Main chain contains an unsupported change type",
+                status=status_token,
+            )
+        if status == "R":
+            if index + 1 >= len(fields):
+                _qa_overlay_fail(
+                    "malformed_rename_requires_exact_candidate_snapshot",
+                    "Direct Main chain rename record is incomplete",
+                )
+            old_path = exact_path(fields[index])
+            new_path = exact_path(fields[index + 1])
+            index += 2
+            changes.append(
+                {
+                    "status": "R",
+                    "path": new_path,
+                    "old_path": old_path,
+                }
+            )
+            continue
+        if index >= len(fields):
+            _qa_overlay_fail(
+                "malformed_diff_requires_exact_candidate_snapshot",
+                "Direct Main chain diff path record is incomplete",
+            )
+        changes.append(
+            {
+                "status": status,
+                "path": exact_path(fields[index]),
+                "old_path": "",
+            }
+        )
+        index += 1
+    return changes
+
+
+def _direct_main_immutable_revision_chain_authority(
+    project_root: Path,
+    *,
+    base_commit_sha: str,
+    candidate_commit_sha: str,
+    backlog_id: str,
+    task_id: str,
+    declared_files: Sequence[str],
+) -> dict[str, Any]:
+    """Prove one bounded same-execution linear chain and its cumulative scope."""
+
+    base_commit = str(base_commit_sha or "").strip().lower()
+    candidate_commit = str(candidate_commit_sha or "").strip().lower()
+    missing: list[str] = []
+    mismatches: list[dict[str, Any]] = []
+    steps_descending: list[dict[str, Any]] = []
+    all_touched_files: set[str] = set()
+    cumulative_changed_files: list[str] = []
+    chain_truncated = False
+    current = candidate_commit
+
+    for field, commit in (
+        ("base_commit_sha", base_commit),
+        ("candidate_commit_sha", candidate_commit),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+            missing.append("implementation_chain_full_object_ids")
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": "full commit object id",
+                    "actual": commit,
+                }
+            )
+            continue
+        try:
+            resolved = _qa_git_bytes(
+                project_root,
+                ["rev-parse", "--verify", f"{commit}^{{commit}}"],
+            )
+        except _QACandidateOverlayError:
+            resolved = None
+        resolved_commit = (
+            resolved.stdout.decode("ascii", errors="ignore").strip().lower()
+            if resolved is not None and resolved.returncode == 0
+            else ""
+        )
+        if resolved_commit != commit:
+            missing.append("implementation_chain_commit_objects_exist")
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": "full commit object in registered repository",
+                    "actual": commit,
+                }
+            )
+
+    if base_commit == candidate_commit:
+        missing.append("implementation_chain_candidate_descends_from_base")
+    while not missing and current != base_commit:
+        if len(steps_descending) >= _DIRECT_MAIN_IMMUTABLE_REVISION_MAX_COMMITS:
+            chain_truncated = True
+            missing.append("implementation_chain_bounded_traversal_complete")
+            break
+        try:
+            parent_line = _qa_git_bytes(
+                project_root,
+                ["rev-list", "--parents", "-n", "1", current],
+            )
+        except _QACandidateOverlayError:
+            parent_line = None
+        parent_tokens = (
+            parent_line.stdout.decode("ascii", errors="ignore")
+            .strip()
+            .lower()
+            .split()
+            if parent_line is not None and parent_line.returncode == 0
+            else []
+        )
+        if len(parent_tokens) != 2 or parent_tokens[:1] != [current]:
+            missing.append("implementation_commit_single_parent")
+            mismatches.append(
+                {
+                    "field": "implementation_chain_parent_count",
+                    "commit_sha": current,
+                    "expected": 1,
+                    "actual": max(len(parent_tokens) - 1, 0),
+                }
+            )
+            break
+        parent_commit = parent_tokens[1]
+        expected_trailers = {
+            "Chain-Source-Task": task_id,
+            "Chain-Source-Contract-Execution": task_id,
+            "Chain-Source-Stage": "implementation",
+            "Chain-Task": task_id,
+            "Chain-Bug-Id": backlog_id,
+            "Chain-Backlog": backlog_id,
+            "Chain-Route": "operator_supervised_direct_main",
+            "Chain-Parent": parent_commit,
+        }
+        try:
+            trailer_result = _qa_git_bytes(
+                project_root,
+                [
+                    "show",
+                    "-s",
+                    "--format=%(trailers:only,unfold=true)",
+                    current,
+                ],
+            )
+        except _QACandidateOverlayError:
+            trailer_result = None
+        canonical_trailers: dict[str, list[str]] = {}
+        if trailer_result is not None and trailer_result.returncode == 0:
+            for line in trailer_result.stdout.decode(
+                "utf-8", errors="surrogateescape"
+            ).splitlines():
+                key, separator, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                if separator and key and value:
+                    canonical_trailers.setdefault(key, []).append(value)
+        trailer_mismatches = {
+            key: {
+                "expected": [expected_value],
+                "actual": list(canonical_trailers.get(key) or []),
+            }
+            for key, expected_value in expected_trailers.items()
+            if list(canonical_trailers.get(key) or []) != [expected_value]
+        }
+        if trailer_result is None or trailer_result.returncode != 0:
+            trailer_mismatches["git_trailer_read"] = {
+                "expected": ["successful bounded Git trailer read"],
+                "actual": [],
+            }
+        if trailer_mismatches:
+            missing.append("implementation_commit_chain_trailers_exact")
+            mismatches.append(
+                {
+                    "field": "implementation_commit_chain_trailers",
+                    "commit_sha": current,
+                    "expected": expected_trailers,
+                    "actual": canonical_trailers,
+                }
+            )
+        try:
+            changed = _qa_git_bytes(
+                project_root,
+                [
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--name-status",
+                    "-z",
+                    "-M",
+                    f"{parent_commit}..{current}",
+                    "--",
+                    ".",
+                ],
+            )
+        except _QACandidateOverlayError:
+            changed = None
+        step_files: set[str] = set()
+        if changed is None or changed.returncode != 0:
+            missing.append("implementation_changed_files_server_verified")
+        else:
+            try:
+                changes = _direct_main_parse_exact_name_status_z(
+                    changed.stdout
+                )
+            except _QACandidateOverlayError:
+                changes = []
+                missing.append("implementation_changed_files_server_verified")
+            for item in changes:
+                step_files.update(
+                    str(path or "")
+                    for path in (item.get("old_path"), item.get("path"))
+                    if str(path or "")
+                )
+        if not step_files:
+            missing.append("implementation_changed_files_server_verified")
+        all_touched_files.update(step_files)
+        steps_descending.append(
+            {
+                "commit_sha": current,
+                "parent_commit_sha": parent_commit,
+                "changed_files": sorted(step_files),
+                "canonical_commit_trailers": canonical_trailers,
+                "expected_commit_trailers": expected_trailers,
+                "commit_trailer_mismatches": trailer_mismatches,
+            }
+        )
+        current = parent_commit
+
+    chain_complete = bool(
+        current == base_commit
+        and base_commit != candidate_commit
+        and steps_descending
+        and not chain_truncated
+    )
+    if not chain_complete:
+        missing.append("implementation_chain_base_to_candidate_complete")
+
+    declared_set = {
+        str(path or "")
+        for path in declared_files
+        if str(path or "")
+    }
+    unexpected_touched_files = sorted(all_touched_files - declared_set)
+    if unexpected_touched_files:
+        missing.append("implementation_chain_changed_files_within_scope")
+        mismatches.append(
+            {
+                "field": "implementation_chain_changed_files",
+                "expected": sorted(declared_set),
+                "actual": sorted(all_touched_files),
+                "unexpected_files": unexpected_touched_files,
+            }
+        )
+
+    if chain_complete:
+        try:
+            cumulative = _qa_git_bytes(
+                project_root,
+                [
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--name-status",
+                    "-z",
+                    "-M",
+                    f"{base_commit}..{candidate_commit}",
+                    "--",
+                    ".",
+                ],
+            )
+        except _QACandidateOverlayError:
+            cumulative = None
+        cumulative_paths: set[str] = set()
+        if cumulative is None or cumulative.returncode != 0:
+            missing.append("implementation_changed_files_server_verified")
+        else:
+            try:
+                cumulative_changes = _direct_main_parse_exact_name_status_z(
+                    cumulative.stdout
+                )
+            except _QACandidateOverlayError:
+                cumulative_changes = []
+                missing.append("implementation_changed_files_server_verified")
+            for item in cumulative_changes:
+                cumulative_paths.update(
+                    str(path or "")
+                    for path in (item.get("old_path"), item.get("path"))
+                    if str(path or "")
+                )
+        cumulative_changed_files = sorted(cumulative_paths)
+        if not cumulative_changed_files:
+            missing.append("implementation_changed_files_server_verified")
+
+    steps = list(reversed(steps_descending))
+    candidate_step = steps_descending[0] if steps_descending else {}
+    missing = list(dict.fromkeys(missing))
+    return {
+        "passed": not missing,
+        "base_commit_sha": base_commit,
+        "candidate_commit_sha": candidate_commit,
+        "implementation_parent_commit": str(
+            candidate_step.get("parent_commit_sha") or ""
+        ),
+        "chain_complete": chain_complete,
+        "chain_truncated": chain_truncated,
+        "chain_max_commits": _DIRECT_MAIN_IMMUTABLE_REVISION_MAX_COMMITS,
+        "chain_commit_count": len(steps),
+        "chain_commits": [str(step.get("commit_sha") or "") for step in steps],
+        "chain_steps": steps,
+        "all_touched_files": sorted(all_touched_files),
+        "unexpected_touched_files": unexpected_touched_files,
+        "cumulative_changed_files": cumulative_changed_files,
+        "canonical_commit_trailers": dict(
+            candidate_step.get("canonical_commit_trailers") or {}
+        ),
+        "expected_commit_trailers": dict(
+            candidate_step.get("expected_commit_trailers") or {}
+        ),
+        "commit_trailer_mismatches": dict(
+            candidate_step.get("commit_trailer_mismatches") or {}
+        ),
+        "commit_trailers_exact": bool(
+            steps
+            and all(
+                not step.get("commit_trailer_mismatches") for step in steps
+            )
+        ),
+        "missing_requirement_ids": missing,
+        "identity_mismatches": mismatches,
+    }
+
+
 def _qa_exact_candidate_direct_main_strict_comparison_authority(
     *,
     strict_record: Mapping[str, Any],
@@ -15096,7 +15479,6 @@ def _qa_exact_candidate_direct_main_strict_comparison_authority(
             world_ref.get("base_commit"),
             world_ref.get("target_head_commit"),
             prewrite.get("expected_runtime_base_commit"),
-            prewrite.get("implementation_parent_commit"),
         )
     }
     prewrite_candidate_values = {
@@ -15147,6 +15529,14 @@ def _qa_exact_candidate_direct_main_strict_comparison_authority(
             ]
         )
     )
+    fresh_chain = _direct_main_immutable_revision_chain_authority(
+        canonical_root,
+        base_commit_sha=comparison_base,
+        candidate_commit_sha=candidate_commit_sha,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        declared_files=declared_files,
+    )
     try:
         diff_identity = _qa_exact_candidate_diff_identity(
             canonical_root,
@@ -15166,11 +15556,66 @@ def _qa_exact_candidate_direct_main_strict_comparison_authority(
             ]
         )
     )
+    chain_authority_fields = {
+        "chain_complete",
+        "chain_truncated",
+        "chain_max_commits",
+        "chain_commit_count",
+        "chain_commits",
+        "chain_steps",
+        "chain_all_touched_files",
+        "chain_unexpected_touched_files",
+    }
+    supplied_chain_fields = chain_authority_fields.intersection(prewrite)
+    complete_chain_authority_matches = bool(
+        supplied_chain_fields == chain_authority_fields
+        and fresh_chain.get("passed") is True
+        and fresh_chain.get("chain_complete") is True
+        and fresh_chain.get("chain_truncated") is False
+        and str(
+            fresh_chain.get("implementation_parent_commit") or ""
+        ).strip()
+        == str(prewrite.get("implementation_parent_commit") or "").strip()
+        and list(fresh_chain.get("chain_commits") or [])
+        == list(prewrite.get("chain_commits") or [])
+        and list(fresh_chain.get("chain_steps") or [])
+        == list(prewrite.get("chain_steps") or [])
+        and list(fresh_chain.get("all_touched_files") or [])
+        == list(prewrite.get("chain_all_touched_files") or [])
+        and int(fresh_chain.get("chain_commit_count") or 0)
+        == int(prewrite.get("chain_commit_count") or 0)
+        and int(fresh_chain.get("chain_max_commits") or 0)
+        == int(prewrite.get("chain_max_commits") or 0)
+        and prewrite.get("chain_complete") is True
+        and prewrite.get("chain_truncated") is False
+        and list(prewrite.get("chain_unexpected_touched_files") or []) == []
+    )
+    legacy_single_commit_authority_matches = bool(
+        not supplied_chain_fields
+        and fresh_chain.get("passed") is True
+        and fresh_chain.get("chain_complete") is True
+        and fresh_chain.get("chain_truncated") is False
+        and int(fresh_chain.get("chain_commit_count") or 0) == 1
+        and list(fresh_chain.get("chain_commits") or [])
+        == [candidate_commit_sha]
+        and str(
+            fresh_chain.get("implementation_parent_commit") or ""
+        ).strip()
+        == comparison_base
+        and str(prewrite.get("implementation_parent_commit") or "").strip()
+        == comparison_base
+    )
     if not (
         declared_files
         and declared_files == binding_owned_files
         and declared_files == binding_target_files
+        and (
+            complete_chain_authority_matches
+            or legacy_single_commit_authority_matches
+        )
         and prewrite_changed_files
+        and prewrite_changed_files
+        == list(fresh_chain.get("cumulative_changed_files") or [])
         and prewrite_changed_files == diff_changed_files
         and set(diff_changed_files).issubset(declared_files)
     ):
@@ -15292,6 +15737,17 @@ def _qa_exact_candidate_direct_main_comparison_authority(
             expected="available full candidate commit",
             actual="missing_or_unavailable",
         )
+    strict_records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    matching_strict_records = [
+        record
+        for record in strict_records
+        if str(record.get("contract_execution_id") or "").strip()
+        == task_id
+    ]
     implementation_events = (
         _onboard_parentless_direct_main_timeline_events(
             conn,
@@ -15352,6 +15808,53 @@ def _qa_exact_candidate_direct_main_comparison_authority(
             expected="registered project root",
             actual="unavailable",
         )
+    if matching_strict_records:
+        if len(matching_strict_records) != 1:
+            return _qa_exact_candidate_direct_main_comparison_failure(
+                "exact_candidate_direct_main_runtime_binding_invalid",
+                field="strict_runtime_record_count",
+                expected=1,
+                actual=len(matching_strict_records),
+            )
+        strict_metadata = (
+            matching_strict_records[0].get("metadata")
+            if isinstance(matching_strict_records[0].get("metadata"), Mapping)
+            else {}
+        )
+        strict_binding = (
+            strict_metadata.get(
+                "operator_supervised_direct_main_runtime_binding"
+            )
+            if isinstance(
+                strict_metadata.get(
+                    "operator_supervised_direct_main_runtime_binding"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        comparison_base = _contract_runtime_full_commit_value(
+            project_id,
+            strict_binding.get("base_commit"),
+        )
+        if not comparison_base or comparison_base == candidate_commit_sha:
+            return _qa_exact_candidate_direct_main_comparison_failure(
+                "exact_candidate_direct_main_base_commit_unavailable",
+                field="comparison_base_commit_sha",
+                expected="bound full commit distinct from candidate",
+                actual=comparison_base,
+            )
+        return _qa_exact_candidate_direct_main_strict_comparison_authority(
+            strict_record=matching_strict_records[0],
+            direct_event=direct_event,
+            implementation_event=authoritative_events[0],
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            project_root=Path(project_root).resolve(),
+            candidate_commit_sha=candidate_commit_sha,
+            comparison_base=comparison_base,
+        )
     parents = _qa_git_bytes(
         Path(project_root).resolve(),
         ["rev-list", "--parents", "--max-count=1", candidate_commit_sha],
@@ -15381,36 +15884,6 @@ def _qa_exact_candidate_direct_main_comparison_authority(
             field="comparison_base_commit_sha",
             expected="available full commit distinct from candidate",
             actual="missing_or_equal_to_candidate",
-        )
-    strict_records = _operator_supervised_direct_main_strict_records(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-    )
-    matching_strict_records = [
-        record
-        for record in strict_records
-        if str(record.get("contract_execution_id") or "").strip()
-        == task_id
-    ]
-    if matching_strict_records:
-        if len(matching_strict_records) != 1:
-            return _qa_exact_candidate_direct_main_comparison_failure(
-                "exact_candidate_direct_main_runtime_binding_invalid",
-                field="strict_runtime_record_count",
-                expected=1,
-                actual=len(matching_strict_records),
-            )
-        return _qa_exact_candidate_direct_main_strict_comparison_authority(
-            strict_record=matching_strict_records[0],
-            direct_event=direct_event,
-            implementation_event=authoritative_events[0],
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-            project_root=Path(project_root).resolve(),
-            candidate_commit_sha=candidate_commit_sha,
-            comparison_base=comparison_base,
         )
     return {
         "commit_sha": comparison_base,
@@ -200334,7 +200807,10 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         event
         for event in events
         if task_timeline._close_event_key(event) == "implementation"
-        and task_timeline._event_passed(event)
+        and (
+            task_timeline._event_passed(event)
+            or str(event.get("status") or "").strip().lower() == "waived"
+        )
         and (
             prospective_event_id <= 0
             or int(event.get("id") or event.get("event_id") or 0)
@@ -200399,9 +200875,10 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
     expected_commit_trailers: dict[str, str] = {}
     commit_trailer_mismatches: dict[str, dict[str, Any]] = {}
     commit_trailers_exact = False
+    immutable_revision_chain: dict[str, Any] = {}
     ignored_demo_control_metadata_paths: list[str] = []
     verified_changed_files_source = (
-        "server_git_single_parent_to_implementation_diff_name_status_z_m"
+        "server_git_runtime_base_to_implementation_diff_name_status_z_m"
     )
 
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha):
@@ -200459,6 +200936,62 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
                         "actual": commit_sha,
                     }
                 )
+            elif strict_binding:
+                immutable_revision_chain = (
+                    _direct_main_immutable_revision_chain_authority(
+                        root,
+                        base_commit_sha=str(
+                            strict_binding.get("base_commit") or ""
+                        ),
+                        candidate_commit_sha=commit_sha,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        declared_files=current_row_files,
+                    )
+                )
+                implementation_parent_commit = str(
+                    immutable_revision_chain.get(
+                        "implementation_parent_commit"
+                    )
+                    or ""
+                )
+                verified_changed_files = list(
+                    immutable_revision_chain.get(
+                        "cumulative_changed_files"
+                    )
+                    or []
+                )
+                canonical_commit_trailers = dict(
+                    immutable_revision_chain.get(
+                        "canonical_commit_trailers"
+                    )
+                    or {}
+                )
+                expected_commit_trailers = dict(
+                    immutable_revision_chain.get(
+                        "expected_commit_trailers"
+                    )
+                    or {}
+                )
+                commit_trailer_mismatches = dict(
+                    immutable_revision_chain.get(
+                        "commit_trailer_mismatches"
+                    )
+                    or {}
+                )
+                commit_trailers_exact = bool(
+                    immutable_revision_chain.get("commit_trailers_exact")
+                    is True
+                )
+                commit_missing.extend(
+                    immutable_revision_chain.get(
+                        "missing_requirement_ids"
+                    )
+                    or []
+                )
+                commit_mismatches.extend(
+                    immutable_revision_chain.get("identity_mismatches") or []
+                )
             else:
                 parent_line = _qa_git_bytes(
                     root,
@@ -200467,110 +201000,66 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
                 parent_tokens = parent_line.stdout.decode(
                     "ascii", errors="ignore"
                 ).strip().lower().split()
-                if (
-                    parent_line.returncode != 0
-                    or len(parent_tokens) != 2
-                    or parent_tokens[0] != commit_sha
-                ):
-                    commit_missing.append("implementation_commit_single_parent")
-                else:
-                    implementation_parent_commit = parent_tokens[1]
-                    trailer_result = _qa_git_bytes(
+                legacy_base = (
+                    parent_tokens[1]
+                    if parent_line.returncode == 0
+                    and len(parent_tokens) == 2
+                    and parent_tokens[0] == commit_sha
+                    else ""
+                )
+                immutable_revision_chain = (
+                    _direct_main_immutable_revision_chain_authority(
                         root,
-                        [
-                            "show",
-                            "-s",
-                            "--format=%(trailers:only,unfold=true)",
-                            commit_sha,
-                        ],
+                        base_commit_sha=legacy_base,
+                        candidate_commit_sha=commit_sha,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        declared_files=current_row_files,
                     )
-                    if trailer_result.returncode == 0:
-                        for line in trailer_result.stdout.decode(
-                            "utf-8", errors="surrogateescape"
-                        ).splitlines():
-                            key, separator, value = line.partition(":")
-                            key = key.strip()
-                            value = value.strip()
-                            if not separator or not key or not value:
-                                continue
-                            canonical_commit_trailers.setdefault(key, []).append(
-                                value
-                            )
-                    expected_commit_trailers = {
-                        "Chain-Source-Task": task_id,
-                        "Chain-Source-Contract-Execution": task_id,
-                        "Chain-Source-Stage": "implementation",
-                        "Chain-Task": task_id,
-                        "Chain-Bug-Id": backlog_id,
-                        "Chain-Backlog": backlog_id,
-                        "Chain-Route": "operator_supervised_direct_main",
-                        "Chain-Parent": implementation_parent_commit,
-                    }
-                    commit_trailer_mismatches = {
-                        key: {
-                            "expected": [expected_value],
-                            "actual": list(canonical_commit_trailers.get(key) or []),
-                        }
-                        for key, expected_value in expected_commit_trailers.items()
-                        if list(canonical_commit_trailers.get(key) or [])
-                        != [expected_value]
-                    }
-                    commit_trailers_exact = bool(
-                        trailer_result.returncode == 0
-                        and not commit_trailer_mismatches
+                )
+                implementation_parent_commit = str(
+                    immutable_revision_chain.get(
+                        "implementation_parent_commit"
                     )
-                    if not commit_trailers_exact:
-                        commit_missing.append(
-                            "implementation_commit_chain_trailers_exact"
-                        )
-                        commit_mismatches.append(
-                            {
-                                "field": "implementation_commit_chain_trailers",
-                                "expected": expected_commit_trailers,
-                                "actual": canonical_commit_trailers,
-                            }
-                        )
-                    changed = _qa_git_bytes(
-                        root,
-                        [
-                            "diff",
-                            "--no-ext-diff",
-                            "--no-textconv",
-                            "--name-status",
-                            "-z",
-                            "-M",
-                            f"{implementation_parent_commit}..{commit_sha}",
-                            "--",
-                            ".",
-                        ],
+                    or ""
+                )
+                verified_changed_files = list(
+                    immutable_revision_chain.get(
+                        "cumulative_changed_files"
                     )
-                    if changed.returncode != 0:
-                        commit_missing.append(
-                            "implementation_changed_files_server_verified"
-                        )
-                    else:
-                        for item in _qa_parse_name_status_z(changed.stdout):
-                            for candidate_path in (
-                                item.get("old_path"),
-                                item.get("path"),
-                            ):
-                                normalized_path = str(
-                                    candidate_path or ""
-                                ).strip()
-                                if (
-                                    normalized_path
-                                    and normalized_path
-                                    not in verified_changed_files
-                                ):
-                                    verified_changed_files.append(
-                                        normalized_path
-                                    )
-                        if not verified_changed_files:
-                            commit_missing.append(
-                                "implementation_changed_files_server_verified"
-                            )
-                        else:
-                            verified_changed_files.sort()
+                    or []
+                )
+                canonical_commit_trailers = dict(
+                    immutable_revision_chain.get(
+                        "canonical_commit_trailers"
+                    )
+                    or {}
+                )
+                expected_commit_trailers = dict(
+                    immutable_revision_chain.get(
+                        "expected_commit_trailers"
+                    )
+                    or {}
+                )
+                commit_trailer_mismatches = dict(
+                    immutable_revision_chain.get(
+                        "commit_trailer_mismatches"
+                    )
+                    or {}
+                )
+                commit_trailers_exact = bool(
+                    immutable_revision_chain.get("commit_trailers_exact")
+                    is True
+                )
+                commit_missing.extend(
+                    immutable_revision_chain.get(
+                        "missing_requirement_ids"
+                    )
+                    or []
+                )
+                commit_mismatches.extend(
+                    immutable_revision_chain.get("identity_mismatches") or []
+                )
         try:
             head = _qa_git_bytes(
                 root,
@@ -200644,16 +201133,18 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
             )
         if not (
             expected_base_commit
-            and implementation_parent_commit == expected_base_commit
+            and immutable_revision_chain.get("base_commit_sha")
+            == expected_base_commit
+            and immutable_revision_chain.get("chain_complete") is True
         ):
-            commit_missing.append(
-                "implementation_parent_matches_runtime_base"
-            )
+            commit_missing.append("implementation_chain_matches_runtime_base")
             commit_mismatches.append(
                 {
-                    "field": "implementation_parent_commit",
+                    "field": "implementation_chain_base_commit",
                     "expected": expected_base_commit,
-                    "actual": implementation_parent_commit,
+                    "actual": immutable_revision_chain.get(
+                        "base_commit_sha"
+                    ),
                 }
             )
         if not (
@@ -200797,6 +201288,30 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         ),
         "verified_changed_files": verified_changed_files,
         "verified_changed_files_source": verified_changed_files_source,
+        "chain_complete": bool(
+            immutable_revision_chain.get("chain_complete") is True
+        ),
+        "chain_truncated": bool(
+            immutable_revision_chain.get("chain_truncated") is True
+        ),
+        "chain_max_commits": immutable_revision_chain.get(
+            "chain_max_commits", _DIRECT_MAIN_IMMUTABLE_REVISION_MAX_COMMITS
+        ),
+        "chain_commit_count": immutable_revision_chain.get(
+            "chain_commit_count", 0
+        ),
+        "chain_commits": list(
+            immutable_revision_chain.get("chain_commits") or []
+        ),
+        "chain_steps": list(
+            immutable_revision_chain.get("chain_steps") or []
+        ),
+        "chain_all_touched_files": list(
+            immutable_revision_chain.get("all_touched_files") or []
+        ),
+        "chain_unexpected_touched_files": list(
+            immutable_revision_chain.get("unexpected_touched_files") or []
+        ),
         "route_token_ref": route_token_ref,
         "route_scope_exact": route_scope_exact,
         "direct_route_identity_exact": direct_route_identity_exact,
