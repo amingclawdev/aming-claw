@@ -4831,16 +4831,43 @@ def _advance_cow_to_completed_generation(database, root, source):
     return completed_source
 
 
+def _completed_cow_exact_graph_fixture(tmp_path, monkeypatch):
+    from agent.governance import db, graph_snapshot_store
+
+    current_graph_schema = graph_snapshot_store.GRAPH_SNAPSHOT_SCHEMA_SQL
+    monkeypatch.setattr(
+        graph_snapshot_store,
+        "GRAPH_SNAPSHOT_SCHEMA_SQL",
+        _historical_graph_snapshot_schema_sql_for_generation_receipt(db),
+    )
+    root, database, linked, source, process, receipt = (
+        _phase_z_cow_prestart_fixture(
+            tmp_path,
+            monkeypatch,
+            rebuild_successor_from_final_predecessor=True,
+        )
+    )
+    monkeypatch.setattr(
+        graph_snapshot_store,
+        "GRAPH_SNAPSHOT_SCHEMA_SQL",
+        current_graph_schema,
+    )
+    completed_source = _advance_cow_to_completed_generation(database, root, source)
+    connection = sqlite3.connect(database)
+    _install_all_graph_owners_for_inventory_test(db, connection)
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    return root, database, linked, completed_source, process, receipt
+
+
 def test_cow_completed_generation_uses_current_projection_not_issuance_digest(
     tmp_path, monkeypatch,
 ):
     from agent.governance import db
 
-    root, database, linked, source, _process, receipt = (
-        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
-    )
-    completed_source = _advance_cow_to_completed_generation(
-        database, root, source,
+    root, database, linked, completed_source, _process, receipt = (
+        _completed_cow_exact_graph_fixture(tmp_path, monkeypatch)
     )
     assert completed_source["branch"] == "codex/ac-dev"
     connection = sqlite3.connect(database)
@@ -4856,13 +4883,20 @@ def test_cow_completed_generation_uses_current_projection_not_issuance_digest(
     ) == receipt
 
 
-def _completed_cow_basic_restart_fixture(tmp_path, monkeypatch):
+def _completed_cow_basic_restart_fixture(
+    tmp_path, monkeypatch, *, exact_graph_overlay=False,
+):
     from agent.governance import db
 
-    root, database, _linked, source, _process, _receipt = (
-        _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
-    )
-    candidate = _advance_cow_to_completed_generation(database, root, source)
+    if exact_graph_overlay:
+        root, database, _linked, candidate, _process, _receipt = (
+            _completed_cow_exact_graph_fixture(tmp_path, monkeypatch)
+        )
+    else:
+        root, database, _linked, source, _process, _receipt = (
+            _phase_z_cow_prestart_fixture(tmp_path, monkeypatch)
+        )
+        candidate = _advance_cow_to_completed_generation(database, root, source)
     _phase_z_bind_first_start_runtime(tmp_path, monkeypatch, root)
     original_kill = os.kill
 
@@ -4879,6 +4913,144 @@ def _completed_cow_basic_restart_fixture(tmp_path, monkeypatch):
         source_sha256="sha256:" + "0" * 64, port=40008,
     )
     return root, database, candidate, stable, launch_path
+
+
+def test_completed_cow_basic_restart_schema_meta_projection_skips_unrelated_rows(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, candidate, _stable, _launch_path = (
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
+    )
+    original_connect = db.sqlite3.connect
+    connection = original_connect(database)
+    try:
+        def projection_select(table):
+            columns = [str(row[1]) for row in connection.execute(
+                f"PRAGMA table_info({db._sqlite_quote_identifier(table)})"
+            )]
+            return "SELECT " + ",".join(
+                db._sqlite_quote_identifier(column) for column in columns
+            ) + " FROM " + db._sqlite_quote_identifier(table)
+
+        unrelated_select = projection_select("backlog_bugs")
+    finally:
+        connection.close()
+
+    statements = []
+
+    def traced_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    projection_calls = []
+    original_projection = db._sqlite_logical_projection
+
+    def traced_projection(connection, **kwargs):
+        caller = sys._getframe(1).f_code.co_name
+        before = len(statements)
+        result = original_projection(connection, **kwargs)
+        projection_calls.append({
+            "caller": caller,
+            "include_tables": kwargs.get("include_tables"),
+            "unrelated_reads": statements[before:].count(unrelated_select),
+        })
+        return result
+
+    monkeypatch.setattr(db.sqlite3, "connect", traced_connect)
+    monkeypatch.setattr(db, "_sqlite_logical_projection", traced_projection)
+    result = db._validate_dev_cow_completed_basic_restart(
+        root,
+        source_identity=candidate,
+        stable_binding=db.verified_stable_database_binding(),
+    )
+
+    assert result["axis"]["revision"] == 3
+    assert [
+        call for call in projection_calls
+        if call["caller"] in {
+            "_select_dev_cow_generation_phase",
+            "_validated_dev_cow_completed_generation_axis",
+        }
+    ] == [
+        {
+            "caller": "_select_dev_cow_generation_phase",
+            "include_tables": frozenset({"schema_meta"}),
+            "unrelated_reads": 0,
+        },
+        {
+            "caller": "_validated_dev_cow_completed_generation_axis",
+            "include_tables": frozenset({"schema_meta"}),
+            "unrelated_reads": 0,
+        },
+        {
+            "caller": "_validated_dev_cow_completed_generation_axis",
+            "include_tables": frozenset({"schema_meta"}),
+            "unrelated_reads": 0,
+        },
+    ]
+    assert [
+        call for call in projection_calls
+        if call["caller"] == "_database_logical_sha256"
+    ] == [
+        {
+            "caller": "_database_logical_sha256",
+            "include_tables": None,
+            "unrelated_reads": 1,
+        },
+        {
+            "caller": "_database_logical_sha256",
+            "include_tables": None,
+            "unrelated_reads": 1,
+        },
+    ]
+
+
+def test_completed_cow_basic_restart_full_projection_detects_unrelated_change(
+    tmp_path, monkeypatch,
+):
+    from agent.governance import db
+
+    root, database, candidate, _stable, _launch_path = (
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
+    )
+    logical_observations = []
+    original_logical_sha256 = db._database_logical_sha256
+
+    def observed_logical_sha256(path):
+        if logical_observations:
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE c1_unrelated_change(id INTEGER PRIMARY KEY,value TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO c1_unrelated_change(value) VALUES('changed')"
+            )
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.close()
+        result = original_logical_sha256(path)
+        logical_observations.append(result)
+        return result
+
+    monkeypatch.setattr(db, "_database_logical_sha256", observed_logical_sha256)
+    with pytest.raises(
+        ValueError,
+        match="AC dev COW completed basic restart preflight changed the database",
+    ):
+        db._validate_dev_cow_completed_basic_restart(
+            root,
+            source_identity=candidate,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+    assert len(logical_observations) == 2
+    assert logical_observations[0] != logical_observations[1]
 
 
 @pytest.mark.parametrize("entrypoint", ("completed_axis", "basic_restart"))
@@ -5914,9 +6086,13 @@ def test_cow_generation_phase_selector_is_closed_for_first_and_completed(
         root, linked_v3_receipt=linked, source_identity=source,
         stable_binding=stable,
     ) is db._DevCowGenerationPhase.FIRST_ISSUANCE
-    completed_source = _advance_cow_to_completed_generation(
-        database, root, source,
+
+    completed_fixture = tmp_path / "completed"
+    completed_fixture.mkdir()
+    root, _database, linked, completed_source, _process, _receipt = (
+        _completed_cow_exact_graph_fixture(completed_fixture, monkeypatch)
     )
+    stable = db.verified_stable_database_binding()
     assert db._select_dev_cow_generation_phase(
         root, linked_v3_receipt=linked, source_identity=completed_source,
         stable_binding=stable,
@@ -8036,6 +8212,86 @@ def test_sqlite_projection_value_is_lossless_and_type_tagged():
     assert encode("") != encode(b"")
     assert encode("ff") != encode(b"\xff")
     assert encode(memoryview(b"\x00\xff")) == ["blob-hex", "00ff"]
+
+
+def test_sqlite_schema_meta_selection_matches_legacy_full_projection_exactly():
+    from governance import db
+
+    def legacy_full_projection(connection):
+        tables = [str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ) if not str(row[0]).startswith("sqlite_")]
+        projection = {}
+        for table in tables:
+            quoted_table = db._sqlite_quote_identifier(table)
+            columns = [str(row[1]) for row in connection.execute(
+                f"PRAGMA table_info({quoted_table})"
+            )]
+            quoted_columns = ",".join(
+                db._sqlite_quote_identifier(column) for column in columns
+            )
+            rows = connection.execute(
+                f"SELECT {quoted_columns} FROM {quoted_table}"
+            ).fetchall()
+            encoded_rows = [
+                [db._sqlite_projection_value(value) for value in row]
+                for row in rows
+            ]
+            encoded_rows.sort(key=lambda row: json.dumps(
+                row, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            ).encode("utf-8"))
+            payload = {"table": table, "columns": columns, "rows": encoded_rows}
+            projection[table] = "sha256:" + hashlib.sha256(json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            ).encode("utf-8")).hexdigest()
+        return projection
+
+    empty = sqlite3.connect(":memory:")
+    empty.execute("CREATE TABLE schema_meta(kind,value)")
+    empty.execute("CREATE TABLE unrelated(id,value)")
+    empty_legacy = legacy_full_projection(empty)
+    assert db._sqlite_logical_projection(empty) == empty_legacy
+    assert db._sqlite_logical_projection(
+        empty, include_tables=frozenset({"schema_meta"}),
+    ) == {"schema_meta": empty_legacy["schema_meta"]}
+    assert db._sqlite_logical_projection(
+        empty, include_tables=frozenset({"missing"}),
+    ) == {}
+    empty.close()
+
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE schema_meta(kind,value)")
+    connection.executemany("INSERT INTO schema_meta VALUES(?,?)", [
+        (None, None),
+        ("empty", ""),
+        ("unicode-雪", "值\u0000"),
+        ("blob", sqlite3.Binary(b"\x00\xff")),
+        ("minimum", -(2**63)),
+        ("maximum", 2**63 - 1),
+        ("float", 1.5),
+        ("signed-zero", -0.0),
+        ("duplicate", "same"),
+        ("duplicate", "same"),
+    ])
+    connection.execute("CREATE TABLE unrelated(id,value)")
+    connection.execute("INSERT INTO unrelated VALUES(1,'before')")
+    connection.commit()
+
+    legacy = legacy_full_projection(connection)
+    assert db._sqlite_logical_projection(connection) == legacy
+    assert db._sqlite_logical_projection(
+        connection, include_tables=frozenset({"schema_meta"}),
+    ) == {"schema_meta": legacy["schema_meta"]}
+    selected_before = db._sqlite_logical_projection(
+        connection, include_tables=frozenset({"schema_meta"}),
+    )
+    connection.execute("UPDATE unrelated SET value='after' WHERE id=1")
+    connection.commit()
+    assert db._sqlite_logical_projection(
+        connection, include_tables=frozenset({"schema_meta"}),
+    ) == selected_before
+    assert db._sqlite_logical_projection(connection) != legacy
+    connection.close()
 
 
 def test_sqlite_projection_covers_fts_shadow_blobs_and_is_row_order_independent(tmp_path):

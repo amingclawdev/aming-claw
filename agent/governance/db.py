@@ -634,11 +634,16 @@ def _sqlite_projection_value(value: object) -> list[str]:
 @dashboard_read_timed("db.sqlite_logical_projection")
 def _sqlite_logical_projection(
     connection: sqlite3.Connection, *, exclude_tables: frozenset[str] = frozenset(),
+    include_tables: frozenset[str] | None = None,
 ) -> dict[str, str]:
     """Hash ordered tables/columns/rows with one lossless tagged encoding."""
     tables = [str(row[0]) for row in connection.execute(
         "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-    ) if str(row[0]) not in exclude_tables and not str(row[0]).startswith("sqlite_")]
+    ) if (
+        str(row[0]) not in exclude_tables
+        and not str(row[0]).startswith("sqlite_")
+        and (include_tables is None or str(row[0]) in include_tables)
+    )]
     projection: dict[str, str] = {}
     for table in tables:
         quoted_table = _sqlite_quote_identifier(table)
@@ -7082,7 +7087,9 @@ def _validated_dev_cow_completed_generation_axis(
         or (current["device"], current["inode"])
         == (stable_identity.get("device"), stable_identity.get("inode"))
         or set(meta) != _COW_COMPLETED_GENERATION_META_KEYS
-        or _sqlite_logical_projection(conn).get("schema_meta")
+        or _sqlite_logical_projection(
+            conn, include_tables=frozenset({"schema_meta"}),
+        ).get("schema_meta")
         == issuance_schema_meta
         or meta.get("governance_world_genesis_json") != successor.get("genesis_json")
         or meta.get("governance_world_genesis_sha256")
@@ -7134,7 +7141,9 @@ def _select_dev_cow_generation_phase(
         conn.execute("BEGIN")
         _verify_existing_schema(conn)
         _verify_dev_world_schema_inventory(conn)
-        current_schema_meta = _sqlite_logical_projection(conn).get("schema_meta")
+        current_schema_meta = _sqlite_logical_projection(
+            conn, include_tables=frozenset({"schema_meta"}),
+        ).get("schema_meta")
         first = current_schema_meta == issuance_schema_meta
         try:
             _validated_dev_cow_completed_generation_axis(
