@@ -20098,9 +20098,17 @@ def _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
     if not snapshot:
         return {**blocked, "reason": "explicit_snapshot_not_found"}
 
-    notes = _json_loads(snapshot.get("notes"), {})
-    checkout = dict(notes.get("checkout_provenance") or {})
-    full_reconcile_anchor = dict(notes.get("full_reconcile_anchor") or {})
+    decoded_notes = _json_loads(snapshot.get("notes"), {})
+    notes_is_mapping = isinstance(decoded_notes, Mapping)
+    notes = dict(decoded_notes) if notes_is_mapping else {}
+    checkout_value = notes.get("checkout_provenance")
+    checkout_is_mapping = isinstance(checkout_value, Mapping)
+    checkout = dict(checkout_value) if checkout_is_mapping else {}
+    anchor_value = notes.get("full_reconcile_anchor")
+    anchor_is_mapping = isinstance(anchor_value, Mapping)
+    full_reconcile_anchor = (
+        dict(anchor_value) if anchor_is_mapping else {}
+    )
     try:
         from .checkout_provenance import describe_checkout
 
@@ -20164,6 +20172,16 @@ def _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
             "resolution_error": type(exc).__name__,
         }
     materialization_errors = []
+    if not notes_is_mapping:
+        materialization_errors.append("snapshot_notes_invalid")
+    if not checkout_is_mapping:
+        materialization_errors.append(
+            "snapshot_checkout_provenance_invalid"
+        )
+    if not anchor_is_mapping:
+        materialization_errors.append(
+            "snapshot_full_reconcile_anchor_invalid"
+        )
     if not all(
         str(snapshot.get(field) or "").strip()
         for field in ("graph_sha256", "inventory_sha256", "drift_sha256")
@@ -20239,6 +20257,61 @@ def _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
                 or "snapshot_companion_integrity_invalid"
             )
         )
+    graph_index_counts: dict[str, Any] = {
+        "expected": {},
+        "actual": {},
+        "matches": False,
+    }
+    try:
+        graph_payload = json.loads(
+            graph_snapshot_store.snapshot_graph_path(
+                project_id,
+                snapshot_id,
+            ).read_text(encoding="utf-8")
+        )
+        if not isinstance(graph_payload, dict):
+            raise ValueError("snapshot graph payload is not an object")
+        expected_graph_index_counts = (
+            graph_snapshot_store.graph_payload_stats(graph_payload)
+        )
+        actual_graph_index_counts = {
+            "nodes": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM graph_nodes_index "
+                    "WHERE project_id=? AND snapshot_id=?",
+                    (project_id, snapshot_id),
+                ).fetchone()[0]
+            ),
+            "edges": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM graph_edges_index "
+                    "WHERE project_id=? AND snapshot_id=?",
+                    (project_id, snapshot_id),
+                ).fetchone()[0]
+            ),
+        }
+        graph_index_counts = {
+            "expected": dict(expected_graph_index_counts),
+            "actual": actual_graph_index_counts,
+            "matches": (
+                actual_graph_index_counts == expected_graph_index_counts
+            ),
+        }
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+    ) as exc:
+        graph_index_counts["resolution_error"] = type(exc).__name__
+    if (
+        graph_index_counts.get("matches") is not True
+        and "snapshot_materialization_incomplete"
+        not in materialization_errors
+    ):
+        materialization_errors.append("snapshot_materialization_incomplete")
     if identity_mismatches or materialization_errors:
         return {
             **blocked,
@@ -20252,6 +20325,7 @@ def _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
             "full_reconcile_anchor_mismatches": anchor_mismatches,
             "c_family_action_status_counts": c_family_status_counts,
             "companion_integrity": dict(companion_integrity),
+            "graph_index_counts": graph_index_counts,
         }
     authority = {
         **blocked,
@@ -20263,6 +20337,8 @@ def _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
         "target_project_root": str(canonical_root),
         "candidate_materialization_verified": True,
         "companion_integrity_verified": True,
+        "graph_index_verified": True,
+        "graph_index_counts": graph_index_counts,
     }
     authority["authority_hash"] = stable_sha256(authority)
     return authority

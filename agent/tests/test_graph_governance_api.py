@@ -106149,6 +106149,174 @@ def test_fresh_direct_main_explicit_complete_nonactive_current_graph_admits_prem
     ).fetchone()[0] == pinned_trace_count
 
 
+def test_fresh_direct_main_nonactive_selection_verifies_graph_index_materialization(
+    conn,
+    tmp_path,
+):
+    project_root = tmp_path / "direct-nonactive-index-materialization"
+    commit_sha = _init_test_git_repo(project_root)
+
+    def notes(snapshot_id):
+        return {
+            "checkout_provenance": describe_checkout(
+                project_root,
+                project_id=PID,
+            ),
+            "full_reconcile_anchor": {
+                "project_id": PID,
+                "snapshot_id": snapshot_id,
+                "anchor_commit": commit_sha,
+                "reconcile_mode": "full",
+            },
+        }
+
+    def select(snapshot_id):
+        return server._operator_supervised_direct_main_nonactive_graph_snapshot_selection(
+            conn,
+            project_id=PID,
+            requested_snapshot_id=snapshot_id,
+            selected_direct={
+                "resolved": True,
+                "source": "fresh_registry_authority",
+                "records": [],
+            },
+            world_ref={
+                "accepted": True,
+                "base_commit": commit_sha,
+                "target_project_root": str(project_root.resolve()),
+            },
+        )
+
+    unindexed_id = "full-direct-nonactive-unindexed"
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=unindexed_id,
+        commit_sha=commit_sha,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        status="candidate",
+        created_by="test",
+        notes=json.dumps(notes(unindexed_id)),
+    )
+    before = conn.total_changes
+    rejected = select(unindexed_id)
+    assert rejected["accepted"] is False
+    assert "snapshot_materialization_incomplete" in rejected[
+        "materialization_errors"
+    ]
+    assert rejected["graph_index_counts"] == {
+        "expected": {"nodes": 1, "edges": 1},
+        "actual": {"nodes": 0, "edges": 0},
+        "matches": False,
+    }
+    assert conn.total_changes == before
+
+    empty_id = "full-direct-nonactive-empty-index"
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=empty_id,
+        commit_sha=commit_sha,
+        snapshot_kind="full",
+        graph_json={},
+        status="candidate",
+        created_by="test",
+        notes=json.dumps(notes(empty_id)),
+    )
+    before = conn.total_changes
+    accepted = select(empty_id)
+    assert accepted["accepted"] is True
+    assert accepted["graph_index_verified"] is True
+    assert accepted["graph_index_counts"] == {
+        "expected": {"nodes": 0, "edges": 0},
+        "actual": {"nodes": 0, "edges": 0},
+        "matches": True,
+    }
+    assert conn.total_changes == before
+
+
+@pytest.mark.parametrize(
+    "notes_value",
+    [
+        "not-a-mapping",
+        ["not", "a", "mapping"],
+        {"checkout_provenance": "not-a-mapping"},
+        {"checkout_provenance": ["not", "a", "mapping"]},
+        {"full_reconcile_anchor": "not-a-mapping"},
+        {"full_reconcile_anchor": ["not", "a", "mapping"]},
+    ],
+    ids=[
+        "notes-string",
+        "notes-list",
+        "checkout-string",
+        "checkout-list",
+        "anchor-string",
+        "anchor-list",
+    ],
+)
+def test_fresh_direct_main_nonactive_selection_rejects_malformed_notes(
+    conn,
+    tmp_path,
+    notes_value,
+):
+    project_root = tmp_path / "direct-nonactive-malformed-notes"
+    commit_sha = _init_test_git_repo(project_root)
+    snapshot_id = "full-direct-nonactive-malformed-notes"
+    snapshot_notes = {
+        "checkout_provenance": describe_checkout(
+            project_root,
+            project_id=PID,
+        ),
+        "full_reconcile_anchor": {
+            "project_id": PID,
+            "snapshot_id": snapshot_id,
+            "anchor_commit": commit_sha,
+            "reconcile_mode": "full",
+        },
+    }
+    if isinstance(notes_value, dict):
+        snapshot_notes.update(copy.deepcopy(notes_value))
+        persisted_notes = snapshot_notes
+    else:
+        persisted_notes = notes_value
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=snapshot_id,
+        commit_sha=commit_sha,
+        snapshot_kind="full",
+        graph_json={},
+        status="candidate",
+        created_by="test",
+        notes=json.dumps(persisted_notes),
+    )
+    before = conn.total_changes
+    rejected = server._operator_supervised_direct_main_nonactive_graph_snapshot_selection(
+        conn,
+        project_id=PID,
+        requested_snapshot_id=snapshot_id,
+        selected_direct={
+            "resolved": True,
+            "source": "fresh_registry_authority",
+            "records": [],
+        },
+        world_ref={
+            "accepted": True,
+            "base_commit": commit_sha,
+            "target_project_root": str(project_root.resolve()),
+        },
+    )
+    assert rejected["accepted"] is False
+    assert rejected["status"] == "blocked"
+    assert rejected["writes_performed"] is False
+    assert rejected["reason"] in {
+        "explicit_snapshot_identity_mismatch",
+        "explicit_snapshot_materialization_incomplete",
+    }
+    assert conn.total_changes == before
+
+
 @pytest.mark.parametrize(
     ("execution_revision", "pinned_existing", "route_renewal"),
     [
