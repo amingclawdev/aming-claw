@@ -10126,22 +10126,57 @@ def handle_observer_route_context_renew(ctx: RequestContext):
             project_root = _graph_governance_project_root(project_id, body)
         except Exception:
             project_root = None
-        renewed = observer_route_context.renew_route_token_ref(
-            conn,
-            project_id=project_id,
-            storage_project_id=_route_registry_storage_project_id(project_id),
-            route_token_ref=route_token_ref,
-            backlog_id=backlog_id,
-            task_id=task_id,
-            caller_role=caller_role,
-            allowed_actions=allowed_actions,
-            target_files=target_files,
-            owned_files=owned_files,
-            ttl_hours=ttl_hours,
-            renew_within_seconds=renew_within_seconds,
-            evidence_refs=evidence_refs,
-            project_root=project_root,
-        )
+        renewal_kwargs = {
+            "project_id": project_id,
+            "storage_project_id": _route_registry_storage_project_id(project_id),
+            "route_token_ref": route_token_ref,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "caller_role": caller_role,
+            "allowed_actions": allowed_actions,
+            "target_files": target_files,
+            "owned_files": owned_files,
+            "ttl_hours": ttl_hours,
+            "renew_within_seconds": renew_within_seconds,
+            "evidence_refs": evidence_refs,
+            "project_root": project_root,
+        }
+        if _runtime_plane() == "stable":
+            # The route registry uses this same re-entrant lock internally.
+            # Hold it across the Direct classification/preflight and the
+            # mutation, and pair it with one SQLite write transaction, so an
+            # exact-scope refusal cannot race a supersede or mint.
+            with observer_route_context._REF_REGISTRY_LOCK:
+                started_transaction = not conn.in_transaction
+                if started_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _operator_supervised_direct_main_stable_renewal_scope_preflight(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        route_token_ref=route_token_ref,
+                        allowed_actions=allowed_actions,
+                        target_files=target_files,
+                        owned_files=owned_files,
+                    )
+                    renewed = observer_route_context.renew_route_token_ref(
+                        conn,
+                        **renewal_kwargs,
+                        commit=False,
+                    )
+                    if started_transaction:
+                        conn.commit()
+                except Exception:
+                    if started_transaction and conn.in_transaction:
+                        conn.rollback()
+                    raise
+        else:
+            renewed = observer_route_context.renew_route_token_ref(
+                conn,
+                **renewal_kwargs,
+            )
     except observer_route_context.RouteTokenRefError as exc:
         return 422, {
             "ok": False,
@@ -153697,6 +153732,678 @@ def _operator_supervised_direct_main_legacy_empty_closed_shapes_valid(
         and all(type(world_ref.get(field)) is bool for field in world_bool_fields)
         and all(type(route.get(field)) is str for field in route)
     )
+
+
+def _operator_supervised_direct_main_registry_json_list(
+    row: Mapping[str, Any],
+    field: str,
+) -> list[str] | None:
+    try:
+        value = json.loads(str(row.get(field) or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, list) or any(type(item) is not str for item in value):
+        return None
+    return sorted(set(item.strip() for item in value if item.strip()))
+
+
+def _operator_supervised_direct_main_registry_json_mapping(
+    row: Mapping[str, Any],
+    field: str,
+) -> dict[str, Any] | None:
+    try:
+        value = json.loads(
+            str(row.get(field) or "{}"),
+            object_pairs_hook=_operator_supervised_direct_main_closed_json_object,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return dict(value) if isinstance(value, Mapping) else None
+
+
+def _operator_supervised_direct_main_stable_renewal_scope_preflight(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+    allowed_actions: Sequence[str] | None,
+    target_files: Sequence[str] | None,
+    owned_files: Sequence[str] | None,
+) -> None:
+    """Reject narrowing of a bound stable Direct replacement before minting."""
+
+    from . import observer_route_context
+
+    if _runtime_plane() != "stable":
+        return
+    try:
+        execution_rows = conn.execute(
+            """SELECT project_id, backlog_id, contract_id,
+                      contract_execution_id, revision, record_json
+                 FROM contract_runtime_executions
+                WHERE project_id=? AND backlog_id=?
+                  AND contract_execution_id=?
+                  AND contract_id='operator_supervised_direct_main'""",
+            (project_id, backlog_id, task_id),
+        ).fetchall()
+    except sqlite3.Error:
+        # A non-Direct project may not have ContractRuntime storage.  The
+        # generic renewal implementation remains authoritative for that case.
+        return
+    if not execution_rows:
+        return
+
+    def reject(field: str, expected: Any, actual: Any, code: str) -> NoReturn:
+        raise observer_route_context.RouteTokenRefError(
+            f"stable Direct route renewal changed immutable {field}",
+            code=code,
+            details={
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+                "route_token_ref": route_token_ref,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+
+    if len(execution_rows) != 1:
+        reject(
+            "contract_execution_id",
+            "one_exact_physical_direct_execution",
+            len(execution_rows),
+            "route_token_ref_direct_execution_ambiguous",
+        )
+    physical = dict(execution_rows[0])
+    try:
+        record = json.loads(
+            str(physical.get("record_json") or "{}"),
+            object_pairs_hook=_operator_supervised_direct_main_closed_json_object,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        record = {}
+    metadata = record.get("metadata") if isinstance(record, Mapping) else {}
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(metadata, Mapping)
+        and isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    binding_hash = str(binding.get("binding_hash") or "").strip()
+    immutable_identity = (
+        dict(binding.get("route_identity") or {})
+        if isinstance(binding.get("route_identity"), Mapping)
+        else {}
+    )
+    immutable_ref = str(immutable_identity.get("route_token_ref") or "").strip()
+    record_exact = bool(
+        isinstance(record, Mapping)
+        and str(physical.get("project_id") or "") == project_id
+        and str(physical.get("backlog_id") or "") == backlog_id
+        and str(physical.get("contract_id") or "")
+        == "operator_supervised_direct_main"
+        and str(physical.get("contract_execution_id") or "").strip() == task_id
+        and str(physical.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        and str(record.get("project_id") or "") == project_id
+        and str(record.get("backlog_id") or "") == backlog_id
+        and str(record.get("contract_execution_id") or "").strip() == task_id
+        and str(record.get("contract_id") or "")
+        == "operator_supervised_direct_main"
+        and binding.get("strict_runtime_binding_required") is True
+        and binding.get("server_derived") is True
+        and binding.get("caller_claims_trusted") is False
+        and str(binding.get("project_id") or "") == project_id
+        and str(binding.get("backlog_id") or "") == backlog_id
+        and str(binding.get("contract_execution_id") or "").strip() == task_id
+        and binding_hash
+        == stable_sha256(
+            {key: value for key, value in binding.items() if key != "binding_hash"}
+        )
+        and _observer_root_route_identity_complete(immutable_identity)
+        and immutable_ref
+    )
+    if not record_exact:
+        reject(
+            "direct_runtime_binding",
+            "exact_hash_bound_immutable_binding",
+            "missing_or_invalid",
+            "route_token_ref_direct_immutable_binding_invalid",
+        )
+
+    storage_project_id = _route_registry_storage_project_id(project_id)
+    try:
+        route_rows = conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
+            (storage_project_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        route_rows = []
+    rows_by_ref = {
+        str(dict(row).get("route_token_ref") or "").strip(): dict(row)
+        for row in route_rows
+        if str(dict(row).get("route_token_ref") or "").strip()
+    }
+    requested_row = rows_by_ref.get(route_token_ref)
+    root_row = rows_by_ref.get(immutable_ref)
+    if requested_row is None:
+        return
+
+    # A fresh same-CEX route issued independently of the immutable binding is
+    # current permission, not a replacement edge.  Keep that normal delegation
+    # behavior.  Only a row whose canonical proof ancestry reaches the bound
+    # root is a Direct replacement renewal governed by this exact-scope guard.
+    related = route_token_ref == immutable_ref
+    current_ref = route_token_ref
+    visited: set[str] = set()
+    while not related and current_ref and current_ref not in visited:
+        visited.add(current_ref)
+        current_row = rows_by_ref.get(current_ref)
+        lineage = (
+            _operator_supervised_direct_main_registry_json_mapping(
+                current_row or {}, "route_lineage_json"
+            )
+            or {}
+        )
+        parents = {
+            str(proof.get("previous_route_token_ref") or "").strip()
+            for key in ("renewal_proof", "same_scope_reissue_proof")
+            for proof in [lineage.get(key)]
+            if isinstance(proof, Mapping)
+            and str(proof.get("previous_route_token_ref") or "").strip()
+        }
+        if len(parents) != 1:
+            break
+        current_ref = next(iter(parents))
+        related = current_ref == immutable_ref
+    if not related:
+        return
+    if root_row is None:
+        reject(
+            "route_identity.route_token_ref",
+            immutable_ref,
+            "missing_registry_row",
+            "route_token_ref_direct_immutable_route_missing",
+        )
+
+    root_identity = _route_registry_row_identity(root_row)
+    root_scope = _operator_supervised_direct_main_registry_json_mapping(
+        root_row, "scope_json"
+    )
+    root_actions = _operator_supervised_direct_main_registry_json_list(
+        root_row, "allowed_actions_json"
+    )
+    root_target_files = _operator_supervised_direct_main_registry_json_list(
+        root_row, "target_files_json"
+    )
+    root_owned_files = _operator_supervised_direct_main_registry_json_list(
+        root_row, "owned_files_json"
+    )
+    registered_root = {
+        **root_identity,
+        "caller_role": str(root_row.get("caller_role") or "").strip(),
+        "allowed_actions": root_actions or [],
+        "target_files": root_target_files or [],
+        "owned_files": root_owned_files or [],
+    }
+    root_authority = _operator_supervised_direct_main_route_authority_from_resolved(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=immutable_ref,
+        row_files=list(binding.get("target_files") or []),
+        route=registered_root,
+    )
+    if not (
+        root_identity == {
+            field: str(immutable_identity.get(field) or "").strip()
+            for field in _ROUTE_REGISTRY_IDENTITY_FIELDS
+        }
+        and isinstance(root_scope, Mapping)
+        and {
+            field: str(root_scope.get(field) or "").strip()
+            for field in ("project_id", "backlog_id", "task_id")
+        }
+        == {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        }
+        and root_authority.get("accepted") is True
+        and root_target_files
+        == sorted(set(str(item).strip() for item in binding.get("target_files") or []))
+        and root_owned_files
+        == sorted(set(str(item).strip() for item in binding.get("owned_files") or []))
+    ):
+        reject(
+            "route_identity",
+            immutable_identity,
+            root_identity,
+            "route_token_ref_direct_immutable_route_invalid",
+        )
+
+    if route_token_ref != immutable_ref:
+        try:
+            resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
+                conn,
+                project_id=project_id,
+                storage_project_id=storage_project_id,
+                route_token_ref=immutable_ref,
+            )
+        except observer_route_context.RouteTokenRefError:
+            raise
+        if not isinstance(resolved, Mapping) or str(
+            resolved.get("route_token_ref") or ""
+        ).strip() != route_token_ref:
+            reject(
+                "route_token_ref",
+                "unique_active_exact_descendant",
+                route_token_ref,
+                "route_token_ref_direct_descendant_invalid",
+            )
+
+    comparisons = (
+        (
+            "allowed_actions",
+            sorted(
+                {
+                    str(item).strip()
+                    for item in (allowed_actions or root_actions or [])
+                    if str(item).strip()
+                }
+            ),
+            root_actions,
+            "route_token_ref_renewal_allowed_actions_mismatch",
+        ),
+        (
+            "target_files",
+            sorted(
+                {
+                    str(item).strip()
+                    for item in (target_files or root_target_files or [])
+                    if str(item).strip()
+                }
+            ),
+            root_target_files,
+            "route_token_ref_renewal_target_files_mismatch",
+        ),
+        (
+            "owned_files",
+            sorted(
+                {
+                    str(item).strip()
+                    for item in (owned_files or root_owned_files or [])
+                    if str(item).strip()
+                }
+            ),
+            root_owned_files,
+            "route_token_ref_renewal_owned_files_mismatch",
+        ),
+    )
+    for field, actual, expected, code in comparisons:
+        if actual != expected:
+            reject(field, expected, actual, code)
+
+
+def _operator_supervised_direct_main_legacy_stable_admission_valid(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    execution_id: str,
+    binding: Mapping[str, Any],
+) -> bool:
+    """Cross-bind immutable stable custody to its one accepted admission."""
+
+    from . import task_timeline
+
+    try:
+        rows = conn.execute(
+            """SELECT project_id, backlog_id, contract_id,
+                      contract_execution_id, record_json
+                 FROM contract_runtime_executions
+                WHERE project_id=? AND backlog_id=?
+                  AND contract_execution_id=?
+                  AND contract_id='operator_supervised_direct_main'""",
+            (project_id, backlog_id, execution_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    if len(rows) != 1:
+        return False
+    physical = dict(rows[0])
+    try:
+        record = json.loads(
+            str(physical.get("record_json") or "{}"),
+            object_pairs_hook=_operator_supervised_direct_main_closed_json_object,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(record, Mapping) or not (
+        str(physical.get("project_id") or "") == project_id
+        and str(physical.get("backlog_id") or "") == backlog_id
+        and str(physical.get("contract_id") or "")
+        == "operator_supervised_direct_main"
+        and str(physical.get("contract_execution_id") or "").strip()
+        == execution_id
+        and str(record.get("project_id") or "") == project_id
+        and str(record.get("backlog_id") or "") == backlog_id
+        and str(record.get("contract_execution_id") or "").strip()
+        == execution_id
+        and str(record.get("contract_id") or "")
+        == "operator_supervised_direct_main"
+    ):
+        return False
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    persisted_binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    persisted_route_authority = (
+        metadata.get("operator_supervised_direct_main_route_authority")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_route_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    if dict(persisted_binding) != dict(binding):
+        return False
+
+    immutable_identity = dict(binding.get("route_identity") or {})
+    immutable_ref = str(immutable_identity.get("route_token_ref") or "").strip()
+    try:
+        route_rows = conn.execute(
+            "SELECT * FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            (_route_registry_storage_project_id(project_id), immutable_ref),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    if len(route_rows) != 1:
+        return False
+    route_row = dict(route_rows[0])
+    route_scope = _operator_supervised_direct_main_registry_json_mapping(
+        route_row, "scope_json"
+    )
+    route_actions = _operator_supervised_direct_main_registry_json_list(
+        route_row, "allowed_actions_json"
+    )
+    route_targets = _operator_supervised_direct_main_registry_json_list(
+        route_row, "target_files_json"
+    )
+    route_owned = _operator_supervised_direct_main_registry_json_list(
+        route_row, "owned_files_json"
+    )
+    registry_identity = _route_registry_row_identity(route_row)
+    registered_route = {
+        **registry_identity,
+        "caller_role": str(route_row.get("caller_role") or "").strip(),
+        "allowed_actions": route_actions or [],
+        "target_files": route_targets or [],
+        "owned_files": route_owned or [],
+    }
+    recomputed_authority = _operator_supervised_direct_main_route_authority_from_resolved(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=immutable_ref,
+        row_files=list(binding.get("target_files") or []),
+        route=registered_route,
+    )
+    historical_actions = sorted(
+        _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
+    current_actions = sorted(
+        _OPERATOR_SUPERVISED_DIRECT_MAIN_STABLE_GUIDE_ISSUE_ACTIONS
+    )
+    persisted_actions = persisted_route_authority.get("allowed_actions")
+    persisted_expected_actions = persisted_route_authority.get(
+        "expected_allowed_actions"
+    )
+    supported_generation = bool(
+        isinstance(persisted_actions, list)
+        and isinstance(persisted_expected_actions, list)
+        and all(type(item) is str for item in persisted_actions)
+        and all(type(item) is str for item in persisted_expected_actions)
+        and (persisted_actions, persisted_expected_actions)
+        in (
+            (historical_actions, historical_actions),
+            (historical_actions, current_actions),
+            (current_actions, current_actions),
+        )
+    )
+    persisted_projection_exact = bool(
+        set(persisted_route_authority) == set(recomputed_authority)
+        and persisted_route_authority.get("schema_version")
+        == "operator_supervised_direct_main.route_authority.v1"
+        and persisted_route_authority.get("accepted") is True
+        and persisted_route_authority.get("status") == "accepted"
+        and persisted_route_authority.get("server_derived") is True
+        and persisted_route_authority.get("caller_claims_trusted") is False
+        and persisted_route_authority.get("historical_backfill_allowed") is False
+        and persisted_route_authority.get("zero_write_on_failure") is True
+        and str(persisted_route_authority.get("project_id") or "")
+        == project_id
+        and str(persisted_route_authority.get("backlog_id") or "")
+        == backlog_id
+        and str(
+            persisted_route_authority.get("contract_execution_id") or ""
+        )
+        == execution_id
+        and str(persisted_route_authority.get("route_token_ref") or "")
+        == immutable_ref
+        and dict(persisted_route_authority.get("route_identity") or {})
+        == registry_identity
+        and persisted_route_authority.get("row_declared_files")
+        == sorted(set(binding.get("target_files") or []))
+        and persisted_route_authority.get("route_target_files")
+        == route_targets
+        and persisted_route_authority.get("route_owned_files") == route_owned
+        and str(
+            persisted_route_authority.get("route_resolution_error") or ""
+        )
+        == ""
+        and persisted_route_authority.get("source_free_operation") is False
+        and persisted_route_authority.get("source_mutation_forbidden") is False
+        and persisted_actions == route_actions
+        and supported_generation
+        and persisted_route_authority.get("authority_hash")
+        == stable_sha256(
+            {
+                key: value
+                for key, value in persisted_route_authority.items()
+                if key != "authority_hash"
+            }
+        )
+    )
+    if not (
+        str(route_row.get("status") or "").strip()
+        in {"active", "expired", "superseded"}
+        and registry_identity
+        == {
+            field: str(immutable_identity.get(field) or "").strip()
+            for field in _ROUTE_REGISTRY_IDENTITY_FIELDS
+        }
+        and isinstance(route_scope, Mapping)
+        and {
+            field: str(route_scope.get(field) or "").strip()
+            for field in ("project_id", "backlog_id", "task_id")
+        }
+        == {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": execution_id,
+        }
+        and recomputed_authority.get("accepted") is True
+        and persisted_projection_exact
+    ):
+        return False
+
+    try:
+        event_rows = conn.execute(
+            """SELECT * FROM task_timeline_events
+                WHERE project_id=? AND backlog_id=? AND task_id=?
+                  AND phase='pre_mutation' AND status='accepted'
+                  AND (
+                    event_type='mf.observer_direct_implementation_exception'
+                    OR event_kind='observer_direct_implementation_exception'
+                  )
+                ORDER BY id""",
+            (project_id, backlog_id, execution_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    if len(event_rows) != 1:
+        return False
+    event = task_timeline._row_to_dict(event_rows[0])
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    timeline_binding = (
+        payload.get("direct_contract_runtime_binding")
+        if isinstance(payload.get("direct_contract_runtime_binding"), Mapping)
+        else {}
+    )
+    pre_authority = (
+        payload.get("observer_direct_pre_mutation_authority")
+        if isinstance(payload.get("observer_direct_pre_mutation_authority"), Mapping)
+        else {}
+    )
+    source_authority = (
+        payload.get("source_backed_contract_gate_authority")
+        if isinstance(payload.get("source_backed_contract_gate_authority"), Mapping)
+        else {}
+    )
+    route_gate = (
+        source_authority.get("route_token_gate")
+        if isinstance(source_authority.get("route_token_gate"), Mapping)
+        else {}
+    )
+    gate_scope = route_gate.get("scope") if isinstance(route_gate.get("scope"), Mapping) else {}
+    fingerprint = str(pre_authority.get("pre_mutation_request_fingerprint") or "").strip()
+    exact_event = {
+        "event_type": "mf.observer_direct_implementation_exception",
+        "event_kind": "observer_direct_implementation_exception",
+        "phase": "pre_mutation",
+        "status": "accepted",
+        "decision": "operator_supervised_direct_main_approved",
+    }
+    if not (
+        str(event.get("actor") or "").strip() == "observer"
+        and all(str(event.get(key) or "").strip() == value for key, value in exact_event.items())
+        and timeline_binding
+        == {
+            "schema_version": "operator_supervised_direct_main.timeline_binding.v1",
+            "contract_execution_id": execution_id,
+            "stage_id": "pre_mutation",
+            "line_id": "observer_direct_implementation_exception",
+            "binding_hash": str(binding.get("binding_hash") or ""),
+            "server_derived": True,
+            "caller_claims_trusted": False,
+        }
+        and pre_authority.get("schema_version")
+        == "observer_direct_pre_mutation_authority_projection.v1"
+        and pre_authority.get("accepted") is True
+        and pre_authority.get("server_projected") is True
+        and pre_authority.get("projection_source")
+        == "task_timeline_append_pre_persistence_gate"
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint)
+        and task_timeline._source_backed_route_gate_authority_valid(source_authority)
+        and task_timeline._source_backed_route_gate_accepted(route_gate)
+        and route_gate.get("allowed") is True
+        and route_gate.get("server_projected") is True
+        and route_gate.get("server_issued_binding") is True
+        and route_gate.get("resolved_from_ref") is True
+        and route_gate.get("registry_verified") is True
+        and str(route_gate.get("projection_source") or "")
+        == "server_route_token_mutation_gate"
+        and str(route_gate.get("binding_source") or "")
+        == "observer_route_token_refs"
+        and str(route_gate.get("action") or "") == "task_timeline_append"
+        and str(route_gate.get("caller_role") or "") == "observer"
+        and str(route_gate.get("route_token_ref") or "") == immutable_ref
+        and {
+            field: str(route_gate.get(field) or "").strip()
+            for field in _ROUTE_REGISTRY_IDENTITY_FIELDS
+        }
+        == registry_identity
+        and {
+            field: str(gate_scope.get(field) or "").strip()
+            for field in ("project_id", "backlog_id", "task_id")
+        }
+        == {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": execution_id,
+        }
+        and {
+            f"backlog:{backlog_id}",
+            f"contract_runtime:{execution_id}",
+        }.issubset(
+            {str(item or "").strip() for item in route_gate.get("evidence_refs") or []}
+        )
+    ):
+        return False
+
+    completed = [
+        line for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    bind_lines = [
+        line for line in completed
+        if str(line.get("stage_id") or "") == "route_gate"
+        and str(line.get("line_id") or "") == "observer_bind_direct_scope"
+        and str(line.get("actor_role") or "") == "observer"
+        and str(line.get("evidence_kind") or "") == "contract_binding"
+    ]
+    pre_lines = [
+        line for line in completed
+        if str(line.get("stage_id") or "") == "pre_mutation"
+        and str(line.get("line_id") or "")
+        == "observer_direct_implementation_exception"
+        and str(line.get("actor_role") or "") == "observer"
+        and str(line.get("evidence_kind") or "")
+        == "observer_direct_implementation_exception"
+    ]
+    if len(bind_lines) != 1 or len(pre_lines) != 1:
+        return False
+    bind_payload = (
+        bind_lines[0].get("payload")
+        if isinstance(bind_lines[0].get("payload"), Mapping)
+        else {}
+    )
+    pre_payload = (
+        pre_lines[0].get("payload")
+        if isinstance(pre_lines[0].get("payload"), Mapping)
+        else {}
+    )
+    return bool(
+        bind_payload.get("schema_version")
+        == "operator_supervised_direct_main.route_binding_evidence.v1"
+        and dict(bind_payload.get("direct_runtime_binding") or {}) == dict(binding)
+        and str(bind_payload.get("direct_runtime_binding_hash") or "")
+        == str(binding.get("binding_hash") or "")
+        and pre_payload.get("schema_version")
+        == "operator_supervised_direct_main.pre_mutation_evidence.v1"
+        and pre_payload.get("server_admitted_single_pre_mutation") is True
+        and pre_payload.get("same_generation_retry_allowed") is False
+        and str(pre_payload.get("direct_runtime_binding_hash") or "")
+        == str(binding.get("binding_hash") or "")
+        and str(pre_payload.get("pre_mutation_request_fingerprint") or "")
+        == fingerprint
+        and dict(pre_payload.get("route_identity") or {}) == immutable_identity
+        and dict(pre_payload.get("event") or {}) == exact_event
+    )
+
+
 def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
     conn,
     *,
@@ -153887,98 +154594,12 @@ def _operator_supervised_direct_main_legacy_empty_stable_world_valid(
     )
     if not static_valid:
         return False
-    route_registry = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        ("observer_route_token_refs",),
-    ).fetchone()
-    if route_registry is None:
-        return False
-    from . import observer_route_context
-
-    immutable_route_identity = {
-        field: str(route.get(field) or "").strip()
-        for field in _legacy_empty_stable_route_identity_keys
-    }
-    try:
-        resolved_route = (
-            observer_route_context.resolve_route_token_ref_renewal_descendant(
-                conn,
-                project_id=project_id,
-                storage_project_id=_route_registry_storage_project_id(
-                    project_id
-                ),
-                route_token_ref=immutable_route_identity["route_token_ref"],
-            )
-        )
-    except (
-        observer_route_context.RouteTokenRefError,
-        sqlite3.Error,
-        TypeError,
-        ValueError,
-    ):
-        return False
-    if not isinstance(resolved_route, Mapping):
-        return False
-    active_route_identity = {
-        field: str(resolved_route.get(field) or "").strip()
-        for field in _legacy_empty_stable_route_identity_keys
-    }
-    renewal = (
-        resolved_route.get("renewal_resolution")
-        if isinstance(resolved_route.get("renewal_resolution"), Mapping)
-        else {}
-    )
-    if renewal:
-        requested_identity = (
-            renewal.get("requested_route_identity")
-            if isinstance(renewal.get("requested_route_identity"), Mapping)
-            else {}
-        )
-        resolved_identity = (
-            renewal.get("resolved_route_identity")
-            if isinstance(renewal.get("resolved_route_identity"), Mapping)
-            else {}
-        )
-        chain = renewal.get("route_token_ref_chain")
-        edges = renewal.get("edge_types")
-        renewal_valid = bool(
-            renewal.get("schema_version")
-            == "route_token_ref_exact_renewal_descendant_resolution.v1"
-            and renewal.get("status") == "resolved_active_descendant"
-            and renewal.get("exact_scope_verified") is True
-            and renewal.get("registry_verified") is True
-            and renewal.get("writes_performed") is False
-            and renewal.get("raw_route_token_exposed") is False
-            and dict(requested_identity) == immutable_route_identity
-            and dict(resolved_identity) == active_route_identity
-            and renewal.get("scope")
-            == {
-                "project_id": project_id,
-                "backlog_id": backlog_id,
-                "task_id": execution_id,
-            }
-            and isinstance(chain, list)
-            and len(chain) >= 2
-            and chain[0] == immutable_route_identity["route_token_ref"]
-            and chain[-1] == active_route_identity["route_token_ref"]
-            and isinstance(edges, list)
-            and len(edges) == len(chain) - 1
-        )
-    else:
-        renewal_valid = active_route_identity == immutable_route_identity
-    if not renewal_valid:
-        return False
-    route_authority = _operator_supervised_direct_main_route_authority(
+    return _operator_supervised_direct_main_legacy_stable_admission_valid(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
-        contract_execution_id=execution_id,
-        route_token_ref=active_route_identity["route_token_ref"],
-    )
-    return bool(
-        route_authority.get("accepted") is True
-        and dict(route_authority.get("route_identity") or {})
-        == active_route_identity
+        execution_id=execution_id,
+        binding=binding,
     )
 
 
