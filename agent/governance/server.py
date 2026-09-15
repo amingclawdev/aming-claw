@@ -20033,6 +20033,241 @@ def _observer_graph_query_route_authority(
     return proof
 
 
+def _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
+    conn,
+    *,
+    project_id: str,
+    requested_snapshot_id: str,
+    selected_direct: Mapping[str, Any],
+    world_ref: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove one explicit current full candidate for fresh Direct graph-first."""
+
+    from . import graph_snapshot_store
+
+    snapshot_id = str(requested_snapshot_id or "").strip()
+    expected_commit = str(world_ref.get("base_commit") or "").strip().lower()
+    expected_root = str(world_ref.get("target_project_root") or "").strip()
+    blocked = {
+        "schema_version": (
+            "operator_supervised_direct_main."
+            "nonactive_graph_snapshot_selection.v1"
+        ),
+        "accepted": False,
+        "status": "blocked",
+        "selection_source": "explicit_nonactive_snapshot",
+        "requested_snapshot_id": snapshot_id,
+        "resolved_snapshot_id": "",
+        "snapshot_is_active": False,
+        "pre_mutation_source_fact_only": True,
+        "grants_active_or_release_authority": False,
+        "read_only": True,
+        "writes_performed": False,
+    }
+    fresh_unmaterialized = bool(
+        selected_direct.get("resolved") is True
+        and selected_direct.get("source") == "fresh_registry_authority"
+        and not selected_direct.get("record")
+        and not list(selected_direct.get("records") or [])
+    )
+    if not fresh_unmaterialized:
+        return {
+            **blocked,
+            "reason": "fresh_unmaterialized_direct_execution_required",
+        }
+    if not snapshot_id or snapshot_id == "active":
+        return {**blocked, "reason": "explicit_nonactive_snapshot_required"}
+    if (
+        world_ref.get("accepted") is not True
+        or not expected_commit
+        or not expected_root
+    ):
+        return {**blocked, "reason": "current_server_world_unavailable"}
+    try:
+        snapshot = graph_snapshot_store.get_graph_snapshot(
+            conn,
+            project_id,
+            snapshot_id,
+        ) or {}
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return {
+            **blocked,
+            "reason": "explicit_snapshot_lookup_failed",
+            "resolution_error": type(exc).__name__,
+        }
+    if not snapshot:
+        return {**blocked, "reason": "explicit_snapshot_not_found"}
+
+    notes = _json_loads(snapshot.get("notes"), {})
+    checkout = dict(notes.get("checkout_provenance") or {})
+    full_reconcile_anchor = dict(notes.get("full_reconcile_anchor") or {})
+    try:
+        from .checkout_provenance import describe_checkout
+
+        canonical_root = Path(expected_root).expanduser().resolve()
+        live_checkout = describe_checkout(canonical_root, project_id=project_id)
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        return {
+            **blocked,
+            "reason": "current_checkout_provenance_unavailable",
+            "resolution_error": type(exc).__name__,
+        }
+    expected_identity = {
+        "snapshot_project_id": project_id,
+        "snapshot_commit": expected_commit,
+        "snapshot_kind": "full",
+        "snapshot_status": "candidate",
+        "live_is_git_worktree": True,
+        "live_commit": expected_commit,
+        "live_execution_root": str(canonical_root),
+        "checkout_provenance_hash": stable_sha256(live_checkout),
+    }
+    actual_identity = {
+        "snapshot_project_id": str(snapshot.get("project_id") or ""),
+        "snapshot_commit": str(snapshot.get("commit_sha") or "")
+        .strip()
+        .lower(),
+        "snapshot_kind": str(snapshot.get("snapshot_kind") or "").strip(),
+        "snapshot_status": str(snapshot.get("status") or "").strip(),
+        "live_is_git_worktree": live_checkout.get("is_git_worktree"),
+        "live_commit": str(live_checkout.get("commit_sha") or "")
+        .strip()
+        .lower(),
+        "live_execution_root": str(
+            Path(str(live_checkout.get("execution_root") or ""))
+            .expanduser()
+            .resolve()
+        ),
+        "checkout_provenance_hash": stable_sha256(checkout),
+    }
+    identity_mismatches = [
+        {
+            "field": field,
+            "expected": expected,
+            "actual": actual_identity.get(field),
+        }
+        for field, expected in expected_identity.items()
+        if actual_identity.get(field) != expected
+    ]
+    try:
+        persisted_provenance = (
+            graph_snapshot_store.snapshot_materialization_provenance(snapshot)
+        )
+        companion_integrity = (
+            graph_snapshot_store.validate_snapshot_companion_integrity(snapshot)
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        persisted_provenance = {}
+        companion_integrity = {
+            "valid": False,
+            "error": "snapshot_companion_integrity_unavailable",
+            "resolution_error": type(exc).__name__,
+        }
+    materialization_errors = []
+    if not all(
+        str(snapshot.get(field) or "").strip()
+        for field in ("graph_sha256", "inventory_sha256", "drift_sha256")
+    ):
+        materialization_errors.append("snapshot_materialization_incomplete")
+    if not persisted_provenance or not checkout:
+        materialization_errors.append("snapshot_checkout_provenance_missing")
+    expected_anchor = {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "anchor_commit": expected_commit,
+        "reconcile_mode": "full",
+    }
+    actual_anchor = {
+        key: (
+            str(full_reconcile_anchor.get(key) or "").strip().lower()
+            if key == "anchor_commit"
+            else str(full_reconcile_anchor.get(key) or "").strip()
+        )
+        for key in expected_anchor
+    }
+    anchor_mismatches = [
+        {
+            "field": field,
+            "expected": expected,
+            "actual": actual_anchor.get(field),
+        }
+        for field, expected in expected_anchor.items()
+        if actual_anchor.get(field) != expected
+    ]
+    if anchor_mismatches:
+        materialization_errors.append("snapshot_full_reconcile_anchor_invalid")
+    c_family_status_counts: dict[str, int] = {}
+    c_family_hash = str(notes.get("c_family_analysis_sha256") or "").strip()
+    if c_family_hash:
+        c_family_index_counts = (
+            notes.get("c_family_index_counts")
+            if isinstance(notes.get("c_family_index_counts"), Mapping)
+            else {}
+        )
+        try:
+            expected_action_count = int(
+                c_family_index_counts.get("actions")
+            )
+            c_family_status_counts = {
+                str(row[0] or "").strip(): int(row[1] or 0)
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) "
+                    "FROM graph_c_family_compilation_actions "
+                    "WHERE project_id=? AND snapshot_id=? GROUP BY status",
+                    (project_id, snapshot_id),
+                ).fetchall()
+            }
+        except (sqlite3.Error, TypeError, ValueError):
+            expected_action_count = -1
+            c_family_status_counts = {}
+        indexed_action_count = sum(c_family_status_counts.values())
+        if (
+            expected_action_count < 0
+            or indexed_action_count != expected_action_count
+            or any(
+                status != "ok" and count > 0
+                for status, count in c_family_status_counts.items()
+            )
+        ):
+            materialization_errors.append(
+                "snapshot_c_family_analysis_incomplete"
+            )
+    if companion_integrity.get("valid") is not True:
+        materialization_errors.append(
+            str(
+                companion_integrity.get("error")
+                or "snapshot_companion_integrity_invalid"
+            )
+        )
+    if identity_mismatches or materialization_errors:
+        return {
+            **blocked,
+            "reason": (
+                "explicit_snapshot_identity_mismatch"
+                if identity_mismatches
+                else "explicit_snapshot_materialization_incomplete"
+            ),
+            "identity_mismatches": identity_mismatches,
+            "materialization_errors": materialization_errors,
+            "full_reconcile_anchor_mismatches": anchor_mismatches,
+            "c_family_action_status_counts": c_family_status_counts,
+            "companion_integrity": dict(companion_integrity),
+        }
+    authority = {
+        **blocked,
+        "accepted": True,
+        "status": "selected",
+        "reason": "explicit_current_full_candidate_verified",
+        "resolved_snapshot_id": snapshot_id,
+        "snapshot_commit_sha": expected_commit,
+        "target_project_root": str(canonical_root),
+        "candidate_materialization_verified": True,
+        "companion_integrity_verified": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _observer_parentless_direct_main_graph_world_authority(
     conn,
     *,
@@ -20120,7 +20355,7 @@ def _observer_parentless_direct_main_graph_world_authority(
     except (KeyError, ValueError, ValidationError) as exc:
         raise GovernanceError(
             "observer_direct_main_graph_world_unavailable",
-            "Direct rev2 graph query requires the current active snapshot",
+            "Strict Direct graph query requires one resolvable snapshot",
             409,
             {
                 "requested_snapshot_id": requested_snapshot_id,
@@ -20165,12 +20400,31 @@ def _observer_parentless_direct_main_graph_world_authority(
                 "actual": str(world_ref.get("status") or "rejected"),
             }
         )
+    nonactive_selection: dict[str, Any] = {}
     if resolved_snapshot_id != active_snapshot_id:
+        nonactive_selection = (
+            _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
+                conn,
+                project_id=project_id,
+                requested_snapshot_id=resolved_snapshot_id,
+                selected_direct=selected_direct,
+                world_ref=world_ref,
+            )
+        )
+    if (
+        resolved_snapshot_id != active_snapshot_id
+        and nonactive_selection.get("accepted") is not True
+    ):
         world_mismatches.append(
             {
                 "field": "snapshot_id",
-                "expected": active_snapshot_id,
+                "expected": (
+                    "active_or_verified_fresh_nonactive_current_full"
+                ),
                 "actual": resolved_snapshot_id,
+                "selection_reason": str(
+                    nonactive_selection.get("reason") or ""
+                ),
             }
         )
     if not expected_commit or snapshot_commit != expected_commit:
@@ -20206,8 +20460,8 @@ def _observer_parentless_direct_main_graph_world_authority(
         raise GovernanceError(
             "observer_direct_main_graph_world_mismatch",
             (
-                "Direct rev2 graph query must use the exact current active "
-                "pre-mutation world"
+                "Strict Direct graph query must use the exact active or "
+                "verified fresh candidate pre-mutation world"
             ),
             409,
             {
@@ -20320,19 +20574,29 @@ def _observer_parentless_direct_main_graph_world_authority(
             },
         )
 
-    body["snapshot_id"] = active_snapshot_id
+    body["snapshot_id"] = resolved_snapshot_id
+    selected_snapshot_is_active = resolved_snapshot_id == active_snapshot_id
     world_projection = {
         "schema_version": (
             "operator_supervised_direct_main.graph_world_projection.v1"
         ),
         "source": (
             "operator_supervised_direct_main_world_ref+active_graph_snapshot"
+            if selected_snapshot_is_active
+            else (
+                "operator_supervised_direct_main_world_ref+"
+                "verified_nonactive_current_full_candidate"
+            )
         ),
         "verified": True,
         "server_derived": True,
         "caller_claims_trusted": False,
         "pre_mutation_world_ref": dict(world_ref),
-        "snapshot_id": active_snapshot_id,
+        "snapshot_id": resolved_snapshot_id,
+        "active_snapshot_id": active_snapshot_id,
+        "selected_snapshot_is_active": selected_snapshot_is_active,
+        "pre_mutation_source_fact_only": not selected_snapshot_is_active,
+        "grants_active_or_release_authority": False,
         "snapshot_commit_sha": snapshot_commit,
         "root_identity": root_identity,
         "root_identity_hash": stable_sha256(root_identity),
@@ -20340,6 +20604,11 @@ def _observer_parentless_direct_main_graph_world_authority(
         "canonical_project_identity_hash": query_root_identity_hash,
         "repository_identity_hash": repository_identity_hash,
         "zero_write_on_failure": True,
+        **(
+            {"nonactive_snapshot_selection": nonactive_selection}
+            if nonactive_selection
+            else {}
+        ),
     }
     return {
         "direct_main_graph_world_projection": world_projection,
@@ -153478,14 +153747,141 @@ def _onboard_parentless_direct_main_graph_query_guidance(
     task_id: str,
     route_token_ref: str,
     target_files: Sequence[str] = (),
+    conn=None,
+    selected_direct: Mapping[str, Any] | None = None,
+    graph_snapshot_id: str = "",
 ) -> dict[str, Any]:
     approved_target_files = _runtime_context_service_dedupe(
         [str(path or "").strip() for path in target_files]
     )
     query_path = approved_target_files[0] if approved_target_files else ""
+    requested_snapshot_id = str(graph_snapshot_id or "").strip()
+    snapshot_selector = "active"
+    snapshot_selection: dict[str, Any] = {}
+    direct_selection = dict(selected_direct or {})
+    if conn is not None and requested_snapshot_id not in {"", "active"}:
+        try:
+            from . import graph_snapshot_store
+
+            world_ref = _operator_supervised_direct_main_world_ref(
+                project_id=project_id,
+            )
+            active_id = _resolve_graph_snapshot_id(conn, project_id, "active")
+            resolved_requested_id = _resolve_graph_snapshot_id(
+                conn,
+                project_id,
+                requested_snapshot_id,
+            )
+            active_snapshot = graph_snapshot_store.get_graph_snapshot(
+                conn,
+                project_id,
+                active_id,
+            ) or {}
+            active_matches_current = bool(
+                world_ref.get("accepted") is True
+                and str(active_snapshot.get("commit_sha") or "")
+                .strip()
+                .lower()
+                == str(world_ref.get("base_commit") or "").strip().lower()
+            )
+        except (
+            KeyError,
+            OSError,
+            sqlite3.Error,
+            ValueError,
+            ValidationError,
+        ):
+            active_id = ""
+            resolved_requested_id = requested_snapshot_id
+            active_matches_current = False
+            world_ref = {}
+        if (
+            active_id
+            and resolved_requested_id == active_id
+            and active_matches_current
+        ):
+            snapshot_selector = "active"
+        elif active_id and resolved_requested_id == active_id:
+            snapshot_selection = {
+                "schema_version": (
+                    "operator_supervised_direct_main."
+                    "nonactive_graph_snapshot_selection.v1"
+                ),
+                "accepted": False,
+                "status": "blocked",
+                "reason": "explicit_current_full_snapshot_required",
+                "requested_snapshot_id": requested_snapshot_id,
+                "resolved_snapshot_id": "",
+                "active_snapshot_id": active_id,
+                "snapshot_is_active": True,
+                "pre_mutation_source_fact_only": False,
+                "grants_active_or_release_authority": False,
+                "read_only": True,
+                "writes_performed": False,
+            }
+        else:
+            snapshot_selection = (
+                _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
+                    conn,
+                    project_id=project_id,
+                    requested_snapshot_id=resolved_requested_id,
+                    selected_direct=direct_selection,
+                    world_ref=world_ref,
+                )
+            )
+            snapshot_selector = str(
+                snapshot_selection.get("resolved_snapshot_id")
+                or resolved_requested_id
+            ).strip()
+    elif (
+        conn is not None
+        and direct_selection.get("source") == "fresh_registry_authority"
+    ):
+        try:
+            from . import graph_snapshot_store
+
+            world_ref = _operator_supervised_direct_main_world_ref(
+                project_id=project_id,
+            )
+            active_id = _resolve_graph_snapshot_id(conn, project_id, "active")
+            active_snapshot = graph_snapshot_store.get_graph_snapshot(
+                conn,
+                project_id,
+                active_id,
+            ) or {}
+            active_matches_current = bool(
+                world_ref.get("accepted") is True
+                and str(active_snapshot.get("commit_sha") or "").strip().lower()
+                == str(world_ref.get("base_commit") or "").strip().lower()
+            )
+        except (KeyError, OSError, sqlite3.Error, ValueError, ValidationError):
+            active_matches_current = False
+            active_id = ""
+        if not active_matches_current:
+            snapshot_selection = {
+                "schema_version": (
+                    "operator_supervised_direct_main."
+                    "nonactive_graph_snapshot_selection.v1"
+                ),
+                "accepted": False,
+                "status": "blocked",
+                "reason": "explicit_current_full_snapshot_required",
+                "requested_snapshot_id": "",
+                "resolved_snapshot_id": "",
+                "active_snapshot_id": active_id,
+                "snapshot_is_active": False,
+                "pre_mutation_source_fact_only": True,
+                "grants_active_or_release_authority": False,
+                "read_only": True,
+                "writes_performed": False,
+            }
+    selection_ready = bool(
+        not snapshot_selection
+        or snapshot_selection.get("accepted") is True
+    )
     arguments = {
         "project_id": str(project_id or "").strip(),
-        "snapshot_id": "active",
+        "snapshot_id": snapshot_selector,
         "tool": "find_node_by_path",
         "args": {"path": query_path},
         "query_source": "observer",
@@ -153494,6 +153890,19 @@ def _onboard_parentless_direct_main_graph_query_guidance(
         "backlog_id": str(backlog_id or "").strip(),
         "task_id": str(task_id or "").strip(),
     }
+    ready = bool(
+        selection_ready
+        and all(
+            [
+                arguments["project_id"],
+                arguments["route_token_ref"],
+                arguments["backlog_id"],
+                arguments["task_id"],
+                arguments["args"]["path"],
+            ]
+        )
+    )
+    selected_snapshot_is_active = snapshot_selector == "active"
     return {
         "schema_version": (
             "onboard_route_guide.parentless_direct_main."
@@ -153513,15 +153922,7 @@ def _onboard_parentless_direct_main_graph_query_guidance(
         "recommended_query_purpose": "gate_validation",
         "copy_safe_graph_query": {
             "mcp_tool": "graph_query",
-            "ready": all(
-                [
-                    arguments["project_id"],
-                    arguments["route_token_ref"],
-                    arguments["backlog_id"],
-                    arguments["task_id"],
-                    arguments["args"]["path"],
-                ]
-            ),
+            "ready": ready,
             "arguments": arguments,
             "raw_route_token_required": False,
         },
@@ -153536,7 +153937,10 @@ def _onboard_parentless_direct_main_graph_query_guidance(
             ),
         },
         "server_derived_world_ref": {
-            "snapshot_selector": "active",
+            "snapshot_selector": snapshot_selector,
+            "selected_snapshot_is_active": selected_snapshot_is_active,
+            "pre_mutation_source_fact_only": not selected_snapshot_is_active,
+            "grants_active_or_release_authority": False,
             "commit_and_root_are_caller_inputs": False,
             "commit_source": (
                 "operator_supervised_direct_main.pre_mutation_world_ref"
@@ -153545,6 +153949,9 @@ def _onboard_parentless_direct_main_graph_query_guidance(
             "snapshot_commit_must_match_world_ref": True,
             "mismatch_creates_trace": False,
         },
+        "status": "ready" if ready else "blocked",
+        "accepted": ready,
+        "snapshot_selection": snapshot_selection,
         "exploration_only": {
             "query_purposes": ["inspect_node"],
             "graph_query_valid": True,
@@ -157544,6 +157951,14 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             revision=selected_revision,
             world_authority=dev_world,
         )
+    selected_direct_identity = (
+        _operator_supervised_direct_main_selected_execution_identity(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+        )
+    )
     selector_authority = _operator_supervised_direct_main_dev_selector_authority(
         conn,
         project_id=project_id,
@@ -157751,6 +158166,11 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             task_id=execution_id,
             route_token_ref=effective_ref,
             target_files=target_files,
+            conn=conn,
+            selected_direct=selected_direct_identity,
+            graph_snapshot_id=str(
+                (request_body or {}).get("graph_snapshot_id") or ""
+            ).strip(),
         )
         pre_mutation = (
             _onboard_parentless_direct_main_pre_mutation_event_guidance(
@@ -157772,13 +158192,21 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             "requires_graph_first": True,
             "requires_operator_approval": True,
             "requires_route_token_ref": True,
+            "actionable": bool(
+                graph_guidance.get("copy_safe_graph_query", {}).get("ready")
+            ),
             "action_input": dict(
                 pre_mutation.get("arguments_template") or {}
             ),
             "copy_safe_body": dict(
                 pre_mutation.get("arguments_template") or {}
             ),
-            "action_input_ready": bool(pre_mutation.get("identity_ready")),
+            "action_input_ready": bool(
+                pre_mutation.get("identity_ready")
+                and graph_guidance.get("copy_safe_graph_query", {}).get(
+                    "ready"
+                )
+            ),
             "graph_query_close_authority": graph_guidance,
             "copy_safe_pre_mutation_event": pre_mutation,
             "source_of_authority": (

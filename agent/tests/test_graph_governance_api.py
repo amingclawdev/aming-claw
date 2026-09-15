@@ -105602,6 +105602,553 @@ def _canonical_parentless_direct_main_implementation_body(
     }
 
 
+def test_fresh_direct_main_explicit_complete_nonactive_current_graph_admits_premutation(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DIRECT-CURRENT-HEAD-NONACTIVE-GRAPH"
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    project_root = demo_root / "direct-current-head-nonactive-graph"
+    stale_commit = _init_test_git_repo(project_root)
+    current_commit = _commit_test_git_files(
+        project_root,
+        ["current.txt"],
+        message="current clean head",
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "project_exists",
+        lambda project_id: project_id == PID,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? "
+        "WHERE bug_id = ?",
+        (json.dumps(row_files[:1]), json.dumps(row_files[1:]), backlog_id),
+    )
+    conn.commit()
+
+    revision = str(
+        server._operator_supervised_direct_main_fresh_definition()["revision"]
+    )
+    task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision=revision,
+    )
+    route_token_ref = "rtok-direct-current-head-nonactive-graph"
+    route_identity = {
+        "route_id": "route-direct-current-head-nonactive-graph",
+        "route_context_hash": _fake_sha("direct-current-nonactive-context"),
+        "prompt_contract_id": "rprompt-direct-current-nonactive",
+        "prompt_contract_hash": _fake_sha("direct-current-nonactive-prompt"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "direct-current-nonactive-manifest"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+            "target_files": row_files,
+            "owned_files": row_files,
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{task_id}",
+            ],
+        },
+    )
+    active_snapshot_id = "full-direct-nonactive-stale-active"
+    _activate_basic_graph(
+        conn,
+        active_snapshot_id,
+        commit_sha=stale_commit,
+    )
+    candidate_snapshot_id = "full-direct-nonactive-current-candidate"
+    current_checkout = describe_checkout(project_root, project_id=PID)
+
+    def full_candidate_notes(snapshot_id):
+        return {
+            "state_only": True,
+            "run_id": f"current-full-{snapshot_id}",
+            "snapshot_kind": "full",
+            "checkout_provenance": copy.deepcopy(current_checkout),
+            "full_reconcile_anchor": {
+                "project_id": PID,
+                "snapshot_id": snapshot_id,
+                "anchor_commit": current_commit,
+                "structure_rule_fingerprint": _fake_sha(
+                    f"structure-{snapshot_id}"
+                ),
+                "rebuild_input_fingerprint": _fake_sha(
+                    f"rebuild-{snapshot_id}"
+                ),
+                "reconcile_mode": "full",
+                "rule_schema_version": 1,
+            },
+            "trace": {
+                "trace_dir": f"state-reconcile/{snapshot_id}/trace",
+                "summary_path": (
+                    f"state-reconcile/{snapshot_id}/trace/summary.json"
+                ),
+            },
+        }
+
+    complete_action = {
+        "compilation_action_id": _fake_sha("complete-action"),
+        "translation_unit_id": _fake_sha("complete-translation-unit"),
+        "profile_id": _fake_sha("complete-profile"),
+        "file": "current.txt",
+        "language": "c++",
+    }
+    complete_c_family = {
+        "schema_version": "graph.c_family_analysis.v1",
+        "status": "complete",
+        "actions": [complete_action],
+        "files": [],
+        "symbols": [],
+        "occurrences": [],
+        "relations": [],
+        "macro_analysis": [],
+        "diagnostics": [],
+        "results": [{"action": complete_action, "status": "ok"}],
+    }
+    complete_notes = full_candidate_notes(candidate_snapshot_id)
+    complete_notes["c_family_index_counts"] = {
+        "actions": 1,
+        "symbols": 0,
+        "occurrences": 0,
+        "relations": 0,
+        "diagnostics": 0,
+    }
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=candidate_snapshot_id,
+        commit_sha=current_commit,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        status="candidate",
+        created_by="current-full-test-builder",
+        notes=json.dumps(complete_notes),
+        c_family_analysis=complete_c_family,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    assert store.index_c_family_analysis(
+        conn,
+        PID,
+        candidate_snapshot_id,
+        complete_c_family,
+    ) == complete_notes["c_family_index_counts"]
+    conn.commit()
+    persisted_candidate = store.get_graph_snapshot(
+        conn,
+        PID,
+        candidate_snapshot_id,
+    )
+    assert store.snapshot_materialization_provenance(persisted_candidate)[
+        "execution_root"
+    ] == str(project_root.resolve())
+    assert store.validate_snapshot_companion_integrity(
+        persisted_candidate
+    )["valid"] is True
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_build_claim_history "
+        "WHERE project_id=? AND snapshot_id=?",
+        (PID, candidate_snapshot_id),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reconcile_run_metrics "
+        "WHERE project_id=? AND snapshot_id=?",
+        (PID, candidate_snapshot_id),
+    ).fetchone()[0] == 0
+    retained_partial_snapshot_id = "full-direct-nonactive-retained-partial"
+    partial_action = {
+        "compilation_action_id": _fake_sha("partial-action"),
+        "translation_unit_id": _fake_sha("partial-translation-unit"),
+        "profile_id": _fake_sha("partial-profile"),
+        "file": "current.txt",
+        "language": "c++",
+    }
+    partial_c_family = {
+        "schema_version": "graph.c_family_analysis.v1",
+        "status": "partial",
+        "actions": [partial_action],
+        "files": [],
+        "symbols": [],
+        "occurrences": [],
+        "relations": [],
+        "macro_analysis": [],
+        "diagnostics": [
+            {
+                "compilation_action_id": partial_action[
+                    "compilation_action_id"
+                ],
+                "analysis_status": "failed",
+                "severity": "error",
+                "file": "current.txt",
+                "line": 1,
+                "message": "retained partial analysis",
+            }
+        ],
+        "results": [
+            {
+                "action": partial_action,
+                "status": "failed",
+            }
+        ],
+    }
+    partial_notes = full_candidate_notes(retained_partial_snapshot_id)
+    partial_notes["c_family_index_counts"] = {
+        "actions": 1,
+        "symbols": 0,
+        "occurrences": 0,
+        "relations": 0,
+        "diagnostics": 1,
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=retained_partial_snapshot_id,
+        commit_sha=current_commit,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        status="candidate",
+        created_by="retained-partial-test-builder",
+        notes=json.dumps(partial_notes),
+        c_family_analysis=partial_c_family,
+    )
+    assert store.index_c_family_analysis(
+        conn,
+        PID,
+        retained_partial_snapshot_id,
+        partial_c_family,
+    ) == partial_notes["c_family_index_counts"]
+    missing_provenance_snapshot_id = (
+        "full-direct-nonactive-missing-provenance"
+    )
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=missing_provenance_snapshot_id,
+        commit_sha=current_commit,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        status="candidate",
+        created_by="missing-provenance-test-builder",
+    )
+    conn.commit()
+    protected_history = tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT ref_name,snapshot_id,commit_sha FROM graph_snapshot_refs "
+            "WHERE project_id=? ORDER BY ref_name",
+            (PID,),
+        ).fetchall()
+    )
+
+    guide_body = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+        "route_token_ref": route_token_ref,
+        "graph_snapshot_id": candidate_snapshot_id,
+        "view": "compact",
+    }
+    routed = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(guide_body),
+        )
+    )
+    graph_authority = routed["next_legal_action"][
+        "graph_query_close_authority"
+    ]
+    graph_query_body = copy.deepcopy(
+        graph_authority["copy_safe_graph_query"]["arguments"]
+    )
+    # Exercise the same explicit body on the parent: before the repair it is
+    # rejected solely because this complete current snapshot is not active.
+    graph_query_body["snapshot_id"] = candidate_snapshot_id
+    graph_query_trace.ensure_schema(conn)
+    trace_count_before = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as partial_rejected:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    **copy.deepcopy(graph_query_body),
+                    "snapshot_id": retained_partial_snapshot_id,
+                },
+            )
+        )
+    assert partial_rejected.value.code == (
+        "observer_direct_main_graph_world_mismatch"
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0] == trace_count_before
+    drift_commit = _commit_test_git_files(
+        project_root,
+        ["guide-drift.txt"],
+        message="head changed after guide",
+    )
+    assert drift_commit != current_commit
+    with pytest.raises(GovernanceError) as drift_rejected:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(graph_query_body),
+            )
+        )
+    assert drift_rejected.value.code == (
+        "observer_direct_main_graph_world_mismatch"
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0] == trace_count_before
+    subprocess.run(
+        ["git", "reset", "--hard", current_commit],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    graph_query = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(graph_query_body),
+        )
+    )
+    assert graph_authority["copy_safe_graph_query"]["arguments"][
+        "snapshot_id"
+    ] == candidate_snapshot_id
+    assert graph_authority["server_derived_world_ref"][
+        "snapshot_selector"
+    ] == candidate_snapshot_id
+    assert graph_authority["server_derived_world_ref"][
+        "selected_snapshot_is_active"
+    ] is False
+    assert graph_authority["server_derived_world_ref"][
+        "pre_mutation_source_fact_only"
+    ] is True
+    assert graph_authority["server_derived_world_ref"][
+        "grants_active_or_release_authority"
+    ] is False
+    assert graph_query["ok"] is True
+    assert graph_query["graph_query_identity"]["snapshot_id"] == (
+        candidate_snapshot_id
+    )
+    assert graph_query["graph_query_identity"]["commit_sha"] == current_commit
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0] == trace_count_before + 1
+    assert tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT ref_name,snapshot_id,commit_sha FROM graph_snapshot_refs "
+            "WHERE project_id=? ORDER BY ref_name",
+            (PID,),
+        ).fetchall()
+    ) == protected_history
+    assert protected_history == (("active", active_snapshot_id, stale_commit),)
+
+    missing_selection = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                key: value
+                for key, value in guide_body.items()
+                if key != "graph_snapshot_id"
+            },
+        )
+    )
+    missing_graph = missing_selection["next_legal_action"][
+        "graph_query_close_authority"
+    ]
+    assert missing_selection["next_legal_action"]["actionable"] is False
+    assert missing_graph["copy_safe_graph_query"]["ready"] is False
+    assert missing_graph["snapshot_selection"]["reason"] == (
+        "explicit_current_full_snapshot_required"
+    )
+    incomplete_selection = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **guide_body,
+                "graph_snapshot_id": retained_partial_snapshot_id,
+            },
+        )
+    )
+    incomplete_graph = incomplete_selection["next_legal_action"][
+        "graph_query_close_authority"
+    ]
+    assert incomplete_graph["copy_safe_graph_query"]["ready"] is False
+    assert incomplete_graph["snapshot_selection"]["accepted"] is False
+    assert "snapshot_c_family_analysis_incomplete" in incomplete_graph[
+        "snapshot_selection"
+    ]["materialization_errors"]
+    assert incomplete_graph["snapshot_selection"][
+        "c_family_action_status_counts"
+    ] == {"failed": 1}
+    missing_provenance = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **guide_body,
+                "graph_snapshot_id": missing_provenance_snapshot_id,
+            },
+        )
+    )
+    missing_provenance_graph = missing_provenance["next_legal_action"][
+        "graph_query_close_authority"
+    ]
+    assert missing_provenance_graph["copy_safe_graph_query"][
+        "ready"
+    ] is False
+    assert "snapshot_checkout_provenance_missing" in (
+        missing_provenance_graph["snapshot_selection"][
+            "materialization_errors"
+        ]
+    )
+    manifest_path = (
+        store.snapshot_companion_dir(PID, candidate_snapshot_id)
+        / "manifest.json"
+    )
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_path.write_bytes(b"{}")
+    tampered_selection = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(guide_body),
+        )
+    )
+    tampered_graph = tampered_selection["next_legal_action"][
+        "graph_query_close_authority"
+    ]
+    assert tampered_graph["copy_safe_graph_query"]["ready"] is False
+    assert tampered_graph["snapshot_selection"]["accepted"] is False
+    assert tampered_graph["snapshot_selection"]["companion_integrity"][
+        "valid"
+    ] is False
+    manifest_path.write_bytes(manifest_bytes)
+
+    append_body = _canonical_parentless_direct_main_pre_mutation_body(
+        append_base={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "route_token_ref": route_token_ref,
+        },
+        route_identity=route_identity,
+        allowed_files=row_files,
+        graph_trace_ids=[graph_query["trace_id"]],
+        approval_ref="operator-direct-current-head-nonactive",
+    )
+    admitted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(append_body),
+        )
+    )
+    lineage = admitted["payload"]["direct_contract_runtime_lineage"]
+    assert [item["line_id"] for item in lineage["completed_line_refs"]] == [
+        "observer_bind_direct_scope",
+        "observer_graph_context",
+        "observer_direct_implementation_exception",
+    ]
+    record = server._contract_runtime(conn).store.get(task_id)
+    assert record["revision"] == revision
+    assert len(record["completed_lines"]) == 3
+    assert record["authoritative_common_rule_join"]["join_state"] == "resolved"
+    assert record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "observer_implementation"
+    )
+    replay = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(append_body),
+        )
+    )
+    assert replay["id"] == admitted["id"]
+    assert replay["idempotent_replay"] is True
+    assert replay["writes_performed"] is False
+    pinned_trace_count = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as pinned_rejected:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(graph_query_body),
+            )
+        )
+    assert pinned_rejected.value.code == (
+        "observer_direct_main_graph_world_mismatch"
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0] == pinned_trace_count
+
+
 @pytest.mark.parametrize(
     ("execution_revision", "pinned_existing", "route_renewal"),
     [
@@ -105901,6 +106448,31 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
         exact_snapshot_id,
         commit_sha=parent_commit,
     )
+    explicit_active_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+                "graph_snapshot_id": exact_snapshot_id,
+                "view": "compact",
+            },
+        )
+    )
+    explicit_active_graph = explicit_active_guide["next_legal_action"][
+        "graph_query_close_authority"
+    ]
+    assert explicit_active_graph["copy_safe_graph_query"]["ready"] is True
+    assert explicit_active_graph["copy_safe_graph_query"]["arguments"][
+        "snapshot_id"
+    ] == "active"
+    assert explicit_active_graph["server_derived_world_ref"][
+        "selected_snapshot_is_active"
+    ] is True
     forged_graph_body = {
         **copy.deepcopy(graph_query_body),
         "commit_sha": "e" * 40,
