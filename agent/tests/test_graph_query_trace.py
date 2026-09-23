@@ -771,6 +771,73 @@ def test_get_file_excerpt_accepts_start_line_end_line_aliases(conn, tmp_path):
     assert "line 1\n" not in excerpt["excerpt"]
 
 
+def test_c_family_function_call_queries_filter_the_requested_endpoint(conn):
+    snapshot_id = "full-c-family-direction"
+    calls = [
+        {
+            "caller": "cxx::Origin", "caller_short": "Origin",
+            "caller_module": "cxx.origin",
+            "callee": f"cxx::{name}", "callee_short": name,
+            "callee_module": "cxx.target",
+        }
+        for name in ("OnlyCallee", "OtherCallee")
+    ]
+    called_by = [
+        {
+            "caller": f"cxx::{name}", "caller_short": name,
+            "caller_module": "cxx.origin",
+            "callee": "cxx::Target", "callee_short": "Target",
+            "callee_module": "cxx.target",
+            "raw_target": "TargetAlias" if name == "OnlyCaller" else "Target",
+        }
+        for name in ("OnlyCaller", "OtherCaller")
+    ]
+    for node_id, module, key, facts in (
+        ("L7.1", "cxx.origin", "function_calls", calls),
+        ("L7.2", "cxx.target", "function_called_by", called_by),
+    ):
+        conn.execute(
+            "INSERT INTO graph_nodes_index "
+            "(project_id, snapshot_id, node_id, layer, title, kind, "
+            "metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (PID, snapshot_id, node_id, "L7", module, "implementation",
+             json.dumps({"module": module, key: facts})),
+        )
+    conn.commit()
+
+    def lookup(tool, **args):
+        result = graph_query_trace.run_tool(
+            conn, PID, snapshot_id, tool=tool, args=args,
+        )
+        assert result["ok"] is True
+        return result
+
+    assert lookup("function_callees", query="OnlyCallee")["count"] == 0
+    assert lookup("function_callees", query="cxx.target")["count"] == 0
+    assert [row["callee_short"] for row in lookup(
+        "function_callees", query="Origin"
+    )["matches"]] == ["OnlyCallee", "OtherCallee"]
+    assert lookup("function_callers", query="OnlyCaller")["count"] == 0
+    assert lookup("function_callers", query="cxx.origin")["count"] == 0
+    assert [row["caller_short"] for row in lookup(
+        "function_callers", query="Target"
+    )["matches"]] == ["OnlyCaller", "OtherCaller"]
+    assert [row["caller_short"] for row in lookup(
+        "function_callers", query="TargetAlias"
+    )["matches"]] == ["OnlyCaller"]
+    assert lookup("function_callees", node_id="L7.1")["count"] == 2
+    assert lookup("function_callers", node_id="L7.2")["count"] == 2
+    assert lookup(
+        "function_callees", query="OnlyCallee", node_id="L7.1"
+    )["count"] == 0
+    assert lookup(
+        "function_callers", query="OnlyCaller", node_id="L7.2"
+    )["count"] == 0
+    limited = lookup("function_callees", query="Origin", limit=1)
+    assert limited["count"] == 1
+    assert limited["truncation_reason"] == "limit"
+
+
 def test_function_call_query_reports_truncation_instead_of_scanning_forever(conn, tmp_path):
     snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
 

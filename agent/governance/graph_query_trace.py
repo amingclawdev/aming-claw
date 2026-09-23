@@ -2395,15 +2395,11 @@ def _function_fact_matches(fact: dict[str, Any], query: str, node_id: str, direc
     if not query:
         return True
     needle = query.lower()
-    fields = [
-        "caller",
-        "caller_short",
-        "caller_module",
-        "callee",
-        "callee_short",
-        "callee_module",
-        "raw_target",
-    ]
+    fields = (
+        ("caller", "caller_short", "caller_module")
+        if direction == "callees"
+        else ("callee", "callee_short", "callee_module", "raw_target")
+    )
     return any(needle in str(fact.get(field) or "").lower() for field in fields)
 
 
