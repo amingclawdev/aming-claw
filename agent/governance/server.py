@@ -8395,6 +8395,22 @@ def _observer_route_context_issue_request_kind(
         return "mf_parallel_onboard_precursor"
     if (
         "canonical_ref_adoption" not in body
+        and set(body)
+        == {
+            "project_id",
+            "caller_role",
+            "backlog_id",
+            "task_id",
+            "allowed_actions",
+            "evidence_refs",
+        }
+        and body.get("caller_role") == "observer"
+        and isinstance(allowed_actions, list)
+        and allowed_actions == [_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION]
+    ):
+        return "mf_parallel_finished_worker_merge_route"
+    if (
+        "canonical_ref_adoption" not in body
         and isinstance(allowed_actions, list)
         and "parallel_branch_allocate" in allowed_actions
         and isinstance(body.get("parent_route_identity"), Mapping)
@@ -9444,6 +9460,15 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 project_id=project_id,
                 body=body,
             )
+        if request_kind == "mf_parallel_finished_worker_merge_route":
+            body = (
+                _ac_dev_mf_parallel_finished_worker_merge_route_issue_precheck(
+                    project_id=project_id,
+                    body=body,
+                    query=ctx.query,
+                )
+            )
+            mf_parallel_final_body = dict(body)
         if request_kind in {
             "mf_parallel_onboard_precursor", "mf_parallel_entered_lane",
             "mf_parallel_recovery_continuation", "mf_parallel_recovery_bypass_continuation",
@@ -9849,12 +9874,22 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             if mf_parallel_final_body is not None:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    _ac_dev_mf_parallel_onboard_route_issue_revalidate(
-                        conn,
-                        project_id=project_id,
-                        body=mf_parallel_final_body,
-                        token=issued["route_token"],
-                    )
+                    if request_kind == "mf_parallel_finished_worker_merge_route":
+                        (
+                            _ac_dev_mf_parallel_finished_worker_merge_route_issue_revalidate(
+                                conn,
+                                project_id=project_id,
+                                body=mf_parallel_final_body,
+                                token=issued["route_token"],
+                            )
+                        )
+                    else:
+                        _ac_dev_mf_parallel_onboard_route_issue_revalidate(
+                            conn,
+                            project_id=project_id,
+                            body=mf_parallel_final_body,
+                            token=issued["route_token"],
+                        )
                     observer_route_context.persist_route_token_ref(
                         conn,
                         project_id=project_id,
@@ -156080,8 +156115,66 @@ def _require_onboard_dev_selector_endpoint(
                         revision=revision,
                         world_authority=world_authority,
                     )
+        # A fresh observer MF entry uses task_id for its new bounded worker
+        # task, not for a Direct execution. Keep every physical-world and
+        # explicit CEX claim in the Direct check. An existing namespaced Direct
+        # execution, or a CEX-shaped task claim, retains Direct classification.
+        selector_request = request_body
+        mf_task_claims = [
+            str(value or "").strip()
+            for value in _operator_supervised_direct_main_request_claim_values(
+                request_body, "task_id",
+            )
+        ]
+        mf_bounded_task = (
+            project_id == AC_PROJECT_ID
+            and ownership["world"] == "unbound"
+            and str(role or "").strip() == "observer"
+            and str(work_type or "").strip() == "mf_parallel"
+            and len(mf_task_claims) == 1
+            and mf_task_claims[0]
+            and not mf_task_claims[0].startswith("cex-")
+            and not mf_task_claims[0].startswith("onboard-service-")
+        )
+        if mf_bounded_task and (
+            world_authority.get("accepted") is not True
+            or world_authority.get("server_derived") is not True
+            or world_authority.get("caller_claims_trusted") is not False
+            or world_authority.get("runtime_plane") != "dev"
+            or int(world_authority.get("runtime_port") or 0)
+            != AC_DEV_SERVICE_PORT
+            or world_authority.get("runtime_stale") is not False
+            or str(world_authority.get("loaded_runtime_commit") or "").strip()
+            != str(world_authority.get("target_head_commit") or "").strip()
+        ):
+            raise GovernanceError(
+                "ac_onboard_dev_mf_parallel_world_not_current",
+                "fresh MF entry requires the current loaded dev world",
+                409,
+                {
+                    "runtime_plane": "dev",
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "public_safe": True,
+                    "secret_safe": True,
+                },
+            )
+        if (
+            mf_bounded_task
+            and not _operator_supervised_direct_main_strict_records(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                world_authority=world_authority,
+            )
+        ):
+            selector_request = {
+                field: values
+                for field, values in (request_body or {}).items()
+                if field != "task_id"
+            }
         mismatches = _operator_supervised_direct_main_request_mismatches(
-            request_body,
+            selector_request,
             execution_id=execution_id,
             world_authority=world_authority,
             selector_authority=authority,
@@ -158830,6 +158923,555 @@ def _ac_dev_mf_parallel_onboard_route_issue_rejection(
             "raw_route_token_exposed": False,
         },
     )
+
+
+def _ac_dev_mf_parallel_finished_worker_merge_route_rejection(
+    *,
+    reason: str,
+    body: Mapping[str, Any] | None = None,
+    expected_body: Mapping[str, Any] | None = None,
+) -> GovernanceError:
+    """Build the closed worker merge-route issuer's zero-write rejection."""
+
+    return GovernanceError(
+        "ac_dev_mf_parallel_finished_worker_merge_route_rejected",
+        "finished MF Parallel worker merge-route issuance authority is invalid",
+        409,
+        {
+            "schema_version": (
+                "ac_dev_mf_parallel_finished_worker_merge_route.rejection.v1"
+            ),
+            "reason": str(reason or "authority_invalid"),
+            "runtime_plane": "dev",
+            "required_endpoint": "http://127.0.0.1:40008",
+            "request_body_hash": stable_sha256(dict(body or {})),
+            "expected_body_hash": stable_sha256(dict(expected_body or {})),
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "contract_runtime_mutated": False,
+            "route_registry_mutated": False,
+            "caller_claims_trusted": False,
+            "public_safe": True,
+            "secret_safe": True,
+            "raw_route_token_exposed": False,
+        },
+    )
+
+
+def _ac_dev_mf_parallel_finished_worker_merge_route_issue_revalidate(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    token: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rebuild one finished-worker merge-route authority from durable state."""
+
+    def reject(
+        reason: str,
+        expected_body: Mapping[str, Any] | None = None,
+    ) -> NoReturn:
+        raise _ac_dev_mf_parallel_finished_worker_merge_route_rejection(
+            reason=reason,
+            body=body,
+            expected_body=expected_body,
+        )
+
+    if _runtime_plane() != "dev" or project_id != AC_PROJECT_ID:
+        reject("wrong_runtime")
+    world = _operator_supervised_direct_main_dev_world_authority()
+    if not (
+        world.get("accepted") is True
+        and world.get("server_derived") is True
+        and world.get("caller_claims_trusted") is False
+        and str(world.get("world_id") or "") == "ac-dev"
+        and int(world.get("runtime_port") or 0) == AC_DEV_SERVICE_PORT
+        and world.get("runtime_stale") is False
+        and str(world.get("loaded_runtime_commit") or "").strip().lower()
+        == str(world.get("target_head_commit") or "").strip().lower()
+        and str(world.get("target_project_root") or "").strip()
+        == str(world.get("worktree_path") or "").strip()
+    ):
+        reject("dev_world_not_current")
+
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    if not backlog_id or not task_id:
+        reject("identity_incomplete")
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id=?",
+        (backlog_id,),
+    ).fetchone()
+    if row is None or str(_row_get(row, "status", "")).strip() != "OPEN":
+        reject("backlog_not_open")
+
+    from . import observer_route_context
+    from .parallel_branch_runtime import (
+        STATE_VALIDATED,
+        get_branch_context,
+    )
+
+    context = get_branch_context(conn, project_id, task_id)
+    if context is None:
+        reject("worker_runtime_context_missing")
+    contract_execution_id = str(
+        getattr(context, "parent_task_id", "") or ""
+    ).strip()
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    merge_queue_id = str(getattr(context, "merge_queue_id", "") or "").strip()
+    context_files = sorted(
+        _runtime_context_public_file_values(list(context.owned_files or ()))
+    )
+    context_target_files = sorted(
+        _runtime_context_public_file_values(list(context.target_files or ()))
+    )
+    if not (
+        context.project_id == project_id
+        and context.backlog_id == backlog_id
+        and context.task_id == task_id
+        and runtime_context_id
+        and contract_execution_id
+        and merge_queue_id
+        and context_files
+        and context_target_files == context_files
+        and str(context.status or "").strip() == STATE_VALIDATED
+    ):
+        reject("worker_runtime_context_identity_mismatch")
+    try:
+        record = _contract_runtime(conn).current_record(
+            contract_execution_id,
+            actor_role="observer",
+        )
+    except (ContractRuntimeError, sqlite3.Error):
+        reject("parent_contract_runtime_missing")
+    current = conn.execute(
+        "SELECT root_contract_execution_id, current_contract_execution_id, "
+        "contract_chain_id, current_contract_id "
+        "FROM backlog_contract_chain_current "
+        "WHERE project_id=? AND backlog_id=?",
+        (project_id, backlog_id),
+    ).fetchone()
+    root_execution_id = str(
+        _row_get(current, "root_contract_execution_id", "") or ""
+    ).strip()
+    chain_id = str(_row_get(current, "contract_chain_id", "") or "").strip()
+    # Allocation can leave RuntimeContext.chain_id empty. Its exact current
+    # CEX parent/root joins to the durable chain projection; a populated
+    # context chain must still agree with that projection.
+    if not (
+        str(record.get("project_id") or "").strip() == project_id
+        and str(record.get("backlog_id") or "").strip() == backlog_id
+        and str(record.get("contract_execution_id") or "").strip()
+        == contract_execution_id
+        and _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        and str(record.get("revision") or "").strip() == "rev10"
+        and str(_row_get(current, "current_contract_execution_id", "") or "")
+        == contract_execution_id
+        and str(_row_get(current, "current_contract_id", "") or "").strip()
+        == str(record.get("contract_id") or "").strip()
+        and root_execution_id
+        and chain_id
+        and root_execution_id != contract_execution_id
+        and str(record.get("root_contract_execution_id") or "").strip()
+        == root_execution_id
+        and str(record.get("contract_chain_id") or "").strip() == chain_id
+        and str(record.get("parent_contract_execution_id") or "").strip()
+        == root_execution_id
+        and str(getattr(context, "root_task_id", "") or "").strip()
+        == contract_execution_id
+        and str(getattr(context, "parent_task_id", "") or "").strip()
+        == contract_execution_id
+        and str(getattr(context, "chain_id", "") or "").strip()
+        in {"", chain_id}
+        and str(_contract_runtime_next_line(record).get("line_id") or "").strip()
+        == "observer_merge"
+    ):
+        reject("parent_contract_runtime_not_current_merge")
+
+    plan = _contract_runtime_mf_parallel_admitted_prefill_child_plan(record)
+    route_binding = (
+        plan.get("parent_route_binding")
+        if isinstance(plan, Mapping)
+        and isinstance(plan.get("parent_route_binding"), Mapping)
+        else {}
+    )
+    route_token_ref = str(route_binding.get("route_token_ref") or "").strip()
+    expected_route_identity = (
+        route_binding.get("route_identity")
+        if isinstance(route_binding.get("route_identity"), Mapping)
+        else {}
+    )
+    if not (
+        route_token_ref
+        and str(plan.get("contract_execution_id") or "").strip()
+        == contract_execution_id
+        and str(plan.get("parent_contract_execution_id") or "").strip()
+        == root_execution_id
+        and str(plan.get("root_contract_execution_id") or "").strip()
+        == root_execution_id
+    ):
+        reject("current_parent_route_binding_missing")
+    try:
+        parent_route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=root_execution_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        reject("current_parent_route_inactive")
+    if not isinstance(parent_route, Mapping):
+        reject("current_parent_route_inactive")
+    parent_route_identity = {
+        field: str(parent_route.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not (
+        parent_route.get("caller_role") == "observer"
+        and set(context_files).issubset(parent_route.get("target_files") or [])
+        and set(context_files).issubset(parent_route.get("owned_files") or [])
+        and all(parent_route_identity.values())
+        and all(
+            parent_route_identity[field]
+            == str(expected_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+    ):
+        reject("current_parent_route_identity_mismatch")
+    completed = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    dispatch = _contract_runtime_current_dispatch_authority_line(record)
+    dispatch_index = int(dispatch.get("completed_line_index", -1))
+    if not 0 <= dispatch_index < len(completed):
+        reject("current_parent_dispatch_missing")
+    dispatch_line = completed[dispatch_index]
+    dispatch_acceptance = _contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=dispatch_index,
+        expected_line=dispatch_line,
+    )
+    dispatch_payload = (
+        dispatch.get("payload")
+        if isinstance(dispatch.get("payload"), Mapping)
+        else {}
+    )
+    dispatch_ticket = (
+        dispatch_payload.get("dispatch_ticket_authority")
+        if isinstance(dispatch_payload.get("dispatch_ticket_authority"), Mapping)
+        else {}
+    )
+    workers = _contract_runtime_mf_parallel_bounded_workers(
+        {"payload": dispatch_payload}
+    )
+    selected_workers = [
+        worker
+        for worker in workers
+        if isinstance(worker, Mapping)
+        and str(worker.get("task_id") or "").strip() == task_id
+    ]
+    if len(selected_workers) != 1:
+        reject("current_parent_dispatch_worker_missing_or_ambiguous")
+    worker = selected_workers[0]
+    worker_identity = {
+        field: str(worker.get(field) or "").strip()
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "merge_queue_id",
+        )
+    }
+    context_identity = {
+        field: str(getattr(context, field, "") or "").strip()
+        for field in worker_identity
+    }
+    worker_files = sorted(
+        _runtime_context_public_file_values(worker.get("owned_files") or [])
+    )
+    worker_target_files = sorted(
+        _runtime_context_public_file_values(worker.get("target_files") or [])
+    )
+    plan_lanes = [
+        lane
+        for lane in plan.get("lanes") or []
+        if isinstance(lane, Mapping)
+        and str(lane.get("task_id") or "").strip() == task_id
+    ]
+    if not (
+        dispatch.get("status") == "selected"
+        and dispatch_acceptance.get("db_verified") is True
+        and str(dispatch_ticket.get("schema_version") or "").strip()
+        in {
+            "mf_parallel.dispatch_ticket_authority.v1",
+            "mf_parallel.atomic_dispatch_ticket_authority.v1",
+        }
+        and str(dispatch_ticket.get("source") or "").strip()
+        == "observer_route_token_refs"
+        and dispatch_ticket.get("server_resolved_child_route_identity") is True
+        and dispatch_ticket.get("runtime_context_bound") is True
+        and len(plan_lanes) == 1
+        and context_identity == worker_identity
+        and all(worker_identity.values())
+        and worker_identity["parent_task_id"] == contract_execution_id
+        and worker_files == context_files
+        and worker_target_files == context_target_files
+        and worker_target_files == worker_files
+        and worker_files
+        == sorted(
+            _runtime_context_public_file_values(
+                plan_lanes[0].get("owned_files") or []
+            )
+        )
+        and worker_identity["worker_id"]
+        == str(plan_lanes[0].get("worker_id") or "").strip()
+        and worker_identity["worker_slot_id"]
+        == str(plan_lanes[0].get("worker_slot_id") or "").strip()
+    ):
+        reject("current_parent_dispatch_worker_identity_mismatch")
+
+    finish_candidates = [
+        (index, line)
+        for index, line in enumerate(completed)
+        if index > dispatch_index
+        and str(line.get("line_id") or "").strip() == "worker_finish_gate"
+        and str(line.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(line.get("line_instance_id") or "").strip()
+        == f"runtime_context:{runtime_context_id}"
+    ]
+    if len(finish_candidates) != 1:
+        reject("finished_worker_gate_missing_or_ambiguous")
+    finish_index, finish_line = finish_candidates[0]
+    finish_payload = (
+        finish_line.get("payload")
+        if isinstance(finish_line.get("payload"), Mapping)
+        else {}
+    )
+    finish_head = str(
+        finish_line.get("head_commit")
+        or finish_payload.get("validated_head_commit")
+        or finish_payload.get("head_commit")
+        or ""
+    ).strip().lower()
+    finish_checkpoint = str(finish_payload.get("checkpoint_id") or "").strip()
+    finish_changed_files = _runtime_context_service_query_values(
+        finish_payload,
+        "changed_files",
+    )
+    finish_results = (
+        finish_payload.get("test_results")
+        if isinstance(finish_payload.get("test_results"), Mapping)
+        else {}
+    )
+    if not (
+        finish_head
+        and finish_checkpoint
+        and finish_head == str(context.head_commit or "").strip().lower()
+        and finish_checkpoint == str(context.checkpoint_id or "").strip()
+        and _contract_runtime_finish_test_results_consumer_acceptance(
+            finish_results,
+            expected_baseline_commit=str(context.base_commit or "").strip(),
+        ).get("accepted")
+    ):
+        reject("finished_worker_gate_identity_mismatch")
+
+    try:
+        stored_record = _contract_runtime_store(conn).get(contract_execution_id)
+        canonical_record = deepcopy(stored_record)
+        stored_guide = canonical_record.get("runtime_guide")
+        if isinstance(stored_guide, Mapping):
+            canonical_record["runtime_guide"] = {
+                key: value
+                for key, value in stored_guide.items()
+                if key != "completed_lines"
+            }
+        attestation = _runtime_context_contract_finish_attestation_projection(
+            conn,
+            context=context,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context_id,
+            parent_task_id=contract_execution_id,
+            head_commit=finish_head,
+            changed_files=finish_changed_files,
+            test_results=finish_results,
+            supplied_worker_session_id=str(
+                finish_payload.get("worker_session_id") or ""
+            ).strip(),
+            supplied_filer_principal=str(
+                finish_payload.get("filer_principal") or ""
+            ).strip(),
+            read_receipt_event_id=str(
+                finish_payload.get("read_receipt_event_id") or ""
+            ).strip(),
+            read_receipt_hash=str(
+                finish_payload.get("read_receipt_hash") or ""
+            ).strip(),
+            supplied_attestation=(
+                finish_payload.get("worker_self_attestation")
+                if isinstance(
+                    finish_payload.get("worker_self_attestation"), Mapping
+                )
+                else {}
+            ),
+            canonical_record=canonical_record,
+        )
+    except (ContractRuntimeError, GovernanceError, sqlite3.Error) as exc:
+        reject(
+            "finished_worker_attestation_invalid:"
+            + str(getattr(exc, "code", type(exc).__name__))
+        )
+    attestation_ref = str(
+        attestation.get("contract_runtime_source_ref") or ""
+    ).strip()
+    attestation_match = re.fullmatch(
+        rf"contract_runtime:{re.escape(contract_execution_id)}:"
+        r"completed_lines:(\d+)",
+        attestation_ref,
+    )
+    if not attestation_match:
+        reject("finished_worker_attestation_source_invalid")
+    attestation_index = int(attestation_match.group(1))
+    if not 0 <= attestation_index < len(completed):
+        reject("finished_worker_attestation_source_invalid")
+    attestation_line = completed[attestation_index]
+    stored_completed = stored_record.get("completed_lines")
+    if not (
+        str(attestation.get("worker_session_id") or "").strip()
+        and isinstance(stored_completed, list)
+        and 0 <= attestation_index < len(stored_completed)
+        and isinstance(stored_completed[attestation_index], Mapping)
+        and stable_sha256(stored_completed[attestation_index])
+        == stable_sha256(attestation_line)
+        and _contract_runtime_completed_line_acceptance(
+            conn,
+            project_id=project_id,
+            record=record,
+            completed_line_index=attestation_index,
+            expected_line=attestation_line,
+            allow_verified_worker_finish_attestation=True,
+            expected_worker_identity=worker_identity,
+            expected_baseline_commit=str(context.base_commit or "").strip(),
+        ).get("db_verified")
+        is True
+        and _contract_runtime_completed_line_acceptance(
+            conn,
+            project_id=project_id,
+            record=record,
+            completed_line_index=finish_index,
+            expected_line=finish_line,
+            allow_statusless_worker_finish_gate=True,
+            expected_worker_identity=worker_identity,
+            expected_baseline_commit=str(context.base_commit or "").strip(),
+        ).get("db_verified")
+        is True
+    ):
+        reject("finished_worker_evidence_not_db_accepted")
+
+    revision_payload = _runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    try:
+        worker_commit = _runtime_context_contract_worker_commit_projection(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            revision_payload=revision_payload,
+            body={"contract_execution_id": contract_execution_id},
+            source=(
+                "observer_route_context_issue."
+                "mf_parallel_finished_worker_merge_route"
+            ),
+        )
+    except (GovernanceError, ValueError, OSError) as exc:
+        reject(
+            "immutable_worker_commit_invalid:"
+            + str(getattr(exc, "code", type(exc).__name__))
+        )
+    worker_head = str(worker_commit.get("worker_commit_sha") or "").strip().lower()
+    if not (
+        worker_commit.get("status") == "validated"
+        and worker_commit.get("clean_worktree") is True
+        and str(worker_commit.get("task_id") or "") == task_id
+        and str(worker_commit.get("runtime_context_id") or "") == runtime_context_id
+        and sorted(worker_commit.get("owned_files") or []) == context_files
+        and worker_head
+        == str(context.head_commit or "").strip().lower()
+        == finish_head
+    ):
+        reject("immutable_worker_commit_scope_or_head_mismatch")
+
+    expected_request = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "allowed_actions": [_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION],
+        "evidence_refs": [
+            f"parallel_branch_task:{task_id}",
+            f"contract_runtime:{contract_execution_id}",
+            f"backlog:{backlog_id}",
+        ],
+    }
+    expected_body = {
+        **expected_request,
+        "target_files": context_files,
+        "owned_files": context_files,
+        "parent_route_identity": {
+            **parent_route_identity,
+            "route_token_ref": route_token_ref,
+            "selected_project": project_id,
+            "selected_backlog_id": backlog_id,
+        },
+    }
+    supplied_expected = expected_body if token is not None else expected_request
+    if dict(body) != supplied_expected:
+        reject("request_not_exact_current_finished_worker_recipe", supplied_expected)
+    _ac_dev_mf_parallel_route_issue_token_revalidate(
+        body=body,
+        expected_body=expected_body,
+        token=token,
+    )
+    return expected_body
+
+
+def _ac_dev_mf_parallel_finished_worker_merge_route_issue_precheck(
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read-only precheck for the exact finished-worker merge-route recipe."""
+
+    if query:
+        raise _ac_dev_mf_parallel_finished_worker_merge_route_rejection(
+            reason="query_claims_forbidden",
+            body=body,
+        )
+    conn = get_connection(project_id)
+    try:
+        return _ac_dev_mf_parallel_finished_worker_merge_route_issue_revalidate(
+            conn,
+            project_id=project_id,
+            body=body,
+        )
+    finally:
+        conn.close()
 
 
 def _ac_dev_mf_parallel_onboard_route_issue_precheck(

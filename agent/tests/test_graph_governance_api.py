@@ -212408,6 +212408,242 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
     }
 
 
+def _prepare_ac_dev_mf_parallel_ready_guide(conn, monkeypatch, tmp_path):
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-MF-BOUNDED-TASK-SELECTOR",
+        target_files=[
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+    )
+    project_id, backlog_id = case["project_id"], case["backlog_id"]
+    fixture_registry = server._registry_project_config
+    monkeypatch.setattr(server, "_registry_project_config", lambda selected: (
+        ({**fixture_registry(PID)[0], "project_id": project_id}, "test_registry")
+        if selected == project_id else fixture_registry(selected)
+    ))
+    issued = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": project_id}, method="POST", body=case["body"],
+    ))
+    assert issued["ok"] is True
+    status, registered = server.handle_observer_session_register(_ctx(
+        {"project_id": project_id}, method="POST", body={
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": case["parent_execution_id"],
+            "cex_id": case["parent_execution_id"],
+            "route_token_ref": issued["route_token_ref"],
+        },
+    ))
+    assert status == 201, registered
+    case["guide_body"] = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "mf_parallel",
+        "response_view": "full",
+        "route_token_ref": issued["route_token_ref"],
+        "observer_session_id": registered["session_id"],
+        "task_id": "mf-bounded-selector-task",
+        "reason": "Enter two bounded, disjoint implementation lanes.",
+        "metadata": {
+            "required_worker_count": 2,
+            "lane_intents": [
+                {
+                    "task_id": "mf-bounded-selector-source",
+                    "worker_id": "source",
+                    "worker_slot_id": "source",
+                    "owned_files": [case["target_files"][0]],
+                },
+                {
+                    "task_id": "mf-bounded-selector-test",
+                    "worker_id": "test",
+                    "worker_slot_id": "test",
+                    "owned_files": [case["target_files"][1]],
+                },
+            ],
+        },
+    }
+    # Bind the issued route to the service parent once. The subsequent Guide
+    # is then a read-only projection over the same active authority records.
+    precursor = dict(case["guide_body"])
+    precursor.pop("task_id")
+    precursor.pop("metadata")
+    assert server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": project_id}, method="POST", body=precursor,
+    ))["next_legal_action"]["action_input_ready"] is False
+    return case
+
+
+def _ac_dev_mf_guide_work_write_counts(conn, backlog_id):
+    return (
+        conn.execute(
+            "SELECT COUNT(*) FROM contract_runtime_executions "
+            "WHERE project_id=? AND backlog_id=? "
+            "AND contract_id IN ('operator_supervised_direct_main', 'mf_parallel')",
+            ("aming-claw", backlog_id),
+        ).fetchone()[0],
+        conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events "
+            "WHERE project_id=? AND backlog_id=?",
+            ("aming-claw", backlog_id),
+        ).fetchone()[0],
+    )
+
+
+def test_ac_dev_mf_parallel_guide_accepts_bounded_task_without_direct_cex(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_mf_parallel_ready_guide(
+        conn, monkeypatch, tmp_path,
+    )
+    before_work = _ac_dev_mf_guide_work_write_counts(conn, case["backlog_id"])
+
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST",
+        body=case["guide_body"],
+    ))
+
+    action = guide["next_legal_action"]
+    authority = action["successor_action_input"]["entry_authority"]
+    assert action["id"] == "mf_parallel_enter"
+    assert action["action_input_ready"] is True
+    assert authority["evaluated"] is True
+    assert authority["accepted"] is True
+    assert authority["observer_proof_accepted"] is True
+    assert authority["lane_plan_conformance_accepted"] is True
+    assert action["successor_action_input"]["copy_safe_body"] == {
+        "project_id": case["project_id"],
+        "backlog_id": case["backlog_id"],
+        "onboard_service_waiver": True,
+        "target_files": case["target_files"],
+        "owned_files": case["target_files"],
+        "task_id": case["guide_body"]["task_id"],
+        "reason": case["guide_body"]["reason"],
+        "observer_session_id": case["guide_body"]["observer_session_id"],
+        "observer_route_token_ref": case["guide_body"]["route_token_ref"],
+        "metadata": case["guide_body"]["metadata"],
+    }
+    assert _ac_dev_mf_guide_work_write_counts(conn, case["backlog_id"]) == before_work
+
+
+@pytest.mark.parametrize("invalid_case", [
+    "foreign_route", "inactive_session", "duplicate_lane", "wrong_file",
+    "foreign_root", "foreign_head", "foreign_ref", "foreign_port",
+    "direct_task_cex", "explicit_direct_cex", "existing_direct_cex",
+    "stable_owned", "stale_world",
+])
+def test_ac_dev_mf_parallel_guide_bounded_task_negative_no_worker_write(
+    conn, monkeypatch, tmp_path, invalid_case,
+):
+    case = _prepare_ac_dev_mf_parallel_ready_guide(
+        conn, monkeypatch, tmp_path,
+    )
+    body = copy.deepcopy(case["guide_body"])
+    world = case["world"]
+    if invalid_case == "foreign_route":
+        body["route_token_ref"] = "rtok-foreign-mf-selector"
+    elif invalid_case == "inactive_session":
+        body["observer_session_id"] = "obs-foreign-mf-selector"
+    elif invalid_case == "duplicate_lane":
+        body["metadata"]["lane_intents"][1]["task_id"] = (
+            body["metadata"]["lane_intents"][0]["task_id"]
+        )
+    elif invalid_case == "wrong_file":
+        body["metadata"]["lane_intents"][1]["owned_files"] = [
+            "agent/tests/foreign.py"
+        ]
+    elif invalid_case == "foreign_root":
+        body["target_project_root"] = str(tmp_path)
+    elif invalid_case == "foreign_head":
+        body["target_head_commit"] = "f" * 40
+    elif invalid_case == "foreign_ref":
+        body["target_ref"] = "refs/heads/foreign"
+    elif invalid_case == "foreign_port":
+        body["runtime_port"] = server.AC_STABLE_SERVICE_PORT
+    elif invalid_case == "direct_task_cex":
+        body["task_id"] = "cex-direct-main-foreign"
+    elif invalid_case == "explicit_direct_cex":
+        body["contract_execution_id"] = "cex-direct-main-foreign"
+    elif invalid_case == "existing_direct_cex":
+        execution_id = server._operator_supervised_direct_main_execution_id(
+            case["project_id"], case["backlog_id"],
+            revision="rev3", world_authority=world,
+        )
+        SQLiteContractExecutionStore(conn).create({
+            "project_id": case["project_id"],
+            "backlog_id": case["backlog_id"],
+            "contract_execution_id": execution_id,
+            "contract_id": "operator_supervised_direct_main",
+            "version": "v1",
+            "revision": "rev3",
+            "execution_state_revision": 1,
+            "metadata": {
+                "operator_supervised_direct_main_runtime_binding": {
+                    "strict_runtime_binding_required": True,
+                    "runtime_world_authority": world,
+                },
+            },
+        })
+        conn.commit()
+    elif invalid_case == "stable_owned":
+        execution_id = "cex-direct-main-stable-owned"
+        record = {
+            "project_id": case["project_id"],
+            "backlog_id": case["backlog_id"],
+            "contract_execution_id": execution_id,
+            "contract_id": "operator_supervised_direct_main",
+            "version": "v1",
+            "revision": "rev3",
+            "execution_state_revision": 1,
+            "metadata": {
+                "operator_supervised_direct_main_runtime_binding": {
+                    "strict_runtime_binding_required": True,
+                },
+            },
+        }
+        conn.execute(
+            "INSERT INTO contract_runtime_executions "
+            "(contract_execution_id, project_id, backlog_id, contract_id, "
+            "version, revision, execution_state_revision, record_json, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (execution_id, case["project_id"], case["backlog_id"],
+             "operator_supervised_direct_main", "v1", "rev3", 1,
+             json.dumps(record), "2026-09-22T00:00:00Z", "2026-09-22T00:00:00Z"),
+        )
+        conn.commit()
+    elif invalid_case == "stale_world":
+        stale = {**world, "runtime_stale": True}
+        monkeypatch.setattr(
+            server, "_operator_supervised_direct_main_dev_world_authority",
+            lambda: copy.deepcopy(stale),
+        )
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    before_work = _ac_dev_mf_guide_work_write_counts(conn, case["backlog_id"])
+    try:
+        guide = server.handle_project_onboard_route_guide(_ctx(
+            {"project_id": case["project_id"]}, method="POST", body=body,
+        ))
+    except GovernanceError as exc:
+        assert invalid_case in {
+            "foreign_root", "foreign_head", "foreign_ref", "foreign_port",
+            "direct_task_cex", "explicit_direct_cex", "existing_direct_cex",
+            "stable_owned", "stale_world",
+        }
+        assert exc.details["writes_performed"] is False
+        assert conn.total_changes == before_changes
+        assert tuple(conn.iterdump()) == before
+    else:
+        assert invalid_case in {
+            "foreign_route", "inactive_session", "duplicate_lane", "wrong_file",
+            "stale_world",
+        }
+        assert guide["next_legal_action"]["action_input_ready"] is False
+        assert guide["next_legal_action"]["successor_action_input"]["copy_safe_body"] == {}
+    assert _ac_dev_mf_guide_work_write_counts(conn, case["backlog_id"]) == before_work
+
+
 def _prepare_ac_dev_entered_parallel_lane_routes(
     conn, monkeypatch, tmp_path, *, target_files=None
 ):
@@ -233621,3 +233857,361 @@ def test_concurrent_dev_basic_readers_take_independent_native_observations(
         )]
     assert len(set(reader_threads)) == 2
     assert sorted(observed) == sorted(reader_threads * 2)
+
+
+@pytest.fixture()
+def finished_parallel_merge_route_world(conn, monkeypatch, tmp_path):
+    """Run the ordinary two-lane producers up to the observer merge step."""
+    from agent.governance.parallel_branch_runtime import get_branch_context
+
+    graph_events.ensure_schema(conn)
+    graph_correction_patches.ensure_schema(conn)
+    conn.commit()
+    monkeypatch.setattr(store, "_graph_activation_policy_for_connection", lambda _conn: {
+        "runtime_plane": "dev", "active_graph_activation_allowed": True,
+        "classification_reason": "verified_dev_cow_successor_receipt_history",
+        "world_id": "ac-dev", "project_id": "aming-claw", "port": 40008,
+        "cow_successor_verified": True, "source_checkout_verified": True,
+        "live_runtime_custody_verified": True,
+    })
+    case = _prepare_ac_dev_entered_parallel_lane_routes(
+        conn, monkeypatch, tmp_path,
+        target_files=["agent/governance/server.py", "agent/tests/test_graph_governance_api.py"],
+    )
+    project_id, execution_id = case["project_id"], case["execution_id"]
+    recipe = case["recipe"]
+    children = [server.handle_observer_route_context_issue(_ctx(
+        {"project_id": project_id}, method="POST", body=body,
+    )) for body in recipe["request_bodies"]]
+    assert all(child["ok"] is True for child in children)
+    precheck_body = copy.deepcopy(recipe["atomic_precheck"]["request_body_template"])
+    for binding, child in zip(recipe["route_token_ref_bindings"], children, strict=True):
+        precheck_body["lanes"][binding["lane_index"]]["route_token_ref"] = child["route_token_ref"]
+    prechecked = server.handle_graph_governance_parallel_branch_allocate_precheck(_ctx(
+        {"project_id": project_id}, method="POST", body=precheck_body,
+    ))
+    assert prechecked["ok"] is True, prechecked
+    allocations = []
+    for body in prechecked["copy_safe_allocation_bodies"]:
+        status, allocated = server.handle_graph_governance_parallel_branch_allocate(_ctx(
+            {"project_id": project_id}, method="POST", body=body,
+        ))
+        assert status == 201 and allocated["ok"] is True, allocated
+        allocations.append((body, get_branch_context(conn, project_id, body["task_id"])))
+    dispatch = server._contract_runtime_read(
+        conn, contract_execution_id=execution_id, actor_role="observer",
+    )["runtime_guide"]["next_legal_action"]["writer_role_safe_copy_payload"]["copy_payload"]
+    assert server.handle_project_contract_runtime_line_write(_ctx_with_role(
+        {"project_id": project_id, "contract_execution_id": execution_id},
+        "observer", method="POST", body=dispatch,
+    ))["ok"] is True
+    results = {"status": "passed", "passed": True, "commands": [
+        {"command": "python3 -m pytest lane-owned -q", "status": "passed"},
+    ]}
+    finished = []
+    for allocation_body, context in allocations:
+        assert context is not None
+        route_identity = dict(allocation_body["route_identity"])
+        session_id = f"session-{context.task_id}"
+        joined = server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {"project_id": project_id, "runtime_context_id": context.runtime_context_id},
+                "coordinator", method="POST", body={
+                    "task_id": context.task_id, "parent_task_id": execution_id,
+                    "contract_execution_id": execution_id,
+                    "target_project_root": context.target_project_root,
+                    "worker_id": context.worker_id, "worker_slot_id": context.worker_slot_id,
+                    "agent_id": context.worker_id, "actual_host_worker_id": context.worker_id,
+                    "worker_session_id": session_id, "host_session_id": session_id,
+                    "host_startup_id": f"startup-{context.task_id}",
+                    **route_identity, "ttl_seconds": 3600,
+                    "reason": "Exercise the normal rev10 worker custody path.",
+                },
+            )
+        )
+        assert joined["ok"] is True, joined
+        monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE")
+        context = get_branch_context(conn, project_id, context.task_id)
+        worker_root = Path(context.worktree_path)
+        successor, context, head, events, startup = _normal_mf_parallel_finish_precursor(
+            conn, tmp_path, backlog_id=case["backlog_id"],
+            worker_task_id=context.task_id, worker_token=joined["session_token"],
+            worker_fence=joined["fence_token"], worker_root=worker_root,
+            graph_trace_id=f"gqt-{context.task_id}", test_results=results,
+            project_id=project_id, prepared={
+                "successor": {"contract_execution_id": execution_id},
+                "runtime_context": context, "route_identity": route_identity,
+            },
+        )
+        response, _ = _finish_normal_mf_parallel_worker(
+            conn, project_id=project_id, successor=successor,
+            runtime_context=context, head_commit=head, evidence_events=events,
+            startup=startup, worker_token=joined["session_token"],
+            worker_fence=joined["fence_token"], worker_root=worker_root,
+            test_results=results,
+        )
+        assert response["ok"] is True, response
+        finished.append(get_branch_context(conn, project_id, context.task_id))
+        monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    record = server._contract_runtime_store(conn).get(execution_id)
+    assert record["runtime_guide"]["next_legal_action"]["line_id"] == "observer_merge"
+    assert all(context.status == "validated" for context in finished)
+    assert conn.execute("SELECT COUNT(*) FROM parallel_branch_merge_queue_items").fetchone()[0] == 0
+    parent_ref = case["plan"]["parent_route_binding"]["route_token_ref"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_sessions WHERE session_id=? AND status='active'",
+        (case["observer_session_id"],),
+    ).fetchone()[0] == 1
+    conn.execute("UPDATE observer_sessions SET status='revoked' WHERE session_id=?",
+                 (case["observer_session_id"],))
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts SET lease_expires_at=? "
+        "WHERE project_id=? AND task_id=?",
+        ("2020-01-01T00:00:00Z", project_id, finished[0].task_id),
+    )
+    conn.commit()
+    assert parent_ref != ""
+
+    def post(body):
+        from http.server import HTTPServer
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+        path = f"/api/projects/{project_id}/observer/route-context/issue"
+        with HTTPServer(("127.0.0.1", 0), server.GovernanceHandler) as httpd:
+            httpd.timeout = 20
+
+            def client():
+                request = Request(
+                    f"http://127.0.0.1:{httpd.server_port}{path}",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                try:
+                    response = urlopen(request, timeout=20)
+                except HTTPError as exc:
+                    response = exc
+                with response:
+                    return response.status, json.loads(response.read())
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(client)
+                httpd.handle_request()
+                return future.result(timeout=20)
+
+    selected = finished[0]
+    body = {
+        "project_id": project_id, "caller_role": "observer",
+        "backlog_id": case["backlog_id"], "task_id": selected.task_id,
+        "allowed_actions": ["close_or_merge_after_evidence"],
+        "evidence_refs": [f"parallel_branch_task:{selected.task_id}",
+                          f"contract_runtime:{execution_id}",
+                          f"backlog:{case['backlog_id']}"],
+    }
+    yield {**case, "conn": conn, "post": post, "body": body,
+           "selected": selected, "finished": finished,
+           "parent_ref": parent_ref, "record": record}
+
+
+def test_ac_dev_finished_worker_merge_route_real_http_root_parent_and_stale_session(
+    finished_parallel_merge_route_world,
+):
+    from agent.governance.parallel_branch_runtime import get_branch_context
+
+    case = finished_parallel_merge_route_world
+    conn, first_body = case["conn"], case["body"]
+    assert case["record"]["contract_chain_id"]
+    assert case["parent_execution_id"] != case["execution_id"]
+    parent_route = observer_route_context.resolve_route_token_ref(
+        conn, project_id=first_body["project_id"],
+        storage_project_id=server._route_registry_storage_project_id(first_body["project_id"]),
+        route_token_ref=case["parent_ref"], backlog_id=first_body["backlog_id"],
+        task_id=case["parent_execution_id"],
+    )
+    assert parent_route["scope"]["task_id"] == case["parent_execution_id"]
+    before_runtime = tuple(conn.execute(
+        "SELECT * FROM contract_runtime_executions ORDER BY contract_execution_id"
+    ).fetchall())
+    assert len(case["finished"]) == 2
+    assert {context.task_id for context in case["finished"]} == {
+        lane["task_id"] for lane in case["plan"]["lanes"]
+    }
+    for context in case["finished"]:
+        assert context.root_task_id == case["execution_id"]
+        assert context.parent_task_id == case["execution_id"]
+        assert context.chain_id == ""  # Ordinary allocation omits this optional field.
+        assert get_branch_context(
+            conn, first_body["project_id"], context.task_id,
+        ).status == "validated"
+        body = {
+            **first_body,
+            "task_id": context.task_id,
+            "evidence_refs": [
+                f"parallel_branch_task:{context.task_id}",
+                f"contract_runtime:{case['execution_id']}",
+                f"backlog:{case['backlog_id']}",
+            ],
+        }
+        status, issued = case["post"](body)
+        assert status == 200 and issued["ok"] is True, issued
+        assert issued["ref_registered"] is True
+        route = observer_route_context.resolve_route_token_ref(
+            conn, project_id=body["project_id"],
+            storage_project_id=server._route_registry_storage_project_id(body["project_id"]),
+            route_token_ref=issued["route_token_ref"],
+            backlog_id=body["backlog_id"], task_id=body["task_id"],
+        )
+        assert route["scope"]["task_id"] == context.task_id
+        assert route["target_files"] == route["owned_files"] == list(context.owned_files)
+        assert route["allowed_actions"] == ["close_or_merge_after_evidence"]
+    assert tuple(conn.execute(
+        "SELECT * FROM contract_runtime_executions ORDER BY contract_execution_id"
+    ).fetchall()) == before_runtime
+    assert conn.execute("SELECT COUNT(*) FROM parallel_branch_merge_queue_items").fetchone()[0] == 0
+
+
+def test_ac_dev_finished_worker_merge_route_rejects_caller_claims_without_writes(
+    finished_parallel_merge_route_world,
+):
+    case = finished_parallel_merge_route_world
+    conn, body = case["conn"], case["body"]
+    malformed = {
+        "wrong_project": {**body, "project_id": "foreign-project"},
+        "wrong_backlog": {**body, "backlog_id": "AC-OTHER-BACKLOG"},
+        "wrong_worker": {**body, "task_id": "foreign-worker"},
+        "wrong_role": {**body, "caller_role": "qa"},
+        "wrong_action": {**body, "allowed_actions": ["merge"]},
+        "extra_action": {**body, "allowed_actions": ["close_or_merge_after_evidence", "merge"]},
+        "wrong_evidence": {**body, "evidence_refs": ["caller:claimed-evidence"]},
+        "extra_target_files": {**body, "target_files": list(case["target_files"])},
+        "extra_owned_files": {**body, "owned_files": list(case["target_files"])},
+        "extra_parent_identity": {**body, "parent_route_identity": {"route_token_ref": case["parent_ref"]}},
+        "raw_route_token": {**body, "route_token": "caller-must-not-supply"},
+        "raw_session_token": {**body, "observer_session_token": "caller-must-not-supply"},
+        "raw_metadata": {**body, "metadata": {"force": True}},
+    }
+    assert set(body) == {
+        "project_id", "caller_role", "backlog_id", "task_id",
+        "allowed_actions", "evidence_refs",
+    }
+    for name, request_body in malformed.items():
+        before, changes = tuple(conn.iterdump()), conn.total_changes
+        status, rejected = case["post"](request_body)
+        assert status in {400, 403, 409}, (name, status, rejected)
+        assert rejected.get("error"), (name, rejected)
+        assert conn.total_changes == changes, name
+        assert tuple(conn.iterdump()) == before, name
+
+
+def test_ac_dev_finished_worker_merge_route_rejects_persisted_drift_without_writes(
+    finished_parallel_merge_route_world,
+):
+    case = finished_parallel_merge_route_world
+    conn, body = case["conn"], case["body"]
+    context = case["selected"]
+    execution_id = case["execution_id"]
+
+    def rejected_after_change(table, column, where, args, replacement):
+        original = conn.execute(
+            f"SELECT {column} FROM {table} WHERE {where}", args,
+        ).fetchone()[0]
+        conn.execute(f"UPDATE {table} SET {column}=? WHERE {where}",
+                     (replacement, *args))
+        conn.commit()
+        before, changes = tuple(conn.iterdump()), conn.total_changes
+        status, rejected = case["post"](body)
+        assert status == 409, (table, column, status, rejected)
+        assert rejected.get("error"), (table, column, rejected)
+        assert conn.total_changes == changes, (table, column)
+        assert tuple(conn.iterdump()) == before, (table, column)
+        conn.execute(f"UPDATE {table} SET {column}=? WHERE {where}",
+                     (original, *args))
+        conn.commit()
+
+    context_where = "project_id=? AND task_id=?"
+    context_args = (body["project_id"], context.task_id)
+    for column, replacement in (
+        ("backlog_id", "AC-OTHER-BACKLOG"),
+        ("parent_task_id", "cex-other-parent"),
+        ("root_task_id", "cex-other-root"),
+        ("chain_id", "cchain-other"),
+        ("target_files_json", json.dumps(["outside.txt"])),
+        ("owned_files_json", json.dumps(["outside.txt"])),
+        ("merge_queue_id", "mq-other"),
+        ("head_commit", "f" * 40),
+        ("status", "allocated"),
+    ):
+        rejected_after_change(
+            "parallel_branch_runtime_contexts", column,
+            context_where, context_args, replacement,
+        )
+    chain_where = "project_id=? AND backlog_id=?"
+    chain_args = (body["project_id"], body["backlog_id"])
+    for column, replacement in (
+        ("current_contract_execution_id", "cex-other-current"),
+        ("root_contract_execution_id", "cex-other-root"),
+        ("contract_chain_id", "cchain-other"),
+    ):
+        rejected_after_change(
+            "backlog_contract_chain_current", column,
+            chain_where, chain_args, replacement,
+        )
+    rejected_after_change(
+        "observer_route_token_refs", "expires_at",
+        "route_token_ref=?", (case["parent_ref"],), "2020-01-01T00:00:00Z",
+    )
+    rejected_after_change(
+        "observer_route_token_refs", "status",
+        "route_token_ref=?", (case["parent_ref"],), "revoked",
+    )
+    rejected_after_change(
+        "backlog_bugs", "status", "bug_id=?", (body["backlog_id"],), "CLOSED",
+    )
+
+    stored = server._contract_runtime_store(conn).get(execution_id)
+    for name, mutate in (
+        ("finish_head", lambda line: line.update(head_commit="f" * 40)),
+        ("finish_context", lambda line: line.update(runtime_context_id="rc-other")),
+        ("finish_checkpoint", lambda line: line["payload"].update(checkpoint_id="checkpoint-other")),
+        ("unproven_no_pass_attestation", lambda line: line["payload"].update(
+            test_results={"status": "passed", "passed": False, "commands": []},
+        )),
+    ):
+        modified = copy.deepcopy(stored)
+        finish = next(line for line in modified["completed_lines"]
+                      if line.get("line_id") == "worker_finish_gate"
+                      and line.get("runtime_context_id") == context.runtime_context_id)
+        mutate(finish)
+        rejected_after_change(
+            "contract_runtime_executions", "record_json",
+            "contract_execution_id=?", (execution_id,), json.dumps(modified),
+        )
+
+
+def test_ac_dev_finished_worker_merge_route_rechecks_parent_in_atomic_writer(
+    finished_parallel_merge_route_world, monkeypatch,
+):
+    case = finished_parallel_merge_route_world
+    conn = case["conn"]
+    original = observer_route_context.issue_observer_write_route_context
+    raced = {}
+
+    def issue_after_parent_revoked(*args, **kwargs):
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='revoked' WHERE route_token_ref=?",
+            (case["parent_ref"],),
+        )
+        conn.commit()
+        raced["dump"] = tuple(conn.iterdump())
+        raced["changes"] = conn.total_changes
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        observer_route_context, "issue_observer_write_route_context",
+        issue_after_parent_revoked,
+    )
+    status, rejected = case["post"](case["body"])
+    assert status == 409, rejected
+    assert rejected.get("error")
+    assert raced
+    assert conn.total_changes == raced["changes"]
+    assert tuple(conn.iterdump()) == raced["dump"]
