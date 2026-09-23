@@ -98225,14 +98225,40 @@ def _current_full_reconcile_postmerge_target_owner(
     if str(selected_action.get("line_id") or "") != "observer_reconcile":
         # A completed reconcile uses the existing terminal replay path.  A
         # changed Guide alone cannot remove the pending owner's preflight.
-        if any(
-            isinstance(line, Mapping)
+        terminal_lines = [
+            line
+            for line in record.get("completed_lines") or []
+            if isinstance(line, Mapping)
             and str(line.get("line_id") or "") == "observer_reconcile"
             and str(line.get("status") or "") == "passed"
-            for line in record.get("completed_lines") or []
+        ]
+        if len(terminal_lines) != 1:
+            reject("observer_reconcile_not_selected")
+        terminal_line = terminal_lines[0]
+        terminal_identity = {
+            field: str(terminal_line.get(field) or "").strip()
+            for field in ("runtime_context_id", "task_id", "parent_task_id")
+        }
+        if not (
+            all(terminal_identity.values())
+            and terminal_identity["parent_task_id"] == execution_id
+            and terminal_identity["task_id"]
+            == str(body.get("task_id") or "").strip()
+            and terminal_identity["runtime_context_id"]
+            == str(body.get("runtime_context_id") or "").strip()
+            and str(terminal_line.get("commit_sha") or "").strip().lower()
+            == str(
+                body.get("target_commit_sha") or body.get("commit_sha") or ""
+            ).strip().lower()
         ):
-            return {}
-        reject("observer_reconcile_not_selected")
+            reject("terminal_reconcile_lane_mismatch")
+        # Existing run/terminal evidence still decides whether this is an
+        # idempotent replay.  Preserve only the CEX field that the pending
+        # owner path put in its persisted run scope.
+        return {
+            "terminal_replay_contract_execution_id": execution_id,
+            "terminal_replay_selected_lane": terminal_identity,
+        }
 
     required_count = _contract_runtime_mf_parallel_current_generation_worker_count(
         record, conn=conn, project_id=project_id
@@ -98467,7 +98493,9 @@ def _current_full_reconcile_runtime_context_scope(
     rebuilding the canonical current graph.
     """
 
-    if postmerge_target_owner_authority:
+    if postmerge_target_owner_authority and postmerge_target_owner_authority.get(
+        "selected_reconcile_lane"
+    ):
         # The activating rev8+ route has already bound the parent CEX, every
         # current-generation merge, and the independently selected executor.
         # Keep the aggregate commit while routing the receipt to that executor.
@@ -98966,6 +98994,33 @@ def _current_full_reconcile_runtime_context_scope(
                 "fail_closed": True,
             },
         )
+    terminal_execution_id = str(
+        (postmerge_target_owner_authority or {}).get(
+            "terminal_replay_contract_execution_id"
+        ) or ""
+    ).strip()
+    if terminal_execution_id:
+        terminal_lane = (postmerge_target_owner_authority or {}).get(
+            "terminal_replay_selected_lane"
+        ) or {}
+        if not (
+            canonical_scope["parent_task_id"] == terminal_execution_id
+            and all(
+                str(canonical_scope.get(field) or "")
+                == str(terminal_lane.get(field) or "")
+                for field in ("runtime_context_id", "task_id", "parent_task_id")
+            )
+        ):
+            raise GovernanceError(
+                "current_full_postmerge_target_owner_unverified",
+                "terminal reconcile lane does not match the persisted runtime context",
+                409,
+                {
+                    "reason": "terminal_reconcile_runtime_context_mismatch",
+                    "fail_closed": True,
+                },
+            )
+        canonical_scope["contract_execution_id"] = terminal_execution_id
     successor_contract_kind = (
         _current_full_reconcile_runtime_successor_contract_kind(
             conn,
@@ -102492,7 +102547,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             and body.get("bind_only_preimplementation_provenance") is not True
             else {}
         )
-        if postmerge_target_owner:
+        if postmerge_target_owner.get("target_project_root"):
             root = Path(postmerge_target_owner["target_project_root"])
         head_commit = _git_head_commit(root)
         target_commit = str(
