@@ -495,6 +495,350 @@ def test_dev_force_graph_guide_enrollment_build_activate_and_normal_denial(
     assert normal_tuple["valid"] is True, normal_tuple["errors"]
 
 
+def test_dev_force_graph_is_source_read_for_old_direct_scope_only(
+    conn, monkeypatch, tmp_path,
+):
+    """An immutable old Direct CEX can read current force graph, not write it."""
+
+    backlog_id = "AC-DEV-OLD-DIRECT-SOURCE-READ"
+    case = _prepare_ac_dev_direct_route_bootstrap(
+        conn, monkeypatch, tmp_path, backlog_id=backlog_id,
+        real_git_world=True,
+    )
+    assert case["guide"]["next_legal_action"]["mcp_tool"] == (
+        "observer_route_context_issue"
+    )
+    issued = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": case["project_id"]}, method="POST",
+        body=case["issue_body"],
+    ))
+    ref = issued["route_token_ref"]
+    registered_status, registered = server.handle_observer_session_register(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "project_id": case["project_id"], "route_token_ref": ref,
+            "backlog_id": backlog_id, "task_id": case["task_id"],
+            "cex_id": case["task_id"],
+        },
+    ))
+    assert registered_status == 201, registered
+    session_id = registered["observer_session_id"]
+    old_record = copy.deepcopy(server._contract_runtime_store(conn).get(case["task_id"]))
+    old_binding = old_record["metadata"][
+        "operator_supervised_direct_main_runtime_binding"
+    ]
+    assert old_binding["target_head_commit"] == case["commit"]
+    assert old_record["completed_lines"] == []
+
+    head = _commit_test_git_files(
+        case["root"], ["current.py"], message="load current DEV source",
+    )
+    world = _fixed_ac_dev_direct_world(case["root"], head)
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: head)
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: True)
+    policy = {
+        "runtime_plane": "dev", "active_graph_activation_allowed": True,
+        "classification_reason": "verified_dev_cow_successor_receipt_history",
+        "world_id": "ac-dev", "project_id": case["project_id"],
+        "port": server.AC_DEV_SERVICE_PORT,
+        "cow_successor_verified": True, "source_checkout_verified": True,
+        "live_runtime_custody_verified": True,
+    }
+    monkeypatch.setattr(server, "classify_graph_activation_connection", lambda _: dict(policy))
+    monkeypatch.setattr(governance_db, "classify_graph_activation_connection", lambda _: dict(policy))
+    monkeypatch.setattr(
+        governance_db, "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _: {"host": "127.0.0.1", "port": server.AC_DEV_SERVICE_PORT},
+    )
+    monkeypatch.setattr(
+        governance_db, "canonical_ac_database_identity",
+        lambda _: {"world_id": "ac-dev", "project_id": case["project_id"]},
+    )
+    governance_db.admit_ac_dev_graph_materialization_schema(
+        conn, project_id=case["project_id"],
+    )
+    snapshot_id = server._current_full_deterministic_snapshot_id(head)
+    monkeypatch.setattr(
+        store, "_graph_activation_policy_for_connection",
+        lambda _: dict(policy),
+    )
+    _activate_basic_graph(conn, snapshot_id, project_id=case["project_id"], commit_sha=head)
+    producer_scope = {
+        "project_id": case["project_id"], "backlog_id": "AC-DEV-FORCE-PRODUCER",
+        "task_id": "force-producer-task",
+    }
+    producer_auth = {
+        "role": "observer", "role_source": "observer_session_route_token_ref",
+        "principal_id": "producer-observer", "observer_session_id": "producer-expired",
+        "route_token_ref": "producer-expired-route",
+        "route_token_scope": producer_scope,
+    }
+    route_evidence = server._current_full_reconcile_route_evidence(producer_auth)
+    route_evidence.update({
+        "dev_force_graph_only": True, "force_reason": "refresh source graph",
+        "operator_authorization_ref": "user-decision:force-graph",
+        "dev_world_hash": world["world_hash"],
+        "dev_database_identity": {},
+        "loaded_commit": head,
+    })
+    run_id = "force-current-source-read"
+    scope = server._current_full_reconcile_idempotency_scope(route_evidence)
+    route_evidence.update(reconcile_run_id=run_id, idempotency_scope=scope)
+    result = {"elapsed_ms": 1, "activation": {"previous_snapshot_id": "old"}}
+    server._record_current_full_atomic_evidence(
+        conn, store, project_id=case["project_id"], body={
+            "force_reason": "refresh source graph",
+            "operator_authorization_ref": "user-decision:force-graph",
+        }, result=result, run_id=run_id, snapshot_id=snapshot_id,
+        target_commit=head, route_evidence=route_evidence,
+        runtime_context_scope={}, request_id="req-force-source-read",
+        request_started_at=server._utc_now(),
+        graph_delta_mode="dev_force_graph_only", declared_actor_role="observer",
+        route_bound=True,
+    )
+    conn.commit()
+    terminal = store.current_full_active_terminal_tuple(
+        conn, project_id=case["project_id"], run_id=run_id,
+        target_commit_sha=head, expected_scope=scope,
+        snapshot_id=snapshot_id, dev_force_graph_only=True,
+    )
+    assert terminal["valid"] is True, terminal["errors"]
+    assert server._dev_active_source_graph_read_authority(
+        conn, project_id=case["project_id"],
+    )["graph_source_read_ready"] is True
+
+    fresh_backlog = "AC-DEV-FRESH-DIRECT-AFTER-FORCE"
+    _insert_simple_mf_close_backlog(conn, fresh_backlog)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
+        (json.dumps(["agent/governance/server.py"]),
+         json.dumps(["agent/tests/test_graph_governance_api.py"]), fresh_backlog),
+    )
+    conn.commit()
+    fresh_guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": fresh_backlog, "role": "observer",
+            "work_type": "operator_supervised_direct_main",
+            "target_project_root": str(case["root"]),
+            "target_head_commit": head, "target_ref": server.AC_DEV_BRANCH,
+        },
+    ))
+    assert fresh_guide["next_legal_action"]["mcp_tool"] == (
+        "observer_route_context_issue"
+    )
+    assert "dev_force_graph" not in fresh_guide[
+        "next_legal_action"
+    ]["copy_safe_body"]["allowed_actions"]
+    fresh_issued = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": case["project_id"]}, method="POST",
+        body=fresh_guide["next_legal_action"]["copy_safe_body"],
+    ))
+    fresh_status, fresh_session = server.handle_observer_session_register(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "project_id": case["project_id"],
+            "route_token_ref": fresh_issued["route_token_ref"],
+            "backlog_id": fresh_backlog,
+            "task_id": fresh_guide["contract_execution_id"],
+            "cex_id": fresh_guide["contract_execution_id"],
+        },
+    ))
+    assert fresh_status == 201, fresh_session
+    fresh_bound_guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": fresh_backlog, "role": "observer",
+            "work_type": "operator_supervised_direct_main",
+            "route_token_ref": fresh_issued["route_token_ref"],
+            "observer_session_id": fresh_session["observer_session_id"],
+            "task_id": fresh_guide["contract_execution_id"],
+            "target_project_root": str(case["root"]),
+            "target_head_commit": head, "target_ref": server.AC_DEV_BRANCH,
+        },
+    ))
+    assert fresh_bound_guide["dev_local_graph_bootstrap"]["graph_query_ready"] is True
+    assert fresh_bound_guide["next_legal_action"]["line_id"] == (
+        "observer_bind_direct_scope"
+    )
+    assert fresh_bound_guide["next_legal_action"]["mcp_tool"] == (
+        "observer_direct_mutation_exception"
+    )
+    fresh_query_body = fresh_bound_guide["next_legal_action"][
+        "graph_query_close_authority"
+    ]["copy_safe_graph_query"]["arguments"]
+    fresh_query = server.handle_graph_governance_query(_ctx_with_role(
+        {"project_id": case["project_id"]}, "observer", method="POST",
+        body=dict(fresh_query_body),
+    ))
+    assert fresh_query["graph_query_identity"]["task_id"] == (
+        fresh_guide["contract_execution_id"]
+    )
+    assert fresh_query["graph_query_identity"]["commit_sha"] == head
+    fresh_pre_mutation = copy.deepcopy(
+        fresh_bound_guide["next_legal_action"]["copy_safe_body"]
+    )
+    fresh_pre_mutation["payload"]["reason"] = "fresh current-HEAD Direct scope"
+    for source in (
+        fresh_pre_mutation["payload"], fresh_pre_mutation["verification"],
+        fresh_pre_mutation["artifact_refs"],
+    ):
+        source["graph_trace_ids"] = [fresh_query["trace_id"]]
+        source["graph_query_trace_ids"] = [fresh_query["trace_id"]]
+    fresh_pre_mutation["payload"]["operator_approval"]["approval_ref"] = "test:approval"
+    fresh_pre_mutation["verification"]["operator_approval"]["approval_ref"] = "test:approval"
+    fresh_pre_mutation["artifact_refs"]["operator_approval_ref"] = "test:approval"
+    fresh_mutation = server.handle_observer_direct_mutation_exception(_ctx_with_role(
+        {"project_id": case["project_id"]}, "observer", method="POST",
+        body=fresh_pre_mutation,
+    ))
+    assert fresh_mutation["task_id"] == fresh_guide["contract_execution_id"]
+
+    guide_body = {
+        "backlog_id": backlog_id, "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+        "route_token_ref": ref, "observer_session_id": session_id,
+        "task_id": case["task_id"],
+        "target_project_root": str(case["root"]),
+        "target_head_commit": head, "target_ref": server.AC_DEV_BRANCH,
+    }
+    guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=guide_body,
+    ))
+    assert guide["dev_local_graph_bootstrap"]["state"] == "graph_source_read_ready", guide
+    action = guide["next_legal_action"]
+    assert action["mcp_tool"] == "graph_query"
+    assert action["authorizes_write"] is False
+    assert action["successor_required_for_mutation"] is True
+    query = server.handle_graph_governance_query(_ctx_with_role(
+        {"project_id": case["project_id"]}, "observer", method="POST",
+        body=action["copy_safe_body"],
+    ))
+    assert query["graph_query_identity"]["task_id"] == case["task_id"]
+    assert query["graph_query_identity"]["commit_sha"] == head
+    with pytest.raises(server.GovernanceError):
+        server.handle_graph_governance_query(_ctx_with_role(
+            {"project_id": case["project_id"]}, "observer", method="POST",
+            body={**action["copy_safe_body"], "backlog_id": fresh_backlog},
+        ))
+    assert guide["dev_local_graph_bootstrap"]["bootstrap_authority"][
+        "preimplementation_contract_runtime_exact"
+    ] is False
+    assert guide["dev_local_graph_bootstrap"]["bootstrap_authority"][
+        "exact_canonical_active"
+    ] is False
+    old_pre_mutation = (
+        server._onboard_parentless_direct_main_pre_mutation_event_guidance(
+            project_id=case["project_id"], backlog_id=backlog_id,
+            task_id=case["task_id"], route_token_ref=ref,
+            target_files=["agent/governance/server.py"],
+        )["arguments_template"]
+    )
+    old_pre_mutation["payload"]["reason"] = "old CEX must not mutate current HEAD"
+    for source in (
+        old_pre_mutation["payload"], old_pre_mutation["verification"],
+        old_pre_mutation["artifact_refs"],
+    ):
+        source["graph_trace_ids"] = [query["trace_id"]]
+        source["graph_query_trace_ids"] = [query["trace_id"]]
+    old_pre_mutation["payload"]["operator_approval"]["approval_ref"] = "test:approval"
+    old_pre_mutation["verification"]["operator_approval"]["approval_ref"] = "test:approval"
+    old_pre_mutation["artifact_refs"]["operator_approval_ref"] = "test:approval"
+    with pytest.raises((server.GovernanceError, server.PermissionDeniedError)):
+        server.handle_observer_direct_mutation_exception(_ctx_with_role(
+            {"project_id": case["project_id"]}, "observer", method="POST",
+            body=old_pre_mutation,
+        ))
+    assert server._contract_runtime_store(conn).get(case["task_id"]) == old_record
+    normal_terminal = store.current_full_active_terminal_tuple(
+        conn, project_id=case["project_id"], run_id=run_id,
+        target_commit_sha=head, expected_scope=scope, snapshot_id=snapshot_id,
+    )
+    assert normal_terminal["valid"] is False
+
+    query_body = dict(action["copy_safe_body"])
+
+    def source_read_denied() -> None:
+        with pytest.raises(server.GovernanceError):
+            server.handle_graph_governance_query(_ctx_with_role(
+                {"project_id": case["project_id"]}, "observer",
+                method="POST", body=dict(query_body),
+            ))
+
+    snapshot_notes = conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (case["project_id"], snapshot_id),
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE graph_snapshots SET notes='{}' WHERE project_id=? AND snapshot_id=?",
+        (case["project_id"], snapshot_id),
+    )
+    source_read_denied()
+    conn.execute(
+        "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+        (snapshot_notes, case["project_id"], snapshot_id),
+    )
+    force_event_id = result["timeline_event_recorded"]["id"]
+    conn.execute(
+        "UPDATE task_timeline_events SET event_type='graph.reconcile' WHERE id=?",
+        (force_event_id,),
+    )
+    source_read_denied()
+    conn.execute(
+        "UPDATE task_timeline_events SET event_type='graph.dev_force_graph_reconcile' WHERE id=?",
+        (force_event_id,),
+    )
+    conn.execute(
+        "UPDATE reconcile_run_metrics SET status='failed' WHERE project_id=? AND run_id=?",
+        (case["project_id"], run_id),
+    )
+    source_read_denied()
+    conn.execute(
+        "UPDATE reconcile_run_metrics SET status='complete' WHERE project_id=? AND run_id=?",
+        (case["project_id"], run_id),
+    )
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: False)
+    source_read_denied()
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: True)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    assert server._dev_active_source_graph_read_authority(
+        conn, project_id=case["project_id"],
+    )["graph_source_read_ready"] is False
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    conn.execute(
+        "UPDATE graph_snapshots SET commit_sha=? WHERE project_id=? AND snapshot_id=?",
+        ("f" * 40, case["project_id"], snapshot_id),
+    )
+    source_read_denied()
+    conn.execute(
+        "UPDATE graph_snapshots SET commit_sha=? WHERE project_id=? AND snapshot_id=?",
+        (head, case["project_id"], snapshot_id),
+    )
+    conn.execute(
+        "UPDATE observer_sessions SET last_seen_at='2000-01-01T00:00:00Z' WHERE session_id=?",
+        (session_id,),
+    )
+    stale_guide = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=guide_body,
+    ))
+    assert stale_guide["dev_local_graph_bootstrap"]["graph_query_ready"] is False
+    assert stale_guide["next_legal_action"]["mcp_tool"] != "graph_query"
+    conn.execute(
+        "UPDATE observer_sessions SET last_seen_at=? WHERE session_id=?",
+        (server._utc_now(), session_id),
+    )
+    conn.execute(
+        "UPDATE observer_route_token_refs SET expires_at='2000-01-01T00:00:00Z' "
+        "WHERE route_token_ref=?", (ref,),
+    )
+    with pytest.raises(server.GovernanceError):
+        server.handle_graph_governance_query(_ctx_with_role(
+            {"project_id": case["project_id"]}, "observer",
+            method="POST", body=query_body,
+        ))
+    assert server._contract_runtime_store(conn).get(case["task_id"]) == old_record
+
+
 def test_dev_force_graph_mcp_transport_is_explicit_and_copy_safe():
     from agent.mcp import tools as mcp_tools
 

@@ -20839,6 +20839,33 @@ def _observer_parentless_direct_main_graph_world_authority(
         project_id=project_id,
     )
     expected_commit = str(world_ref.get("base_commit") or "").strip().lower()
+    direct_record = _contract_runtime_store(conn).get(task_id)
+    direct_metadata = (
+        direct_record.get("metadata")
+        if isinstance(direct_record.get("metadata"), Mapping) else {}
+    )
+    direct_binding = (
+        direct_metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            direct_metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        ) else {}
+    )
+    bound_commit = str(direct_binding.get("target_head_commit") or "").lower()
+    source_read_only = bool(bound_commit and bound_commit != expected_commit)
+    source_graph_authority: dict[str, Any] = {}
+    if source_read_only:
+        source_graph_authority = _dev_active_source_graph_read_authority(
+            conn, project_id=project_id,
+        )
+        if source_graph_authority.get("graph_source_read_ready") is not True:
+            raise GovernanceError(
+                "observer_direct_main_source_graph_unverified",
+                "The old Direct scope may read only a verified current source graph",
+                409,
+                {"source_graph_authority": source_graph_authority,
+                 "zero_write_rejection": True, "writes_performed": False},
+            )
     expected_root = str(
         world_ref.get("target_project_root") or ""
     ).strip()
@@ -20899,6 +20926,12 @@ def _observer_parentless_direct_main_graph_world_authority(
         except (OSError, RuntimeError):
             root_claims[field] = supplied
     world_mismatches: list[dict[str, Any]] = []
+    if source_read_only and resolved_snapshot_id != active_snapshot_id:
+        world_mismatches.append({
+            "field": "source_read_snapshot_id",
+            "expected": active_snapshot_id,
+            "actual": resolved_snapshot_id,
+        })
     if world_ref.get("accepted") is not True:
         world_mismatches.append(
             {
@@ -21088,7 +21121,9 @@ def _observer_parentless_direct_main_graph_world_authority(
             "operator_supervised_direct_main.graph_world_projection.v1"
         ),
         "source": (
-            "operator_supervised_direct_main_world_ref+active_graph_snapshot"
+            "verified_active_source_graph_read_only"
+            if source_read_only
+            else "operator_supervised_direct_main_world_ref+active_graph_snapshot"
             if selected_snapshot_is_active
             else (
                 "operator_supervised_direct_main_world_ref+"
@@ -21102,7 +21137,11 @@ def _observer_parentless_direct_main_graph_world_authority(
         "snapshot_id": resolved_snapshot_id,
         "active_snapshot_id": active_snapshot_id,
         "selected_snapshot_is_active": selected_snapshot_is_active,
-        "pre_mutation_source_fact_only": not selected_snapshot_is_active,
+        "pre_mutation_source_fact_only": (
+            source_read_only or not selected_snapshot_is_active
+        ),
+        "contract_runtime_line_authority": not source_read_only,
+        "source_graph_read_authority": source_graph_authority,
         "grants_active_or_release_authority": False,
         "snapshot_commit_sha": snapshot_commit,
         "root_identity": root_identity,
@@ -99789,6 +99828,121 @@ def _dev_direct_exact_active_provenance_authority(
     }
 
 
+def _dev_active_source_graph_read_authority(
+    conn, *, project_id: str,
+) -> dict[str, Any]:
+    """Verify a current DEV graph as source fact, never as contract proof."""
+
+    blocked = {
+        "schema_version": "ac_dev.active_source_graph_read_authority.v1",
+        "graph_source_read_ready": False,
+        "normal_reconcile_authority": False,
+        "contract_runtime_line_authority": False,
+        "authorizes_write": False,
+        "writes_performed": False,
+    }
+    if project_id != AC_PROJECT_ID or _runtime_plane() != "dev":
+        return {**blocked, "reason": "wrong_runtime_world"}
+    try:
+        from . import graph_snapshot_store as store
+
+        world = _operator_supervised_direct_main_dev_world_authority()
+        root = Path(str(world["target_project_root"]))
+        head = str(world["target_head_commit"]).lower()
+        if (
+            world.get("accepted") is not True
+            or _git_head_commit(root) != head
+            or not _git_clean_worktree_verified(root)
+        ):
+            return {**blocked, "reason": "source_not_exact_clean_loaded_head"}
+        custody = classify_graph_activation_connection(conn)
+        if not (
+            custody.get("runtime_plane") == "dev"
+            and custody.get("classification_reason")
+            == "verified_dev_cow_successor_receipt_history"
+            and custody.get("world_id") == "ac-dev"
+            and custody.get("project_id") == project_id
+            and int(custody.get("port") or 0) == AC_DEV_SERVICE_PORT
+            and custody.get("cow_successor_verified") is True
+            and custody.get("source_checkout_verified") is True
+            and custody.get("live_runtime_custody_verified") is True
+        ):
+            return {**blocked, "reason": "dev_custody_unverified"}
+        active = store.get_active_graph_snapshot(conn, project_id) or {}
+        snapshot_id = str(active.get("snapshot_id") or "")
+        if not (
+            snapshot_id == _current_full_deterministic_snapshot_id(head)
+            and str(active.get("commit_sha") or "").lower() == head
+            and str(active.get("snapshot_kind") or "") == "full"
+            and str(active.get("status") or "") == "active"
+        ):
+            return {**blocked, "reason": "active_full_snapshot_not_exact_head"}
+        refs = conn.execute(
+            "SELECT ref_name,snapshot_id,commit_sha FROM graph_snapshot_refs "
+            "WHERE project_id=? AND (ref_name='active' OR snapshot_id=?)",
+            (project_id, snapshot_id),
+        ).fetchall()
+        statuses = conn.execute(
+            "SELECT snapshot_id FROM graph_snapshots WHERE project_id=? AND status='active'",
+            (project_id,),
+        ).fetchall()
+        if not (
+            len(refs) == 1 and str(refs[0]["ref_name"]) == "active"
+            and str(refs[0]["snapshot_id"]) == snapshot_id
+            and str(refs[0]["commit_sha"]).lower() == head
+            and len(statuses) == 1
+            and str(statuses[0]["snapshot_id"]) == snapshot_id
+        ):
+            return {**blocked, "reason": "active_snapshot_ref_not_unique"}
+        binding = store._current_full_snapshot_provenance_binding(
+            conn, project_id, active,
+        )
+        marker = binding.get("marker") if isinstance(binding.get("marker"), Mapping) else {}
+        route_evidence = (
+            marker.get("route_evidence")
+            if isinstance(marker.get("route_evidence"), Mapping) else {}
+        )
+        run_id = str(route_evidence.get("reconcile_run_id") or "")
+        scope = route_evidence.get("idempotency_scope")
+        if not run_id or not isinstance(scope, Mapping):
+            return {**blocked, "reason": "active_terminal_scope_missing"}
+        force_only = binding.get("force_verified") is True
+        normal = binding.get("verified") is True
+        if not (force_only or normal):
+            return {**blocked, "reason": "active_provenance_unverified"}
+        terminal = store.current_full_active_terminal_tuple(
+            conn, project_id=project_id, run_id=run_id,
+            target_commit_sha=head, expected_scope=dict(scope),
+            snapshot_id=snapshot_id, dev_force_graph_only=force_only,
+        )
+        if terminal.get("valid") is not True:
+            return {
+                **blocked, "reason": "active_terminal_invalid",
+                "terminal_errors": list(terminal.get("errors") or []),
+            }
+        if force_only and not (
+            route_evidence.get("dev_force_graph_only") is True
+            and str(route_evidence.get("loaded_commit") or "").lower() == head
+            and str(route_evidence.get("dev_world_hash") or "")
+            == str(world.get("world_hash") or "")
+            and dict(route_evidence.get("dev_database_identity") or {})
+            == dict(world.get("database_identity") or {})
+        ):
+            return {**blocked, "reason": "force_dev_world_binding_mismatch"}
+        return {
+            **blocked,
+            "graph_source_read_ready": True,
+            "reason": "verified_active_source_graph",
+            "source_mode": "dev_force_graph_only" if force_only else "normal_current_full",
+            "active_snapshot_id": snapshot_id,
+            "active_commit": head,
+            "terminal_run_id": run_id,
+            "terminal_provenance_id": str(binding.get("provenance_id") or ""),
+        }
+    except (GovernanceError, KeyError, OSError, sqlite3.Error, ValueError, TypeError):
+        return {**blocked, "reason": "source_graph_verification_unavailable"}
+
+
 def _dev_direct_graph_bootstrap_reconcile_authority(
     conn,
     *,
@@ -159636,6 +159790,78 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                     )
                     is True
                 )
+                source_graph = _dev_active_source_graph_read_authority(
+                    conn, project_id=project_id,
+                )
+                route_scope = (
+                    bootstrap_auth.get("route_token_scope")
+                    if isinstance(bootstrap_auth.get("route_token_scope"), Mapping)
+                    else {}
+                )
+                direct_record = _contract_runtime_store(conn).get(execution_id)
+                direct_metadata = (
+                    direct_record.get("metadata")
+                    if isinstance(direct_record.get("metadata"), Mapping) else {}
+                )
+                direct_binding = (
+                    direct_metadata.get("operator_supervised_direct_main_runtime_binding")
+                    if isinstance(
+                        direct_metadata.get("operator_supervised_direct_main_runtime_binding"),
+                        Mapping,
+                    ) else {}
+                )
+                binding_route = (
+                    direct_binding.get("route_identity")
+                    if isinstance(direct_binding.get("route_identity"), Mapping)
+                    else {}
+                )
+                read_route = _operator_supervised_direct_main_active_route_authority(
+                    conn, project_id=project_id, backlog_id=backlog_id,
+                    task_id=execution_id,
+                    immutable_route_identity=binding_route,
+                    active_route_token_ref=effective_ref,
+                    expected_files=list(direct_binding.get("owned_files") or []),
+                )
+                read_session = _unique_active_route_bound_observer_session(
+                    conn, project_id=project_id,
+                    session_id=str(bootstrap_auth.get("observer_session_id") or ""),
+                    route_token_ref=effective_ref,
+                    route_identity=(
+                        read_route.get("active_route_identity")
+                        if isinstance(read_route.get("active_route_identity"), Mapping)
+                        else {}
+                    ),
+                    backlog_id=backlog_id, task_id=execution_id,
+                )
+                bound_head = str(
+                    direct_binding.get("target_head_commit") or ""
+                ).strip().lower()
+                current_head = str(
+                    dev_world.get("target_head_commit") or ""
+                ).strip().lower()
+                read_scope_ready = bool(
+                    source_graph.get("graph_source_read_ready") is True
+                    and bootstrap_auth.get("role_source")
+                    == "observer_session_route_token_ref"
+                    and str(route_scope.get("project_id") or "") == project_id
+                    and str(route_scope.get("backlog_id") or "") == backlog_id
+                    and str(route_scope.get("task_id") or "") == execution_id
+                    and read_route.get("passed") is True
+                    and read_session
+                    and direct_record.get("completed_lines") == []
+                    and str(direct_record.get("revision") or "")
+                    in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+                    and str(direct_record.get("project_id") or "") == project_id
+                    and str(direct_record.get("backlog_id") or "") == backlog_id
+                    and str(direct_record.get("contract_execution_id") or "")
+                    == execution_id
+                    and graph_guidance.get("copy_safe_graph_query", {}).get("ready")
+                    is True
+                )
+                old_binding_source_read = bool(
+                    read_scope_ready and bound_head and current_head
+                    and bound_head != current_head
+                )
                 existing_candidate_activation = bool(
                     bootstrap_authority.get(
                         "existing_candidate_activation_required"
@@ -159793,6 +160019,66 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                             "synthesizes_qa": False,
                             "synthesizes_pass": False,
                         }
+                    elif old_binding_source_read:
+                        source_query_guidance = deepcopy(graph_guidance)
+                        source_query_guidance.update({
+                            "authority": "verified_active_source_graph_read",
+                            "server_gate": "dev_source_graph_read_only",
+                            "close_authoritative": False,
+                            "contract_runtime_line_authority": False,
+                            "authorizes_write": False,
+                            "successor_required_for_mutation": True,
+                        })
+                        source_query_guidance["server_derived_world_ref"].update({
+                            "pre_mutation_source_fact_only": True,
+                            "commit_source": "verified_active_source_graph_terminal",
+                            "snapshot_commit_must_match_world_ref": True,
+                        })
+                        graph_bootstrap_projection.update({
+                            "state": "graph_source_read_ready",
+                            "graph_query_ready": True,
+                            "current_full_reconcile_ready": False,
+                            "graph_source_read_authority": source_graph,
+                            "preimplementation_contract_runtime_exact": False,
+                            "exact_canonical_active": False,
+                            "successor_required_for_mutation": True,
+                            "bound_contract_head": bound_head,
+                            "current_source_head": current_head,
+                            "contract_runtime_line_advanced": False,
+                        })
+                        query_body = dict(
+                            graph_guidance["copy_safe_graph_query"]["arguments"]
+                        )
+                        next_action = {
+                            "schema_version": "onboard_route_guide.next_action.v1",
+                            "id": "dev_source_graph_query_then_successor",
+                            "action": "graph_query", "mcp_tool": "graph_query",
+                            "requires_role": "observer",
+                            "action_input": query_body,
+                            "copy_safe_body": query_body,
+                            "action_input_ready": True,
+                            "query_ready": True,
+                            "graph_query_close_authority": source_query_guidance,
+                            "source_fact_only": True,
+                            "authorizes_write": False,
+                            "contract_runtime_line_authority": False,
+                            "successor_required_for_mutation": True,
+                        }
+                    elif (
+                        read_scope_ready and bound_head and current_head
+                        and bound_head == current_head
+                    ):
+                        graph_bootstrap_projection.update({
+                            "state": "graph_source_read_ready",
+                            "graph_query_ready": True,
+                            "current_full_reconcile_ready": False,
+                            "graph_source_read_authority": source_graph,
+                            "exact_canonical_active": False,
+                            "contract_runtime_line_advanced": False,
+                            "source_graph_is_contract_evidence": False,
+                        })
+                        # Keep the ordinary first-line facade. Its own route,
+                        # trace and ContractRuntime checks remain authoritative.
                     elif active_snapshot:
                         next_action = {
                             "schema_version": "onboard_route_guide.next_action.v1",
