@@ -170980,6 +170980,139 @@ def _onboard_route_guide_completed_mf_parallel_action_input(
     }
 
 
+def _onboard_route_guide_mf_parallel_parent_route_state(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    target_files: Sequence[str],
+    requested_route_token_ref: str = "",
+) -> str:
+    """Classify the persisted parent route without exposing its opaque ref."""
+
+    if _runtime_plane() != "dev" or project_id != "aming-claw":
+        return ""
+    from . import observer_route_context
+
+    parent_id = _onboard_service_execution_id(project_id, backlog_id)
+    route_ref = str(parent_record.get("route_token_ref") or "").strip()
+    requested_ref = str(requested_route_token_ref or "").strip()
+    route_rows = conn.execute(
+        "SELECT route_token_ref, status FROM observer_route_token_refs "
+        "WHERE project_id=? AND backlog_id=? AND task_id=?",
+        (_route_registry_storage_project_id(project_id), backlog_id, parent_id),
+    ).fetchall()
+    if not route_ref and not route_rows:
+        return "unissued"
+    active_refs = [
+        str(row["route_token_ref"])
+        for row in route_rows
+        if str(row["status"] or "") == "active"
+    ]
+    if not route_ref or len(active_refs) != 1:
+        return "unavailable"
+    active_ref = active_refs[0]
+    if requested_ref and requested_ref not in {route_ref, active_ref}:
+        return "unavailable"
+    renewal_rebind = False
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=route_ref,
+            backlog_id=backlog_id,
+            task_id=parent_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        # A normal renewal leaves the bound ref SUPERSEDED. Only an explicit
+        # active descendant with server-verified same-scope ancestry may rebind
+        # it through the existing parent materializer. An omitted Guide read
+        # must leave the historical binding untouched.
+        bound_status = next(
+            (
+                str(row["status"] or "")
+                for row in route_rows
+                if str(row["route_token_ref"] or "") == route_ref
+            ),
+            "",
+        )
+        if bound_status != "superseded" or requested_ref != active_ref:
+            return "unavailable"
+        try:
+            resolved = (
+                observer_route_context.resolve_route_token_ref_renewal_descendant(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
+                    route_token_ref=route_ref,
+                )
+            )
+        except observer_route_context.RouteTokenRefError:
+            return "unavailable"
+        lineage = (
+            resolved.get("renewal_resolution")
+            if isinstance(resolved, Mapping)
+            and isinstance(resolved.get("renewal_resolution"), Mapping)
+            else {}
+        )
+        if not (
+            isinstance(resolved, Mapping)
+            and str(resolved.get("route_token_ref") or "") == active_ref
+            and lineage.get("requested_route_token_ref") == route_ref
+            and lineage.get("resolved_route_token_ref") == active_ref
+            and lineage.get("registry_verified") is True
+            and lineage.get("exact_scope_verified") is True
+        ):
+            return "unavailable"
+        renewal_rebind = True
+    if not isinstance(resolved, Mapping):
+        return "unavailable"
+    scope = resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    expected_actions = {"onboard_route_guide", "mf_parallel_enter"}
+    actions = set(resolved.get("allowed_actions") or [])
+    if not (
+        _onboard_service_record(parent_record)
+        and str(parent_record.get("contract_execution_id") or "") == parent_id
+        and str(parent_record.get("root_contract_execution_id") or "") == parent_id
+        and not str(parent_record.get("parent_contract_execution_id") or "").strip()
+        and resolved.get("caller_role") == "observer"
+        and scope.get("project_id") == project_id
+        and scope.get("backlog_id") == backlog_id
+        and scope.get("task_id") == parent_id
+        and set(resolved.get("target_files") or [])
+        == set(_runtime_context_public_file_values(target_files))
+        and expected_actions.issubset(actions)
+    ):
+        return "unavailable"
+    if renewal_rebind:
+        return (
+            "renewable_requested"
+            if "observer_session_register" in actions
+            else "unavailable"
+        )
+    return "existing" if "observer_session_register" in actions else "legacy"
+
+
+def _onboard_route_guide_hide_opaque_parent_ref(value: Any, route_ref: str) -> Any:
+    """Keep an omitted parent ref out of the unauthenticated Guide view."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _onboard_route_guide_hide_opaque_parent_ref(item, route_ref)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _onboard_route_guide_hide_opaque_parent_ref(item, route_ref)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return value.replace(route_ref, "")
+    return value
+
+
 def _onboard_route_guide_completed_mf_parallel_entry_authority(
     conn,
     *,
@@ -171588,6 +171721,7 @@ def _onboard_route_guide_completed_next_action(
     request_body: Mapping[str, Any] | None = None,
     onboard_service_continuation_authority: Mapping[str, Any] | None = None,
     mf_parallel_entry_authority: Mapping[str, Any] | None = None,
+    mf_parallel_parent_route_state: str = "",
     source_free_operation_authority: Mapping[str, Any] | None = None,
     completed_source_free_reconcile_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -171875,6 +172009,19 @@ def _onboard_route_guide_completed_next_action(
             ),
         }
     if selected_work_type in {"parallel_worker", "mf_parallel"}:
+        if mf_parallel_parent_route_state == "unavailable":
+            return {
+                **base,
+                "id": "mf_parallel_parent_route_unavailable",
+                "action": "no_runtime_action",
+                "action_input_ready": False,
+                "successor_action_input": {"copy_safe_body": {}},
+                "route_reissue_allowed": False,
+                "next_step": (
+                    "the persisted Onboard parent route is unavailable or ambiguous; "
+                    "resolve its existing route lineage before entering Parallel"
+                ),
+            }
         action_input = _onboard_route_guide_completed_mf_parallel_action_input(
             project_id=project_id,
             backlog_id=backlog_id,
@@ -171898,7 +172045,20 @@ def _onboard_route_guide_completed_next_action(
             if enter_action_ready
             else {}
         )
-        route_issue_required = not bool(str(route_token_ref or "").strip())
+        route_issue_required = (
+            mf_parallel_parent_route_state == "unissued"
+            if mf_parallel_parent_route_state
+            else not bool(str(route_token_ref or "").strip())
+        )
+        existing_route_recovery = mf_parallel_parent_route_state == "existing"
+        requested_route_ref = str(
+            (request_body or {}).get("route_token_ref")
+            or (request_body or {}).get("observer_route_token_ref")
+            or ""
+        ).strip()
+        existing_route_ref_supplied = bool(
+            existing_route_recovery and requested_route_ref == route_token_ref
+        )
         host_precursor_action = (
             {
                 "schema_version": "guide.host_precursor_action.v1",
@@ -171920,6 +172080,38 @@ def _onboard_route_guide_completed_next_action(
             if route_issue_required
             else {}
         )
+        if (
+            existing_route_recovery
+            and not existing_route_ref_supplied
+            and not enter_action_ready
+        ):
+            host_precursor_action = {
+                "schema_version": "guide.host_precursor_action.v1",
+                "source_of_authority": (
+                    "onboard_route_guide.persisted_onboard_parent_route"
+                ),
+                "action": "contract_runtime_current",
+                "facade": "contract_runtime_current",
+                "mcp_tool": "contract_runtime_current",
+                "method": "GET",
+                "path": (
+                    "/api/projects/{project_id}/contract-runtime/"
+                    "{contract_execution_id}/current-state"
+                ),
+                "body_source": "copy_safe_body",
+                "copy_safe_body": {
+                    "project_id": project_id,
+                    "contract_execution_id": _onboard_service_execution_id(
+                        project_id, backlog_id
+                    ),
+                },
+                "refresh_after_success": True,
+                "raw_route_token_exposed": False,
+            }
+        if existing_route_recovery:
+            successor_action_input["dynamic_fields"]["observer_route_token_ref"][
+                "source"
+            ] = "contract_runtime_current.route_token_ref"
         return {
             **base,
             "id": "mf_parallel_enter",
@@ -171935,7 +172127,11 @@ def _onboard_route_guide_completed_next_action(
                 "keepalive_interface": "observer_session_heartbeat",
                 "instruction": (
                     "register or heartbeat an active observer session before "
-                    "issuing this route and calling mf_parallel_enter"
+                    + (
+                        "calling mf_parallel_enter with the existing parent route"
+                        if existing_route_recovery
+                        else "issuing this route and calling mf_parallel_enter"
+                    )
                 ),
                 "raw_session_token_persisted": False,
             },
@@ -171950,14 +172146,20 @@ def _onboard_route_guide_completed_next_action(
             "observer_route_context_issue": {
                 "required": route_issue_required,
                 "mcp_tool": "observer_route_context_issue",
-                "copy_safe_body": dict(action_input),
-                "bind_response_field": "route_token_ref",
+                "copy_safe_body": (
+                    dict(action_input) if not existing_route_recovery else {}
+                ),
+                "bind_response_field": (
+                    "route_token_ref" if not existing_route_recovery else ""
+                ),
             },
             "successor_action_input_interface": "mf_parallel_enter",
             "successor_action_input": successor_action_input,
             "allowed_actions": list(action_input["allowed_actions"]),
             "route_token_ref_source": (
-                "observer_route_context_issue.route_token_ref"
+                "contract_runtime_current.route_token_ref"
+                if existing_route_recovery
+                else "observer_route_context_issue.route_token_ref"
             ),
             "mf_parallel_enter_contract_execution_id_required": False,
             "raw_session_token_exposed": False,
@@ -171974,10 +172176,18 @@ def _onboard_route_guide_completed_next_action(
             "observer_as_worker_allowed": False,
             "worker_runtime_guide_after_dispatch": "runtime_context_worker_guide",
             "next_step": (
-                "select a separate CLI Agent Service or host-created bounded "
-                "subagent, then use mf_parallel_enter from the observer route to "
-                "create the row-scoped worker runtime; the observer must never act "
-                "as the worker"
+                "read the existing parent route_token_ref through "
+                "contract_runtime_current, register or heartbeat an active "
+                "observer session against that route, refresh this guide, then "
+                "call mf_parallel_enter with authenticated scope"
+                if existing_route_recovery and not existing_route_ref_supplied
+                and not enter_action_ready
+                else (
+                    "select a separate CLI Agent Service or host-created bounded "
+                    "subagent, then use mf_parallel_enter from the observer route "
+                    "to create the row-scoped worker runtime; the observer must "
+                    "never act as the worker"
+                )
             ),
         }
     return {
@@ -181143,11 +181353,45 @@ def _onboard_route_guide_service_response_base(
                     project_id=project_id,
                     backlog_id=backlog_id,
                 )
-    record = _onboard_service_materialize_parent_record(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-        route_token_ref=materialize_route_token_ref,
+    mf_parallel_parent_route_state = ""
+    existing_mf_parent: Mapping[str, Any] = {}
+    if (
+        _runtime_plane() == "dev"
+        and project_id == "aming-claw"
+        and str(role or "").strip() == "observer"
+        and str(work_type or "").strip() in {"parallel_worker", "mf_parallel"}
+    ):
+        try:
+            existing_mf_parent = _contract_runtime_store(conn).get(
+                _onboard_service_execution_id(project_id, backlog_id)
+            )
+        except ContractRuntimeError:
+            pass
+        if existing_mf_parent:
+            mf_parallel_parent_route_state = (
+                _onboard_route_guide_mf_parallel_parent_route_state(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    parent_record=existing_mf_parent,
+                    target_files=_onboard_contract_route_issue_target_files(
+                        conn, backlog_id=backlog_id, body={}, metadata={}
+                    ),
+                    requested_route_token_ref=materialize_route_token_ref,
+                )
+            )
+    record = (
+        dict(existing_mf_parent)
+        if (
+            mf_parallel_parent_route_state == "unavailable"
+            and str(existing_mf_parent.get("route_token_ref") or "").strip()
+        )
+        else _onboard_service_materialize_parent_record(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=materialize_route_token_ref,
+        )
     )
     route_token_ref = str(record.get("route_token_ref") or "").strip()
     batch_action_request_body = request_body
@@ -181195,6 +181439,16 @@ def _onboard_route_guide_service_response_base(
         str(role or "").strip() == "observer"
         and str(work_type or "").strip() in {"parallel_worker", "mf_parallel"}
     ):
+        mf_parallel_parent_route_state = (
+            _onboard_route_guide_mf_parallel_parent_route_state(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                parent_record=record,
+                target_files=target_files,
+                requested_route_token_ref=materialize_route_token_ref,
+            )
+        )
         mf_parallel_entry_authority = (
             _onboard_route_guide_completed_mf_parallel_entry_authority(
                 conn,
@@ -181481,6 +181735,7 @@ def _onboard_route_guide_service_response_base(
                     onboard_service_continuation_authority
                 ),
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
+                mf_parallel_parent_route_state=mf_parallel_parent_route_state,
                 source_free_operation_authority=(
                     source_free_operation_authority
                 ),
@@ -181507,6 +181762,7 @@ def _onboard_route_guide_service_response_base(
                     onboard_service_continuation_authority
                 ),
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
+                mf_parallel_parent_route_state=mf_parallel_parent_route_state,
                 source_free_operation_authority=(
                     source_free_operation_authority
                 ),
@@ -181963,6 +182219,14 @@ def _onboard_route_guide_service_response_base(
     if direct_main_failed_qa_state:
         response["direct_main_failed_qa_rework"] = dict(
             direct_main_failed_qa_state
+        )
+    if (
+        mf_parallel_parent_route_state in {"existing", "unavailable"}
+        and requested_route_token_ref != route_token_ref
+        and route_token_ref
+    ):
+        response = _onboard_route_guide_hide_opaque_parent_ref(
+            response, route_token_ref
         )
     if response_view == "full":
         response["response_view"] = "full"
