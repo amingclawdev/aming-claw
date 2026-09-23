@@ -255,7 +255,6 @@ def _seed_snapshot(conn, tmp_path):
         nodes=graph["deps_graph"]["nodes"],
         edges=store.graph_payload_edges(graph),
     )
-    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
     conn.commit()
     return snapshot["snapshot_id"], project_root
 
