@@ -212419,6 +212419,505 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
     }
 
 
+def _ac_dev_bound_mf_parent_registration_case(conn, monkeypatch, tmp_path, backlog_id):
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn, monkeypatch, tmp_path, backlog_id=backlog_id,
+        target_files=[
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+    )
+    assert case["parent"]["route_token_ref"] == ""
+    assert "observer_session_register" in case["body"]["allowed_actions"]
+    assert "parent_route_identity" not in case["body"]
+    issued = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=case["body"],
+    ))
+    assert issued["ok"] is True, issued
+    # Bind the issued ref through the supported Guide path. Route issuance
+    # itself does not perform this parent update.
+    server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "mf_parallel", "route_token_ref": issued["route_token_ref"],
+        },
+    ))
+    parent = server._contract_runtime_store(conn).get(case["parent_execution_id"])
+    assert parent["route_token_ref"] == issued["route_token_ref"]
+    assert parent["execution_state_revision"] == 2
+    case.update({"issued": issued, "parent": parent})
+    return case
+
+
+def _ac_dev_bound_mf_parent_lineage(conn, case):
+    return {
+        "parent": copy.deepcopy(server._contract_runtime_store(conn).get(
+            case["parent_execution_id"]
+        )),
+        "route_count": conn.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs "
+            "WHERE project_id=? AND backlog_id=?",
+            (server._route_registry_storage_project_id(case["project_id"]),
+             case["backlog_id"]),
+        ).fetchone()[0],
+        "execution_count": conn.execute(
+            "SELECT COUNT(*) FROM contract_runtime_executions "
+            "WHERE project_id=? AND backlog_id=?",
+            (case["project_id"], case["backlog_id"]),
+        ).fetchone()[0],
+    }
+
+
+def test_ac_dev_bound_mf_parent_omitted_ref_registers_existing_route_then_enters_ready(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_mf_parallel_route_precursor(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-BOUND-MF-PARENT-OMITTED-REF",
+        target_files=[
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+    )
+    initial = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "mf_parallel", "response_view": "compact",
+        },
+    ))
+    assert initial["host_precursor_action"]["mcp_tool"] == (
+        "observer_route_context_issue"
+    )
+    assert initial["host_precursor_action"]["copy_safe_body"] == case["body"]
+    issued = server.handle_observer_route_context_issue(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=case["body"],
+    ))
+    assert issued["ok"] is True, issued
+    # The route issuer and parent binding are separate producers in this setup.
+    server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "mf_parallel", "route_token_ref": issued["route_token_ref"],
+        },
+    ))
+    parent = server._contract_runtime_store(conn).get(case["parent_execution_id"])
+    case["parent"] = parent
+    persisted_ref = parent["route_token_ref"]
+    assert persisted_ref == issued["route_token_ref"]
+    assert parent["execution_state_revision"] == 2
+    before = _ac_dev_bound_mf_parent_lineage(conn, case)
+
+    omitted = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "mf_parallel", "response_view": "compact",
+        },
+    ))
+    precursor = omitted["host_precursor_action"]
+    assert omitted["host_precursor_required"] is True
+    assert precursor["mcp_tool"] == "contract_runtime_current"
+    assert precursor["copy_safe_body"] == {
+        "project_id": case["project_id"],
+        "contract_execution_id": case["parent_execution_id"],
+    }
+    assert persisted_ref not in json.dumps(omitted)
+    assert omitted["mcp_tool"] == "contract_runtime_current"
+    assert omitted["next_legal_action"]["action_input_ready"] is False
+    assert _ac_dev_bound_mf_parent_lineage(conn, case) == before
+    full = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "mf_parallel", "response_view": "full",
+        },
+    ))
+    assert persisted_ref not in json.dumps(full)
+    assert _ac_dev_bound_mf_parent_lineage(conn, case) == before
+
+    current = server.handle_project_contract_runtime_current_state(_ctx(
+        precursor["copy_safe_body"], method="GET",
+        query={"response_view": "cli_current"},
+    ))
+    assert current["route_token_ref"] == persisted_ref
+    status, registered = server.handle_observer_session_register(_ctx(
+        {"project_id": case["project_id"]}, method="POST",
+        body={
+            "project_id": case["project_id"],
+            "backlog_id": case["backlog_id"],
+            "task_id": case["parent_execution_id"],
+            "cex_id": case["parent_execution_id"],
+            "route_token_ref": current["route_token_ref"],
+        },
+    ))
+    assert status == 201, registered
+    registry_config = server._registry_project_config
+    monkeypatch.setattr(server, "_registry_project_config", lambda selected: (
+        ({**registry_config(PID)[0], "project_id": case["project_id"]}, "test_registry")
+        if selected == case["project_id"] else registry_config(selected)
+    ))
+    refreshed = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "mf_parallel", "response_view": "compact",
+            "route_token_ref": persisted_ref,
+            "observer_session_id": registered["session_id"],
+            "task_id": "bound-parent-mf-entry",
+            "reason": "Enter the two allocated file owners.",
+            "metadata": {"required_worker_count": 2, "lane_intents": [
+                {"task_id": f"bound-parent-lane-{index}",
+                 "worker_id": f"worker-{index}", "worker_slot_id": f"slot-{index}",
+                 "owned_files": [path]}
+                for index, path in enumerate(case["target_files"], start=1)
+            ]},
+        },
+    ))
+    assert refreshed["host_precursor_required"] is False
+    assert refreshed["mcp_tool"] == "mf_parallel_enter"
+    assert refreshed["next_legal_action"]["action_input_ready"] is True
+    assert refreshed["next_legal_action"]["successor_action_input"][
+        "entry_authority"
+    ]["accepted"] is True
+    assert refreshed["canonical_executable_action"]["copy_safe_body"][
+        "observer_route_token_ref"
+    ] == persisted_ref
+    assert _ac_dev_bound_mf_parent_lineage(conn, case) == before
+
+
+@pytest.mark.parametrize("invalid_route", [
+    "expired", "revoked", "foreign", "ambiguous", "wrong_ref",
+])
+def test_ac_dev_bound_mf_parent_omitted_ref_invalid_route_fails_closed(
+    conn, monkeypatch, tmp_path, invalid_route,
+):
+    case = _ac_dev_bound_mf_parent_registration_case(
+        conn, monkeypatch, tmp_path,
+        backlog_id=f"AC-DEV-BOUND-MF-PARENT-INVALID-{invalid_route.upper()}",
+    )
+    ref = case["issued"]["route_token_ref"]
+    request_ref = ""
+    if invalid_route == "expired":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET expires_at=? "
+            "WHERE route_token_ref=?",
+            ("2000-01-01T00:00:00Z", ref),
+        )
+    elif invalid_route == "revoked":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='revoked' "
+            "WHERE route_token_ref=?", (ref,),
+        )
+    elif invalid_route == "foreign":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET task_id=? "
+            "WHERE route_token_ref=?", ("foreign-parent-task", ref),
+        )
+    elif invalid_route == "ambiguous":
+        existing = conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
+            (ref,),
+        ).fetchone()
+        competing = dict(existing)
+        competing["route_token_ref"] = "rtok-competing-bound-parent"
+        competing["route_id"] = "route-competing-bound-parent"
+        competing["route_context_hash"] = _fake_sha("competing-bound-parent")
+        competing["prompt_contract_id"] = "rprompt-competing-bound-parent"
+        competing["prompt_contract_hash"] = _fake_sha("competing-parent-prompt")
+        competing["visible_injection_manifest_hash"] = _fake_sha(
+            "competing-parent-visible"
+        )
+        columns = list(competing)
+        conn.execute(
+            f"INSERT INTO observer_route_token_refs ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            tuple(competing[column] for column in columns),
+        )
+    else:
+        request_ref = "rtok-wrong-bound-parent"
+    conn.commit()
+    before = _ac_dev_bound_mf_parent_lineage(conn, case)
+
+    request = {
+        "backlog_id": case["backlog_id"], "role": "observer",
+        "work_type": "mf_parallel", "response_view": "compact",
+    }
+    if request_ref:
+        request["route_token_ref"] = request_ref
+    try:
+        guide = server.handle_project_onboard_route_guide(_ctx(
+            {"project_id": case["project_id"]}, method="POST", body=request,
+        ))
+    except GovernanceError:
+        pass
+    else:
+        assert guide.get("mcp_tool") not in {
+            "observer_route_context_issue", "observer_session_register",
+            "mf_parallel_enter",
+        }
+        assert (guide.get("host_precursor_action") or {}).get(
+            "mcp_tool"
+        ) not in {"observer_route_context_issue", "observer_session_register"}
+        assert (guide.get("next_legal_action") or {}).get(
+            "action_input_ready"
+        ) is not True
+    assert _ac_dev_bound_mf_parent_lineage(conn, case) == before
+
+
+def _ac_dev_bound_mf_parent_renewal_case(
+    conn, monkeypatch, tmp_path, suffix, *, renewal_hops=1,
+):
+    case = _ac_dev_bound_mf_parent_registration_case(
+        conn, monkeypatch, tmp_path,
+        backlog_id=f"AC-DEV-BOUND-MF-RENEWAL-{suffix}",
+    )
+    old_ref = case["issued"]["route_token_ref"]
+    assert renewal_hops in {1, 2}
+    ancestor_refs = [old_ref]
+    new_ref = old_ref
+    for _ in range(renewal_hops):
+        renewed = observer_route_context.renew_route_token_ref(
+            conn,
+            project_id=case["project_id"],
+            storage_project_id=server._route_registry_storage_project_id(
+                case["project_id"]
+            ),
+            route_token_ref=new_ref,
+            backlog_id=case["backlog_id"],
+            task_id=case["parent_execution_id"],
+            caller_role="observer",
+        )
+        new_ref = renewed["route_token_ref"]
+        if len(ancestor_refs) < renewal_hops:
+            ancestor_refs.append(new_ref)
+    assert new_ref != old_ref
+    rows = conn.execute(
+        "SELECT route_token_ref, status FROM observer_route_token_refs "
+        "WHERE project_id=? AND backlog_id=? AND task_id=?",
+        (server._route_registry_storage_project_id(case["project_id"]),
+         case["backlog_id"], case["parent_execution_id"]),
+    ).fetchall()
+    assert {row["route_token_ref"]: row["status"] for row in rows} == {
+        **{ref: "superseded" for ref in ancestor_refs},
+        new_ref: "active",
+    }
+    assert server._contract_runtime_store(conn).get(
+        case["parent_execution_id"]
+    )["route_token_ref"] == old_ref
+    case.update(old_ref=old_ref, new_ref=new_ref, ancestor_refs=ancestor_refs)
+    return case
+
+
+def _ac_dev_bound_mf_parent_route_rows(conn, case):
+    return [tuple(row) for row in conn.execute(
+        "SELECT route_token_ref, status, expires_at, task_id, "
+        "parent_route_lineage_json, child_route_lineage_json, route_lineage_json "
+        "FROM observer_route_token_refs WHERE project_id=? AND backlog_id=? "
+        "ORDER BY route_token_ref",
+        (server._route_registry_storage_project_id(case["project_id"]),
+         case["backlog_id"]),
+    ).fetchall()]
+
+
+def _ac_dev_bound_mf_parent_guide(conn, case, route_token_ref=""):
+    body = {
+        "backlog_id": case["backlog_id"], "role": "observer",
+        "work_type": "mf_parallel", "response_view": "compact",
+    }
+    if route_token_ref:
+        body["route_token_ref"] = route_token_ref
+    return server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body=body,
+    ))
+
+
+@pytest.mark.parametrize("renewal_hops", [1, 2])
+def test_ac_dev_bound_mf_parent_renewal_explicit_rebind_then_omitted_recovery(
+    conn, monkeypatch, tmp_path, renewal_hops,
+):
+    case = _ac_dev_bound_mf_parent_renewal_case(
+        conn, monkeypatch, tmp_path, f"EXPLICIT-REBIND-{renewal_hops}",
+        renewal_hops=renewal_hops,
+    )
+    before = _ac_dev_bound_mf_parent_lineage(conn, case)
+    route_rows = _ac_dev_bound_mf_parent_route_rows(conn, case)
+
+    # A superseded parent is not an authority for an omitted-ref Guide.
+    omitted_before = _ac_dev_bound_mf_parent_guide(conn, case)
+    assert omitted_before.get("mcp_tool") in {"", "no_runtime_action"}
+    assert omitted_before["next_legal_action"]["id"] == (
+        "mf_parallel_parent_route_unavailable"
+    )
+    assert case["old_ref"] not in json.dumps(omitted_before)
+    assert case["new_ref"] not in json.dumps(omitted_before)
+    assert _ac_dev_bound_mf_parent_lineage(conn, case) == before
+    assert _ac_dev_bound_mf_parent_route_rows(conn, case) == route_rows
+
+    explicit = _ac_dev_bound_mf_parent_guide(
+        conn, case, route_token_ref=case["new_ref"],
+    )
+    assert explicit["mcp_tool"] not in {
+        "observer_route_context_issue", "no_runtime_action",
+    }
+    rebound = server._contract_runtime_store(conn).get(
+        case["parent_execution_id"]
+    )
+    assert rebound["route_token_ref"] == case["new_ref"]
+    assert rebound["execution_state_revision"] == (
+        before["parent"]["execution_state_revision"] + 1
+    )
+    assert _ac_dev_bound_mf_parent_route_rows(conn, case) == route_rows
+
+    after_rebind = _ac_dev_bound_mf_parent_lineage(conn, case)
+    omitted_after = _ac_dev_bound_mf_parent_guide(conn, case)
+    assert omitted_after["host_precursor_action"]["mcp_tool"] == (
+        "contract_runtime_current"
+    )
+    assert omitted_after["mcp_tool"] == "contract_runtime_current"
+    assert case["old_ref"] not in json.dumps(omitted_after)
+    assert case["new_ref"] not in json.dumps(omitted_after)
+    assert _ac_dev_bound_mf_parent_lineage(conn, case) == after_rebind
+    assert _ac_dev_bound_mf_parent_route_rows(conn, case) == route_rows
+
+    # The omitted Guide's read action leads back to the same active parent.
+    current = server.handle_project_contract_runtime_current_state(_ctx(
+        omitted_after["host_precursor_action"]["copy_safe_body"], method="GET",
+        query={"response_view": "cli_current"},
+    ))
+    assert current["route_token_ref"] == case["new_ref"]
+    status, registered = server.handle_observer_session_register(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "project_id": case["project_id"],
+            "backlog_id": case["backlog_id"],
+            "task_id": case["parent_execution_id"],
+            "cex_id": case["parent_execution_id"],
+            "route_token_ref": current["route_token_ref"],
+        },
+    ))
+    assert status == 201, registered
+    registry_config = server._registry_project_config
+    monkeypatch.setattr(server, "_registry_project_config", lambda selected: (
+        ({**registry_config(PID)[0], "project_id": case["project_id"]},
+         "test_registry")
+        if selected == case["project_id"] else registry_config(selected)
+    ))
+    ready = server.handle_project_onboard_route_guide(_ctx(
+        {"project_id": case["project_id"]}, method="POST", body={
+            "backlog_id": case["backlog_id"], "role": "observer",
+            "work_type": "mf_parallel", "response_view": "compact",
+            "route_token_ref": case["new_ref"],
+            "observer_session_id": registered["session_id"],
+            "task_id": "bound-parent-renewal-mf-entry",
+            "reason": "Enter the two allocated file owners after renewal.",
+            "metadata": {"required_worker_count": 2, "lane_intents": [
+                {"task_id": f"renewed-parent-lane-{index}",
+                 "worker_id": f"worker-{index}", "worker_slot_id": f"slot-{index}",
+                 "owned_files": [path]}
+                for index, path in enumerate(case["target_files"], start=1)
+            ]},
+        },
+    ))
+    assert ready["host_precursor_required"] is False
+    assert ready["mcp_tool"] == "mf_parallel_enter"
+    assert ready["next_legal_action"]["action_input_ready"] is True
+    assert ready["next_legal_action"]["successor_action_input"][
+        "entry_authority"
+    ]["accepted"] is True
+    assert ready["canonical_executable_action"]["copy_safe_body"][
+        "observer_route_token_ref"
+    ] == case["new_ref"]
+    assert _ac_dev_bound_mf_parent_lineage(conn, case) == after_rebind
+    assert _ac_dev_bound_mf_parent_route_rows(conn, case) == route_rows
+
+
+@pytest.mark.parametrize("invalid_descendant", [
+    "expired", "revoked", "foreign", "wrong_ref", "wrong_ancestry",
+    "two_active",
+])
+def test_ac_dev_bound_mf_parent_renewal_invalid_descendant_fails_closed(
+    conn, monkeypatch, tmp_path, invalid_descendant,
+):
+    case = _ac_dev_bound_mf_parent_renewal_case(
+        conn, monkeypatch, tmp_path, invalid_descendant.upper(),
+    )
+    request_ref = case["new_ref"]
+    if invalid_descendant == "expired":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET expires_at=? "
+            "WHERE route_token_ref=?",
+            ("2000-01-01T00:00:00Z", request_ref),
+        )
+    elif invalid_descendant == "revoked":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='revoked' "
+            "WHERE route_token_ref=?", (request_ref,),
+        )
+    elif invalid_descendant == "foreign":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET task_id=? "
+            "WHERE route_token_ref=?",
+            ("foreign-parent-task", request_ref),
+        )
+    elif invalid_descendant == "wrong_ref":
+        request_ref = "rtok-unrelated-bound-parent-renewal"
+    else:
+        # Mint an independent same-scope route through the storage facade.
+        # With the renewed leaf revoked there is just one ACTIVE row, but it
+        # has no ancestry back to the parent's superseded binding.
+        if invalid_descendant == "wrong_ancestry":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET status='revoked' "
+                "WHERE route_token_ref=?", (request_ref,),
+            )
+        unrelated = observer_route_context.issue_observer_write_route_context(
+            project_id=case["project_id"],
+            backlog_id=case["backlog_id"],
+            task_id=case["parent_execution_id"],
+            target_files=case["body"]["target_files"],
+            allowed_actions=case["body"]["allowed_actions"],
+            evidence_refs=[
+                *case["body"]["evidence_refs"],
+                f"independent_route:{invalid_descendant}",
+            ],
+            now=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=case["project_id"],
+            storage_project_id=server._route_registry_storage_project_id(
+                case["project_id"]
+            ),
+            route_token_ref=unrelated["route_token_ref"],
+            token=unrelated["route_token"],
+        )
+        if invalid_descendant == "wrong_ancestry":
+            request_ref = unrelated["route_token_ref"]
+    conn.commit()
+    before = _ac_dev_bound_mf_parent_lineage(conn, case)
+    route_rows = _ac_dev_bound_mf_parent_route_rows(conn, case)
+
+    for selected_ref in ("", request_ref):
+        try:
+            guide = _ac_dev_bound_mf_parent_guide(
+                conn, case, route_token_ref=selected_ref,
+            )
+        except GovernanceError:
+            pass
+        else:
+            assert guide.get("mcp_tool") not in {
+                "observer_route_context_issue", "observer_session_register",
+                "mf_parallel_enter", "contract_runtime_current",
+            }
+            assert (guide.get("host_precursor_action") or {}).get(
+                "mcp_tool"
+            ) not in {"observer_route_context_issue", "observer_session_register"}
+            assert (guide.get("next_legal_action") or {}).get(
+                "action_input_ready"
+            ) is not True
+            if not selected_ref:
+                assert case["old_ref"] not in json.dumps(guide)
+                assert case["new_ref"] not in json.dumps(guide)
+        assert _ac_dev_bound_mf_parent_lineage(conn, case) == before
+        assert _ac_dev_bound_mf_parent_route_rows(conn, case) == route_rows
+
+
 def _prepare_ac_dev_mf_parallel_ready_guide(conn, monkeypatch, tmp_path):
     case = _prepare_ac_dev_mf_parallel_route_precursor(
         conn, monkeypatch, tmp_path,
