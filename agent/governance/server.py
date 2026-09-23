@@ -7208,6 +7208,18 @@ def handle_observer_session_register(ctx: RequestContext):
                 if force_route:
                     if str(ctx.body.get("cex_id") or "").strip():
                         raise ValueError("graph-only observer registration has no CEX")
+                    enrollment_ref = next(
+                        (
+                            str(ref).removeprefix("dev_force_graph_enrolled_by:")
+                            for ref in force_route.get("evidence_refs") or []
+                            if str(ref).startswith("dev_force_graph_enrolled_by:")
+                        ),
+                        "",
+                    )
+                    _dev_force_graph_enrollment_session(
+                        conn, project_id=project_id, body=ctx.body,
+                        expected_session_id=enrollment_ref,
+                    )
                     capabilities = {
                         "actions": ["observer_session_heartbeat", "observer_session_close",
                                     "observer_session_revoke"],
@@ -7216,6 +7228,7 @@ def handle_observer_session_register(ctx: RequestContext):
                             "route_token_ref": str(ctx.body.get("route_token_ref") or ""),
                             "backlog_id": str(ctx.body.get("backlog_id") or ""),
                             "task_id": str(ctx.body.get("task_id") or ""),
+                            "enrollment_observer_session_id": enrollment_ref,
                             "dev_force_graph_only": True,
                         },
                     }
@@ -7253,6 +7266,8 @@ def handle_observer_session_register(ctx: RequestContext):
             "error": str(getattr(exc, "code", "observer_registration_route_rejected")),
             "message": "observer registration route authority rejected",
         }
+    except GovernanceError as exc:
+        return exc.status, {"ok": False, **exc.to_dict()}
     except Exception as exc:
         return _observer_error(exc)
     return 201, {"project_id": project_id, **result}
@@ -8387,6 +8402,7 @@ _DEV_FORCE_GRAPH_MARKER = "dev_force_graph_only:v1"
 
 def _dev_force_graph_issue_body(
     conn, *, project_id: str, backlog_id: str,
+    enrollment_observer_session_id: str = "",
 ) -> dict[str, Any]:
     """Derive one DEV graph-only enrollment route from the live world and row."""
 
@@ -8405,18 +8421,57 @@ def _dev_force_graph_issue_body(
     task_id = "dev-force-graph-" + stable_sha256(
         {"project_id": project_id, "backlog_id": backlog_id}
     ).removeprefix("sha256:")[:20]
+    enrollment_observer_session_id = str(enrollment_observer_session_id or "").strip()
     return {
         "project_id": project_id, "caller_role": "observer",
         "backlog_id": backlog_id, "task_id": task_id,
+        "enrollment_observer_session_id": enrollment_observer_session_id,
         "target_files": files, "owned_files": files,
         "allowed_actions": ["observer_session_register", _DEV_FORCE_GRAPH_ACTION],
         "evidence_refs": [
             f"backlog:{backlog_id}", _DEV_FORCE_GRAPH_MARKER,
             f"dev_force_graph_head:{world['target_head_commit']}",
             f"dev_force_graph_world:{world['world_hash']}",
+            f"dev_force_graph_enrolled_by:{enrollment_observer_session_id}",
         ],
         "dev_force_graph_route": True,
     }
+
+
+def _dev_force_graph_enrollment_session(
+    conn, *, project_id: str, body: Mapping[str, Any],
+    expected_session_id: str = "",
+) -> dict[str, Any]:
+    """Authenticate a preexisting observer credential, not caller identity text."""
+
+    session_id = str(body.get("enrollment_observer_session_id") or "").strip()
+    raw_token = str(body.get("enrollment_session_token") or "").strip()
+    if not session_id or not raw_token or (
+        expected_session_id and session_id != expected_session_id
+    ):
+        raise GovernanceError(
+            "dev_force_graph_enrollment_credential_required",
+            "a genuine existing observer session credential is required to enroll",
+            403,
+        )
+    try:
+        session = observer_session.authenticate_session(
+            conn, project_id=project_id, session_id=session_id,
+            session_token=raw_token,
+            action=observer_session.ACTION_SESSION_HEARTBEAT,
+        )
+    except (observer_session.ObserverAuthError,
+            observer_session.ObserverPermissionError) as exc:
+        raise GovernanceError(
+            "dev_force_graph_enrollment_auth_failed",
+            "existing observer session enrollment authority rejected", 403,
+        ) from exc
+    if session.get("computed_status") != "active":
+        raise GovernanceError(
+            "dev_force_graph_enrollment_not_active",
+            "existing observer session must be active", 403,
+        )
+    return session
 
 
 def _dev_force_graph_resolved_route(
@@ -8443,8 +8498,19 @@ def _dev_force_graph_resolved_route(
         if not require_force:
             return {}
         raise GovernanceError("dev_force_graph_route_required", "exact force route required", 403)
+    enrollment_refs = sorted(
+        str(ref).removeprefix("dev_force_graph_enrolled_by:")
+        for ref in evidence
+        if str(ref).startswith("dev_force_graph_enrolled_by:")
+    )
+    if len(enrollment_refs) != 1 or not enrollment_refs[0]:
+        raise GovernanceError(
+            "dev_force_graph_enrollment_binding_missing",
+            "force route lacks its enrolling observer identity", 403,
+        )
     expected = _dev_force_graph_issue_body(
         conn, project_id=project_id, backlog_id=backlog_id,
+        enrollment_observer_session_id=enrollment_refs[0],
     )
     resolved_scope = (
         resolved.get("scope")
@@ -8479,10 +8545,19 @@ def _handle_dev_force_graph_route_issue(
     conn = get_connection(project_id)
     try:
         backlog_id = str(body.get("backlog_id") or "").strip()
+        enrollment = _dev_force_graph_enrollment_session(
+            conn, project_id=project_id, body=body,
+        )
+        enrollment_id = str(enrollment["session_id"])
         expected = _dev_force_graph_issue_body(
             conn, project_id=project_id, backlog_id=backlog_id,
+            enrollment_observer_session_id=enrollment_id,
         )
-        if dict(body) != expected:
+        public_body = {
+            key: value for key, value in body.items()
+            if key not in {"enrollment_session_token", "enrollment_observer_session_token_ref"}
+        }
+        if public_body != expected:
             raise GovernanceError(
                 "dev_force_graph_route_not_guide_bound",
                 "force route issue requires the exact live Guide body", 409,
@@ -8493,6 +8568,7 @@ def _handle_dev_force_graph_route_issue(
             try:
                 if _dev_force_graph_issue_body(
                     conn, project_id=project_id, backlog_id=backlog_id,
+                    enrollment_observer_session_id=enrollment_id,
                 ) != expected:
                     raise GovernanceError(
                         "dev_force_graph_route_world_changed", "DEV force route world changed", 409,
@@ -8519,6 +8595,7 @@ def _handle_dev_force_graph_route_issue(
         return {
             "ok": True, "project_id": project_id,
             "backlog_id": backlog_id, "task_id": expected["task_id"],
+            "enrollment_observer_session_id": enrollment_id,
             "route_token_ref": issued["route_token_ref"],
             "dev_force_graph_only": True, "ref_registered": True,
             "raw_route_token_exposed": False,
@@ -13549,12 +13626,22 @@ def _require_dev_force_graph_auth(
         and isinstance(capabilities.get("route_provenance"), Mapping)
         else {}
     )
+    enrollment_ref = next(
+        (
+            str(ref).removeprefix("dev_force_graph_enrolled_by:")
+            for ref in route.get("evidence_refs") or []
+            if str(ref).startswith("dev_force_graph_enrolled_by:")
+        ),
+        "",
+    )
     if not (
         session.get("computed_status") == "active"
         and provenance.get("dev_force_graph_only") is True
         and str(provenance.get("route_token_ref") or "") == auth["route_token_ref"]
         and str(provenance.get("backlog_id") or "") == scope["backlog_id"]
         and str(provenance.get("task_id") or "") == scope["task_id"]
+        and str(provenance.get("enrollment_observer_session_id") or "")
+        == enrollment_ref
         and route
     ):
         raise GovernanceError(
@@ -100650,8 +100737,9 @@ def _record_current_full_atomic_evidence(
             conn, project_id=project_id,
             backlog_id=str(scope.get("backlog_id") or ""),
             task_id=str(scope.get("task_id") or ""),
-            event_type="graph.reconcile", event_kind="reconcile",
-            phase="reconcile", actor=str(body.get("actor") or "observer"),
+            event_type="graph.dev_force_graph_reconcile",
+            event_kind="graph_only", phase="graph",
+            actor=str(body.get("actor") or "observer"),
             status="recorded", commit_sha=target_commit,
             payload={
                 "schema_version": "dev_force_graph_only.v1",
@@ -181619,8 +181707,16 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
             from . import graph_snapshot_store as force_store
 
             backlog_id = str(kwargs["backlog_id"])
+            guide_input = kwargs.get("request_body") or {}
+            enrollment_id = str(
+                guide_input.get("enrollment_observer_session_id") or ""
+            ).strip()
+            enrollment_token_ref = str(
+                guide_input.get("enrollment_observer_session_token_ref") or ""
+            ).strip()
             force_issue = _dev_force_graph_issue_body(
                 conn, project_id=AC_PROJECT_ID, backlog_id=backlog_id,
+                enrollment_observer_session_id=enrollment_id,
             )
             world = _operator_supervised_direct_main_dev_world_authority()
             active_graph = force_store.get_active_graph_snapshot(
@@ -181640,12 +181736,17 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
             route_ready = False
             if requested_ref:
                 try:
-                    route_ready = bool(_dev_force_graph_resolved_route(
+                    resolved_force = _dev_force_graph_resolved_route(
                         conn, project_id=AC_PROJECT_ID,
                         route_token_ref=requested_ref,
                         backlog_id=backlog_id,
                         task_id=force_issue["task_id"],
-                    ))
+                    )
+                    route_ready = bool(
+                        resolved_force
+                        and f"dev_force_graph_enrolled_by:{enrollment_id}"
+                        in list(resolved_force.get("evidence_refs") or [])
+                    )
                 except (GovernanceError, sqlite3.Error, ValueError):
                     pass
             session_ready = False
@@ -181708,8 +181809,20 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
                 action = {
                     "action": "observer_route_context_issue",
                     "mcp_tool": "observer_route_context_issue",
-                    "copy_safe_body": force_issue,
-                    "action_input_ready": True,
+                    "copy_safe_body": {
+                        **force_issue,
+                        **(
+                            {"enrollment_observer_session_token_ref": enrollment_token_ref}
+                            if enrollment_token_ref else {}
+                        ),
+                    },
+                    "action_input_ready": bool(enrollment_id and enrollment_token_ref),
+                    "action_input_missing_fields": [
+                        field for field, ready in (
+                            ("enrollment_observer_session_id", bool(enrollment_id)),
+                            ("enrollment_observer_session_token_ref", bool(enrollment_token_ref)),
+                        ) if not ready
+                    ],
                 }
             elif not session_ready:
                 action = {
@@ -181720,8 +181833,13 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
                         "route_token_ref": requested_ref,
                         "backlog_id": backlog_id,
                         "task_id": force_issue["task_id"],
+                        "enrollment_observer_session_id": enrollment_id,
+                        **(
+                            {"enrollment_observer_session_token_ref": enrollment_token_ref}
+                            if enrollment_token_ref else {}
+                        ),
                     },
-                    "action_input_ready": True,
+                    "action_input_ready": bool(enrollment_id and enrollment_token_ref),
                 }
             else:
                 action_body = dict(base_body)
@@ -181743,6 +181861,8 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
                 "source": "loaded_dev_world+open_backlog+active_graph",
                 "normal_contract_reconcile_authority": False,
                 "qa_or_close_authority": False,
+                "enrollment_requires_existing_observer_credential": True,
+                "enrollment_credential_source": "managed_observer_session_token_ref",
                 "route_ready": route_ready,
                 "session_ready": session_ready,
                 "candidate_ready": candidate_ready,

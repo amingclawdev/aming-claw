@@ -150,10 +150,30 @@ def test_dev_force_graph_guide_enrollment_build_activate_and_normal_denial(
         server._GOVERNANCE_MANAGER_CERTIFICATES, project_id,
         _test_manager_certificate(project_id),
     )
+    enrolling_observer = observer_session.register_session(
+        conn, project_id=project_id, observer_kind="codex",
+        capabilities={"actions": ["observer_session_heartbeat"]},
+    )
+    enrollment_id = enrolling_observer["session_id"]
+    enrollment_token = enrolling_observer["session_token"]
     guide = server._onboard_route_guide_service_response(
         conn, project_id=project_id, backlog_id=backlog_id,
         role="observer", work_type="operator_supervised_direct_main",
         request_body={}, route_token_ref="",
+    )
+    assert guide["next_legal_action"]["action_input_ready"] is False
+    with pytest.raises(server.GovernanceError):
+        server.handle_observer_route_context_issue(
+            _ctx({"project_id": project_id}, method="POST",
+                 body=guide["next_legal_action"]["copy_safe_body"]),
+        )
+    guide = server._onboard_route_guide_service_response(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        role="observer", work_type="operator_supervised_direct_main",
+        request_body={
+            "enrollment_observer_session_id": enrollment_id,
+            "enrollment_observer_session_token_ref": "managed-existing-observer-ref",
+        }, route_token_ref="",
     )
     issue_body = guide["next_legal_action"]["copy_safe_body"]
     assert issue_body["allowed_actions"] == [
@@ -162,29 +182,86 @@ def test_dev_force_graph_guide_enrollment_build_activate_and_normal_denial(
     with pytest.raises(server.GovernanceError):
         server.handle_observer_route_context_issue(_ctx(
             {"project_id": project_id}, method="POST", body={
-                **issue_body, "target_files": ["foreign.py"],
+                **issue_body, "enrollment_session_token": "forged-token",
+            },
+        ))
+    issue_http_body = {
+        **issue_body, "enrollment_session_token": enrollment_token,
+    }
+    with pytest.raises(server.GovernanceError):
+        server.handle_observer_route_context_issue(_ctx(
+            {"project_id": project_id}, method="POST", body={
+                **issue_http_body, "target_files": ["foreign.py"],
             },
         ))
     issued = server.handle_observer_route_context_issue(
-        _ctx({"project_id": project_id}, method="POST", body=issue_body),
+        _ctx({"project_id": project_id}, method="POST", body=issue_http_body),
     )
     assert issued["ok"] is True
     ref = issued["route_token_ref"]
+    registration_body = {
+        "route_token_ref": ref, "backlog_id": backlog_id,
+        "task_id": issue_body["task_id"],
+        "enrollment_observer_session_id": enrollment_id,
+        "enrollment_session_token": enrollment_token,
+    }
+    for denied_registration in (
+        {key: value for key, value in registration_body.items()
+         if key != "enrollment_session_token"},
+        {**registration_body, "enrollment_session_token": "forged-token"},
+        {**registration_body, "enrollment_observer_session_id": "foreign-observer"},
+    ):
+        denied_status, denied = server.handle_observer_session_register(_ctx(
+            {"project_id": project_id}, method="POST", body=denied_registration,
+        ))
+        assert denied_status == 403, denied
+    conn.execute(
+        "UPDATE observer_sessions SET last_seen_at='2000-01-01T00:00:00Z' WHERE session_id=?",
+        (enrollment_id,),
+    )
+    expired_status, expired = server.handle_observer_session_register(_ctx(
+        {"project_id": project_id}, method="POST", body=registration_body,
+    ))
+    assert expired_status == 403, expired
+    conn.execute(
+        "UPDATE observer_sessions SET last_seen_at=? WHERE session_id=?",
+        (server._utc_now(), enrollment_id),
+    )
     registered = server.handle_observer_session_register(_ctx(
-        {"project_id": project_id}, method="POST", body={
-            "route_token_ref": ref, "backlog_id": backlog_id,
-            "task_id": issue_body["task_id"],
-        },
+        {"project_id": project_id}, method="POST", body=registration_body,
     ))
     assert registered[0] == 201, registered
     session_id = registered[1]["session_id"]
     guide = server._onboard_route_guide_service_response(
         conn, project_id=project_id, backlog_id=backlog_id,
         role="observer", work_type="operator_supervised_direct_main",
-        request_body={"observer_session_id": session_id}, route_token_ref=ref,
+        request_body={
+            "observer_session_id": session_id,
+            "enrollment_observer_session_id": enrollment_id,
+            "enrollment_observer_session_token_ref": "managed-existing-observer-ref",
+        }, route_token_ref=ref,
     )
     build_body = guide["next_legal_action"]["copy_safe_body"]
     assert build_body["activate"] is False
+    enrolled_row = conn.execute(
+        "SELECT capabilities_json FROM observer_sessions WHERE session_id=?",
+        (session_id,),
+    ).fetchone()
+    original_capabilities = enrolled_row["capabilities_json"]
+    altered_capabilities = json.loads(original_capabilities)
+    altered_capabilities["route_provenance"]["enrollment_observer_session_id"] = "foreign-observer"
+    conn.execute(
+        "UPDATE observer_sessions SET capabilities_json=? WHERE session_id=?",
+        (json.dumps(altered_capabilities), session_id),
+    )
+    with pytest.raises(server.GovernanceError):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": project_id}, method="POST", body=build_body),
+        )
+    conn.execute(
+        "UPDATE observer_sessions SET capabilities_json=? WHERE session_id=?",
+        (original_capabilities, session_id),
+    )
     for denied_index, denied_body in enumerate((
         {**build_body, "observer_session_id": "unknown-session"},
         {**build_body, "route_token_ref": "unknown-route"},
@@ -280,7 +357,7 @@ def test_dev_force_graph_guide_enrollment_build_activate_and_normal_denial(
         "WHERE project_id=? AND backlog_id=? ORDER BY id DESC LIMIT 1",
         (project_id, backlog_id),
     ).fetchone()
-    assert event["event_type"] == "graph.reconcile"
+    assert event["event_type"] == "graph.dev_force_graph_reconcile"
     assert json.loads(event["payload_json"])["contract_runtime_mutated"] is False
     assert event["payload_json"] and json.loads(event["payload_json"])["graph_reconciled"] is False
     metric = conn.execute(
@@ -431,9 +508,40 @@ def test_dev_force_graph_mcp_transport_is_explicit_and_copy_safe():
 
     def api(method, path, body=None):
         calls.append((method, path, body))
+        if path.endswith("/observer-sessions/register"):
+            return {
+                "ok": True, "session_id": "new-managed-observer",
+                "session_token": "raw-observer-secret",
+            }
+        if path.endswith("/observer/route-context/issue"):
+            return {"ok": True, "route_token_ref": "new-force-route"}
         return {"ok": True, "dev_force_graph_only": True, "graph_reconciled": False}
 
     dispatcher = mcp_tools.ToolDispatcher(api, worker_pool=None)
+    managed = dispatcher.dispatch("observer_session_register", {
+        "project_id": "aming-claw",
+    })
+    managed_ref = managed["observer_session_token_ref"]
+    assert "raw-observer-secret" not in json.dumps(managed)
+    issue = dispatcher.dispatch("observer_route_context_issue", {
+        "project_id": "aming-claw", "caller_role": "observer",
+        "backlog_id": "AC-FORCE", "task_id": "force-task",
+        "dev_force_graph_route": True,
+        "enrollment_observer_session_id": "new-managed-observer",
+        "enrollment_observer_session_token_ref": managed_ref,
+    })
+    assert issue["route_token_ref"] == "new-force-route"
+    assert calls[-1][2]["enrollment_session_token"] == "raw-observer-secret"
+    assert "enrollment_observer_session_token_ref" not in calls[-1][2]
+    registered = dispatcher.dispatch("observer_session_register", {
+        "project_id": "aming-claw", "route_token_ref": "new-force-route",
+        "backlog_id": "AC-FORCE", "task_id": "force-task",
+        "enrollment_observer_session_id": "new-managed-observer",
+        "enrollment_observer_session_token_ref": managed_ref,
+    })
+    assert registered["raw_observer_session_token_exposed"] is False
+    assert calls[-1][2]["enrollment_session_token"] == "raw-observer-secret"
+    calls.clear()
     body = {
         "project_id": "aming-claw", "dev_force_graph": True,
         "force_reason": "loaded DEV graph stale", "operator_authorization_ref": "audit-only",

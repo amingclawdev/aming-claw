@@ -4256,11 +4256,14 @@ def current_full_active_terminal_tuple(
         else:
             if (
                 str(timeline_event.get("event_type") or "")
-                != "graph.reconcile"
+                != (
+                    "graph.dev_force_graph_reconcile"
+                    if dev_force_graph_only else "graph.reconcile"
+                )
                 or str(timeline_event.get("event_kind") or "")
-                != "reconcile"
+                != ("graph_only" if dev_force_graph_only else "reconcile")
                 or str(timeline_event.get("phase") or "")
-                != "reconcile"
+                != ("graph" if dev_force_graph_only else "reconcile")
                 or str(timeline_event.get("status") or "")
                 != ("recorded" if dev_force_graph_only else "passed")
                 or str(timeline_event.get("backlog_id") or "")

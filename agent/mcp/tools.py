@@ -4434,6 +4434,14 @@ TOOLS: list[dict] = [
                         "for dev-plane session registration."
                     ),
                 },
+                "enrollment_observer_session_id": {
+                    "type": "string",
+                    "description": "Existing observer session used only to authenticate force enrollment.",
+                },
+                "enrollment_observer_session_token_ref": {
+                    "type": "string",
+                    "description": "Managed opaque credential for the existing observer session.",
+                },
                 "backlog_id": {
                     "type": "string",
                     "description": "Exact backlog scope bound to route_token_ref.",
@@ -4604,6 +4612,11 @@ TOOLS: list[dict] = [
                 "dev_force_graph_route": {
                     "type": "boolean",
                     "description": "Exact DEV graph-only observer enrollment route returned by live Onboard.",
+                },
+                "enrollment_observer_session_id": {"type": "string"},
+                "enrollment_observer_session_token_ref": {
+                    "type": "string",
+                    "description": "Managed opaque observer credential required for force enrollment.",
                 },
             },
             "required": ["project_id", "caller_role", "task_id"],
@@ -8395,6 +8408,25 @@ class ToolDispatcher:
                 )
                 if key in args and args[key] is not None
             }
+            if args.get("enrollment_observer_session_id") or args.get(
+                "enrollment_observer_session_token_ref"
+            ):
+                enrollment_id, enrollment_token, enrollment_error = (
+                    self._observer_session_auth_for_ref({
+                        "project_id": pid,
+                        "observer_session_id": args.get("enrollment_observer_session_id"),
+                        "observer_session_token_ref": args.get("enrollment_observer_session_token_ref"),
+                    })
+                )
+                if enrollment_error:
+                    return enrollment_error
+                if not enrollment_id or not enrollment_token:
+                    return self._observer_session_ref_error(
+                        "dev_force_graph_enrollment_credential_required",
+                        "Existing observer credential is required for force registration.",
+                    )
+                body["enrollment_observer_session_id"] = enrollment_id
+                body["enrollment_session_token"] = enrollment_token
             return self._register_observer_session_ref(
                 args,
                 self._api(
@@ -8491,8 +8523,25 @@ class ToolDispatcher:
             body = {
                 key: value
                 for key, value in args.items()
-                if value is not None
+                if value is not None and key != "enrollment_observer_session_token_ref"
             }
+            if args.get("dev_force_graph_route") is True:
+                enrollment_id, enrollment_token, enrollment_error = (
+                    self._observer_session_auth_for_ref({
+                        "project_id": pid,
+                        "observer_session_id": args.get("enrollment_observer_session_id"),
+                        "observer_session_token_ref": args.get("enrollment_observer_session_token_ref"),
+                    })
+                )
+                if enrollment_error:
+                    return enrollment_error
+                if not enrollment_id or not enrollment_token:
+                    return self._observer_session_ref_error(
+                        "dev_force_graph_enrollment_credential_required",
+                        "Existing observer credential is required for force route issue.",
+                    )
+                body["enrollment_observer_session_id"] = enrollment_id
+                body["enrollment_session_token"] = enrollment_token
             return _copy_safe_observer_route_context_issue_result(
                 self._api(
                     "POST",
