@@ -98135,7 +98135,6 @@ def _current_full_reconcile_postmerge_target_owner(
     project_id: str,
     body: Mapping[str, Any],
     auth: Mapping[str, Any],
-    registered_root: Path | None,
 ) -> dict[str, Any]:
     """Resolve a pre-QA postmerge CEX to its clean, linked target owner.
 
@@ -98168,10 +98167,20 @@ def _current_full_reconcile_postmerge_target_owner(
         else route_task_id
     )
     try:
-        record = _contract_runtime_store(conn).get(execution_id)
-    except (ContractRuntimeError, sqlite3.Error):
+        record_row = conn.execute(
+            "SELECT project_id, backlog_id, contract_id, record_json "
+            "FROM contract_runtime_executions WHERE contract_execution_id=?",
+            (execution_id,),
+        ).fetchone()
+    except sqlite3.Error:
         return {}
-    if not record or not _is_mf_parallel_postmerge_revision(record):
+    if record_row is None:
+        return {}
+    try:
+        record = json.loads(str(record_row["record_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(record, Mapping) or not _is_mf_parallel_postmerge_revision(record):
         return {}
 
     def reject(reason: str) -> NoReturn:
@@ -98193,6 +98202,10 @@ def _current_full_reconcile_postmerge_target_owner(
     backlog_id = str(record.get("backlog_id") or "").strip()
     if not (
         str(record.get("project_id") or "") == project_id
+        and str(record_row["project_id"] or "") == project_id
+        and str(record_row["backlog_id"] or "") == backlog_id
+        and str(record_row["contract_id"] or "")
+        == str(record.get("contract_id") or "")
         and str(record.get("contract_execution_id") or "") == execution_id
         and backlog_id
         and backlog_id == str(route_scope.get("backlog_id") or "").strip()
@@ -98210,6 +98223,15 @@ def _current_full_reconcile_postmerge_target_owner(
         selected_action if isinstance(selected_action, Mapping) else {}
     )
     if str(selected_action.get("line_id") or "") != "observer_reconcile":
+        # A completed reconcile uses the existing terminal replay path.  A
+        # changed Guide alone cannot remove the pending owner's preflight.
+        if any(
+            isinstance(line, Mapping)
+            and str(line.get("line_id") or "") == "observer_reconcile"
+            and str(line.get("status") or "") == "passed"
+            for line in record.get("completed_lines") or []
+        ):
+            return {}
         reject("observer_reconcile_not_selected")
 
     required_count = _contract_runtime_mf_parallel_current_generation_worker_count(
@@ -98362,7 +98384,9 @@ def _current_full_reconcile_postmerge_target_owner(
     if claimed_commit and claimed_commit != final_commit:
         reject("aggregate_final_commit_mismatch")
 
-    if registered_root is None:
+    try:
+        registered_root = _graph_governance_project_root(project_id, {})
+    except ValidationError:
         reject("registered_project_root_unavailable")
     try:
         listing = subprocess.run(
@@ -102463,7 +102487,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 project_id=project_id,
                 body=body,
                 auth=current_full_auth,
-                registered_root=_graph_governance_project_root(project_id, {}),
             )
             if activate_requested
             and body.get("bind_only_preimplementation_provenance") is not True
