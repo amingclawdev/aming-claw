@@ -98129,6 +98129,299 @@ def _current_full_reconcile_runtime_successor_contract_kind(
     return ""
 
 
+def _current_full_reconcile_postmerge_target_owner(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    auth: Mapping[str, Any],
+    registered_root: Path | None,
+) -> dict[str, Any]:
+    """Resolve a pre-QA postmerge CEX to its clean, linked target owner.
+
+    The route selects the CEX. ContractRuntime selects the reconcile executor;
+    neither the caller's root nor the last merging lane selects either one.
+    This runs before the builder or any current-full schema admission.
+    """
+
+    route_scope = auth.get("route_token_scope")
+    route_scope = route_scope if isinstance(route_scope, Mapping) else {}
+    route_task_id = str(route_scope.get("task_id") or "").strip()
+    allowed_actions = {
+        str(action or "").strip().lower().replace("-", "_").replace(".", "_")
+        for action in auth.get("route_token_allowed_actions") or []
+    }
+    if (
+        str(auth.get("role_source") or "")
+        != "observer_session_route_token_ref"
+        or not route_task_id
+        or "observer_direct_mutation_exception" in allowed_actions
+        or auth.get("route_token_source_free_operation") is True
+    ):
+        return {}
+    from .parallel_branch_runtime import get_branch_context
+
+    route_context = get_branch_context(conn, project_id, route_task_id)
+    execution_id = (
+        _runtime_context_mf_sub_parent_task_id(route_context)
+        if route_context is not None
+        else route_task_id
+    )
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    if not record or not _is_mf_parallel_postmerge_revision(record):
+        return {}
+
+    def reject(reason: str) -> NoReturn:
+        raise GovernanceError(
+            "current_full_postmerge_target_owner_unverified",
+            "postmerge current-full target owner is not verified",
+            409,
+            {
+                "reason": reason,
+                "project_id": project_id,
+                "contract_execution_id": execution_id,
+                "rebuild_started": False,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
+
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    if not (
+        str(record.get("project_id") or "") == project_id
+        and str(record.get("contract_execution_id") or "") == execution_id
+        and backlog_id
+        and backlog_id == str(route_scope.get("backlog_id") or "").strip()
+        and route_task_id in {execution_id, str(body.get("task_id") or "").strip()}
+        and str(body.get("task_id") or route_task_id).strip() == route_task_id
+        and str(body.get("contract_execution_id") or execution_id).strip()
+        == execution_id
+        and str(body.get("backlog_id") or backlog_id).strip() == backlog_id
+    ):
+        reject("route_contract_scope_mismatch")
+    guide = record.get("runtime_guide")
+    guide = guide if isinstance(guide, Mapping) else {}
+    selected_action = guide.get("next_legal_action")
+    selected_action = (
+        selected_action if isinstance(selected_action, Mapping) else {}
+    )
+    if str(selected_action.get("line_id") or "") != "observer_reconcile":
+        reject("observer_reconcile_not_selected")
+
+    required_count = _contract_runtime_mf_parallel_current_generation_worker_count(
+        record, conn=conn, project_id=project_id
+    )
+    aggregate = _contract_runtime_rev8_two_worker_merge_projection(
+        record,
+        required_worker_count=required_count,
+        conn=conn,
+        project_id=project_id,
+    )
+    if not (
+        aggregate.get("timeline_verified") is True
+        and aggregate.get("authority_verified") is True
+        and aggregate.get("dispatch_lineage_verified") is True
+        and aggregate.get("all_lane_merges_verified") is True
+        and int(aggregate.get("lane_merge_count") or 0) == required_count
+    ):
+        reject("current_generation_aggregate_merge_unverified")
+    selected = _contract_runtime_rev8_selected_reconcile_lane_projection(
+        conn,
+        project_id=project_id,
+        record=record,
+        aggregate_merge=aggregate,
+    )
+    selected_identity = {
+        field: str(selected.get(field) or "").strip()
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "merge_queue_id",
+        )
+    }
+    if not (
+        selected.get("reconcile_lane_identity_source")
+        == "RuntimeContext.current_values"
+        and selected.get("aggregate_final_merge_identity")
+        == {
+            field: str(aggregate.get(field) or "").strip()
+            for field in selected_identity
+        }
+        and selected.get("reconcile_line_instance_id")
+        == f"runtime_context:{selected_identity['runtime_context_id']}"
+        and all(selected_identity.values())
+        and selected_identity["parent_task_id"] == execution_id
+        and selected_identity["runtime_context_id"]
+        in set(aggregate.get("lane_runtime_context_ids") or [])
+        and selected_identity["merge_queue_id"]
+        in set(aggregate.get("lane_merge_queue_ids") or [])
+        and route_task_id
+        in {execution_id, selected_identity["task_id"]}
+        and all(
+            str(selected_action.get(field) or "").strip() == expected
+            for field, expected in selected_identity.items()
+        )
+        and str(selected_action.get("line_instance_id") or "").strip()
+        == f"runtime_context:{selected_identity['runtime_context_id']}"
+    ):
+        reject("selected_reconcile_lane_unverified")
+    from .parallel_branch_runtime import (
+        _git_target_owner_alignment_evidence,
+        get_branch_context_by_runtime_context_id,
+    )
+
+    context = get_branch_context_by_runtime_context_id(
+        conn, project_id, selected_identity["runtime_context_id"]
+    )
+    if not context or any(
+        str(getattr(context, field, "") or "").strip() != expected
+        for field, expected in (
+            ("task_id", selected_identity["task_id"]),
+            ("parent_task_id", execution_id),
+            ("merge_queue_id", selected_identity["merge_queue_id"]),
+            ("backlog_id", backlog_id),
+        )
+    ):
+        reject("selected_reconcile_runtime_context_mismatch")
+    for field, expected in (
+        ("runtime_context_id", selected_identity["runtime_context_id"]),
+        ("parent_task_id", execution_id),
+        ("merge_queue_id", selected_identity["merge_queue_id"]),
+    ):
+        for claims in (body, body.get("evidence")):
+            if isinstance(claims, Mapping):
+                claim = str(claims.get(field) or "").strip()
+                if claim and claim != expected:
+                    reject(f"selected_reconcile_{field}_claim_mismatch")
+
+    dispatch_index = int(aggregate["dispatch_completed_line_index"])
+    dispatch_ref = str(aggregate["contract_runtime_dispatch_source_ref"])
+    lanes: list[dict[str, Any]] = []
+    for line in (record.get("completed_lines") or [])[dispatch_index + 1 :]:
+        if not isinstance(line, Mapping) or line.get("line_id") != "observer_merge":
+            continue
+        payload = line.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        durable = payload.get("durable_merge_authority")
+        durable = durable if isinstance(durable, Mapping) else {}
+        if str(durable.get("contract_runtime_dispatch_source_ref") or "") != dispatch_ref:
+            reject("aggregate_lane_dispatch_mismatch")
+        lanes.append(dict(durable))
+    if len(lanes) != required_count:
+        reject("aggregate_lane_count_mismatch")
+    lanes.sort(key=lambda item: int(item.get("merge_event_id") or 0))
+    target_ref = ""
+    previous_head = ""
+    for index, lane in enumerate(lanes):
+        queue_id = str(lane.get("merge_queue_id") or "").strip()
+        queue_item_id = str(lane.get("queue_item_id") or "").strip()
+        rows = conn.execute(
+            "SELECT * FROM parallel_branch_merge_queue_items "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            (project_id, queue_id, queue_item_id),
+        ).fetchall()
+        if len(rows) != 1:
+            reject("aggregate_lane_queue_item_not_unique")
+        row = rows[0]
+        lane_commit = str(lane.get("merge_commit") or "").strip().lower()
+        before = str(row["target_head_before_merge"] or "").strip().lower()
+        after = str(row["target_head_after_merge"] or "").strip().lower()
+        row_ref = str(row["target_ref"] or "").strip()
+        if not (
+            str(row["status"] or "") == "merged"
+            and str(row["backlog_id"] or "") == backlog_id
+            and str(row["task_id"] or "") == str(lane.get("task_id") or "")
+            and str(row["merge_queue_id"] or "") == queue_id
+            and str(row["queue_item_id"] or "") == queue_item_id
+            and str(row["merge_commit"] or "").strip().lower()
+            == lane_commit == after
+            and str(lane.get("target_head_before_merge") or "").strip().lower()
+            == before
+            and str(lane.get("target_head_after_merge") or "").strip().lower()
+            == after
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before)
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", after)
+            and row_ref.startswith("refs/heads/")
+            and (index == 0 or before == previous_head)
+            and (not target_ref or row_ref == target_ref)
+        ):
+            reject("aggregate_lane_queue_target_chain_mismatch")
+        target_ref = row_ref
+        previous_head = after
+    final_commit = str(aggregate.get("merged_commit_sha") or "").strip().lower()
+    if previous_head != final_commit:
+        reject("aggregate_final_commit_mismatch")
+    claimed_commit = str(
+        body.get("target_commit_sha") or body.get("commit_sha") or ""
+    ).strip().lower()
+    if claimed_commit and claimed_commit != final_commit:
+        reject("aggregate_final_commit_mismatch")
+
+    if registered_root is None:
+        reject("registered_project_root_unavailable")
+    try:
+        listing = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=registered_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        reject("target_ref_worktree_listing_unavailable")
+    if listing.returncode != 0:
+        reject("target_ref_worktree_listing_unavailable")
+    owners = []
+    for block in listing.stdout.strip().split("\n\n"):
+        fields = dict(
+            line.split(" ", 1) if " " in line else (line, "")
+            for line in block.splitlines()
+        )
+        if fields.get("branch") == target_ref:
+            owners.append(fields)
+    if len(owners) != 1 or not owners[0].get("worktree"):
+        reject("target_ref_owner_missing_or_ambiguous")
+    try:
+        owner = Path(owners[0]["worktree"]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        reject("target_ref_owner_missing_or_ambiguous")
+    if (
+        "detached" in owners[0]
+        or str(owners[0].get("HEAD") or "").strip().lower()
+        != final_commit
+    ):
+        reject("target_ref_owner_head_or_branch_mismatch")
+    alignment = _git_target_owner_alignment_evidence(
+        owner, target_ref=target_ref, merge_commit=final_commit,
+        timeout_seconds=10,
+    )
+    if not (
+        alignment.get("passed") is True
+        and str(alignment.get("head_commit") or "").strip().lower()
+        == final_commit
+        and str(alignment.get("target_commit") or "").strip().lower()
+        == final_commit
+        and alignment.get("index_clean") is True
+        and alignment.get("worktree_clean") is True
+    ):
+        reject("target_ref_owner_not_clean_and_aligned")
+    return {
+        "target_project_root": str(owner),
+        "target_ref": target_ref,
+        "merged_commit_sha": final_commit,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "aggregate_merge": aggregate,
+        "selected_reconcile_lane": selected_identity,
+    }
+
+
 def _current_full_reconcile_runtime_context_scope(
     conn,
     *,
@@ -98138,6 +98431,7 @@ def _current_full_reconcile_runtime_context_scope(
     target_commit_sha: str,
     candidate_only: bool = False,
     source_free_reconcile_authority: Mapping[str, Any] | None = None,
+    postmerge_target_owner_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve current-full runtime provenance from persisted branch identity.
 
@@ -98148,6 +98442,29 @@ def _current_full_reconcile_runtime_context_scope(
     provenance when it already exists, but it is never a prerequisite for
     rebuilding the canonical current graph.
     """
+
+    if postmerge_target_owner_authority:
+        # The activating rev8+ route has already bound the parent CEX, every
+        # current-generation merge, and the independently selected executor.
+        # Keep the aggregate commit while routing the receipt to that executor.
+        selected = postmerge_target_owner_authority["selected_reconcile_lane"]
+        return {
+            "project_id": project_id,
+            "backlog_id": postmerge_target_owner_authority["backlog_id"],
+            "contract_execution_id": postmerge_target_owner_authority[
+                "contract_execution_id"
+            ],
+            "runtime_context_id": selected["runtime_context_id"],
+            "task_id": selected["task_id"],
+            "parent_task_id": selected["parent_task_id"],
+            "merge_queue_id": selected["merge_queue_id"],
+            "source": "parallel_branch_runtime_context",
+            "server_derived": True,
+            "postmerge_selected_reconcile_lane_verified": True,
+            "contract_merge_authority": dict(
+                postmerge_target_owner_authority["aggregate_merge"]
+            ),
+        }
 
     body_scope = _contract_timeline_scope_from_graph_body(body)
     route_scope = (
@@ -102139,10 +102456,26 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             conn,
             "graph-governance.reconcile.current-full",
         )
+        activate_requested = bool(body.get("activate", True))
+        postmerge_target_owner = (
+            _current_full_reconcile_postmerge_target_owner(
+                conn,
+                project_id=project_id,
+                body=body,
+                auth=current_full_auth,
+                registered_root=_graph_governance_project_root(project_id, {}),
+            )
+            if activate_requested
+            and body.get("bind_only_preimplementation_provenance") is not True
+            else {}
+        )
+        if postmerge_target_owner:
+            root = Path(postmerge_target_owner["target_project_root"])
         head_commit = _git_head_commit(root)
         target_commit = str(
             body.get("target_commit_sha")
             or body.get("commit_sha")
+            or postmerge_target_owner.get("merged_commit_sha")
             or head_commit
             or ""
         ).strip()
@@ -102155,7 +102488,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
                 "target_commit_sha": target_commit,
             }
-        activate_requested = bool(body.get("activate", True))
         request_category = _current_full_reconcile_request_category(
             conn,
             request_context=ctx,
@@ -102271,6 +102603,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 if isinstance(source_free_reconcile_authority, Mapping)
                 else {}
             ),
+            postmerge_target_owner_authority=postmerge_target_owner,
         )
         merge_queue_id = str(
             runtime_context_scope.get("merge_queue_id")
