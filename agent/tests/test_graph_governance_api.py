@@ -112697,6 +112697,150 @@ def _strict_direct_main_close_ready_completion_world(conn, monkeypatch, tmp_path
     return {**world, "close_body": body, "qa_event": qa_event, "runtime": runtime}
 
 
+def test_strict_direct_first_close_projects_server_runtime_authority_before_validation(
+    conn, monkeypatch, tmp_path,
+):
+    world = _strict_direct_main_close_ready_completion_world(
+        conn, monkeypatch, tmp_path,
+    )
+    candidate = world["candidate_commit"]
+    # Model the first close position after the canonical reconcile line has
+    # landed, as in a Direct execution whose next action is observer_close_ready.
+    server._operator_supervised_direct_main_apply_timeline_runtime(
+        conn, project_id=PID, backlog_id=world["backlog_id"],
+        contract_execution_id=world["task_id"],
+        event_kind="current_full_reconcile", body=world["close_body"],
+        normalized_payload=world["close_body"]["payload"],
+    )
+    assert world["runtime"].store.get(world["task_id"])["runtime_guide"][
+        "next_legal_action"
+    ]["line_id"] == "observer_close_ready"
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body={
+                "backlog_id": world["backlog_id"], "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": world["route_token_ref"],
+            },
+        )
+    )
+    body = copy.deepcopy(guide["next_legal_action"]["copy_safe_body"])
+    body["contract_execution_id"] = world["task_id"]
+    assert server._contract_runtime_close_execution_id(body, conn=conn) == world["task_id"]
+    assert server._contract_runtime_close_event_kind_supported(body["event_kind"])
+    assert server._contract_runtime_completed_line_projection_preflight_gate(
+        conn, body=body, event_kind=body["event_kind"],
+        trusted_actor_role="observer",
+    ) == {}
+    body["verification"]["test_results"]["commands"] = (
+        _canonical_parentless_direct_main_test_results(candidate)["commands"]
+    )
+    body["payload"].update({"no_pass_claim": True, "overall_release_pass": False})
+    body["payload"]["direct_runtime_binding_hash"] = (
+        world["runtime"].store.get(world["task_id"])["metadata"][
+            "operator_supervised_direct_main_runtime_binding"
+        ]["binding_hash"]
+    )
+    loaded = {"loaded_commit": candidate, "runtime_stale": False,
+              "runtime_stale_reasons": []}
+    monkeypatch.setattr(
+        server, "__file__",
+        str(world["project_root"] / "agent/governance/server.py"),
+    )
+    monkeypatch.setattr(
+        server, "governance_loaded_runtime_identity",
+        lambda _version: dict(loaded),
+    )
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+
+    def reject_without_write(submitted, expected_code):
+        with pytest.raises(GovernanceError) as rejection:
+            server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID}, "observer", method="POST",
+                    body=copy.deepcopy(submitted),
+                )
+            )
+        assert rejection.value.code == expected_code
+        assert tuple(conn.iterdump()) == before
+        assert conn.total_changes == before_changes
+        return rejection.value
+
+    loaded["loaded_commit"] = world["base_commit"]
+    forged = copy.deepcopy(body)
+    forged["payload"]["runtime_deployment_authority"] = {
+        "applicable": True, "passed": True, "authority_hash": "caller-forged",
+    }
+    wrong_loaded = reject_without_write(
+        forged, "contract_runtime_close_evidence_rejected",
+    )
+    assert "runtime deployment authority" in json.dumps(wrong_loaded.details)
+    loaded["loaded_commit"] = candidate
+    loaded["runtime_stale"] = True
+    loaded["runtime_stale_reasons"] = ["loaded_commit_differs_from_worktree"]
+    reject_without_write(
+        forged, "contract_runtime_close_evidence_rejected",
+    )
+    loaded["runtime_stale"] = False
+    loaded["runtime_stale_reasons"] = []
+
+    malformed = copy.deepcopy(body)
+    malformed["verification"]["test_results"]["commands"] = []
+    reject_without_write(
+        malformed, "parentless_direct_main_close_ready_canonical_evidence_incomplete",
+    )
+
+    listed_events = task_timeline.list_events
+    for hidden_kind in ("observer_direct_implementation_exception", "implementation"):
+        with monkeypatch.context() as missing:
+            def without_required_event(*args, **kwargs):
+                events = listed_events(*args, **kwargs)
+                if kwargs.get("task_id") != world["task_id"]:
+                    return events
+                return [event for event in events if (
+                    str(event.get("event_kind") or "").strip() != hidden_kind
+                )]
+
+            missing.setattr(task_timeline, "list_events", without_required_event)
+            assert server._contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
+                conn, project_id=PID, body=forged, event_kind="close_ready",
+                normalized_status="passed", normalized_payload=body["payload"],
+                runtime_deployment_projection_only=True,
+            ) == {}
+            assert tuple(conn.iterdump()) == before
+            assert conn.total_changes == before_changes
+
+    close_gate = server._contract_runtime_close_gate
+    validated_deployment = []
+
+    def capture_close_validation(*args, **kwargs):
+        validated_deployment.append(copy.deepcopy(
+            kwargs["norm_payload"].get("runtime_deployment_authority")
+        ))
+        return close_gate(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_contract_runtime_close_gate", capture_close_validation)
+    accepted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST", body=forged,
+        )
+    )
+    projected = accepted["payload"]["runtime_deployment_authority"]
+    assert projected["server_derived"] is True
+    assert projected["caller_claims_trusted"] is False
+    assert projected["passed"] is True
+    assert projected["loaded_commit"] == candidate
+    assert projected["authority_hash"] == server.stable_sha256({
+        key: value for key, value in projected.items() if key != "authority_hash"
+    })
+    assert validated_deployment == [projected]
+    close_line = world["runtime"].store.get(world["task_id"])["completed_lines"][-1]
+    assert close_line["line_id"] == "observer_close_ready"
+    assert close_line["payload"]["runtime_deployment_authority"] == projected
+
+
 def test_strict_direct_rev3_exact_current_persisted_authority_without_landed_fields_remains_valid(
     conn, monkeypatch, tmp_path,
 ):

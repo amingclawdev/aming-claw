@@ -195053,19 +195053,24 @@ def _contract_runtime_close_gate(
             "canonical_submit_required": True,
             "direct_main_qa_facade_binding_validated": True,
         }
-    direct_implementation_precheck_only = bool(
+    direct_main_precheck_only = bool(
         str(authority_record.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
         and str(authority_record.get("revision") or "").strip()
         in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and actor_role == "observer"
-        and _contract_runtime_close_normalized(event_kind)
-        == "implementation"
+        and (
+            _contract_runtime_close_normalized(event_kind) == "implementation"
+            or (
+                _contract_runtime_close_normalized(event_kind) == "close_ready"
+                and str(line.get("line_id") or "").strip()
+                == "observer_close_ready"
+            )
+        )
     )
-    if direct_implementation_precheck_only:
-        # A generic Contract selector is an additional prewrite validator for
-        # Direct implementation evidence.  The timeline adapter below remains
-        # the sole canonical writer after every server projection is complete.
+    if direct_main_precheck_only:
+        # The generic Contract selector validates strict Direct submissions;
+        # the timeline adapter writes after all canonical evidence checks.
         result = runtime.precheck_line_write(
             contract_execution_id,
             write,
@@ -195102,7 +195107,7 @@ def _contract_runtime_close_gate(
             "decision": result.get("decision") or {},
             **_contract_runtime_qa_rejection_response_fields(result),
         }
-        if direct_implementation_precheck_only:
+        if direct_main_precheck_only:
             diagnostics.update(
                 {
                     "zero_write_rejection": True,
@@ -195125,7 +195130,7 @@ def _contract_runtime_close_gate(
             422,
             diagnostics,
         )
-    if direct_implementation_precheck_only:
+    if direct_main_precheck_only:
         return {
             "schema_version": (
                 _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
@@ -203775,6 +203780,7 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
     event_kind: str,
     normalized_status: str,
     normalized_payload: Mapping[str, Any],
+    runtime_deployment_projection_only: bool = False,
 ) -> dict[str, Any]:
     """Reject incomplete direct-main close evidence before it becomes immutable."""
 
@@ -203957,6 +203963,12 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
         if strict_binding
         else {}
     )
+    if runtime_deployment_projection_only:
+        return (
+            {"runtime_deployment_authority": runtime_deployment_authority}
+            if runtime_deployment_authority
+            else {}
+        )
     if runtime_deployment_authority:
         checks["runtime_deployment_current_if_applicable"] = bool(
             runtime_deployment_authority.get("applicable") is False
@@ -210677,6 +210689,23 @@ def _handle_task_timeline_append(ctx: RequestContext):
                 409,
                 binding_mismatch,
             )
+        if (
+            task_timeline._close_event_key(
+                {"event_kind": ctx.body.get("event_kind")}
+            ) == "close_ready"
+            and _operator_supervised_direct_main_strict_records(
+                conn,
+                project_id=project_id,
+                backlog_id=str(ctx.body.get("backlog_id") or "").strip(),
+                contract_execution_id=str(ctx.body.get("task_id") or "").strip(),
+            )
+        ):
+            # The strict Direct close consumes only server-projected deployment
+            # identity; caller claims cannot satisfy or override that proof.
+            for container_key in ("payload", "verification", "artifact_refs"):
+                container = ctx.body.get(container_key)
+                if isinstance(container, dict):
+                    container.pop("runtime_deployment_authority", None)
         trusted_contract_runtime_actor_role = (
             _trusted_contract_runtime_actor_role_from_context(ctx, conn)
         )
@@ -211133,6 +211162,26 @@ def _handle_task_timeline_append(ctx: RequestContext):
                     contract_runtime_completed_projection_gate
                 )
             else:
+                # The strict Direct close line consumes this server-owned
+                # authority before the full canonical prewrite gate runs.
+                direct_deployment_projection = (
+                    _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
+                        conn,
+                        project_id=project_id,
+                        body=ctx.body or {},
+                        event_kind=norm_event_kind,
+                        normalized_status=norm_status,
+                        normalized_payload=validation_payload,
+                        runtime_deployment_projection_only=True,
+                    )
+                )
+                runtime_deployment_authority = (
+                    direct_deployment_projection.get("runtime_deployment_authority")
+                )
+                if isinstance(runtime_deployment_authority, Mapping):
+                    validation_payload["runtime_deployment_authority"] = dict(
+                        runtime_deployment_authority
+                    )
                 if not trusted_contract_runtime_actor_role:
                     trusted_contract_runtime_actor_role = (
                         _trusted_contract_runtime_actor_role_from_context(ctx, conn)
