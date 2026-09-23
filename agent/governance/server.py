@@ -98651,6 +98651,25 @@ def _current_full_reconcile_postmerge_target_owner(
         and str(body.get("backlog_id") or backlog_id).strip() == backlog_id
     ):
         reject("route_contract_scope_mismatch")
+    try:
+        record = _contract_runtime(conn).current_record(
+            execution_id, actor_role="observer"
+        )
+    except (ContractRuntimeError, sqlite3.Error):
+        reject("current_contract_view_unavailable")
+    if not (
+        _is_mf_parallel_postmerge_revision(record)
+        and str(record.get("project_id") or "") == project_id
+        and str(record.get("backlog_id") or "") == backlog_id
+        and str(record.get("contract_execution_id") or "") == execution_id
+    ):
+        reject("current_contract_view_scope_mismatch")
+    record, _context_projection = (
+        _contract_runtime_apply_mf_parallel_context_projection(
+            conn, project_id=project_id, record=record,
+            actor_role="observer",
+        )
+    )
     guide = record.get("runtime_guide")
     guide = guide if isinstance(guide, Mapping) else {}
     selected_action = guide.get("next_legal_action")
@@ -98718,6 +98737,8 @@ def _current_full_reconcile_postmerge_target_owner(
         record=record,
         aggregate_merge=aggregate,
     )
+    # The freshly compiled CEX Guide selects the line. RuntimeContext and the
+    # verified aggregate select its lane; the raw Guide carries no lane fields.
     selected_identity = {
         field: str(selected.get(field) or "").strip()
         for field in (
@@ -98745,12 +98766,6 @@ def _current_full_reconcile_postmerge_target_owner(
         in set(aggregate.get("lane_merge_queue_ids") or [])
         and route_task_id
         in {execution_id, selected_identity["task_id"]}
-        and all(
-            str(selected_action.get(field) or "").strip() == expected
-            for field, expected in selected_identity.items()
-        )
-        and str(selected_action.get("line_instance_id") or "").strip()
-        == f"runtime_context:{selected_identity['runtime_context_id']}"
     ):
         reject("selected_reconcile_lane_unverified")
     from .parallel_branch_runtime import (
@@ -160356,14 +160371,32 @@ def _ac_dev_mf_parallel_postmerge_reconcile_route_recipe(
     ):
         reject("selected_contract_not_current")
     try:
-        record = _contract_runtime_store(conn).get(contract_execution_id)
+        record = _contract_runtime(conn).current_record(
+            contract_execution_id, actor_role="observer"
+        )
     except (ContractRuntimeError, sqlite3.Error):
         reject("selected_contract_missing")
+    record, _context_projection = (
+        _contract_runtime_apply_mf_parallel_context_projection(
+            conn, project_id=project_id, record=record,
+            actor_role="observer",
+        )
+    )
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
     selected = guide.get("next_legal_action") if isinstance(guide.get("next_legal_action"), Mapping) else {}
-    task_id = str(selected.get("task_id") or "").strip()
-    runtime_context_id = str(selected.get("runtime_context_id") or "").strip()
-    merge_queue_id = str(selected.get("merge_queue_id") or "").strip()
+    required_count = _contract_runtime_mf_parallel_current_generation_worker_count(
+        record, conn=conn, project_id=project_id
+    )
+    aggregate = _contract_runtime_rev8_two_worker_merge_projection(
+        record, required_worker_count=required_count,
+        conn=conn, project_id=project_id,
+    )
+    lane = _contract_runtime_rev8_selected_reconcile_lane_projection(
+        conn, project_id=project_id, record=record, aggregate_merge=aggregate,
+    )
+    task_id = str(lane.get("task_id") or "").strip()
+    runtime_context_id = str(lane.get("runtime_context_id") or "").strip()
+    merge_queue_id = str(lane.get("merge_queue_id") or "").strip()
     try:
         revision = int(record.get("execution_state_revision") or 0)
     except (TypeError, ValueError):
@@ -160374,7 +160407,13 @@ def _ac_dev_mf_parallel_postmerge_reconcile_route_recipe(
         and str(record.get("backlog_id") or "") == backlog_id
         and str(record.get("contract_execution_id") or "") == contract_execution_id
         and str(selected.get("line_id") or "") == "observer_reconcile"
-        and str(selected.get("parent_task_id") or "") == contract_execution_id
+        and aggregate.get("authority_verified") is True
+        and aggregate.get("all_lane_merges_verified") is True
+        and lane.get("reconcile_lane_identity_source")
+        == "RuntimeContext.current_values"
+        and str(lane.get("parent_task_id") or "") == contract_execution_id
+        and lane.get("reconcile_line_instance_id")
+        == f"runtime_context:{runtime_context_id}"
         and task_id and runtime_context_id and merge_queue_id and revision > 0
     ):
         reject("selected_reconcile_generation_invalid")
