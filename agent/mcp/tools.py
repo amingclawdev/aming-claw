@@ -2819,6 +2819,8 @@ def _current_full_reconcile_compact_result(
                 "head_commit",
                 "active_graph_commit",
                 "current_full_reconcile",
+                "dev_force_graph_only",
+                "graph_reconciled",
                 "strategy",
                 "scope_reconcile_strategy",
                 "graph_delta_mode",
@@ -4599,6 +4601,10 @@ TOOLS: list[dict] = [
                 "commit_sha": {"type": "string"},
                 "target_head_commit": {"type": "string"},
                 "head_commit": {"type": "string"},
+                "dev_force_graph_route": {
+                    "type": "boolean",
+                    "description": "Exact DEV graph-only observer enrollment route returned by live Onboard.",
+                },
             },
             "required": ["project_id", "caller_role", "task_id"],
         },
@@ -6557,6 +6563,15 @@ TOOLS: list[dict] = [
                 "run_id": {"type": "string"},
                 "snapshot_id": {"type": "string"},
                 "expected_old_snapshot_id": {"type": "string"},
+                "dev_force_graph": {
+                    "type": "boolean",
+                    "description": "Explicit DEV observer graph-only build or activation mode.",
+                },
+                "force_reason": {"type": "string"},
+                "operator_authorization_ref": {
+                    "type": "string",
+                    "description": "Audit reference only; never an authentication credential.",
+                },
                 "project_root": {
                     "type": "string",
                     "description": (

@@ -3400,6 +3400,7 @@ def record_current_full_reconcile_provenance(
     runtime_context_scope: Mapping[str, Any] | None = None,
     marker_created_at: str | None = None,
     schema_ready: bool = False,
+    dev_force_graph_only: bool = False,
 ) -> dict[str, Any]:
     """Seal one protected current-full completion to its durable reconcile event."""
 
@@ -3522,7 +3523,8 @@ def record_current_full_reconcile_provenance(
         "target_commit_sha": target_commit_sha,
         "snapshot_id": snapshot_id,
         "activate": True,
-        "normal_update_path": True,
+        "normal_update_path": not dev_force_graph_only,
+        "dev_force_graph_only": bool(dev_force_graph_only),
         "reconcile_event_id": reconcile_event_id,
         "reconcile_event_created_at": reconcile_event_created_at,
         "route_evidence": safe_route_evidence,
@@ -3715,7 +3717,7 @@ def _current_full_snapshot_provenance_binding(
     except (TypeError, ValueError):
         marker_reconcile_event_id = 0
         provenance_reconcile_event_id = 0
-    verified = bool(
+    common_verified = bool(
         project_id
         and snapshot_id
         and snapshot_commit
@@ -3729,7 +3731,6 @@ def _current_full_snapshot_provenance_binding(
         and _stable_sha256(marker_core) == marker_hash
         and str(marker.get("schema_version") or "").strip()
         == "current_full_reconcile.provenance.v2"
-        and marker.get("normal_update_path") is True
         and marker.get("activate") is True
         and str(marker.get("target_commit_sha") or "").strip().lower()
         == snapshot_commit
@@ -3778,8 +3779,25 @@ def _current_full_snapshot_provenance_binding(
         == "graph_current_full_reconcile"
         and runtime_context_scope_link_verified
     )
+    verified = bool(
+        common_verified
+        and marker.get("normal_update_path") is True
+        and marker.get("dev_force_graph_only") is not True
+    )
+    force_verified = bool(
+        common_verified
+        and marker.get("normal_update_path") is False
+        and marker.get("dev_force_graph_only") is True
+        and route_evidence.get("dev_force_graph_only") is True
+        and route_evidence.get("authenticated_role") == "observer"
+        and route_evidence.get("authentication_source")
+        == "observer_session_route_token_ref"
+        and not marker_runtime_scope
+        and not route_runtime_scope
+    )
     return {
         "verified": verified,
+        "force_verified": force_verified,
         "snapshot_id": snapshot_id,
         "snapshot_commit": snapshot_commit,
         "snapshot_status": snapshot_status,
@@ -4052,6 +4070,7 @@ def current_full_active_terminal_tuple(
     target_commit_sha: str,
     expected_scope: Mapping[str, Any],
     snapshot_id: str,
+    dev_force_graph_only: bool = False,
 ) -> dict[str, Any]:
     """Pure-read proof of one exact server-authored active completion."""
 
@@ -4188,11 +4207,11 @@ def current_full_active_terminal_tuple(
         ):
             if str(metric.get(field) or "") != expected:
                 errors.append(f"terminal_metric_{field}_mismatch")
-        if metric_mode not in {
-            "full_rebuild",
-            "bind_only_existing_full",
-            "same_active_current_full",
-        }:
+        accepted_modes = (
+            {"dev_force_graph_only"} if dev_force_graph_only
+            else {"full_rebuild", "bind_only_existing_full", "same_active_current_full"}
+        )
+        if metric_mode not in accepted_modes:
             errors.append("terminal_metric_graph_delta_mode_mismatch")
     if not isinstance(evidence_value, Mapping):
         errors.append("terminal_metric_evidence_malformed")
@@ -4218,7 +4237,9 @@ def current_full_active_terminal_tuple(
         if not provenance:
             errors.append("terminal_provenance_missing")
         else:
-            if provenance_binding.get("verified") is not True:
+            if provenance_binding.get(
+                "force_verified" if dev_force_graph_only else "verified"
+            ) is not True:
                 errors.append("terminal_provenance_binding_invalid")
             if str(provenance_binding.get("provenance_id") or "") != provenance_id:
                 errors.append("terminal_provenance_id_mismatch")
@@ -4234,10 +4255,14 @@ def current_full_active_terminal_tuple(
             errors.append("terminal_timeline_missing")
         else:
             if (
-                str(timeline_event.get("event_type") or "") != "graph.reconcile"
-                or str(timeline_event.get("event_kind") or "") != "reconcile"
-                or str(timeline_event.get("phase") or "") != "reconcile"
-                or str(timeline_event.get("status") or "") != "passed"
+                str(timeline_event.get("event_type") or "")
+                != "graph.reconcile"
+                or str(timeline_event.get("event_kind") or "")
+                != "reconcile"
+                or str(timeline_event.get("phase") or "")
+                != "reconcile"
+                or str(timeline_event.get("status") or "")
+                != ("recorded" if dev_force_graph_only else "passed")
                 or str(timeline_event.get("backlog_id") or "")
                 != expected_scope.get("backlog_id")
                 or str(timeline_event.get("task_id") or "")
@@ -4252,13 +4277,26 @@ def current_full_active_terminal_tuple(
                 or str(timeline_payload.get("snapshot_id") or "") != snapshot_id
                 or str(timeline_payload.get("active_snapshot_id") or "")
                 != snapshot_id
-                or timeline_payload.get("current_full_reconcile") is not True
-                or timeline_payload.get("graph_reconciled") is not True
-                or str(event_trace.get("run_id") or "") != run_id
+                or (
+                    not (
+                        timeline_payload.get("dev_force_graph_only") is True
+                        and timeline_payload.get("graph_reconciled") is False
+                        and not timeline_payload.get("contract_evidence")
+                        and str(timeline_payload.get("run_id") or "") == run_id
+                    )
+                    if dev_force_graph_only
+                    else (
+                        timeline_payload.get("current_full_reconcile") is not True
+                        or timeline_payload.get("graph_reconciled") is not True
+                        or str(event_trace.get("run_id") or "") != run_id
+                    )
+                )
             ):
                 errors.append("terminal_timeline_payload_mismatch")
-            if str(event_result.get("graph_delta_mode") or "") != str(
-                metric.get("graph_delta_mode") or ""
+            if (
+                not dev_force_graph_only
+                and str(event_result.get("graph_delta_mode") or "")
+                != str(metric.get("graph_delta_mode") or "")
             ):
                 errors.append("terminal_timeline_metric_mode_mismatch")
             metric_mode = str(metric.get("graph_delta_mode") or "")

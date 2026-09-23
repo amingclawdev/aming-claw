@@ -82,6 +82,377 @@ from agent.governance.contract_runtime_visualization import (
 from agent.governance.db import _ensure_schema
 
 
+@pytest.mark.parametrize("audit_failure", [False, True])
+def test_dev_force_graph_guide_enrollment_build_activate_and_normal_denial(
+    conn, monkeypatch, tmp_path, audit_failure,
+):
+    """A stale DEV graph can be refreshed without creating contract evidence."""
+
+    project_id = "aming-claw"
+    backlog_id = "AC-DEV-FORCE-GRAPH-TEST"
+    root = tmp_path / "dev-source"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", root], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+    (root / "source.py").write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "source.py"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "candidate"], check=True)
+    head = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    conn.execute(
+        "INSERT INTO backlog_bugs (bug_id,title,status,mf_type,target_files,test_files,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (backlog_id, "force graph", "OPEN", "chain_rescue",
+         json.dumps(["agent/governance/server.py"]), json.dumps(["agent/tests/test_graph_governance_api.py"]),
+         "2026-09-23T00:00:00Z", "2026-09-23T00:00:00Z"),
+    )
+    monkeypatch.setattr(
+        store, "_graph_activation_policy_for_connection",
+        lambda _conn: {
+            "runtime_plane": "stable", "active_graph_activation_allowed": True,
+            "project_id": project_id,
+        },
+    )
+    _activate_basic_graph(
+        conn, "full-old-force-test", project_id=project_id,
+        commit_sha="a" * 40,
+    )
+    world = {
+        "accepted": True,
+        "target_head_commit": head,
+        "loaded_runtime_commit": head,
+        "target_project_root": str(root.resolve()),
+        "world_hash": "sha256:" + "b" * 64,
+        "namespace_hash": "sha256:" + "c" * 64,
+        "database_identity": {"world_id": "ac-dev"},
+    }
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(server, "_dev_exact_source_root", lambda: root.resolve())
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: dict(world),
+    )
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_: root.resolve())
+    monkeypatch.setattr(
+        server, "_onboard_route_guide_service_response_base",
+        lambda _conn, **_kwargs: {"ok": True, "onboard_route_guide": {}},
+    )
+    monkeypatch.setattr(
+        governance_db, "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "stable", "active_graph_activation_allowed": True,
+            "project_id": project_id,
+        },
+    )
+    monkeypatch.setitem(
+        server._GOVERNANCE_MANAGER_CERTIFICATES, project_id,
+        _test_manager_certificate(project_id),
+    )
+    guide = server._onboard_route_guide_service_response(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        role="observer", work_type="operator_supervised_direct_main",
+        request_body={}, route_token_ref="",
+    )
+    issue_body = guide["next_legal_action"]["copy_safe_body"]
+    assert issue_body["allowed_actions"] == [
+        "observer_session_register", "dev_force_graph",
+    ]
+    with pytest.raises(server.GovernanceError):
+        server.handle_observer_route_context_issue(_ctx(
+            {"project_id": project_id}, method="POST", body={
+                **issue_body, "target_files": ["foreign.py"],
+            },
+        ))
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": project_id}, method="POST", body=issue_body),
+    )
+    assert issued["ok"] is True
+    ref = issued["route_token_ref"]
+    registered = server.handle_observer_session_register(_ctx(
+        {"project_id": project_id}, method="POST", body={
+            "route_token_ref": ref, "backlog_id": backlog_id,
+            "task_id": issue_body["task_id"],
+        },
+    ))
+    assert registered[0] == 201, registered
+    session_id = registered[1]["session_id"]
+    guide = server._onboard_route_guide_service_response(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        role="observer", work_type="operator_supervised_direct_main",
+        request_body={"observer_session_id": session_id}, route_token_ref=ref,
+    )
+    build_body = guide["next_legal_action"]["copy_safe_body"]
+    assert build_body["activate"] is False
+    for denied_index, denied_body in enumerate((
+        {**build_body, "observer_session_id": "unknown-session"},
+        {**build_body, "route_token_ref": "unknown-route"},
+        {**build_body, "backlog_id": "FOREIGN-BACKLOG"},
+        {**build_body, "task_id": "foreign-task"},
+        {**build_body, "target_commit_sha": "f" * 40},
+        {**build_body, "project_root": str(tmp_path)},
+    )):
+        try:
+            denied = server.handle_graph_governance_current_full_reconcile(
+                _ctx({"project_id": project_id}, method="POST", body=denied_body),
+            )
+        except server.GovernanceError:
+            continue
+        assert denied[0] in {400, 403, 409, 422}, (denied_index, denied)
+
+    from agent.governance import state_reconcile as force_state
+
+    def build_candidate(_conn, _project_id, _root, **kwargs):
+        store.create_graph_snapshot(
+            _conn, _project_id, snapshot_id=kwargs["snapshot_id"],
+            commit_sha=head, snapshot_kind="full", graph_json=_graph(),
+            notes=json.dumps({"run_id": kwargs["run_id"]}),
+        )
+        _conn.commit()
+        return {
+            "ok": True, "snapshot_id": kwargs["snapshot_id"],
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(force_state, "run_state_only_full_reconcile", build_candidate)
+    SQLiteContractExecutionStore(conn)
+    before_contract_rows = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0]
+    built_status, built = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": project_id}, method="POST", body=build_body),
+    )
+    assert built_status == 201, built
+    assert built["dev_force_graph_only"] is True
+    activation_body = built["next_action"]["copy_safe_body"]
+    for denied_body in (
+        {**activation_body, "expected_old_snapshot_id": "wrong-old"},
+        {**activation_body, "snapshot_id": "wrong-candidate"},
+    ):
+        denied_status, denied = server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": project_id}, method="POST", body=denied_body),
+        )
+        assert denied_status == 409, denied
+    companion = store.snapshot_companion_dir(
+        project_id, activation_body["snapshot_id"],
+    ) / "graph.json"
+    companion_original = companion.read_bytes()
+    companion.write_text("{}\n", encoding="utf-8")
+    companion_status, companion_denied = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": project_id}, method="POST", body=activation_body),
+    )
+    assert companion_status == 409, companion_denied
+    companion.write_bytes(companion_original)
+    (root / "source.py").write_text("value = 2\n", encoding="utf-8")
+    dirty_status, dirty = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": project_id}, method="POST", body=activation_body),
+    )
+    assert dirty_status == 409 and dirty["error"] == "dirty_worktree"
+    (root / "source.py").write_text("value = 1\n", encoding="utf-8")
+    old_active_id = store.get_active_graph_snapshot(conn, project_id)["snapshot_id"]
+    if audit_failure:
+        def reject_audit(*_args, **_kwargs):
+            raise RuntimeError("injected force audit failure")
+
+        monkeypatch.setattr(server, "_record_current_full_atomic_evidence", reject_audit)
+        with pytest.raises(RuntimeError, match="injected force audit failure"):
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx({"project_id": project_id}, method="POST", body=activation_body),
+            )
+        assert store.get_active_graph_snapshot(conn, project_id)["snapshot_id"] == old_active_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events WHERE project_id=? AND backlog_id=?",
+            (project_id, backlog_id),
+        ).fetchone()[0] == 0
+        return
+    activated_status, activated = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": project_id}, method="POST", body=activation_body),
+    )
+    assert activated_status == 200, activated
+    assert activated["activated"] is True
+    assert activated["dev_force_graph_only"] is True
+    assert activated["graph_reconciled"] is False
+    assert store.get_active_graph_snapshot(conn, project_id)["commit_sha"] == head
+    event = conn.execute(
+        "SELECT event_type,payload_json FROM task_timeline_events "
+        "WHERE project_id=? AND backlog_id=? ORDER BY id DESC LIMIT 1",
+        (project_id, backlog_id),
+    ).fetchone()
+    assert event["event_type"] == "graph.reconcile"
+    assert json.loads(event["payload_json"])["contract_runtime_mutated"] is False
+    assert event["payload_json"] and json.loads(event["payload_json"])["graph_reconciled"] is False
+    metric = conn.execute(
+        "SELECT evidence_json FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+        (project_id, activation_body["run_id"]),
+    ).fetchone()
+    normal_tuple = store.current_full_active_terminal_tuple(
+        conn, project_id=project_id, run_id=activation_body["run_id"],
+        target_commit_sha=head,
+        expected_scope=json.loads(metric["evidence_json"])["idempotency_scope"],
+        snapshot_id=activated["snapshot_id"],
+    )
+    assert normal_tuple["valid"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0] == before_contract_rows
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": project_id}, method="POST", body=activation_body),
+    )
+    assert replay_status == 200 and replay["idempotent_replay"] is True
+    changed_audit_status, changed_audit = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": project_id}, method="POST", body={
+            **activation_body, "force_reason": "different audit explanation",
+        }),
+    )
+    assert changed_audit_status == 409 and changed_audit["ok"] is False
+    conn.execute(
+        "UPDATE observer_sessions SET status='revoked', revoked_at=? WHERE session_id=?",
+        ("2026-09-23T00:00:00Z", session_id),
+    )
+    with pytest.raises(server.GovernanceError):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": project_id}, method="POST", body=activation_body),
+        )
+    conn.execute(
+        "UPDATE observer_sessions SET status='active', revoked_at='' WHERE session_id=?",
+        (session_id,),
+    )
+    conn.execute(
+        "UPDATE observer_route_token_refs SET expires_at=? WHERE route_token_ref=?",
+        ("2000-01-01T00:00:00Z", ref),
+    )
+    with pytest.raises((server.GovernanceError, observer_route_context.RouteTokenRefError)):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": project_id}, method="POST", body=activation_body),
+        )
+    conn.execute(
+        "UPDATE observer_route_token_refs SET expires_at=? WHERE route_token_ref=?",
+        ("2099-01-01T00:00:00Z", ref),
+    )
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    with pytest.raises(server.GovernanceError):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": project_id}, method="POST", body=activation_body),
+        )
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: (_ for _ in ()).throw(server.GovernanceError(
+            "ac_dev_direct_main_runtime_world_invalid", "stale source", 409,
+        )),
+    )
+    with pytest.raises(server.GovernanceError):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": project_id}, method="POST", body=activation_body),
+        )
+    with pytest.raises(server.GovernanceError):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": project_id}, method="POST", body={
+                key: value for key, value in activation_body.items()
+                if key != "dev_force_graph"
+            }),
+        )
+
+    # A later genuine QA route can create normal proof using a new run at
+    # this already-current graph.  The force receipt itself remains invalid
+    # to the normal verifier above.
+    normal_auth = {
+        "role": "observer", "role_source": "observer_session_route_token_ref",
+        "observer_session_id": "new-qa-observer", "route_token_ref": "new-qa-route",
+        "route_token_scope": {
+            "project_id": project_id, "backlog_id": backlog_id,
+            "task_id": "cex-new-qa",
+        },
+    }
+    qa_authority = {
+        "applicable": True, "passed": True, "qa_passed": True,
+        "close_satisfying": True, "landed_ancestor_current_head_verified": True,
+    }
+    monkeypatch.setattr(
+        server, "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: dict(normal_auth),
+    )
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_reconcile_qa_preflight_authority",
+        lambda *_args, **_kwargs: dict(qa_authority),
+    )
+    monkeypatch.setattr(
+        server, "_current_full_reconcile_runtime_context_scope",
+        lambda *_args, **_kwargs: {},
+    )
+    normal_run = "normal-after-force-new-run"
+    normal_route = server._current_full_reconcile_route_evidence(
+        normal_auth, runtime_context_scope={},
+    )
+    normal_route["direct_main_qa_preflight_authority"] = dict(qa_authority)
+    normal_route.update(
+        reconcile_run_id=normal_run,
+        idempotency_scope=server._current_full_reconcile_idempotency_scope(normal_route),
+    )
+    normal_body = {
+        "backlog_id": backlog_id, "task_id": "cex-new-qa",
+        "run_id": normal_run, "snapshot_id": activated["snapshot_id"],
+        "expected_old_snapshot_id": activated["snapshot_id"],
+        "target_commit_sha": head, "activate": True,
+    }
+    normal_status, normal_result = (
+        server._operator_supervised_direct_main_post_qa_same_active_reconcile(
+            _ctx({"project_id": project_id}, method="POST", body=normal_body),
+            conn, store, root=root, project_id=project_id,
+            body=normal_body, route_evidence=normal_route,
+            runtime_context_scope={}, target_commit=head, head_commit=head,
+            request_started_at=server._utc_now(),
+            request_total_changes_before=conn.total_changes,
+        )
+    )
+    assert normal_status == 201, normal_result
+    assert normal_result["same_active_current_full"] is True
+    normal_tuple = store.current_full_active_terminal_tuple(
+        conn, project_id=project_id, run_id=normal_run,
+        target_commit_sha=head,
+        expected_scope=normal_route["idempotency_scope"],
+        snapshot_id=activated["snapshot_id"],
+    )
+    assert normal_tuple["valid"] is True, normal_tuple["errors"]
+
+
+def test_dev_force_graph_mcp_transport_is_explicit_and_copy_safe():
+    from agent.mcp import tools as mcp_tools
+
+    schemas = {tool["name"]: tool["inputSchema"] for tool in mcp_tools.TOOLS}
+    assert "dev_force_graph_route" in schemas["observer_route_context_issue"]["properties"]
+    current_schema = schemas["graph_current_full_reconcile"]
+    assert {"dev_force_graph", "force_reason", "operator_authorization_ref"} <= set(
+        current_schema["properties"]
+    )
+    calls = []
+
+    def api(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "dev_force_graph_only": True, "graph_reconciled": False}
+
+    dispatcher = mcp_tools.ToolDispatcher(api, worker_pool=None)
+    body = {
+        "project_id": "aming-claw", "dev_force_graph": True,
+        "force_reason": "loaded DEV graph stale", "operator_authorization_ref": "audit-only",
+        "activate": False, "run_id": "force-mcp-run",
+        "observer_session_id": "observer-session", "route_token_ref": "route-ref",
+        "backlog_id": "AC-FORCE", "task_id": "force-task",
+    }
+    result = dispatcher.dispatch("graph_current_full_reconcile", body)
+    assert result["dev_force_graph_only"] is True
+    assert calls == [(
+        "POST", "/api/graph-governance/aming-claw/reconcile/current-full",
+        {
+            **{key: value for key, value in body.items()
+               if key not in {"project_id", "route_token_ref"}},
+            "observer_route_token_ref": "route-ref",
+        },
+    )]
+
+
 def test_canonical_ref_adoption_intent_is_exactly_route_scoped():
     """The new intent is data, but it cannot widen an issued observer route."""
 

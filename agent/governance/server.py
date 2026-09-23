@@ -7198,15 +7198,37 @@ def handle_observer_session_register(ctx: RequestContext):
             cwd = str(ctx.body.get("cwd") or "")
             session_id = str(ctx.body.get("session_id") or "") or None
             if _runtime_plane() == "dev":
-                capabilities = observer_route_context.resolve_observer_session_registration_route(
-                    conn,
-                    project_id=project_id,
-                    storage_project_id=_route_registry_storage_project_id(project_id),
+                force_route = _dev_force_graph_resolved_route(
+                    conn, project_id=project_id,
                     route_token_ref=str(ctx.body.get("route_token_ref") or ""),
                     backlog_id=str(ctx.body.get("backlog_id") or ""),
                     task_id=str(ctx.body.get("task_id") or ""),
-                    cex_id=str(ctx.body.get("cex_id") or ""),
+                    require_force=False,
                 )
+                if force_route:
+                    if str(ctx.body.get("cex_id") or "").strip():
+                        raise ValueError("graph-only observer registration has no CEX")
+                    capabilities = {
+                        "actions": ["observer_session_heartbeat", "observer_session_close",
+                                    "observer_session_revoke"],
+                        "command_types": [],
+                        "route_provenance": {
+                            "route_token_ref": str(ctx.body.get("route_token_ref") or ""),
+                            "backlog_id": str(ctx.body.get("backlog_id") or ""),
+                            "task_id": str(ctx.body.get("task_id") or ""),
+                            "dev_force_graph_only": True,
+                        },
+                    }
+                else:
+                    capabilities = observer_route_context.resolve_observer_session_registration_route(
+                        conn,
+                        project_id=project_id,
+                        storage_project_id=_route_registry_storage_project_id(project_id),
+                        route_token_ref=str(ctx.body.get("route_token_ref") or ""),
+                        backlog_id=str(ctx.body.get("backlog_id") or ""),
+                        task_id=str(ctx.body.get("task_id") or ""),
+                        cex_id=str(ctx.body.get("cex_id") or ""),
+                    )
                 observer_kind = "codex"
                 pid = 0
                 cwd = ""
@@ -8359,6 +8381,152 @@ def _canonical_ref_adoption_server_issue_body(
         conn.close()
 
 
+_DEV_FORCE_GRAPH_ACTION = "dev_force_graph"
+_DEV_FORCE_GRAPH_MARKER = "dev_force_graph_only:v1"
+
+
+def _dev_force_graph_issue_body(
+    conn, *, project_id: str, backlog_id: str,
+) -> dict[str, Any]:
+    """Derive one DEV graph-only enrollment route from the live world and row."""
+
+    if project_id != AC_PROJECT_ID or _runtime_plane() != "dev":
+        raise GovernanceError("dev_force_graph_wrong_world", "DEV graph force is unavailable", 403)
+    world = _operator_supervised_direct_main_dev_world_authority()
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id=?", (backlog_id,),
+    ).fetchone()
+    files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    if not row or str(row["status"] or "") != "OPEN" or not files:
+        raise GovernanceError(
+            "dev_force_graph_backlog_scope_invalid",
+            "DEV graph force requires one open file-scoped backlog row", 409,
+        )
+    task_id = "dev-force-graph-" + stable_sha256(
+        {"project_id": project_id, "backlog_id": backlog_id}
+    ).removeprefix("sha256:")[:20]
+    return {
+        "project_id": project_id, "caller_role": "observer",
+        "backlog_id": backlog_id, "task_id": task_id,
+        "target_files": files, "owned_files": files,
+        "allowed_actions": ["observer_session_register", _DEV_FORCE_GRAPH_ACTION],
+        "evidence_refs": [
+            f"backlog:{backlog_id}", _DEV_FORCE_GRAPH_MARKER,
+            f"dev_force_graph_head:{world['target_head_commit']}",
+            f"dev_force_graph_world:{world['world_hash']}",
+        ],
+        "dev_force_graph_route": True,
+    }
+
+
+def _dev_force_graph_resolved_route(
+    conn, *, project_id: str, route_token_ref: str, backlog_id: str,
+    task_id: str, require_force: bool = True,
+) -> dict[str, Any]:
+    """Read an exact persisted force route; a registration probe may miss."""
+
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=route_token_ref, backlog_id=backlog_id,
+            task_id=task_id, renew_within_seconds=0,
+        )
+    except observer_route_context.RouteTokenRefError:
+        if not require_force:
+            return {}
+        raise
+    evidence = list((resolved or {}).get("evidence_refs") or [])
+    if _DEV_FORCE_GRAPH_MARKER not in evidence:
+        if not require_force:
+            return {}
+        raise GovernanceError("dev_force_graph_route_required", "exact force route required", 403)
+    expected = _dev_force_graph_issue_body(
+        conn, project_id=project_id, backlog_id=backlog_id,
+    )
+    resolved_scope = (
+        resolved.get("scope")
+        if isinstance((resolved or {}).get("scope"), Mapping) else {}
+    )
+    if not (
+        resolved and resolved.get("caller_role") == "observer"
+        and str(resolved_scope.get("project_id") or "") == project_id
+        and str(resolved_scope.get("backlog_id") or "") == backlog_id
+        and str(resolved_scope.get("task_id") or "") == task_id == expected["task_id"]
+        and sorted(resolved.get("target_files") or []) == expected["target_files"]
+        and sorted(resolved.get("owned_files") or []) == expected["owned_files"]
+        and list(resolved.get("allowed_actions") or []) == expected["allowed_actions"]
+        and sorted(evidence) == sorted([
+            f"route:{resolved.get('route_id')}", *expected["evidence_refs"]
+        ])
+    ):
+        raise GovernanceError(
+            "dev_force_graph_route_scope_changed",
+            "force route does not match the current DEV world and backlog", 409,
+        )
+    return dict(resolved)
+
+
+def _handle_dev_force_graph_route_issue(
+    ctx: RequestContext, *, project_id: str, body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist a narrow enrollment route before a fresh observer session exists."""
+
+    from . import observer_route_context
+
+    conn = get_connection(project_id)
+    try:
+        backlog_id = str(body.get("backlog_id") or "").strip()
+        expected = _dev_force_graph_issue_body(
+            conn, project_id=project_id, backlog_id=backlog_id,
+        )
+        if dict(body) != expected:
+            raise GovernanceError(
+                "dev_force_graph_route_not_guide_bound",
+                "force route issue requires the exact live Guide body", 409,
+                {"expected_body": expected, "zero_write_rejection": True},
+            )
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if _dev_force_graph_issue_body(
+                    conn, project_id=project_id, backlog_id=backlog_id,
+                ) != expected:
+                    raise GovernanceError(
+                        "dev_force_graph_route_world_changed", "DEV force route world changed", 409,
+                    )
+                issued = observer_route_context.issue_observer_write_route_context(
+                    project_id=project_id, backlog_id=backlog_id,
+                    task_id=expected["task_id"], target_files=expected["target_files"],
+                    allowed_actions=expected["allowed_actions"],
+                    evidence_refs=expected["evidence_refs"],
+                    project_root=Path(_dev_exact_source_root()),
+                )
+                token = issued["route_token"]
+                token["owned_files"] = expected["owned_files"]
+                observer_route_context.persist_route_token_ref(
+                    conn, project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
+                    route_token_ref=issued["route_token_ref"], token=token,
+                    commit=False,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {
+            "ok": True, "project_id": project_id,
+            "backlog_id": backlog_id, "task_id": expected["task_id"],
+            "route_token_ref": issued["route_token_ref"],
+            "dev_force_graph_only": True, "ref_registered": True,
+            "raw_route_token_exposed": False,
+        }
+    finally:
+        conn.close()
+
+
 def _observer_route_context_issue_request_kind(
     body: Mapping[str, Any],
 ) -> str:
@@ -8374,6 +8542,9 @@ def _observer_route_context_issue_request_kind(
     Direct field beside the canonical marker is never silently discarded or
     routed as a different dev operation.
     """
+
+    if body.get("dev_force_graph_route") is True:
+        return "dev_force_graph_route"
 
     if (
         body.get("source_free_operation") is True
@@ -9459,6 +9630,10 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     # Keep the ordinary dev bootstrap behaviour for every other issue shape,
     # but never permit that shortcut to preempt canonical QA validation.
     if _runtime_plane() == "dev":
+        if request_kind == "dev_force_graph_route":
+            return _handle_dev_force_graph_route_issue(
+                ctx, project_id=project_id, body=body,
+            )
         if request_kind == "completed_source_free_system_operation":
             return _handle_ac_dev_completed_source_free_route_context_issue(
                 ctx,
@@ -13340,6 +13515,53 @@ def _require_reconcile_terminalization_auth(
             raw_route_token_required=False,
         )
         raise
+
+
+def _require_dev_force_graph_auth(
+    ctx: RequestContext, conn, *, project_id: str,
+) -> dict[str, Any]:
+    """Require the same fresh observer custody used to enroll this force route."""
+
+    if str(ctx.token or "").strip() or not _current_full_route_proof_requested(ctx):
+        raise GovernanceError(
+            "dev_force_graph_observer_route_required",
+            "DEV graph force requires an observer session and scoped route ref", 403,
+        )
+    auth = _require_current_full_reconcile_auth(
+        ctx, conn, "dev_force_graph",
+        accepted_route_actions=[_DEV_FORCE_GRAPH_ACTION],
+        route_ref_renew_within_seconds=0,
+    )
+    scope = auth["route_token_scope"]
+    route = _dev_force_graph_resolved_route(
+        conn, project_id=project_id,
+        route_token_ref=str(auth["route_token_ref"]),
+        backlog_id=str(scope["backlog_id"]), task_id=str(scope["task_id"]),
+    )
+    session = observer_session.get_session(
+        conn, project_id=project_id,
+        session_id=str(auth["observer_session_id"]),
+    ) or {}
+    capabilities = session.get("capabilities")
+    provenance = (
+        capabilities.get("route_provenance")
+        if isinstance(capabilities, Mapping)
+        and isinstance(capabilities.get("route_provenance"), Mapping)
+        else {}
+    )
+    if not (
+        session.get("computed_status") == "active"
+        and provenance.get("dev_force_graph_only") is True
+        and str(provenance.get("route_token_ref") or "") == auth["route_token_ref"]
+        and str(provenance.get("backlog_id") or "") == scope["backlog_id"]
+        and str(provenance.get("task_id") or "") == scope["task_id"]
+        and route
+    ):
+        raise GovernanceError(
+            "dev_force_graph_session_route_mismatch",
+            "DEV force requires a live observer session enrolled under this route", 403,
+        )
+    return auth
 
 
 def _current_full_reconcile_route_evidence(
@@ -100418,12 +100640,49 @@ def _record_current_full_atomic_evidence(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Deposit the canonical current-full event, provenance, and metric."""
 
-    event = _record_pending_scope_reconcile_contract_event(
-        conn, project_id=project_id, body=body, result=result,
-        target_commit_sha=target_commit,
-        runtime_context_scope=runtime_context_scope,
-        declared_actor_role=declared_actor_role, post_commit_hooks=False,
-    )
+    force_graph_only = route_evidence.get("dev_force_graph_only") is True
+    if force_graph_only:
+        from . import task_timeline
+
+        scope = route_evidence.get("route_token_scope") or {}
+        activation = result.get("activation") or {}
+        event = task_timeline.record_event(
+            conn, project_id=project_id,
+            backlog_id=str(scope.get("backlog_id") or ""),
+            task_id=str(scope.get("task_id") or ""),
+            event_type="graph.reconcile", event_kind="reconcile",
+            phase="reconcile", actor=str(body.get("actor") or "observer"),
+            status="recorded", commit_sha=target_commit,
+            payload={
+                "schema_version": "dev_force_graph_only.v1",
+                "dev_force_graph_only": True,
+                "graph_reconciled": False,
+                "qa_synthesized": False,
+                "contract_runtime_mutated": False,
+                "target_commit_sha": target_commit,
+                "snapshot_id": snapshot_id,
+                "active_snapshot_id": snapshot_id,
+                "previous_snapshot_id": str(
+                    activation.get("previous_snapshot_id") or ""
+                ),
+                "run_id": run_id,
+                "force_reason": str(body.get("force_reason") or ""),
+                "operator_authorization_ref": str(
+                    body.get("operator_authorization_ref") or ""
+                ),
+                "observer_session_id": str(route_evidence.get("session_id") or ""),
+                "route_token_ref": str(route_evidence.get("route_token_ref") or ""),
+                "dev_world_hash": str(route_evidence.get("dev_world_hash") or ""),
+                "loaded_commit": str(route_evidence.get("loaded_commit") or ""),
+            },
+        )
+    else:
+        event = _record_pending_scope_reconcile_contract_event(
+            conn, project_id=project_id, body=body, result=result,
+            target_commit_sha=target_commit,
+            runtime_context_scope=runtime_context_scope,
+            declared_actor_role=declared_actor_role, post_commit_hooks=False,
+        )
     failure = {"run_id": run_id, "snapshot_id": snapshot_id, "fail_closed": True}
     if route_bound and not event:
         raise GovernanceError(
@@ -100436,7 +100695,8 @@ def _record_current_full_atomic_evidence(
         result["timeline_event_recorded"] = {
             "id": event.get("id"), "ref": f"timeline:{event.get('id')}",
             "event_kind": event.get("event_kind"), "phase": event.get("phase"),
-            "status": event.get("status"), "requirement_id": "reconcile",
+            "status": event.get("status"),
+            "requirement_id": "" if force_graph_only else "reconcile",
         }
         provenance = store.record_current_full_reconcile_provenance(
             conn, project_id=project_id, snapshot_id=snapshot_id,
@@ -100447,6 +100707,7 @@ def _record_current_full_atomic_evidence(
             reconcile_event_id=int(event.get("id") or 0),
             reconcile_event_created_at=str(event.get("created_at") or ""),
             marker_created_at=_utc_now(), schema_ready=True,
+            dev_force_graph_only=force_graph_only,
         )
         result["current_full_reconcile_provenance"] = provenance
     if route_bound and not provenance:
@@ -100857,6 +101118,20 @@ def _operator_supervised_direct_main_post_qa_same_active_reconcile(
                 # independently owned history and cannot occupy this CEX.
                 if dict(prior_scope) == expected_terminal_scope:
                     prior_same_scope_runs.append(prior_run_id)
+                continue
+            force_terminal = store.current_full_active_terminal_tuple(
+                conn,
+                project_id=project_id,
+                run_id=prior_run_id,
+                target_commit_sha=target_commit,
+                expected_scope=dict(prior_scope),
+                snapshot_id=snapshot_id,
+                dev_force_graph_only=True,
+            )
+            if force_terminal.get("valid") is True:
+                # Graph-only custody is intact foreign history.  It never
+                # supplies normal reconcile proof, but cannot permanently
+                # block a later QA-authorized run at the same active graph.
                 continue
 
             provenance_id = str(
@@ -101620,8 +101895,17 @@ def _current_full_reconcile_existing_run(
             target_commit_sha=target_commit_sha,
             expected_scope=expected_scope,
             snapshot_id=snapshot_id,
+            dev_force_graph_only=(
+                route_evidence.get("dev_force_graph_only") is True
+            ),
         )
-        if terminal_tuple["valid"]:
+        terminal_provenance = terminal_tuple.get("provenance") or {}
+        exact_force_route = bool(
+            route_evidence.get("dev_force_graph_only") is not True
+            or _json_loads(terminal_provenance.get("route_evidence_json"), {})
+            == dict(route_evidence)
+        )
+        if terminal_tuple["valid"] and exact_force_route:
             return {
                 "status": "complete",
                 "run_id": run_id,
@@ -102158,6 +102442,7 @@ def _current_full_reconcile_idempotent_response(
     graph_delta_mode = str(
         metric.get("graph_delta_mode") or "full_rebuild"
     ).strip()
+    force_graph_only = graph_delta_mode == "dev_force_graph_only"
     reconcile_event_id = int(timeline_event.get("id") or 0)
     return {
         "ok": True,
@@ -102174,6 +102459,8 @@ def _current_full_reconcile_idempotent_response(
         "scope_reconcile_strategy": "current_full_reconcile",
         "graph_delta_mode": graph_delta_mode,
         "scope_graph_delta_mode": graph_delta_mode,
+        "dev_force_graph_only": force_graph_only,
+        "graph_reconciled": not force_graph_only,
         "activated": True,
         "idempotent_replay": True,
         "rebuild_skipped": True,
@@ -102184,7 +102471,7 @@ def _current_full_reconcile_idempotent_response(
                 "event_kind": str(timeline_event.get("event_kind") or ""),
                 "phase": str(timeline_event.get("phase") or ""),
                 "status": str(timeline_event.get("status") or ""),
-                "requirement_id": "reconcile",
+                "requirement_id": "" if force_graph_only else "reconcile",
             }
             if reconcile_event_id
             else {}
@@ -102324,6 +102611,8 @@ def _current_full_reconcile_bounded_http_response(
                 "head_commit",
                 "active_graph_commit",
                 "current_full_reconcile",
+                "dev_force_graph_only",
+                "graph_reconciled",
                 "strategy",
                 "scope_reconcile_strategy",
                 "graph_delta_mode",
@@ -102480,6 +102769,11 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     body, manager_action = _consume_reconcile_terminalization_action(
         ctx.body if isinstance(ctx.body, Mapping) else {}
     )
+    dev_force_graph = body.get("dev_force_graph") is True
+    if "dev_force_graph" in body and not dev_force_graph:
+        raise GovernanceError(
+            "dev_force_graph_flag_invalid", "dev_force_graph must be true", 422,
+        )
     if manager_action is not None:
         from . import graph_snapshot_store as terminalization_store
 
@@ -102617,11 +102911,48 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     request_total_changes_before = int(conn.total_changes)
     process_build_key: tuple[str, str] | None = None
     try:
-        current_full_auth = _require_current_full_reconcile_auth(
-            ctx,
-            conn,
-            "graph-governance.reconcile.current-full",
+        current_full_auth = (
+            _require_dev_force_graph_auth(ctx, conn, project_id=project_id)
+            if dev_force_graph
+            else _require_current_full_reconcile_auth(
+                ctx, conn, "graph-governance.reconcile.current-full",
+            )
         )
+        force_world: dict[str, Any] = {}
+        if dev_force_graph:
+            force_world = _operator_supervised_direct_main_dev_world_authority()
+            allowed_force_fields = {
+                "project_id", "dev_force_graph", "activate", "project_root",
+                "target_commit_sha", "run_id", "snapshot_id",
+                "expected_old_snapshot_id", "require_clean", "semantic_use_ai",
+                "force_reason", "operator_authorization_ref", "actor",
+                "observer_session_id", "observer_route_token_ref", "route_token_ref",
+                "backlog_id", "task_id",
+            }
+            scope = current_full_auth["route_token_scope"]
+            force_mismatches = sorted(set(body) - allowed_force_fields)
+            if (
+                body.get("project_id", project_id) != project_id
+                or str(body.get("backlog_id") or "") != scope["backlog_id"]
+                or str(body.get("task_id") or "") != scope["task_id"]
+                or body.get("require_clean") is not True
+                or body.get("semantic_use_ai") is not False
+                or not isinstance(body.get("activate"), bool)
+                or not str(body.get("run_id") or "").strip()
+                or not str(body.get("force_reason") or "").strip()
+                or not str(body.get("operator_authorization_ref") or "").strip()
+                or str(body.get("target_commit_sha") or "").strip().lower()
+                != force_world["target_head_commit"]
+                or Path(str(body.get("project_root") or "")).resolve()
+                != Path(force_world["target_project_root"])
+                or Path(root).resolve() != Path(force_world["target_project_root"])
+                or force_mismatches
+            ):
+                raise GovernanceError(
+                    "dev_force_graph_request_scope_invalid",
+                    "force request must match the exact loaded DEV world and observer route", 409,
+                    {"unexpected_fields": force_mismatches, "zero_write_rejection": True},
+                )
         activate_requested = bool(body.get("activate", True))
         postmerge_target_owner = (
             _current_full_reconcile_postmerge_target_owner(
@@ -102630,7 +102961,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 body=body,
                 auth=current_full_auth,
             )
-            if activate_requested
+            if activate_requested and not dev_force_graph
             and body.get("bind_only_preimplementation_provenance") is not True
             else {}
         )
@@ -102660,7 +102991,10 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             body=body,
             auth=current_full_auth,
             target_commit_sha=target_commit,
-        )
+        ) if not dev_force_graph else {
+            "category": "dev_force_graph_only",
+            "source_free_reconcile_authority": {},
+        }
         source_free_reconcile_authority = request_category.get(
             "source_free_reconcile_authority"
         )
@@ -102685,6 +103019,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 target_commit=target_commit,
                 current_full_auth=current_full_auth,
             )
+            if not dev_force_graph else {}
         )
         terminal_replay_authority = (
             _dev_direct_existing_candidate_terminal_replay_authority(
@@ -102754,7 +103089,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         # activating requests as active-target candidates so an exact candidate
         # remains resumable after QA or a failed CAS.
         identity = store.normalize_pending_scope_identity(ref_name="active")
-        require_clean = True if not activate_requested else bool(body.get("require_clean", True))
+        require_clean = True if dev_force_graph or not activate_requested else bool(body.get("require_clean", True))
 
         runtime_context_scope = _current_full_reconcile_runtime_context_scope(
             conn,
@@ -102769,7 +103104,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 else {}
             ),
             postmerge_target_owner_authority=postmerge_target_owner,
-        )
+        ) if not dev_force_graph else {}
         merge_queue_id = str(
             runtime_context_scope.get("merge_queue_id")
             or body.get("merge_queue_id")
@@ -102785,6 +103120,35 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 head_commit=head_commit,
             )
         )
+        if dev_force_graph:
+            active_ref = conn.execute(
+                "SELECT snapshot_id FROM graph_snapshot_refs "
+                "WHERE project_id=? AND ref_name='active'",
+                (project_id,),
+            ).fetchone()
+            active_before = str(active_ref["snapshot_id"] or "") if active_ref else ""
+            if activate_requested and not (
+                str(body.get("snapshot_id") or "").strip()
+                and str(body.get("expected_old_snapshot_id") or "").strip()
+                and (
+                    str(body.get("expected_old_snapshot_id") or "").strip()
+                    == active_before
+                    or str(body.get("snapshot_id") or "").strip()
+                    == active_before
+                )
+            ):
+                return 409, {
+                    "ok": False, "error": "dev_force_graph_candidate_or_cas_required",
+                    "active_snapshot_id": active_before,
+                    "writes_performed": False, "zero_write_rejection": True,
+                }
+            if not activate_requested and (
+                body.get("snapshot_id") or body.get("expected_old_snapshot_id")
+            ):
+                return 422, {
+                    "ok": False, "error": "dev_force_graph_build_does_not_select_candidate",
+                    "writes_performed": False, "zero_write_rejection": True,
+                }
         # All category, target/HEAD, Direct-QA, and runtime-scope decisions are
         # read-only and must complete before graph materialization can create
         # or alter schema.
@@ -102800,6 +103164,15 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             current_full_auth,
             runtime_context_scope=runtime_context_scope,
         )
+        if dev_force_graph:
+            route_evidence.update({
+                "dev_force_graph_only": True,
+                "force_reason": str(body["force_reason"]).strip(),
+                "operator_authorization_ref": str(body["operator_authorization_ref"]).strip(),
+                "dev_world_hash": str(force_world["world_hash"]),
+                "dev_database_identity": dict(force_world["database_identity"]),
+                "loaded_commit": str(force_world["loaded_runtime_commit"]),
+            })
         if direct_main_qa_preflight_authority.get("applicable") is True:
             route_evidence = {
                 **route_evidence,
@@ -102933,7 +103306,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 target_commit_sha=target_commit,
                 head_commit=head_commit,
             )
-            if activate_requested and target_commit == head_commit:
+            if activate_requested and target_commit == head_commit and not dev_force_graph:
                 existing_snapshot_id = str(
                     existing.get("snapshot_id") or ""
                 ).strip()
@@ -103375,10 +103748,24 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             result.setdefault("candidate_only", True)
             result["candidate_snapshot_id"] = graph_epoch_snapshot_id
             result["exact_candidate_snapshot"] = True
+            if dev_force_graph:
+                result["dev_force_graph_only"] = True
+                result["graph_reconciled"] = False
+                result["next_action"] = {
+                    "action": "graph_current_full_reconcile",
+                    "mcp_tool": "graph_current_full_reconcile",
+                    "copy_safe_body": {
+                        **dict(body), "activate": True,
+                        "snapshot_id": graph_epoch_snapshot_id,
+                        "expected_old_snapshot_id": active_before,
+                    },
+                    "action_input_ready": True,
+                    "authority": "observer_session_and_same_scoped_route",
+                }
             result["next_action"] = _exact_candidate_snapshot_qa_retry_guidance(
                 snapshot_id=graph_epoch_snapshot_id,
                 target_commit_sha=target_commit,
-            )
+            ) if not dev_force_graph else result["next_action"]
             if resumed_candidate:
                 result["merge_queue_graph_epoch_auto_record"] = {
                     "status": "skipped",
@@ -103476,6 +103863,43 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         try:
             with sqlite_write_lock():
                 conn.execute("BEGIN IMMEDIATE")
+                if dev_force_graph:
+                    locked_auth = _require_dev_force_graph_auth(
+                        ctx, conn, project_id=project_id,
+                    )
+                    locked_world = _operator_supervised_direct_main_dev_world_authority()
+                    locked_evidence = _current_full_reconcile_route_evidence(
+                        locked_auth, runtime_context_scope={},
+                    )
+                    locked_evidence.update({
+                        "dev_force_graph_only": True,
+                        "force_reason": str(body["force_reason"]).strip(),
+                        "operator_authorization_ref": str(body["operator_authorization_ref"]).strip(),
+                        "dev_world_hash": str(locked_world["world_hash"]),
+                        "dev_database_identity": dict(locked_world["database_identity"]),
+                        "loaded_commit": str(locked_world["loaded_runtime_commit"]),
+                        "reconcile_run_id": run_id,
+                        "idempotency_scope": idempotency_scope,
+                    })
+                    locked_active_ref = conn.execute(
+                        "SELECT snapshot_id FROM graph_snapshot_refs "
+                        "WHERE project_id=? AND ref_name='active'",
+                        (project_id,),
+                    ).fetchone()
+                    if not (
+                        locked_world["target_head_commit"] == target_commit
+                        and _git_head_commit(root) == target_commit
+                        and not filter_dirty_files(_git_dirty_paths(root))
+                        and locked_evidence == route_evidence
+                        and locked_active_ref
+                        and str(locked_active_ref["snapshot_id"] or "")
+                        == str(body["expected_old_snapshot_id"])
+                    ):
+                        conn.rollback()
+                        return 409, {
+                            "ok": False, "error": "dev_force_graph_locked_authority_changed",
+                            "writes_performed": False, "zero_write_rejection": True,
+                        }
                 if dev_graph_bootstrap_authority.get(
                     "existing_candidate_activation_required"
                 ) is True:
@@ -103693,7 +104117,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "commit_shas": [],
                     "snapshot_id": graph_epoch_snapshot_id,
                 }
-                if pending_scope_commits:
+                if pending_scope_commits and not dev_force_graph:
                     pending_scope_waiver = store.waive_pending_scope_reconcile(
                         conn,
                         project_id,
@@ -103774,7 +104198,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "source": "atomic_transaction",
                     "requested": True,
                     "verified": bool(
-                        matches_target and matches_head and pending_count == 0
+                        matches_target and matches_head
+                        and (dev_force_graph or pending_count == 0)
                     ),
                     "active_snapshot_id": active_snapshot_id,
                     "active_graph_commit": active_graph_commit,
@@ -103821,7 +104246,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         runtime_context_scope=runtime_context_scope,
                         request_id=str(ctx.request_id),
                         request_started_at=request_started_at,
-                        graph_delta_mode="full_rebuild",
+                        graph_delta_mode=(
+                            "dev_force_graph_only" if dev_force_graph else "full_rebuild"
+                        ),
                         declared_actor_role=(
                             "observer"
                             if str(current_full_auth.get("role") or "").strip()
@@ -103842,7 +104269,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 commit_sha=target_commit,
                 snapshot_kind="full",
                 strategy="current_full_reconcile",
-                graph_delta_mode="full_rebuild",
+                graph_delta_mode=(
+                    "dev_force_graph_only" if dev_force_graph else "full_rebuild"
+                ),
                 status="failed",
                 elapsed_ms=int((time.monotonic() - request_started_monotonic) * 1000),
                 evidence={
@@ -103857,27 +104286,29 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             raise
 
         if timeline_event:
-            _task_timeline.run_post_commit_hooks(conn, timeline_event)
-            conn.commit()
+            if not dev_force_graph:
+                _task_timeline.run_post_commit_hooks(conn, timeline_event)
+                conn.commit()
 
         # Queue-epoch propagation and advisory activation hooks run only after
         # the activation/evidence transaction is durable.  A failure here can
         # be safely answered by the same-run terminal lookup without creating
         # duplicate timeline or provenance rows.
-        result["merge_queue_graph_epoch_auto_record"] = record_merge_queue_graph_epoch_after_reconcile(
-            conn,
-            project_id=project_id,
-            target_head_commit=target_commit,
-            snapshot_id=graph_epoch_snapshot_id,
-            projection_id=graph_epoch_projection_id,
-            merge_queue_id=merge_queue_id,
-            queue_item_id=queue_item_id,
-            incomplete_fanin_descendant_verified=(
-                incomplete_fanin_descendant_verified
-            ),
-            now_iso=_utc_now(),
-        )
-        conn.commit()
+        if not dev_force_graph:
+            result["merge_queue_graph_epoch_auto_record"] = record_merge_queue_graph_epoch_after_reconcile(
+                conn,
+                project_id=project_id,
+                target_head_commit=target_commit,
+                snapshot_id=graph_epoch_snapshot_id,
+                projection_id=graph_epoch_projection_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                incomplete_fanin_descendant_verified=(
+                    incomplete_fanin_descendant_verified
+                ),
+                now_iso=_utc_now(),
+            )
+            conn.commit()
         try:
             from . import event_bus
 
@@ -103948,6 +104379,11 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         )
         if runtime_context_scope:
             result["current_full_reconcile_runtime_context_scope"] = dict(runtime_context_scope)
+        if dev_force_graph:
+            result["dev_force_graph_only"] = True
+            result["graph_reconciled"] = False
+            result["qa_synthesized"] = False
+            result["contract_runtime_mutated"] = False
         request_db_total_changes_delta = max(
             0,
             int(conn.total_changes) - request_total_changes_before,
@@ -181178,6 +181614,148 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
     if (kwargs.get("project_id") != AC_PROJECT_ID or not kwargs.get("backlog_id")
             or _runtime_plane() != "dev"):
         return response
+    if str(kwargs.get("role") or "").strip() == "observer":
+        try:
+            from . import graph_snapshot_store as force_store
+
+            backlog_id = str(kwargs["backlog_id"])
+            force_issue = _dev_force_graph_issue_body(
+                conn, project_id=AC_PROJECT_ID, backlog_id=backlog_id,
+            )
+            world = _operator_supervised_direct_main_dev_world_authority()
+            active_graph = force_store.get_active_graph_snapshot(
+                conn, AC_PROJECT_ID,
+            ) or {}
+            active_id = str(active_graph.get("snapshot_id") or "")
+            graph_stale = str(active_graph.get("commit_sha") or "") != str(
+                world["target_head_commit"]
+            )
+        except (GovernanceError, sqlite3.Error, ValueError, KeyError):
+            graph_stale = False
+        if graph_stale:
+            requested_ref = str(kwargs.get("route_token_ref") or "").strip()
+            session_id = str(
+                (kwargs.get("request_body") or {}).get("observer_session_id") or ""
+            ).strip()
+            route_ready = False
+            if requested_ref:
+                try:
+                    route_ready = bool(_dev_force_graph_resolved_route(
+                        conn, project_id=AC_PROJECT_ID,
+                        route_token_ref=requested_ref,
+                        backlog_id=backlog_id,
+                        task_id=force_issue["task_id"],
+                    ))
+                except (GovernanceError, sqlite3.Error, ValueError):
+                    pass
+            session_ready = False
+            if route_ready and session_id:
+                session = observer_session.get_session(
+                    conn, project_id=AC_PROJECT_ID, session_id=session_id,
+                ) or {}
+                capabilities = session.get("capabilities") or {}
+                provenance = (
+                    capabilities.get("route_provenance")
+                    if isinstance(capabilities, Mapping) else {}
+                ) or {}
+                session_ready = bool(
+                    session.get("computed_status") == "active"
+                    and provenance.get("dev_force_graph_only") is True
+                    and provenance.get("route_token_ref") == requested_ref
+                )
+            run_id = (
+                "dev-force-" + world["target_head_commit"][:12] + "-"
+                + stable_sha256(backlog_id).removeprefix("sha256:")[:8]
+            )
+            base_body = {
+                "project_id": AC_PROJECT_ID,
+                "dev_force_graph": True,
+                "project_root": world["target_project_root"],
+                "target_commit_sha": world["target_head_commit"],
+                "run_id": run_id,
+                "activate": False,
+                "require_clean": True,
+                "semantic_use_ai": False,
+                "force_reason": "Refresh the exact loaded DEV source graph",
+                "operator_authorization_ref": (
+                    "user-decision:20260923-authenticated-observer-dev-force-graph"
+                ),
+                "observer_session_id": session_id,
+                "route_token_ref": requested_ref,
+                "backlog_id": backlog_id,
+                "task_id": force_issue["task_id"],
+            }
+            candidate = _current_full_requested_snapshot_identity(
+                conn, project_id=AC_PROJECT_ID,
+                target_commit_sha=world["target_head_commit"],
+            )
+            candidate_id = str(candidate.get("snapshot_id") or "")
+            candidate_row = (
+                conn.execute(
+                    "SELECT status FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+                    (AC_PROJECT_ID, candidate_id),
+                ).fetchone() if candidate_id else None
+            )
+            candidate_ready = bool(
+                candidate_row and str(candidate_row["status"] or "") == "candidate"
+                and force_store.current_full_candidate_tuple_from_db(
+                    conn, project_id=AC_PROJECT_ID, run_id=run_id,
+                    target_commit_sha=world["target_head_commit"],
+                    snapshot_id=candidate_id,
+                ).get("valid") is True
+            )
+            if not route_ready:
+                action = {
+                    "action": "observer_route_context_issue",
+                    "mcp_tool": "observer_route_context_issue",
+                    "copy_safe_body": force_issue,
+                    "action_input_ready": True,
+                }
+            elif not session_ready:
+                action = {
+                    "action": "observer_session_register",
+                    "mcp_tool": "observer_session_register",
+                    "copy_safe_body": {
+                        "project_id": AC_PROJECT_ID,
+                        "route_token_ref": requested_ref,
+                        "backlog_id": backlog_id,
+                        "task_id": force_issue["task_id"],
+                    },
+                    "action_input_ready": True,
+                }
+            else:
+                action_body = dict(base_body)
+                if candidate_ready:
+                    action_body.update(
+                        activate=True, snapshot_id=candidate_id,
+                        expected_old_snapshot_id=active_id,
+                    )
+                action = {
+                    "action": "graph_current_full_reconcile",
+                    "mcp_tool": "graph_current_full_reconcile",
+                    "copy_safe_body": action_body,
+                    "action_input_ready": True,
+                    "dev_force_graph_only": True,
+                }
+            response["dev_force_graph"] = {
+                "schema_version": "onboard_route_guide.dev_force_graph.v1",
+                "classification": "dev_force_graph_only",
+                "source": "loaded_dev_world+open_backlog+active_graph",
+                "normal_contract_reconcile_authority": False,
+                "qa_or_close_authority": False,
+                "route_ready": route_ready,
+                "session_ready": session_ready,
+                "candidate_ready": candidate_ready,
+                "active_snapshot_id": active_id,
+                "route_issue_body": force_issue,
+                "next_legal_action": action,
+            }
+            response["next_legal_action"] = action
+            guide = response.get("onboard_route_guide")
+            if isinstance(guide, dict):
+                guide["dev_force_graph"] = dict(response["dev_force_graph"])
+                guide["next_legal_action"] = dict(action)
+            return response
     if str(kwargs.get("role") or "").strip() == "observer":
         backlog_id = str(kwargs["backlog_id"])
         current = conn.execute(
