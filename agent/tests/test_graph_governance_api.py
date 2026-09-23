@@ -179,6 +179,23 @@ def test_dev_force_graph_guide_enrollment_build_activate_and_normal_denial(
     assert issue_body["allowed_actions"] == [
         "observer_session_register", "dev_force_graph",
     ]
+    before_bad_ref = conn.total_changes
+    with pytest.raises(GovernanceError) as bad_force_ref:
+        server._onboard_route_guide_service_response(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            role="observer", work_type="operator_supervised_direct_main",
+            request_body={
+                "dev_force_graph": True,
+                "enrollment_observer_session_id": enrollment_id,
+                "enrollment_observer_session_token_ref": (
+                    "managed-existing-observer-ref"
+                ),
+            },
+            route_token_ref="rtok-foreign-force-guide",
+        )
+    assert bad_force_ref.value.code == "dev_force_graph_route_required"
+    assert bad_force_ref.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before_bad_ref
     with pytest.raises(server.GovernanceError):
         server.handle_observer_route_context_issue(_ctx(
             {"project_id": project_id}, method="POST", body={
@@ -106740,6 +106757,49 @@ def test_fresh_direct_main_explicit_complete_nonactive_current_graph_admits_prem
         "SELECT COUNT(*) FROM graph_query_traces WHERE task_id=?",
         (task_id,),
     ).fetchone()[0]
+    selected = server._operator_supervised_direct_main_selected_execution_identity(
+        conn, project_id=PID, backlog_id=backlog_id,
+        contract_execution_id=task_id,
+    )
+    assert selected["source"] == "fresh_registry_authority"
+    with monkeypatch.context() as incoherent_selection:
+        incoherent_selection.setattr(
+            server, "_operator_supervised_direct_main_selected_execution_identity",
+            lambda *_args, **_kwargs: {
+                **selected, "source": "pinned_record", "record": None,
+                "records": [{}],
+            },
+        )
+        with pytest.raises(GovernanceError) as missing_pinned:
+            server._observer_parentless_direct_main_graph_world_authority(
+                conn, project_id=PID, body=copy.deepcopy(graph_query_body),
+                route_proof={
+                    "backlog_id": backlog_id, "task_id": task_id,
+                    "route_token_ref": route_token_ref,
+                },
+                action="graph-governance.query",
+            )
+    assert missing_pinned.value.code == (
+        "observer_direct_main_pinned_execution_unverified"
+    )
+    assert missing_pinned.value.details["zero_write_rejection"] is True
+    for invalid_claim in (
+        {"project_root": str(tmp_path)},
+        {"commit_sha": "f" * 40},
+        {"route_token_ref": "rtok-foreign-nonactive"},
+        {"backlog_id": "AC-FOREIGN-NONACTIVE"},
+    ):
+        with pytest.raises(GovernanceError):
+            server.handle_graph_governance_query(
+                _ctx_with_role(
+                    {"project_id": PID}, "observer", method="POST",
+                    body={**copy.deepcopy(graph_query_body), **invalid_claim},
+                )
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM graph_query_traces WHERE task_id=?",
+            (task_id,),
+        ).fetchone()[0] == trace_count_before
     with pytest.raises(GovernanceError) as partial_rejected:
         server.handle_graph_governance_query(
             _ctx_with_role(

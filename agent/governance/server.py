@@ -20839,7 +20839,35 @@ def _observer_parentless_direct_main_graph_world_authority(
         project_id=project_id,
     )
     expected_commit = str(world_ref.get("base_commit") or "").strip().lower()
-    direct_record = _contract_runtime_store(conn).get(task_id)
+    selected_source = str(selected_direct.get("source") or "").strip()
+    if (
+        selected_source == "fresh_registry_authority"
+        and not selected_direct.get("record")
+        and not list(selected_direct.get("records") or [])
+    ):
+        direct_record: Mapping[str, Any] = {}
+    elif selected_source == "pinned_record":
+        selected_record = selected_direct.get("record")
+        if not (
+            isinstance(selected_record, Mapping)
+            and str(selected_record.get("project_id") or "") == project_id
+            and str(selected_record.get("backlog_id") or "") == backlog_id
+            and str(selected_record.get("contract_execution_id") or "") == task_id
+        ):
+            raise GovernanceError(
+                "observer_direct_main_pinned_execution_unverified",
+                "The selected Direct execution is missing or incoherent",
+                409,
+                {"zero_write_rejection": True, "writes_performed": False},
+            )
+        direct_record = selected_record
+    else:
+        raise GovernanceError(
+            "observer_direct_main_execution_source_unverified",
+            "The selected Direct execution has no valid source",
+            409,
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
     direct_metadata = (
         direct_record.get("metadata")
         if isinstance(direct_record.get("metadata"), Mapping) else {}
@@ -182053,27 +182081,46 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
             )
         except (GovernanceError, sqlite3.Error, ValueError, KeyError):
             graph_stale = False
+        resolved_force: dict[str, Any] = {}
         if graph_stale:
             requested_ref = str(kwargs.get("route_token_ref") or "").strip()
+            explicit_force = bool(
+                guide_input.get("dev_force_graph") is True
+                or enrollment_id or enrollment_token_ref
+                or str(guide_input.get("task_id") or "").strip()
+                == force_issue["task_id"]
+            )
+            initial_direct_force = bool(
+                str(kwargs.get("work_type") or "").strip()
+                == "operator_supervised_direct_main" and not requested_ref
+            )
+            if requested_ref:
+                resolved_force = _dev_force_graph_resolved_route(
+                    conn, project_id=AC_PROJECT_ID,
+                    route_token_ref=requested_ref,
+                    backlog_id=backlog_id,
+                    task_id=force_issue["task_id"],
+                    require_force=False,
+                )
+            if explicit_force and requested_ref and not resolved_force:
+                raise GovernanceError(
+                    "dev_force_graph_route_required",
+                    "Explicit force Guide requires its exact enrolled route",
+                    403,
+                    {"zero_write_rejection": True, "writes_performed": False},
+                )
+            graph_stale = bool(
+                initial_direct_force or explicit_force or resolved_force
+            )
+        if graph_stale:
             session_id = str(
                 (kwargs.get("request_body") or {}).get("observer_session_id") or ""
             ).strip()
-            route_ready = False
-            if requested_ref:
-                try:
-                    resolved_force = _dev_force_graph_resolved_route(
-                        conn, project_id=AC_PROJECT_ID,
-                        route_token_ref=requested_ref,
-                        backlog_id=backlog_id,
-                        task_id=force_issue["task_id"],
-                    )
-                    route_ready = bool(
-                        resolved_force
-                        and f"dev_force_graph_enrolled_by:{enrollment_id}"
-                        in list(resolved_force.get("evidence_refs") or [])
-                    )
-                except (GovernanceError, sqlite3.Error, ValueError):
-                    pass
+            route_ready = bool(
+                resolved_force
+                and f"dev_force_graph_enrolled_by:{enrollment_id}"
+                in list(resolved_force.get("evidence_refs") or [])
+            )
             session_ready = False
             if route_ready and session_id:
                 session = observer_session.get_session(
