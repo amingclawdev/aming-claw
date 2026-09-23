@@ -234215,3 +234215,538 @@ def test_ac_dev_finished_worker_merge_route_rechecks_parent_in_atomic_writer(
     assert raced
     assert conn.total_changes == raced["changes"]
     assert tuple(conn.iterdump()) == raced["dump"]
+
+
+def _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path):
+    """Persist the pre-QA two-lane world while main has a linked owner."""
+
+    registered = tmp_path / "registered"
+    base = _init_test_git_repo(registered, filename="base.txt")
+    subprocess.run(["git", "branch", "-M", "main"], cwd=registered, check=True)
+    subprocess.run(
+        ["git", "switch", "-c", "unrelated"],
+        cwd=registered, check=True, capture_output=True, text=True,
+    )
+    unrelated = _commit_test_git_files(
+        registered, ["unrelated.txt"], message="unrelated registered checkout",
+    )
+    (registered / "local-dirty.txt").write_text("unrelated local edit\n")
+    owner = tmp_path / "linked-main-owner"
+    subprocess.run(
+        ["git", "worktree", "add", str(owner), "main"],
+        cwd=registered, check=True, capture_output=True, text=True,
+    )
+    first = _commit_test_git_files(
+        owner, ["first-lane.txt"], message="first accepted lane merge",
+    )
+    final = _commit_test_git_files(
+        owner, ["second-lane.txt"], message="second accepted lane merge",
+    )
+    assert batch_jobs.git_commit(registered) == unrelated != final
+    assert batch_jobs.git_commit(owner) == final
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=owner, check=True,
+        capture_output=True, text=True,
+    ).stdout == ""
+
+    execution_id = "cex-rev10-current-full-linked-owner"
+    backlog_id = "AC-REV10-CURRENT-FULL-LINKED-OWNER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    workers = []
+    contexts = []
+    rows = []
+    merge_lines = []
+    for index, (before, after) in enumerate(((base, first), (first, final)), 1):
+        task_id = f"rev10-linked-owner-lane-{index}"
+        runtime_context_id = f"mfrctx-rev10-linked-owner-{index}"
+        merge_queue_id = f"mq-rev10-linked-owner-{index}"
+        lane_root = tmp_path / f"lane-{index}"
+        subprocess.run(
+            ["git", "worktree", "add", "-b", f"lane-{index}", str(lane_root), base],
+            cwd=registered, check=True, capture_output=True, text=True,
+        )
+        context = upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PID,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                runtime_context_id=runtime_context_id,
+                parent_task_id=execution_id,
+                root_task_id=execution_id,
+                worker_id=f"worker-{index}",
+                worker_slot_id=f"slot-{index}",
+                branch_ref=f"refs/heads/lane-{index}",
+                worktree_path=str(lane_root),
+                target_project_root=str(lane_root),
+                base_commit=base,
+                head_commit=base,
+                target_head_commit=after,
+                merge_queue_id=merge_queue_id,
+                status="merged",
+                owned_files=(f"lane-{index}.txt",),
+                target_files=(f"lane-{index}.txt",),
+            ),
+        )
+        contexts.append(context)
+        queue_item_id = f"{merge_queue_id}:{task_id}"
+        row = upsert_merge_queue_item(
+            conn,
+            MergeQueueItem(
+                project_id=PID,
+                backlog_id=backlog_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                task_id=task_id,
+                branch_ref=context.branch_ref,
+                queue_index=index,
+                status="merged",
+                target_ref="refs/heads/main",
+                branch_head=base,
+                validated_target_head=before,
+                current_target_head=after,
+                merge_commit=after,
+                target_head_before_merge=before,
+                target_head_after_merge=after,
+            ),
+        )
+        rows.append(row)
+        workers.append(
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": execution_id,
+                "worker_role": "mf_sub",
+                "worker_id": f"worker-{index}",
+                "worker_slot_id": f"slot-{index}",
+                "merge_queue_id": merge_queue_id,
+            }
+        )
+        event = task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_type="observer.merge",
+            event_kind="merge",
+            phase="observer_merge",
+            actor="observer",
+            status="passed",
+            payload={"merge_queue_id": merge_queue_id, "merged_commit": after},
+            commit_sha=after,
+            post_commit_hooks=False,
+        )
+        durable = {
+            "schema_version": "contract_runtime.observer_merge_durable_authority.v1",
+            "source": "parallel_branch_merge_queue+task_timeline_merge",
+            "server_derived": True,
+            "db_verified": True,
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            **workers[-1],
+            "queue_item_id": queue_item_id,
+            "queue_item_status": "merged",
+            "target_ref": "refs/heads/main",
+            "target_head_before_merge": before,
+            "target_head_after_merge": after,
+            "merge_commit": after,
+            "merge_event_ref": f"timeline:{event['id']}",
+            "merge_event_id": int(event["id"]),
+            "merge_event_created_at": event["created_at"],
+            "contract_runtime_dispatch_source_ref": (
+                f"contract_runtime:{execution_id}:completed_lines:0"
+            ),
+            "pre_qa_merge_authorized": True,
+            "final_qa_required_after_reconcile": True,
+            "qa_contract_runtime_verified": False,
+            "qa_completed_line_index": -1,
+            "qa_graph_completed_line_index": -1,
+        }
+        merge_lines.append(
+            {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "line_instance_id": f"runtime_context:{runtime_context_id}",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "status": "passed",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": execution_id,
+                "commit_sha": after,
+                "payload": {"durable_merge_authority": durable},
+            }
+        )
+
+    dispatch = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer",
+        "evidence_kind": "dispatch_bounded_worker",
+        "payload": {
+            "worker_count": 2,
+            "required_worker_count": 2,
+            "atomic_dispatch": True,
+            "bounded_workers": workers,
+        },
+    }
+    selected = contexts[0]
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": execution_id,
+        "version": "v2",
+        "revision": "rev10",
+        "execution_state_revision": 10,
+        "completed_lines": [dispatch, *merge_lines],
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "observer_reconcile",
+                "line_id": "observer_reconcile",
+                "runtime_context_id": selected.runtime_context_id,
+                "task_id": selected.task_id,
+                "parent_task_id": execution_id,
+                "merge_queue_id": selected.merge_queue_id,
+                "line_instance_id": f"runtime_context:{selected.runtime_context_id}",
+            }
+        },
+    }
+    conn.execute(
+        """INSERT INTO contract_runtime_executions (
+               contract_execution_id, project_id, backlog_id, contract_id,
+               version, revision, execution_state_revision, record_json,
+               created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            execution_id, PID, backlog_id, "mf_parallel.v2", "v2", "rev10", 10,
+            json.dumps(record), "2026-09-22T00:00:00Z", "2026-09-22T00:00:00Z",
+        ),
+    )
+    session_id = _insert_active_observer_session_ref(
+        conn, session_id="obs-rev10-current-full-linked-owner",
+    )
+    route_ref = "rtok-rev10-current-full-linked-owner"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=selected.task_id,
+        route_token_ref=route_ref,
+        allowed_actions=["graph_current_full_reconcile"],
+    )
+    conn.commit()
+    def registered_project_root(project_id, explicit_root=None, *, fallback_self=True):
+        assert project_id == PID
+        return (
+            Path(explicit_root).resolve()
+            if explicit_root
+            else registered.resolve()
+        )
+
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root", registered_project_root,
+    )
+    monkeypatch.setitem(
+        server._GOVERNANCE_MANAGER_CERTIFICATES,
+        PID,
+        _test_manager_certificate(),
+    )
+    body = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": selected.task_id,
+        "parent_task_id": execution_id,
+        "runtime_context_id": selected.runtime_context_id,
+        "merge_queue_id": selected.merge_queue_id,
+        "contract_execution_id": execution_id,
+        "target_commit_sha": final,
+        "activate": True,
+        "semantic_enrich": False,
+        "observer_session_id": session_id,
+        "observer_route_token_ref": route_ref,
+    }
+    return {
+        "registered": registered,
+        "owner": owner,
+        "base": base,
+        "first": first,
+        "final": final,
+        "unrelated": unrelated,
+        "contexts": contexts,
+        "rows": rows,
+        "record": record,
+        "body": body,
+    }
+
+
+def test_rev10_current_full_activates_from_clean_linked_target_owner(
+    conn, monkeypatch, tmp_path,
+):
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    record = case["record"]
+    assert [line["line_id"] for line in record["completed_lines"]] == [
+        "observer_dispatch_bounded_workers", "observer_merge", "observer_merge",
+    ]
+    assert record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "observer_reconcile"
+    )
+    assert all(
+        line["payload"]["durable_merge_authority"]["qa_contract_runtime_verified"]
+        is False for line in record["completed_lines"][1:]
+    )
+    aggregate = server._contract_runtime_rev8_two_worker_merge_projection(
+        record, required_worker_count=2, conn=conn, project_id=PID,
+    )
+    assert aggregate["all_lane_merges_verified"] is True
+    assert aggregate["merged_commit_sha"] == case["final"]
+    selected = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        conn, project_id=PID, record=record, aggregate_merge=aggregate,
+    )
+    assert selected["runtime_context_id"] == case["contexts"][0].runtime_context_id
+    assert selected["task_id"] == case["contexts"][0].task_id
+    assert selected["merge_queue_id"] == case["contexts"][0].merge_queue_id
+    assert selected["merged_commit_sha"] == case["final"]
+    assert selected["reconcile_lane_identity_source"] == (
+        "RuntimeContext.current_values"
+    )
+    assert selected["aggregate_final_merge_identity"] == {
+        field: getattr(case["contexts"][1], field)
+        for field in (
+            "runtime_context_id", "task_id", "parent_task_id", "merge_queue_id",
+        )
+    }
+
+    scopes = []
+    original_scope = server._current_full_reconcile_runtime_context_scope
+
+    def capture_runtime_scope(*args, **kwargs):
+        scope = original_scope(*args, **kwargs)
+        scopes.append(scope)
+        return scope
+
+    monkeypatch.setattr(
+        server, "_current_full_reconcile_runtime_context_scope",
+        capture_runtime_scope,
+    )
+    builds = []
+
+    def build(_conn, project_id, root, **kwargs):
+        builds.append((project_id, Path(root).resolve(), kwargs))
+        snapshot_id = kwargs["snapshot_id"]
+        store.create_graph_snapshot(
+            _conn, project_id, snapshot_id=snapshot_id,
+            commit_sha=case["final"], snapshot_kind="full",
+            graph_json=_graph(), notes=json.dumps({"run_id": kwargs["run_id"]}),
+        )
+        _conn.commit()
+        return {
+            "ok": True, "snapshot_id": snapshot_id,
+            "projection_id": "semproj-rev10-linked-owner",
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", build)
+    before_registered = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=case["registered"], check=True,
+        capture_output=True, text=True,
+    ).stdout
+    assert before_registered.strip()
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx({ "project_id": PID }, method="POST", body=case["body"])
+    )
+    assert status == 201, result
+    assert result["activated"] is True
+    assert len(builds) == 1
+    assert builds[0][1] == case["owner"].resolve()
+    assert builds[0][2]["commit_sha"] == case["final"]
+    assert len(scopes) == 1
+    assert scopes[0]["postmerge_selected_reconcile_lane_verified"] is True
+    assert {
+        field: scopes[0][field]
+        for field in (
+            "runtime_context_id", "task_id", "parent_task_id", "merge_queue_id",
+        )
+    } == {
+        field: getattr(case["contexts"][0], field)
+        for field in (
+            "runtime_context_id", "task_id", "parent_task_id", "merge_queue_id",
+        )
+    }
+    assert scopes[0]["contract_merge_authority"]["merged_commit_sha"] == (
+        case["final"]
+    )
+    assert batch_jobs.git_commit(case["registered"]) == case["unrelated"]
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=case["registered"], check=True,
+        capture_output=True, text=True,
+    ).stdout == before_registered
+    assert not any(
+        line["line_id"].startswith("qa_")
+        for line in server._contract_runtime_store(conn).get(
+            record["contract_execution_id"]
+        )["completed_lines"]
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE project_id=? AND backlog_id=? AND event_kind LIKE 'qa%'",
+        (PID, record["backlog_id"]),
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("defect", "reason"),
+    [
+        ("missing_lane_merge", "current_generation_aggregate_merge_unverified"),
+        ("duplicate_lane", "current_generation_aggregate_merge_unverified"),
+        ("foreign_task", "current_generation_aggregate_merge_unverified"),
+        ("foreign_queue", "current_generation_aggregate_merge_unverified"),
+        ("dispatch_mismatch", "current_generation_aggregate_merge_unverified"),
+        ("queue_not_merged", "aggregate_lane_queue_target_chain_mismatch"),
+        ("different_target_refs", "aggregate_lane_queue_target_chain_mismatch"),
+        ("broken_target_chain", "aggregate_lane_queue_target_chain_mismatch"),
+        ("selected_outside_aggregate", "selected_reconcile_lane_unverified"),
+        ("aggregate_commit_mismatch", "aggregate_final_commit_mismatch"),
+        ("missing_owner", "target_ref_owner_missing_or_ambiguous"),
+        ("ambiguous_owner", "target_ref_owner_missing_or_ambiguous"),
+        ("dirty_owner", "target_ref_owner_not_clean_and_aligned"),
+        ("detached_owner", "target_ref_owner_missing_or_ambiguous"),
+        ("wrong_ref_owner", "target_ref_owner_missing_or_ambiguous"),
+        ("caller_root_override", "target_ref_owner_missing_or_ambiguous"),
+    ],
+)
+def test_rev10_current_full_linked_target_owner_rejects_untrusted_world_before_build(
+    conn, monkeypatch, tmp_path, defect, reason,
+):
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    record = copy.deepcopy(case["record"])
+    second = record["completed_lines"][2]["payload"]["durable_merge_authority"]
+    second_row = case["rows"][1]
+    queue_change = None
+    if defect == "missing_lane_merge":
+        record["completed_lines"].pop()
+    elif defect == "duplicate_lane":
+        second["runtime_context_id"] = case["contexts"][0].runtime_context_id
+    elif defect == "foreign_task":
+        second["task_id"] = "foreign-lane"
+    elif defect == "foreign_queue":
+        second["merge_queue_id"] = "mq-foreign-lane"
+    elif defect == "dispatch_mismatch":
+        second["contract_runtime_dispatch_source_ref"] = (
+            f"contract_runtime:{record['contract_execution_id']}:completed_lines:99"
+        )
+    elif defect == "queue_not_merged":
+        queue_change = ("status", "merge_ready")
+    elif defect == "different_target_refs":
+        queue_change = ("target_ref", "refs/heads/unrelated")
+    elif defect == "broken_target_chain":
+        queue_change = ("target_head_before_merge", case["base"])
+    elif defect == "selected_outside_aggregate":
+        record["runtime_guide"]["next_legal_action"].update(
+            runtime_context_id="mfrctx-foreign-lane",
+            task_id="foreign-lane",
+            merge_queue_id="mq-foreign-lane",
+            line_instance_id="runtime_context:mfrctx-foreign-lane",
+        )
+    elif defect == "aggregate_commit_mismatch":
+        case["body"]["target_commit_sha"] = case["first"]
+    elif defect in {"missing_owner", "caller_root_override"}:
+        if defect == "caller_root_override":
+            foreign = tmp_path / "clean-foreign-repository"
+            subprocess.run(
+                ["git", "clone", "--quiet", str(case["registered"]), str(foreign)],
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "switch", "main"], cwd=foreign,
+                check=True, capture_output=True, text=True,
+            )
+            assert batch_jobs.git_commit(foreign) == case["final"]
+            assert subprocess.run(
+                ["git", "status", "--porcelain"], cwd=foreign, check=True,
+                capture_output=True, text=True,
+            ).stdout == ""
+            case["body"]["project_root"] = str(foreign)
+            case["body"]["worktree_path"] = str(foreign)
+        subprocess.run(
+            ["git", "worktree", "remove", str(case["owner"])],
+            cwd=case["registered"], check=True, capture_output=True, text=True,
+        )
+    elif defect == "ambiguous_owner":
+        git_run = subprocess.run
+
+        def duplicate_main_owner(command, *args, **kwargs):
+            completed = git_run(command, *args, **kwargs)
+            if list(command[:4]) == ["git", "worktree", "list", "--porcelain"]:
+                completed.stdout += (
+                    f"\nworktree {tmp_path / 'duplicate-main-owner'}\n"
+                    f"HEAD {case['final']}\nbranch refs/heads/main\n"
+                )
+            return completed
+
+        monkeypatch.setattr(server.subprocess, "run", duplicate_main_owner)
+    elif defect == "dirty_owner":
+        (case["owner"] / "uncommitted.txt").write_text("dirty owner\n")
+    elif defect == "detached_owner":
+        subprocess.run(
+            ["git", "switch", "--detach"],
+            cwd=case["owner"], check=True, capture_output=True, text=True,
+        )
+    elif defect == "wrong_ref_owner":
+        subprocess.run(
+            ["git", "switch", "-c", "wrong-owner-ref"],
+            cwd=case["owner"], check=True, capture_output=True, text=True,
+        )
+
+    if queue_change:
+        column, value = queue_change
+        conn.execute(
+            f"UPDATE parallel_branch_merge_queue_items SET {column}=? "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            (value, PID, second_row.merge_queue_id, second_row.queue_item_id),
+        )
+    if record != case["record"]:
+        conn.execute(
+            "UPDATE contract_runtime_executions SET record_json=? "
+            "WHERE contract_execution_id=?",
+            (json.dumps(record), record["contract_execution_id"]),
+        )
+    conn.commit()
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "graph_snapshots",
+            "graph_current_full_build_claim_history",
+            "graph_current_full_reconcile_provenance",
+            "task_timeline_events",
+        )
+    }
+    before_changes = conn.total_changes
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        lambda *_args, **_kwargs: pytest.fail(
+            f"{defect}: current-full builder ran before target-owner admission"
+        ),
+    )
+    try:
+        response = server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=case["body"])
+        )
+    except GovernanceError as exc:
+        rejection = exc
+    else:
+        pytest.fail(
+            f"{defect}: expected owner-specific rejection, got "
+            f"status={response[0]} error={response[1].get('error')} "
+            f"reason={response[1].get('reason')}"
+        )
+    assert rejection.code == "current_full_postmerge_target_owner_unverified"
+    assert rejection.details["reason"] == reason
+    assert rejection.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in before
+    } == before
