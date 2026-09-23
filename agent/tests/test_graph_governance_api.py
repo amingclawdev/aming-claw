@@ -23726,6 +23726,15 @@ def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_
     tmp_path,
 ):
     head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    root_lookups = []
+
+    def body_only_root(project_id, body):
+        assert project_id == PID
+        assert body.get("project_root") == str(tmp_path)
+        root_lookups.append(dict(body))
+        return str(tmp_path)
+
+    monkeypatch.setattr(server, "_graph_governance_project_root", body_only_root)
     backlog_id = "AC-CURRENT-FULL-ONBOARD-DIRECT-MAIN"
     observer_session_id = _insert_active_observer_session_ref(
         conn,
@@ -23765,6 +23774,7 @@ def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_
                 {"project_id": PID},
                 method="POST",
                 body={
+                    "project_root": str(tmp_path),
                     "target_commit_sha": head,
                     "activate": activate,
                     "semantic_enrich": False,
@@ -23787,6 +23797,7 @@ def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_
     assert [call["activate"] for call in calls] == [False]
     assert deployed["resumed_candidate"] is True
     assert deployed["rebuild_skipped"] is True
+    assert len(root_lookups) >= 2
     assert all(
         "current_full_reconcile_runtime_context_scope" not in result
         for result in (preflight, deployed)
@@ -234593,6 +234604,121 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
         "WHERE project_id=? AND backlog_id=? AND event_kind LIKE 'qa%'",
         (PID, record["backlog_id"]),
     ).fetchone()[0] == 0
+
+
+def test_rev10_current_full_nonpending_record_preserves_terminal_replay(
+    conn, monkeypatch, tmp_path,
+):
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    builds = []
+
+    def build(_conn, project_id, root, **kwargs):
+        builds.append(Path(root).resolve())
+        store.create_graph_snapshot(
+            _conn, project_id, snapshot_id=kwargs["snapshot_id"],
+            commit_sha=case["final"], snapshot_kind="full",
+            graph_json=_graph(), notes=json.dumps({"run_id": kwargs["run_id"]}),
+        )
+        _conn.commit()
+        return {
+            "ok": True, "snapshot_id": kwargs["snapshot_id"],
+            "projection_id": "semproj-rev10-linked-owner-terminal",
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", build)
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=case["body"])
+    )
+    assert first_status == 201, first
+    assert first["activated"] is True
+    assert builds == [case["owner"].resolve()]
+
+    record = copy.deepcopy(case["record"])
+    selected_context = case["contexts"][0]
+    record["completed_lines"].append(
+        {
+            "stage_id": "observer_reconcile",
+            "line_id": "observer_reconcile",
+            "actor_role": "observer",
+            "evidence_kind": "reconcile",
+            "status": "passed",
+            "runtime_context_id": selected_context.runtime_context_id,
+            "task_id": selected_context.task_id,
+            "parent_task_id": selected_context.parent_task_id,
+            "commit_sha": case["final"],
+        }
+    )
+    record["runtime_guide"]["next_legal_action"]["line_id"] = (
+        "qa_independent_verification"
+    )
+    conn.execute(
+        "UPDATE contract_runtime_executions SET record_json=? "
+        "WHERE contract_execution_id=?",
+        (json.dumps(record), record["contract_execution_id"]),
+    )
+    conn.commit()
+
+    def replay_body_only_root(project_id, explicit_root=None, *, fallback_self=True):
+        assert project_id == PID
+        assert explicit_root == str(case["owner"])
+        return case["owner"].resolve()
+
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root", replay_body_only_root,
+    )
+    monkeypatch.setattr(
+        state_reconcile, "run_state_only_full_reconcile",
+        lambda *_args, **_kwargs: pytest.fail(
+            "terminal replay must not rebuild the graph"
+        ),
+    )
+    replay_body = {
+        **case["body"],
+        "project_root": str(case["owner"]),
+        "snapshot_id": first["snapshot_id"],
+    }
+    before_changes = conn.total_changes
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=replay_body)
+    )
+    assert replay_status == 200, replay
+    assert replay["idempotent_replay"] is True
+    assert replay["rebuild_skipped"] is True
+    assert conn.total_changes == before_changes
+    assert builds == [case["owner"].resolve()]
+
+
+def test_rev10_current_full_nonpending_guide_without_reconcile_line_fails_closed(
+    conn, monkeypatch, tmp_path,
+):
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    record = copy.deepcopy(case["record"])
+    record["runtime_guide"]["next_legal_action"]["line_id"] = (
+        "qa_independent_verification"
+    )
+    conn.execute(
+        "UPDATE contract_runtime_executions SET record_json=? "
+        "WHERE contract_execution_id=?",
+        (json.dumps(record), record["contract_execution_id"]),
+    )
+    conn.commit()
+    before_changes = conn.total_changes
+    monkeypatch.setattr(
+        state_reconcile, "run_state_only_full_reconcile",
+        lambda *_args, **_kwargs: pytest.fail(
+            "tampered Guide reached current-full builder"
+        ),
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=case["body"])
+        )
+    assert rejected.value.code == "current_full_postmerge_target_owner_unverified"
+    assert rejected.value.details["reason"] == "observer_reconcile_not_selected"
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
 
 
 @pytest.mark.parametrize(
