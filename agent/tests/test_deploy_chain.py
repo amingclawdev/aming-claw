@@ -2526,11 +2526,102 @@ http.server.HTTPServer(("127.0.0.1",port),Handler).serve_forever()
         ).strip() == stable
 
 
-@pytest.mark.parametrize("main_preimage,fault", [(False, "none"), (False, "candidate_start"), (False, "after_branch"), (False, "after_source"), (True, "none"), (True, "after_source")])
-def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tmp_path, main_preimage, fault):
+@pytest.mark.parametrize("listener_delay,health_delay,expected_failure,health_error", [
+    (449, 100, False, "http"), (449, 100, False, "url"),
+    (449, 152, True, "http"), (449, 152, True, "url")])
+def test_activation_cold_start_uses_one_600_second_budget(monkeypatch, listener_delay, health_delay, expected_failure, health_error):
+    runtime = TestExplicitACPromotionScript._activation_runtime()
+    clock = {"now": 0.0}
+    from types import SimpleNamespace
+    runtime["time"] = SimpleNamespace(monotonic=lambda: clock["now"],
+        sleep=lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+    launch = ["/python", "-m", "agent.cli"]
+    identity = {"pid": 1234, "birth": "same-birth", "command": "/python -m agent.cli"}
+    class Ops:
+        def pid_identity(self, _pid): return dict(identity)
+        def pid_alive(self, _pid): return True
+        def port_pids(self, _port): return [1234] if clock["now"] >= listener_delay else []
+    machine = object.__new__(runtime["ActivationMachine"])
+    machine.plan = {"runtime_process_executable": "/python", "stable_port": 40000}
+    machine.ops = Ops()
+    healthy_at = listener_delay + health_delay
+    def health(_commit, _pid, *, legacy=False):
+        if clock["now"] < healthy_at:
+            if health_error == "http":
+                from urllib.error import HTTPError
+                raise HTTPError("http://127.0.0.1:40000/api/health", 503, "warming", {}, None)
+            if health_error == "url":
+                from urllib.error import URLError
+                raise URLError("warming")
+            runtime["fail"]("activation_health_identity_mismatch", "wrong exact health")
+        return {"status": "ok"}
+    machine.exact_health = health
+    assert machine.exact_started_process(1234, launch, "listener_pending") == identity
+    if expected_failure:
+        with pytest.raises(runtime["PromotionFailure"], match="did not become available"):
+            machine.poll_health("candidate", 1234)
+        assert clock["now"] < 601
+    else:
+        assert machine.poll_health("candidate", 1234) == {"status": "ok"}
+        assert clock["now"] >= healthy_at
+        machine.ops.port_pids = lambda _port: []
+        with pytest.raises(runtime["PromotionFailure"]) as drift:
+            machine.poll_health("candidate", 1234)
+        assert drift.value.code == "activation_listener_identity_drift"
+        machine.ops.port_pids = lambda _port: [1234]
+        machine.exact_health = lambda *_args, **_kwargs: runtime["fail"](
+            "activation_health_identity_mismatch", "wrong loaded source")
+        before = clock["now"]
+        with pytest.raises(runtime["PromotionFailure"]) as mismatch:
+            machine.poll_health("candidate", 1234)
+        assert mismatch.value.code == "activation_health_identity_mismatch"
+        assert clock["now"] == before
+        # Rollback starts a fresh bounded wait for its distinct old process.
+        identity.update(pid=1235, birth="rollback-birth")
+        machine.ops.port_pids = lambda _port: [1235]
+        assert machine.exact_started_process(1235, launch, "rollback_pending") == identity
+        assert machine._cold_start_deadline == pytest.approx(clock["now"] + 600)
+
+
+@pytest.mark.parametrize("first_main", [False, True])
+def test_main_binding_runs_exact_shell_precheck_before_legacy_timeline_branch(monkeypatch, tmp_path, first_main):
+    """Execute the actual promotion_precheck heredoc; the v1/main path exits early."""
+    from contextlib import redirect_stdout
+    from io import StringIO
+    from agent.tests.test_graph_governance_api import _main_binding_release_fixture
+    from agent.governance import server
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path, main_preimage=True, first_main=first_main)
+    manifest = fixture["manifest"]
+    script = TestExplicitACPromotionScript._script()
+    lines = script.read_text().splitlines()
+    start = next(i + 1 for i, line in enumerate(lines) if line.startswith('python3 - "$MANIFEST" "$LIVE_DB"'))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "PY")
+    manifest_path = tmp_path / "promotion-manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    verifier = "sha256:" + hashlib.sha256((fixture["dev"] / "scripts/merge-and-deploy.sh").read_bytes()).hexdigest()
+    args = ["promotion_precheck", str(manifest_path), str(fixture["stable_db"]),
+            manifest["stable_anchor_commit"], manifest["candidate_commit"],
+            manifest["diff_sha256"], verifier, server.AC_STABLE_ANCHOR_COMMIT,
+            json.dumps(manifest["stable_database_identity"])]
+    output = StringIO()
+    with monkeypatch.context() as boundary, redirect_stdout(output):
+        boundary.setattr(sys, "argv", args)
+        with pytest.raises(SystemExit) as completed:
+            exec(compile("\n".join(lines[start:end]) + "\n", str(script), "exec"),
+                 {"__name__": "main_promotion_precheck_fixture"})
+    assert completed.value.code == 0
+    receipt = json.loads(output.getvalue())
+    assert receipt == server._ac_main_binding_precheck(manifest)
+    if first_main:
+        assert manifest["prior_promotion"]["continuity"] == "legacy_first_main"
+        assert receipt["previous_promotion_receipt_hash"] is None
+
+
+@pytest.mark.parametrize("main_preimage,fault,first_main", [(False, "none", False), (False, "candidate_start", False), (False, "after_branch", False), (False, "after_source", False), (True, "none", False), (True, "after_source", False), (True, "none", True), (True, "after_source", True)])
+def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tmp_path, main_preimage, fault, first_main):
     from agent.tests.test_graph_governance_api import _main_binding_release_fixture
     from agent.governance import server, db
-    fixture = _main_binding_release_fixture(monkeypatch, tmp_path, main_preimage=main_preimage)
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path, main_preimage=main_preimage, first_main=first_main)
     # Real authentication in the physical fixture control DB, never a cached role.
     with sqlite3.connect(fixture["stable_db"]) as conn:
         conn.row_factory = sqlite3.Row
@@ -2678,11 +2769,32 @@ def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tm
         assert journal.rows[-1]["state"] == "COMPLETED"
         with sqlite3.connect(fixture["stable_db"]) as conn:
             rows = conn.execute("SELECT payload_json FROM task_timeline_events WHERE event_type='ac.stable_promotion_completed'").fetchall()
-        assert len(rows) == (2 if main_preimage else 1)
+        assert len(rows) == (2 if main_preimage and not first_main else 1)
         receipt = json.loads(rows[-1][0])
         assert receipt["prior_promotion"] == manifest["prior_promotion"]
         assert receipt["stable_branch"] == "main"
         assert receipt["previous_promotion_receipt_hash"] == manifest["prior_promotion"].get("receipt_hash")
+        if first_main:
+            # The emitted receipt, rather than a seeded fixture row, is the
+            # exact predecessor selected by the next normal main release.
+            with sqlite3.connect(fixture["stable_db"]) as conn:
+                conn.row_factory = sqlite3.Row
+                emitted = server._ac_promotion_completion_events(conn, "aming-claw")
+            next_prior = server._ac_main_binding_receipt_predecessor(
+                [row for row in emitted if row["commit_sha"] == candidate],
+                candidate, manifest["stable_database_identity"])
+            assert next_prior == {"kind": "timeline_receipt",
+                "timeline_event_id": emitted[0]["id"],
+                "receipt_hash": receipt["promotion_receipt_hash"]}
+            next_body = {"promotion_manifest": {"prior_promotion": next_prior},
+                "precheck_receipt": {"previous_promotion_receipt_hash": next_prior["receipt_hash"],
+                    "prior_promotion_event_id": next_prior["timeline_event_id"]},
+                "previous_promotion_receipt_hash": next_prior["receipt_hash"]}
+            assert server._ac_promotion_request_previous_receipt(
+                next_body, previous_stable=candidate) == next_prior["receipt_hash"]
+            with pytest.raises(server.ValidationError, match="ambiguous"):
+                server._ac_main_binding_receipt_predecessor(
+                    [emitted[0], emitted[0]], candidate, manifest["stable_database_identity"])
     else:
         assert fixture["stable_db"].read_bytes() == before_db
         assert result["rolled_back"] is True

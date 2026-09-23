@@ -230820,6 +230820,7 @@ def _main_binding_release_fixture(
     tmp_path,
     *,
     main_preimage=False,
+    first_main=False,
     create_operator_signoff=True,
 ):
     """File SQLite/Git, real Rule/route/QA validators; seeded accepted prefix, not live admission."""
@@ -230872,7 +230873,7 @@ def _main_binding_release_fixture(
         implementation_id = append_event(dev_conn, "observer.implementation", "implementation", "implementation", "observer-fixture", {"direct_main_implementation_commit_prewrite_authority": authority})
     with sqlite3.connect(stable / governance_db.AC_DATABASE_STABLE_RELATIVE_PATH) as stable_conn:
         _ensure_schema(stable_conn)
-        if main_preimage:
+        if main_preimage and not first_main:
             # Seed an immutable predecessor carrier; this is not prior live deployment proof.
             prior = {"schema_version": "ac_stable_promotion_completion_receipt.v1",
                 "promoted_commit": health["runtime_loaded_version"], "previous_stable_commit": git("rev-parse", health["runtime_loaded_version"] + "^"),
@@ -230880,6 +230881,19 @@ def _main_binding_release_fixture(
             prior["promotion_receipt_hash"] = server.stable_sha256(prior)
             stable_conn.execute("INSERT INTO task_timeline_events(project_id,backlog_id,task_id,event_type,phase,event_kind,actor,status,payload_json,verification_json,artifact_refs_json,commit_sha,created_at) VALUES ('aming-claw','HISTORICAL-PREDECESSOR','historical-cex','ac.stable_promotion_completed','release','stable_promotion','operator','accepted',?,'{}','{}',?,?)",
                 (json.dumps(prior), health["runtime_loaded_version"], "2026-09-08T00:00:00Z"))
+        if first_main:
+            assert main_preimage
+            # A historical exception is context, never a normal receipt.
+            legacy = health["runtime_loaded_version"]
+            for event_type, phase in (("ac.stable_promotion_break_glass_authorized", "promotion_precheck"),
+                                      ("ac.stable_promotion_break_glass_completed", "stable_promotion")):
+                stable_conn.execute("INSERT INTO task_timeline_events(project_id,backlog_id,task_id,event_type,phase,event_kind,actor,status,payload_json,verification_json,artifact_refs_json,commit_sha,created_at) VALUES ('aming-claw','HISTORICAL-BREAK-GLASS','historical-cex',?,?,'promotion_contract_bypass','observer','proceeded_with_exception',?,'{}','{}',?,?)",
+                    (event_type, phase, json.dumps({"candidate_commit": legacy}), legacy, "2026-09-08T00:00:00Z"))
+            graph_commit = git("rev-parse", legacy + "^")
+            stable_conn.execute("INSERT INTO graph_snapshots(project_id,snapshot_id,commit_sha,snapshot_kind,graph_sha256,status,created_at) VALUES ('aming-claw','fixture-active',?,'full',?,'active',?)",
+                (graph_commit, "sha256:" + "a" * 64, "2026-09-08T00:00:00Z"))
+            stable_conn.execute("INSERT INTO graph_snapshot_refs VALUES ('aming-claw','active','fixture-active',?,?)",
+                (graph_commit, "2026-09-08T00:00:00Z"))
     release = server._ac_main_binding_release_instance()
     intent = server._ac_main_binding_intent(release)
     intent_hash = server.stable_sha256(intent)
@@ -230949,8 +230963,9 @@ def _main_binding_release_fixture(
         _ensure_schema(stable_conn)
         store.ensure_schema(stable_conn)
         graph_commit = git("rev-parse", health["runtime_loaded_version"] + "^")
-        stable_conn.execute("INSERT INTO graph_snapshots(project_id,snapshot_id,commit_sha,snapshot_kind,graph_sha256,status,created_at) VALUES ('aming-claw','fixture-active',?,'full',?,'active',?)", (graph_commit, report, now.isoformat()))
-        stable_conn.execute("INSERT INTO graph_snapshot_refs VALUES ('aming-claw','active','fixture-active',?,?)", (graph_commit, now.isoformat()))
+        if not first_main:
+            stable_conn.execute("INSERT INTO graph_snapshots(project_id,snapshot_id,commit_sha,snapshot_kind,graph_sha256,status,created_at) VALUES ('aming-claw','fixture-active',?,'full',?,'active',?)", (graph_commit, report, now.isoformat()))
+            stable_conn.execute("INSERT INTO graph_snapshot_refs VALUES ('aming-claw','active','fixture-active',?,?)", (graph_commit, now.isoformat()))
         server._ensure_release_operator_head_queue_schema(stable_conn)
         operator_session = server.role_service.register(stable_conn, operator["operator_principal_id"], "aming-claw", "coordinator")
     signoff_body = {"action": "reorder", "backlog_ids": [], "reason": json.dumps(reason, sort_keys=True, separators=(",", ":"))}
@@ -231558,6 +231573,47 @@ def test_main_binding_producer_precheck_and_durable_consumer_use_current_instanc
     fixture["save"]()
     with pytest.raises(server.ValidationError, match="source/reconcile evidence"):
         server._ac_main_binding_precheck(manifest)
+
+
+def test_first_main_continuation_uses_receiptless_legacy_context_and_real_gates(monkeypatch, tmp_path):
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path, main_preimage=True, first_main=True)
+    prior = fixture["manifest"]["prior_promotion"]
+    assert prior["kind"] == "current_instance"
+    assert prior["continuity"] == "legacy_first_main"
+    assert prior["legacy_context"]["stable_commit"] == fixture["instance"]["stable_anchor_commit"]
+    with sqlite3.connect(fixture["stable_db"]) as conn:
+        assert conn.execute("SELECT count(*) FROM task_timeline_events WHERE event_type='ac.stable_promotion_completed'").fetchone()[0] == 0
+    precheck = server._ac_main_binding_precheck(fixture["manifest"])
+    assert precheck["previous_promotion_receipt_hash"] is None
+    assert precheck["prior_promotion_event_id"] is None
+    body = {"promotion_manifest": fixture["manifest"], "precheck_receipt": precheck,
+            "previous_promotion_receipt_hash": None}
+    assert server._ac_promotion_request_previous_receipt(
+        body, previous_stable=fixture["instance"]["stable_anchor_commit"]) is None
+
+
+@pytest.mark.parametrize("fault", ["earlier_normal", "missing_legacy", "altered_legacy", "duplicate_legacy", "graph_drift", "forged_prior"])
+def test_first_main_continuation_rejects_wrong_history_and_preimage(monkeypatch, tmp_path, fault):
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path, main_preimage=True, first_main=True)
+    if fault == "forged_prior":
+        fixture["manifest"]["prior_promotion"]["legacy_context"]["completed_event_id"] += 1
+    else:
+        with sqlite3.connect(fixture["stable_db"]) as conn:
+            if fault == "earlier_normal":
+                conn.execute("INSERT INTO task_timeline_events(project_id,backlog_id,task_id,event_type,phase,event_kind,actor,status,payload_json,verification_json,artifact_refs_json,commit_sha,created_at) VALUES ('aming-claw','OLD','old-cex','ac.stable_promotion_completed','release','stable_promotion','operator','accepted','{}','{}','{}',?,?)",
+                    (fixture["git"]("rev-parse", fixture["instance"]["stable_anchor_commit"] + "^"), "2026-09-08T00:00:00Z"))
+            elif fault == "missing_legacy":
+                conn.execute("DELETE FROM task_timeline_events WHERE event_type='ac.stable_promotion_break_glass_completed'")
+            elif fault == "altered_legacy":
+                conn.execute("UPDATE task_timeline_events SET payload_json='{}' WHERE event_type='ac.stable_promotion_break_glass_completed'")
+            elif fault == "duplicate_legacy":
+                cols = [row[1] for row in conn.execute("PRAGMA table_info(task_timeline_events)") if row[1] != "id"]
+                names = ",".join(cols)
+                conn.execute(f"INSERT INTO task_timeline_events({names}) SELECT {names} FROM task_timeline_events WHERE event_type='ac.stable_promotion_break_glass_completed'")
+            elif fault == "graph_drift":
+                conn.execute("DELETE FROM graph_snapshot_refs WHERE ref_name='active'")
+    with pytest.raises(server.ValidationError):
+        server._ac_main_binding_precheck(fixture["manifest"])
 
 
 def test_current_release_guide_ignores_unrelated_candidate_before_physical_reads(monkeypatch, tmp_path):

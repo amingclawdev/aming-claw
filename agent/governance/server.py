@@ -217953,6 +217953,25 @@ def _ac_main_binding_instance_core(instance: Mapping[str, Any]) -> dict[str, Any
             if key not in {"phase", "route_token_ref", "stable_deploy_authorized", "writes_performed"}}
 
 
+def _ac_main_binding_receipt_predecessor(predecessors: list[Mapping[str, Any]],
+                                         anchor: str, stable_identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Consume exactly one real completion for the current stable commit."""
+    if len(predecessors) != 1:
+        raise ValidationError("release predecessor receipt is ambiguous")
+    previous = predecessors[0]
+    receipt = previous.get("payload") or {}
+    receipt_hash = receipt.get("promotion_receipt_hash")
+    if not (previous.get("status") == "accepted" and previous.get("phase") == "release"
+            and previous.get("event_kind") == "stable_promotion"
+            and previous.get("commit_sha") == anchor
+            and receipt.get("promoted_commit") == anchor
+            and receipt.get("stable_database_identity") == dict(stable_identity)
+            and receipt.get("schema_version") in {"ac_stable_promotion_completion_receipt.v1", "ac_stable_promotion_completion_receipt.v2"}
+            and receipt_hash == stable_sha256({k: v for k, v in receipt.items() if k != "promotion_receipt_hash"})):
+        raise ValidationError("release predecessor receipt identity/hash mismatch")
+    return {"kind": "timeline_receipt", "timeline_event_id": int(previous["id"]), "receipt_hash": receipt_hash}
+
+
 def _ac_main_binding_dev_connection(instance: Mapping[str, Any]):
     """Open only the admitted physical dev database; never the caller's path."""
     from . import db
@@ -218223,22 +218242,50 @@ def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
                       "implementation_event_hash": _ac_promotion_event_hash(event), "preimage": preimage}
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as stable_conn:
         stable_conn.row_factory = sqlite3.Row
-        predecessors = [item for item in _ac_promotion_completion_events(stable_conn, "aming-claw")
-                        if item.get("commit_sha") == anchor]
+        stable_conn.execute("PRAGMA query_only=ON")
+        completions = _ac_promotion_completion_events(stable_conn, "aming-claw")
+        predecessors = [item for item in completions if item.get("commit_sha") == anchor]
+        if not predecessors and branches[0] == "main" and anchor != AC_STABLE_ANCHOR_COMMIT:
+            # The first normal release may start at a live, receiptless legacy
+            # main. Its old publication remains historical break-glass evidence,
+            # never a fabricated normal predecessor receipt.
+            if completions:
+                raise ValidationError("first main continuation requires no earlier normal completion")
+            historical = [_ac_promotion_row_to_event(row) for row in stable_conn.execute(
+                "SELECT * FROM task_timeline_events WHERE project_id=? AND event_type IN "
+                "('ac.stable_promotion_break_glass_authorized','ac.stable_promotion_break_glass_completed') ORDER BY id",
+                ("aming-claw",)).fetchall()]
+            legacy = [item for item in historical if item.get("event_type") == "ac.stable_promotion_break_glass_completed"]
+            if len(legacy) != 1:
+                raise ValidationError("ordinary main successor requires its predecessor receipt or one verified legacy completion")
+            old = legacy[0]
+            authorizations = [item for item in historical if item.get("event_type") == "ac.stable_promotion_break_glass_authorized"
+                              and item.get("commit_sha") == old.get("commit_sha")
+                              and item.get("backlog_id") == old.get("backlog_id")
+                              and item.get("task_id") == old.get("task_id") and int(item["id"]) < int(old["id"])]
+            if not (len(authorizations) == 1 and old.get("status") == "proceeded_with_exception"
+                    and old.get("phase") == "stable_promotion" and old.get("event_kind") == "promotion_contract_bypass"
+                    and (old.get("payload") or {}).get("candidate_commit") == old.get("commit_sha")
+                    and authorizations[0].get("status") == "proceeded_with_exception"
+                    and (authorizations[0].get("payload") or {}).get("candidate_commit") == old.get("commit_sha")
+                    and subprocess.run(["git", "merge-base", "--is-ancestor", old["commit_sha"], anchor],
+                                       cwd=source_root, capture_output=True, check=False, timeout=5).returncode == 0):
+                raise ValidationError("first main historical context is not exact")
+            graph_hash = _ac_main_binding_graph_identity(stable_conn, source_identity={
+                "stable_anchor_commit": anchor, "candidate_commit": actual_candidate,
+                "stable_runtime_source_sha256": "sha256:" + hashlib.sha256(git("show", f"{anchor}:agent/governance/server.py")).hexdigest(),
+                "candidate_runtime_source_sha256": "sha256:" + hashlib.sha256(git("show", f"{actual_candidate}:agent/governance/server.py")).hexdigest()})
+            source_custody = {**source_custody, "continuity": "legacy_first_main",
+                "legacy_context": {"authorized_event_id": int(authorizations[0]["id"]),
+                    "authorized_event_hash": _ac_promotion_event_hash(authorizations[0]),
+                    "completed_event_id": int(old["id"]),
+                    "completed_event_hash": _ac_promotion_event_hash(old),
+                    "stable_graph_identity_hash": graph_hash,
+                    "stable_commit": anchor, "stable_database_identity": stable_identity}}
     if predecessors:
-        if len(predecessors) != 1:
-            raise ValidationError("release predecessor receipt is ambiguous")
-        previous = predecessors[0]
-        receipt = previous.get("payload") or {}
-        receipt_hash = receipt.get("promotion_receipt_hash")
-        if not (previous.get("status") == "accepted" and previous.get("phase") == "release"
-                and previous.get("event_kind") == "stable_promotion"
-                and receipt.get("promoted_commit") == anchor
-                and receipt.get("stable_database_identity") == stable_identity
-                and receipt.get("schema_version") in {"ac_stable_promotion_completion_receipt.v1", "ac_stable_promotion_completion_receipt.v2"}
-                and receipt_hash == stable_sha256({k: v for k, v in receipt.items() if k != "promotion_receipt_hash"})):
-            raise ValidationError("release predecessor receipt identity/hash mismatch")
-        prior = {"kind": "timeline_receipt", "timeline_event_id": int(previous["id"]), "receipt_hash": receipt_hash}
+        prior = _ac_main_binding_receipt_predecessor(predecessors, anchor, stable_identity)
+    elif branches[0] == "main" and source_custody.get("continuity") == "legacy_first_main":
+        prior = source_custody
     elif branches[0] == "main" or anchor == AC_STABLE_ANCHOR_COMMIT:
         raise ValidationError("ordinary main successor requires its existing predecessor receipt")
     else:
@@ -218781,7 +218828,9 @@ def _validate_ac_stable_promotion_durable_evidence_core(
 
     prior = manifest.get("prior_promotion")
     if main_instance is not None and isinstance(prior, Mapping) and prior.get("kind") == "current_instance":
-        if (prior != main_instance["prior_promotion"] or precheck.get("previous_promotion_receipt_hash") is not None or precheck.get("prior_promotion_event_id") is not None):
+        if (prior != main_instance["prior_promotion"]
+                or precheck.get("previous_promotion_receipt_hash") is not None or precheck.get("prior_promotion_event_id") is not None
+                or (prior.get("continuity") == "legacy_first_main" and _ac_promotion_completion_events(conn, project_id))):
             raise ValidationError("current instance predecessor projection mismatch", fail_details)
         return
     previous_receipt = str(precheck.get("previous_promotion_receipt_hash") or "")
@@ -219226,7 +219275,9 @@ def _ac_promotion_request_previous_receipt(
         preimage = prior.get("preimage")
         instance = preimage.get("instance") if isinstance(preimage, Mapping) else None
         if not (
-            set(prior) == {"kind", "implementation_event_id", "implementation_event_hash", "preimage"}
+            (set(prior) == {"kind", "implementation_event_id", "implementation_event_hash", "preimage"}
+             or (set(prior) == {"kind", "implementation_event_id", "implementation_event_hash", "preimage", "continuity", "legacy_context"}
+                 and prior.get("continuity") == "legacy_first_main"))
             and isinstance(instance, Mapping)
             and manifest.get("schema_version") == "ac_stable_promotion_manifest.v1"
             and manifest.get("backlog_id") == instance.get("backlog_id") and bool(instance.get("backlog_id"))

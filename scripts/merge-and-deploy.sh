@@ -66,6 +66,8 @@ import time
 import urllib.error
 import urllib.request
 
+COLD_START_TIMEOUT_SECONDS = 600.0
+
 
 class PromotionFailure(RuntimeError):
     def __init__(self, code, message):
@@ -613,7 +615,11 @@ class ActivationMachine:
         return {}
 
     def exact_started_process(self, pid, launch_spec, code, *, poll=True):
-        deadline = time.monotonic() + (15.0 if poll else 0.0)
+        deadline = time.monotonic() + (COLD_START_TIMEOUT_SECONDS if poll else 0.0)
+        if poll:
+            # Health and listener readiness share one bounded cold-start budget.
+            # A rollback restart starts a fresh budget for the old process.
+            self._cold_start_deadline = deadline
         expected_command = self.expected_process_command(launch_spec)
         first_identity = {}
         while True:
@@ -743,7 +749,7 @@ class ActivationMachine:
         return health
 
     def poll_health(self, expected_commit, expected_pid, *, legacy=False):
-        deadline = time.monotonic() + 15.0
+        deadline = getattr(self, "_cold_start_deadline", time.monotonic() + COLD_START_TIMEOUT_SECONDS)
         first = self.ops.pid_identity(expected_pid)
         while True:
             if self.ops.pid_identity(expected_pid) != first:
@@ -751,13 +757,15 @@ class ActivationMachine:
                     "activation_process_identity_drift",
                     "PID/birth/argv changed while waiting for health",
                 )
+            if self.ops.port_pids(self.plan["stable_port"]) != [expected_pid]:
+                fail("activation_listener_identity_drift", "unique stable listener changed while waiting for health")
             try:
                 return self.exact_health(
                     expected_commit, expected_pid, legacy=legacy
                 )
-            except PromotionFailure as exc:
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
                 if time.monotonic() >= deadline:
-                    raise exc
+                    fail("activation_health_unavailable", f"stable health did not become available: {exc}")
             time.sleep(0.1)
 
     def completion_body(self, health, previous_entry_hash):
