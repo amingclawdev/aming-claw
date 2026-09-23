@@ -234606,8 +234606,9 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
     ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("replay_root", ["original_body", "explicit_owner"])
 def test_rev10_current_full_nonpending_record_preserves_terminal_replay(
-    conn, monkeypatch, tmp_path,
+    conn, monkeypatch, tmp_path, replay_root,
 ):
     case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
     builds = []
@@ -234665,20 +234666,21 @@ def test_rev10_current_full_nonpending_record_preserves_terminal_replay(
         assert explicit_root == str(case["owner"])
         return case["owner"].resolve()
 
-    monkeypatch.setattr(
-        server.project_service, "resolve_project_root", replay_body_only_root,
-    )
+    if replay_root == "explicit_owner":
+        monkeypatch.setattr(
+            server.project_service, "resolve_project_root", replay_body_only_root,
+        )
     monkeypatch.setattr(
         state_reconcile, "run_state_only_full_reconcile",
         lambda *_args, **_kwargs: pytest.fail(
             "terminal replay must not rebuild the graph"
         ),
     )
-    replay_body = {
-        **case["body"],
-        "project_root": str(case["owner"]),
-        "snapshot_id": first["snapshot_id"],
-    }
+    replay_body = dict(case["body"])
+    if replay_root == "explicit_owner":
+        replay_body.update(
+            project_root=str(case["owner"]), snapshot_id=first["snapshot_id"],
+        )
     before_changes = conn.total_changes
     replay_status, replay = server.handle_graph_governance_current_full_reconcile(
         _ctx({"project_id": PID}, method="POST", body=replay_body)
