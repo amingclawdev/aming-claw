@@ -235377,3 +235377,314 @@ def test_rev10_current_full_linked_target_owner_rejects_untrusted_world_before_b
         table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         for table in before
     } == before
+
+
+def _rev10_postmerge_route_issue_world(conn, monkeypatch, tmp_path):
+    monkeypatch.setitem(globals(), "PID", "aming-claw")
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    for _owner, ensure_schema, _inventory in (
+        governance_db._graph_schema_owner_registry()
+    ):
+        ensure_schema(conn)
+    backlog_id = case["record"]["backlog_id"]
+    execution_id = case["record"]["contract_execution_id"]
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files=?, test_files='[]' WHERE bug_id=?",
+        (json.dumps(["first-lane.txt", "second-lane.txt"]), backlog_id),
+    )
+    conn.execute(
+        "INSERT INTO backlog_contract_chain_current "
+        "(project_id, backlog_id, current_contract_execution_id, "
+        "current_contract_id, generation, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (PID, backlog_id, execution_id, "mf_parallel.v2", 7,
+         "2026-09-23T00:00:00Z"),
+    )
+    conn.execute(
+        "DELETE FROM observer_route_token_refs WHERE route_token_ref=?",
+        (case["body"]["observer_route_token_ref"],),
+    )
+    conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _pid: _NoCloseConn(conn))
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: _fixed_ac_dev_direct_world(case["owner"], case["final"]),
+    )
+    custody = {
+        "runtime_plane": "dev",
+        "port": server.AC_DEV_SERVICE_PORT,
+        "classification_reason": "verified_dev_cow_successor_receipt_history",
+        "cow_successor_verified": True,
+        "source_checkout_verified": True,
+        "live_runtime_custody_verified": True,
+        "active_graph_activation_allowed": True,
+        "world_id": "ac-dev",
+        "project_id": PID,
+    }
+    monkeypatch.setattr(
+        server, "classify_graph_activation_connection", lambda _conn: custody,
+    )
+    case["custody"] = custody
+    case["session_id"] = case["body"]["observer_session_id"]
+    case["issue_body"], case["current_full_body"] = (
+        server._ac_dev_mf_parallel_postmerge_reconcile_route_recipe(
+            conn, project_id=PID, backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            observer_session_id=case["session_id"],
+        )
+    )
+    case["public_issue_body"] = (
+        server._ac_dev_mf_parallel_postmerge_reconcile_public_issue_body(
+            case["issue_body"]
+        )
+    )
+    return case
+
+
+def test_rev10_postmerge_guide_issues_exact_graph_only_route(
+    conn, monkeypatch, tmp_path,
+):
+    from agent.mcp import tools as mcp_tools
+    from agent.governance import mcp_server as governance_mcp_server
+
+    def public_schema(module, name):
+        return next(tool["inputSchema"] for tool in module.TOOLS
+                    if tool["name"] == name)
+
+    case = _rev10_postmerge_route_issue_world(conn, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server, "_onboard_route_guide_service_response_base",
+        lambda *_args, **_kwargs: {"ok": True, "next_legal_action": {
+            "line_id": "observer_reconcile"}, "onboard_route_guide": {}},
+    )
+    guide = server._onboard_route_guide_service_response(
+        conn, project_id=PID, backlog_id=case["record"]["backlog_id"],
+        role="observer", work_type="continue_contract_chain",
+        request_body={"observer_session_id": case["session_id"]},
+    )
+    action = guide["next_legal_action"]
+    assert action["mcp_tool"] == "observer_route_context_issue"
+    assert action["copy_safe_body"] == case["public_issue_body"]
+    for module in (mcp_tools, governance_mcp_server):
+        schema = public_schema(module, "observer_route_context_issue")
+        extra = set(action["copy_safe_body"]) - set(schema["properties"])
+        if module is governance_mcp_server:
+            # This facade fills caller_role=observer and permits the same
+            # explicit value through its JSON-schema additional-properties default.
+            assert extra == {"caller_role"}
+            assert schema.get("additionalProperties", True) is True
+        else:
+            assert not extra
+        assert set(schema["required"]) <= set(action["copy_safe_body"])
+    assert action["copy_safe_body"]["allowed_actions"] == [
+        "graph_current_full_reconcile"
+    ]
+    assert guide["postmerge_current_full_reconcile"]["selected_task_id"] == (
+        case["contexts"][0].task_id
+    )
+    assert guide["postmerge_current_full_reconcile"]["target_head_commit"] == (
+        case["final"]
+    )
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": PID}, method="POST", body=action["copy_safe_body"])
+    )
+    assert issued["ok"] is True, json.dumps(issued, indent=2, sort_keys=True)
+    assert issued["ref_registered"] is True
+    ref = issued["route_token_ref"]
+    resolved = observer_route_context.resolve_route_token_ref(
+        conn, project_id=PID, route_token_ref=ref,
+        backlog_id=case["record"]["backlog_id"],
+        task_id=case["contexts"][0].task_id,
+    )
+    assert resolved["allowed_actions"] == ["graph_current_full_reconcile"]
+    assert resolved["target_files"] == ["first-lane.txt", "second-lane.txt"]
+    assert set(case["issue_body"]["evidence_refs"]).issubset(
+        resolved["evidence_refs"]
+    )
+    guide_with_ref = server._onboard_route_guide_service_response(
+        conn, project_id=PID, backlog_id=case["record"]["backlog_id"],
+        role="observer", work_type="continue_contract_chain",
+        route_token_ref=ref,
+        request_body={"observer_session_id": case["session_id"]},
+    )
+    graph_action = guide_with_ref["next_legal_action"]
+    assert graph_action["mcp_tool"] == "graph_current_full_reconcile"
+    graph_body = graph_action["copy_safe_body"]
+    for module in (mcp_tools, governance_mcp_server):
+        schema = public_schema(module, "graph_current_full_reconcile")
+        assert set(graph_body) <= set(schema["properties"])
+        assert set(schema["required"]) <= set(graph_body)
+    assert "contract_execution_id" not in graph_body
+    assert "project_root" not in graph_body
+    assert graph_body["task_id"] == case["contexts"][0].task_id
+    assert graph_body["target_commit_sha"] == case["final"]
+    transport_body = {
+        key: value for key, value in graph_body.items()
+        if key != "project_id"
+    }
+    transport_body, alias_error = (
+        mcp_tools._normalize_current_full_reconcile_route_token_aliases(
+            transport_body
+        )
+    )
+    assert alias_error is None
+    transport_body = mcp_tools._ensure_current_full_reconcile_run_id(
+        transport_body
+    )
+    auth = server._require_current_full_reconcile_auth(
+        _ctx({"project_id": PID}, method="POST", body=transport_body),
+        conn, "graph_current_full_reconcile",
+    )
+    assert auth["route_token_scope"]["task_id"] == case["contexts"][0].task_id
+    monkeypatch.setattr(
+        governance_db, "classify_graph_activation_connection",
+        lambda _conn: case["custody"],
+    )
+    monkeypatch.setattr(
+        server, "admit_ac_dev_graph_materialization_schema",
+        lambda _conn, **_kwargs: {"accepted": True},
+    )
+    def build(_conn, project_id, root, **kwargs):
+        assert project_id == PID
+        assert Path(root).resolve() == case["owner"].resolve()
+        assert kwargs["commit_sha"] == case["final"]
+        store.create_graph_snapshot(
+            _conn, project_id, snapshot_id=kwargs["snapshot_id"],
+            commit_sha=case["final"], snapshot_kind="full",
+            graph_json=_graph(), notes=json.dumps({"run_id": kwargs["run_id"]}),
+        )
+        _conn.commit()
+        return {
+            "ok": True, "snapshot_id": kwargs["snapshot_id"],
+            "projection_id": "semproj-postmerge-route",
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+            "elapsed_ms": 1,
+        }
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", build)
+    reconcile_status, reconciled = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=transport_body)
+        )
+    )
+    assert reconcile_status == 201, reconciled
+    assert reconciled["activated"] is True
+
+
+@pytest.mark.parametrize("defect", [
+    "wrong_task", "wrong_parent", "wrong_generation", "wrong_root",
+    "wrong_head", "wrong_action", "direct_mixing", "inactive_session",
+    "genesis_only_custody",
+])
+def test_rev10_postmerge_route_issue_rejects_noncurrent_scope_zero_write(
+    conn, monkeypatch, tmp_path, defect,
+):
+    case = _rev10_postmerge_route_issue_world(conn, monkeypatch, tmp_path)
+    body = copy.deepcopy(case["public_issue_body"])
+    if defect == "wrong_task":
+        body["task_id"] = case["contexts"][1].task_id
+    elif defect == "wrong_parent":
+        body["parent_task_id"] = "cex-foreign"
+    elif defect == "wrong_generation":
+        body["evidence_refs"] = [
+            ref[:-1] + "8" if ref.startswith("mf_postmerge_generation:") else ref
+            for ref in body["evidence_refs"]
+        ]
+    elif defect == "wrong_root":
+        body["target_project_root"] = str(case["registered"])
+    elif defect == "wrong_head":
+        body["target_head_commit"] = case["first"]
+    elif defect == "wrong_action":
+        body["allowed_actions"].append("observer_direct_mutation_exception")
+    elif defect == "direct_mixing":
+        body["operator_supervised_direct_main"] = True
+    elif defect == "inactive_session":
+        conn.execute(
+            "UPDATE observer_sessions SET status='revoked' WHERE session_id=?",
+            (case["session_id"],),
+        )
+        conn.commit()
+    elif defect == "genesis_only_custody":
+        monkeypatch.setattr(
+            server, "classify_graph_activation_connection",
+            lambda _conn: {**case["custody"],
+                           "classification_reason": "genesis_only_dev_database",
+                           "cow_successor_verified": False},
+        )
+    before = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_observer_route_context_issue(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+    assert rejected.value.code == (
+        "ac_dev_mf_parallel_postmerge_reconcile_route_rejected"
+    )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0] == before
+
+
+@pytest.mark.parametrize("defect", [
+    "expired_ref", "revoked_ref", "superseded_ref", "foreign_ref",
+    "stale_generation", "stale_reconcile_head", "candidate_only",
+    "private_parent_override", "wrong_selected_task", "wrong_observer_session",
+])
+def test_rev10_postmerge_current_full_refuses_stale_or_foreign_route(
+    conn, monkeypatch, tmp_path, defect,
+):
+    case = _rev10_postmerge_route_issue_world(conn, monkeypatch, tmp_path)
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": PID}, method="POST", body=case["public_issue_body"])
+    )
+    assert issued["ok"] is True
+    ref = issued["route_token_ref"]
+    body = {**case["current_full_body"], "observer_route_token_ref": ref}
+    if defect == "expired_ref":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET expires_at=? "
+            "WHERE route_token_ref=?",
+            ("2020-01-01T00:00:00Z", ref),
+        )
+    elif defect in {"revoked_ref", "superseded_ref"}:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status=? "
+            "WHERE route_token_ref=?",
+            (defect.removesuffix("_ref"), ref),
+        )
+    elif defect == "foreign_ref":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET project_id=? "
+            "WHERE route_token_ref=?",
+            ("foreign-project", ref),
+        )
+    elif defect == "stale_generation":
+        conn.execute(
+            "UPDATE backlog_contract_chain_current SET generation=generation+1 "
+            "WHERE project_id=? AND backlog_id=?",
+            (PID, case["record"]["backlog_id"]),
+        )
+    elif defect == "stale_reconcile_head":
+        body["target_commit_sha"] = case["first"]
+    elif defect == "candidate_only":
+        body["activate"] = False
+    elif defect == "private_parent_override":
+        body["parent_task_id"] = case["record"]["contract_execution_id"]
+    elif defect == "wrong_selected_task":
+        body["task_id"] = case["contexts"][1].task_id
+    elif defect == "wrong_observer_session":
+        body["observer_session_id"] = "obs-foreign"
+    conn.commit()
+    before = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server._require_current_full_reconcile_auth(
+            _ctx({"project_id": PID}, method="POST", body=body),
+            conn, "graph_current_full_reconcile",
+        )
+    assert rejected.value.code in {
+        "observer_route_token_proof_required",
+        "route_token_ref_invalid", "observer_session_not_active",
+        "postmerge_route_scope_mismatch", "route_token_ref_scope_mismatch",
+    }
+    assert conn.total_changes == before

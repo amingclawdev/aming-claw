@@ -8410,6 +8410,11 @@ def _observer_route_context_issue_request_kind(
     ):
         return "mf_parallel_finished_worker_merge_route"
     if (
+        isinstance(body.get("evidence_refs"), list)
+        and "mf_parallel_postmerge_reconcile:v1" in body["evidence_refs"]
+    ):
+        return "mf_parallel_postmerge_reconcile_route"
+    if (
         "canonical_ref_adoption" not in body
         and isinstance(allowed_actions, list)
         and "parallel_branch_allocate" in allowed_actions
@@ -9469,6 +9474,11 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                 )
             )
             mf_parallel_final_body = dict(body)
+        if request_kind == "mf_parallel_postmerge_reconcile_route":
+            body = _ac_dev_mf_parallel_postmerge_reconcile_route_precheck(
+                project_id=project_id, body=body, query=ctx.query,
+            )
+            mf_parallel_final_body = dict(body)
         if request_kind in {
             "mf_parallel_onboard_precursor", "mf_parallel_entered_lane",
             "mf_parallel_recovery_continuation", "mf_parallel_recovery_bypass_continuation",
@@ -9883,6 +9893,13 @@ def handle_observer_route_context_issue(ctx: RequestContext):
                                 token=issued["route_token"],
                             )
                         )
+                    elif request_kind == "mf_parallel_postmerge_reconcile_route":
+                        _ac_dev_mf_parallel_postmerge_reconcile_route_revalidate(
+                            conn, project_id=project_id,
+                            body=mf_parallel_final_body,
+                            token=issued["route_token"],
+                            allow_internal=True,
+                        )
                     else:
                         _ac_dev_mf_parallel_onboard_route_issue_revalidate(
                             conn,
@@ -9978,9 +9995,16 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             rejection = (
                 exc
                 if isinstance(exc, GovernanceError)
-                else _ac_dev_mf_parallel_onboard_route_issue_rejection(
-                    reason="writer_revalidation_failed",
-                    body=mf_parallel_final_body,
+                else (
+                    _ac_dev_mf_parallel_postmerge_reconcile_route_rejection(
+                        reason="writer_revalidation_failed",
+                        body=mf_parallel_final_body,
+                    )
+                    if request_kind == "mf_parallel_postmerge_reconcile_route"
+                    else _ac_dev_mf_parallel_onboard_route_issue_rejection(
+                        reason="writer_revalidation_failed",
+                        body=mf_parallel_final_body,
+                    )
                 )
             )
             return 409, {
@@ -13199,6 +13223,69 @@ def _require_current_full_reconcile_auth(
             allowed_actions=normalized_allowed,
             accepted_actions=accepted_actions,
         )
+
+    evidence_refs = list(resolved.get("evidence_refs") or [])
+    postmerge_markers = [
+        ref for ref in evidence_refs
+        if str(ref).startswith("mf_postmerge_generation:")
+    ]
+    if postmerge_markers:
+        if len(postmerge_markers) != 1:
+            _raise_current_full_route_proof(
+                "postmerge_route_generation_ambiguous",
+                "postmerge current-full route has ambiguous generation evidence",
+            )
+        try:
+            marker_fields = postmerge_markers[0].split(":")
+            if len(marker_fields) != 4 or not marker_fields[1]:
+                raise ValueError("invalid postmerge route generation marker")
+            expected_route, expected_reconcile = (
+                _ac_dev_mf_parallel_postmerge_reconcile_route_recipe(
+                    conn, project_id=project_id, backlog_id=backlog_id,
+                    contract_execution_id=marker_fields[1],
+                    observer_session_id=observer_session_id,
+                )
+            )
+        except (GovernanceError, ValueError) as exc:
+            _raise_current_full_route_proof(
+                "postmerge_route_authority_changed",
+                "postmerge current-full route no longer matches the current CEX",
+                reason=str(
+                    getattr(exc, "details", {}).get("reason")
+                    or getattr(exc, "code", type(exc).__name__)
+                ),
+            )
+        supplied = ctx.body if isinstance(ctx.body, Mapping) else {}
+        exact_request = (
+            supplied.get("project_id", project_id) == project_id
+        ) and all(
+            supplied.get(field) == expected_reconcile[field]
+            for field in (
+                "backlog_id", "task_id", "target_commit_sha",
+                "activate", "require_clean", "semantic_use_ai",
+                "observer_session_id",
+            )
+        ) and not any(
+            field in supplied
+            for field in (
+                "contract_execution_id", "parent_task_id", "runtime_context_id",
+                "merge_queue_id", "target_project_root", "project_root",
+                "worktree_path",
+            )
+        )
+        if not (
+            exact_request
+            and normalized_allowed == expected_route["allowed_actions"]
+            and sorted(resolved.get("target_files") or [])
+            == expected_route["target_files"]
+            and sorted(resolved.get("owned_files") or [])
+            == expected_route["owned_files"]
+            and set(expected_route["evidence_refs"]).issubset(evidence_refs)
+        ):
+            _raise_current_full_route_proof(
+                "postmerge_route_scope_mismatch",
+                "postmerge current-full request or route differs from current CEX",
+            )
 
     return {
         "role": "observer",
@@ -159370,6 +159457,270 @@ def _ac_dev_mf_parallel_finished_worker_merge_route_rejection(
     )
 
 
+def _ac_dev_mf_parallel_postmerge_reconcile_route_rejection(
+    *, reason: str, body: Mapping[str, Any] | None = None,
+    expected_body: Mapping[str, Any] | None = None,
+) -> GovernanceError:
+    return GovernanceError(
+        "ac_dev_mf_parallel_postmerge_reconcile_route_rejected",
+        "postmerge reconcile route requires the exact current MF authority",
+        409,
+        {
+            "schema_version": "ac_dev_mf_parallel_postmerge_reconcile_route.rejection.v1",
+            "reason": reason,
+            "request_body_hash": stable_sha256(dict(body or {})),
+            "expected_body_hash": stable_sha256(dict(expected_body or {})),
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "route_registry_mutated": False,
+            "caller_claims_trusted": False,
+            "public_safe": True,
+            "secret_safe": True,
+            "raw_route_token_exposed": False,
+        },
+    )
+
+
+def _ac_dev_mf_parallel_postmerge_reconcile_route_recipe(
+    conn: sqlite3.Connection, *, project_id: str, backlog_id: str,
+    contract_execution_id: str, observer_session_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Derive the graph-only route and current-full body from the current CEX."""
+
+    def reject(reason: str) -> NoReturn:
+        raise _ac_dev_mf_parallel_postmerge_reconcile_route_rejection(
+            reason=reason,
+        )
+
+    if _runtime_plane() != "dev" or project_id != AC_PROJECT_ID:
+        reject("wrong_runtime")
+    world = _operator_supervised_direct_main_dev_world_authority()
+    if not (
+        world.get("accepted") is True
+        and world.get("runtime_stale") is False
+        and world.get("world_id") == "ac-dev"
+        and int(world.get("runtime_port") or 0) == AC_DEV_SERVICE_PORT
+        and str(world.get("loaded_runtime_commit") or "").lower()
+        == str(world.get("target_head_commit") or "").lower()
+    ):
+        reject("dev_world_not_current")
+    try:
+        custody = classify_graph_activation_connection(conn)
+    except (ValueError, sqlite3.Error):
+        reject("dev_cow_runtime_custody_unverified")
+    if not (
+        custody.get("classification_reason")
+        == "verified_dev_cow_successor_receipt_history"
+        and custody.get("cow_successor_verified") is True
+        and custody.get("source_checkout_verified") is True
+        and custody.get("live_runtime_custody_verified") is True
+        and custody.get("active_graph_activation_allowed") is True
+        and custody.get("world_id") == "ac-dev"
+        and custody.get("project_id") == project_id
+    ):
+        reject("dev_cow_runtime_custody_unverified")
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id=?", (backlog_id,),
+    ).fetchone()
+    if row is None or str(_row_get(row, "status", "")) not in {
+        "OPEN", "MF_IN_PROGRESS",
+    }:
+        reject("backlog_not_current")
+    current = conn.execute(
+        "SELECT current_contract_execution_id, current_contract_id, generation "
+        "FROM backlog_contract_chain_current WHERE project_id=? AND backlog_id=?",
+        (project_id, backlog_id),
+    ).fetchone()
+    try:
+        generation = int(current["generation"] or 0) if current is not None else 0
+    except (TypeError, ValueError):
+        reject("selected_contract_generation_invalid")
+    if not (
+        current is not None
+        and str(current["current_contract_execution_id"] or "")
+        == contract_execution_id
+        and _is_mf_parallel_record_contract_id(
+            str(current["current_contract_id"] or "")
+        )
+        and generation > 0
+    ):
+        reject("selected_contract_not_current")
+    try:
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        reject("selected_contract_missing")
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    selected = guide.get("next_legal_action") if isinstance(guide.get("next_legal_action"), Mapping) else {}
+    task_id = str(selected.get("task_id") or "").strip()
+    runtime_context_id = str(selected.get("runtime_context_id") or "").strip()
+    merge_queue_id = str(selected.get("merge_queue_id") or "").strip()
+    try:
+        revision = int(record.get("execution_state_revision") or 0)
+    except (TypeError, ValueError):
+        reject("selected_reconcile_revision_invalid")
+    if not (
+        _is_mf_parallel_postmerge_revision(record)
+        and str(record.get("project_id") or "") == project_id
+        and str(record.get("backlog_id") or "") == backlog_id
+        and str(record.get("contract_execution_id") or "") == contract_execution_id
+        and str(selected.get("line_id") or "") == "observer_reconcile"
+        and str(selected.get("parent_task_id") or "") == contract_execution_id
+        and task_id and runtime_context_id and merge_queue_id and revision > 0
+    ):
+        reject("selected_reconcile_generation_invalid")
+    session = observer_session.get_session(
+        conn, project_id=project_id, session_id=observer_session_id,
+    )
+    if not session or str(session.get("computed_status") or "") != "active":
+        reject("observer_session_not_active")
+    owner = _current_full_reconcile_postmerge_target_owner(
+        conn,
+        project_id=project_id,
+        body={
+            "project_id": project_id, "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "task_id": task_id, "runtime_context_id": runtime_context_id,
+            "parent_task_id": contract_execution_id,
+            "merge_queue_id": merge_queue_id,
+        },
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id, "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "route_token_allowed_actions": ["graph_current_full_reconcile"],
+        },
+    )
+    final_root = str(owner.get("target_project_root") or "")
+    final_head = str(owner.get("merged_commit_sha") or "").lower()
+    if not (
+        final_root == str(world.get("target_project_root") or "")
+        and final_head == str(world.get("target_head_commit") or "").lower()
+    ):
+        reject("final_target_not_loaded_dev_world")
+    target_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    if not target_files:
+        reject("backlog_file_scope_missing")
+    body = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "task_id": task_id,
+        "parent_task_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+        "target_project_root": final_root,
+        "target_head_commit": final_head,
+        "execution_state_revision": revision,
+        "contract_chain_generation": generation,
+        "observer_session_id": observer_session_id,
+        "target_files": target_files,
+        "owned_files": target_files,
+        "allowed_actions": ["graph_current_full_reconcile"],
+        "evidence_refs": [
+            "mf_parallel_postmerge_reconcile:v1",
+            f"backlog:{backlog_id}",
+            f"contract_runtime:{contract_execution_id}",
+            f"observer_session:{observer_session_id}",
+            f"mf_postmerge_generation:{contract_execution_id}:{revision}:{generation}",
+            f"merged_commit:{final_head}",
+        ],
+    }
+    current_full_body = {
+        "project_id": project_id, "backlog_id": backlog_id,
+        "task_id": task_id,
+        "target_commit_sha": final_head,
+        "activate": True, "require_clean": True,
+        "semantic_use_ai": False,
+        "observer_session_id": observer_session_id,
+    }
+    return body, current_full_body
+
+
+def _ac_dev_mf_parallel_postmerge_reconcile_public_issue_body(
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the persisted route scope onto the callable MCP issue schema."""
+    return {
+        key: body[key]
+        for key in (
+            "project_id", "caller_role", "backlog_id", "task_id",
+            "target_files", "allowed_actions", "evidence_refs",
+        )
+    }
+
+
+def _ac_dev_mf_parallel_postmerge_reconcile_route_revalidate(
+    conn: sqlite3.Connection, *, project_id: str,
+    body: Mapping[str, Any], token: Mapping[str, Any] | None = None,
+    allow_internal: bool = False,
+) -> dict[str, Any]:
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    current = conn.execute(
+        "SELECT current_contract_execution_id FROM backlog_contract_chain_current "
+        "WHERE project_id=? AND backlog_id=?",
+        (project_id, backlog_id),
+    ).fetchone()
+    contract_execution_id = str(
+        _row_get(current, "current_contract_execution_id", "") or ""
+    ).strip()
+    session_refs = [
+        str(ref).partition(":")[2]
+        for ref in body.get("evidence_refs") or []
+        if str(ref).startswith("observer_session:")
+    ] if isinstance(body.get("evidence_refs"), list) else []
+    if len(session_refs) != 1 or not session_refs[0]:
+        raise _ac_dev_mf_parallel_postmerge_reconcile_route_rejection(
+            reason="observer_session_evidence_invalid", body=body,
+        )
+    try:
+        expected, _ = _ac_dev_mf_parallel_postmerge_reconcile_route_recipe(
+            conn, project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            observer_session_id=session_refs[0],
+        )
+    except GovernanceError as exc:
+        if exc.code == "current_full_postmerge_target_owner_unverified":
+            raise _ac_dev_mf_parallel_postmerge_reconcile_route_rejection(
+                reason=str(exc.details.get("reason") or "target_owner_unverified"),
+                body=body,
+            ) from exc
+        raise
+    expected_request = (
+        expected if allow_internal
+        else _ac_dev_mf_parallel_postmerge_reconcile_public_issue_body(expected)
+    )
+    if dict(body) != expected_request:
+        raise _ac_dev_mf_parallel_postmerge_reconcile_route_rejection(
+            reason="request_not_exact_current_guide_recipe",
+            body=body, expected_body=expected_request,
+        )
+    _ac_dev_mf_parallel_route_issue_token_revalidate(
+        body=body, expected_body=expected, token=token,
+    )
+    return expected
+
+
+def _ac_dev_mf_parallel_postmerge_reconcile_route_precheck(
+    *, project_id: str, body: Mapping[str, Any],
+    query: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if query:
+        raise _ac_dev_mf_parallel_postmerge_reconcile_route_rejection(
+            reason="query_claims_forbidden", body=body,
+        )
+    conn = get_connection(project_id)
+    try:
+        return _ac_dev_mf_parallel_postmerge_reconcile_route_revalidate(
+            conn, project_id=project_id, body=body,
+        )
+    finally:
+        conn.close()
+
+
 def _ac_dev_mf_parallel_finished_worker_merge_route_issue_revalidate(
     conn: sqlite3.Connection,
     *,
@@ -180824,9 +181175,129 @@ def _ac_promotion_rollback_route_guide_overlay(
 
 def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
     response = _onboard_route_guide_service_response_base(conn, **kwargs)
-    if (kwargs.get("project_id") != "aming-claw" or not kwargs.get("backlog_id")
+    if (kwargs.get("project_id") != AC_PROJECT_ID or not kwargs.get("backlog_id")
             or _runtime_plane() != "dev"):
         return response
+    if str(kwargs.get("role") or "").strip() == "observer":
+        backlog_id = str(kwargs["backlog_id"])
+        current = conn.execute(
+            "SELECT current_contract_execution_id FROM backlog_contract_chain_current "
+            "WHERE project_id=? AND backlog_id=?",
+            (AC_PROJECT_ID, backlog_id),
+        ).fetchone()
+        execution_id = str(
+            _row_get(current, "current_contract_execution_id", "") or ""
+        ).strip()
+        session_id = str(
+            (kwargs.get("request_body") or {}).get("observer_session_id") or ""
+        ).strip()
+        if execution_id and session_id:
+            try:
+                issue_body, current_full_body = (
+                    _ac_dev_mf_parallel_postmerge_reconcile_route_recipe(
+                        conn, project_id=AC_PROJECT_ID,
+                        backlog_id=backlog_id,
+                        contract_execution_id=execution_id,
+                        observer_session_id=session_id,
+                    )
+                )
+            except GovernanceError:
+                pass  # Ordinary Guide selection remains authoritative on a miss.
+            else:
+                from . import observer_route_context
+
+                requested_ref = str(kwargs.get("route_token_ref") or "").strip()
+                route_ready = False
+                if requested_ref:
+                    try:
+                        resolved = observer_route_context.resolve_route_token_ref(
+                            conn, project_id=AC_PROJECT_ID,
+                            storage_project_id=_route_registry_storage_project_id(
+                                AC_PROJECT_ID
+                            ),
+                            route_token_ref=requested_ref,
+                            backlog_id=backlog_id,
+                            task_id=issue_body["task_id"],
+                        )
+                    except observer_route_context.RouteTokenRefError:
+                        resolved = None
+                    route_ready = bool(
+                        isinstance(resolved, Mapping)
+                        and resolved.get("caller_role") == "observer"
+                        and list(resolved.get("allowed_actions") or [])
+                        == issue_body["allowed_actions"]
+                        and sorted(resolved.get("target_files") or [])
+                        == issue_body["target_files"]
+                        and sorted(resolved.get("owned_files") or [])
+                        == issue_body["owned_files"]
+                        and [
+                            ref for ref in resolved.get("evidence_refs") or []
+                            if str(ref).startswith("mf_postmerge_generation:")
+                        ] == [
+                            ref for ref in issue_body["evidence_refs"]
+                            if str(ref).startswith("mf_postmerge_generation:")
+                        ]
+                        and set(issue_body["evidence_refs"]).issubset(
+                            resolved.get("evidence_refs") or []
+                        )
+                    )
+                if route_ready:
+                    current_full_body["observer_route_token_ref"] = requested_ref
+                    action = {
+                        "action": "graph_current_full_reconcile",
+                        "mcp_tool": "graph_current_full_reconcile",
+                        "copy_safe_body": current_full_body,
+                        "action_input_ready": True,
+                        "line_id": "observer_reconcile",
+                        "contract_execution_id": execution_id,
+                    }
+                elif requested_ref:
+                    action = {
+                        "action": "refresh_observer_route_context",
+                        "mcp_tool": "onboard_route_guide",
+                        "action_input_ready": False,
+                        "reason": "requested_postmerge_route_not_current",
+                        "line_id": "observer_reconcile",
+                    }
+                else:
+                    action = {
+                        "action": "observer_route_context_issue",
+                        "mcp_tool": "observer_route_context_issue",
+                        "copy_safe_body": (
+                            _ac_dev_mf_parallel_postmerge_reconcile_public_issue_body(
+                                issue_body
+                            )
+                        ),
+                        "action_input_ready": True,
+                        "line_id": "observer_reconcile",
+                        "contract_execution_id": execution_id,
+                    }
+                public_issue_body = (
+                    _ac_dev_mf_parallel_postmerge_reconcile_public_issue_body(
+                        issue_body
+                    )
+                )
+                response["postmerge_current_full_reconcile"] = {
+                    "schema_version": "onboard_route_guide.mf_postmerge_current_full.v1",
+                    "route_issue": {
+                        "mcp_tool": "observer_route_context_issue",
+                        "copy_safe_body": public_issue_body,
+                    },
+                    "current_full_body": current_full_body,
+                    "selected_contract_execution_id": execution_id,
+                    "selected_task_id": issue_body["task_id"],
+                    "target_project_root": issue_body["target_project_root"],
+                    "target_head_commit": issue_body["target_head_commit"],
+                    "route_ready": route_ready,
+                    "raw_route_token_exposed": False,
+                }
+                response["next_legal_action"] = action
+                route_guide = response.get("onboard_route_guide")
+                if isinstance(route_guide, dict):
+                    route_guide["postmerge_current_full_reconcile"] = dict(
+                        response["postmerge_current_full_reconcile"]
+                    )
+                    route_guide["next_legal_action"] = dict(action)
     # Select by the immutable current candidate before observing any release
     # dependency. An unrelated backlog's Guide must not inherit this candidate's
     # incomplete implementation, QA, stable-process or route state.
