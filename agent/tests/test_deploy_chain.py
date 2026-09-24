@@ -2044,486 +2044,157 @@ http.server.HTTPServer(("127.0.0.1",port),Handler).serve_forever()
         } == before_bytes
 
     @staticmethod
-    def _negative_promotion_fixture(tmp_path: Path, case: str) -> tuple[Path, Path, str]:
-        source_script = TestExplicitACPromotionScript._script()
-        stable_root = tmp_path / "stable"
-        dev_root = tmp_path / "dev"
-        stable_root.mkdir()
+    def _current_main_state(fixture):
+        """Capture physical release state immediately before a read-only guard."""
+        def database_state(path):
+            return {
+                suffix: (path.parent / (path.name + suffix)).read_bytes()
+                for suffix in ("", "-wal", "-shm")
+                if (path.parent / (path.name + suffix)).is_file()
+            }
 
-        def run(args, cwd, *, text=True):
-            result = subprocess.run(
-                args,
-                cwd=cwd,
-                capture_output=True,
-                text=text,
-                check=False,
-            )
-            assert result.returncode == 0, result.stderr
-            return result.stdout
-
-        run(["git", "init", "-b", "main"], stable_root)
-        run(["git", "config", "user.email", "test@example.com"], stable_root)
-        run(["git", "config", "user.name", "Test"], stable_root)
-        for path in (
-            stable_root / "agent" / "cli.py",
-            stable_root / "agent" / "governance" / "db.py",
-            stable_root / "agent" / "governance" / "server.py",
-        ):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("# fixture\n", encoding="utf-8")
-        script = stable_root / "scripts" / "merge-and-deploy.sh"
-        script.parent.mkdir(parents=True)
-        script.write_bytes(source_script.read_bytes())
-        script.chmod(0o755)
-        (stable_root / "change.txt").write_text("base\n", encoding="utf-8")
-        (stable_root / ".gitignore").write_text(
-            "shared-volume/\n", encoding="utf-8"
-        )
-        run(["git", "add", "."], stable_root)
-        run(["git", "commit", "-m", "base"], stable_root)
-        stable = run(["git", "rev-parse", "HEAD"], stable_root).strip()
-        run(
-            ["git", "worktree", "add", "-b", "codex/ac-dev", str(dev_root), stable],
-            stable_root,
-        )
-        (dev_root / "change.txt").write_text("candidate\n", encoding="utf-8")
-        run(["git", "add", "change.txt"], dev_root)
-        run(["git", "commit", "-m", "candidate"], dev_root)
-        candidate = run(["git", "rev-parse", "HEAD"], dev_root).strip()
-        diff = subprocess.run(
-            [
-                "git", "diff", "--no-ext-diff", "--no-textconv", "--binary",
-                "--full-index", "-M", f"{stable}..{candidate}", "--", ".",
-            ],
-            cwd=dev_root,
-            capture_output=True,
-            check=True,
-        ).stdout
-        diff_hash = "sha256:" + hashlib.sha256(diff).hexdigest()
-        verifier_hash = "sha256:" + hashlib.sha256(
-            (dev_root / "scripts" / "merge-and-deploy.sh").read_bytes()
-        ).hexdigest()
-        fence = ["change.txt"]
-        deploy = {"authorized": True, "mode": "host_supervisor", "stable_port": 40000}
-        if case == "extra_deploy_key":
-            deploy["caller_claimed_pass"] = True
-        backlog_id = "AC-SCRIPT-E2E"
-        cex = "cex-script-e2e"
-        intent = {
-            "schema_version": "ac_stable_promotion_manifest.v1",
-            "project_id": "aming-claw",
-            "backlog_id": backlog_id,
-            "contract_execution_id": cex,
-            "stable_anchor_commit": stable,
-            "stable_branch": "main",
-            "branch": "codex/ac-dev",
-            "candidate_commit": candidate,
-            "file_fence": fence,
-            "diff_sha256": diff_hash,
-            "deploy": deploy,
+        with sqlite3.connect(f"file:{fixture['stable_db']}?mode=ro", uri=True) as conn:
+            queue = tuple(conn.execute(
+                "SELECT * FROM release_operator_head_queue_events ORDER BY id"
+            ))
+            refs = tuple(conn.execute(
+                "SELECT * FROM graph_snapshot_refs ORDER BY ref_name"
+            ))
+        return {
+            "stable_db": database_state(fixture["stable_db"]),
+            "dev_db": database_state(fixture["dev_db"]),
+            "queue": queue,
+            "refs": refs,
+            "stable_head": fixture["git"]("rev-parse", "HEAD", root=fixture["stable"]),
+            "dev_head": fixture["git"]("rev-parse", "HEAD", root=fixture["dev"]),
         }
 
-        def sha(value):
-            return "sha256:" + hashlib.sha256(
-                json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
+    @pytest.mark.parametrize("case", [
+        "stale_anchor", "extra_deploy_key", "missing_qa", "forged_qa",
+        "failed_qa_authority", "cross_actor_qa_replay", "expired_signoff",
+        "replayed_signoff", "route_ref_signoff", "broken_prior", "symlink_db",
+    ])
+    def test_current_main_precheck_fault_preserves_release_state(
+        self, monkeypatch, tmp_path, case
+    ):
+        from agent.governance import server
+        from agent.tests.test_graph_governance_api import (
+            _main_binding_release_fixture, _main_binding_rebind_signoff,
+        )
 
-        shared = stable_root / "shared-volume"
-        db_path = (
-            shared / "codex-tasks" / "state" / "governance" / "aming-claw" / "governance.db"
+        fixture = _main_binding_release_fixture(
+            monkeypatch, tmp_path, main_preimage=True
         )
-        db_path.parent.mkdir(parents=True)
-        conn = sqlite3.connect(db_path)
-        metadata = db_path.stat()
-        database_identity = {
-            "schema_version": "ac_stable_database_identity.v1",
-            "device": int(metadata.st_dev),
-            "inode": int(metadata.st_ino),
-            "stable_relative_path_sha256": "sha256:"
-            + hashlib.sha256(
-                b"shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
-            ).hexdigest(),
-        }
-        intent["stable_database_identity"] = database_identity
-        intent_hash = sha(intent)
-        conn.executescript(
-            """
-            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO schema_meta VALUES('schema_version', '47');
-            CREATE TABLE task_timeline_events(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT, backlog_id TEXT,
-                task_id TEXT, event_type TEXT, phase TEXT, event_kind TEXT, actor TEXT,
-                status TEXT, payload_json TEXT, verification_json TEXT,
-                artifact_refs_json TEXT, commit_sha TEXT, created_at TEXT
-            );
-            CREATE TABLE release_operator_head_queue_events(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT, action TEXT,
-                backlog_id TEXT, actor TEXT, reason TEXT, before_json TEXT,
-                after_json TEXT, created_at TEXT
-            );
-            CREATE TABLE sessions(
-                session_id TEXT PRIMARY KEY, principal_id TEXT, project_id TEXT,
-                role TEXT, scope_json TEXT, status TEXT
-            );
-            CREATE TABLE graph_snapshots(
-                project_id TEXT, snapshot_id TEXT, commit_sha TEXT,
-                PRIMARY KEY(project_id, snapshot_id)
-            );
-            CREATE TABLE graph_query_traces(
-                trace_id TEXT PRIMARY KEY, project_id TEXT, snapshot_id TEXT,
-                actor TEXT, query_source TEXT, query_purpose TEXT, task_id TEXT,
-                backlog_id TEXT, commit_sha TEXT, qa_session_id TEXT,
-                qa_scope_binding_ref TEXT, status TEXT
-            );
-            """
-        )
-        previous_receipt = "sha256:" + "7" * 64
-        prior_event_id = 888
-        if case != "broken_prior":
-            conn.execute(
-                """INSERT INTO task_timeline_events(
-                       id, project_id, backlog_id, task_id, event_type, phase,
-                       event_kind, actor, status, payload_json, verification_json,
-                       artifact_refs_json, commit_sha, created_at
-                   ) VALUES (?, 'aming-claw', 'AC-PRIOR', 'cex-prior',
-                       'ac.stable_promotion_completed', 'release', 'stable_promotion',
-                       'operator', 'accepted', ?, '{}', '{}', ?, ?)""",
-                (
-                    prior_event_id,
-                    json.dumps(
-                        {
-                            "promoted_commit": stable,
-                            "promotion_receipt_hash": previous_receipt,
-                            "stable_database_identity": database_identity,
-                        },
-                        sort_keys=True,
-                    ),
-                    stable,
-                    "2026-08-27T13:00:00Z",
-                ),
-            )
-        qa_event_id = 999
-        if case != "missing_qa":
-            qa_principal = "qa-e2e"
-            qa_session_id = "qa-session-e2e"
-            qa_scope_binding_ref = "qa-scope-e2e"
-            qa_snapshot_id = "full-e2e-candidate"
-            qa_trace_id = "gqt-e2e-independent-verification"
-            conn.execute(
-                "INSERT INTO sessions VALUES (?, ?, 'aming-claw', 'qa', ?, 'active')",
-                (
-                    qa_session_id,
-                    qa_principal,
-                    json.dumps([qa_scope_binding_ref]),
-                ),
-            )
-            conn.execute(
-                "INSERT INTO graph_snapshots VALUES ('aming-claw', ?, ?)",
-                (qa_snapshot_id, candidate),
-            )
-            conn.execute(
-                """INSERT INTO graph_query_traces VALUES(
-                       ?, 'aming-claw', ?, ?, 'qa', 'independent_verification',
-                       ?, ?, ?, ?, ?, 'complete')""",
-                (
-                    qa_trace_id,
-                    qa_snapshot_id,
-                    qa_principal,
-                    cex,
-                    backlog_id,
-                    candidate,
-                    qa_session_id,
-                    qa_scope_binding_ref,
-                ),
-            )
-            qa_proof = {
-                "schema_version": "qa_session_scope_proof.v1",
-                "source": "authenticated_qa_session",
-                "role": "qa",
-                "verified": True,
-                "observer_impersonation": False,
-                "evidence_status": (
-                    "failed" if case == "failed_qa_authority" else "passed"
-                ),
-                "authority_scope": "close_satisfying",
-                "close_satisfying": True,
-                "audit_only": False,
-                "passing_status_required_for_close": True,
-                "db_verified_graph_trace": True,
-                "query_source": "qa",
-                "query_purpose": "independent_verification",
-                "project_id": "aming-claw",
-                "backlog_id": backlog_id,
-                "task_id": cex,
-                "commit_sha": candidate,
-                "principal_id": qa_principal,
-                "qa_session_id": qa_session_id,
-                "qa_scope_binding_ref": qa_scope_binding_ref,
-                "snapshot_id": qa_snapshot_id,
-                "snapshot_commit_sha": candidate,
-                "graph_trace_ids": [qa_trace_id],
-                "candidate_review_context": {
-                    "candidate_commit_sha": candidate,
-                    "comparison_base_commit_sha": stable,
-                    "comparison_authority_required": True,
-                    "candidate_diff_hash": diff_hash,
-                    "changed_files": fence,
-                },
-            }
-            authority = {
-                "schema_version": "source_backed_contract_gate_authority.v1",
-                "source": "server_qa_session_verification",
-                "source_of_authority": "qa_session_verification",
-                "authority_scope": "close_satisfying",
-                "close_satisfying": True,
-                "audit_only": False,
-                "qa_session_proof": qa_proof,
-            }
-            authority["authority_hash"] = sha(authority)
-            qa_payload = {
-                "source_backed_contract_gate_authority": authority,
-                "contract_runtime_canonical_line": {
-                    "stage_id": "qa",
-                    "line_id": "qa_independent_verification",
-                    "contract_execution_id": cex,
-                    "runtime_guide_hash": "sha256:" + "5" * 64,
-                },
-                "stable_anchor_commit": stable,
-                "promotion_intent_sha256": intent_hash,
-                "file_fence": fence,
-                "stable_database_identity": database_identity,
-            }
-            report_hash = "sha256:" + "4" * 64
-            qa_verification = {
-                "pass_synthesized": False,
-                "promotion_gate_results": {
-                    "branch_service": {
-                        "test_id": "branch-loopback", "status": "passed",
-                        "report_sha256": report_hash, "runtime_plane": "dev",
-                        "port": 40008, "bind_host": "127.0.0.1",
-                    },
-                    "lanes": {
-                        lane: {
-                            "test_id": f"lane-{lane}", "status": "passed",
-                            "report_sha256": report_hash,
-                        }
-                        for lane in ("direct_main", "mf_parallel", "mf_batch_parallel")
-                    },
-                },
-            }
-            conn.execute(
-                """INSERT INTO task_timeline_events(
-                       id, project_id, backlog_id, task_id, event_type, phase,
-                       event_kind, actor, status, payload_json, verification_json,
-                       artifact_refs_json, commit_sha, created_at
-                   ) VALUES (?, 'aming-claw', ?, ?, ?, 'qa',
-                       'independent_verification', ?, 'passed', ?, ?, '{}', ?, ?)""",
-                (
-                    qa_event_id,
-                    backlog_id,
-                    cex,
-                    "qa.forged" if case == "forged_qa" else "qa.independent_verification",
-                    qa_principal,
-                    json.dumps(qa_payload, sort_keys=True),
-                    json.dumps(qa_verification, sort_keys=True),
-                    candidate,
-                    "2026-08-27T14:00:00Z",
-                ),
-            )
-            if case == "cross_actor_qa_replay":
-                conn.execute(
-                    """INSERT INTO task_timeline_events(
-                           project_id, backlog_id, task_id, event_type, phase,
-                           event_kind, actor, status, payload_json,
-                           verification_json, artifact_refs_json, commit_sha,
-                           created_at
-                       ) VALUES ('aming-claw', 'AC-OTHER', 'cex-other',
-                           'observer.copied_qa', 'observer', 'copied_qa',
-                           'observer-principal', 'accepted', '{}', ?, '{}', ?, ?)""",
-                    (
-                        json.dumps(
-                            {"source_backed_contract_gate_authority": authority},
-                            sort_keys=True,
-                        ),
-                        candidate,
-                        "2026-08-27T14:01:00Z",
-                    ),
-                )
-        qa_gate = {"timeline_event_id": qa_event_id, "status": "passed"}
-        now = datetime.now(timezone.utc)
-        created = now - timedelta(hours=2) if case == "expired_signoff" else now
-        expires = created + timedelta(minutes=30)
-        operator_base = {
-            "status": "approved",
-            "nonce": "6" * 32,
-            "operator_principal_id": (
-                "observer:route_ref"
-                if case == "route_ref_signoff"
-                else "operator-e2e"
-            ),
-            "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        prior = {
-            "kind": "timeline_receipt",
-            "timeline_event_id": prior_event_id,
-            "receipt_hash": previous_receipt,
-        }
-        manifest_hash = sha(
-            {
-                **intent,
-                "promotion_intent_sha256": intent_hash,
-                "prior_promotion": prior,
-                "gates": {
-                    "qa_verdict": qa_gate,
-                    "operator_signoff": operator_base,
-                },
-            }
-        )
-        signoff = {
-            "schema_version": "ac_stable_promotion_operator_signoff.v1",
-            "nonce": operator_base["nonce"],
-            "operator_principal_id": operator_base["operator_principal_id"],
-            "expires_at": operator_base["expires_at"],
-            "project_id": "aming-claw",
-            "backlog_id": backlog_id,
-            "contract_execution_id": cex,
-            "stable_anchor_commit": stable,
-            "candidate_commit": candidate,
-            "promotion_intent_sha256": intent_hash,
-            "promotion_manifest_sha256": manifest_hash,
-            "verifier_sha256": verifier_hash,
-            "diff_sha256": diff_hash,
-            "file_fence": fence,
-            "deploy": deploy,
-            "stable_database_identity": database_identity,
-        }
-        reason = json.dumps(signoff, sort_keys=True, separators=(",", ":"))
-        before_after = json.dumps({"backlog_ids": [backlog_id]}, sort_keys=True)
-        signoff_cursor = conn.execute(
-            """INSERT INTO release_operator_head_queue_events(
-                   project_id, action, backlog_id, actor, reason,
-                   before_json, after_json, created_at
-               ) VALUES ('aming-claw', 'reorder', '', ?, ?, ?, ?, ?)""",
-            (
-                operator_base["operator_principal_id"],
-                reason,
-                before_after,
-                before_after,
-                created.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            ),
-        )
-        signoff_event_id = int(signoff_cursor.lastrowid)
-        if case == "replayed_signoff":
-            conn.execute(
-                """INSERT INTO release_operator_head_queue_events(
-                       project_id, action, backlog_id, actor, reason,
-                       before_json, after_json, created_at
-                   ) VALUES ('aming-claw', 'reorder', '', ?, ?, ?, ?, ?)""",
-                (
-                    operator_base["operator_principal_id"], reason,
-                    before_after, before_after,
-                    created.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                ),
-            )
-        conn.commit()
-        conn.close()
-        if case == "symlink_db":
-            escaped_db = tmp_path / "escaped-governance.db"
-            db_path.replace(escaped_db)
-            db_path.symlink_to(escaped_db)
-        manifest = {
-            **intent,
-            "promotion_intent_sha256": intent_hash,
-            "promotion_manifest_sha256": manifest_hash,
-            "gates": {
-                "qa_verdict": qa_gate,
-                "operator_signoff": {
-                    **operator_base,
-                    "queue_event_id": signoff_event_id,
-                },
-            },
-            "prior_promotion": prior,
-        }
+        manifest = fixture["manifest"]
+        baseline = server._ac_main_binding_precheck(manifest)
+        assert baseline["writes_performed"] is False
+        assert baseline["candidate_commit"] == fixture["candidate"]
+        assert baseline["gate_event_ids"]["qa_verdict"] == fixture["qa_id"]
+
         if case == "stale_anchor":
             manifest["stable_anchor_commit"] = "e" * 40
-        manifest_path = tmp_path / f"manifest-{case}.json"
-        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-        return dev_root / "scripts" / "merge-and-deploy.sh", manifest_path, stable
+        elif case == "extra_deploy_key":
+            manifest["deploy"]["caller_claimed_pass"] = True
+        elif case in {"missing_qa", "forged_qa", "failed_qa_authority", "cross_actor_qa_replay"}:
+            with sqlite3.connect(fixture["dev_db"]) as conn:
+                if case == "missing_qa":
+                    conn.execute("DELETE FROM task_timeline_events WHERE id=?", (fixture["qa_id"],))
+                elif case == "forged_qa":
+                    conn.execute("UPDATE task_timeline_events SET event_type='qa.forged' WHERE id=?", (fixture["qa_id"],))
+                elif case == "failed_qa_authority":
+                    conn.execute("UPDATE sessions SET status='revoked' WHERE role='qa'")
+                else:
+                    row = conn.execute("SELECT * FROM task_timeline_events WHERE id=?", (fixture["qa_id"],)).fetchone()
+                    columns = [item[1] for item in conn.execute("PRAGMA table_info(task_timeline_events)") if item[1] != "id"]
+                    values = dict(zip([item[1] for item in conn.execute("PRAGMA table_info(task_timeline_events)")], row))
+                    values.update(backlog_id="AC-OTHER", task_id="cex-other", actor="observer-replay", event_type="observer.copied_qa")
+                    conn.execute(
+                        f"INSERT INTO task_timeline_events({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                        [values[key] for key in columns],
+                    )
+        elif case == "expired_signoff":
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            _main_binding_rebind_signoff(
+                fixture,
+                expires_at=(now - timedelta(minutes=1)).isoformat(),
+                created_at=(now - timedelta(minutes=30)).isoformat(),
+            )
+        elif case == "replayed_signoff":
+            with sqlite3.connect(fixture["stable_db"]) as conn:
+                row = conn.execute("SELECT * FROM release_operator_head_queue_events WHERE id=?", (fixture["operator"]["queue_event_id"],)).fetchone()
+                columns = [item[1] for item in conn.execute("PRAGMA table_info(release_operator_head_queue_events)") if item[1] != "id"]
+                values = dict(zip([item[1] for item in conn.execute("PRAGMA table_info(release_operator_head_queue_events)")], row))
+                conn.execute(
+                    f"INSERT INTO release_operator_head_queue_events({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                    [values[key] for key in columns],
+                )
+        elif case == "route_ref_signoff":
+            _main_binding_rebind_signoff(
+                fixture, operator_principal_id="observer:route_ref", actor="observer:route_ref"
+            )
+        elif case == "broken_prior":
+            with sqlite3.connect(fixture["stable_db"]) as conn:
+                conn.execute("DELETE FROM task_timeline_events WHERE event_type='ac.stable_promotion_completed'")
+        else:
+            escaped = tmp_path / "escaped-governance.db"
+            fixture["stable_db"].replace(escaped)
+            fixture["stable_db"].symlink_to(escaped)
 
-    @pytest.mark.parametrize(
-        ("case", "expected"),
-        [
-            ("stale_anchor", "manifest anchor is stale"),
-            ("extra_deploy_key", "deploy identity mismatch"),
-            ("missing_qa", "timeline event 999 is missing"),
-            ("forged_qa", "QA event_type mismatch"),
-            (
-                "failed_qa_authority",
-                "QA verdict lacks role-bound server authority",
-            ),
-            ("cross_actor_qa_replay", "QA authority replay/ambiguity"),
-            ("expired_signoff", "operator signoff is expired"),
-            ("replayed_signoff", "nonce replay/ambiguity"),
-            (
-                "route_ref_signoff",
-                "operator signoff is not an authenticated stable no-op queue decision",
-            ),
-            ("broken_prior", "timeline event 888 is missing"),
-            ("symlink_db", "live AC database path cannot contain a symlink"),
-        ],
-    )
-    def test_negative_promotion_e2e_never_mutates_stable(
-        self, tmp_path, case, expected
-    ):
-        script, manifest, stable = self._negative_promotion_fixture(tmp_path, case)
-        result = subprocess.run(
-            [str(script), "--promotion-manifest", str(manifest), "--dry-run"],
-            cwd=script.parents[1],
-            env={
-                **os.environ,
-                "SHARED_VOLUME_PATH": str(
-                    tmp_path / "stable" / "shared-volume"
-                ),
-            },
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        assert result.returncode != 0
-        assert expected in (result.stderr + result.stdout)
-        stable_root = tmp_path / "stable"
-        assert subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=stable_root, text=True
-        ).strip() == stable
+        before = self._current_main_state(fixture)
+        expected = {
+            "extra_deploy_key": "promotion manifest does not match deployed request",
+            "missing_qa": "release canonical QA line differs from its unique accepted event",
+            "forged_qa": "release canonical QA line differs from its unique accepted event",
+            "failed_qa_authority": "durable QA verdict is not role-bound",
+            "cross_actor_qa_replay": "durable QA authority replay/ambiguity detected",
+            "expired_signoff": "durable operator signoff is expired",
+            "replayed_signoff": "durable operator signoff nonce replay detected",
+            "route_ref_signoff": "durable operator signoff identity mismatch",
+            "broken_prior": "ordinary main successor requires its predecessor receipt",
+            "symlink_db": "release stable DB path changed",
+        }
+        if case == "stale_anchor":
+            lines = self._script().read_text(encoding="utf-8").splitlines()
+            start = next(i for i, line in enumerate(lines) if line == 'if [ "$MANIFEST_ANCHOR" != "$CURRENT_STABLE" ]; then')
+            clause = "\n".join(lines[start:start + 3]) + "\n"
+            result = subprocess.run(
+                ["bash", "-c", clause],
+                env={**os.environ, "MANIFEST_ANCHOR": manifest["stable_anchor_commit"],
+                     "CURRENT_STABLE": fixture["instance"]["stable_anchor_commit"]},
+                capture_output=True, text=True, check=False,
+            )
+            assert result.returncode != 0
+            assert "manifest anchor is stale relative to current stable HEAD" in result.stderr
+        else:
+            with pytest.raises(server.ValidationError, match=expected[case]):
+                server._ac_main_binding_precheck(manifest)
+        assert self._current_main_state(fixture) == before
 
     def test_promotion_rejects_alternate_ac_shaped_shared_volume_before_mutation(
-        self, tmp_path
+        self, monkeypatch, tmp_path
     ):
-        script, manifest, stable = self._negative_promotion_fixture(
-            tmp_path, "broken_prior"
-        )
+        from agent.governance import server
+        from agent.tests.test_graph_governance_api import _main_binding_release_fixture
+
+        fixture = _main_binding_release_fixture(monkeypatch, tmp_path, main_preimage=True)
+        assert server._ac_main_binding_precheck(fixture["manifest"])["writes_performed"] is False
+        stable = fixture["stable"]
         alternate = tmp_path / "alternate-shared"
         alternate.mkdir()
-
+        script = self._script()
+        lines = script.read_text(encoding="utf-8").splitlines()
+        marker = 'LIVE_DB="$(python3 - "$STABLE_WORKTREE" "${SHARED_VOLUME_PATH}" <<\'PY\''
+        start = next(i + 1 for i, line in enumerate(lines) if line == marker)
+        end = next(i for i in range(start, len(lines)) if lines[i] == "PY")
+        before = self._current_main_state(fixture)
         result = subprocess.run(
-            [str(script), "--promotion-manifest", str(manifest), "--dry-run"],
-            cwd=script.parents[1],
-            env={**os.environ, "SHARED_VOLUME_PATH": str(alternate)},
-            capture_output=True,
-            text=True,
-            check=False,
+            [sys.executable, "-", str(stable), str(alternate)],
+            input="\n".join(lines[start:end]) + "\n",
+            capture_output=True, text=True, check=False,
         )
-
         assert result.returncode != 0
-        assert "alternate SHARED_VOLUME_PATH is forbidden" in (
-            result.stderr + result.stdout
-        )
-        assert subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=tmp_path / "stable",
-            text=True,
-        ).strip() == stable
+        assert "alternate SHARED_VOLUME_PATH is forbidden" in result.stderr
+        assert self._current_main_state(fixture) == before
 
 
 @pytest.mark.parametrize("listener_delay,health_delay,expected_failure,health_error", [
