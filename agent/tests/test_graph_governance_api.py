@@ -108573,8 +108573,9 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
         "requires_role"
     ] == "qa"
     qa_action = post_implementation_guide["next_legal_action"]
-    assert qa_action["mcp_tool"] == ""
-    assert qa_action["transport"] == "http"
+    assert qa_action["mcp_tool"] == "task_timeline_append"
+    assert qa_action["transport"] == "managed_mcp"
+    assert qa_action["http_request"]["method"] == "POST"
     assert qa_action["copy_safe_body"]["event_type"] == (
         "qa.independent_verification"
     )
@@ -127229,8 +127230,9 @@ def test_direct_main_rev3_fresh_world_warranty_requires_db_verified_qa(
     )
     qa_action = qa_guide["next_legal_action"]
     assert qa_action["line_id"] == "qa_graph_context"
-    assert qa_action["mcp_tool"] == ""
-    assert qa_action["transport"] == "http"
+    assert qa_action["mcp_tool"] == "task_timeline_append"
+    assert qa_action["transport"] == "managed_mcp"
+    assert qa_action["http_request"]["method"] == "POST"
     assert qa_action["copy_safe_body"]["task_id"] == task_id
     assert qa_action["copy_safe_body"]["contract_execution_id"] == task_id
     assert qa_action["generic_contract_runtime_submit_line_allowed"] is False
