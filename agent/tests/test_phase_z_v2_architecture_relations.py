@@ -17,9 +17,11 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
     FunctionMeta,
     ModuleInfo,
     _c_family_modules,
+    aggregate_functions_into_nodes,
     apply_dependency_patches,
     build_candidate_coverage_ledger,
     build_call_graph,
+    build_function_call_facts,
     build_module_dependency_edges,
     build_rebase_candidate_graph,
     build_graph_v2_from_symbols,
@@ -213,6 +215,29 @@ def test_c_family_full_chain_keeps_compile_identity_and_attaches_non_architectur
     )
     assert {row["role"] for row in occurrence_query["result"]["occurrences"]} == {"declaration", "definition"}
     assert {Path(row["file"]).name for row in occurrence_query["result"]["occurrences"]} == {"overlay.h", "overlay.cc"}
+    function_index = graph_query_trace.traced_query(
+        conn, "c-family-full-chain", snapshot["snapshot_id"],
+        actor="observer", query_source="observer", query_purpose="prompt_context_build",
+        tool="function_index", args={"query": "selected_feature"}, project_root=project,
+    )["result"]["matches"]
+    assert len(function_index) == 1
+    assert function_index[0]["primary_file"] == "overlay.cc"
+    function_callers = graph_query_trace.traced_query(
+        conn, "c-family-full-chain", snapshot["snapshot_id"],
+        actor="observer", query_source="observer", query_purpose="prompt_context_build",
+        tool="function_callers", args={"query": "selected_feature"}, project_root=project,
+    )["result"]["matches"]
+    assert any(
+        row["caller_file"] == "overlay.cc" and row["callee_file"] == "overlay.cc"
+        and row["confidence"] == "strong"
+        for row in function_callers
+    )
+    function_callees = graph_query_trace.traced_query(
+        conn, "c-family-full-chain", snapshot["snapshot_id"],
+        actor="observer", query_source="observer", query_purpose="prompt_context_build",
+        tool="function_callees", args={"query": "render"}, project_root=project,
+    )["result"]["matches"]
+    assert any(row["callee_short"].startswith("selected_feature") for row in function_callees)
 
     selected_call = next(
         row for row in analysis["relations"]
@@ -307,6 +332,186 @@ def test_c_family_modules_keep_extension_identity_and_merge_same_file_actions(tm
         row["compilation_action_id"]
         for row in modules["overlay__cc"].adapter_symbols
     } == {"source-action-a", "source-action-b"}
+
+
+def test_c_family_physical_definition_owner_resolves_header_declaration_aliases(tmp_path):
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    header = project / "src" / "reference.h"
+    owner = project / "src" / "reference_store.cc"
+    caller = project / "src" / "mark_controller.cc"
+    header.write_text("bool ReferenceVisible();\n", encoding="utf-8")
+    owner.write_text("bool Predicate() { return true; }\nbool ReferenceVisible() { return Predicate(); }\n", encoding="utf-8")
+    caller.write_text("bool VisibleJob() { return ReferenceVisible(); }\n", encoding="utf-8")
+
+    def symbol(symbol_id, name, file, line, definition):
+        return {
+            "symbol_id": symbol_id, "name": name, "qualified_name": f"seethis::{name}",
+            "kind": "FunctionDecl", "signature": "bool ()", "file": str(file),
+            "lineno": line, "end_lineno": line, "is_definition": definition,
+            "linkage": "external",
+        }
+
+    def action(path, action_id, symbols, relations):
+        return {
+            "status": "ok", "action": {"file": str(path), "language": "cpp", "compilation_action_id": action_id},
+            "files": [{"file": str(path), "role": "source"}],
+            "symbols": symbols, "relations": relations,
+        }
+
+    analysis = {"results": [
+        action(owner, "owner-action", [
+            symbol("definition-id", "ReferenceVisible", owner, 2, True),
+            symbol("predicate-id", "Predicate", owner, 1, True),
+            symbol("definition-id", "ReferenceVisible", header, 1, False),
+        ], [{
+            "relation_type": "calls", "source_symbol_id": "definition-id",
+            "target_symbol_id": "predicate-id", "source_file": str(owner),
+        }]),
+        action(caller, "caller-action", [
+            symbol("visible-job-id", "VisibleJob", caller, 1, True),
+            symbol("declaration-alias-id", "ReferenceVisible", header, 1, False),
+        ], [{
+            "relation_type": "calls", "source_symbol_id": "visible-job-id",
+            "target_symbol_id": "declaration-alias-id", "source_file": str(caller),
+        }]),
+    ]}
+    modules = _c_family_modules(str(project), analysis)
+    assert set(modules) == {"src.reference_store", "src.mark_controller"}
+    assert [function.name for function in modules["src.reference_store"].functions].count("ReferenceVisible") == 1
+    assert not any(function.name == "ReferenceVisible" for function in modules["src.mark_controller"].functions)
+    assert any(
+        symbol["symbol_id"] == "declaration-alias-id" and not symbol["is_definition"]
+        for symbol in modules["src.mark_controller"].adapter_symbols
+    )
+    visible = next(function for function in modules["src.reference_store"].functions if function.name == "ReferenceVisible")
+    assert set(visible.adapter_symbol_ids) == {"definition-id", "declaration-alias-id"}
+
+    call_graph = build_call_graph(modules)
+    job = modules["src.mark_controller"].functions[0]
+    predicate = next(function for function in modules["src.reference_store"].functions if function.name == "Predicate")
+    assert call_graph.edges[job.qualified_name] == [visible.qualified_name]
+    assert call_graph.edges[visible.qualified_name] == [predicate.qualified_name]
+    assert call_graph.weak_edges == []
+    facts = build_function_call_facts(modules, call_graph)
+    assert [(row["caller_file"], row["callee_file"], row["confidence"]) for row in facts["src.reference_store"]["called_by"] if row["callee"] == visible.qualified_name] == [
+        ("src/mark_controller.cc", "src/reference_store.cc", "strong")
+    ]
+    assert [(row["callee"], row["confidence"]) for row in facts["src.reference_store"]["calls"]] == [
+        (predicate.qualified_name, "strong")
+    ]
+
+
+def test_c_family_header_definitions_keep_physical_owner_aliases_and_scoped_identity(tmp_path):
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    header = project / "src" / "shared.h"
+    source_a = project / "src" / "a.cc"
+    source_b = project / "src" / "b.cc"
+    header.write_text(
+        "inline int Shared() { return 1; }\n"
+        "static int Local() { return 1; }\n"
+        "int alpha_render(int);\n"
+        "int beta_render(int);\n"
+        "int alpha_render(double);\n",
+        encoding="utf-8",
+    )
+    source_a.write_text("int RunA() { return Shared(); }\n", encoding="utf-8")
+    source_b.write_text("int RunB() { return Shared(); }\n", encoding="utf-8")
+
+    def symbol(symbol_id, name, qualified, signature, path, line, *, linkage="external", tu=""):
+        return {
+            "symbol_id": symbol_id, "name": name, "qualified_name": qualified,
+            "kind": "FunctionDecl", "signature": signature, "file": str(path),
+            "lineno": line, "end_lineno": line, "is_definition": True,
+            "linkage": linkage, "translation_unit_id": tu,
+        }
+
+    def action(path, action_id, tu, inline_id, static_id, run_id, extra):
+        return {
+            "status": "ok", "action": {"file": str(path), "language": "cpp", "compilation_action_id": action_id},
+            "files": [{"file": str(path), "role": "source"}],
+            "symbols": [
+                symbol(inline_id, "Shared", "api::Shared", "int ()", header, 1),
+                symbol(static_id, "Local", "api::Local", "int ()", header, 2, linkage="internal", tu=tu),
+                symbol(run_id, f"Run{tu[-1].upper()}", f"api::Run{tu[-1].upper()}", "int ()", path, 1),
+                symbol(f"aux-id-{tu[-1]}", f"Aux{tu[-1].upper()}", f"api::Aux{tu[-1].upper()}", "int ()", path, 1),
+                *extra,
+            ],
+            "relations": [{
+                "relation_type": "calls", "source_symbol_id": run_id,
+                "target_symbol_id": inline_id, "source_file": str(path),
+            }, {
+                "relation_type": "calls", "source_symbol_id": run_id,
+                "target_symbol_id": static_id, "source_file": str(path),
+            }, {
+                "relation_type": "calls", "source_symbol_id": inline_id,
+                "target_symbol_id": f"aux-id-{tu[-1]}", "source_file": str(header),
+            }],
+        }
+
+    shared_a = [
+        symbol("alpha-id", "Render", "alpha::Render", "int (int)", header, 3),
+        symbol("beta-id", "Render", "beta::Render", "int (int)", header, 4),
+        symbol("overload-id", "Render", "alpha::Render", "int (double)", header, 5),
+    ]
+    modules = _c_family_modules(str(project), {"results": [
+        action(source_a, "action-a", "tu-a", "inline-id-a", "static-id-a", "run-id-a", shared_a),
+        action(source_b, "action-b", "tu-b", "inline-id-b", "static-id-b", "run-id-b", []),
+    ]})
+    assert set(modules) == {"src.shared", "src.a", "src.b"}
+    header_module = modules["src.shared"]
+    assert header_module.path == "src/shared.h"
+    assert all(function.module == "src.shared" for function in header_module.functions)
+    shared = [function for function in header_module.functions if function.name == "Shared"]
+    assert len(shared) == 1
+    assert set(shared[0].adapter_symbol_ids) == {"inline-id-a", "inline-id-b"}
+    locals_ = [function for function in header_module.functions if function.name == "Local"]
+    assert len(locals_) == 2
+    assert locals_[0].qualified_name != locals_[1].qualified_name
+    renders = [function for function in header_module.functions if function.name == "Render"]
+    assert len(renders) == 3
+    assert len({function.qualified_name for function in renders}) == 3
+    assert all("Render" not in function.qualified_name for function in modules["src.a"].functions)
+    assert all("Render" not in function.qualified_name for function in modules["src.b"].functions)
+
+    header_node = next(node for node in aggregate_functions_into_nodes(modules, {}) if node["module"] == "src.shared")
+    assert header_node["primary_file"] == "src/shared.h"
+    assert "Render [int (int)]" not in header_node["function_lines"]
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    snapshot_store.index_graph_snapshot(conn, "header-owner", "fixture", nodes=[{
+        "id": "shared", "layer": "L7", "title": "Shared header", "kind": "module",
+        "primary": [header_node["primary_file"]],
+        "metadata": {
+            "module": header_node["module"],
+            "functions": header_node["functions"],
+            "function_lines": header_node["function_lines"],
+        },
+    }], edges=[])
+    alpha = graph_query_trace.run_tool(conn, "header-owner", "fixture", tool="function_index", args={"query": "alpha::Render [int (int)]"})
+    beta = graph_query_trace.run_tool(conn, "header-owner", "fixture", tool="function_index", args={"query": "beta::Render [int (int)]"})
+    assert [(row["primary_file"], row["line_start"]) for row in alpha["matches"]] == [("src/shared.h", 3)]
+    assert [(row["primary_file"], row["line_start"]) for row in beta["matches"]] == [("src/shared.h", 4)]
+    conn.close()
+
+    call_graph = build_call_graph(modules)
+    for module_name, inline_id, static_id in (("src.a", "inline-id-a", "static-id-a"), ("src.b", "inline-id-b", "static-id-b")):
+        runner = next(function for function in modules[module_name].functions if function.name.startswith("Run"))
+        targets = call_graph.edges[runner.qualified_name]
+        assert shared[0].qualified_name in targets
+        assert next(function for function in locals_ if static_id in function.adapter_symbol_ids).qualified_name in targets
+        assert len(targets) == 2
+    assert call_graph.weak_edges == []
+    assert {call_graph.all_functions[target].name for target in call_graph.edges[shared[0].qualified_name]} == {"AuxA", "AuxB"}
+    facts = build_function_call_facts(modules, call_graph)
+    assert len(facts["src.shared"]["called_by"]) == 4
+    assert len(facts["src.shared"]["calls"]) == 2
+    assert {row["caller_file"] for row in facts["src.shared"]["called_by"]} == {"src/a.cc", "src/b.cc"}
+    assert {row["callee_file"] for row in facts["src.shared"]["called_by"]} == {"src/shared.h"}
+    dependency_edges = build_module_dependency_edges(modules, call_graph)
+    assert {edge["target_module"] for edge in dependency_edges if edge["source_module"] == "src.shared" and edge["relation_type"] == "calls_module"} == {"src.a", "src.b"}
+    assert not any(edge["source_module"] == "src.a" and edge["target_module"] == "src.b" for edge in dependency_edges)
 
 
 def test_c_family_dependency_owner_collisions_remain_unresolved_or_weak():

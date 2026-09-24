@@ -132,6 +132,7 @@ class FunctionMeta:
     # available, so short names never decide ownership.
     adapter_symbol_id: str = ""
     adapter_qualified_name: str = ""
+    adapter_symbol_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -543,102 +544,151 @@ def _analyze_c_family_project(project_root: str) -> Dict[str, Any]:
 
 
 def _c_family_modules(project_root: str, analysis: Mapping[str, Any]) -> Dict[str, ModuleInfo]:
-    """Convert successful production actions to ordinary Phase-Z source nodes."""
-    modules: Dict[str, ModuleInfo] = {}
+    """Project Clang definitions onto their physical source or header owner."""
+    function_kinds = {
+        "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl",
+        "CXXDestructorDecl", "ObjCMethodDecl",
+    }
+    root = Path(project_root).resolve()
+
+    def project_file(raw: str) -> Path | None:
+        if not raw:
+            return None
+        path = Path(raw)
+        path = (path if path.is_absolute() else root / path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return None
+        return path
+
+    successful: List[Tuple[Mapping[str, Any], Mapping[str, Any], Path]] = []
     source_paths_by_base: Dict[str, set[str]] = {}
     for result in analysis.get("results") or []:
         if not isinstance(result, Mapping) or result.get("status") != "ok":
             continue
         file_rows = [row for row in (result.get("files") or []) if isinstance(row, Mapping)]
         action = result.get("action") if isinstance(result.get("action"), Mapping) else {}
-        source_path = str(action.get("file") or "")
-        if not file_rows or file_rows[0].get("role") != "source" or not source_path:
+        source_path = project_file(str(action.get("file") or ""))
+        if not file_rows or file_rows[0].get("role") != "source" or source_path is None:
             continue
-        source_paths_by_base.setdefault(_path_to_module(source_path, project_root), set()).add(source_path)
-    for result in analysis.get("results") or []:
-        if not isinstance(result, Mapping) or result.get("status") != "ok":
-            continue
-        file_rows = [row for row in (result.get("files") or []) if isinstance(row, Mapping)]
-        if not file_rows or file_rows[0].get("role") != "source":
-            continue
-        action = result.get("action") if isinstance(result.get("action"), Mapping) else {}
-        source_path = str(action.get("file") or "")
-        if not source_path:
-            continue
-        rel_path = _repo_relpath(project_root, source_path)
-        base_module_name = _path_to_module(source_path, project_root)
-        source_suffix = Path(source_path).suffix.lower().lstrip(".").replace("+", "p")
-        module_name = (
-            f"{base_module_name}__{source_suffix}"
-            if source_suffix and len(source_paths_by_base.get(base_module_name, set())) > 1
-            else base_module_name
-        )
-        try:
-            source = Path(source_path).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            source = ""
+        successful.append((result, action, source_path))
+        source_paths_by_base.setdefault(_path_to_module(str(source_path), project_root), set()).add(str(source_path))
+        for symbol in result.get("symbols") or []:
+            if not isinstance(symbol, Mapping) or not symbol.get("is_definition"):
+                continue
+            if str(symbol.get("kind") or "") not in function_kinds:
+                continue
+            owner_path = project_file(str(symbol.get("file") or ""))
+            if owner_path is not None:
+                source_paths_by_base.setdefault(_path_to_module(str(owner_path), project_root), set()).add(str(owner_path))
+
+    def module_name_for(path: Path) -> str:
+        base = _path_to_module(str(path), project_root)
+        suffix = path.suffix.lower().lstrip(".").replace("+", "p")
+        return f"{base}__{suffix}" if suffix and len(source_paths_by_base.get(base, set())) > 1 else base
+
+    def ensure_module(path: Path, language: str) -> ModuleInfo:
+        module_name = module_name_for(path)
+        if module_name not in modules:
+            try:
+                source = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                source = ""
+            modules[module_name] = ModuleInfo(
+                path=_repo_relpath(project_root, str(path)),
+                module_name=module_name,
+                source=source,
+                language=language,
+                source_kind="clang_ast",
+            )
+        return modules[module_name]
+
+    modules: Dict[str, ModuleInfo] = {}
+    definitions: Dict[Tuple[str, int, str, str, str, str], Dict[str, Any]] = {}
+    header_symbols: Dict[str, List[Dict[str, Any]]] = {}
+    header_relations: Dict[str, List[Dict[str, Any]]] = {}
+    for result, action, source_path in successful:
+        language = str(action.get("language") or "")
+        source_module = ensure_module(source_path, language)
         symbols = [dict(row) for row in (result.get("symbols") or []) if isinstance(row, Mapping)]
-        calls_by_source: Dict[str, List[str]] = {}
-        adapter_relations: List[Dict[str, Any]] = []
+        relations: List[Dict[str, Any]] = []
+        calls_by_source: Dict[Tuple[str, str], set[str]] = {}
         for row in result.get("relations") or []:
             if not isinstance(row, Mapping):
                 continue
             relation = dict(row)
             relation.setdefault("target", str(row.get("target_file") or row.get("target_name") or ""))
             relation.setdefault("target_kind", "file" if row.get("relation_type") == "includes" else "symbol")
-            adapter_relations.append(relation)
+            relations.append(relation)
+            relation_file = project_file(str(row.get("source_file") or ""))
+            if relation_file is not None and relation_file != source_path:
+                header_relations.setdefault(str(relation_file), []).append(relation)
             if row.get("relation_type") == "calls" and row.get("source_symbol_id"):
-                calls_by_source.setdefault(str(row.get("source_symbol_id")), []).append(
-                    str(row.get("target_symbol_id") or row.get("target_qualified_name") or row.get("target_name") or "")
-                )
-        functions: List[FunctionMeta] = []
-        symbols_by_id: Dict[str, Dict[str, Any]] = {}
+                target = str(row.get("target_symbol_id") or row.get("target_qualified_name") or row.get("target_name") or "")
+                if target:
+                    calls_by_source.setdefault((str(row.get("source_symbol_id")), str(relation_file or "")), set()).add(target)
+        source_module.adapter_symbols.extend(symbols)
+        source_module.adapter_relations.extend(relations)
         for symbol in symbols:
+            owner_path = project_file(str(symbol.get("file") or ""))
+            if owner_path is not None and owner_path != source_path:
+                header_symbols.setdefault(str(owner_path), []).append(symbol)
             symbol_id = str(symbol.get("symbol_id") or "")
-            existing = symbols_by_id.get(symbol_id)
-            if existing is None or (symbol.get("is_definition") and not existing.get("is_definition")):
-                symbols_by_id[symbol_id] = symbol
-        for symbol in symbols_by_id.values():
             name = str(symbol.get("name") or "")
-            if not name or str(symbol.get("kind") or "") not in {
-                "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl",
-                "CXXDestructorDecl", "ObjCMethodDecl",
-            }:
+            if not (symbol_id and name and symbol.get("is_definition")):
                 continue
+            if str(symbol.get("kind") or "") not in function_kinds or owner_path is None:
+                continue
+            qualified = str(symbol.get("qualified_name") or name)
             signature = str(symbol.get("signature") or "")
-            unique_name = f"{name} [{signature}]" if signature else name
-            functions.append(FunctionMeta(
-                module=module_name,
-                name=name,
-                qualified_name=f"{module_name}::{unique_name}",
-                lineno=int(symbol.get("lineno") or 1),
-                end_lineno=int(symbol.get("end_lineno") or symbol.get("lineno") or 1),
-                calls=sorted({value for value in calls_by_source.get(str(symbol.get("symbol_id") or ""), []) if value}),
-                is_entry=name == "main",
-                adapter_symbol_id=str(symbol.get("symbol_id") or ""),
-                adapter_qualified_name=str(symbol.get("qualified_name") or ""),
-            ))
-        candidate = ModuleInfo(
-            path=rel_path,
-            module_name=module_name,
-            functions=functions,
-            source=source,
-            language=str(action.get("language") or ""),
-            source_kind="clang_ast",
-            adapter_symbols=symbols,
-            adapter_relations=adapter_relations,
-        )
-        existing_module = modules.get(module_name)
-        if existing_module is None:
-            modules[module_name] = candidate
-            continue
+            linkage = str(symbol.get("linkage") or "")
+            scope = str(symbol.get("translation_unit_id") or action.get("compilation_action_id") or symbol_id) if linkage == "internal" else ""
+            key = (str(owner_path), int(symbol.get("lineno") or 1), qualified, signature, str(symbol.get("kind") or ""), scope)
+            bucket = definitions.setdefault(key, {
+                "symbol": symbol, "path": owner_path, "language": language,
+                "ids": set(), "calls": set(),
+            })
+            bucket["ids"].add(symbol_id)
+            bucket["calls"].update(calls_by_source.get((symbol_id, str(owner_path)), set()))
+            bucket["calls"].update(calls_by_source.get((symbol_id, ""), set()))
 
-        # Multiple compile actions for one translation-unit path are separate
-        # indexed facts, but they must not overwrite the Phase-Z source node.
-        function_by_name = {
-            function.qualified_name: function
-            for function in [*existing_module.functions, *candidate.functions]
-        }
+    definition_languages = {key[0]: bucket["language"] for key, bucket in definitions.items()}
+    for path_str, rows in header_symbols.items():
+        if path_str not in definition_languages:
+            continue
+        module = ensure_module(Path(path_str), str(definition_languages[path_str]))
+        module.adapter_symbols.extend(rows)
+        module.adapter_relations.extend(header_relations.get(path_str, []))
+
+    # A declaration seen in a different action may have a different Clang id
+    # from its one physical definition.  Bind only unambiguous, fully scoped
+    # identities; overloads and translation-unit-local symbols stay separate.
+    definitions_by_identity: Dict[Tuple[str, str, str, str], set[Tuple[str, int, str, str, str, str]]] = {}
+    for key, bucket in definitions.items():
+        symbol = bucket["symbol"]
+        identity = (key[2], key[3], str(symbol.get("linkage") or ""), key[5])
+        definitions_by_identity.setdefault(identity, set()).add(key)
+    for result, action, _ in successful:
+        for symbol in result.get("symbols") or []:
+            if not isinstance(symbol, Mapping) or symbol.get("is_definition"):
+                continue
+            if str(symbol.get("kind") or "") not in function_kinds:
+                continue
+            symbol_id = str(symbol.get("symbol_id") or "")
+            if not symbol_id:
+                continue
+            linkage = str(symbol.get("linkage") or "")
+            scope = str(symbol.get("translation_unit_id") or action.get("compilation_action_id") or symbol_id) if linkage == "internal" else ""
+            identity = (
+                str(symbol.get("qualified_name") or symbol.get("name") or ""),
+                str(symbol.get("signature") or ""), linkage, scope,
+            )
+            owners = definitions_by_identity.get(identity, set())
+            if len(owners) == 1:
+                definitions[next(iter(owners))]["ids"].add(symbol_id)
+
+    for module in modules.values():
         symbol_by_identity = {
             (
                 str(symbol.get("compilation_action_id") or ""),
@@ -648,15 +698,41 @@ def _c_family_modules(project_root: str, analysis: Mapping[str, Any]) -> Dict[st
                 int(symbol.get("column") or 0),
                 bool(symbol.get("is_definition")),
             ): symbol
-            for symbol in [*existing_module.adapter_symbols, *candidate.adapter_symbols]
+            for symbol in module.adapter_symbols
         }
         relation_by_identity = {
             str(relation.get("relation_id") or json.dumps(relation, sort_keys=True, default=str)): relation
-            for relation in [*existing_module.adapter_relations, *candidate.adapter_relations]
+            for relation in module.adapter_relations
         }
-        existing_module.functions = sorted(function_by_name.values(), key=lambda function: function.qualified_name)
-        existing_module.adapter_symbols = list(symbol_by_identity.values())
-        existing_module.adapter_relations = list(relation_by_identity.values())
+        module.adapter_symbols = list(symbol_by_identity.values())
+        module.adapter_relations = list(relation_by_identity.values())
+
+    name_counts: Dict[Tuple[str, str], int] = {}
+    for key, bucket in definitions.items():
+        name = key[2] + (f" [{key[3]}]" if key[3] else "")
+        module_name = module_name_for(bucket["path"])
+        name_counts[(module_name, name)] = name_counts.get((module_name, name), 0) + 1
+    for key, bucket in sorted(definitions.items()):
+        symbol = bucket["symbol"]
+        module = ensure_module(bucket["path"], bucket["language"])
+        name = key[2] + (f" [{key[3]}]" if key[3] else "")
+        if name_counts[(module.module_name, name)] > 1:
+            name += f" [identity:{hashlib.sha256(repr(key).encode()).hexdigest()[:12]}]"
+        ids = sorted(bucket["ids"])
+        module.functions.append(FunctionMeta(
+            module=module.module_name,
+            name=str(symbol.get("name") or ""),
+            qualified_name=f"{module.module_name}::{name}",
+            lineno=int(symbol.get("lineno") or 1),
+            end_lineno=int(symbol.get("end_lineno") or symbol.get("lineno") or 1),
+            calls=sorted(bucket["calls"]),
+            is_entry=str(symbol.get("name") or "") == "main",
+            adapter_symbol_id=ids[0],
+            adapter_qualified_name=str(symbol.get("qualified_name") or ""),
+            adapter_symbol_ids=ids,
+        ))
+    for module in modules.values():
+        module.functions.sort(key=lambda function: function.qualified_name)
     return modules
 
 
@@ -908,9 +984,15 @@ def _function_meta_from_adapter_symbols(
 
 def _function_line_index(functions: List[FunctionMeta]) -> Dict[str, List[int]]:
     line_index: Dict[str, List[int]] = {}
+    short_counts: Dict[str, int] = {}
     for func in functions:
         short_name = str(func.qualified_name or func.name).rsplit("::", 1)[-1]
-        if not short_name:
+        if short_name:
+            short_counts[short_name] = short_counts.get(short_name, 0) + 1
+    for func in functions:
+        full_name = str(func.qualified_name or func.name)
+        short_name = full_name.rsplit("::", 1)[-1]
+        if not full_name:
             continue
         start = int(func.lineno or 0)
         if start <= 0:
@@ -918,7 +1000,9 @@ def _function_line_index(functions: List[FunctionMeta]) -> Dict[str, List[int]]:
         end = int(func.end_lineno or start)
         if end <= 0:
             end = start
-        line_index[short_name] = [start, end]
+        line_index[full_name] = [start, end]
+        if short_counts[short_name] == 1:
+            line_index[short_name] = [start, end]
     return line_index
 
 
@@ -1205,8 +1289,9 @@ def build_call_graph(
             all_funcs[func.qualified_name] = func
             function_languages[func.qualified_name] = str(mod_info.language or "")
             module_local_funcs[mod_name][func.name] = func.qualified_name
-            if func.adapter_symbol_id:
-                adapter_symbol_to_function.setdefault(func.adapter_symbol_id, []).append(func.qualified_name)
+            for symbol_id in set([func.adapter_symbol_id, *func.adapter_symbol_ids]):
+                if symbol_id:
+                    adapter_symbol_to_function.setdefault(symbol_id, []).append(func.qualified_name)
 
             short = func.name
             if short not in name_to_qualified:
@@ -3357,10 +3442,20 @@ def build_module_dependency_edges(
     cfamily_canonical_modules: Dict[str, Set[str]] = {}
     cfamily_qualified_modules: Dict[str, List[Dict[str, str]]] = {}
     cfamily_file_modules: Dict[str, Set[str]] = {}
+
+    def belongs_to_module(file_path: str, module_path: str) -> bool:
+        if not file_path:
+            return True  # Legacy synthetic adapter facts without a file.
+        file_parts = Path(file_path).parts
+        module_parts = Path(module_path).parts
+        return bool(module_parts) and file_parts[-len(module_parts):] == module_parts
+
     for module_name, module in sorted(modules.items()):
         if str(module.language or "") not in {"c", "cpp", "objective-c", "objective-cpp"} or str(module.source_kind or "") != "clang_ast":
             continue
         for symbol in module.adapter_symbols or []:
+            if not belongs_to_module(str(symbol.get("file") or ""), str(module.path or "")):
+                continue
             symbol_id = str(symbol.get("symbol_id") or "")
             qualified = str(symbol.get("qualified_name") or "")
             if not symbol_id:
@@ -3463,6 +3558,8 @@ def build_module_dependency_edges(
         if str(module.language or "") not in {"c", "cpp", "objective-c", "objective-cpp"} or str(module.source_kind or "") != "clang_ast":
             continue
         for relation in module.adapter_relations or []:
+            if not belongs_to_module(str(relation.get("source_file") or ""), str(module.path or "")):
+                continue
             relation_type = str(relation.get("relation_type") or "")
             if relation_type not in {"calls", "includes", "inherits", "references"}:
                 continue
