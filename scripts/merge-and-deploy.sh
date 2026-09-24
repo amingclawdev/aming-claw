@@ -3197,7 +3197,18 @@ try:
         graph_hash = sha([list(row) for row in rows])
 finally:
     conn.close()
-python_bin = str(Path(python_raw).resolve(strict=True))
+python_path = Path(python_raw)
+if not (
+    python_path.is_absolute()
+    and python_path.is_file()
+    and os.access(python_path, os.X_OK)
+    and python_path.resolve(strict=True).is_file()
+    and os.access(python_path.resolve(strict=True), os.X_OK)
+):
+    fail("activation_plan_python_invalid", "repository Python runtime is not executable")
+# Resolving the repository virtualenv entrypoint loses its package lookup.
+# The observed process executable is captured separately below.
+python_bin = python_raw
 shared = str(stable_root / "shared-volume")
 old_launch = [
     python_bin, "-m", "agent.cli", "start", "--workspace",

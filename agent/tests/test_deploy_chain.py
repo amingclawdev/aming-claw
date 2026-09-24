@@ -2288,6 +2288,123 @@ def test_main_binding_runs_exact_shell_precheck_before_legacy_timeline_branch(mo
         assert receipt["previous_promotion_receipt_hash"] is None
 
 
+def test_main_binding_prepare_preserves_real_venv_launcher_for_candidate_and_rollback(monkeypatch, tmp_path):
+    from agent.tests.test_graph_governance_api import _main_binding_release_fixture
+    from agent.governance import server
+
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path, main_preimage=True)
+    stable, dev = fixture["stable"], fixture["dev"]
+    manifest = fixture["manifest"]
+    venv_python = tmp_path / "repo-runtime" / ".venv" / "bin" / "python"
+    created = subprocess.run(
+        [sys.executable, "-m", "venv", str(venv_python.parent.parent)],
+        capture_output=True, text=True, check=False,
+    )
+    assert created.returncode == 0, created.stderr
+    assert venv_python.is_symlink()
+    site_packages = subprocess.check_output(
+        [str(venv_python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        text=True,
+    ).strip()
+    (Path(site_packages) / "ac_venv_launcher_sentinel.py").write_text("VALUE = 'venv-only'\n")
+
+    script = TestExplicitACPromotionScript._script()
+    runtime = TestExplicitACPromotionScript._activation_runtime()
+    launch_env = runtime["scrubbed_environment"]({
+        "PYTHONPATH": str(stable), "SHARED_VOLUME_PATH": str(stable / "shared-volume"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    bare_import = subprocess.run(
+        [str(venv_python.resolve()), "-c", "import ac_venv_launcher_sentinel"],
+        cwd=stable, env=launch_env, capture_output=True, text=True, check=False,
+    )
+    assert bare_import.returncode != 0
+    assert "No module named 'ac_venv_launcher_sentinel'" in bare_import.stderr
+    observed = subprocess.check_output(
+        [str(venv_python), "-c", "import os, subprocess; "
+         "print(subprocess.check_output(['ps', '-p', str(os.getpid()), '-o', 'command='], "
+         "text=True).split()[0])"],
+        cwd=stable, env=launch_env, text=True,
+    ).strip()
+    assert observed.startswith("/") and observed != str(venv_python)
+    fixture["old_process"]["command"] = " ".join(
+        [observed, *fixture["old_launch"][1:]]
+    )
+
+    precheck = server._ac_main_binding_precheck(manifest)
+    manifest_path = tmp_path / "venv-manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    plan_path = tmp_path / "venv-activation.json"
+    lines = script.read_text().splitlines()
+    start = next(i + 1 for i, line in enumerate(lines)
+                 if 'python3 - "$ACTIVATION_PLAN" "$DRY_RUN"' in line)
+    end = next(i for i in range(start, len(lines)) if lines[i] == "PY")
+    prepare_source = "\n".join(lines[start:end]) + "\n"
+    real_run = subprocess.run
+
+    def observed_process_boundary(args, **kwargs):
+        if args[0] == "ps":
+            field = "birth" if args[-1] == "lstart=" else "command"
+            return subprocess.CompletedProcess(args, 0,
+                stdout=fixture["old_process"][field] + "\n", stderr="")
+        if args[0] == "lsof":
+            return subprocess.CompletedProcess(args, 0,
+                stdout=str(fixture["old_process"]["pid"]) + "\n", stderr="")
+        return real_run(args, **kwargs)
+
+    prepare_argv = ["prepare", str(plan_path), "false", str(manifest_path),
+        json.dumps(precheck), str(stable), str(dev), manifest["stable_anchor_commit"],
+        fixture["candidate"], json.dumps(manifest["stable_database_identity"]),
+        str(fixture["stable_db"]), str(fixture["old_process"]["pid"]),
+        str(venv_python), precheck["verifier_sha256"], "40000"]
+    with monkeypatch.context() as boundary:
+        boundary.setattr(subprocess, "run", observed_process_boundary)
+        boundary.setattr(sys, "argv", prepare_argv)
+        exec(compile(prepare_source, str(script), "exec"), {"__name__": "venv_prepare_fixture"})
+    plan = json.loads(plan_path.read_bytes())
+    assert plan["candidate_launch_spec"][0] == str(venv_python)
+    assert plan["old_launch_spec"][0] == str(venv_python)
+    assert plan["runtime_process_executable"] == observed
+    assert plan["old_process"]["command"].split()[0] == observed
+    with monkeypatch.context() as boundary:
+        boundary.setattr(sys, "argv", ["script", "activate", str(plan_path), "false", str(script)])
+        runtime["validate_plan"](plan, plan_path.read_bytes(), str(script))
+        wrong_argv = copy.deepcopy(plan)
+        wrong_argv["old_process"]["command"] += " --unexpected"
+        wrong_argv["plan_hash"] = runtime["sha"]({
+            key: value for key, value in wrong_argv.items() if key != "plan_hash"
+        })
+        wrong_bytes = (runtime["canonical"](wrong_argv) + "\n").encode()
+        with pytest.raises(runtime["PromotionFailure"]) as rejected:
+            runtime["validate_plan"](wrong_argv, wrong_bytes, str(script))
+        assert rejected.value.code == "activation_plan_launch_spec_invalid"
+
+    # The fixture CLI exercises the plan's interpreter and sanitized environment
+    # without starting a governance listener on the stable port.
+    (stable / "ac_venv_launch_probe.py").write_text(
+        "import ac_venv_launcher_sentinel, json, os, subprocess, sys\n"
+        "physical = subprocess.check_output(['ps', '-p', str(os.getpid()), '-o', 'command='], "
+        "text=True).split()[0]\n"
+        "print(json.dumps({'sentinel': ac_venv_launcher_sentinel.VALUE, "
+        "'physical': physical, 'argv': sys.argv[1:]}))\n"
+    )
+    for spec_key, env_key in (("candidate_launch_spec", "candidate_launch_environment"),
+                              ("old_launch_spec", "old_launch_environment")):
+        spec = plan[spec_key]
+        env = runtime["scrubbed_environment"](plan[env_key])
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        launched = subprocess.run(
+            [spec[0], "-m", "ac_venv_launch_probe", *spec[4:]],
+            cwd=stable, env=env, capture_output=True, text=True, check=False,
+        )
+        assert launched.returncode == 0, (spec_key, launched.stderr)
+        result = json.loads(launched.stdout)
+        assert result["sentinel"] == "venv-only"
+        assert result["physical"] == plan["runtime_process_executable"]
+        assert "--runtime-plane" in result["argv"]
+        assert "stable" in result["argv"]
+
+
 @pytest.mark.parametrize("main_preimage,fault,first_main", [(False, "none", False), (False, "candidate_start", False), (False, "after_branch", False), (False, "after_source", False), (True, "none", False), (True, "after_source", False), (True, "none", True), (True, "after_source", True)])
 def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tmp_path, main_preimage, fault, first_main):
     from agent.tests.test_graph_governance_api import _main_binding_release_fixture
