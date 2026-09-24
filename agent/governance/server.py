@@ -219227,14 +219227,8 @@ def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
         world = binding.get("runtime_world_authority") or {}
         identity = world.get("database_identity") or {}
         base = str(binding.get("base_commit") or "")
-        expected_trailers = {"Chain-Source-Task": execution, "Chain-Source-Contract-Execution": execution,
-            "Chain-Source-Stage": "implementation", "Chain-Task": execution,
-            "Chain-Bug-Id": backlog, "Chain-Backlog": backlog,
-            "Chain-Route": "operator_supervised_direct_main", "Chain-Parent": base}
         changed = git("diff", "--name-only", base, actual_candidate).decode().splitlines()
-        if not (all(trailers.get(k) == [v] for k, v in expected_trailers.items())
-                and git("rev-list", "--parents", "-n", "1", actual_candidate).decode().split() == [actual_candidate, base]
-                and all(record.get(k) == v and binding.get(k) == v for k, v in {
+        if not (all(record.get(k) == v and binding.get(k) == v for k, v in {
                     "project_id": "aming-claw", "backlog_id": backlog, "contract_execution_id": execution}.items())
                 and record.get("contract_id") == "operator_supervised_direct_main"
                 and record.get("version") == "v1" and record.get("revision") == "rev3"
@@ -219290,6 +219284,27 @@ def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
             raise ValidationError("release needs its unique accepted implementation event")
         event = _ac_promotion_row_to_event(events[0])
         authority = (event.get("payload") or {}).get("direct_main_implementation_commit_prewrite_authority") or {}
+        fresh_chain = _direct_main_immutable_revision_chain_authority(
+            dev_root, base_commit_sha=base, candidate_commit_sha=actual_candidate,
+            backlog_id=backlog, task_id=execution,
+            declared_files=binding.get("owned_files") or [],
+        )
+        chain_matches_accepted = bool(
+            fresh_chain.get("passed") is True
+            and fresh_chain.get("chain_complete") is True
+            and fresh_chain.get("chain_truncated") is False
+            and authority.get("expected_runtime_base_commit") == base
+            and authority.get("implementation_parent_commit") == fresh_chain.get("implementation_parent_commit")
+            and authority.get("chain_complete") is True
+            and authority.get("chain_truncated") is False
+            and authority.get("chain_max_commits") == fresh_chain.get("chain_max_commits")
+            and authority.get("chain_commit_count") == fresh_chain.get("chain_commit_count")
+            and authority.get("chain_commits") == fresh_chain.get("chain_commits")
+            and authority.get("chain_steps") == fresh_chain.get("chain_steps")
+            and authority.get("chain_all_touched_files") == fresh_chain.get("all_touched_files")
+            and authority.get("chain_unexpected_touched_files") == []
+            and authority.get("verified_changed_files") == fresh_chain.get("cumulative_changed_files")
+        )
         if not _operator_supervised_direct_main_persisted_active_route_authority_valid(
             authority.get("active_route_authority") or {}, project_id="aming-claw",
             backlog_id=backlog, task_id=execution, immutable_route_identity=binding.get("route_identity") or {},
@@ -219310,6 +219325,7 @@ def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
                 and ("status" not in (payload.get("event") or {})
                      or payload["event"]["status"] in {"pass", "passed"})
                 and authority.get("server_derived") is True and authority.get("passed") is True
+                and chain_matches_accepted
                 and authority.get("commit_sha") == authority.get("canonical_head_commit") == actual_candidate
                 and authority.get("task_id") == execution and authority.get("runtime_binding_hash") == binding["binding_hash"]
                 and authority.get("authority_hash") == stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})

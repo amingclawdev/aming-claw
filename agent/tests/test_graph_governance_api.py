@@ -231698,7 +231698,7 @@ def _assert_normal_reconcile_release_carrier(source, record, tmp_path):
         assert snapshot() == before
 
 
-def _main_binding_normal_implementation_fixture(monkeypatch, tmp_path):
+def _main_binding_normal_implementation_fixture(monkeypatch, tmp_path, *, extra_revisions=0):
     """Seed only admission, then use the authenticated normal implementation writer.
 
     Git objects, the immutable Rule, routes, ContractRuntime, prewrite checks,
@@ -231819,6 +231819,15 @@ def _main_binding_normal_implementation_fixture(monkeypatch, tmp_path):
     git("commit", "-qm", _canonical_parentless_direct_main_commit_message(
         backlog_id=backlog_id, task_id=task_id, parent_commit=base,
     ), root=dev)
+    for revision in range(extra_revisions):
+        parent = git("rev-parse", "HEAD", root=dev)
+        (dev / "agent/governance/server.py").write_text(
+            f'AC_STABLE_BRANCH = "main"\n# normal implementation revision {revision + 2}\n'
+        )
+        git("add", "agent/governance/server.py", root=dev)
+        git("commit", "-qm", _canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id, task_id=task_id, parent_commit=parent,
+        ), root=dev)
     candidate = git("rev-parse", "HEAD", root=dev)
     loaded["commit"] = candidate  # isolated observation of the ordinary dev refresh
     body = _canonical_parentless_direct_main_implementation_body(
@@ -231884,14 +231893,35 @@ def test_main_release_consumes_normal_statusless_implementation(monkeypatch, tmp
     }, sort_keys=True))
 
 
+def test_main_release_consumes_accepted_same_execution_revision_chain(monkeypatch, tmp_path):
+    case = _main_binding_normal_implementation_fixture(
+        monkeypatch, tmp_path, extra_revisions=2,
+    )
+    authority = case["event"]["payload"]["direct_main_implementation_commit_prewrite_authority"]
+    assert authority["chain_commit_count"] == 3
+    assert authority["chain_commits"][-1] == case["candidate"]
+    assert authority["implementation_parent_commit"] == authority["chain_commits"][-2]
+    assert authority["implementation_parent_commit"] != case["base"]
+    assert authority["verified_changed_files"] == ["agent/governance/server.py"]
+    before = case["snapshot"]()
+    instance = server._ac_main_binding_release_instance()
+    assert instance["candidate_commit"] == case["candidate"]
+    assert instance["source_custody"]["implementation_event_id"] == case["event"]["id"]
+    assert case["snapshot"]() == before
+
+
 @pytest.mark.parametrize("defect", [
     "missing_event", "duplicate_event", "event_commit", "event_status", "event_phase",
     "canonical_commit", "canonical_binding", "canonical_failed", "canonical_actor",
     "canonical_stage", "canonical_evidence", "prewrite_commit", "prewrite_task",
     "prewrite_binding", "prewrite_hash", "route_hash", "legacy_failed_projection",
+    "chain_parent", "chain_middle_step", "chain_commits", "chain_cumulative_files",
 ])
 def test_main_release_normal_implementation_denials_are_durable_zero_write(monkeypatch, tmp_path, defect, record_property):
-    case = _main_binding_normal_implementation_fixture(monkeypatch, tmp_path)
+    case = _main_binding_normal_implementation_fixture(
+        monkeypatch, tmp_path,
+        extra_revisions=2 if defect.startswith("chain_") else 0,
+    )
     record = case["record"]
     line = case["implementation"]
     event = case["event"]
@@ -231910,6 +231940,14 @@ def test_main_release_normal_implementation_denials_are_durable_zero_write(monke
         line["evidence_kind"] = "independent_verification"
     elif defect == "legacy_failed_projection":
         line["payload"]["event"] = {"status": "failed"}
+    elif defect == "chain_parent":
+        authority["implementation_parent_commit"] = case["base"]
+    elif defect == "chain_middle_step":
+        authority["chain_steps"][1]["canonical_commit_trailers"]["Chain-Parent"] = [case["base"]]
+    elif defect == "chain_commits":
+        authority["chain_commits"][1] = case["base"]
+    elif defect == "chain_cumulative_files":
+        authority["verified_changed_files"] = []
     elif defect in {"prewrite_commit", "prewrite_task", "prewrite_binding"}:
         field, value = {
             "prewrite_commit": ("canonical_head_commit", case["base"]),
@@ -231922,6 +231960,8 @@ def test_main_release_normal_implementation_denials_are_durable_zero_write(monke
         authority["authority_hash"] = "sha256:" + "f" * 64
     elif defect == "route_hash":
         authority["active_route_authority"]["authority_hash"] = "sha256:" + "f" * 64
+        authority["authority_hash"] = server.stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})
+    if defect.startswith("chain_"):
         authority["authority_hash"] = server.stable_sha256({k: v for k, v in authority.items() if k != "authority_hash"})
     with case["connect"]() as connection:
         connection.execute("UPDATE contract_runtime_executions SET record_json=? WHERE contract_execution_id=?",
@@ -231981,6 +232021,25 @@ def _main_binding_release_fixture(
         monkeypatch.setattr(module, "_stable_process_identity", lambda _pid: (old_process["birth"], old_process["command"], str(stable)))
     authority = {"server_derived": True, "passed": True, "commit_sha": candidate, "canonical_head_commit": candidate,
                  "task_id": record["contract_execution_id"], "runtime_binding_hash": binding["binding_hash"]}
+    chain = server._direct_main_immutable_revision_chain_authority(
+        dev, base_commit_sha=binding["base_commit"], candidate_commit_sha=candidate,
+        backlog_id=record["backlog_id"], task_id=record["contract_execution_id"],
+        declared_files=binding["owned_files"],
+    )
+    assert chain["passed"] is True and chain["chain_complete"] is True
+    authority.update({
+        "expected_runtime_base_commit": binding["base_commit"],
+        "implementation_parent_commit": chain["implementation_parent_commit"],
+        "chain_complete": chain["chain_complete"],
+        "chain_truncated": chain["chain_truncated"],
+        "chain_max_commits": chain["chain_max_commits"],
+        "chain_commit_count": chain["chain_commit_count"],
+        "chain_commits": chain["chain_commits"],
+        "chain_steps": chain["chain_steps"],
+        "chain_all_touched_files": chain["all_touched_files"],
+        "chain_unexpected_touched_files": chain["unexpected_touched_files"],
+        "verified_changed_files": chain["cumulative_changed_files"],
+    })
     authority["authority_hash"] = server.stable_sha256(authority)
     record["completed_lines"].append({"line_id": "observer_implementation", "stage_id": "implementation",
         "actor_role": "observer", "evidence_kind": "implementation", "status": "completed",
@@ -232785,7 +232844,7 @@ def test_current_release_does_not_depend_on_live_development_phase(monkeypatch, 
     ("implementation_commit", "accepted implementation identity"),
     ("duplicate_implementation", "unique accepted implementation"),
     ("source_route_hash", "accepted source route authority"),
-    ("wrong_parent", "ordinary Direct source identity"),
+    ("wrong_parent", "accepted implementation identity"),
     ("qa_session", "not role-bound"),
     ("qa_graph", "not role-bound"),
     ("duplicate_qa", "canonical QA line"),
