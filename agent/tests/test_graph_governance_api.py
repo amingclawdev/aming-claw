@@ -236498,6 +236498,51 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
         record["contract_execution_id"]
     )["completed_lines"]) == before_lines
 
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID,
+             "contract_execution_id": record["contract_execution_id"]},
+            "observer",
+        )
+    )
+    written = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID,
+             "contract_execution_id": record["contract_execution_id"]},
+            "observer", method="POST",
+            body=current["next_legal_action"]["writer_role_safe_copy_payload"][
+                "copy_payload"
+            ],
+        )
+    )
+    assert written["ok"] is True, written
+    persisted = server._contract_runtime_store(conn).get(
+        record["contract_execution_id"]
+    )
+    final_qa = server._contract_runtime_rev8_postmerge_qa_authority(
+        conn, project_id=PID, record=persisted,
+    )
+    assert final_qa["verified"] is True, final_qa
+    assert final_qa["target_project_root"] == str(case["owner"].resolve())
+
+    tampered = copy.deepcopy(persisted)
+    tampered_receipt = tampered["completed_lines"][-1]["payload"][
+        "reconcile_authority"
+    ]
+    tampered_receipt["authority_hash"] = "sha256:" + "f" * 64
+    blocked_qa = server._contract_runtime_rev8_postmerge_qa_authority(
+        conn, project_id=PID, record=tampered,
+    )
+    assert blocked_qa["verified"] is False
+    assert "observer_reconcile_receipt_unverified" in blocked_qa["blocker_codes"]
+
+    (case["owner"] / "after-reconcile.txt").write_text("dirty owner\\n")
+    dirty_qa = server._contract_runtime_rev8_postmerge_qa_authority(
+        conn, project_id=PID, record=persisted,
+    )
+    assert dirty_qa["verified"] is False
+    assert "target_ref_owner_not_clean_and_aligned" in dirty_qa["blocker_codes"]
+
 
 @pytest.mark.parametrize(
     "defect",

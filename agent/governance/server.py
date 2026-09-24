@@ -138861,7 +138861,11 @@ def _contract_runtime_rev8_postmerge_qa_authority(
                 record=record,
                 merge=reconcile_merge,
                 reconcile=reconciled_merge,
-                target_project_root_override=str(target_owner),
+                **(
+                    {}
+                    if str(record.get("revision") or "").strip() == "rev10"
+                    else {"target_project_root_override": str(target_owner)}
+                ),
             )
         )
     )
@@ -146867,6 +146871,57 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     )
     root = ""
     if linked_postmerge:
+        persisted_identity_source = (
+            "ContractRuntime.completed_lines.observer_reconcile."
+            "reconcile_authority"
+        )
+        persisted_identity_verified = False
+        if merge.get("reconcile_lane_identity_source") == persisted_identity_source:
+            receipts = [
+                line.get("payload", {}).get("reconcile_authority")
+                for line in record.get("completed_lines") or []
+                if isinstance(line, Mapping)
+                and str(line.get("line_id") or "").strip()
+                == "observer_reconcile"
+                and isinstance(line.get("payload"), Mapping)
+                and isinstance(
+                    line["payload"].get("reconcile_authority"), Mapping
+                )
+            ]
+            if receipts:
+                receipt_resolution = _contract_runtime_reconcile_receipt_resolution(
+                    conn, project_id=project_id, record=record,
+                    authority=receipts[-1],
+                )
+                receipt = receipt_resolution.get("authority")
+                receipt = receipt if isinstance(receipt, Mapping) else {}
+                terminal = receipt.get("terminal_current_full_reconcile_authority")
+                terminal = terminal if isinstance(terminal, Mapping) else {}
+                persisted_identity_verified = bool(
+                    receipt_resolution.get("status") in {"current", "corrected"}
+                    and receipt.get("record_verified") is True
+                    and receipt.get("reconcile_event_recorded") is True
+                    and receipt.get("current_full_reconcile_activation_verified")
+                    is True
+                    and _contract_runtime_close_authority_hash_matches(receipt)
+                    and _contract_runtime_current_full_reconcile_activation_verified(
+                        terminal
+                    )
+                    and all(
+                        str(receipt.get(field) or "").strip()
+                        == str(merge.get(field) or "").strip()
+                        == str(terminal.get(field) or "").strip()
+                        for field in (
+                            "project_id", "backlog_id", "contract_execution_id",
+                            "runtime_context_id", "task_id", "parent_task_id",
+                            "merge_queue_id", "merged_commit_sha", "merge_source_ref",
+                        )
+                    )
+                    and str(receipt.get("reconcile_source_ref") or "").strip()
+                    == str(reconcile.get("reconcile_source_ref") or "").strip()
+                    and int(receipt.get("reconcile_event_id") or 0)
+                    == int(reconcile.get("reconcile_event_id") or 0)
+                )
         execution_id = str(record.get("contract_execution_id") or "").strip()
         selected_identity = {
             field: str(merge.get(field) or "").strip()
@@ -146902,7 +146957,16 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
             and selected_identity["merge_queue_id"]
             in set(merge.get("lane_merge_queue_ids") or [])
             and merge.get("reconcile_lane_identity_source")
-            in {"RuntimeContext.current_values", "terminal_current_full_reconcile_receipt"}
+            in {
+                "RuntimeContext.current_values",
+                "terminal_current_full_reconcile_receipt",
+                persisted_identity_source,
+            }
+            and (
+                merge.get("reconcile_lane_identity_source")
+                != persisted_identity_source
+                or persisted_identity_verified
+            )
             and final_identity.get("parent_task_id") == execution_id
             and all(str(final_identity.get(field) or "").strip()
                     for field in selected_identity)
