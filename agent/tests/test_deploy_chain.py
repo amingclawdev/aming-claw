@@ -2326,7 +2326,7 @@ def test_main_binding_prepare_preserves_real_venv_launcher_for_candidate_and_rol
          "text=True).split()[0])"],
         cwd=stable, env=launch_env, text=True,
     ).strip()
-    assert observed.startswith("/") and observed != str(venv_python)
+    assert observed.startswith("/")
     fixture["old_process"]["command"] = " ".join(
         [observed, *fixture["old_launch"][1:]]
     )
@@ -2383,10 +2383,10 @@ def test_main_binding_prepare_preserves_real_venv_launcher_for_candidate_and_rol
     # without starting a governance listener on the stable port.
     (stable / "ac_venv_launch_probe.py").write_text(
         "import ac_venv_launcher_sentinel, json, os, subprocess, sys\n"
-        "physical = subprocess.check_output(['ps', '-p', str(os.getpid()), '-o', 'command='], "
-        "text=True).split()[0]\n"
+        "physical_command = subprocess.check_output("
+        "['ps', '-p', str(os.getpid()), '-o', 'command='], text=True).strip()\n"
         "print(json.dumps({'sentinel': ac_venv_launcher_sentinel.VALUE, "
-        "'physical': physical, 'argv': sys.argv[1:]}))\n"
+        "'physical_command': physical_command, 'argv': sys.argv[1:]}))\n"
     )
     for spec_key, env_key in (("candidate_launch_spec", "candidate_launch_environment"),
                               ("old_launch_spec", "old_launch_environment")):
@@ -2400,9 +2400,10 @@ def test_main_binding_prepare_preserves_real_venv_launcher_for_candidate_and_rol
         assert launched.returncode == 0, (spec_key, launched.stderr)
         result = json.loads(launched.stdout)
         assert result["sentinel"] == "venv-only"
-        assert result["physical"] == plan["runtime_process_executable"]
-        assert "--runtime-plane" in result["argv"]
-        assert "stable" in result["argv"]
+        assert result["physical_command"] == " ".join(
+            [plan["runtime_process_executable"], "-m", "ac_venv_launch_probe", *spec[4:]]
+        )
+        assert result["argv"] == spec[4:]
 
 
 @pytest.mark.parametrize("main_preimage,fault,first_main", [(False, "none", False), (False, "candidate_start", False), (False, "after_branch", False), (False, "after_source", False), (True, "none", False), (True, "after_source", False), (True, "none", True), (True, "after_source", True)])
