@@ -21,6 +21,8 @@ def _load_smoke_module():
 
 
 def test_v2_release_versions_are_synchronized():
+    from agent.governance import contract_state_runtime
+
     smoke = _load_smoke_module()
     preflight = smoke.offline_preflight(ROOT)
     assert preflight["status"] == "passed"
@@ -28,6 +30,13 @@ def test_v2_release_versions_are_synchronized():
     assert preflight["checks"]["managed_profile_plugin_version"] is True
     assert preflight["checks"]["compose_isolated_volume"] is True
     assert preflight["checks"]["docker_context_excludes_local_state"] is True
+    manifest = json.loads(
+        (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    assert (
+        contract_state_runtime.CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_VERSION
+        == manifest["version"]
+    )
 
 
 def test_codex_manifest_default_prompts_satisfy_doctor_contract():
@@ -42,15 +51,33 @@ def test_codex_manifest_default_prompts_satisfy_doctor_contract():
     assert any("onboard_route_guide" in prompt for prompt in prompts)
 
 
-def test_happy_path_smoke_declares_two_zero_bypass_reference_worlds():
+def test_happy_path_smoke_declares_three_zero_bypass_reference_worlds():
     smoke = _load_smoke_module()
-    assert [world.lane for world in smoke.REFERENCE_WORLDS] == [
-        "mf_parallel",
-        "mf_batch_parallel",
+    assert [
+        (world.lane, world.project_id, world.backlog_ids)
+        for world in smoke.REFERENCE_WORLDS
+    ] == [
+        (
+            "direct_main",
+            "daily-planner-v2-direct-253d7f62-20260808t200221z",
+            ("DP-V2-DIRECT-253D7F62-R1-20260808",),
+        ),
+        (
+            "mf_parallel",
+            "daily-planner-v2-parallel-r3-20260809t050248z",
+            ("DP-V2-PARALLEL-R8-20260809",),
+        ),
+        (
+            "mf_batch_parallel",
+            "daily-planner-v2-batch-530a9121-20260809t043433z",
+            (
+                "DP-V2-BATCH-MODELS-530A9121-R2-20260809",
+                "DP-V2-BATCH-PLANNER-530A9121-R2-20260809",
+                "DP-V2-BATCH-COORD-530A9121-R2-20260809",
+            ),
+        ),
     ]
     assert all(len(world.close_commit) == 40 for world in smoke.REFERENCE_WORLDS)
-    assert len(smoke.REFERENCE_WORLDS[0].backlog_ids) == 1
-    assert len(smoke.REFERENCE_WORLDS[1].backlog_ids) == 3
 
 
 def test_no_pass_detector_uses_formal_fields_not_route_guidance_text():
