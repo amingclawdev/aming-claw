@@ -13,9 +13,14 @@ from agent.governance import graph_events
 from agent.governance import graph_query_trace
 from agent.governance import graph_snapshot_store as snapshot_store
 from agent.governance.reconcile_phases.phase_z_v2 import (
+    CallGraph,
+    FunctionMeta,
+    ModuleInfo,
     _c_family_modules,
     apply_dependency_patches,
     build_candidate_coverage_ledger,
+    build_call_graph,
+    build_module_dependency_edges,
     build_rebase_candidate_graph,
     build_graph_v2_from_symbols,
     extract_typed_relations,
@@ -74,6 +79,25 @@ def test_c_family_full_chain_keeps_compile_identity_and_attaches_non_architectur
     assert any(row["test_file"] == "unbound_test.cc" for row in result["c_family_test_bindings"]["unbound"])
     assert any(row["relation_type"] == "calls" and row["target_name"] == "selected_feature" for row in analysis["relations"])
     assert not any(row["relation_type"] == "includes" and row["target_name"] == "inactive_only.h" for row in analysis["relations"])
+    assert any(
+        row["relation_type"] == "calls_module"
+        and row["source_module"] == "overlay"
+        and row["target_module"] == "overlay_mac"
+        and "clang calls" in row["evidence"]
+        for row in result["module_dependency_edges"]
+    )
+    assert any(
+        row["relation_type"] == "includes_module"
+        and row["source_module"] == "overlay"
+        and row["target_module"] == "overlay_mac"
+        for row in result["module_dependency_edges"]
+    )
+    assert any(
+        row["relation_type"] == "references_module"
+        and row["source_module"] == "overlay"
+        and row["target_module"] == "overlay_mac"
+        for row in result["module_dependency_edges"]
+    )
 
     monkeypatch.setattr(db, "_governance_root", lambda: tmp_path / "state")
     monkeypatch.setattr(db, "classify_graph_activation_connection", lambda _conn: {
@@ -106,8 +130,76 @@ def test_c_family_full_chain_keeps_compile_identity_and_attaches_non_architectur
     )
     conn.commit()
 
+    candidate = build_rebase_candidate_graph(str(project), result)
+    graph_nodes = candidate["deps_graph"]["nodes"]
+    graph_edges = snapshot_store.graph_payload_edges({"deps_graph": candidate["deps_graph"]})
+    indexed = snapshot_store.index_graph_snapshot(
+        conn,
+        "c-family-full-chain",
+        snapshot["snapshot_id"],
+        nodes=graph_nodes,
+        edges=graph_edges,
+    )
+    conn.commit()
+    assert indexed["nodes"] == len(graph_nodes)
+    assert indexed["edges"] == len(graph_edges)
+    overlay_graph_node = next(node for node in graph_nodes if "overlay.cc" in node.get("primary", []))
+    overlay_mac_graph_node = next(node for node in graph_nodes if "overlay_mac.mm" in node.get("primary", []))
+    indexed_edges = conn.execute(
+        "SELECT src, dst, edge_type, direction, evidence_json "
+        "FROM graph_edges_index WHERE project_id=? AND snapshot_id=?",
+        ("c-family-full-chain", snapshot["snapshot_id"]),
+    ).fetchall()
+    module_edge = next(
+        row for row in indexed_edges
+        if row["src"] == overlay_graph_node["id"]
+        and row["dst"] == overlay_mac_graph_node["id"]
+        and row["edge_type"] == "depends_on"
+    )
+    assert module_edge["direction"] == "dependency"
+    assert "clang calls" in module_edge["evidence_json"]
+    assert "clang includes" in module_edge["evidence_json"]
+    assert "clang references" in module_edge["evidence_json"]
+    assert "calls_module" in module_edge["evidence_json"]
+    assert "includes_module" in module_edge["evidence_json"]
+    assert "references_module" in module_edge["evidence_json"]
+    impact_query = graph_query_trace.traced_query(
+        conn,
+        "c-family-full-chain",
+        snapshot["snapshot_id"],
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="get_neighbors",
+        args={"node_id": overlay_mac_graph_node["id"], "direction": "in", "include_edge_semantic": True},
+        project_root=project,
+    )
+    impact_edges = impact_query["result"]["edges"]
+    assert any(
+        edge["src"] == overlay_graph_node["id"]
+        and edge["dst"] == overlay_mac_graph_node["id"]
+        and edge["edge_type"] == "depends_on"
+        and "clang calls" in json.dumps(edge["evidence"])
+        for edge in impact_edges
+    )
+
     selected_symbols = [row for row in analysis["symbols"] if row["name"] == "selected_feature"]
     selected_id = selected_symbols[0]["symbol_id"]
+    assert len(selected_symbols) >= 2
+    assert {row["qualified_name"] for row in selected_symbols} == {"overlay::selected_feature"}
+    assert {Path(row["file"]).name for row in selected_symbols} == {"overlay.h", "overlay.cc"}
+    selected_definition = next(row for row in selected_symbols if row["is_definition"])
+    same_tu_selected = [
+        row for row in selected_symbols
+        if row["translation_unit_id"] == selected_definition["translation_unit_id"]
+    ]
+    assert {Path(row["file"]).name for row in same_tu_selected} == {"overlay.h", "overlay.cc"}
+    assert len({row["symbol_id"] for row in same_tu_selected}) == 1
+    assert all(
+        row["definition_clang_id"] == row["clang_id"]
+        for row in same_tu_selected
+        if row["is_definition"]
+    )
     occurrence_query = graph_query_trace.traced_query(
         conn,
         "c-family-full-chain",
@@ -169,9 +261,6 @@ def test_c_family_full_chain_keeps_compile_identity_and_attaches_non_architectur
     ).fetchone()[0] == 1
     conn.close()
 
-    candidate = build_rebase_candidate_graph(str(project), result)
-    graph_nodes = candidate["deps_graph"]["nodes"]
-    overlay_graph_node = next(node for node in graph_nodes if "overlay.cc" in node.get("primary", []))
     assert "overlay_test.cc" in overlay_graph_node["test"]
     assert "docs/overlay.md" in overlay_graph_node["secondary"]
     assert {"config/build.yaml", "config/settings.json"}.issubset(set(overlay_graph_node["config"]))
@@ -218,6 +307,84 @@ def test_c_family_modules_keep_extension_identity_and_merge_same_file_actions(tm
         row["compilation_action_id"]
         for row in modules["overlay__cc"].adapter_symbols
     } == {"source-action-a", "source-action-b"}
+
+
+def test_c_family_dependency_owner_collisions_remain_unresolved_or_weak():
+    def function(module, name, signature, symbol_id):
+        return FunctionMeta(
+            module=module,
+            name=name,
+            qualified_name=f"{module}::{name} [{signature}]",
+            lineno=1,
+            end_lineno=1,
+            adapter_symbol_id=symbol_id,
+            adapter_qualified_name=f"api::{name}",
+        )
+
+    modules = {
+        "owner_int": ModuleInfo(
+            path="src/owner_int.cc", module_name="owner_int", language="cpp", source_kind="clang_ast",
+            adapter_symbols=[{
+                "symbol_id": "int-id", "qualified_name": "api::lookup", "signature": "int (int)",
+                "linkage": "external", "translation_unit_id": "tu-int", "is_definition": True,
+                "kind": "FunctionDecl",
+            }],
+        ),
+        "owner_double": ModuleInfo(
+            path="src/owner_double.cc", module_name="owner_double", language="cpp", source_kind="clang_ast",
+            adapter_symbols=[{
+                "symbol_id": "double-id", "qualified_name": "api::lookup", "signature": "double (double)",
+                "linkage": "external", "translation_unit_id": "tu-double", "is_definition": True,
+                "kind": "FunctionDecl",
+            }],
+        ),
+        "caller": ModuleInfo(
+            path="src/caller.cc", module_name="caller", language="cpp", source_kind="clang_ast",
+            adapter_relations=[{
+                "relation_type": "calls", "source_file": "src/caller.cc", "line": 7,
+                "target_symbol_id": "unmatched-external-decl", "target_qualified_name": "api::lookup",
+                "target_name": "lookup", "evidence": "clang calls unresolved overloaded api::lookup",
+            }],
+        ),
+        "include_caller": ModuleInfo(
+            path="src/use.cc", module_name="include_caller", language="cpp", source_kind="clang_ast",
+            adapter_relations=[{
+                "relation_type": "includes", "source_file": "src/use.cc", "line": 1,
+                "target_file": "/project/include/foo.h", "target_name": "foo.h",
+                "evidence": "clang includes exact /project/include/foo.h",
+            }],
+        ),
+        "a_foo": ModuleInfo(path="a/foo.cc", module_name="a_foo", language="cpp", source_kind="clang_ast"),
+        "b_foo": ModuleInfo(path="b/foo.mm", module_name="b_foo", language="objective-cpp", source_kind="clang_ast"),
+    }
+    dependency_edges = build_module_dependency_edges(modules, CallGraph())
+    assert not any(edge["relation_type"] == "calls_module" for edge in dependency_edges)
+    assert not any(edge["relation_type"] == "includes_module" for edge in dependency_edges)
+
+    duplicate_id = "header-inline-symbol"
+    call_modules = {
+        "tu_a": ModuleInfo(
+            path="src/a.cc", module_name="tu_a", language="cpp", source_kind="clang_ast",
+            functions=[function("tu_a", "inline_value", "int ()", duplicate_id)],
+        ),
+        "tu_b": ModuleInfo(
+            path="src/b.cc", module_name="tu_b", language="cpp", source_kind="clang_ast",
+            functions=[function("tu_b", "inline_value", "int ()", duplicate_id)],
+        ),
+        "caller": ModuleInfo(
+            path="src/caller.cc", module_name="caller", language="cpp", source_kind="clang_ast",
+            functions=[FunctionMeta(
+                module="caller", name="run", qualified_name="caller::run [int ()]", lineno=1,
+                end_lineno=1, calls=[duplicate_id],
+            )],
+        ),
+    }
+    call_graph = build_call_graph(call_modules)
+    assert call_graph.edges["caller::run [int ()]"] == []
+    assert len(call_graph.weak_edges) == 1
+    assert set(call_graph.weak_edges[0].candidates) == {
+        "tu_a::inline_value [int ()]", "tu_b::inline_value [int ()]",
+    }
 
 
 def test_c_family_test_binding_uses_exact_qualified_symbol(tmp_path, monkeypatch):
@@ -286,6 +453,39 @@ def test_c_family_test_binding_uses_exact_qualified_symbol(tmp_path, monkeypatch
         (b_node["node_id"], b_render["symbol_id"]),
     }
     assert all(row["relation_id"] and row["source_symbol_id"] for row in multi_target)
+
+
+def test_python_from_import_lookup_preserves_calls_and_imports_module_edges(tmp_path):
+    project = tmp_path / "python-import-project"
+    _write(
+        str(project / ".aming-claw.yaml"),
+        "\n".join([
+            "version: 2",
+            "project_id: python-import-project",
+            "language: python",
+            "source_roots:",
+            "  - src",
+            "",
+        ]),
+    )
+    _write(str(project / "src" / "store.py"), "def lookup():\n    return 1\n")
+    _write(
+        str(project / "src" / "consumer.py"),
+        "from src.store import lookup\n\n"
+        "def consume():\n    return lookup()\n",
+    )
+
+    result = build_graph_v2_from_symbols(
+        str(project), dry_run=True, scratch_dir=str(tmp_path / "scratch-python-import"),
+    )
+    edges = {
+        (row["source_module"], row["target_module"], row["relation_type"]): row
+        for row in result["module_dependency_edges"]
+    }
+    assert ("src.store", "src.consumer", "calls_module") in edges
+    assert ("src.store", "src.consumer", "imports_module") in edges
+    assert "lookup" in edges[("src.store", "src.consumer", "calls_module")]["evidence"]
+    assert "src.store.lookup" in edges[("src.store", "src.consumer", "imports_module")]["evidence"]
 
 
 def test_extracts_state_route_task_event_and_artifact_relations(tmp_path):

@@ -127,6 +127,11 @@ class FunctionMeta:
     calls: List[str] = field(default_factory=list)
     call_contexts: List[Dict[str, Any]] = field(default_factory=list)
     is_entry: bool = False
+    # C-family functions retain the exact Clang endpoint alongside the
+    # language-neutral Phase-Z name.  Calls use adapter_symbol_id when
+    # available, so short names never decide ownership.
+    adapter_symbol_id: str = ""
+    adapter_qualified_name: str = ""
 
 
 @dataclass
@@ -483,7 +488,7 @@ def _path_to_module(path: str, root: str) -> str:
     """Convert a file path to a dotted module name relative to root's parent."""
     rel = os.path.relpath(path, os.path.dirname(root) if not os.path.isdir(root) else os.path.dirname(root))
     # Actually, root is the project root containing agent/ and scripts/
-    rel = os.path.relpath(path, root)
+    rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
     rel = rel.replace(os.sep, "/")
     rel = DEFAULT_LANGUAGE_POLICY.strip_source_suffix(rel)
     if rel.endswith("/__init__"):
@@ -583,7 +588,9 @@ def _c_family_modules(project_root: str, analysis: Mapping[str, Any]) -> Dict[st
             relation.setdefault("target_kind", "file" if row.get("relation_type") == "includes" else "symbol")
             adapter_relations.append(relation)
             if row.get("relation_type") == "calls" and row.get("source_symbol_id"):
-                calls_by_source.setdefault(str(row.get("source_symbol_id")), []).append(str(row.get("target_name") or ""))
+                calls_by_source.setdefault(str(row.get("source_symbol_id")), []).append(
+                    str(row.get("target_symbol_id") or row.get("target_qualified_name") or row.get("target_name") or "")
+                )
         functions: List[FunctionMeta] = []
         symbols_by_id: Dict[str, Dict[str, Any]] = {}
         for symbol in symbols:
@@ -608,6 +615,8 @@ def _c_family_modules(project_root: str, analysis: Mapping[str, Any]) -> Dict[st
                 end_lineno=int(symbol.get("end_lineno") or symbol.get("lineno") or 1),
                 calls=sorted({value for value in calls_by_source.get(str(symbol.get("symbol_id") or ""), []) if value}),
                 is_entry=name == "main",
+                adapter_symbol_id=str(symbol.get("symbol_id") or ""),
+                adapter_qualified_name=str(symbol.get("qualified_name") or ""),
             ))
         candidate = ModuleInfo(
             path=rel_path,
@@ -1188,6 +1197,7 @@ def build_call_graph(
     # module_name -> {func_short_name -> qualified_name}
     module_local_funcs: Dict[str, Dict[str, str]] = {}
     function_languages: Dict[str, str] = {}
+    adapter_symbol_to_function: Dict[str, List[str]] = {}
 
     for mod_name, mod_info in modules.items():
         module_local_funcs[mod_name] = {}
@@ -1195,6 +1205,8 @@ def build_call_graph(
             all_funcs[func.qualified_name] = func
             function_languages[func.qualified_name] = str(mod_info.language or "")
             module_local_funcs[mod_name][func.name] = func.qualified_name
+            if func.adapter_symbol_id:
+                adapter_symbol_to_function.setdefault(func.adapter_symbol_id, []).append(func.qualified_name)
 
             short = func.name
             if short not in name_to_qualified:
@@ -1212,18 +1224,28 @@ def build_call_graph(
                 graph.edges[caller] = []
 
             for call_index, call_target in enumerate(func.calls):
-                resolved = _resolve_call(
-                    call_target=call_target,
-                    caller_module=mod_name,
-                    import_map=mod_info.import_map,
-                    local_funcs=local_funcs,
-                    all_funcs=all_funcs,
-                    name_to_qualified=name_to_qualified,
-                    module_local_funcs=module_local_funcs,
-                    caller_language=str(mod_info.language or ""),
-                    function_languages=function_languages,
-                    call_resolution_rules=call_resolution_rules,
-                )
+                # C-family adapter relations carry the Clang symbol id.  Bind
+                # that endpoint directly before consulting any language-level
+                # fallback; legacy adapters continue through _resolve_call.
+                adapter_targets = sorted(set(adapter_symbol_to_function.get(call_target, [])))
+                resolved: str | List[str] | None
+                if len(adapter_targets) == 1:
+                    resolved = adapter_targets[0]
+                elif len(adapter_targets) > 1:
+                    resolved = adapter_targets
+                else:
+                    resolved = _resolve_call(
+                        call_target=call_target,
+                        caller_module=mod_name,
+                        import_map=mod_info.import_map,
+                        local_funcs=local_funcs,
+                        all_funcs=all_funcs,
+                        name_to_qualified=name_to_qualified,
+                        module_local_funcs=module_local_funcs,
+                        caller_language=str(mod_info.language or ""),
+                        function_languages=function_languages,
+                        call_resolution_rules=call_resolution_rules,
+                    )
 
                 if resolved is None:
                     # External / builtin — skip
@@ -2124,7 +2146,10 @@ def _repo_relpath(project_root: str, path: str) -> str:
     raw = str(path or "")
     try:
         if os.path.isabs(raw):
-            raw = os.path.relpath(raw, project_root)
+            # Compilation databases and temporary macOS fixtures can spell
+            # the same path through /var and /private/var.  Resolve both
+            # sides before deriving the repository-relative identity.
+            raw = os.path.relpath(os.path.realpath(raw), os.path.realpath(project_root))
     except ValueError:
         pass
     rel = raw.replace("\\", "/")
@@ -3322,6 +3347,146 @@ def build_module_dependency_edges(
             "direction": "dependency_to_dependent",
             "evidence": evidence,
         })
+
+    # C-family relations already carry Clang's exact symbol endpoints.  Build
+    # the owner index from definition facts first so a declaration repeated in
+    # a header resolves to the source module that owns its definition.  This
+    # avoids the short-name fallback and keeps overloads, namespaces, and TU
+    # local symbols distinct.
+    cfamily_symbol_modules: Dict[str, Set[str]] = {}
+    cfamily_canonical_modules: Dict[str, Set[str]] = {}
+    cfamily_qualified_modules: Dict[str, List[Dict[str, str]]] = {}
+    cfamily_file_modules: Dict[str, Set[str]] = {}
+    for module_name, module in sorted(modules.items()):
+        if str(module.language or "") not in {"c", "cpp", "objective-c", "objective-cpp"} or str(module.source_kind or "") != "clang_ast":
+            continue
+        for symbol in module.adapter_symbols or []:
+            symbol_id = str(symbol.get("symbol_id") or "")
+            qualified = str(symbol.get("qualified_name") or "")
+            if not symbol_id:
+                continue
+            if symbol.get("is_definition"):
+                cfamily_symbol_modules.setdefault(symbol_id, set()).add(module_name)
+                canonical_id = str(
+                    symbol.get("canonical_decl_id")
+                    or symbol.get("canonical_clang_id")
+                    or symbol_id
+                )
+                cfamily_canonical_modules.setdefault(canonical_id, set()).add(module_name)
+                if qualified:
+                    cfamily_qualified_modules.setdefault(qualified, []).append({
+                        "module": module_name,
+                        "symbol_id": symbol_id,
+                        "canonical_id": canonical_id,
+                        "signature": str(symbol.get("signature") or ""),
+                        "linkage": str(symbol.get("linkage") or ""),
+                        "translation_unit_id": str(symbol.get("translation_unit_id") or ""),
+                    })
+            definition_clang_id = str(symbol.get("definition_clang_id") or "")
+            if (
+                definition_clang_id
+                and str(symbol.get("file") or "")
+                and str(symbol.get("kind") or "") in {
+                    "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl",
+                    "CXXDestructorDecl", "ObjCMethodDecl",
+                }
+            ):
+                cfamily_file_modules.setdefault(
+                    os.path.realpath(str(symbol.get("file") or "")), set()
+                ).add(module_name)
+
+    def unique_symbol_module(relation: Mapping[str, Any]) -> str:
+        target_symbol_id = str(relation.get("target_symbol_id") or "")
+        ambiguous_symbol_id = False
+        if target_symbol_id:
+            owners = cfamily_symbol_modules.get(target_symbol_id, set())
+            if len(owners) == 1:
+                return next(iter(owners))
+            if len(owners) > 1:
+                ambiguous_symbol_id = True
+        canonical_id = str(
+            relation.get("target_canonical_decl_id")
+            or relation.get("canonical_decl_id")
+            or ""
+        )
+        if canonical_id:
+            owners = cfamily_canonical_modules.get(canonical_id, set())
+            if len(owners) == 1:
+                return next(iter(owners))
+            if len(owners) > 1:
+                return ""
+            if ambiguous_symbol_id:
+                return ""
+        target_qualified = str(relation.get("target_qualified_name") or "")
+        if not target_qualified:
+            return ""
+        if ambiguous_symbol_id and not canonical_id:
+            return ""
+        candidates = list(cfamily_qualified_modules.get(target_qualified, []))
+        canonical_identity = str(
+            relation.get("target_canonical_decl_id")
+            or relation.get("canonical_decl_id")
+            or ""
+        )
+        if canonical_identity not in cfamily_canonical_modules:
+            canonical_identity = ""
+        identity_fields = {
+            "signature": str(relation.get("target_signature") or relation.get("signature") or ""),
+            "linkage": str(relation.get("target_linkage") or relation.get("linkage") or ""),
+            "translation_unit_id": str(relation.get("target_translation_unit_id") or ""),
+            "canonical_id": canonical_identity,
+        }
+        for field, value in identity_fields.items():
+            if value:
+                candidates = [candidate for candidate in candidates if candidate.get(field) == value]
+        return str(candidates[0].get("module") or "") if len(candidates) == 1 else ""
+
+    def unique_include_module(relation: Mapping[str, Any]) -> str:
+        target_file = str(relation.get("target_file") or "")
+        if not target_file:
+            return ""
+        owners = cfamily_file_modules.get(os.path.realpath(target_file), set())
+        if len(owners) == 1:
+            return next(iter(owners))
+        if len(owners) > 1:
+            return ""
+        target_stem = Path(target_file).stem
+        matches = [
+            candidate_name
+            for candidate_name, candidate in modules.items()
+            if str(candidate.language or "") in {"c", "cpp", "objective-c", "objective-cpp"}
+            and Path(str(candidate.path or "")).stem == target_stem
+        ]
+        return matches[0] if len(matches) == 1 else ""
+
+    for module_name, module in sorted(modules.items()):
+        if str(module.language or "") not in {"c", "cpp", "objective-c", "objective-cpp"} or str(module.source_kind or "") != "clang_ast":
+            continue
+        for relation in module.adapter_relations or []:
+            relation_type = str(relation.get("relation_type") or "")
+            if relation_type not in {"calls", "includes", "inherits", "references"}:
+                continue
+            target_module = ""
+            if relation_type == "includes":
+                target_module = unique_include_module(relation)
+            else:
+                target_module = unique_symbol_module(relation)
+            if not target_module or target_module == module_name:
+                continue
+            line = int(relation.get("line") or 0)
+            column = int(relation.get("column") or 0)
+            target = str(
+                relation.get("target_qualified_name")
+                or relation.get("target_name")
+                or relation.get("target_file")
+                or target_module
+            )
+            evidence = str(relation.get("evidence") or "").strip()
+            if not evidence:
+                evidence = f"clang {relation_type} {module_name} -> {target}"
+            if line:
+                evidence = f"{evidence} at {relation.get('source_file') or module.path}:{line}:{column}"
+            add_edge(target_module, module_name, f"{relation_type}_module", evidence)
 
     for caller, targets in sorted((call_graph.edges or {}).items()):
         caller_module = _module_from_qname(caller)
@@ -4855,11 +5020,33 @@ def build_rebase_candidate_graph(
         key = (source, target, relation_type)
         if key in index:
             item = index[key]
-            item["evidence_count"] = int(item.get("evidence_count") or 1) + 1
             if evidence:
                 sample = item.setdefault("evidence_sample", [])
-                if isinstance(sample, list) and evidence not in sample and len(sample) < 5:
+                if isinstance(sample, list) and evidence not in sample:
                     sample.append(evidence)
+                if isinstance(sample, list):
+                    item["evidence"] = " | ".join(str(value) for value in sample if value)
+                    item["evidence_count"] = len(sample)
+            if "evidence_count" not in item:
+                item["evidence_count"] = 1
+            if metadata:
+                existing_metadata = item.setdefault("metadata", {})
+                if isinstance(existing_metadata, dict):
+                    for metadata_key, metadata_value in metadata.items():
+                        if metadata_key == "relation_type":
+                            prior = existing_metadata.get(metadata_key)
+                            values = []
+                            if isinstance(prior, list):
+                                values.extend(str(value) for value in prior if value)
+                            elif prior:
+                                values.append(str(prior))
+                            if isinstance(metadata_value, list):
+                                values.extend(str(value) for value in metadata_value if value)
+                            elif metadata_value:
+                                values.append(str(metadata_value))
+                            existing_metadata[metadata_key] = sorted(set(values))
+                        else:
+                            existing_metadata.setdefault(metadata_key, metadata_value)
             return True
         item = {"source": source, "target": target, "type": relation_type}
         if evidence:
@@ -5009,10 +5196,12 @@ def build_rebase_candidate_graph(
         target_module = str(edge.get("target_module") or "")
         source_id = id_map.get(source_module, "")
         target_id = id_map.get(target_module, "")
-        evidence = str(edge.get("evidence") or "")
+        relation_type = str(edge.get("relation_type") or "")
+        raw_evidence = str(edge.get("evidence") or "")
+        evidence = f"{relation_type}: {raw_evidence}" if relation_type else raw_evidence
         metadata = {
             "edge_kind": "module_dependency",
-            "relation_type": edge.get("relation_type") or "",
+            "relation_type": relation_type,
         }
         add_indexed_link(
             evidence_links,

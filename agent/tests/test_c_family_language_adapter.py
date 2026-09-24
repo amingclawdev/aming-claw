@@ -129,6 +129,30 @@ def test_objective_cpp_sdk_and_failed_sdk_are_structured(c_family_runtime):
     assert mac["action"]["language"] == "objective-cpp"
     assert mac["action"]["sdk"] == str(SDK.resolve())
     assert any(row["relation_type"] == "includes" and row["target_name"] == "AppKit.h" and row["resolution"] == "resolved" for row in mac["relations"])
+    assert not any(
+        str(row.get("file") or "").startswith(str(SDK))
+        for row in mac["symbols"]
+    )
+    assert not any(
+        str(row.get("source_file") or "").startswith(str(SDK))
+        for row in mac["relations"]
+    )
+    sdk_identities = {
+        "NSJSONSerialization",
+        "isValidJSONObject:",
+        "NSDateComponents",
+        "isValidDateInCalendar:",
+    }
+    assert not any(
+        (row.get("name") in sdk_identities or row.get("qualified_name") in sdk_identities)
+        and Path(row.get("file") or "").name == "overlay_mac.mm"
+        for row in mac["symbols"]
+    )
+    assert any(
+        row["qualified_name"] == "overlay::TextView"
+        and Path(row["file"]).name == "overlay.h"
+        for row in mac["symbols"]
+    )
 
     failed = _adapter(c_family_runtime, "sdk_failure.mm").analyze_action()
     assert failed["status"] == "failed"
@@ -209,12 +233,59 @@ def test_exact_internal_linkage_member_locations_and_angled_dependencies(c_famil
         if relation["relation_type"] == "calls" and relation["target_symbol_id"] == method["symbol_id"]
     )
     assert method["lineno"] == 1
+    assert method["qualified_name"] == "Counter::value"
+    assert method["canonical_decl_id"]
+    assert method["definition_clang_id"]
     assert member_call["line"] == 2
     assert member_call["resolution"] == "resolved"
-
     selected_before = next(action for action in actions if Path(action.file).name == "selected.cc")
     assert any(path == str(generated.resolve()) for path, _digest in selected_before.dependency_hashes)
     generated.write_text("#define CHOICE 2\n", encoding="utf-8")
     selected_after = action_for_file(load_compilation_actions(project), project / "selected.cc")
     assert selected_after is not None
     assert selected_after.compilation_action_id != selected_before.compilation_action_id
+
+
+def test_out_of_class_reference_store_owner_converges_across_header_and_definition(c_family_runtime):
+    project = c_family_runtime["project"] / "reference-store"
+    project.mkdir()
+    header = project / "reference_store.h"
+    source = project / "reference_store.cc"
+    header.write_text(
+        "namespace seethis::core {\n"
+        "class ReferenceStore { public: static int Lookup(int); };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    source.write_text(
+        '#include "reference_store.h"\n'
+        "int seethis::core::ReferenceStore::Lookup(int value) { return value; }\n",
+        encoding="utf-8",
+    )
+    (project / "compile_commands.json").write_text(
+        json.dumps([{
+            "directory": str(project),
+            "file": str(source),
+            "arguments": [str(CLANGXX), "-std=c++17", "-I", str(project), "-c", str(source)],
+        }]),
+        encoding="utf-8",
+    )
+    action = action_for_file(load_compilation_actions(project), source)
+    assert action is not None
+    result = CFamilyAdapter(
+        action,
+        helper_path=str(c_family_runtime["helper"]),
+        clang_path=str(CLANG),
+    ).analyze_action()
+    assert result["status"] == "ok", result["diagnostics"]
+    lookup = [
+        row for row in result["symbols"]
+        if row["qualified_name"] == "seethis::core::ReferenceStore::Lookup"
+    ]
+    assert {Path(row["file"]).name for row in lookup} == {"reference_store.h", "reference_store.cc"}
+    assert len({row["symbol_id"] for row in lookup}) == 1
+    definition = next(row for row in lookup if row["is_definition"])
+    declaration = next(row for row in lookup if not row["is_definition"])
+    assert definition["canonical_decl_id"] == declaration["canonical_decl_id"]
+    assert declaration["definition_clang_id"] == definition["clang_id"]
+    assert definition["previous_decl_id"] == declaration["clang_id"]

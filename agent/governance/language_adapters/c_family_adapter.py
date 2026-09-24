@@ -65,7 +65,20 @@ def _location(
         candidates.append(raw)
         if spelling is not None:
             candidates.append(spelling)
-    file_path = str(next((row.get("file") for row in candidates if row.get("file")), default_file))
+    explicit_file = next((str(row.get("file")) for row in candidates if row.get("file")), "")
+    included_file = next(
+        (
+            str(row.get("includedFrom", {}).get("file"))
+            for row in candidates
+            if isinstance(row.get("includedFrom"), Mapping)
+            and row.get("includedFrom", {}).get("file")
+        ),
+        "",
+    )
+    # ``includedFrom`` identifies the includer, never the declaration's
+    # owner. Keep it as provenance while leaving omitted declarations
+    # unresolved unless a real parent location is available.
+    file_path = explicit_file or default_file
     line = int(next((row.get("line") for row in candidates if row.get("line") is not None), 0) or 0)
     column = int(next((row.get("col") for row in candidates if row.get("col") is not None), 0) or 0)
     offset_value = next((row.get("offset") for row in candidates if row.get("offset") is not None), None)
@@ -88,6 +101,9 @@ def _location(
             pass
     return {
         "file": file_path,
+        "file_source": "explicit" if explicit_file else "inherited" if default_file else "included_from" if included_file else "omitted",
+        "file_omitted": not bool(explicit_file),
+        "included_from_file": included_file,
         "line": line,
         "column": column,
         "offset": offset,
@@ -286,18 +302,120 @@ class CFamilyAdapter:
         decl_by_clang_id: dict[str, dict[str, Any]] = {}
         symbols: list[dict[str, Any]] = []
         source_cache: dict[str, bytes] = {}
+        dependency_files = [
+            str(Path(str(row.get("path") or "")).resolve())
+            for row in (self.action.get("dependency_hashes") or [])
+            if isinstance(row, Mapping) and row.get("path")
+        ]
+
+        def location_rows(node: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+            rows: list[Mapping[str, Any]] = []
+            raw_rows = [
+                node.get("loc") if isinstance(node.get("loc"), Mapping) else {},
+                ((node.get("range") or {}).get("begin") if isinstance(node.get("range"), Mapping) else {})
+                if isinstance((node.get("range") or {}).get("begin") if isinstance(node.get("range"), Mapping) else {}, Mapping)
+                else {},
+            ]
+            for raw in raw_rows:
+                for key in ("expansionLoc", "", "spellingLoc"):
+                    candidate = raw.get(key) if key else raw
+                    if isinstance(candidate, Mapping):
+                        rows.append(candidate)
+            return rows
+
+        def omitted_declaration_file(node: Mapping[str, Any], name: str) -> str:
+            """Recover an omitted header location from exact Clang offsets.
+
+            Clang's JSON uses ``includedFrom`` for many header declarations
+            and omits the declaration file.  That field names the includer,
+            so use the offset and token in the recorded dependency files to
+            find the owner.  Ambiguous or unmatched evidence remains unknown.
+            """
+            if not name:
+                return ""
+            locations = location_rows(node)
+            token = name.encode("utf-8")
+            matches: list[str] = []
+            for candidate in dependency_files:
+                if candidate == str(Path(default_file).resolve()) or not Path(candidate).is_file():
+                    continue
+                try:
+                    data = source_cache.get(candidate)
+                    if data is None:
+                        data = Path(candidate).read_bytes()
+                        source_cache[candidate] = data
+                except OSError:
+                    continue
+                for location in locations:
+                    offset_value = location.get("offset")
+                    if offset_value is None:
+                        continue
+                    try:
+                        offset = int(offset_value)
+                    except (TypeError, ValueError):
+                        continue
+                    if data[offset:offset + len(token)] != token:
+                        continue
+                    line_value = location.get("line")
+                    if line_value is not None:
+                        actual_line = data.count(b"\n", 0, offset) + 1
+                        if int(line_value) != actual_line:
+                            continue
+                    matches.append(candidate)
+                    break
+            unique_matches = sorted(set(matches))
+            return unique_matches[0] if len(unique_matches) == 1 else ""
 
         def walk_declarations(
             node: Any,
             scope: tuple[str, ...] = (),
-            inherited_file: str = default_file,
+            inherited_file: str = "",
             inherited_internal_linkage: bool = False,
         ) -> None:
             if not isinstance(node, Mapping):
                 return
             kind = str(node.get("kind") or "")
             name = str(node.get("name") or "")
-            location = _location(node, inherited_file, source_cache)
+            direct_locations = location_rows(node)
+            has_includer_provenance = any(
+                isinstance(row.get("includedFrom"), Mapping)
+                and row.get("includedFrom", {}).get("file")
+                for row in direct_locations
+            )
+            has_explicit_file = any(row.get("file") for row in direct_locations)
+            main_tu_evidence = False
+            if not has_explicit_file and not has_includer_provenance and not inherited_file:
+                for row in direct_locations:
+                    offset_value = row.get("offset")
+                    if offset_value is None or not name:
+                        continue
+                    try:
+                        data = source_cache.get(default_file)
+                        if data is None:
+                            data = Path(default_file).read_bytes()
+                            source_cache[default_file] = data
+                        offset = int(offset_value)
+                    except (OSError, TypeError, ValueError):
+                        continue
+                    window = data[max(0, offset - 1): min(len(data), offset + len(name) + 1)]
+                    if name.encode("utf-8") in window:
+                        main_tu_evidence = True
+                        break
+            # Main-TU declarations often omit ``file`` but have an offset.
+            # Treat those as belonging to the compilation source.  An
+            # ``includedFrom`` chain is different: it is intentionally left
+            # without an owner unless exact dependency-file evidence identifies
+            # the declaration's token and line.
+            omitted_file = ""
+            if not has_explicit_file and not inherited_file and not main_tu_evidence and has_includer_provenance:
+                omitted_file = omitted_declaration_file(node, name)
+            location = _location(
+                node,
+                inherited_file or (default_file if main_tu_evidence else omitted_file),
+                source_cache,
+            )
+            if omitted_file and not has_explicit_file:
+                location["file_source"] = "dependency_offset"
             if (
                 kind in (_FUNCTION_KINDS | _TYPE_KINDS)
                 and name
@@ -305,7 +423,13 @@ class CFamilyAdapter:
                 and str(Path(str(location["file"])).resolve()) in owned_files
             ):
                 signature = str((node.get("type") or {}).get("qualType") or "") if isinstance(node.get("type"), Mapping) else ""
-                qualified = str(node.get("qualifiedName") or "::".join((*scope, name)))
+                previous_decl = str(node.get("previousDecl") or "")
+                previous = decl_by_clang_id.get(previous_decl)
+                qualified = str(
+                    (previous or {}).get("qualified_name")
+                    or node.get("qualifiedName")
+                    or "::".join((*scope, name))
+                )
                 internal_linkage = inherited_internal_linkage or (
                     kind == "FunctionDecl" and str(node.get("storageClass") or "") == "static"
                 )
@@ -326,6 +450,12 @@ class CFamilyAdapter:
                     **action_identity,
                     "symbol_id": symbol_id,
                     "clang_id": str(node.get("id") or ""),
+                    "canonical_clang_id": str((previous or {}).get("canonical_clang_id") or (previous or {}).get("clang_id") or node.get("id") or ""),
+                    "previous_decl": previous_decl,
+                    "previous_decl_id": previous_decl,
+                    "canonical_decl_id": str((previous or {}).get("canonical_clang_id") or (previous or {}).get("clang_id") or node.get("id") or ""),
+                    "declaration_context": "::".join(scope),
+                    "decl_context": "::".join(scope),
                     "name": name,
                     "qualified_name": qualified,
                     "kind": kind,
@@ -335,6 +465,8 @@ class CFamilyAdapter:
                     "lineno": location["line"],
                     "end_lineno": location["line"],
                     "column": location["column"],
+                    "location_source": location.get("file_source", ""),
+                    "location_file_omitted": bool(location.get("file_omitted")),
                     "is_definition": bool(
                         node.get("completeDefinition")
                         or node.get("isThisDeclarationADefinition")
@@ -355,11 +487,22 @@ class CFamilyAdapter:
                 walk_declarations(
                     child,
                     nested_scope,
-                    str(location["file"] or inherited_file),
+                    str(location["file"] or "") if has_explicit_file else "",
                     nested_internal_linkage,
                 )
 
-        walk_declarations(payload)
+        walk_declarations(payload, inherited_file="")
+
+        # A Clang declaration chain has one semantic owner even when the
+        # declaration is repeated in a header and the definition appears
+        # out-of-class in a source file.  Keep every occurrence, but expose the
+        # canonical lineage and the concrete definition endpoint on each fact.
+        definitions_by_symbol: dict[str, str] = {}
+        for symbol in symbols:
+            if symbol.get("is_definition") and symbol.get("clang_id"):
+                definitions_by_symbol.setdefault(str(symbol["symbol_id"]), str(symbol["clang_id"]))
+        for symbol in symbols:
+            symbol["definition_clang_id"] = definitions_by_symbol.get(str(symbol.get("symbol_id") or ""), "")
         occurrences: list[dict[str, Any]] = []
         for symbol in symbols:
             occurrence = {
@@ -396,12 +539,41 @@ class CFamilyAdapter:
                         return found
             return None
 
-        def callee_endpoint(node: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
+        symbols_by_qualified: dict[str, list[dict[str, Any]]] = {}
+        symbols_by_type_qualified: dict[str, list[dict[str, Any]]] = {}
+        for symbol in symbols:
+            qualified = str(symbol.get("qualified_name") or "")
+            if not qualified:
+                continue
+            symbols_by_qualified.setdefault(qualified, []).append(symbol)
+            if str(symbol.get("kind") or "") in _TYPE_KINDS:
+                symbols_by_type_qualified.setdefault(qualified, []).append(symbol)
+
+        def target_identity(symbol_id: str) -> dict[str, str]:
+            candidates = [symbol for symbol in symbols if str(symbol.get("symbol_id") or "") == symbol_id]
+            if not candidates:
+                return {}
+            first = candidates[0]
+            return {
+                "target_signature": str(first.get("signature") or ""),
+                "target_linkage": str(first.get("linkage") or ""),
+                "target_translation_unit_id": (
+                    str(first.get("translation_unit_id") or "")
+                    if str(first.get("linkage") or "") == "internal" else ""
+                ),
+                "target_canonical_decl_id": str(
+                    first.get("canonical_decl_id")
+                    or first.get("canonical_clang_id")
+                    or ""
+                ),
+            }
+
+        def callee_endpoint(node: Mapping[str, Any]) -> tuple[str, str, str, str, str] | None:
             member_id = str(node.get("referencedMemberDecl") or "")
             if member_id:
                 known = decl_by_clang_id.get(member_id)
                 if known:
-                    return str(known["symbol_id"]), str(known["name"]), str(known["qualified_name"]), "resolved"
+                    return str(known["symbol_id"]), str(known["name"]), str(known["qualified_name"]), "resolved", str(known.get("file") or "")
                 return None
             ref = node.get("referencedDecl")
             if isinstance(ref, Mapping) and str(ref.get("kind") or "") in _REFERENCE_KINDS:
@@ -413,15 +585,25 @@ class CFamilyAdapter:
                         return found
             return None
 
-        def endpoint(ref: Mapping[str, Any]) -> tuple[str, str, str, str]:
+        def endpoint(ref: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
             clang_id = str(ref.get("id") or "")
             known = decl_by_clang_id.get(clang_id)
             if known:
-                return str(known["symbol_id"]), str(known["name"]), str(known["qualified_name"]), "resolved"
+                return str(known["symbol_id"]), str(known["name"]), str(known["qualified_name"]), "resolved", str(known.get("file") or "")
             qualified = str(ref.get("qualifiedName") or ref.get("name") or "")
             name = str(ref.get("name") or qualified.rsplit("::", 1)[-1])
             signature = str((ref.get("type") or {}).get("qualType") or "") if isinstance(ref.get("type"), Mapping) else ""
-            return _hash({"language": self.language(), "qualified_name": qualified, "signature": signature}), name, qualified, "external" if name else "unresolved"
+            candidates = symbols_by_qualified.get(qualified, [])
+            if signature:
+                candidates = [
+                    candidate for candidate in candidates
+                    if str(candidate.get("signature") or "") == signature
+                ]
+            if len(candidates) == 1:
+                known = candidates[0]
+                return str(known["symbol_id"]), str(known["name"]), str(known["qualified_name"]), "resolved", str(known.get("file") or "")
+            ref_location = _location(ref, "", source_cache)
+            return _hash({"language": self.language(), "qualified_name": qualified, "signature": signature}), name, qualified, "external" if name else "unresolved", str(ref_location.get("file") or "")
 
         def walk_relations(node: Any, current: dict[str, Any] | None = None) -> None:
             if not isinstance(node, Mapping):
@@ -438,8 +620,14 @@ class CFamilyAdapter:
                     target_name = str(base_type.get("desugaredQualType") or base_type.get("qualType") or "")
                     if target_name:
                         location = _location(node, str(next_current.get("file") or default_file), source_cache)
-                        target_id = _hash({"language": self.language(), "qualified_name": target_name, "signature": "type"})
-                        relations.append(self._relation(next_current, target_id, target_name.rsplit("::", 1)[-1], "inherits", "external", location, condition_ref, macro_refs, target_qualified_name=target_name))
+                        base_candidates = symbols_by_type_qualified.get(target_name, [])
+                        known_base = base_candidates[0] if len(base_candidates) == 1 else None
+                        target_id = str(known_base["symbol_id"]) if known_base else _hash({"language": self.language(), "qualified_name": target_name, "signature": "type"})
+                        target_file = str(known_base.get("file") or "") if known_base else ""
+                        # Keep inheritance resolution conservative for the
+                        # adapter contract; the exact qualified endpoint and
+                        # symbol id still permit Phase-Z project ownership.
+                        relations.append(self._relation(next_current, target_id, target_name.rsplit("::", 1)[-1], "inherits", "external", location, condition_ref, macro_refs, target_qualified_name=target_name, target_file=target_file))
             if next_current and kind == "OverrideAttr":
                 location = _location(node, str(next_current.get("file") or default_file), source_cache)
                 target_name = str(next_current.get("name") or "")
@@ -448,15 +636,15 @@ class CFamilyAdapter:
             if next_current and kind in {"CallExpr", "CXXMemberCallExpr", "CXXConstructExpr"}:
                 target = callee_endpoint(node)
                 if target is not None:
-                    target_id, target_name, target_qualified_name, resolution = target
+                    target_id, target_name, target_qualified_name, resolution, target_file = target
                     location = _location(node, str(next_current.get("file") or default_file), source_cache)
-                    relations.append(self._relation(next_current, target_id, target_name, "calls", resolution, location, condition_ref, macro_refs, target_qualified_name=target_qualified_name))
+                    relations.append(self._relation(next_current, target_id, target_name, "calls", resolution, location, condition_ref, macro_refs, target_qualified_name=target_qualified_name, target_file=target_file, **target_identity(target_id)))
             elif next_current and kind == "DeclRefExpr":
                 ref = referenced_decl(node)
                 if ref is not None:
-                    target_id, target_name, target_qualified_name, resolution = endpoint(ref)
+                    target_id, target_name, target_qualified_name, resolution, target_file = endpoint(ref)
                     location = _location(node, str(next_current.get("file") or default_file), source_cache)
-                    relations.append(self._relation(next_current, target_id, target_name, "references", resolution, location, condition_ref, macro_refs, target_qualified_name=target_qualified_name))
+                    relations.append(self._relation(next_current, target_id, target_name, "references", resolution, location, condition_ref, macro_refs, target_qualified_name=target_qualified_name, target_file=target_file, **target_identity(target_id)))
             for child in node.get("inner") or []:
                 walk_relations(child, next_current)
 
@@ -505,7 +693,7 @@ class CFamilyAdapter:
             "diagnostics": diagnostics,
         }
 
-    def _relation(self, source: Mapping[str, Any], target_id: str, target_name: str, relation_type: str, resolution: str, location: Mapping[str, Any], condition_ref: str, macro_refs: list[str], *, target_qualified_name: str = "") -> dict[str, Any]:
+    def _relation(self, source: Mapping[str, Any], target_id: str, target_name: str, relation_type: str, resolution: str, location: Mapping[str, Any], condition_ref: str, macro_refs: list[str], *, target_qualified_name: str = "", target_file: str = "", target_signature: str = "", target_linkage: str = "", target_translation_unit_id: str = "", target_canonical_decl_id: str = "") -> dict[str, Any]:
         identity = {
             "compilation_action_id": self.action.get("compilation_action_id", ""),
             "translation_unit_id": self.action.get("translation_unit_id", ""),
@@ -525,14 +713,20 @@ class CFamilyAdapter:
             "relation_id": _hash(payload),
             "direction": "out",
             "source_name": source.get("qualified_name", ""),
+            "source_qualified_name": source.get("qualified_name", ""),
             "source_file": source.get("file", ""),
             "target_name": target_name,
             "target_qualified_name": target_qualified_name,
-            "target_file": "",
+            "target_file": target_file,
+            "target_signature": target_signature,
+            "target_linkage": target_linkage,
+            "target_translation_unit_id": target_translation_unit_id,
+            "target_canonical_decl_id": target_canonical_decl_id,
             "resolution": resolution,
             "condition_ref": condition_ref,
             "macro_refs": list(macro_refs),
             "provenance": ["clang_ast_json", *list(self.action.get("provenance") or [])],
+            "evidence": f"clang {relation_type} source={source.get('qualified_name', '')} target={target_qualified_name or target_name}",
         }
 
 
