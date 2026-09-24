@@ -109007,7 +109007,7 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
     assert len(completed_record["execution_state"]["completed_lines"]) == 8
     assert completed_record["runtime_guide"]["next_legal_action"] is None
     if execution_revision == "rev3" and not route_renewal:
-        _assert_normal_reconcile_release_carrier(conn, completed_record, tmp_path)
+        _assert_normal_reconcile_release_carrier(conn, completed_record, tmp_path, monkeypatch)
     completed_guide = server.handle_project_onboard_route_guide(
         _ctx_with_role(
             {"project_id": PID},
@@ -231639,16 +231639,18 @@ def test_dev_registry_config_recovery_direct_issuance_authority_gap(
     }, sort_keys=True))
 
 
-def _assert_normal_reconcile_release_carrier(source, record, tmp_path):
+def _assert_normal_reconcile_release_carrier(source, record, tmp_path, monkeypatch):
     """Check actual normal-facade output against its durable current-full Facts."""
     line = next(item for item in record["completed_lines"] if item["line_id"] == "observer_reconcile")
     assert "status" not in line
     assert "event" not in line["payload"]["timeline_payload"]
     candidate = line["commit_sha"]
     source.commit()
+    dev_root = Path(record["metadata"]["operator_supervised_direct_main_runtime_binding"]["target_project_root"])
     for defect in ("none", "canonical_commit", "canonical_binding", "authority_missing", "authority_hash",
                    "authority_event", "no_pass", "missing_provenance", "provenance_hash",
-                   "snapshot_commit", "event_status"):
+                   "snapshot_commit", "event_status", "missing_qa_line", "missing_qa_event",
+                   "missing_graph_trace"):
         path = tmp_path / f"normal-reconcile-{defect}.sqlite3"
         with sqlite3.connect(path) as connection:
             source.backup(connection)
@@ -231677,6 +231679,14 @@ def _assert_normal_reconcile_release_carrier(source, record, tmp_path):
                 connection.execute("UPDATE graph_snapshots SET commit_sha=? WHERE snapshot_id=?", ("f" * 40, authority["active_snapshot_id"]))
             elif defect == "event_status":
                 connection.execute("UPDATE task_timeline_events SET status='failed' WHERE id=?", (authority["reconcile_event_id"],))
+            elif defect == "missing_qa_line":
+                mutated["completed_lines"] = [line for line in mutated["completed_lines"]
+                    if line["line_id"] != "qa_independent_verification"]
+            elif defect == "missing_qa_event":
+                connection.execute("DELETE FROM task_timeline_events WHERE event_type='qa.independent_verification'")
+            elif defect == "missing_graph_trace":
+                connection.execute("DELETE FROM graph_query_traces WHERE project_id=?",
+                    (record["project_id"],))
             connection.execute("UPDATE contract_runtime_executions SET record_json=? WHERE contract_execution_id=?",
                                (json.dumps(mutated), record["contract_execution_id"]))
             connection.commit()
@@ -231692,9 +231702,24 @@ def _assert_normal_reconcile_release_carrier(source, record, tmp_path):
             completed = next(item for item in persisted["completed_lines"] if item["line_id"] == "observer_reconcile")
             if defect == "none":
                 server._ac_main_binding_validate_reconcile(connection, record=persisted, completed=completed, candidate=candidate)
+                # Stable release resolves the registry to stable, while its
+                # admitted source binding and read-only database belong to DEV.
+                with monkeypatch.context() as registry:
+                    registry.setattr(server.project_service, "resolve_project_root",
+                        lambda *args, **kwargs: tmp_path / "stable-registry")
+                    with pytest.raises(server.ValidationError, match="canonical reconcile"):
+                        server._ac_main_binding_validate_reconcile(connection, record=persisted,
+                            completed=completed, candidate=candidate)
+                    server._ac_main_binding_validate_reconcile(connection, record=persisted,
+                        completed=completed, candidate=candidate, verified_dev_root=dev_root)
+                    with pytest.raises(server.ValidationError, match="canonical reconcile"):
+                        server._ac_main_binding_validate_reconcile(connection, record=persisted,
+                            completed=completed, candidate=candidate,
+                            verified_dev_root=tmp_path / "stable-registry")
             else:
                 with pytest.raises(server.ValidationError, match="canonical reconcile"):
-                    server._ac_main_binding_validate_reconcile(connection, record=persisted, completed=completed, candidate=candidate)
+                    server._ac_main_binding_validate_reconcile(connection, record=persisted,
+                        completed=completed, candidate=candidate, verified_dev_root=dev_root)
         assert snapshot() == before
 
 
@@ -232834,6 +232859,30 @@ def test_current_release_does_not_depend_on_live_development_phase(monkeypatch, 
     with sqlite3.connect(fixture["dev_db"]) as conn:
         conn.execute("INSERT INTO contract_runtime_executions VALUES ('aming-claw','AUDIT-ONLY-OLD-ROW','operator_supervised_direct_main','unrelated-old-cex','{}')")
     assert server._ac_main_binding_precheck(fixture["manifest"]) == original
+
+
+def test_current_release_forwards_its_physical_dev_root_under_stable_registry(
+    monkeypatch, tmp_path,
+):
+    fixture = _main_binding_release_fixture(monkeypatch, tmp_path)
+    _stable_release_test_world(monkeypatch, fixture)
+    monkeypatch.setattr(server.project_service, "resolve_project_root",
+        lambda *args, **kwargs: fixture["stable"])
+    before = _main_binding_release_durable_state(fixture)
+    original = server._ac_main_binding_validate_reconcile
+    seen = []
+
+    def validate(conn, *, record, completed, candidate, verified_dev_root=None):
+        seen.append(verified_dev_root)
+        return original(conn, record=record, completed=completed,
+            candidate=candidate, verified_dev_root=verified_dev_root)
+
+    monkeypatch.setattr(server, "_ac_main_binding_validate_reconcile", validate)
+    instance = server._ac_main_binding_release_instance(
+        candidate=fixture["candidate"], require_close_ready=True)
+    assert instance["candidate_commit"] == fixture["candidate"]
+    assert seen == [fixture["dev"]]
+    assert _main_binding_release_durable_state(fixture) == before
 
 
 @pytest.mark.parametrize("drift,reason", [

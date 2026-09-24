@@ -164312,6 +164312,7 @@ def _operator_supervised_direct_main_landed_qa_authority(
     task_id: str,
     proof: Mapping[str, Any],
     target_commit: str,
+    _release_dev_root: Path | None = None,
 ) -> dict[str, Any]:
     """Reverify a QA-proven immutable candidate inside current canonical HEAD."""
 
@@ -164366,14 +164367,17 @@ def _operator_supervised_direct_main_landed_qa_authority(
     ).fetchall()
     if len(rows) != 1:
         return {}
-    try:
-        project_root = Path(
-            project_service.resolve_project_root(
-                project_id, None, fallback_self=True,
-            )
-        ).resolve()
-    except Exception:
-        return {}
+    if _release_dev_root is not None:
+        project_root = _release_dev_root
+    else:
+        try:
+            project_root = Path(
+                project_service.resolve_project_root(
+                    project_id, None, fallback_self=True,
+                )
+            ).resolve()
+        except Exception:
+            return {}
     fresh, mismatches = _qa_exact_candidate_post_merge_provenance(
         conn,
         project_id=project_id,
@@ -165415,6 +165419,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
     backlog_id: str,
     contract_execution_id: str,
     record: Mapping[str, Any],
+    _release_dev_root: Path | None = None,
 ) -> dict[str, Any]:
     """Project one exact Direct current-full provenance from existing Facts."""
 
@@ -165445,16 +165450,26 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
     if len(implementation_commits) != 1:
         return {}
     implementation_commit = implementation_commits[0]
-    try:
-        project_root = Path(
-            project_service.resolve_project_root(
-                project_id,
-                None,
-                fallback_self=True,
-            )
-        ).resolve()
-    except Exception:
-        return {}
+    if _release_dev_root is not None:
+        # Release already verified this physical worktree against the Direct
+        # binding and its own current HEAD. Reject a mismatched internal root.
+        if not (
+            str(_release_dev_root) == binding.get("target_project_root")
+            == binding.get("worktree_path")
+        ):
+            return {}
+        project_root = _release_dev_root
+    else:
+        try:
+            project_root = Path(
+                project_service.resolve_project_root(
+                    project_id,
+                    None,
+                    fallback_self=True,
+                )
+            ).resolve()
+        except Exception:
+            return {}
     canonical_head = _git_head_commit(project_root).strip().lower()
     if not canonical_head:
         return {}
@@ -165505,6 +165520,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 task_id=contract_execution_id,
                 proof=proof,
                 target_commit=canonical_head,
+                _release_dev_root=_release_dev_root,
             )
         )
         if not (
@@ -219113,7 +219129,8 @@ def _ac_main_binding_dev_connection(instance: Mapping[str, Any]):
 
 
 def _ac_main_binding_validate_reconcile(conn, *, record: Mapping[str, Any],
-                                        completed: Mapping[str, Any], candidate: str) -> None:
+                                        completed: Mapping[str, Any], candidate: str,
+                                        verified_dev_root: Path | None = None) -> None:
     """Consume the normal current-full carrier, retaining historical projections."""
     payload = completed.get("payload") or {}
     binding = (record.get("metadata") or {}).get("operator_supervised_direct_main_runtime_binding") or {}
@@ -219124,6 +219141,7 @@ def _ac_main_binding_validate_reconcile(conn, *, record: Mapping[str, Any],
         current = _operator_supervised_direct_main_current_full_reconcile_authority(
             conn, project_id=record["project_id"], backlog_id=record["backlog_id"],
             contract_execution_id=record["contract_execution_id"], record=record,
+            _release_dev_root=verified_dev_root,
         )
         valid = bool(current and payload["direct_current_full_reconcile_authority"] == current
                      and current.get("qa_passed") is True and current.get("close_satisfying") is True
@@ -219368,7 +219386,8 @@ def _ac_main_binding_release_instance(*, candidate: str = "", anchor: str = "",
         reconcile_line = by_id.get("observer_reconcile")
         if reconcile_line is not None:
             _ac_main_binding_validate_reconcile(conn, record=record,
-                completed=reconcile_line, candidate=actual_candidate)
+                completed=reconcile_line, candidate=actual_candidate,
+                verified_dev_root=dev_root)
     instance.update({"backlog_id": backlog, "contract_execution_id": execution, "base_commit": base,
         "direct_runtime_binding_hash": binding["binding_hash"], "dev_database_identity": identity})
     preimage = {"instance": _ac_main_binding_instance_core(instance), "stable_database_identity": stable_identity}
