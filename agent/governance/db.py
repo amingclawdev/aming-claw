@@ -7300,8 +7300,13 @@ def _validate_dev_cow_completed_basic_restart(
     root = Path(storage_root).expanduser().absolute()
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
     _validate_dev_cow_stopped_sidecar_residue(database)
-    database_before = _durable_database_sha256(database)
-    logical_before = _database_logical_sha256(database)
+    artifacts_before = _dev_cow_basic_restart_artifact_snapshot(database)
+    database_before = str(dict(artifacts_before["database"] or {})["sha256"])
+    # With no committed WAL frames, the main database is the complete SQLite
+    # image.  The physical digest and artifact identity then prove equality
+    # without materializing every row (and every BLOB) in Python memory.
+    empty_wal = not int(dict(artifacts_before["wal"] or {}).get("size") or 0)
+    logical_before = None if empty_wal else _database_logical_sha256(database)
     receipt = validate_dev_cow_successor_receipt(root)
     linked_ref = dict(dict(receipt.get("history") or {}).get("linked_v3") or {})
     linked_path = Path(str(linked_ref.get("path") or "")).expanduser().absolute()
@@ -7353,10 +7358,12 @@ def _validate_dev_cow_completed_basic_restart(
     _validate_existing_adoption_receipt(root)
     if (
         _durable_database_sha256(database) != database_before
-        or _database_logical_sha256(database) != logical_before
+        or (not empty_wal and _database_logical_sha256(database) != logical_before)
     ):
         raise ValueError("AC dev COW completed basic restart preflight changed the database")
     artifacts = _dev_cow_basic_restart_artifact_snapshot(database)
+    if empty_wal and artifacts != artifacts_before:
+        raise ValueError("AC dev COW completed basic restart preflight changed the database")
     if str(dict(artifacts.get("database") or {}).get("sha256") or "") != database_before:
         raise ValueError("AC dev COW completed basic restart database snapshot changed")
     source_snapshot = _dev_cow_basic_restart_source_snapshot(source_identity)
@@ -8027,6 +8034,15 @@ def bootstrap_dev_governance_store(
                         "AC dev COW completed basic restart changed committed data"
                     )
                 _validate_dev_cow_basic_restart_writer_lease(database)
+            elif (
+                _dev_cow_basic_restart_artifact_snapshot(database)
+                != basic_cow_restart["artifacts"]
+            ):
+                raise ValueError(
+                    "AC dev COW completed basic restart artifacts changed under lease"
+                )
+            else:
+                _validate_dev_cow_basic_restart_writer_lease(database)
             return result
         conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row
@@ -8291,8 +8307,9 @@ def bootstrap_dev_governance_store(
                 if (
                     _durable_database_sha256(database)
                     != basic_cow_restart["database_sha256"]
-                    or _database_logical_sha256(database)
-                    != basic_cow_restart["logical_sha256"]
+                    or (basic_cow_restart["logical_sha256"] is not None
+                        and _database_logical_sha256(database)
+                        != basic_cow_restart["logical_sha256"])
                 ):
                     raise ValueError(
                         "AC dev COW completed basic restart changed the database"

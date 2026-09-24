@@ -4963,6 +4963,7 @@ def test_completed_cow_basic_restart_schema_meta_projection_skips_unrelated_rows
 
     monkeypatch.setattr(db.sqlite3, "connect", traced_connect)
     monkeypatch.setattr(db, "_sqlite_logical_projection", traced_projection)
+    artifacts_before = db._dev_cow_basic_restart_artifact_snapshot(database)
     result = db._validate_dev_cow_completed_basic_restart(
         root,
         source_identity=candidate,
@@ -4970,6 +4971,9 @@ def test_completed_cow_basic_restart_schema_meta_projection_skips_unrelated_rows
     )
 
     assert result["axis"]["revision"] == 3
+    assert result["logical_sha256"] is None
+    assert result["artifacts"] == artifacts_before
+    assert db._dev_cow_basic_restart_artifact_snapshot(database) == artifacts_before
     assert [
         call for call in projection_calls
         if call["caller"] in {
@@ -4993,24 +4997,11 @@ def test_completed_cow_basic_restart_schema_meta_projection_skips_unrelated_rows
             "unrelated_reads": 0,
         },
     ]
-    assert [
-        call for call in projection_calls
-        if call["caller"] == "_database_logical_sha256"
-    ] == [
-        {
-            "caller": "_database_logical_sha256",
-            "include_tables": None,
-            "unrelated_reads": 1,
-        },
-        {
-            "caller": "_database_logical_sha256",
-            "include_tables": None,
-            "unrelated_reads": 1,
-        },
-    ]
+    assert not [call for call in projection_calls
+                if call["caller"] == "_database_logical_sha256"]
 
 
-def test_completed_cow_basic_restart_full_projection_detects_unrelated_change(
+def test_completed_cow_basic_restart_physical_snapshot_detects_same_size_change(
     tmp_path, monkeypatch,
 ):
     from agent.governance import db
@@ -5020,26 +5011,30 @@ def test_completed_cow_basic_restart_full_projection_detects_unrelated_change(
             tmp_path, monkeypatch, exact_graph_overlay=True,
         )
     )
-    logical_observations = []
-    original_logical_sha256 = db._database_logical_sha256
+    original_snapshot = db._dev_cow_basic_restart_artifact_snapshot
+    snapshots = []
 
-    def observed_logical_sha256(path):
-        if logical_observations:
-            connection = sqlite3.connect(database)
-            connection.execute(
-                "CREATE TABLE c1_unrelated_change(id INTEGER PRIMARY KEY,value TEXT)"
-            )
-            connection.execute(
-                "INSERT INTO c1_unrelated_change(value) VALUES('changed')"
-            )
-            connection.commit()
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            connection.close()
-        result = original_logical_sha256(path)
-        logical_observations.append(result)
+    def snapshot_after_same_size_mutation(path):
+        if snapshots:
+            with database.open("r+b") as handle:
+                handle.seek(-1, os.SEEK_END)
+                original = handle.read(1)
+                handle.seek(-1, os.SEEK_END)
+                handle.write(bytes([original[0] ^ 1]))
+        result = original_snapshot(path)
+        snapshots.append(result)
         return result
 
-    monkeypatch.setattr(db, "_database_logical_sha256", observed_logical_sha256)
+    monkeypatch.setattr(
+        db, "_dev_cow_basic_restart_artifact_snapshot",
+        snapshot_after_same_size_mutation,
+    )
+    monkeypatch.setattr(
+        db, "_database_logical_sha256",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("empty WAL must not scan the logical database")
+        ),
+    )
     with pytest.raises(
         ValueError,
         match="AC dev COW completed basic restart preflight changed the database",
@@ -5049,8 +5044,75 @@ def test_completed_cow_basic_restart_full_projection_detects_unrelated_change(
             source_identity=candidate,
             stable_binding=db.verified_stable_database_binding(),
         )
-    assert len(logical_observations) == 2
-    assert logical_observations[0] != logical_observations[1]
+    assert len(snapshots) == 2
+    assert snapshots[0]["database"]["size"] == snapshots[1]["database"]["size"]
+    assert snapshots[0]["database"]["sha256"] != snapshots[1]["database"]["sha256"]
+
+
+@pytest.mark.parametrize("attack", ("inode_replacement", "wal_appearance"))
+def test_completed_cow_basic_restart_rejects_artifact_change_during_preflight(
+    tmp_path, monkeypatch, attack,
+):
+    from agent.governance import db
+
+    root, database, candidate, _stable, _launch_path = (
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
+    )
+    original_snapshot = db._dev_cow_basic_restart_artifact_snapshot
+    observations = []
+
+    def snapshot_after_change(path):
+        if observations:
+            if attack == "inode_replacement":
+                replacement = database.with_name(database.name + ".replacement")
+                replacement.write_bytes(database.read_bytes())
+                replacement.replace(database)
+            else:
+                Path(str(database) + "-wal").write_bytes(b"concurrent WAL")
+        result = original_snapshot(path)
+        observations.append(result)
+        return result
+
+    monkeypatch.setattr(
+        db, "_dev_cow_basic_restart_artifact_snapshot", snapshot_after_change,
+    )
+    with pytest.raises(
+        ValueError,
+        match="AC dev COW completed basic restart preflight changed the database",
+    ):
+        db._validate_dev_cow_completed_basic_restart(
+            root, source_identity=candidate,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+    assert len(observations) == 2
+    assert observations[0] != observations[1]
+
+
+@pytest.mark.parametrize("defect", ("bad_sidecar", "quick_check"))
+def test_completed_cow_basic_restart_empty_wal_keeps_sqlite_validation(
+    tmp_path, monkeypatch, defect,
+):
+    from agent.governance import db
+
+    root, database, candidate, _stable, _launch_path = (
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
+    )
+    if defect == "bad_sidecar":
+        Path(str(database) + "-wal").write_bytes(b"")
+        Path(str(database) + "-shm").write_bytes(b"bad WAL index")
+    else:
+        monkeypatch.setattr(db, "_quick_check_returns_literal_ok", lambda _conn: False)
+    before = database.read_bytes()
+    with pytest.raises(ValueError):
+        db._validate_dev_cow_completed_basic_restart(
+            root, source_identity=candidate,
+            stable_binding=db.verified_stable_database_binding(),
+        )
+    assert database.read_bytes() == before
 
 
 @pytest.mark.parametrize("entrypoint", ("completed_axis", "basic_restart"))
@@ -5515,10 +5577,13 @@ def test_completed_cow_basic_restart_preserves_database_and_refreshes_only_basic
     from agent.governance import db
 
     root, database, candidate, stable, launch_path = (
-        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
     )
     database_before = database.read_bytes()
-    logical_before = db._database_logical_sha256(database)
+    original_logical_sha256 = db._database_logical_sha256
+    logical_before = original_logical_sha256(database)
     launch_before = launch_path.read_bytes()
     archive_before = {
         str(path.relative_to(root)): path.read_bytes()
@@ -5526,6 +5591,12 @@ def test_completed_cow_basic_restart_preserves_database_and_refreshes_only_basic
         if path.is_file()
     }
     process = {"pid": os.getpid(), "start_identity": f"pid:{os.getpid()}:cli-bootstrap"}
+    monkeypatch.setattr(
+        db, "_database_logical_sha256",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("empty-WAL bootstrap scanned the logical database")
+        ),
+    )
 
     binding = db.bootstrap_dev_governance_store(
         root, source_identity=candidate, process_identity=process,
@@ -5535,7 +5606,7 @@ def test_completed_cow_basic_restart_preserves_database_and_refreshes_only_basic
     assert binding["source_upgraded"] is False
     assert binding["current_process_identity"] != process
     assert database.read_bytes() == database_before
-    assert db._database_logical_sha256(database) == logical_before
+    assert original_logical_sha256(database) == logical_before
     assert launch_path.read_bytes() == launch_before
     assert {
         str(path.relative_to(root)): path.read_bytes()
@@ -5601,7 +5672,9 @@ def test_completed_cow_basic_restart_recovers_committed_wal_and_closed_observer(
     from agent.governance import db
 
     root, database, historical, _stable, launch_path = (
-        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
     )
     candidate = historical
     if source_descendant:
@@ -5755,7 +5828,9 @@ def test_completed_cow_basic_restart_returns_before_normal_sqlite_connect(
     from agent.governance import db
 
     root, database, historical, _stable, launch_path = (
-        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
     )
     current = _defer_completed_source_and_open_clean_successor(
         tmp_path, historical,
@@ -5835,7 +5910,9 @@ def test_completed_cow_basic_restart_early_return_failure_releases_new_lease(
     from agent.governance import db
 
     root, database, candidate, _stable, launch_path = (
-        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
     )
     original_classifier = db._validate_dev_cow_completed_basic_restart
     original_connect = db.sqlite3.connect
@@ -5891,7 +5968,9 @@ def test_completed_cow_basic_restart_lease_window_cas_rejects_exact_drift(
     from agent.governance import db
 
     root, database, candidate, _stable, launch_path = (
-        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
     )
     before_artifacts = db._dev_cow_basic_restart_artifact_snapshot(database)
     basic_before = launch_path.read_bytes()
@@ -5946,6 +6025,7 @@ def test_completed_cow_basic_restart_lease_window_cas_rejects_exact_drift(
             },
         )
 
+    assert len(classified) == 2
     assert db._dev_cow_basic_restart_artifact_snapshot(database) == before_artifacts
     assert str(database.absolute()) not in db._DEV_DATABASE_WRITER_LEASES
     if attacked_path is not None:
@@ -5964,7 +6044,9 @@ def test_completed_cow_basic_restart_rejects_invalid_evidence_without_new_mutati
     from agent.governance import db
 
     root, database, candidate, _stable, launch_path = (
-        _completed_cow_basic_restart_fixture(tmp_path, monkeypatch)
+        _completed_cow_basic_restart_fixture(
+            tmp_path, monkeypatch, exact_graph_overlay=True,
+        )
     )
     if defect == "receipt_missing":
         launch_path.unlink()
