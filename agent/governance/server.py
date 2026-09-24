@@ -98592,6 +98592,144 @@ def _current_full_reconcile_runtime_successor_contract_kind(
     return ""
 
 
+def _contract_runtime_postmerge_clean_linked_target_owner(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    aggregate: Mapping[str, Any],
+    reject,
+    claimed_commit: str = "",
+) -> dict[str, Any]:
+    """Prove the sealed merge chain has one clean owner at its final HEAD."""
+
+    from .parallel_branch_runtime import _git_target_owner_alignment_evidence
+
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    required_count = int(aggregate.get("lane_merge_count") or 0)
+    dispatch_index = int(aggregate["dispatch_completed_line_index"])
+    dispatch_ref = str(aggregate["contract_runtime_dispatch_source_ref"])
+    lanes: list[dict[str, Any]] = []
+    for line in (record.get("completed_lines") or [])[dispatch_index + 1 :]:
+        if not isinstance(line, Mapping) or line.get("line_id") != "observer_merge":
+            continue
+        payload = line.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        durable = payload.get("durable_merge_authority")
+        durable = durable if isinstance(durable, Mapping) else {}
+        if str(durable.get("contract_runtime_dispatch_source_ref") or "") != dispatch_ref:
+            reject("aggregate_lane_dispatch_mismatch")
+        lanes.append(dict(durable))
+    if len(lanes) != required_count:
+        reject("aggregate_lane_count_mismatch")
+    lanes.sort(key=lambda item: int(item.get("merge_event_id") or 0))
+    target_ref = ""
+    previous_head = ""
+    for index, lane in enumerate(lanes):
+        queue_id = str(lane.get("merge_queue_id") or "").strip()
+        queue_item_id = str(lane.get("queue_item_id") or "").strip()
+        rows = conn.execute(
+            "SELECT * FROM parallel_branch_merge_queue_items "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            (project_id, queue_id, queue_item_id),
+        ).fetchall()
+        if len(rows) != 1:
+            reject("aggregate_lane_queue_item_not_unique")
+        row = rows[0]
+        lane_commit = str(lane.get("merge_commit") or "").strip().lower()
+        before = str(row["target_head_before_merge"] or "").strip().lower()
+        after = str(row["target_head_after_merge"] or "").strip().lower()
+        row_ref = str(row["target_ref"] or "").strip()
+        if not (
+            str(row["status"] or "") == "merged"
+            and str(row["backlog_id"] or "") == backlog_id
+            and str(row["task_id"] or "") == str(lane.get("task_id") or "")
+            and str(row["merge_queue_id"] or "") == queue_id
+            and str(row["queue_item_id"] or "") == queue_item_id
+            and str(row["merge_commit"] or "").strip().lower()
+            == lane_commit == after
+            and str(lane.get("target_head_before_merge") or "").strip().lower()
+            == before
+            and str(lane.get("target_head_after_merge") or "").strip().lower()
+            == after
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before)
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", after)
+            and row_ref.startswith("refs/heads/")
+            and (index == 0 or before == previous_head)
+            and (not target_ref or row_ref == target_ref)
+        ):
+            reject("aggregate_lane_queue_target_chain_mismatch")
+        target_ref = row_ref
+        previous_head = after
+    final_commit = str(aggregate.get("merged_commit_sha") or "").strip().lower()
+    if previous_head != final_commit:
+        reject("aggregate_final_commit_mismatch")
+    claimed_commit = str(claimed_commit or "").strip().lower()
+    if claimed_commit and claimed_commit != final_commit:
+        reject("aggregate_final_commit_mismatch")
+
+    try:
+        registered_root = _graph_governance_project_root(project_id, {})
+    except ValidationError:
+        reject("registered_project_root_unavailable")
+    try:
+        listing = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=registered_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        reject("target_ref_worktree_listing_unavailable")
+    if listing.returncode != 0:
+        reject("target_ref_worktree_listing_unavailable")
+    owners = []
+    for block in listing.stdout.strip().split("\n\n"):
+        fields = dict(
+            line.split(" ", 1) if " " in line else (line, "")
+            for line in block.splitlines()
+        )
+        if fields.get("branch") == target_ref:
+            owners.append(fields)
+    if len(owners) != 1 or not owners[0].get("worktree"):
+        reject("target_ref_owner_missing_or_ambiguous")
+    try:
+        owner = Path(owners[0]["worktree"]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        reject("target_ref_owner_missing_or_ambiguous")
+    if (
+        "detached" in owners[0]
+        or str(owners[0].get("HEAD") or "").strip().lower()
+        != final_commit
+    ):
+        reject("target_ref_owner_head_or_branch_mismatch")
+    alignment = _git_target_owner_alignment_evidence(
+        owner, target_ref=target_ref, merge_commit=final_commit,
+        timeout_seconds=10,
+    )
+    if not (
+        alignment.get("passed") is True
+        and str(alignment.get("head_commit") or "").strip().lower()
+        == final_commit
+        and str(alignment.get("target_commit") or "").strip().lower()
+        == final_commit
+        and alignment.get("index_clean") is True
+        and alignment.get("worktree_clean") is True
+    ):
+        reject("target_ref_owner_not_clean_and_aligned")
+    return {
+        "target_project_root": str(owner),
+        "target_ref": target_ref,
+        "merged_commit_sha": final_commit,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "aggregate_merge": aggregate,
+    }
+
+
 def _current_full_reconcile_postmerge_target_owner(
     conn,
     *,
@@ -98797,7 +98935,6 @@ def _current_full_reconcile_postmerge_target_owner(
     ):
         reject("selected_reconcile_lane_unverified")
     from .parallel_branch_runtime import (
-        _git_target_owner_alignment_evidence,
         get_branch_context_by_runtime_context_id,
     )
 
@@ -98825,129 +98962,15 @@ def _current_full_reconcile_postmerge_target_owner(
                 if claim and claim != expected:
                     reject(f"selected_reconcile_{field}_claim_mismatch")
 
-    dispatch_index = int(aggregate["dispatch_completed_line_index"])
-    dispatch_ref = str(aggregate["contract_runtime_dispatch_source_ref"])
-    lanes: list[dict[str, Any]] = []
-    for line in (record.get("completed_lines") or [])[dispatch_index + 1 :]:
-        if not isinstance(line, Mapping) or line.get("line_id") != "observer_merge":
-            continue
-        payload = line.get("payload")
-        payload = payload if isinstance(payload, Mapping) else {}
-        durable = payload.get("durable_merge_authority")
-        durable = durable if isinstance(durable, Mapping) else {}
-        if str(durable.get("contract_runtime_dispatch_source_ref") or "") != dispatch_ref:
-            reject("aggregate_lane_dispatch_mismatch")
-        lanes.append(dict(durable))
-    if len(lanes) != required_count:
-        reject("aggregate_lane_count_mismatch")
-    lanes.sort(key=lambda item: int(item.get("merge_event_id") or 0))
-    target_ref = ""
-    previous_head = ""
-    for index, lane in enumerate(lanes):
-        queue_id = str(lane.get("merge_queue_id") or "").strip()
-        queue_item_id = str(lane.get("queue_item_id") or "").strip()
-        rows = conn.execute(
-            "SELECT * FROM parallel_branch_merge_queue_items "
-            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
-            (project_id, queue_id, queue_item_id),
-        ).fetchall()
-        if len(rows) != 1:
-            reject("aggregate_lane_queue_item_not_unique")
-        row = rows[0]
-        lane_commit = str(lane.get("merge_commit") or "").strip().lower()
-        before = str(row["target_head_before_merge"] or "").strip().lower()
-        after = str(row["target_head_after_merge"] or "").strip().lower()
-        row_ref = str(row["target_ref"] or "").strip()
-        if not (
-            str(row["status"] or "") == "merged"
-            and str(row["backlog_id"] or "") == backlog_id
-            and str(row["task_id"] or "") == str(lane.get("task_id") or "")
-            and str(row["merge_queue_id"] or "") == queue_id
-            and str(row["queue_item_id"] or "") == queue_item_id
-            and str(row["merge_commit"] or "").strip().lower()
-            == lane_commit == after
-            and str(lane.get("target_head_before_merge") or "").strip().lower()
-            == before
-            and str(lane.get("target_head_after_merge") or "").strip().lower()
-            == after
-            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before)
-            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", after)
-            and row_ref.startswith("refs/heads/")
-            and (index == 0 or before == previous_head)
-            and (not target_ref or row_ref == target_ref)
-        ):
-            reject("aggregate_lane_queue_target_chain_mismatch")
-        target_ref = row_ref
-        previous_head = after
-    final_commit = str(aggregate.get("merged_commit_sha") or "").strip().lower()
-    if previous_head != final_commit:
-        reject("aggregate_final_commit_mismatch")
     claimed_commit = str(
         body.get("target_commit_sha") or body.get("commit_sha") or ""
     ).strip().lower()
-    if claimed_commit and claimed_commit != final_commit:
-        reject("aggregate_final_commit_mismatch")
-
-    try:
-        registered_root = _graph_governance_project_root(project_id, {})
-    except ValidationError:
-        reject("registered_project_root_unavailable")
-    try:
-        listing = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
-            cwd=registered_root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        reject("target_ref_worktree_listing_unavailable")
-    if listing.returncode != 0:
-        reject("target_ref_worktree_listing_unavailable")
-    owners = []
-    for block in listing.stdout.strip().split("\n\n"):
-        fields = dict(
-            line.split(" ", 1) if " " in line else (line, "")
-            for line in block.splitlines()
-        )
-        if fields.get("branch") == target_ref:
-            owners.append(fields)
-    if len(owners) != 1 or not owners[0].get("worktree"):
-        reject("target_ref_owner_missing_or_ambiguous")
-    try:
-        owner = Path(owners[0]["worktree"]).resolve(strict=True)
-    except (OSError, RuntimeError, ValueError):
-        reject("target_ref_owner_missing_or_ambiguous")
-    if (
-        "detached" in owners[0]
-        or str(owners[0].get("HEAD") or "").strip().lower()
-        != final_commit
-    ):
-        reject("target_ref_owner_head_or_branch_mismatch")
-    alignment = _git_target_owner_alignment_evidence(
-        owner, target_ref=target_ref, merge_commit=final_commit,
-        timeout_seconds=10,
+    owner = _contract_runtime_postmerge_clean_linked_target_owner(
+        conn, project_id=project_id, record=record, aggregate=aggregate,
+        reject=reject, claimed_commit=claimed_commit,
     )
-    if not (
-        alignment.get("passed") is True
-        and str(alignment.get("head_commit") or "").strip().lower()
-        == final_commit
-        and str(alignment.get("target_commit") or "").strip().lower()
-        == final_commit
-        and alignment.get("index_clean") is True
-        and alignment.get("worktree_clean") is True
-    ):
-        reject("target_ref_owner_not_clean_and_aligned")
-    return {
-        "target_project_root": str(owner),
-        "target_ref": target_ref,
-        "merged_commit_sha": final_commit,
-        "backlog_id": backlog_id,
-        "contract_execution_id": execution_id,
-        "aggregate_merge": aggregate,
-        "selected_reconcile_lane": selected_identity,
-    }
+    owner["selected_reconcile_lane"] = selected_identity
+    return owner
 
 
 def _current_full_reconcile_runtime_context_scope(
@@ -146834,22 +146857,105 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
 
     merged_commit = str(merge.get("merged_commit_sha") or "").strip().lower()
     reconcile = reconcile if isinstance(reconcile, Mapping) else {}
-    root = str(target_project_root_override or "").strip()
-    if root:
-        root = str(Path(root).resolve())
-    else:
-        root = _contract_runtime_postmerge_canonical_project_root(
-            conn,
-            project_id=project_id,
-            record=record,
-            merge=merge,
-        )
-        if not root:
-            root = project_service.resolve_project_root(
-                project_id,
-                None,
-                fallback_self=True,
+    # A current rev10 merge carries the selected reconcile lane and sealed
+    # current-generation dispatch. Recheck the writer's exact linked owner at
+    # consumption time; a dirty registered checkout is not that owner.
+    linked_postmerge = bool(
+        str(record.get("revision") or "").strip() == "rev10"
+        and record.get("runtime_guide")
+        and record.get("completed_lines")
+    )
+    root = ""
+    if linked_postmerge:
+        execution_id = str(record.get("contract_execution_id") or "").strip()
+        selected_identity = {
+            field: str(merge.get(field) or "").strip()
+            for field in (
+                "runtime_context_id", "task_id", "parent_task_id", "merge_queue_id"
             )
+        }
+        final_identity = merge.get("aggregate_final_merge_identity")
+        final_identity = final_identity if isinstance(final_identity, Mapping) else {}
+        required_count = _contract_runtime_mf_parallel_current_generation_worker_count(
+            record, conn=conn, project_id=project_id,
+        )
+        linked_scope_verified = bool(
+            not target_project_root_override
+            and str(record.get("project_id") or "").strip() == project_id
+            and execution_id
+            and str(record.get("backlog_id") or "").strip()
+            and merge.get("timeline_verified") is True
+            and merge.get("authority_verified") is True
+            and merge.get("dispatch_lineage_verified") is True
+            and merge.get("all_lane_merges_verified") is True
+            and isinstance(merge.get("dispatch_completed_line_index"), int)
+            and not isinstance(merge.get("dispatch_completed_line_index"), bool)
+            and int(merge.get("lane_merge_count") or 0) == required_count
+            and str(merge.get("contract_execution_id") or "").strip()
+            == execution_id
+            and str(merge.get("contract_runtime_dispatch_source_ref") or "")
+            .strip().startswith(f"contract_runtime:{execution_id}:")
+            and all(selected_identity.values())
+            and selected_identity["parent_task_id"] == execution_id
+            and selected_identity["runtime_context_id"]
+            in set(merge.get("lane_runtime_context_ids") or [])
+            and selected_identity["merge_queue_id"]
+            in set(merge.get("lane_merge_queue_ids") or [])
+            and merge.get("reconcile_lane_identity_source")
+            in {"RuntimeContext.current_values", "terminal_current_full_reconcile_receipt"}
+            and final_identity.get("parent_task_id") == execution_id
+            and all(str(final_identity.get(field) or "").strip()
+                    for field in selected_identity)
+            and str(merge.get("reconcile_line_instance_id") or "")
+            == f"runtime_context:{selected_identity['runtime_context_id']}"
+        )
+        if linked_scope_verified:
+            from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+
+            context = get_branch_context_by_runtime_context_id(
+                conn, project_id, selected_identity["runtime_context_id"]
+            )
+            linked_scope_verified = bool(
+                context
+                and all(
+                    str(getattr(context, field, "") or "").strip() == expected
+                    for field, expected in (
+                        ("task_id", selected_identity["task_id"]),
+                        ("parent_task_id", execution_id),
+                        ("merge_queue_id", selected_identity["merge_queue_id"]),
+                        ("backlog_id", str(record.get("backlog_id") or "").strip()),
+                    )
+                )
+            )
+        if linked_scope_verified:
+            def reject_unverified_owner(reason: str) -> NoReturn:
+                raise ValueError(reason)
+
+            try:
+                owner = _contract_runtime_postmerge_clean_linked_target_owner(
+                    conn, project_id=project_id, record=record,
+                    aggregate=merge, reject=reject_unverified_owner,
+                )
+            except ValueError:
+                owner = {}
+            root = str(owner.get("target_project_root") or "")
+    else:
+        root = str(target_project_root_override or "").strip()
+        if root:
+            root = str(Path(root).resolve())
+        else:
+            root = _contract_runtime_postmerge_canonical_project_root(
+                conn,
+                project_id=project_id,
+                record=record,
+                merge=merge,
+            )
+            if not root:
+                root = project_service.resolve_project_root(
+                    project_id,
+                    None,
+                    fallback_self=True,
+                )
     target_project_root = str(Path(root).resolve()) if root else ""
     canonical_head_commit = (
         _git_head_commit(Path(root)).strip().lower() if root else ""

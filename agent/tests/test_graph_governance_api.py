@@ -236449,6 +236449,162 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
         (PID, record["backlog_id"]),
     ).fetchone()[0] == 0
 
+    # Consume the writer's exact linked owner through the real ContractRuntime
+    # authority and precheck while the registered checkout remains dirty.
+    before_changes = conn.total_changes
+    before_lines = len(server._contract_runtime_store(conn).get(
+        record["contract_execution_id"]
+    )["completed_lines"])
+    authority = server._contract_runtime_reconcile_record_authority(
+        conn, project_id=PID, record=record,
+    )
+    terminal = authority["terminal_current_full_reconcile_authority"]
+    assert authority["record_verified"] is True
+    assert authority["reconcile_event_recorded"] is True
+    assert authority["current_full_reconcile_activation_verified"] is True
+    assert terminal["target_project_root"] == str(case["owner"].resolve())
+    assert terminal["canonical_head_commit"] == case["final"]
+    assert terminal["active_snapshot_matches_canonical_head"] is True
+    selected_after_activation = (
+        server._contract_runtime_rev8_selected_reconcile_lane_projection(
+            conn, project_id=PID, record=record,
+            aggregate_merge=server._contract_runtime_rev8_two_worker_merge_projection(
+                record, required_worker_count=2, conn=conn, project_id=PID,
+            ),
+        )
+    )
+    caller_root = server._contract_runtime_current_full_reconcile_authority_from_merge(
+        conn, project_id=PID, record=record, merge=selected_after_activation,
+        reconcile=selected_after_activation,
+        target_project_root_override=str(case["owner"]),
+    )
+    assert caller_root["live_verified"] is False
+    assert caller_root["target_project_root"] == ""
+    precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {"project_id": PID,
+             "contract_execution_id": record["contract_execution_id"]},
+            "observer", method="POST",
+            body={
+                "stage_id": "observer_reconcile",
+                "line_id": "observer_reconcile",
+                "evidence_kind": "reconcile",
+            },
+        )
+    )
+    assert precheck["ok"] is True, precheck
+    assert conn.total_changes == before_changes
+    assert len(server._contract_runtime_store(conn).get(
+        record["contract_execution_id"]
+    )["completed_lines"]) == before_lines
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["dirty_owner", "changed_owner_head", "ambiguous_owner",
+     "changed_queue_ref", "wrong_selected_context",
+     "missing_provenance", "forged_provenance"],
+)
+def test_rev10_linked_owner_consumer_rejects_stale_or_untrusted_owner(
+    conn, monkeypatch, tmp_path, defect,
+):
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+
+    def build(_conn, project_id, root, **kwargs):
+        store.create_graph_snapshot(
+            _conn, project_id, snapshot_id=kwargs["snapshot_id"],
+            commit_sha=case["final"], snapshot_kind="full",
+            graph_json=_graph(), notes=json.dumps({"run_id": kwargs["run_id"]}),
+        )
+        _conn.commit()
+        return {
+            "ok": True, "snapshot_id": kwargs["snapshot_id"],
+            "projection_id": "semproj-rev10-consumer-negative",
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", build)
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=case["body"])
+    )
+    assert status == 201, result
+    assert result["activated"] is True
+
+    if defect == "dirty_owner":
+        (case["owner"] / "after-activation.txt").write_text("dirty\n")
+    elif defect == "changed_owner_head":
+        _commit_test_git_files(
+            case["owner"], ["after-activation.txt"],
+            message="owner advanced after activation",
+        )
+    elif defect == "ambiguous_owner":
+        git_run = subprocess.run
+
+        def duplicate_main_owner(command, *args, **kwargs):
+            completed = git_run(command, *args, **kwargs)
+            if list(command[:4]) == ["git", "worktree", "list", "--porcelain"]:
+                completed.stdout += (
+                    f"\nworktree {tmp_path / 'duplicate-main-owner'}\n"
+                    f"HEAD {case['final']}\nbranch refs/heads/main\n"
+                )
+            return completed
+
+        monkeypatch.setattr(server.subprocess, "run", duplicate_main_owner)
+    elif defect == "changed_queue_ref":
+        row = case["rows"][1]
+        conn.execute(
+            "UPDATE parallel_branch_merge_queue_items SET target_ref=? "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            ("refs/heads/unrelated", PID, row.merge_queue_id, row.queue_item_id),
+        )
+        conn.commit()
+    elif defect == "wrong_selected_context":
+        selected = case["contexts"][0]
+        upsert_branch_context(
+            conn, replace(selected, merge_queue_id="mq-foreign-lane"),
+        )
+        conn.commit()
+    elif defect == "missing_provenance":
+        conn.execute(
+            "DELETE FROM graph_current_full_reconcile_provenance "
+            "WHERE project_id=? AND snapshot_id=?",
+            (PID, result["snapshot_id"]),
+        )
+        conn.commit()
+    elif defect == "forged_provenance":
+        conn.execute(
+            "UPDATE graph_current_full_reconcile_provenance "
+            "SET provenance_hash=? WHERE project_id=? AND snapshot_id=?",
+            ("sha256:" + "f" * 64, PID, result["snapshot_id"]),
+        )
+        conn.commit()
+
+    record = case["record"]
+    before_changes = conn.total_changes
+    before_lines = len(server._contract_runtime_store(conn).get(
+        record["contract_execution_id"]
+    )["completed_lines"])
+    with pytest.raises(GovernanceError) as blocked:
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {"project_id": PID,
+                 "contract_execution_id": record["contract_execution_id"]},
+                "observer", method="POST",
+                body={
+                    "stage_id": "observer_reconcile",
+                    "line_id": "observer_reconcile",
+                    "evidence_kind": "reconcile",
+                },
+            )
+        )
+    assert blocked.value.code == "contract_runtime_observer_reconcile_current_full_required"
+    assert blocked.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert len(server._contract_runtime_store(conn).get(
+        record["contract_execution_id"]
+    )["completed_lines"]) == before_lines
+
 
 @pytest.mark.parametrize("replay_root", ["original_body", "explicit_owner"])
 def test_rev10_current_full_nonpending_record_preserves_terminal_replay(
