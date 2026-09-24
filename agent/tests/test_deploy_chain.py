@@ -1956,6 +1956,16 @@ http.server.HTTPServer(("127.0.0.1",port),Handler).serve_forever()
         plan, plan_path, _patch = self._activation_plan_fixture(tmp_path, runtime)
 
         class DryOps:
+            def run(self, args, cwd, code, *, input_bytes=None):
+                assert code == "activation_dashboard_asset_identity_stale"
+                assert args == [
+                    sys.executable,
+                    str(Path(plan["dev_worktree"]) / "scripts/dashboard_asset_identity.py"),
+                    "verify", "--root", plan["dev_worktree"],
+                ]
+                assert cwd == plan["dev_worktree"] and input_bytes is None
+                return b""
+
             def git(self, root, *args, code="activation_git_failed"):
                 if args == ("worktree", "list", "--porcelain"):
                     return (
@@ -2465,6 +2475,16 @@ def test_main_binding_create_prepare_activate_and_exact_rollback(monkeypatch, tm
             self.completed = False
         def run(self, args, cwd, code, *, input_bytes=None):
             self.calls.append(tuple(args))
+            if code == "activation_dashboard_asset_identity_stale":
+                assert args == [
+                    sys.executable,
+                    str(dev / "scripts/dashboard_asset_identity.py"),
+                    "verify", "--root", str(dev),
+                ]
+                assert cwd == str(dev) and input_bytes is None
+                # This historical release fixture predates dashboard packaging;
+                # the dedicated dashboard tests exercise the real verifier.
+                return b""
             result = super().run(args, cwd, code, input_bytes=input_bytes)
             if not self.failed and ((fault == "after_branch" and args[:3] == ["git", "switch", "main"])
                     or (fault == "after_source" and args[:3] == ["git", "merge", "--ff-only"])):

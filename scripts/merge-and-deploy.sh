@@ -48,21 +48,6 @@ if [ "$MODE" = "activate" ] || [ "$MODE" = "recover" ]; then
         echo "Promotion blocked: GOV_COORDINATOR_TOKEN is required for activation." >&2
         exit 2
     fi
-    CANDIDATE_DASHBOARD_ROOT="$(python3 - "$ACTIVATION_PLAN" <<'PY_DASHBOARD_ROOT'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as plan_file:
-    root = json.load(plan_file).get("dev_worktree")
-if not isinstance(root, str) or not root.startswith("/"):
-    raise SystemExit("Promotion blocked: activation plan has no candidate worktree")
-print(root)
-PY_DASHBOARD_ROOT
-)"
-    python3 scripts/dashboard_asset_identity.py verify --root "$CANDIDATE_DASHBOARD_ROOT" || {
-        echo "Promotion blocked: candidate dashboard asset identity is stale." >&2
-        exit 1
-    }
     python3 - "$MODE" "$ACTIVATION_PLAN" "$DRY_RUN" "$0" <<'PY'
 import base64
 import datetime as dt
@@ -982,6 +967,11 @@ class ActivationMachine:
         )
         if self.ops.git(dev, "rev-parse", f"{self.plan['candidate_commit']}^{{tree}}") != self.plan["candidate_tree_sha"]:
             fail("activation_candidate_tree_drift", "candidate tree changed")
+        self.ops.run(
+            [sys.executable, str(Path(dev) / "scripts/dashboard_asset_identity.py"), "verify", "--root", dev],
+            dev,
+            "activation_dashboard_asset_identity_stale",
+        )
         self.exact_database()
         if self.ops.graph_hash(self.plan["stable_database_path"]) != self.plan["graph_identity_hash"]:
             fail("activation_graph_identity_drift", "active graph changed before mutation")
