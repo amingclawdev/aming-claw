@@ -48,6 +48,21 @@ if [ "$MODE" = "activate" ] || [ "$MODE" = "recover" ]; then
         echo "Promotion blocked: GOV_COORDINATOR_TOKEN is required for activation." >&2
         exit 2
     fi
+    CANDIDATE_DASHBOARD_ROOT="$(python3 - "$ACTIVATION_PLAN" <<'PY_DASHBOARD_ROOT'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as plan_file:
+    root = json.load(plan_file).get("dev_worktree")
+if not isinstance(root, str) or not root.startswith("/"):
+    raise SystemExit("Promotion blocked: activation plan has no candidate worktree")
+print(root)
+PY_DASHBOARD_ROOT
+)"
+    python3 scripts/dashboard_asset_identity.py verify --root "$CANDIDATE_DASHBOARD_ROOT" || {
+        echo "Promotion blocked: candidate dashboard asset identity is stale." >&2
+        exit 1
+    }
     python3 - "$MODE" "$ACTIVATION_PLAN" "$DRY_RUN" "$0" <<'PY'
 import base64
 import datetime as dt
@@ -1600,6 +1615,11 @@ fi
 if ! git merge-base --is-ancestor "$CURRENT_STABLE" "$CANDIDATE_COMMIT"; then
     echo "Promotion blocked: candidate is not a linear descendant of current stable." >&2; exit 1
 fi
+
+python3 scripts/dashboard_asset_identity.py verify || {
+    echo "Promotion blocked: candidate dashboard asset identity is stale." >&2
+    exit 1
+}
 
 # Dual-world promotion carries Git source and nothing else.  In particular,
 # the fresh dev genesis, SQLite companions, graph/session/runtime artifacts and

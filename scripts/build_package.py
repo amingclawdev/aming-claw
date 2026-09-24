@@ -35,6 +35,8 @@ def main(argv: list[str] | None = None) -> int:
             "`npm --prefix frontend/dashboard run build` before building the wheel."
         )
 
+    _run(["python3", "scripts/dashboard_asset_identity.py", "verify"])
+
     wheel_dir = ROOT / args.wheel_dir
     wheel_dir.mkdir(parents=True, exist_ok=True)
     wheel_name = build_meta.build_wheel(str(wheel_dir))

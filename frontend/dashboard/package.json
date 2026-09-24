@@ -6,7 +6,7 @@
   "description": "aming-claw governance dashboard P0 — operational view of graph snapshots, semantic projection, and operations queue",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && npm run fingerprint-dist && node scripts/sync-dist-to-python-package.mjs",
+    "build": "tsc -b && vite build && npm run fingerprint-dist && node scripts/sync-dist-to-python-package.mjs && python3 ../../scripts/dashboard_asset_identity.py record && python3 ../../scripts/dashboard_asset_identity.py verify",
     "fingerprint-dist": "node --input-type=module -e 'import { createHash } from \"node:crypto\"; import { readFileSync, writeFileSync } from \"node:fs\"; const indexPath = \"dist/index.html\"; const html = readFileSync(indexPath, \"utf8\"); const next = html.replace(/(\\/dashboard\\/assets\\/[^\"?]+\\.(?:js|css))(?:\\?v=[^\"]*)?/g, (_match, assetPath) => { const bytes = readFileSync(\"dist\" + assetPath.slice(\"/dashboard\".length)); const version = createHash(\"sha256\").update(bytes).digest(\"hex\").slice(0, 8); return assetPath + \"?v=\" + version; }); if (next !== html) writeFileSync(indexPath, next);'",
     "preview": "vite preview --port 5173",
     "typecheck": "tsc -b --noEmit",
