@@ -236334,10 +236334,135 @@ def _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path):
     }
 
 
-def test_rev10_current_full_activates_from_clean_linked_target_owner(
-    conn, monkeypatch, tmp_path,
+def _linked_owner_consumer_result(conn, case):
+    record = case["record"]
+    durable = record["completed_lines"][-1]["payload"]["durable_merge_authority"]
+    aggregate = {
+        "lane_merge_count": 2,
+        "dispatch_completed_line_index": 1,
+        "contract_runtime_dispatch_source_ref": durable["contract_runtime_dispatch_source_ref"],
+        "merged_commit_sha": case["final"],
+    }
+
+    def reject(reason):
+        raise ValueError(reason)
+
+    return server._contract_runtime_postmerge_clean_linked_target_owner(
+        conn, project_id=PID, record=record, aggregate=aggregate,
+        reject=reject, claimed_commit=case["final"],
+    )
+
+
+@pytest.mark.parametrize(
+    "queue_refs",
+    [
+        ("main", "main"),
+        ("refs/heads/main", "refs/heads/main"),
+        ("main", "refs/heads/main"),
+        ("refs/heads/main", "main"),
+    ],
+)
+def test_rev10_linked_owner_consumer_normalizes_equivalent_queue_target_refs(
+    conn, monkeypatch, tmp_path, queue_refs,
 ):
     case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    for row, target_ref in zip(case["rows"], queue_refs):
+        conn.execute(
+            "UPDATE parallel_branch_merge_queue_items SET target_ref=? "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            (target_ref, PID, row.merge_queue_id, row.queue_item_id),
+        )
+    conn.commit()
+
+    owner = _linked_owner_consumer_result(conn, case)
+    assert owner["target_ref"] == "refs/heads/main"
+    assert owner["target_project_root"] == str(case["owner"].resolve())
+    assert owner["merged_commit_sha"] == case["final"]
+    assert tuple(
+        conn.execute(
+            "SELECT target_ref FROM parallel_branch_merge_queue_items "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            (PID, row.merge_queue_id, row.queue_item_id),
+        ).fetchone()[0]
+        for row in case["rows"]
+    ) == queue_refs
+
+
+@pytest.mark.parametrize(
+    ("defect", "reason"),
+    [
+        ("different_branch", "aggregate_lane_queue_target_chain_mismatch"),
+        ("nonheads_ref", "aggregate_lane_queue_target_chain_mismatch"),
+        ("empty_ref", "aggregate_lane_queue_target_chain_mismatch"),
+        ("broken_chain", "aggregate_lane_queue_target_chain_mismatch"),
+        ("dirty_owner", "target_ref_owner_not_clean_and_aligned"),
+        ("missing_owner", "target_ref_owner_missing_or_ambiguous"),
+        ("ambiguous_owner", "target_ref_owner_missing_or_ambiguous"),
+        ("wrong_final_head", "target_ref_owner_head_or_branch_mismatch"),
+    ],
+)
+def test_rev10_linked_owner_consumer_rejects_untrusted_normalized_target(
+    conn, monkeypatch, tmp_path, defect, reason,
+):
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    row = case["rows"][1]
+    if defect in {"different_branch", "nonheads_ref", "empty_ref", "broken_chain"}:
+        column, value = {
+            "different_branch": ("target_ref", "refs/heads/unrelated"),
+            "nonheads_ref": ("target_ref", "refs/tags/main"),
+            "empty_ref": ("target_ref", ""),
+            "broken_chain": ("target_head_before_merge", case["base"]),
+        }[defect]
+        conn.execute(
+            f"UPDATE parallel_branch_merge_queue_items SET {column}=? "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            (value, PID, row.merge_queue_id, row.queue_item_id),
+        )
+        conn.commit()
+    elif defect == "dirty_owner":
+        (case["owner"] / "uncommitted.txt").write_text("dirty\n")
+    elif defect == "missing_owner":
+        subprocess.run(
+            ["git", "worktree", "remove", str(case["owner"])],
+            cwd=case["registered"], check=True, capture_output=True, text=True,
+        )
+    elif defect == "ambiguous_owner":
+        git_run = subprocess.run
+
+        def duplicate_main_owner(command, *args, **kwargs):
+            completed = git_run(command, *args, **kwargs)
+            if list(command[:4]) == ["git", "worktree", "list", "--porcelain"]:
+                completed.stdout += (
+                    f"\nworktree {tmp_path / 'duplicate-main-owner'}\n"
+                    f"HEAD {case['final']}\nbranch refs/heads/main\n"
+                )
+            return completed
+
+        monkeypatch.setattr(server.subprocess, "run", duplicate_main_owner)
+    elif defect == "wrong_final_head":
+        _commit_test_git_files(
+            case["owner"], ["after-merge.txt"], message="owner moved past merge",
+        )
+
+    with pytest.raises(ValueError, match=reason):
+        _linked_owner_consumer_result(conn, case)
+
+
+@pytest.mark.parametrize(
+    "queue_refs",
+    [("refs/heads/main", "refs/heads/main"), ("main", "refs/heads/main")],
+)
+def test_rev10_current_full_activates_from_clean_linked_target_owner(
+    conn, monkeypatch, tmp_path, queue_refs,
+):
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    for row, target_ref in zip(case["rows"], queue_refs):
+        conn.execute(
+            "UPDATE parallel_branch_merge_queue_items SET target_ref=? "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            (target_ref, PID, row.merge_queue_id, row.queue_item_id),
+        )
+    conn.commit()
     record = case["record"]
     assert [line["line_id"] for line in record["completed_lines"]][-2:] == [
         "observer_merge", "observer_merge",

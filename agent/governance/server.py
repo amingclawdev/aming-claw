@@ -98603,7 +98603,10 @@ def _contract_runtime_postmerge_clean_linked_target_owner(
 ) -> dict[str, Any]:
     """Prove the sealed merge chain has one clean owner at its final HEAD."""
 
-    from .parallel_branch_runtime import _git_target_owner_alignment_evidence
+    from .parallel_branch_runtime import (
+        _git_target_owner_alignment_evidence,
+        _read_model_normalized_target_ref,
+    )
 
     backlog_id = str(record.get("backlog_id") or "").strip()
     execution_id = str(record.get("contract_execution_id") or "").strip()
@@ -98640,7 +98643,7 @@ def _contract_runtime_postmerge_clean_linked_target_owner(
         lane_commit = str(lane.get("merge_commit") or "").strip().lower()
         before = str(row["target_head_before_merge"] or "").strip().lower()
         after = str(row["target_head_after_merge"] or "").strip().lower()
-        row_ref = str(row["target_ref"] or "").strip()
+        row_ref = _read_model_normalized_target_ref(row["target_ref"])
         if not (
             str(row["status"] or "") == "merged"
             and str(row["backlog_id"] or "") == backlog_id
