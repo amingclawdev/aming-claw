@@ -1000,9 +1000,10 @@ def _function_line_index(functions: List[FunctionMeta]) -> Dict[str, List[int]]:
         end = int(func.end_lineno or start)
         if end <= 0:
             end = start
-        line_index[full_name] = [start, end]
         if short_counts[short_name] == 1:
             line_index[short_name] = [start, end]
+        else:
+            line_index[full_name] = [start, end]
     return line_index
 
 
