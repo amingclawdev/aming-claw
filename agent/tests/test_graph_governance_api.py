@@ -3254,7 +3254,10 @@ def test_direct_qa_selected_facade_has_exact_identity_and_managed_envelope(
     assert body["direct_runtime_binding_hash"].startswith("sha256:")
     assert selected["generic_contract_runtime_submit_line_allowed"] is False
     assert envelope["raw_qa_session_token_exposed"] is False
-    assert guide["next_legal_action"]["transport"] == "http"
+    assert guide["next_legal_action"]["transport"] == "managed_mcp"
+    assert guide["next_legal_action"]["native_mcp_transport"]["runnable"] is True
+    assert selected["next_action"]["mcp_tool"] == "task_timeline_append"
+    assert selected["writer_role_safe_copy_payload"]["transport"] == "http"
     assert guide["next_legal_action"]["http_request"]["method"] == "POST"
     assert guide["next_legal_action"]["http_request"]["path"] == f"/api/task/{PID}/timeline"
     definition_path = Path(server.__file__).parent / "contract_definitions/operator_supervised_direct_main.v1.rev3.json"
@@ -5053,9 +5056,10 @@ def test_direct_qa_missing_lossy_binding_fields_are_server_derived(
         "direct_runtime_binding_hash",
     ):
         filtered.pop(field)
-    assert guide["next_legal_action"]["mcp_tool"] == ""
-    assert guide["next_legal_action"]["native_mcp_transport"]["runnable"] is False
-    assert guide["next_legal_action"]["native_mcp_transport"]["transport_repair_claimed"] is False
+    assert guide["next_legal_action"]["mcp_tool"] == "task_timeline_append"
+    assert guide["next_legal_action"]["native_mcp_transport"]["runnable"] is True
+    assert guide["next_legal_action"]["native_mcp_transport"]["direct_writer_fields_preserved"] is True
+    assert guide["next_legal_action"]["native_mcp_transport"]["raw_qa_session_token_exposed"] is False
     accepted = append(filtered)
     authority = accepted["payload"]["source_backed_contract_gate_authority"]
     assert authority["qa_session_proof"]["task_id"] == world["task_id"]
@@ -5065,6 +5069,214 @@ def test_direct_qa_missing_lossy_binding_fields_are_server_derived(
     assert [line["line_id"] for line in lines[-2:]] == [
         "qa_graph_context", "qa_independent_verification",
     ]
+
+
+def test_direct_qa_promotion_guide_reuses_one_intent_across_runnable_aliases(
+    conn, monkeypatch, tmp_path,
+):
+    backlog_id = "AC-DIRECT-QA-PROMOTION-GUIDE-TEST"
+    execution_id = "cex-direct-qa-promotion-guide-test"
+    candidate = "b" * 40
+    anchor = "a" * 40
+    diff_hash = "sha256:" + "c" * 64
+    source = {
+        "project_id": "aming-claw", "backlog_id": backlog_id,
+        "task_id": execution_id, "contract_execution_id": execution_id,
+        "commit_sha": candidate, "event_type": "qa.independent_verification",
+        "payload": {}, "verification": {},
+    }
+    http = {"method": "POST", "path": "/api/task/aming-claw/timeline", "body": copy.deepcopy(source)}
+    original = {
+        "selected_role": "qa", "contract_execution_id": execution_id,
+        "next_legal_action": {
+            "action": "task_timeline_append", "line_id": "qa_graph_context",
+            "contract_execution_id": execution_id,
+            "action_input": copy.deepcopy(source), "copy_safe_body": copy.deepcopy(source),
+            "http_request": copy.deepcopy(http),
+        },
+        "action_input": copy.deepcopy(source), "copy_safe_body": copy.deepcopy(source),
+        "canonical_executable_action": {"copy_safe_body": copy.deepcopy(source),
+                                        "host_realization": {"required_replacement_paths": []}},
+        "agent_onboard_guidance": {"selected_role_guidance": {
+            "next_action": {"action_input": copy.deepcopy(source),
+                            "copy_safe_body": copy.deepcopy(source),
+                            "http_request": copy.deepcopy(http)},
+            "writer_role_safe_copy_payload": {"copy_payload": copy.deepcopy(source),
+                                              "http_request": copy.deepcopy(http)},
+            "ordered_steps": [{"id": "submit_one_qa_independent_verification",
+                               "http_request": copy.deepcopy(http)}],
+        }},
+    }
+    instance = {
+        "backlog_id": backlog_id, "contract_execution_id": execution_id,
+        "candidate_commit": candidate, "stable_anchor_commit": anchor,
+        "stable_database_identity": {"inode": 42},
+        "implementation_delta": {"base_commit": anchor, "diff_sha256": diff_hash,
+                                 "file_fence": ["agent/governance/server.py"]},
+        "promotion_delta": {"diff_sha256": diff_hash,
+                            "file_fence": ["agent/governance/server.py", "agent/tests/test_graph_governance_api.py"]},
+        "prior_promotion": {}, "release_evidence_complete": False,
+    }
+    monkeypatch.setattr(server, "_onboard_route_guide_service_response_base",
+                        lambda *_args, **_kwargs: copy.deepcopy(original))
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(server, "_ac_promotion_successor_git_bytes",
+                        lambda *_args, **_kwargs: f"Chain-Backlog: {backlog_id}\n".encode())
+    monkeypatch.setattr(server, "_operator_supervised_direct_main_dev_world_authority",
+                        lambda: {"target_head_commit": candidate})
+    monkeypatch.setattr(server, "_ac_main_binding_release_instance",
+                        lambda **_kwargs: instance)
+    monkeypatch.setattr(server, "_ac_main_binding_dev_connection",
+                        lambda _instance: sqlite3.connect(":memory:"))
+    monkeypatch.setattr(server, "_ac_promotion_successor_qa_projection",
+                        lambda *_args, **_kwargs: {"accepted": False})
+
+    response = server._onboard_route_guide_service_response(
+        conn, project_id="aming-claw", backlog_id=backlog_id, role="qa",
+    )
+    action = response["next_legal_action"]
+    body = action["action_input"]
+    assert body["payload"]["candidate_review_context"] == {
+        "candidate_commit_sha": candidate,
+        "comparison_base_commit_sha": anchor,
+        "comparison_authority_required": True,
+        "candidate_diff_hash": diff_hash,
+        "changed_files": instance["implementation_delta"]["file_fence"],
+    }
+    assert body["payload"]["stable_anchor_commit"] == anchor
+    assert body["payload"]["promotion_intent_sha256"] == response["stable_promotion"]["promotion_intent_sha256"]
+    assert body["payload"]["file_fence"] == instance["promotion_delta"]["file_fence"]
+    assert body["payload"]["stable_database_identity"] == instance["stable_database_identity"]
+    assert body["verification"]["promotion_gate_results"] == {
+        "branch_service": {}, "lanes": {lane: {} for lane in
+                                         ("direct_main", "mf_parallel", "mf_batch_parallel")},
+    }
+    selected = response["agent_onboard_guidance"]["selected_role_guidance"]
+    aliases = (
+        action["copy_safe_body"], action["http_request"]["body"],
+        response["action_input"], response["copy_safe_body"],
+        response["canonical_executable_action"]["copy_safe_body"],
+        selected["next_action"]["action_input"],
+        selected["next_action"]["copy_safe_body"],
+        selected["next_action"]["http_request"]["body"],
+        selected["writer_role_safe_copy_payload"]["copy_payload"],
+        selected["writer_role_safe_copy_payload"]["http_request"]["body"],
+        selected["ordered_steps"][0]["http_request"]["body"],
+    )
+    assert all(alias == body for alias in aliases)
+    assert action["action_input_ready"] is False
+    assert selected["next_action"]["action_input_ready"] is False
+    assert response["canonical_executable_action"]["action_input_ready"] is False
+    assert response["canonical_executable_action"][
+        "promotion_gate_result_requirements"
+    ] == action["promotion_gate_result_requirements"]
+    missing = action["action_input_missing_fields"]
+    assert "verification.promotion_gate_results.branch_service.runtime_plane" in missing
+    assert "verification.promotion_gate_results.branch_service.port" in missing
+    assert "verification.promotion_gate_results.branch_service.bind_host" in missing
+    assert action["promotion_gate_result_requirements"]["four_test_ids_must_be_distinct"] is True
+    assert not any(value == "passed" for value in body["verification"]["promotion_gate_results"].values())
+    assert "qa_session_token_ref" not in json.dumps(body)
+
+    unrelated = server._onboard_route_guide_service_response(
+        conn, project_id="aming-claw", backlog_id="AC-UNRELATED", role="qa",
+    )
+    assert unrelated == original
+
+
+@pytest.mark.parametrize("response_view", ("compact", "full"))
+def test_real_direct_qa_guide_receives_only_matching_promotion_identity(
+    conn, monkeypatch, tmp_path, response_view,
+):
+    world = _strict_direct_main_comparison_world(
+        conn, monkeypatch, tmp_path, suffix="PROMOTION-READINESS-REAL-GUIDE",
+    )
+    backlog_id = world["backlog_id"]
+    candidate = world["candidate_commit"]
+    anchor = world["base_commit"]
+    diff_hash = "sha256:" + "d" * 64
+    instance = {
+        "backlog_id": backlog_id, "contract_execution_id": world["task_id"],
+        "candidate_commit": candidate, "stable_anchor_commit": anchor,
+        "stable_database_identity": {"inode": 73},
+        "implementation_delta": {"base_commit": anchor, "diff_sha256": diff_hash,
+                                 "file_fence": ["agent/governance/server.py"]},
+        "promotion_delta": {"diff_sha256": diff_hash,
+                            "file_fence": ["agent/governance/server.py", "agent/tests/test_graph_governance_api.py"]},
+        "prior_promotion": {}, "release_evidence_complete": False,
+    }
+    monkeypatch.setattr(server, "AC_PROJECT_ID", PID)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(server, "_operator_supervised_direct_main_dev_world_authority",
+                        lambda: {})
+    monkeypatch.setattr(server, "_ac_promotion_successor_git_bytes",
+                        lambda *_args, **_kwargs: f"Chain-Backlog: {backlog_id}\n".encode())
+    monkeypatch.setattr(server, "_ac_main_binding_release_instance",
+                        lambda **_kwargs: instance)
+    monkeypatch.setattr(server, "_ac_main_binding_dev_connection",
+                        lambda _instance: sqlite3.connect(":memory:"))
+    monkeypatch.setattr(server, "_ac_promotion_successor_qa_projection",
+                        lambda *_args, **_kwargs: {"accepted": False})
+
+    base = server._onboard_route_guide_service_response_base(
+        conn, project_id=PID, backlog_id=backlog_id, role="qa",
+        work_type="qa_verification", response_view=response_view,
+        request_body={"backlog_id": backlog_id, "role": "qa",
+                      "work_type": "qa_verification", "response_view": response_view},
+    )
+    assert base["next_legal_action"]["line_id"] == "qa_graph_context"
+    assert "candidate_review_context" not in json.dumps(
+        base["next_legal_action"]["action_input"]
+    )
+    observer_base = server._onboard_route_guide_service_response_base(
+        conn, project_id=PID, backlog_id=backlog_id, role="observer",
+        work_type="operator_supervised_direct_main", response_view=response_view,
+        request_body={"backlog_id": backlog_id, "role": "observer",
+                      "work_type": "operator_supervised_direct_main",
+                      "response_view": response_view},
+    )
+    monkeypatch.setattr(server, "_onboard_route_guide_service_response_base",
+                        lambda *_args, **kwargs: copy.deepcopy(
+                            base if kwargs.get("role") == "qa" else observer_base
+                        ))
+    monkeypatch.setattr(server, "_operator_supervised_direct_main_dev_world_authority",
+                        lambda: {"target_head_commit": candidate})
+    ready = server._onboard_route_guide_service_response(
+        conn, project_id=PID, backlog_id=backlog_id, role="qa",
+        work_type="qa_verification", response_view=response_view,
+        request_body={"backlog_id": backlog_id, "role": "qa",
+                      "work_type": "qa_verification", "response_view": response_view},
+    )
+    action = ready["next_legal_action"]
+    body = ready["action_input"]
+    assert action["line_id"] == "qa_graph_context"
+    assert body["payload"]["candidate_review_context"]["candidate_commit_sha"] == candidate
+    assert body["payload"]["file_fence"] == instance["promotion_delta"]["file_fence"]
+    assert action["copy_safe_body"] == action["http_request"]["body"] == body
+    selected = ready["agent_onboard_guidance"]["selected_role_guidance"]
+    assert selected["writer_role_safe_copy_payload"]["copy_payload"] == body
+    assert selected["next_action"]["action_input"] == body
+    assert selected["next_action"]["facade_action_projection"]["copy_safe_body"] == body
+    assert selected["next_action"]["facade_action_projection"]["http_request"]["body"] == body
+    assert ready["selected_role_guidance"]["next_action"]["copy_safe_body"] == body
+    assert action["action_input_ready"] is False
+    assert "verification.tests_run" in action["action_input_missing_fields"]
+    assert "payload.graph_trace_ids" in action["replace_before_submit"]
+    assert "verification.tests_run" in selected["next_action"]["action_input_missing_fields"]
+    assert "payload.graph_trace_ids" in selected["next_action"]["replace_before_submit"]
+    assert "verification.promotion_gate_results.branch_service.status" in action[
+        "action_input_missing_fields"
+    ]
+    assert "qa_session_token_ref" not in json.dumps(body)
+
+    non_qa = server._onboard_route_guide_service_response(
+        conn, project_id=PID, backlog_id=backlog_id, role="observer",
+        work_type="operator_supervised_direct_main", response_view=response_view,
+        request_body={"backlog_id": backlog_id, "role": "observer",
+                      "work_type": "operator_supervised_direct_main",
+                      "response_view": response_view},
+    )
+    assert "candidate_review_context" not in json.dumps(non_qa.get("action_input") or {})
 
 
 @pytest.mark.parametrize("session_state", ("expired", "wrong_scope"))

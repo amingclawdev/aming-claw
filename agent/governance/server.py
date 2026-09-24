@@ -154856,17 +154856,18 @@ def _onboard_selected_qa_contract_runtime_guidance(
             "body": deepcopy(body), "authentication": token_transport,
         }
         native_transport = {
-            "runnable": False,
-            "reason": "native_task_timeline_adapter_does_not_preserve_direct_writer_binding",
-            "fallback": "http_request",
-            "transport_repair_claimed": False,
+            "runnable": True,
+            "mcp_tool": "task_timeline_append",
+            "qa_session_token_ref": "process_local_argument_outside_timeline_body",
+            "raw_qa_session_token_exposed": False,
+            "direct_writer_fields_preserved": True,
         }
         projected_action = {
             **action,
             "action": "task_timeline_append",
             "interface": "task_timeline_append",
-            "mcp_tool": "",
-            "transport": "http",
+            "mcp_tool": "task_timeline_append",
+            "transport": "managed_mcp",
             "http_request": http_request,
             "native_mcp_transport": native_transport,
             "action_input": deepcopy(body),
@@ -159026,9 +159027,11 @@ def _operator_supervised_direct_main_facade_action_projection(
                 "authentication": "same exact QA session X-Gov-Token header; see selected QA Guide",
             },
             "native_mcp_transport": {
-                "runnable": False,
-                "reason": "native_task_timeline_adapter_does_not_preserve_direct_writer_binding",
-                "transport_repair_claimed": False,
+                "runnable": True,
+                "mcp_tool": "task_timeline_append",
+                "qa_session_token_ref": "process_local_argument_outside_timeline_body",
+                "raw_qa_session_token_exposed": False,
+                "direct_writer_fields_preserved": True,
             },
             "consumes_contract_runtime_lines": [
                 "qa_graph_context",
@@ -159906,7 +159909,18 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             }
             if facade_projection.get("http_request"):
                 next_action.update({
-                    "mcp_tool": "", "transport": "http",
+                    "mcp_tool": (
+                        "task_timeline_append"
+                        if facade_projection.get("facade_tool") == "task_timeline_append"
+                        and (facade_projection.get("native_mcp_transport") or {}).get("runnable") is True
+                        else ""
+                    ),
+                    "transport": (
+                        "managed_mcp"
+                        if facade_projection.get("facade_tool") == "task_timeline_append"
+                        and (facade_projection.get("native_mcp_transport") or {}).get("runnable") is True
+                        else "http"
+                    ),
                     "http_request": deepcopy(facade_projection["http_request"]),
                     "native_mcp_transport": deepcopy(facade_projection["native_mcp_transport"]),
                 })
@@ -178563,6 +178577,17 @@ def _onboard_route_guide_compact_service_response(
         if selected_role_key == "qa"
         else {}
     )
+    if (
+        selected_role_key == "qa"
+        and selected_qa_guidance.get("schema_version")
+        == "onboard_route_guide.selected_direct_qa.v1"
+        and (selected_qa_guidance.get("native_mcp_transport") or {}).get("runnable") is True
+    ):
+        next_action_projection["mcp_tool"] = "task_timeline_append"
+        next_action_projection["transport"] = "managed_mcp"
+        next_action_projection["native_mcp_transport"] = deepcopy(
+            selected_qa_guidance["native_mcp_transport"]
+        )
     qa_recipe_record = (
         qa_runtime_record if isinstance(qa_runtime_record, Mapping) else record
     )
@@ -182239,6 +182264,153 @@ def _ac_promotion_rollback_route_guide_overlay(
         )
 
 
+def _ac_main_binding_direct_qa_guide_identity(
+    response: dict[str, Any], projection: Mapping[str, Any],
+) -> None:
+    """Copy the already derived release identity into the selected QA recipe."""
+    intent = projection.get("intent")
+    comparison = projection.get("qa_comparison")
+    action = response.get("next_legal_action")
+    if not (
+        response.get("selected_role") == "qa"
+        and isinstance(intent, Mapping)
+        and isinstance(comparison, Mapping)
+        and isinstance(action, dict)
+        and action.get("line_id") in {"qa_graph_context", "qa_independent_verification"}
+        and action.get("action") == "task_timeline_append"
+        and (action.get("contract_execution_id") or response.get("contract_execution_id"))
+        == intent.get("contract_execution_id")
+    ):
+        return
+    source_body = action.get("action_input") or response.get("action_input")
+    if not isinstance(source_body, Mapping) or source_body.get("commit_sha") != intent.get("candidate_commit"):
+        return
+    body = deepcopy(dict(source_body))
+    body.setdefault("payload", {}).update({
+        "candidate_review_context": {
+            "candidate_commit_sha": intent["candidate_commit"],
+            "comparison_base_commit_sha": comparison["base_commit"],
+            "comparison_authority_required": True,
+            "candidate_diff_hash": comparison["diff_sha256"],
+            "changed_files": list(comparison["file_fence"]),
+        },
+        "stable_anchor_commit": intent["stable_anchor_commit"],
+        "promotion_intent_sha256": projection["promotion_intent_sha256"],
+        "file_fence": list(intent["file_fence"]),
+        "stable_database_identity": deepcopy(intent["stable_database_identity"]),
+    })
+    body.setdefault("verification", {}).setdefault("promotion_gate_results", {
+        "branch_service": {},
+        "lanes": {lane: {} for lane in ("direct_main", "mf_parallel", "mf_batch_parallel")},
+    })
+    missing = [
+        "verification.promotion_gate_results.branch_service.status",
+        "verification.promotion_gate_results.branch_service.runtime_plane",
+        "verification.promotion_gate_results.branch_service.port",
+        "verification.promotion_gate_results.branch_service.bind_host",
+        "verification.promotion_gate_results.branch_service.test_id",
+        "verification.promotion_gate_results.branch_service.report_sha256",
+        *[
+            f"verification.promotion_gate_results.lanes.{lane}.{field}"
+            for lane in ("direct_main", "mf_parallel", "mf_batch_parallel")
+            for field in ("status", "test_id", "report_sha256")
+        ],
+    ]
+    selected_guidance = (response.get("agent_onboard_guidance") or {}).get(
+        "selected_role_guidance"
+    ) or response.get("selected_role_guidance")
+    for selected in (action, selected_guidance, action.get("facade_action_projection")):
+        if not isinstance(selected, dict):
+            continue
+        selected["action_input"] = deepcopy(body)
+        selected["copy_safe_body"] = deepcopy(body)
+        selected["action_input_ready"] = False
+        selected["action_input_missing_fields"] = list(dict.fromkeys([
+            *(selected.get("action_input_missing_fields") or []), *missing,
+        ]))
+        selected["replace_before_submit"] = list(dict.fromkeys([
+            *(selected.get("replace_before_submit") or []), *missing,
+        ]))
+        selected["promotion_gate_result_requirements"] = {
+            "branch_service": {"runtime_plane": "dev", "port": AC_DEV_SERVICE_PORT,
+                               "bind_host": AC_DEV_BIND_HOST},
+            "required_lanes": ["direct_main", "mf_parallel", "mf_batch_parallel"],
+            "four_test_ids_must_be_distinct": True,
+            "statuses_must_reflect_actual_results": True,
+            "pass_synthesis_allowed": False,
+        }
+        request = selected.get("http_request")
+        if isinstance(request, dict):
+            request["body"] = deepcopy(body)
+    response["action_input"] = deepcopy(body)
+    response["copy_safe_body"] = deepcopy(body)
+    request = action.get("http_request")
+    if isinstance(request, dict):
+        request["body"] = deepcopy(body)
+    canonical = response.get("canonical_executable_action")
+    if isinstance(canonical, dict) and canonical.get("copy_safe_body"):
+        canonical["copy_safe_body"] = deepcopy(body)
+        canonical["action_input_ready"] = False
+        canonical["promotion_gate_result_requirements"] = deepcopy(
+            action["promotion_gate_result_requirements"]
+        )
+        canonical["action_input_missing_fields"] = list(dict.fromkeys([
+            *(canonical.get("action_input_missing_fields") or []), *missing,
+        ]))
+        canonical["replace_before_submit"] = list(dict.fromkeys([
+            *(canonical.get("replace_before_submit") or []), *missing,
+        ]))
+        host = canonical.get("host_realization")
+        if isinstance(host, dict):
+            host["required_replacement_paths"] = list(dict.fromkeys([
+                *(host.get("required_replacement_paths") or []),
+                *(f"copy_safe_body.{field}" for field in missing),
+            ]))
+    if isinstance(selected_guidance, dict):
+        nested = selected_guidance.get("next_action")
+        if isinstance(nested, dict):
+            nested["action_input"] = deepcopy(body)
+            nested["copy_safe_body"] = deepcopy(body)
+            nested["action_input_ready"] = False
+            nested["action_input_missing_fields"] = list(dict.fromkeys([
+                *(nested.get("action_input_missing_fields") or []), *missing,
+            ]))
+            nested["replace_before_submit"] = list(dict.fromkeys([
+                *(nested.get("replace_before_submit") or []), *missing,
+            ]))
+            nested["promotion_gate_result_requirements"] = deepcopy(
+                action["promotion_gate_result_requirements"]
+            )
+            request = nested.get("http_request")
+            if isinstance(request, dict):
+                request["body"] = deepcopy(body)
+            facade = nested.get("facade_action_projection")
+            if isinstance(facade, dict):
+                facade["action_input"] = deepcopy(body)
+                facade["copy_safe_body"] = deepcopy(body)
+                facade["action_input_ready"] = False
+                facade["action_input_missing_fields"] = list(dict.fromkeys([
+                    *(facade.get("action_input_missing_fields") or []), *missing,
+                ]))
+                facade["replace_before_submit"] = list(dict.fromkeys([
+                    *(facade.get("replace_before_submit") or []), *missing,
+                ]))
+                request = facade.get("http_request")
+                if isinstance(request, dict):
+                    request["body"] = deepcopy(body)
+        writer = selected_guidance.get("writer_role_safe_copy_payload")
+        if isinstance(writer, dict):
+            writer["copy_payload"] = deepcopy(body)
+            request = writer.get("http_request")
+            if isinstance(request, dict):
+                request["body"] = deepcopy(body)
+        for step in selected_guidance.get("ordered_steps") or []:
+            if isinstance(step, dict) and step.get("id") == "submit_one_qa_independent_verification":
+                request = step.get("http_request")
+                if isinstance(request, dict):
+                    request["body"] = deepcopy(body)
+
+
 def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
     response = _onboard_route_guide_service_response_base(conn, **kwargs)
     if (kwargs.get("project_id") != AC_PROJECT_ID or not kwargs.get("backlog_id")
@@ -182599,6 +182771,7 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
                               "operator_signoff": {key: signoff[key] for key in ("status", "nonce", "operator_principal_id", "expires_at", "queue_event_id")}}}
                 projection["prepare_required"] = True
         response["stable_promotion"] = projection
+        _ac_main_binding_direct_qa_guide_identity(response, projection)
     except (GovernanceError, RuntimeError, OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
         response["stable_promotion"] = {"state": "current_instance_evidence_incomplete", "reason": str(exc), "writes_performed": False, "activation_authorized": False}
     return response
