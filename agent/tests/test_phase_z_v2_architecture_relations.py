@@ -16,6 +16,7 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
     CallGraph,
     FunctionMeta,
     ModuleInfo,
+    _analyze_c_family_project,
     _c_family_modules,
     aggregate_functions_into_nodes,
     apply_dependency_patches,
@@ -332,6 +333,60 @@ def test_c_family_modules_keep_extension_identity_and_merge_same_file_actions(tm
         row["compilation_action_id"]
         for row in modules["overlay__cc"].adapter_symbols
     } == {"source-action-a", "source-action-b"}
+
+
+def test_c_family_profile_excludes_vendor_actions_and_module_owners(tmp_path, monkeypatch):
+    from agent.governance.language_adapters.c_family_adapter import CFamilyAdapter
+    from agent.governance.project_profile import discover_project_profile
+
+    project = tmp_path / "project"
+    source = project / "src" / "core.cc"
+    vendor_source = project / "vendor" / "ignored.cc"
+    vendor_header = project / "vendor" / "ignored.h"
+    generated = project / "generated" / "choice.h"
+    generated_source = project / "generated" / "choice.cc"
+    for path in (source, vendor_source, vendor_header, generated, generated_source):
+        _write(path, "int value() { return 1; }\n")
+    _write(project / ".aming-claw.yaml", (
+        "version: 2\nproject_id: c-family-profile\nlanguage: cpp\n"
+        "graph:\n  exclude_paths:\n    - vendor\n"
+    ))
+    entries = [
+        {"directory": str(project), "file": str(path), "arguments": ["clang++", "-c", str(path)]}
+        for path in (source, vendor_source, generated_source)
+    ]
+    (project / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
+    analyzed_files = []
+
+    def fake_analysis(adapter):
+        analyzed_files.append(adapter.action["file"])
+        return {
+            "status": "ok", "action": dict(adapter.action),
+            "files": [{"file": adapter.action["file"], "role": "source"}],
+            "symbols": [{
+                "symbol_id": "vendor-value", "name": "value", "qualified_name": "value",
+                "kind": "FunctionDecl", "file": str(vendor_header), "lineno": 1,
+                "is_definition": True,
+            }],
+            "relations": [
+                {"relation_type": "includes", "source_file": str(source), "target_file": str(vendor_header)},
+                {"relation_type": "includes", "source_file": str(source), "target_file": str(generated)},
+            ],
+            "macro_analysis": {}, "diagnostics": [],
+        }
+
+    monkeypatch.setattr(CFamilyAdapter, "analyze_action", fake_analysis)
+    profile = discover_project_profile(str(project))
+    assert profile.is_excluded_path(str(vendor_source))
+    analysis = _analyze_c_family_project(str(project), profile=profile)
+    assert analyzed_files == [str(source)]
+    assert [action["file"] for action in analysis["actions"]] == [str(source)]
+    assert any(row["target_file"] == str(generated) for row in analysis["relations"])
+
+    modules = _c_family_modules(str(project), analysis, profile=profile)
+    assert set(modules) == {"src.core"}
+    assert not modules["src.core"].functions
+    assert not build_module_dependency_edges(modules, CallGraph())
 
 
 def test_c_family_physical_definition_owner_resolves_header_declaration_aliases(tmp_path):

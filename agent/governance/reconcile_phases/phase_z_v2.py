@@ -501,13 +501,25 @@ def _adapter_for_source_file(file_path: str) -> LanguageAdapter:
     return adapter_for_path(file_path)
 
 
-def _analyze_c_family_project(project_root: str) -> Dict[str, Any]:
+def _analyze_c_family_project(project_root: str, *, profile: Optional[Any] = None) -> Dict[str, Any]:
     """Run each configured C-family translation unit once and retain its facts."""
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
+    root = Path(project_root).resolve()
     actions = load_compilation_actions(project_root)
     helper_path = str(os.environ.get("AC_CFAMILY_CLANG_INDEXER") or "")
     clang_path = str(os.environ.get("AC_CFAMILY_CLANG") or "")
     analyses: List[Dict[str, Any]] = []
     for action in actions:
+        source_path = Path(action.file).resolve()
+        if (
+            not source_path.is_relative_to(root)
+            or profile.is_excluded_path(str(source_path))
+            or profile.is_doc_path(str(source_path))
+            or profile.language_policy.is_generated_path(profile.normalize_relpath(str(source_path)))
+        ):
+            continue
         analyses.append(CFamilyAdapter(
             action,
             helper_path=helper_path,
@@ -517,7 +529,7 @@ def _analyze_c_family_project(project_root: str) -> Dict[str, Any]:
         "schema_version": "graph.c_family_analysis.v1",
         "status": "complete" if analyses and all(row.get("status") == "ok" for row in analyses) else "partial" if analyses else "not_configured",
         "extractor_schema_version": "aming_claw.cfamily_clang_index.v1",
-        "actions": [action.as_dict() for action in actions],
+        "actions": [row["action"] for row in analyses],
         "files": [item for row in analyses for item in (row.get("files") or []) if isinstance(item, dict)],
         "symbols": [item for row in analyses for item in (row.get("symbols") or []) if isinstance(item, dict)],
         "occurrences": [item for row in analyses for item in (row.get("occurrences") or []) if isinstance(item, dict)],
@@ -543,8 +555,11 @@ def _analyze_c_family_project(project_root: str) -> Dict[str, Any]:
     }
 
 
-def _c_family_modules(project_root: str, analysis: Mapping[str, Any]) -> Dict[str, ModuleInfo]:
+def _c_family_modules(project_root: str, analysis: Mapping[str, Any], *, profile: Optional[Any] = None) -> Dict[str, ModuleInfo]:
     """Project Clang definitions onto their physical source or header owner."""
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
     function_kinds = {
         "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl",
         "CXXDestructorDecl", "ObjCMethodDecl",
@@ -559,6 +574,13 @@ def _c_family_modules(project_root: str, analysis: Mapping[str, Any]) -> Dict[st
         try:
             path.relative_to(root)
         except ValueError:
+            return None
+        if (
+            profile.is_excluded_path(str(path))
+            or profile.is_test_path(str(path))
+            or profile.is_doc_path(str(path))
+            or profile.language_policy.is_generated_path(profile.normalize_relpath(str(path)))
+        ):
             return None
         return path
 
@@ -611,7 +633,11 @@ def _c_family_modules(project_root: str, analysis: Mapping[str, Any]) -> Dict[st
     for result, action, source_path in successful:
         language = str(action.get("language") or "")
         source_module = ensure_module(source_path, language)
-        symbols = [dict(row) for row in (result.get("symbols") or []) if isinstance(row, Mapping)]
+        symbols = [
+            dict(row) for row in (result.get("symbols") or [])
+            if isinstance(row, Mapping)
+            and (not row.get("file") or project_file(str(row["file"])) is not None)
+        ]
         relations: List[Dict[str, Any]] = []
         calls_by_source: Dict[Tuple[str, str], set[str]] = {}
         for row in result.get("relations") or []:
@@ -3478,9 +3504,8 @@ def build_module_dependency_edges(
                         "linkage": str(symbol.get("linkage") or ""),
                         "translation_unit_id": str(symbol.get("translation_unit_id") or ""),
                     })
-            definition_clang_id = str(symbol.get("definition_clang_id") or "")
             if (
-                definition_clang_id
+                symbol.get("is_definition")
                 and str(symbol.get("file") or "")
                 and str(symbol.get("kind") or "") in {
                     "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl",
@@ -3490,6 +3515,33 @@ def build_module_dependency_edges(
                 cfamily_file_modules.setdefault(
                     os.path.realpath(str(symbol.get("file") or "")), set()
                 ).add(module_name)
+        for function in module.functions or []:
+            for symbol_id in function.adapter_symbol_ids or []:
+                if symbol_id:
+                    cfamily_symbol_modules.setdefault(symbol_id, set()).add(module_name)
+
+    # A project header with declarations that resolve to one physical source
+    # definition can use that source as its exact-path owner. A header with
+    # definitions of its own was indexed above, and mixed owners stay ambiguous.
+    cfamily_declaration_files: Dict[str, List[Set[str]]] = {}
+    for module in modules.values():
+        if str(module.language or "") not in {"c", "cpp", "objective-c", "objective-cpp"} or str(module.source_kind or "") != "clang_ast":
+            continue
+        for symbol in module.adapter_symbols or []:
+            if symbol.get("is_definition") or not symbol.get("file"):
+                continue
+            if str(symbol.get("kind") or "") not in {
+                "FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl",
+                "CXXDestructorDecl", "ObjCMethodDecl",
+            }:
+                continue
+            owners = cfamily_symbol_modules.get(str(symbol.get("symbol_id") or ""), set())
+            cfamily_declaration_files.setdefault(os.path.realpath(str(symbol["file"])), []).append(owners)
+    for file_path, owner_sets in cfamily_declaration_files.items():
+        if all(len(owners) == 1 for owners in owner_sets):
+            owners = set().union(*owner_sets)
+            if len(owners) == 1:
+                cfamily_file_modules.setdefault(file_path, set()).update(owners)
 
     def unique_symbol_module(relation: Mapping[str, Any]) -> str:
         target_symbol_id = str(relation.get("target_symbol_id") or "")
@@ -3546,14 +3598,7 @@ def build_module_dependency_edges(
             return next(iter(owners))
         if len(owners) > 1:
             return ""
-        target_stem = Path(target_file).stem
-        matches = [
-            candidate_name
-            for candidate_name, candidate in modules.items()
-            if str(candidate.language or "") in {"c", "cpp", "objective-c", "objective-cpp"}
-            and Path(str(candidate.path or "")).stem == target_stem
-        ]
-        return matches[0] if len(matches) == 1 else ""
+        return ""
 
     for module_name, module in sorted(modules.items()):
         if str(module.language or "") not in {"c", "cpp", "objective-c", "objective-cpp"} or str(module.source_kind or "") != "clang_ast":
@@ -6225,7 +6270,7 @@ def build_graph_v2_from_symbols(
         project_root,
         profile=profile,
     )
-    c_family_analysis = _analyze_c_family_project(project_root)
+    c_family_analysis = _analyze_c_family_project(project_root, profile=profile)
     c_family_test_files = {
         _repo_relpath(project_root, str(row.get("file") or ""))
         for row in (c_family_analysis.get("files") or [])
@@ -6240,7 +6285,7 @@ def build_graph_v2_from_symbols(
         name: module for name, module in modules.items()
         if _repo_relpath(project_root, module.path) not in c_family_action_files
     }
-    modules.update(_c_family_modules(project_root, c_family_analysis))
+    modules.update(_c_family_modules(project_root, c_family_analysis, profile=profile))
     _record_phase_step(
         phase_trace,
         "production_module_parsing",

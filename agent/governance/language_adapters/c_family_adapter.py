@@ -666,6 +666,9 @@ class CFamilyAdapter:
                 "target_symbol_id": "",
                 "target_name": include,
                 "target_file": target_file,
+                # Clang -H reports every encountered header, including nested
+                # SDK headers; it does not establish a direct include parent.
+                "include_trace_kind": "encountered_closure",
                 "resolution": "resolved" if Path(target_file).is_file() else "external",
                 "condition_ref": condition_ref,
                 "macro_refs": macro_refs,

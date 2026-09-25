@@ -9,6 +9,11 @@ import pytest
 
 from agent.governance.compilation_context import action_for_file, load_compilation_actions
 from agent.governance.language_adapters import CFamilyAdapter, adapter_for_path, capability_for_path
+from agent.governance.reconcile_phases.phase_z_v2 import (
+    CallGraph,
+    _c_family_modules,
+    build_module_dependency_edges,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -289,3 +294,80 @@ def test_out_of_class_reference_store_owner_converges_across_header_and_definiti
     assert definition["canonical_decl_id"] == declaration["canonical_decl_id"]
     assert declaration["definition_clang_id"] == definition["clang_id"]
     assert definition["previous_decl_id"] == declaration["clang_id"]
+
+
+def test_sdk_same_name_include_has_no_project_owner_but_exact_header_does(c_family_runtime):
+    project = c_family_runtime["project"]
+    platform = project / "src" / "platform" / "platform.h"
+    platform.parent.mkdir(parents=True)
+    platform.write_text("inline int project_platform() { return 7; }\n", encoding="utf-8")
+    sdk_user = project / "src" / "sdk_user.cc"
+    sdk_user.write_text("#include <vector>\nint sdk_user() { return 1; }\n", encoding="utf-8")
+    project_user = project / "src" / "project_user.cc"
+    project_user.write_text(
+        '#include "platform/platform.h"\nint project_user() { return project_platform(); }\n',
+        encoding="utf-8",
+    )
+    generated = project / "generated" / "choice.h"
+    generated.parent.mkdir()
+    generated.write_text("inline int generated_choice() { return 2; }\n", encoding="utf-8")
+    generated_user = project / "src" / "generated_user.cc"
+    generated_user.write_text('#include "../generated/choice.h"\nint generated_user() { return generated_choice(); }\n', encoding="utf-8")
+    entries = [
+        {
+            "directory": str(project),
+            "file": str(source),
+            "arguments": [str(CLANGXX), "-std=c++17", "-isysroot", str(SDK), "-I", str(project / "src"), "-c", str(source)],
+        }
+        for source in (sdk_user, project_user, generated_user)
+    ]
+    (project / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
+    actions = load_compilation_actions(project)
+    results = [
+        CFamilyAdapter(action, helper_path=str(c_family_runtime["helper"]), clang_path=str(CLANGXX)).analyze_action()
+        for action in actions
+    ]
+    assert all(row["status"] == "ok" for row in results), [row["diagnostics"] for row in results]
+    sdk_result = next(row for row in results if row["action"]["file"] == str(sdk_user))
+    sdk_platform = SDK / "usr" / "include" / "c++" / "v1" / "__configuration" / "platform.h"
+    assert any(
+        row["relation_type"] == "includes"
+        and Path(row["target_file"]).resolve() == sdk_platform.resolve()
+        and row["include_trace_kind"] == "encountered_closure"
+        for row in sdk_result["relations"]
+    )
+    project_result = next(row for row in results if row["action"]["file"] == str(project_user))
+    assert any(
+        row["relation_type"] == "includes" and Path(row["target_file"]).resolve() == platform.resolve()
+        for row in project_result["relations"]
+    )
+    generated_result = next(row for row in results if row["action"]["file"] == str(generated_user))
+    assert any(path == str(generated.resolve()) for path, _digest in next(
+        action for action in actions if action.file == str(generated_user)
+    ).dependency_hashes)
+    assert any(
+        row["relation_type"] == "includes" and Path(row["target_file"]).resolve() == generated.resolve()
+        for row in generated_result["relations"]
+    )
+
+    modules = _c_family_modules(str(project), {"results": results})
+    assert "src.platform.platform" in modules
+    assert "generated.choice" not in modules
+    edges = build_module_dependency_edges(modules, CallGraph())
+    assert any(
+        row["relation_type"] == "includes_module"
+        and row["source_module"] == "src.platform.platform"
+        and row["target_module"] == "src.project_user"
+        for row in edges
+    )
+    assert any(
+        row["relation_type"] == "calls_module"
+        and row["source_module"] == "src.platform.platform"
+        and row["target_module"] == "src.project_user"
+        for row in edges
+    )
+    assert not any(
+        row["target_module"] == "src.sdk_user" and row["source_module"] == "src.platform.platform"
+        for row in edges
+    )
+    assert not any(row["target_module"] == "src.generated_user" and row["relation_type"] == "includes_module" for row in edges)
