@@ -44,13 +44,14 @@ export default function StaleGraphBanner({
   if (!health || !status) return null;
   const serviceVersion = (health.version || "").trim();
   const graphStale = status.current_state?.graph_stale;
+  const unresolved = graphStale?.comparison_status === "unresolved";
   const snapshotCommit = (
     graphStale?.active_graph_commit ||
     status.graph_snapshot_commit ||
     ""
   ).trim();
-  const headCommit = (graphStale?.head_commit || serviceVersion || "").trim();
-  if (!snapshotCommit || !headCommit) return null;
+  const headCommit = (unresolved ? "" : graphStale?.head_commit || serviceVersion || "").trim();
+  if ((!snapshotCommit || !headCommit) && !unresolved) return null;
 
   const stale =
     typeof graphStale?.is_stale === "boolean"
@@ -59,7 +60,7 @@ export default function StaleGraphBanner({
   const inProgress = phase !== "idle";
   // Keep banner visible briefly after success so the operator can see "done"
   // before it disappears on the next refresh tick.
-  if (!stale && !inProgress) return null;
+  if (!stale && !inProgress && !unresolved) return null;
 
   return (
     <div
@@ -74,27 +75,33 @@ export default function StaleGraphBanner({
           <ReconcileProgress phase={phase} detail={phaseDetail} />
         ) : (
           <>
-            <span className="banner-title">graph snapshot behind HEAD</span>{" "}
-            — HEAD is <span className="mono">{headCommit.slice(0, 7)}</span>,
-            active snapshot was built from{" "}
-            <span className="mono">{snapshotCommit.slice(0, 7)}</span>. Tree counts
-            and semantic scores reflect the snapshot, not the running code.
+            {unresolved ? (
+              <><span className="banner-title">graph target unverified</span>{" "}
+              — The linked main owner could not be verified. Check its checkout
+              and active snapshot provenance before updating the graph.</>
+            ) : (
+              <><span className="banner-title">graph snapshot behind HEAD</span>{" "}
+              — HEAD is <span className="mono">{headCommit.slice(0, 7)}</span>,
+              active snapshot was built from{" "}
+              <span className="mono">{snapshotCommit.slice(0, 7)}</span>. Tree counts
+              and semantic scores reflect the snapshot, not the running code.</>
+            )}
           </>
         )}
       </div>
       {!inProgress ? (
         <>
-          <button
+          {snapshotCommit ? <button
             className="banner-secondary"
             onClick={() => navigator.clipboard?.writeText?.(snapshotCommit)}
             title="Copy snapshot commit"
           >
             Copy commit
-          </button>
+          </button> : null}
           <button
             onClick={onQueueReconcile}
-            disabled={busy}
-            title="Rebuild and activate a current full snapshot, then rebuild projection"
+            disabled={busy || unresolved}
+            title={unresolved ? "Verify the linked main owner before updating" : "Rebuild and activate a current full snapshot, then rebuild projection"}
           >
             {busy ? "Updating…" : "Update graph"}
           </button>

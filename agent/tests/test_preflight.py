@@ -164,6 +164,30 @@ class TestCheckGraph(unittest.TestCase):
         result = check_graph(self.conn, self.pid)
         self.assertEqual(result["status"], "pass")
 
+    def test_explicit_unresolved_is_nonready_but_legacy_unknown_is_unchanged(self):
+        import governance.preflight as preflight
+        from unittest.mock import patch
+
+        base = {
+            "active_snapshot_id": "full-active",
+            "active_graph_commit": "a" * 40,
+            "target_head": "",
+            "graph_stale": False,
+            "graph_state": "unknown",
+            "pending_scope_reconcile_count": 0,
+        }
+        with patch.object(preflight, "_graph_governance_preflight_details", return_value={
+            **base, "comparison_status": "unresolved", "graph_state": "unresolved",
+        }):
+            unresolved = check_graph(self.conn, self.pid)
+        self.assertEqual(unresolved["status"], "fail")
+        self.assertEqual(unresolved["details"]["reason"], "graph_target_owner_unresolved")
+        with patch.object(preflight, "_graph_governance_preflight_details", return_value={
+            **base, "comparison_status": "",
+        }):
+            legacy = check_graph(self.conn, self.pid)
+        self.assertEqual(legacy["status"], "pass")
+
     def test_warn_orphan_pending(self):
         now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(

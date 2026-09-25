@@ -237173,6 +237173,177 @@ def _fresh_direct_linked_active_owner_world(conn, monkeypatch, tmp_path):
             "direct_row_files": row_files, "active_snapshot_id": activated["snapshot_id"]}
 
 
+def test_graph_status_uses_verified_linked_main_owner_even_for_empty_commit(
+    conn, monkeypatch, tmp_path,
+):
+    case = _fresh_direct_linked_active_owner_world(conn, monkeypatch, tmp_path)
+    before = conn.total_changes
+    current = server.handle_graph_governance_status(_ctx({"project_id": PID}))[
+        "current_state"
+    ]["graph_stale"]
+    assert current["comparison_status"] == "verified_linked_main_owner", current
+    assert current["head_commit"] == case["final"]
+    assert current["is_stale"] is False
+    assert conn.total_changes == before
+    original_status = store.graph_governance_status
+
+    def linked_warning_only(*args, **kwargs):
+        projection = original_status(*args, **kwargs)
+        return {
+            **projection,
+            "active_snapshot_warnings": [
+                item for item in projection["active_snapshot_warnings"]
+                if item.get("code") == "linked_worktree_execution_root"
+            ],
+        }
+
+    with monkeypatch.context() as only_linked_warning:
+        only_linked_warning.setattr(store, "graph_governance_status", linked_warning_only)
+        current_queue = server.handle_graph_governance_operations_queue(
+            _ctx({"project_id": PID})
+        )
+    assert current_queue["summary"]["graph_stale"]["is_stale"] is False
+    assert not any(
+        row["operation_id"].startswith("scope-reconcile:suspect-root:")
+        for row in current_queue["operations"]
+    )
+    with monkeypatch.context() as changed_rule:
+        changed_rule.setattr(server, "_graph_rule_fingerprint_status", lambda *_args: {
+            "available": True, "mismatch": True,
+            "snapshot_fingerprint": "sha256:old",
+            "current_fingerprint": "sha256:new",
+        })
+        rule_stale = server.handle_graph_governance_status(_ctx({"project_id": PID}))[
+            "current_state"
+        ]["graph_stale"]
+    assert rule_stale["is_stale"] is True
+    assert rule_stale["stale_reason"] == "rule_fingerprint_mismatch"
+
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "advance linked main"],
+        cwd=case["owner"], check=True, capture_output=True, text=True,
+    )
+    advanced = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=case["owner"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    stale = server.handle_graph_governance_status(_ctx({"project_id": PID}))[
+        "current_state"
+    ]["graph_stale"]
+    assert stale["comparison_status"] == "verified_linked_main_owner", stale
+    assert stale["head_commit"] == advanced
+    assert stale["is_stale"] is True
+    assert stale["changed_file_count"] == 0
+    assert stale["next_action"]["request"]["body"]["target_commit_sha"] == advanced
+    assert conn.total_changes == before
+
+
+@pytest.mark.parametrize(
+    "defect", ("dirty_owner", "missing_execution_root", "forged_common_dir",
+               "missing_active_ref", "detached_owner", "nonmain_owner",
+               "ambiguous_owner", "foreign_owner"),
+)
+def test_graph_status_linked_owner_failure_has_no_actionable_target(
+    conn, monkeypatch, tmp_path, defect,
+):
+    case = _fresh_direct_linked_active_owner_world(conn, monkeypatch, tmp_path)
+    if defect == "dirty_owner":
+        (case["owner"] / "untracked.txt").write_text("dirty\n")
+    elif defect == "missing_active_ref":
+        conn.execute(
+            "DELETE FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+            (PID,),
+        )
+        conn.commit()
+    elif defect in ("detached_owner", "nonmain_owner"):
+        command = ["git", "switch", "--detach"] if defect == "detached_owner" else [
+            "git", "switch", "-c", "not-main",
+        ]
+        subprocess.run(command, cwd=case["owner"], check=True,
+                       capture_output=True, text=True)
+    elif defect == "ambiguous_owner":
+        original_run = subprocess.run
+
+        def ambiguous_listing(args, **kwargs):
+            result = original_run(args, **kwargs)
+            if args == ["git", "worktree", "list", "--porcelain"]:
+                main_block = next(
+                    block for block in result.stdout.strip().split("\n\n")
+                    if "branch refs/heads/main" in block
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout=result.stdout + "\n" + main_block + "\n",
+                    stderr="",
+                )
+            return result
+
+        monkeypatch.setattr(server.subprocess, "run", ambiguous_listing)
+    else:
+        row = conn.execute(
+            "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, case["active_snapshot_id"]),
+        ).fetchone()
+        notes = json.loads(row["notes"])
+        checkout = notes["checkout_provenance"]
+        if defect == "missing_execution_root":
+            checkout["execution_root"] = ""
+        elif defect == "foreign_owner":
+            foreign = tmp_path / "foreign-repository"
+            _init_test_git_repo(foreign)
+            checkout["execution_root"] = str(foreign)
+        else:
+            checkout["git"]["git_common_dir"] = str(tmp_path / "foreign.git")
+        conn.execute(
+            "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+            (json.dumps(notes, sort_keys=True), PID, case["active_snapshot_id"]),
+        )
+        conn.commit()
+    before = conn.total_changes
+    status = server.handle_graph_governance_status(_ctx({"project_id": PID}))
+    unresolved = status["current_state"]["graph_stale"]
+    assert unresolved["comparison_status"] == "unresolved", unresolved
+    assert unresolved["head_commit"] == ""
+    assert unresolved["changed_files"] == []
+    assert "next_action" not in unresolved
+    queue = server.handle_graph_governance_operations_queue(_ctx({"project_id": PID}))
+    assert queue["summary"]["graph_stale"]["comparison_status"] == "unresolved"
+    assert not any(
+        row["operation_id"].startswith("scope-reconcile:stale:")
+        for row in queue["operations"]
+    )
+    from agent.governance import preflight
+    check = preflight.check_graph(conn, PID)
+    assert check["status"] == "fail", check
+    assert check["details"]["reason"] == "graph_target_owner_unresolved"
+    assert check["details"]["target_head"] == ""
+    assert conn.total_changes == before
+
+
+def test_graph_status_nested_project_keeps_legacy_zero_path_comparison(
+    conn, monkeypatch, tmp_path,
+):
+    repository = tmp_path / "shared-repository"
+    base = _init_test_git_repo(repository, filename="outside.txt")
+    nested = repository / "demo"
+    nested.mkdir()
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_args: nested)
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-nested-legacy-status",
+        commit_sha=base, snapshot_kind="full", graph_json=_graph(),
+        notes=json.dumps({"checkout_provenance": describe_checkout(nested, project_id=PID)}),
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+    _commit_test_git_files(repository, ["outside.txt"], message="outside nested root")
+    compared = server.handle_graph_governance_status(_ctx({"project_id": PID}))[
+        "current_state"
+    ]["graph_stale"]
+    assert compared["head_commit"] != base
+    assert compared["is_stale"] is False
+    assert compared["changed_files"] == []
+    assert "comparison_status" not in compared
+
+
 def test_fresh_direct_selects_proven_linked_active_main_owner(
     conn, monkeypatch, tmp_path,
 ):

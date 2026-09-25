@@ -91821,6 +91821,7 @@ def _exact_candidate_snapshot_qa_retry_guidance(
 def _graph_stale_scope_operation(
     project_id: str,
     *,
+    conn: sqlite3.Connection | None = None,
     status: dict[str, Any],
     pending_rows: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -91828,6 +91829,7 @@ def _graph_stale_scope_operation(
         dict(item) for item in status.get("active_snapshot_warnings") or []
         if isinstance(item, dict)
     ]
+    actionable_warnings = active_warnings
     stale_summary: dict[str, Any] = {
         "is_stale": False,
         "active_graph_commit": str(status.get("graph_snapshot_commit") or ""),
@@ -91840,8 +91842,99 @@ def _graph_stale_scope_operation(
         root = _graph_governance_project_root(project_id, {})
     except Exception:
         return None, stale_summary
+    from . import graph_snapshot_store as store
+    from .checkout_provenance import describe_checkout
+
+    active = (store.get_active_graph_snapshot(conn, project_id) or {}) if conn is not None else {}
+    if conn is not None and not active:
+        # A lost active ref must not erase a linked snapshot's owner claim and
+        # make a dirty registered checkout look like a comparable legacy root.
+        orphan_rows = conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id=? AND status='active' LIMIT 2",
+            (project_id,),
+        ).fetchall()
+        if len(orphan_rows) == 1:
+            active = dict(orphan_rows[0])
+    materialization = store.snapshot_materialization_provenance(active)
+    execution_root = str(materialization.get("execution_root") or "").strip()
+    snapshot_git = materialization.get("git") if isinstance(materialization.get("git"), Mapping) else {}
+    snapshot_worktree = str(snapshot_git.get("worktree_root") or "").strip()
+    linked_warning = any(
+        item.get("code") == "linked_worktree_execution_root"
+        for item in materialization.get("warnings") or []
+    )
+    linked = str(active.get("snapshot_kind") or "") == "full" and (
+        linked_warning
+        or bool(
+            execution_root and snapshot_worktree
+            and Path(execution_root).resolve() == Path(snapshot_worktree).resolve()
+            and Path(execution_root).resolve() != root.resolve()
+            and str(snapshot_git.get("git_common_dir") or "")
+            and str(snapshot_git.get("git_common_dir") or "") == str(
+                describe_checkout(root, project_id=project_id).get("git", {}).get("git_common_dir") or ""
+            )
+        )
+    )
+    graph_commit = str(status.get("graph_snapshot_commit") or "").strip().lower()
+    if linked:
+        # The active current-full snapshot identifies the candidate owner; no
+        # caller-supplied root or arbitrary branch may become an update target.
+        owner, error = (
+            _operator_supervised_direct_main_linked_main_owner(
+                registered_root=root,
+                expected_root=Path(execution_root).resolve(),
+                base_commit=graph_commit,
+            )
+            if execution_root else (None, "linked_execution_root_missing")
+        )
+        refs = conn.execute(
+            "SELECT snapshot_id, commit_sha FROM graph_snapshot_refs "
+            "WHERE project_id=? AND ref_name='active'", (project_id,),
+        ).fetchall()
+        proof = store._current_full_snapshot_provenance_binding(conn, project_id, active)
+        try:
+            companion = store.validate_snapshot_companion_integrity(active)
+        except (OSError, ValueError, KeyError):
+            companion = {"valid": False}
+        identity = materialization.get("canonical_project_identity") if isinstance(materialization.get("canonical_project_identity"), Mapping) else {}
+        registered_git = describe_checkout(root, project_id=project_id).get("git") or {}
+        owner_checkout = describe_checkout(owner, project_id=project_id) if owner else {}
+        owner_git = owner_checkout.get("git") if isinstance(owner_checkout.get("git"), Mapping) else {}
+        common_dirs = [str(item.get("git_common_dir") or "") for item in (snapshot_git, registered_git, owner_git)]
+        verified = bool(
+            owner is not None
+            and str(active.get("snapshot_kind") or "") == "full"
+            and str(active.get("status") or "") == "active"
+            and str(active.get("commit_sha") or "").strip().lower() == graph_commit
+            and len(refs) == 1
+            and str(refs[0]["snapshot_id"] or "") == str(active.get("snapshot_id") or "")
+            and str(refs[0]["commit_sha"] or "").strip().lower() == graph_commit
+            and companion.get("valid") is True
+            and proof.get("verified") is True
+            and str(proof.get("provenance_target_commit") or "").strip().lower() == graph_commit
+            and materialization.get("execution_root_role") == "execution_root"
+            and Path(execution_root).resolve() == owner
+            and str(snapshot_git.get("worktree_root") or "") == str(owner)
+            and identity.get("type") == "git"
+            and identity.get("project_id") == project_id
+            and str(identity.get("commit_sha") or "").strip().lower() == graph_commit
+            and all(common_dirs)
+            and len({str(Path(item).resolve()) for item in common_dirs}) == 1
+            and str(owner_checkout.get("commit_sha") or "").strip().lower() == _git_head_commit(owner).strip().lower()
+        )
+        if not verified:
+            stale_summary.update({
+                "comparison_status": "unresolved",
+                "comparison_reason": error or "active_linked_main_provenance_invalid",
+            })
+            return None, stale_summary
+        root = owner
+        stale_summary["comparison_status"] = "verified_linked_main_owner"
+        actionable_warnings = [
+            item for item in active_warnings
+            if item.get("code") != "linked_worktree_execution_root"
+        ]
     head_commit = _git_head_commit(root)
-    graph_commit = str(status.get("graph_snapshot_commit") or "")
     stale_summary["head_commit"] = head_commit
     if not head_commit or not graph_commit:
         return None, stale_summary
@@ -91891,7 +91984,7 @@ def _graph_stale_scope_operation(
                 ),
             }
             return operation, stale_summary
-        if not active_warnings:
+        if not actionable_warnings:
             return None, stale_summary
         operation = {
             "operation_id": f"scope-reconcile:suspect-root:{head_commit[:12]}",
@@ -91922,7 +92015,7 @@ def _graph_stale_scope_operation(
         }
         return operation, stale_summary
     all_changed_files = _git_changed_paths_between(root, graph_commit, head_commit, limit=None)
-    if not all_changed_files:
+    if not all_changed_files and not linked:
         return None, stale_summary
     changed_files = all_changed_files[:25]
     stale_summary.update({
@@ -92072,6 +92165,7 @@ def _dashboard_current_state(
     pending_rows = list(status.get("pending_scope_reconcile") or [])
     _operation, graph_stale = _graph_stale_scope_operation(
         project_id,
+        conn=conn,
         status=status,
         pending_rows=pending_rows,
     )
@@ -92690,6 +92784,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
         pending_scope_rows = list(status.get("pending_scope_reconcile") or [])
         stale_operation, graph_stale_summary = _graph_stale_scope_operation(
             project_id,
+            conn=conn,
             status=status,
             pending_rows=pending_scope_rows,
         )

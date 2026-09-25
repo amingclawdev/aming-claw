@@ -27,6 +27,8 @@ export interface StatusResponse {
       is_stale: boolean;
       active_graph_commit: string;
       head_commit: string;
+      comparison_status?: "unresolved" | "verified_linked_main_owner";
+      comparison_reason?: string;
       changed_files?: string[];
       changed_file_count?: number;
     };

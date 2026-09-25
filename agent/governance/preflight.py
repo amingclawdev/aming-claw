@@ -242,6 +242,7 @@ def _graph_governance_preflight_details(conn, project_id: str) -> dict:
     pending_rows = list(status.get("pending_scope_reconcile") or [])
     _operation, graph_stale = governance_server._graph_stale_scope_operation(
         project_id,
+        conn=conn,
         status=status,
         pending_rows=pending_rows,
     )
@@ -252,16 +253,20 @@ def _graph_governance_preflight_details(conn, project_id: str) -> dict:
     )
     target_head = str(graph_stale.get("head_commit") or "")
     is_stale = bool(graph_stale.get("is_stale"))
+    comparison_status = str(graph_stale.get("comparison_status") or "")
     pending_count = int(status.get("pending_scope_reconcile_count") or len(pending_rows))
     graph_state = "stale" if is_stale else "current"
     if not target_head:
         graph_state = "unknown"
+    if comparison_status == "unresolved":
+        graph_state = "unresolved"
     return {
         "active_snapshot_id": str(status.get("active_snapshot_id") or ""),
         "active_graph_commit": active_graph_commit,
         "target_head": target_head,
         "graph_stale": is_stale,
         "graph_state": graph_state,
+        "comparison_status": comparison_status,
         "pending_scope_reconcile_count": pending_count,
     }
 
@@ -303,6 +308,9 @@ def check_graph(conn, project_id: str) -> dict:
             "pending_count": len(pending_ids),
             **graph_details,
         }
+        if graph_details.get("comparison_status") == "unresolved":
+            details["reason"] = "graph_target_owner_unresolved"
+            return _fail(details)
         if graph_details.get("graph_stale"):
             details["reason"] = "active_graph_stale"
             return _fail(details)
