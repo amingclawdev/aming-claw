@@ -237185,6 +237185,16 @@ def test_graph_status_uses_verified_linked_main_owner_even_for_empty_commit(
     assert current["head_commit"] == case["final"]
     assert current["is_stale"] is False
     assert conn.total_changes == before
+    with monkeypatch.context() as unrelated_dev_runtime:
+        unrelated_dev_runtime.setattr(server, "_runtime_plane", lambda: "dev")
+        unrelated_dev_runtime.setattr(
+            server, "_operator_supervised_direct_main_dev_world_authority",
+            lambda: pytest.fail("external linked status must use main owner proof"),
+        )
+        external_status = server.handle_graph_governance_status(
+            _ctx({"project_id": PID})
+        )["current_state"]["graph_stale"]
+    assert external_status["comparison_status"] == "verified_linked_main_owner"
     original_status = store.graph_governance_status
 
     def linked_warning_only(*args, **kwargs):
@@ -237368,6 +237378,78 @@ def test_graph_status_nonfull_linked_owner_is_unresolved(
     check = preflight.check_graph(conn, PID)
     assert check["status"] == "fail", check
     assert check["details"]["reason"] == "graph_target_owner_unresolved"
+    assert conn.total_changes == before
+
+
+def test_graph_status_ac_dev_current_full_uses_verified_loaded_dev_root(
+    conn, monkeypatch, tmp_path,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    registered = tmp_path / "registered-ac-project"
+    base = _init_test_git_repo(registered, filename="runtime.py")
+    dev_root = tmp_path / "linked-ac-dev"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", server.AC_DEV_BRANCH,
+         str(dev_root), base],
+        cwd=registered, check=True, capture_output=True, text=True,
+    )
+    (registered / "registered-dirty.txt").write_text("unrelated\n")
+    snapshot = store.create_graph_snapshot(
+        conn, "aming-claw", snapshot_id="full-ac-dev-linked-status",
+        commit_sha=base, snapshot_kind="full", graph_json=_graph(),
+        notes=json.dumps({"checkout_provenance": describe_checkout(
+            dev_root, project_id="aming-claw",
+        )}),
+    )
+    store.index_graph_snapshot(
+        conn, "aming-claw", snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    monkeypatch.setattr(
+        governance_db, "classify_graph_activation_connection", lambda _conn: {
+            "runtime_plane": "dev",
+            "active_graph_activation_allowed": True,
+            "classification_reason": "verified_dev_cow_successor_receipt_history",
+            "world_id": "ac-dev", "project_id": "aming-claw", "port": 40008,
+            "cow_successor_verified": True,
+            "source_checkout_verified": True,
+            "live_runtime_custody_verified": True,
+        },
+    )
+    store.activate_graph_snapshot(conn, "aming-claw", snapshot["snapshot_id"])
+    _record_source_free_current_full_provenance(
+        conn, project_id="aming-claw", snapshot_id=snapshot["snapshot_id"],
+        commit_sha=base, suffix="ac-dev-status",
+    )
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_graph_governance_project_root", lambda *_args: registered,
+    )
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: _fixed_ac_dev_direct_world(dev_root, base),
+    )
+    before = conn.total_changes
+    current = server.handle_graph_governance_status(
+        _ctx({"project_id": "aming-claw"})
+    )["current_state"]["graph_stale"]
+    assert current["comparison_status"] == "verified_linked_main_owner", current
+    assert current["head_commit"] == base
+    assert current["is_stale"] is False
+    assert conn.total_changes == before
+
+    with monkeypatch.context() as invalid_world:
+        invalid_world.setattr(
+            server, "_operator_supervised_direct_main_dev_world_authority",
+            lambda: _fixed_ac_dev_direct_world(registered, base),
+        )
+        unresolved = server.handle_graph_governance_status(
+            _ctx({"project_id": "aming-claw"})
+        )["current_state"]["graph_stale"]
+    assert unresolved["comparison_status"] == "unresolved"
+    assert unresolved["head_commit"] == ""
+    assert "next_action" not in unresolved
     assert conn.total_changes == before
 
 

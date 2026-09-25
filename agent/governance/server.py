@@ -91881,14 +91881,36 @@ def _graph_stale_scope_operation(
     if linked:
         # The active current-full snapshot identifies the candidate owner; no
         # caller-supplied root or arbitrary branch may become an update target.
-        owner, error = (
-            _operator_supervised_direct_main_linked_main_owner(
+        dev_world: dict[str, Any] = {}
+        if project_id == "aming-claw" and _runtime_plane() == "dev":
+            try:
+                dev_world = _operator_supervised_direct_main_dev_world_authority()
+            except GovernanceError:
+                owner, error = None, "ac_dev_runtime_world_invalid"
+            else:
+                dev_root = str(dev_world.get("target_project_root") or "").strip()
+                owner = Path(dev_root).resolve() if dev_root else None
+                error = "" if (
+                    dev_world.get("accepted") is True
+                    and owner is not None
+                    and execution_root
+                    and owner == Path(execution_root).resolve()
+                    and _git_clean_worktree_verified(owner)
+                    and _git_head_commit(owner).strip().lower()
+                    == str(dev_world.get("target_head_commit") or "").strip().lower()
+                    and _git_commit_is_ancestor(
+                        owner, graph_commit,
+                        str(dev_world.get("target_head_commit") or ""),
+                    )
+                ) else "ac_dev_snapshot_owner_mismatch"
+                if error:
+                    owner = None
+        else:
+            owner, error = _operator_supervised_direct_main_linked_main_owner(
                 registered_root=root,
                 expected_root=Path(execution_root).resolve(),
                 base_commit=graph_commit,
-            )
-            if execution_root else (None, "linked_execution_root_missing")
-        )
+            ) if execution_root else (None, "linked_execution_root_missing")
         refs = conn.execute(
             "SELECT snapshot_id, commit_sha FROM graph_snapshot_refs "
             "WHERE project_id=? AND ref_name='active'", (project_id,),
