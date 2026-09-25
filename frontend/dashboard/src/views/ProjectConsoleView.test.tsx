@@ -20,6 +20,7 @@ function status(
   isStale: boolean,
   comparisonStatus?: "unresolved" | "verified_linked_main_owner",
   pending = 0,
+  headCommit = comparisonStatus === "unresolved" ? "" : isStale ? head : snapshot,
 ): StatusResponse {
   return {
     ok: true, project_id: project.project_id,
@@ -30,7 +31,7 @@ function status(
     pending_scope_reconcile: pending ? [{ commit_sha: head }] : [],
     current_state: { graph_stale: {
       is_stale: isStale, active_graph_commit: snapshot,
-      head_commit: comparisonStatus === "unresolved" ? "" : head,
+      head_commit: headCommit,
       comparison_status: comparisonStatus,
       changed_files: [], changed_file_count: 0,
     } },
@@ -58,7 +59,7 @@ function assertConsole(condition: boolean, message: string): void {
 }
 
 const unresolvedCurrent = runtime(status(false, "unresolved"));
-const unresolvedContradictory = runtime(status(true, "unresolved", 1));
+const unresolvedContradictory = runtime(status(true, "unresolved", 1, head));
 assertConsole(
   graphKpiCountsFor([unresolvedCurrent, unresolvedContradictory]).current === 0
     && graphKpiCountsFor([unresolvedCurrent, unresolvedContradictory]).stale === 0,
@@ -82,6 +83,9 @@ assertConsole(graphKpiCountsFor([verifiedCurrent, verifiedStale]).current === 1
   "verified linked current and stale count normally");
 assertConsole(lifecycleFor(project, verifiedCurrent).kind === "ready",
   "verified linked equal-HEAD remains ready");
+assertConsole(verifiedCurrent.status?.current_state?.graph_stale?.head_commit === snapshot
+  && targetCommitFor(verifiedCurrent) === snapshot,
+  "verified current fixture actually compares equal HEAD and snapshot commits");
 assertConsole(lifecycleFor(project, verifiedStale).kind === "graph_stale"
   && targetCommitFor(verifiedStale) === head
   && rowMarkup(verifiedStale).includes(">Update graph</button>"),
@@ -89,7 +93,7 @@ assertConsole(lifecycleFor(project, verifiedStale).kind === "graph_stale"
 
 const legacy = runtime(status(false));
 const legacyStale = runtime(status(true));
-const legacyPending = runtime(status(false, undefined, 1));
+const legacyPending = runtime(status(false, undefined, 1, ""));
 assertConsole(graphKpiCountsFor([legacy]).current === 1
   && lifecycleFor(project, legacy).kind === "ready",
   "legacy current state remains ready");
