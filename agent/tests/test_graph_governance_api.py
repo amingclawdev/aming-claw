@@ -237344,6 +237344,33 @@ def test_graph_status_nested_project_keeps_legacy_zero_path_comparison(
     assert "comparison_status" not in compared
 
 
+def test_graph_status_nonfull_linked_owner_is_unresolved(
+    conn, monkeypatch, tmp_path,
+):
+    case = _fresh_direct_linked_active_owner_world(conn, monkeypatch, tmp_path)
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-linked-owner-invalid-full-proof",
+        commit_sha=case["final"], snapshot_kind="scope", graph_json=_graph(),
+        notes=json.dumps({"checkout_provenance": describe_checkout(
+            case["owner"], project_id=PID,
+        )}),
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+    before = conn.total_changes
+    state = server.handle_graph_governance_status(_ctx({"project_id": PID}))[
+        "current_state"
+    ]["graph_stale"]
+    assert state["comparison_status"] == "unresolved", state
+    assert state["head_commit"] == ""
+    assert "next_action" not in state
+    from agent.governance import preflight
+    check = preflight.check_graph(conn, PID)
+    assert check["status"] == "fail", check
+    assert check["details"]["reason"] == "graph_target_owner_unresolved"
+    assert conn.total_changes == before
+
+
 def test_fresh_direct_selects_proven_linked_active_main_owner(
     conn, monkeypatch, tmp_path,
 ):

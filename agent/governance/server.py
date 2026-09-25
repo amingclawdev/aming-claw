@@ -91863,17 +91863,19 @@ def _graph_stale_scope_operation(
         item.get("code") == "linked_worktree_execution_root"
         for item in materialization.get("warnings") or []
     )
-    linked = str(active.get("snapshot_kind") or "") == "full" and (
-        linked_warning
-        or bool(
-            execution_root and snapshot_worktree
-            and Path(execution_root).resolve() == Path(snapshot_worktree).resolve()
-            and Path(execution_root).resolve() != root.resolve()
-            and str(snapshot_git.get("git_common_dir") or "")
-            and str(snapshot_git.get("git_common_dir") or "") == str(
-                describe_checkout(root, project_id=project_id).get("git", {}).get("git_common_dir") or ""
-            )
+    same_repo_linked_root = bool(
+        execution_root and snapshot_worktree
+        and Path(execution_root).resolve() == Path(snapshot_worktree).resolve()
+        and Path(execution_root).resolve() != root.resolve()
+        and str(snapshot_git.get("git_common_dir") or "")
+        and str(snapshot_git.get("git_common_dir") or "") == str(
+            describe_checkout(root, project_id=project_id).get("git", {}).get("git_common_dir") or ""
         )
+    )
+    linked = (
+        snapshot_git.get("is_linked_worktree") is True
+        or linked_warning
+        or same_repo_linked_root
     )
     graph_commit = str(status.get("graph_snapshot_commit") or "").strip().lower()
     if linked:
