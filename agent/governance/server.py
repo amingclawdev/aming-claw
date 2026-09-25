@@ -212066,6 +212066,22 @@ def _handle_task_timeline_append(ctx: RequestContext):
                     contract_execution_id=strict_direct_execution_id,
                 )
                 if admitted_events:
+                    replay_session = ctx.require_auth(conn)
+                    if not (
+                        strict_direct_task_id == strict_direct_execution_id
+                        and trusted_contract_runtime_actor_role == "observer"
+                        and str(replay_session.get("role") or "").strip() == "observer"
+                        and str(replay_session.get("project_id") or "").strip() == project_id
+                        and str(replay_session.get("session_id") or "").strip()
+                        not in {"", "anonymous"}
+                        and str(replay_session.get("principal_id") or "").strip()
+                        not in {"", "anonymous"}
+                    ):
+                        raise GovernanceError(
+                            "operator_supervised_direct_main_replay_observer_auth_required",
+                            "Direct receipt replay requires its authenticated observer boundary",
+                            403, {"zero_write_rejection": True, "writes_performed": False},
+                        )
                     requested_fingerprint = _operator_supervised_direct_main_pre_mutation_fingerprint(
                         provisional_event
                     )

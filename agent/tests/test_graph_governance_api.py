@@ -237377,6 +237377,46 @@ def test_fresh_direct_selects_proven_linked_active_main_owner(
     assert replay["writes_performed"] is False
     assert replay["payload"] == admitted["payload"]
     assert conn.total_changes == before_changes
+    unauthenticated = _ctx(
+        {"project_id": PID}, method="POST", body=copy.deepcopy(pre_mutation),
+    )
+    spoofed = _ctx(
+        {"project_id": PID}, method="POST",
+        body={**copy.deepcopy(pre_mutation), "role": "observer",
+              "observer_session_id": "ses-observer",
+              "principal_id": "observer-principal"},
+    )
+    wrong_principal = _ctx_with_role(
+        {"project_id": PID}, "observer", method="POST",
+        body=copy.deepcopy(pre_mutation),
+    )
+    wrong_principal._session["principal_id"] = "anonymous"
+    wrong_session = _ctx_with_role(
+        {"project_id": PID}, "observer", method="POST",
+        body=copy.deepcopy(pre_mutation),
+    )
+    wrong_session._session["session_id"] = "anonymous"
+    wrong_project = _ctx_with_role(
+        {"project_id": PID}, "observer", method="POST",
+        body=copy.deepcopy(pre_mutation),
+    )
+    wrong_project._session["project_id"] = "foreign-project"
+    wrong_route_body = copy.deepcopy(pre_mutation)
+    wrong_route_body["route_token_ref"] = "rtok-foreign-linked-owner"
+    rejected_contexts = [
+        unauthenticated,
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST",
+                       body=copy.deepcopy(pre_mutation)),
+        _ctx_with_role({"project_id": PID}, "qa", method="POST",
+                       body=copy.deepcopy(pre_mutation)),
+        spoofed, wrong_principal, wrong_session, wrong_project,
+        _ctx_with_role({"project_id": PID}, "observer", method="POST",
+                       body=wrong_route_body),
+    ]
+    for rejected_ctx in rejected_contexts:
+        with pytest.raises(GovernanceError):
+            server.handle_task_timeline_append(rejected_ctx)
+        assert conn.total_changes == before_changes
     altered = copy.deepcopy(pre_mutation)
     altered["payload"]["reason"] = "changed request after owner drift"
     with pytest.raises(GovernanceError) as altered_rejected:
