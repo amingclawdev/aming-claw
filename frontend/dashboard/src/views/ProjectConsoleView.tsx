@@ -26,7 +26,7 @@ interface Props {
   onRefresh(): Promise<void> | void;
 }
 
-interface ProjectRuntime {
+export interface ProjectRuntime {
   projectId: string;
   status?: StatusResponse;
   summary?: ActiveSummaryResponse;
@@ -55,6 +55,7 @@ type LifecycleKind =
   | "loading"
   | "ready"
   | "graph_stale"
+  | "graph_unverified"
   | "graph_missing"
   | "config_missing"
   | "reconcile_pending"
@@ -164,8 +165,7 @@ export default function ProjectConsoleView({
     const runtimes = Object.values(runtime);
     return {
       total: projects.length,
-      current: runtimes.filter((r) => r.status?.current_state?.graph_stale?.is_stale === false).length,
-      stale: runtimes.filter((r) => r.status?.current_state?.graph_stale?.is_stale === true).length,
+      ...graphKpiCountsFor(runtimes),
       missing: projects.filter((p) => lifecycleFor(p, runtime[p.project_id]).kind === "graph_missing").length,
       backlogOpen: runtimes.reduce((sum, r) => sum + countOpenBacklog(r.backlog), 0),
     };
@@ -550,7 +550,7 @@ export default function ProjectConsoleView({
   );
 }
 
-function ProjectRow({
+export function ProjectRow({
   project,
   runtime,
   selected,
@@ -850,12 +850,40 @@ function formatRoute(route?: { provider?: string; model?: string } | null): stri
   return `${provider} / ${model}`;
 }
 
-function lifecycleFor(project: ProjectListItem, runtime?: ProjectRuntime): Lifecycle {
+function graphComparisonUnresolved(status?: StatusResponse): boolean {
+  return status?.current_state?.graph_stale?.comparison_status === "unresolved";
+}
+
+export function graphKpiCountsFor(runtimes: Array<{ status?: StatusResponse }>): {
+  current: number;
+  stale: number;
+} {
+  return {
+    current: runtimes.filter((row) =>
+      !graphComparisonUnresolved(row.status)
+      && row.status?.current_state?.graph_stale?.is_stale === false
+    ).length,
+    stale: runtimes.filter((row) =>
+      !graphComparisonUnresolved(row.status)
+      && row.status?.current_state?.graph_stale?.is_stale === true
+    ).length,
+  };
+}
+
+export function lifecycleFor(project: ProjectListItem, runtime?: ProjectRuntime): Lifecycle {
   if (!runtime) {
     return {
       kind: "loading",
       label: "loading",
       detail: "checking",
+      className: "status-unknown",
+    };
+  }
+  if (graphComparisonUnresolved(runtime.status)) {
+    return {
+      kind: "graph_unverified",
+      label: "unverified",
+      detail: "linked graph target owner unverified",
       className: "status-unknown",
     };
   }
@@ -923,7 +951,8 @@ function lifecycleFor(project: ProjectListItem, runtime?: ProjectRuntime): Lifec
   };
 }
 
-function targetCommitFor(runtime?: ProjectRuntime): string {
+export function targetCommitFor(runtime?: ProjectRuntime): string {
+  if (graphComparisonUnresolved(runtime?.status)) return "";
   const stale = runtime?.status?.current_state?.graph_stale;
   if (stale?.head_commit) return stale.head_commit;
   const pending = runtime?.status?.pending_scope_reconcile?.[0] as
