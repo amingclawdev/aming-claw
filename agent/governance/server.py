@@ -158605,11 +158605,20 @@ def _operator_supervised_direct_main_world_ref(
                     project_root = owner
                     resolved_top_level = owner
                     head_commit = snapshot_commit
-            elif active_root and Path(active_root).resolve() == project_root:
-                if _qa_git_bytes(project_root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout:
+            else:
+                registered_status = _qa_git_bytes(
+                    project_root,
+                    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                )
+                retained_dirty, _ = _qa_filter_authenticated_demo_control_metadata_entries(
+                    project_root,
+                    project_id=project_id,
+                    dirty_entries=[
+                        entry for entry in registered_status.stdout.split(b"\0") if entry
+                    ],
+                )
+                if registered_status.returncode != 0 or retained_dirty:
                     error = "dirty_registered_root_without_linked_active_owner"
-            elif _qa_git_bytes(project_root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout:
-                error = "dirty_registered_root_without_linked_active_owner"
     accepted = bool(
         project_root
         and resolved_top_level == project_root

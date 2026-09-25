@@ -237055,6 +237055,57 @@ def test_rev10_linked_owner_consumer_rejects_stale_or_untrusted_owner(
     )["completed_lines"]) == before_lines
 
 
+@pytest.mark.parametrize(
+    "marker_state",
+    ["authorized", "unregistered", "modified_marker", "extra_dirty", "tracked_modified"],
+)
+def test_direct_registered_root_demo_marker_uses_authenticated_filter(
+    conn, monkeypatch, tmp_path, marker_state,
+):
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    root = demo_root / "direct-registered-demo-marker"
+    _init_test_git_repo(root)
+    environment = {
+        "id": "direct-registered-demo-marker",
+        "template_id": "daily-planner-lite",
+        "project_id": PID,
+        "fixture_root": str(root),
+        "created_at": "2026-08-23T00:00:00Z",
+    }
+    server._write_demo_environment_marker(environment, PID)
+    if marker_state != "unregistered":
+        server._write_demo_environment_registry(PID, [environment])
+    monkeypatch.setattr(
+        server.project_service, "project_exists", lambda project_id: project_id == PID,
+    )
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root", lambda *_args, **_kwargs: root,
+    )
+    marker = root / server.DEMO_ENVIRONMENT_MARKER
+    if marker_state == "modified_marker":
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["created_at"] = "2026-08-24T00:00:00Z"
+        marker.write_text(json.dumps(payload), encoding="utf-8")
+    elif marker_state == "extra_dirty":
+        (root / "real-dirty.txt").write_text("dirty\n")
+    elif marker_state == "tracked_modified":
+        subprocess.run(
+            ["git", "add", server.DEMO_ENVIRONMENT_MARKER], cwd=root,
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "track marker"], cwd=root,
+            check=True, capture_output=True, text=True,
+        )
+        marker.write_text(marker.read_text(encoding="utf-8") + " ")
+    before = conn.total_changes
+    world = server._operator_supervised_direct_main_world_ref(
+        project_id=PID, conn=conn,
+    )
+    assert world["accepted"] is (marker_state == "authorized"), (marker_state, world)
+    assert conn.total_changes == before
+
+
 def _fresh_direct_linked_active_owner_world(conn, monkeypatch, tmp_path):
     case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
 
