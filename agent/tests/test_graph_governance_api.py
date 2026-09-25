@@ -227242,7 +227242,7 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_across_wip(
     assert guide["dev_local_graph_bootstrap"][
         "per_wip_reconcile_provenance_required"
     ] is False
-    assert guide["next_legal_action"]["line_id"] == "observer_bind_direct_scope"
+    assert guide["next_legal_action"]["id"] == "operator_supervised_direct_main_graph_first", guide
     assert guide["next_legal_action"].get("mcp_tool") != (
         "graph_current_full_reconcile"
     )
@@ -237053,6 +237053,361 @@ def test_rev10_linked_owner_consumer_rejects_stale_or_untrusted_owner(
     assert len(server._contract_runtime_store(conn).get(
         record["contract_execution_id"]
     )["completed_lines"]) == before_lines
+
+
+def _fresh_direct_linked_active_owner_world(conn, monkeypatch, tmp_path):
+    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+
+    def build(_conn, project_id, root, **kwargs):
+        snapshot = store.create_graph_snapshot(
+            _conn, project_id, snapshot_id=kwargs["snapshot_id"],
+            commit_sha=case["final"], snapshot_kind="full",
+            graph_json=_graph(), notes=json.dumps({
+                "run_id": kwargs["run_id"],
+                "checkout_provenance": describe_checkout(root, project_id=project_id),
+                "full_reconcile_anchor": {
+                    "project_id": project_id, "snapshot_id": kwargs["snapshot_id"],
+                    "anchor_commit": case["final"], "reconcile_mode": "full",
+                },
+            }),
+        )
+        _conn.commit()
+        return {
+            "ok": True, "snapshot_id": snapshot["snapshot_id"],
+            "projection_id": "semproj-linked-direct-world",
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", build)
+    status, activated = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=case["body"]),
+    )
+    assert status == 201, activated
+    assert activated["activated"] is True
+    backlog_id = "AC-DIRECT-LINKED-ACTIVE-OWNER-TEST"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = ["agent/governance/server.py"]
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
+        (json.dumps(row_files), "[]", backlog_id),
+    )
+    conn.commit()
+    revision = str(server._operator_supervised_direct_main_fresh_definition()["revision"])
+    task_id = server._operator_supervised_direct_main_execution_id(
+        PID, backlog_id, revision=revision,
+    )
+    route_token_ref = "rtok-direct-linked-active-owner-test"
+    route_identity = {
+        "route_id": "route-direct-linked-active-owner-test",
+        "route_context_hash": _fake_sha("direct-linked-context"),
+        "prompt_contract_id": "rprompt-direct-linked-owner",
+        "prompt_contract_hash": _fake_sha("direct-linked-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("direct-linked-manifest"),
+        "route_token_ref": route_token_ref,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn, project_id=PID, route_token_ref=route_token_ref,
+        token={
+            **route_identity, "caller_role": "observer",
+            "allowed_actions": list(server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS),
+            "target_files": row_files, "owned_files": row_files,
+            "scope": {"project_id": PID, "backlog_id": backlog_id, "task_id": task_id},
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [f"backlog:{backlog_id}", f"contract_runtime:{task_id}"],
+        },
+    )
+    return {**case, "direct_backlog_id": backlog_id, "direct_task_id": task_id,
+            "direct_route_token_ref": route_token_ref, "direct_route_identity": route_identity,
+            "direct_row_files": row_files, "active_snapshot_id": activated["snapshot_id"]}
+
+
+def test_fresh_direct_selects_proven_linked_active_main_owner(
+    conn, monkeypatch, tmp_path,
+):
+    case = _fresh_direct_linked_active_owner_world(conn, monkeypatch, tmp_path)
+    before = conn.total_changes
+    world = server._operator_supervised_direct_main_world_ref(project_id=PID, conn=conn)
+    assert world["accepted"] is True, world
+    assert world["target_project_root"] == str(case["owner"].resolve())
+    assert world["base_commit"] == case["final"]
+    assert conn.total_changes == before
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body={"backlog_id": case["direct_backlog_id"], "role": "observer",
+                  "work_type": "operator_supervised_direct_main",
+                  "route_token_ref": case["direct_route_token_ref"],
+                  "view": "compact"},
+        )
+    )
+    assert guide["contract_execution_id"] == case["direct_task_id"]
+    assert guide["next_legal_action"]["id"] == "operator_supervised_direct_main_graph_first", guide
+    graph = guide["next_legal_action"]["graph_query_close_authority"]
+    assert graph["server_derived_world_ref"]["root_source"] == "verified_linked_active_main_owner"
+    assert graph["copy_safe_graph_query"]["ready"] is True, graph
+    assert graph["copy_safe_graph_query"]["arguments"]["snapshot_id"] == "active"
+    query = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body=copy.deepcopy(graph["copy_safe_graph_query"]["arguments"]),
+        )
+    )
+    assert query["ok"] is True, query
+    assert query["graph_query_identity"]["snapshot_id"] == case["active_snapshot_id"]
+    pre_mutation = _canonical_parentless_direct_main_pre_mutation_body(
+        append_base={
+            "backlog_id": case["direct_backlog_id"],
+            "task_id": case["direct_task_id"],
+            "route_token_ref": case["direct_route_token_ref"],
+        },
+        route_identity=case["direct_route_identity"],
+        allowed_files=case["direct_row_files"],
+        graph_trace_ids=[query["trace_id"]],
+        approval_ref="operator-direct-linked-owner",
+    )
+    admitted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body=pre_mutation,
+        )
+    )
+    assert admitted["status"] == "accepted", admitted
+    record = server._contract_runtime(conn).store.get(case["direct_task_id"])
+    binding = record["metadata"]["operator_supervised_direct_main_runtime_binding"]
+    assert binding["target_project_root"] == str(case["owner"].resolve())
+    assert binding["base_commit"] == case["final"]
+    pinned_hash = binding["binding_hash"]
+    close_commit = _commit_test_git_files(
+        case["owner"], case["direct_row_files"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=case["direct_backlog_id"],
+            task_id=case["direct_task_id"], parent_commit=case["final"],
+        ),
+    )
+    implemented = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body=_canonical_parentless_direct_main_implementation_body(
+                backlog_id=case["direct_backlog_id"],
+                task_id=case["direct_task_id"],
+                route_token_ref=case["direct_route_token_ref"],
+                route_identity=case["direct_route_identity"],
+                commit_sha=close_commit,
+                changed_files=case["direct_row_files"],
+                allowed_files=case["direct_row_files"],
+            ),
+        )
+    )
+    assert implemented["status"] == "passed", implemented
+    post_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body={"backlog_id": case["direct_backlog_id"], "role": "observer",
+                  "work_type": "operator_supervised_direct_main",
+                  "route_token_ref": case["direct_route_token_ref"],
+                  "view": "compact"},
+        )
+    )
+    assert post_guide["next_legal_action"]["line_id"] == "qa_graph_context", post_guide
+    pinned_graph = server._onboard_parentless_direct_main_graph_query_guidance(
+        project_id=PID, backlog_id=case["direct_backlog_id"],
+        task_id=case["direct_task_id"],
+        route_token_ref=case["direct_route_token_ref"],
+        target_files=case["direct_row_files"], conn=conn,
+        selected_direct={"source": "pinned_record", "record": record},
+    )
+    assert pinned_graph["server_derived_world_ref"]["root_source"] == "pinned_direct_runtime_binding"
+    assert server._contract_runtime(conn).store.get(case["direct_task_id"])["metadata"][
+        "operator_supervised_direct_main_runtime_binding"
+    ]["binding_hash"] == pinned_hash
+    assert server._operator_supervised_direct_main_world_ref(
+        project_id=PID, conn=conn, pinned_record=record,
+    )["target_head_commit"] == close_commit
+    # The active graph still names the old base. A new CEX cannot reselect it,
+    # while the pinned CEX follows only its immutable owner and descendants.
+    assert server._operator_supervised_direct_main_world_ref(
+        project_id=PID, conn=conn,
+    )["accepted"] is False
+    qa_snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-direct-linked-qa",
+        commit_sha=close_commit, snapshot_kind="full", graph_json=_graph(),
+        notes=json.dumps({"checkout_provenance": describe_checkout(
+            case["owner"], project_id=PID,
+        )}),
+    )
+    store.index_graph_snapshot(
+        conn, PID, qa_snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, qa_snapshot["snapshot_id"])
+    conn.commit()
+    qa_event = _append_authenticated_qa_verification(
+        conn, backlog_id=case["direct_backlog_id"], task_id=case["direct_task_id"],
+        commit_sha=close_commit, snapshot_id="full-direct-linked-qa",
+        principal_id="qa:direct-linked-owner", activate_graph=False,
+    )
+    assert qa_event["payload"]["source_backed_contract_gate_authority"][
+        "close_satisfying"
+    ] is True
+    current_full_auth = {
+        "route_token_ref": case["direct_route_token_ref"],
+        "route_token_scope": {
+            "project_id": PID, "backlog_id": case["direct_backlog_id"],
+            "task_id": case["direct_task_id"],
+        },
+    }
+    preflight = server._operator_supervised_direct_main_reconcile_qa_preflight_authority(
+        conn, project_id=PID, target_commit=close_commit,
+        current_full_auth=current_full_auth,
+    )
+    assert preflight["applicable"] is True, preflight
+    assert preflight["passed"] is True, preflight
+    session_id = case["body"]["observer_session_id"]
+    reconcile_body = {
+        "project_id": PID, "backlog_id": case["direct_backlog_id"],
+        "task_id": case["direct_task_id"],
+        "target_commit_sha": close_commit,
+        "activate": True, "semantic_enrich": False,
+        "observer_session_id": session_id,
+        "observer_route_token_ref": case["direct_route_token_ref"],
+    }
+    wrong_status, wrong_root = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=reconcile_body),
+    )
+    assert wrong_status == 409, wrong_root
+    assert wrong_root["error"] == "operator_supervised_direct_main_bound_root_required"
+    assert wrong_root["writes_performed"] is False
+    builds = []
+
+    def build_direct(_conn, project_id, root, **kwargs):
+        builds.append(Path(root).resolve())
+        snapshot = store.create_graph_snapshot(
+            _conn, project_id, snapshot_id=kwargs["snapshot_id"],
+            commit_sha=close_commit, snapshot_kind="full", graph_json=_graph(),
+            notes=json.dumps({
+                "run_id": kwargs["run_id"],
+                "checkout_provenance": describe_checkout(root, project_id=project_id),
+                "full_reconcile_anchor": {
+                    "project_id": project_id, "snapshot_id": kwargs["snapshot_id"],
+                    "anchor_commit": close_commit, "reconcile_mode": "full",
+                },
+            }),
+        )
+        _conn.commit()
+        return {
+            "ok": True, "snapshot_id": snapshot["snapshot_id"],
+            "projection_id": "semproj-direct-linked-postcommit",
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", build_direct)
+    status, reconciled = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body={
+            **reconcile_body, "project_root": str(case["owner"]),
+            "snapshot_id": "full-direct-linked-postcommit",
+            "run_id": "current-full-direct-linked-postcommit",
+        }),
+    )
+    assert status == 201, reconciled
+    assert reconciled["activated"] is True, reconciled
+    assert builds == [case["owner"].resolve()]
+    close_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body={"backlog_id": case["direct_backlog_id"], "role": "observer",
+                  "work_type": "operator_supervised_direct_main",
+                  "route_token_ref": case["direct_route_token_ref"],
+                  "view": "compact"},
+        )
+    )
+    close_action = close_guide["next_legal_action"]
+    assert close_action["line_id"] == "observer_reconcile", close_guide
+    assert close_action["copy_safe_body"]["event_kind"] == "close_ready"
+    close_body = copy.deepcopy(close_action["copy_safe_body"])
+    close_body["verification"]["test_results"] = (
+        _canonical_parentless_direct_main_test_results(close_commit)
+    )
+    closed = server.handle_task_timeline_append(
+        _ctx_with_role({"project_id": PID}, "observer", method="POST", body=close_body)
+    )
+    assert closed["status"] == "passed", closed
+    completed = server._contract_runtime(conn).store.get(case["direct_task_id"])
+    assert completed["runtime_guide"]["next_legal_action"] is None
+    assert completed["metadata"]["operator_supervised_direct_main_runtime_binding"][
+        "base_commit"
+    ] == case["final"]
+    subprocess.run(
+        ["git", "reset", "--hard", case["base"]], cwd=case["owner"],
+        check=True, capture_output=True, text=True,
+    )
+    assert server._operator_supervised_direct_main_world_ref(
+        project_id=PID, conn=conn, pinned_record=completed,
+    )["accepted"] is False
+    subprocess.run(
+        ["git", "reset", "--hard", close_commit], cwd=case["owner"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "switch", "--detach"], cwd=case["owner"],
+        check=True, capture_output=True, text=True,
+    )
+    assert server._operator_supervised_direct_main_world_ref(
+        project_id=PID, conn=conn, pinned_record=completed,
+    )["accepted"] is False
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["dirty_owner", "missing_owner", "wrong_head", "active_not_full",
+     "active_not_active", "missing_active_ref", "broken_provenance"],
+)
+def test_fresh_direct_rejects_unverified_linked_active_main_owner(
+    conn, monkeypatch, tmp_path, defect,
+):
+    case = _fresh_direct_linked_active_owner_world(conn, monkeypatch, tmp_path)
+    if defect == "dirty_owner":
+        (case["owner"] / "dirty.txt").write_text("dirty\n")
+    elif defect == "missing_owner":
+        subprocess.run(
+            ["git", "worktree", "remove", str(case["owner"])],
+            cwd=case["registered"], check=True, capture_output=True, text=True,
+        )
+    elif defect == "wrong_head":
+        _commit_test_git_files(case["owner"], ["later.txt"], message="later main")
+    elif defect in {"active_not_full", "active_not_active"}:
+        column, value = (
+            ("snapshot_kind", "incremental")
+            if defect == "active_not_full" else ("status", "superseded")
+        )
+        conn.execute(
+            f"UPDATE graph_snapshots SET {column}=? WHERE project_id=? AND snapshot_id=?",
+            (value, PID, case["active_snapshot_id"]),
+        )
+        conn.commit()
+    elif defect == "missing_active_ref":
+        conn.execute(
+            "DELETE FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+            (PID,),
+        )
+        conn.commit()
+    else:
+        row = store.get_graph_snapshot(conn, PID, case["active_snapshot_id"])
+        notes = json.loads(row["notes"])
+        notes["checkout_provenance"]["execution_root"] = str(case["registered"])
+        conn.execute(
+            "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+            (json.dumps(notes), PID, case["active_snapshot_id"]),
+        )
+        conn.commit()
+    before = conn.total_changes
+    rejected = server._operator_supervised_direct_main_world_ref(
+        project_id=PID, conn=conn,
+    )
+    assert rejected["accepted"] is False, (defect, rejected)
+    assert conn.total_changes == before
 
 
 @pytest.mark.parametrize("replay_root", ["original_body", "explicit_owner"])

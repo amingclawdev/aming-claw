@@ -16275,6 +16275,20 @@ def _qa_exact_candidate_direct_main_comparison_authority(
                 expected="bound full commit distinct from candidate",
                 actual=comparison_base,
             )
+        bound_root = str(strict_binding.get("target_project_root") or "").strip()
+        if bound_root and Path(bound_root).resolve() != Path(project_root).resolve():
+            pinned_world = _operator_supervised_direct_main_world_ref(
+                project_id=project_id, conn=conn,
+                pinned_record=matching_strict_records[0],
+            )
+            if pinned_world.get("accepted") is not True:
+                return _qa_exact_candidate_direct_main_comparison_failure(
+                    "exact_candidate_direct_main_runtime_binding_invalid",
+                    field="operator_supervised_direct_main_runtime_binding",
+                    expected="one verified pinned main owner",
+                    actual="bound_owner_unavailable_or_invalid",
+                )
+            project_root = Path(pinned_world["target_project_root"])
         return _qa_exact_candidate_direct_main_strict_comparison_authority(
             strict_record=matching_strict_records[0],
             direct_event=direct_event,
@@ -20836,7 +20850,9 @@ def _observer_parentless_direct_main_graph_world_authority(
     from . import graph_snapshot_store
 
     world_ref = _operator_supervised_direct_main_world_ref(
-        project_id=project_id,
+        project_id=project_id, conn=conn,
+        pinned_record=selected_direct.get("record")
+        if selected_direct.get("source") == "pinned_record" else None,
     )
     expected_commit = str(world_ref.get("base_commit") or "").strip().lower()
     selected_source = str(selected_direct.get("source") or "").strip()
@@ -103332,6 +103348,36 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             )
             if not dev_force_graph else {}
         )
+        if direct_main_qa_preflight_authority.get("applicable") is True:
+            route_scope = current_full_auth.get("route_token_scope") or {}
+            direct_task_id = str(route_scope.get("task_id") or "").strip()
+            try:
+                direct_record = _contract_runtime_store(conn).get(direct_task_id)
+            except ContractRuntimeError:
+                direct_record = {}
+            direct_binding = (direct_record.get("metadata") or {}).get(
+                "operator_supervised_direct_main_runtime_binding"
+            ) or {}
+            bound_root = str(direct_binding.get("target_project_root") or "").strip()
+            registered_root = Path(project_service.resolve_project_root(
+                project_id, None, fallback_self=True,
+            )).resolve()
+            if bound_root and Path(bound_root).resolve() != registered_root:
+                bound_world = _operator_supervised_direct_main_world_ref(
+                    project_id=project_id, conn=conn, pinned_record=direct_record,
+                )
+                if not (
+                    bound_world.get("accepted") is True
+                    and Path(root).resolve() == Path(bound_root).resolve()
+                    and str(target_commit).lower() == str(bound_world.get("target_head_commit") or "").lower()
+                ):
+                    return 409, {
+                        "ok": False, "project_id": project_id,
+                        "error": "operator_supervised_direct_main_bound_root_required",
+                        "rebuild_started": False, "snapshot_materialized": False,
+                        "writes_performed": False, "mutation_performed": False,
+                        "fail_closed": True,
+                    }
         terminal_replay_authority = (
             _dev_direct_existing_candidate_terminal_replay_authority(
                 conn,
@@ -155269,13 +155315,32 @@ def _onboard_parentless_direct_main_graph_query_guidance(
     snapshot_selector = "active"
     snapshot_selection: dict[str, Any] = {}
     direct_selection = dict(selected_direct or {})
+    world_ref = (
+        _operator_supervised_direct_main_world_ref(
+            project_id=project_id, conn=conn,
+            pinned_record=direct_selection.get("record")
+            if direct_selection.get("source") == "pinned_record" else None,
+        )
+        if conn is not None else {}
+    )
+    root_source = "registered_canonical_project_root"
+    if world_ref.get("accepted") is True:
+        try:
+            registered_root = Path(project_service.resolve_project_root(
+                project_id, None, fallback_self=True,
+            )).resolve()
+            if Path(world_ref["target_project_root"]).resolve() != registered_root:
+                root_source = (
+                    "pinned_direct_runtime_binding"
+                    if direct_selection.get("source") == "pinned_record"
+                    else "verified_linked_active_main_owner"
+                )
+        except (OSError, TypeError, ValueError):
+            pass
     if conn is not None and requested_snapshot_id not in {"", "active"}:
         try:
             from . import graph_snapshot_store
 
-            world_ref = _operator_supervised_direct_main_world_ref(
-                project_id=project_id,
-            )
             active_id = _resolve_graph_snapshot_id(conn, project_id, "active")
             resolved_requested_id = _resolve_graph_snapshot_id(
                 conn,
@@ -155350,9 +155415,6 @@ def _onboard_parentless_direct_main_graph_query_guidance(
         try:
             from . import graph_snapshot_store
 
-            world_ref = _operator_supervised_direct_main_world_ref(
-                project_id=project_id,
-            )
             active_id = _resolve_graph_snapshot_id(conn, project_id, "active")
             active_snapshot = graph_snapshot_store.get_graph_snapshot(
                 conn,
@@ -155455,7 +155517,7 @@ def _onboard_parentless_direct_main_graph_query_guidance(
             "commit_source": (
                 "operator_supervised_direct_main.pre_mutation_world_ref"
             ),
-            "root_source": "registered_canonical_project_root",
+            "root_source": root_source,
             "snapshot_commit_must_match_world_ref": True,
             "mismatch_creates_trace": False,
         },
@@ -158349,9 +158411,67 @@ def _operator_supervised_direct_main_route_authority(
     )
 
 
+def _operator_supervised_direct_main_linked_main_owner(
+    *, registered_root: Path, expected_root: Path, base_commit: str = "",
+    expected_head: str = "",
+) -> tuple[Path | None, str]:
+    """Verify the unique clean attached main owner in the registered Git repo."""
+
+    from .checkout_provenance import describe_checkout
+    from .parallel_branch_runtime import _git_target_owner_alignment_evidence
+
+    try:
+        listing = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=registered_root,
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if listing.returncode != 0:
+            return None, "main_worktree_listing_unavailable"
+        owners = []
+        for block in listing.stdout.strip().split("\n\n"):
+            fields = dict(
+                line.split(" ", 1) if " " in line else (line, "")
+                for line in block.splitlines()
+            )
+            if fields.get("branch") == "refs/heads/main":
+                owners.append(fields)
+        if len(owners) != 1 or not owners[0].get("worktree") or "detached" in owners[0]:
+            return None, "main_worktree_owner_missing_or_ambiguous"
+        owner = Path(owners[0]["worktree"]).resolve(strict=True)
+        if owner != expected_root:
+            return None, "main_worktree_owner_root_mismatch"
+        registered_git = describe_checkout(registered_root).get("git") or {}
+        owner_git = describe_checkout(owner).get("git") or {}
+        registered_common = str(registered_git.get("git_common_dir") or "")
+        owner_common = str(owner_git.get("git_common_dir") or "")
+        if not registered_common or not owner_common or Path(registered_common).resolve() != Path(owner_common).resolve():
+            return None, "main_worktree_repository_mismatch"
+        head = str(owners[0].get("HEAD") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+            return None, "main_worktree_head_invalid"
+        if expected_head and head != expected_head:
+            return None, "main_worktree_head_mismatch"
+        alignment = _git_target_owner_alignment_evidence(
+            owner, target_ref="refs/heads/main", merge_commit=head,
+            timeout_seconds=10,
+        )
+        if not (
+            alignment.get("passed") is True
+            and alignment.get("index_clean") is True
+            and alignment.get("worktree_clean") is True
+            and str(alignment.get("head_commit") or "").strip().lower() == head
+            and str(alignment.get("target_commit") or "").strip().lower() == head
+        ):
+            return None, "main_worktree_not_clean_and_aligned"
+        if base_commit and not _git_commit_is_ancestor(owner, base_commit, head):
+            return None, "main_worktree_base_not_ancestor"
+        return owner, ""
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return None, "main_worktree_owner_unavailable"
+
+
 def _operator_supervised_direct_main_world_ref(
-    *,
-    project_id: str,
+    *, project_id: str, conn=None, pinned_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve the one canonical pre-mutation Git world for Direct rev2."""
 
@@ -158412,10 +158532,103 @@ def _operator_supervised_direct_main_world_ref(
         error = str(exc)
     else:
         error = ""
+    if project_root and resolved_top_level == project_root and not error:
+        if pinned_record is not None:
+            metadata = pinned_record.get("metadata") if isinstance(pinned_record.get("metadata"), Mapping) else {}
+            binding = metadata.get("operator_supervised_direct_main_runtime_binding") if isinstance(metadata.get("operator_supervised_direct_main_runtime_binding"), Mapping) else {}
+            bound_root = str(binding.get("target_project_root") or "").strip()
+            bound_base = str(binding.get("base_commit") or "").strip().lower()
+            bound_world = binding.get("pre_mutation_world_ref") if isinstance(binding.get("pre_mutation_world_ref"), Mapping) else {}
+            if bound_root and bound_root != str(project_root):
+                if not (
+                    binding.get("binding_hash") == stable_sha256({key: value for key, value in binding.items() if key != "binding_hash"})
+                    and binding.get("worktree_path") == bound_root
+                    and bound_world.get("target_project_root") == bound_root
+                    and bound_world.get("base_commit") == bound_base
+                    and bound_world.get("authority_hash") == stable_sha256({key: value for key, value in bound_world.items() if key != "authority_hash"})
+                ):
+                    error = "pinned_linked_runtime_binding_invalid"
+                else:
+                    owner, error = _operator_supervised_direct_main_linked_main_owner(
+                        registered_root=project_root, expected_root=Path(bound_root),
+                        base_commit=bound_base,
+                    )
+                    if owner is not None:
+                        project_root = owner
+                        resolved_top_level = owner
+                        head_commit = _git_head_commit(owner).strip().lower()
+        elif conn is not None:
+            from . import graph_snapshot_store
+            from .checkout_provenance import describe_checkout
+
+            active = graph_snapshot_store.get_active_graph_snapshot(conn, project_id) or {}
+            materialization = graph_snapshot_store.snapshot_materialization_provenance(active)
+            active_root = str(materialization.get("execution_root") or "").strip()
+            if active_root and Path(active_root).resolve() != project_root:
+                snapshot_commit = str(active.get("commit_sha") or "").strip().lower()
+                refs = conn.execute(
+                    "SELECT snapshot_id, commit_sha FROM graph_snapshot_refs "
+                    "WHERE project_id=? AND ref_name='active'", (project_id,),
+                ).fetchall()
+                git_meta = materialization.get("git") if isinstance(materialization.get("git"), Mapping) else {}
+                identity = materialization.get("canonical_project_identity") if isinstance(materialization.get("canonical_project_identity"), Mapping) else {}
+                proof = graph_snapshot_store._current_full_snapshot_provenance_binding(
+                    conn, project_id, active,
+                )
+                try:
+                    companion = graph_snapshot_store.validate_snapshot_companion_integrity(active)
+                except (OSError, ValueError, KeyError):
+                    companion = {"valid": False}
+                pending_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM pending_scope_reconcile "
+                    "WHERE project_id=? AND status IN (?,?,?)",
+                    (project_id, graph_snapshot_store.PENDING_STATUS_QUEUED,
+                     graph_snapshot_store.PENDING_STATUS_RUNNING,
+                     graph_snapshot_store.PENDING_STATUS_FAILED),
+                ).fetchone()[0])
+                owner, owner_error = _operator_supervised_direct_main_linked_main_owner(
+                    registered_root=project_root, expected_root=Path(active_root).resolve(),
+                    expected_head=snapshot_commit,
+                )
+                live = describe_checkout(owner, project_id=project_id) if owner else {}
+                live_git = live.get("git") if isinstance(live.get("git"), Mapping) else {}
+                registered_git = describe_checkout(project_root, project_id=project_id).get("git") or {}
+                if not (
+                    len(refs) == 1
+                    and str(active.get("snapshot_kind") or "").strip() == "full"
+                    and str(active.get("status") or "").strip() == "active"
+                    and companion.get("valid") is True
+                    and pending_count == 0
+                    and str(refs[0]["snapshot_id"] or "") == str(active.get("snapshot_id") or "")
+                    and str(refs[0]["commit_sha"] or "").strip().lower() == snapshot_commit
+                    and proof.get("verified") is True
+                    and proof.get("provenance_target_commit") == snapshot_commit
+                    and materialization.get("execution_root_role") == "execution_root"
+                    and str(materialization.get("execution_root") or "") == str(owner or "")
+                    and str(git_meta.get("worktree_root") or "") == str(owner or "")
+                    and identity.get("type") == "git"
+                    and identity.get("project_id") == project_id
+                    and str(identity.get("commit_sha") or "").strip().lower() == snapshot_commit
+                    and owner is not None
+                    and str(live.get("commit_sha") or "").strip().lower() == snapshot_commit
+                    and str(git_meta.get("git_common_dir") or "")
+                    and Path(str(git_meta.get("git_common_dir") or "")).resolve() == Path(str(live_git.get("git_common_dir") or "")).resolve() == Path(str(registered_git.get("git_common_dir") or "")).resolve()
+                ):
+                    error = owner_error or "active_linked_main_provenance_invalid"
+                else:
+                    project_root = owner
+                    resolved_top_level = owner
+                    head_commit = snapshot_commit
+            elif active_root and Path(active_root).resolve() == project_root:
+                if _qa_git_bytes(project_root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout:
+                    error = "dirty_registered_root_without_linked_active_owner"
+            elif _qa_git_bytes(project_root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout:
+                error = "dirty_registered_root_without_linked_active_owner"
     accepted = bool(
         project_root
         and resolved_top_level == project_root
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head_commit)
+        and not error
     )
     authority = {
         "schema_version": (
@@ -158487,7 +158700,7 @@ def _operator_supervised_direct_main_create_fresh_runtime(
     """Create one fresh Direct record from server-validated route authority."""
 
     current_world_ref = _operator_supervised_direct_main_world_ref(
-        project_id=project_id,
+        project_id=project_id, conn=conn,
     )
     if not (
         world_ref.get("accepted") is True
@@ -158689,6 +158902,14 @@ def _operator_supervised_direct_main_start_runtime(
                     "zero_write_rejection": True,
                     "writes_performed": False,
                 },
+            )
+        if not dev_world and _operator_supervised_direct_main_world_ref(
+            project_id=project_id, conn=conn, pinned_record=record,
+        ).get("accepted") is not True:
+            raise GovernanceError(
+                "operator_supervised_direct_main_pinned_world_invalid",
+                "The pinned Direct owner no longer matches its immutable binding",
+                409, {"zero_write_rejection": True, "writes_performed": False},
             )
         return runtime.current_record(execution_id, actor_role="observer")
 
@@ -162585,7 +162806,7 @@ def _ac_dev_direct_materialize_fresh_route_execution(
         execution_id=execution_id,
         route_token_ref=str(materialized["route_token_ref"]),
         route_authority=dict(materialized["route_authority"]),
-        world_ref=_operator_supervised_direct_main_world_ref(project_id=project_id),
+        world_ref=_operator_supervised_direct_main_world_ref(project_id=project_id, conn=conn),
         dev_world=world_authority,
     )
     return {**materialized, "record": record}
@@ -164571,6 +164792,20 @@ def _operator_supervised_direct_main_landed_qa_authority(
             ).resolve()
         except Exception:
             return {}
+        try:
+            pinned = _contract_runtime(conn).store.get(task_id)
+        except ContractRuntimeError:
+            pinned = {}
+        if pinned and str(pinned.get("contract_id") or "") == "operator_supervised_direct_main":
+            binding = (pinned.get("metadata") or {}).get("operator_supervised_direct_main_runtime_binding") or {}
+            bound_root = str(binding.get("target_project_root") or "").strip()
+            if bound_root and Path(bound_root).resolve() != project_root:
+                bound_world = _operator_supervised_direct_main_world_ref(
+                    project_id=project_id, conn=conn, pinned_record=pinned,
+                )
+                if bound_world.get("accepted") is not True:
+                    return {}
+                project_root = Path(bound_world["target_project_root"])
     fresh, mismatches = _qa_exact_candidate_post_merge_provenance(
         conn,
         project_id=project_id,
@@ -165663,6 +165898,14 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             ).resolve()
         except Exception:
             return {}
+        bound_root = str(binding.get("target_project_root") or "").strip()
+        if bound_root and Path(bound_root).resolve() != project_root:
+            bound_world = _operator_supervised_direct_main_world_ref(
+                project_id=project_id, conn=conn, pinned_record=record,
+            )
+            if bound_world.get("accepted") is not True:
+                return {}
+            project_root = Path(bound_world["target_project_root"])
     canonical_head = _git_head_commit(project_root).strip().lower()
     if not canonical_head:
         return {}
@@ -204635,6 +204878,16 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         )
     except Exception:
         project_root = None
+    if strict_binding and project_root is not None:
+        bound_root = str(strict_binding.get("target_project_root") or "").strip()
+        if bound_root and Path(bound_root).resolve() != Path(project_root).resolve():
+            bound_world = _operator_supervised_direct_main_world_ref(
+                project_id=project_id, conn=conn, pinned_record=selected_record,
+            )
+            project_root = (
+                Path(bound_world["target_project_root"])
+                if bound_world.get("accepted") is True else None
+            )
     if project_root is None:
         commit_missing.append("registered_project_root")
     else:
@@ -211809,7 +212062,9 @@ def _handle_task_timeline_append(ctx: RequestContext):
             if strict_direct_requested:
                 direct_main_pre_mutation_world_ref = (
                     _operator_supervised_direct_main_world_ref(
-                        project_id=project_id,
+                        project_id=project_id, conn=conn,
+                        pinned_record=strict_direct_selection.get("record")
+                        if strict_direct_selection.get("source") == "pinned_record" else None,
                     )
                 )
             pre_mutation_graph_trace_gate = (
