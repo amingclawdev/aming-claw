@@ -236242,7 +236242,9 @@ def test_ac_dev_finished_worker_merge_route_rechecks_parent_in_atomic_writer(
     assert tuple(conn.iterdump()) == raced["dump"]
 
 
-def _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path):
+def _rev10_current_full_linked_owner_world(
+    conn, monkeypatch, tmp_path, *, reconcile_lane_index=0,
+):
     """Persist the pre-QA two-lane world while main has a linked owner."""
 
     registered = tmp_path / "registered"
@@ -236448,7 +236450,7 @@ def _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path):
         )
         for worker in workers
     ]
-    selected = contexts[0]
+    selected = contexts[reconcile_lane_index]
     record = {
         "project_id": PID,
         "backlog_id": backlog_id,
@@ -236666,10 +236668,13 @@ def test_rev10_linked_owner_consumer_rejects_untrusted_normalized_target(
     "queue_refs",
     [("refs/heads/main", "refs/heads/main"), ("main", "refs/heads/main")],
 )
+@pytest.mark.parametrize("reconcile_lane_index", (0, 1))
 def test_rev10_current_full_activates_from_clean_linked_target_owner(
-    conn, monkeypatch, tmp_path, queue_refs,
+    conn, monkeypatch, tmp_path, queue_refs, reconcile_lane_index,
 ):
-    case = _rev10_current_full_linked_owner_world(conn, monkeypatch, tmp_path)
+    case = _rev10_current_full_linked_owner_world(
+        conn, monkeypatch, tmp_path, reconcile_lane_index=reconcile_lane_index,
+    )
     for row, target_ref in zip(case["rows"], queue_refs):
         conn.execute(
             "UPDATE parallel_branch_merge_queue_items SET target_ref=? "
@@ -236689,6 +236694,18 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
         is False for line in record["completed_lines"]
         if line["line_id"] == "observer_merge"
     )
+    if reconcile_lane_index == 1:
+        same_lane = case["contexts"][reconcile_lane_index]
+        monkeypatch.setattr(
+            server, "_contract_runtime_authoritative_runtime_context_projection",
+            lambda *_args, **_kwargs: {"current_values": {
+                field: getattr(same_lane, field)
+                for field in (
+                    "runtime_context_id", "task_id", "parent_task_id",
+                    "merge_queue_id",
+                )
+            }},
+        )
     aggregate = server._contract_runtime_rev8_two_worker_merge_projection(
         record, required_worker_count=2, conn=conn, project_id=PID,
     )
@@ -236697,9 +236714,9 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
     selected = server._contract_runtime_rev8_selected_reconcile_lane_projection(
         conn, project_id=PID, record=record, aggregate_merge=aggregate,
     )
-    assert selected["runtime_context_id"] == case["contexts"][0].runtime_context_id
-    assert selected["task_id"] == case["contexts"][0].task_id
-    assert selected["merge_queue_id"] == case["contexts"][0].merge_queue_id
+    assert selected["runtime_context_id"] == case["contexts"][reconcile_lane_index].runtime_context_id
+    assert selected["task_id"] == case["contexts"][reconcile_lane_index].task_id
+    assert selected["merge_queue_id"] == case["contexts"][reconcile_lane_index].merge_queue_id
     assert selected["merged_commit_sha"] == case["final"]
     assert selected["reconcile_lane_identity_source"] == (
         "RuntimeContext.current_values"
@@ -236763,7 +236780,7 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
             "runtime_context_id", "task_id", "parent_task_id", "merge_queue_id",
         )
     } == {
-        field: getattr(case["contexts"][0], field)
+        field: getattr(case["contexts"][reconcile_lane_index], field)
         for field in (
             "runtime_context_id", "task_id", "parent_task_id", "merge_queue_id",
         )
@@ -236863,6 +236880,9 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
     )
     assert final_qa["verified"] is True, final_qa
     assert final_qa["target_project_root"] == str(case["owner"].resolve())
+    if reconcile_lane_index == 1:
+        assert final_qa["reconcile_task_id"] == case["contexts"][1].task_id
+        assert final_qa["task_id"] == case["contexts"][1].task_id
 
     tampered = copy.deepcopy(persisted)
     tampered_receipt = tampered["completed_lines"][-1]["payload"][
@@ -236875,12 +236895,57 @@ def test_rev10_current_full_activates_from_clean_linked_target_owner(
     assert blocked_qa["verified"] is False
     assert "observer_reconcile_receipt_unverified" in blocked_qa["blocker_codes"]
 
+    if reconcile_lane_index == 1 and queue_refs[0] == "refs/heads/main":
+        with monkeypatch.context() as wrong_owner:
+            wrong_owner.setattr(
+                parallel_branch_runtime, "_git_target_ref_owning_worktree",
+                lambda *_args, **_kwargs: (
+                    case["registered"].resolve(), "git_worktree_target_ref_owner",
+                ),
+            )
+            wrong_root_qa = server._contract_runtime_rev8_postmerge_qa_authority(
+                conn, project_id=PID, record=persisted,
+            )
+        assert wrong_root_qa["verified"] is False
+        assert "target_ref_owner_not_clean_and_aligned" in wrong_root_qa["blocker_codes"]
+
+        final_row = case["rows"][1]
+        conn.execute(
+            "UPDATE parallel_branch_merge_queue_items SET target_ref=? "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            ("refs/heads/unrelated", PID, final_row.merge_queue_id,
+             final_row.queue_item_id),
+        )
+        conn.commit()
+        wrong_ref_qa = server._contract_runtime_rev8_postmerge_qa_authority(
+            conn, project_id=PID, record=persisted,
+        )
+        assert wrong_ref_qa["verified"] is False
+        assert "target_ref_owner_not_clean_and_aligned" in wrong_ref_qa["blocker_codes"]
+        conn.execute(
+            "UPDATE parallel_branch_merge_queue_items SET target_ref=? "
+            "WHERE project_id=? AND merge_queue_id=? AND queue_item_id=?",
+            (queue_refs[1], PID, final_row.merge_queue_id,
+             final_row.queue_item_id),
+        )
+        conn.commit()
+
     (case["owner"] / "after-reconcile.txt").write_text("dirty owner\\n")
     dirty_qa = server._contract_runtime_rev8_postmerge_qa_authority(
         conn, project_id=PID, record=persisted,
     )
     assert dirty_qa["verified"] is False
     assert "target_ref_owner_not_clean_and_aligned" in dirty_qa["blocker_codes"]
+    if reconcile_lane_index == 1 and queue_refs[0] == "refs/heads/main":
+        (case["owner"] / "after-reconcile.txt").unlink()
+        _activate_basic_graph(
+            conn, "full-rev10-same-lane-wrong-active", commit_sha=case["unrelated"],
+        )
+        wrong_active_qa = server._contract_runtime_rev8_postmerge_qa_authority(
+            conn, project_id=PID, record=persisted,
+        )
+        assert wrong_active_qa["verified"] is False
+        assert "current_full_active_snapshot_unverified" in wrong_active_qa["blocker_codes"]
 
 
 @pytest.mark.parametrize(

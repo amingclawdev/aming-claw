@@ -138517,7 +138517,7 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             return blocked("observer_reconcile_receipt_unverified")
 
     reconcile_merge = dict(merge)
-    if (
+    reconcile_lane_differs = (
         reconcile_runtime_context_id,
         reconcile_task_id,
         reconcile_parent_task_id,
@@ -138527,7 +138527,8 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         task_id,
         parent_task_id,
         merge_queue_id,
-    ):
+    )
+    if persisted_reconcile_receipt_available or reconcile_lane_differs:
         reconcile_merge.update(
             {
                 "aggregate_final_merge_identity": {
@@ -138537,10 +138538,6 @@ def _contract_runtime_rev8_postmerge_qa_authority(
                     "merge_queue_id": merge_queue_id,
                     "queue_item_id": queue_item_id,
                 },
-                "runtime_context_id": reconcile_runtime_context_id,
-                "task_id": reconcile_task_id,
-                "parent_task_id": reconcile_parent_task_id,
-                "merge_queue_id": reconcile_merge_queue_id,
                 "reconcile_line_instance_id": (
                     f"runtime_context:{reconcile_runtime_context_id}"
                 ),
@@ -138548,6 +138545,15 @@ def _contract_runtime_rev8_postmerge_qa_authority(
                     "ContractRuntime.completed_lines.observer_reconcile."
                     "reconcile_authority"
                 ),
+            }
+        )
+    if reconcile_lane_differs:
+        reconcile_merge.update(
+            {
+                "runtime_context_id": reconcile_runtime_context_id,
+                "task_id": reconcile_task_id,
+                "parent_task_id": reconcile_parent_task_id,
+                "merge_queue_id": reconcile_merge_queue_id,
             }
         )
 
