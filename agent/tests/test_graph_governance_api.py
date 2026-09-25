@@ -855,6 +855,87 @@ def test_dev_force_graph_is_source_read_for_old_direct_scope_only(
         ))
     assert server._contract_runtime_store(conn).get(case["task_id"]) == old_record
 
+    normal_id = server._current_full_normal_after_force_snapshot_id(head)
+    store.create_graph_snapshot(
+        conn, case["project_id"], snapshot_id=normal_id,
+        commit_sha=head, snapshot_kind="full", graph_json=_graph(),
+        notes=json.dumps({"run_id": "normal-after-force-source-read"}),
+    )
+    store.activate_graph_snapshot(
+        conn, case["project_id"], normal_id,
+        expected_old_snapshot_id=snapshot_id, auto_rebuild_projection=False,
+    )
+    normal_auth = {
+        "role": "observer", "role_source": "observer_session_route_token_ref",
+        "observer_session_id": "normal-observer", "route_token_ref": "normal-route",
+        "route_token_scope": {
+            "project_id": case["project_id"], "backlog_id": "NORMAL-PRODUCER",
+            "task_id": "normal-task",
+        },
+    }
+    qa_authority = {
+        "applicable": True, "passed": True, "qa_passed": True,
+        "close_satisfying": True, "landed_ancestor_current_head_verified": True,
+    }
+    normal_route = server._current_full_reconcile_route_evidence(normal_auth)
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_reconcile_qa_preflight_authority",
+        lambda *_args, **_kwargs: dict(qa_authority),
+    )
+    monkeypatch.setattr(
+        server, "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: dict(normal_auth),
+    )
+    monkeypatch.setattr(
+        server, "_current_full_reconcile_runtime_context_scope",
+        lambda *_args, **_kwargs: {},
+    )
+    normal_route["direct_main_qa_preflight_authority"] = dict(qa_authority)
+    normal_run = "normal-after-force-source-read"
+    normal_scope = server._current_full_reconcile_idempotency_scope(normal_route)
+    normal_route.update(reconcile_run_id=normal_run, idempotency_scope=normal_scope)
+    normal_body = {
+        "backlog_id": "NORMAL-PRODUCER", "task_id": "normal-task",
+        "run_id": normal_run, "snapshot_id": normal_id,
+        "expected_old_snapshot_id": normal_id,
+        "target_commit_sha": head, "activate": True,
+    }
+    normal_status, normal_result = (
+        server._operator_supervised_direct_main_post_qa_same_active_reconcile(
+            _ctx({"project_id": case["project_id"]}, method="POST", body=normal_body),
+            conn, store, root=case["root"], project_id=case["project_id"],
+            body=normal_body, route_evidence=normal_route,
+            runtime_context_scope={}, target_commit=head, head_commit=head,
+            request_started_at=server._utc_now(),
+            request_total_changes_before=conn.total_changes,
+        )
+    )
+    assert normal_status == 201, normal_result
+    assert normal_result["same_active_current_full"] is True
+    assert store.current_full_active_terminal_tuple(
+        conn, project_id=case["project_id"], run_id=normal_run,
+        target_commit_sha=head, expected_scope=normal_scope,
+        snapshot_id=normal_id,
+    )["valid"] is True
+    assert server._dev_active_source_graph_read_authority(
+        conn, project_id=case["project_id"],
+    )["graph_source_read_ready"] is True
+    fresh_auth = {
+        "role_source": "observer_session_route_token_ref",
+        "route_token_scope": {
+            "project_id": case["project_id"], "backlog_id": fresh_backlog,
+            "task_id": fresh_guide["contract_execution_id"],
+        },
+        "route_token_ref": fresh_issued["route_token_ref"],
+        "observer_session_id": fresh_session["observer_session_id"],
+    }
+    bootstrap = server._dev_direct_graph_bootstrap_reconcile_authority(
+        conn, project_id=case["project_id"], auth=fresh_auth,
+    )
+    assert bootstrap["target_snapshot_identity"]["status"] == "existing"
+    assert bootstrap["target_snapshot_identity"]["snapshot_id"] == normal_id
+    assert bootstrap["active_predecessor_provenance_verified"] is True
+
 
 def test_dev_force_graph_mcp_transport_is_explicit_and_copy_safe():
     from agent.mcp import tools as mcp_tools
@@ -26301,6 +26382,266 @@ def test_default_current_full_rejects_ambiguous_legacy_commit_snapshots(
         "full-legacy-random-b",
     ]
     assert calls == []
+
+
+def test_default_current_full_separates_proven_force_history_and_rejects_extra_identity(
+    conn, monkeypatch, tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(
+        monkeypatch, tmp_path, fixed_snapshot_id=None,
+    )
+    force_id = server._current_full_deterministic_snapshot_id(head)
+    monkeypatch.setattr(
+        store, "_graph_activation_policy_for_connection",
+        lambda _conn: {
+            "runtime_plane": "stable", "active_graph_activation_allowed": True,
+            "project_id": PID,
+        },
+    )
+    _activate_basic_graph(conn, force_id, project_id=PID, commit_sha=head)
+    force_auth = {
+        "role": "observer", "role_source": "observer_session_route_token_ref",
+        "observer_session_id": "force-observer", "route_token_ref": "force-route",
+        "route_token_scope": {
+            "project_id": PID, "backlog_id": "FORCE-PRODUCER", "task_id": "force-task",
+        },
+    }
+    force_route = server._current_full_reconcile_route_evidence(force_auth)
+    force_route.update({
+        "dev_force_graph_only": True, "force_reason": "refresh source graph",
+        "operator_authorization_ref": "user-decision:force-graph",
+        "dev_world_hash": "sha256:" + "b" * 64,
+        "dev_database_identity": {"world_id": "ac-dev"},
+        "loaded_commit": head,
+    })
+    force_run = "force-before-normal"
+    force_scope = server._current_full_reconcile_idempotency_scope(force_route)
+    force_route.update(reconcile_run_id=force_run, idempotency_scope=force_scope)
+    server._record_current_full_atomic_evidence(
+        conn, store, project_id=PID,
+        body={"force_reason": "refresh source graph",
+              "operator_authorization_ref": "user-decision:force-graph"},
+        result={"elapsed_ms": 1, "activation": {"previous_snapshot_id": "old"}},
+        run_id=force_run, snapshot_id=force_id, target_commit=head,
+        route_evidence=force_route, runtime_context_scope={},
+        request_id="req-force-before-normal", request_started_at=server._utc_now(),
+        graph_delta_mode="dev_force_graph_only", declared_actor_role="observer",
+        route_bound=True,
+    )
+    conn.commit()
+    normal_id = server._current_full_normal_after_force_snapshot_id(head)
+    selected = server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+    )
+    assert selected["status"] == "missing"
+    assert selected["snapshot_id"] == normal_id != force_id
+    world = {
+        "accepted": True, "target_head_commit": head,
+        "loaded_runtime_commit": head,
+        "world_hash": force_route["dev_world_hash"],
+        "database_identity": force_route["dev_database_identity"],
+    }
+    custody = {
+        "runtime_plane": "dev", "world_id": "ac-dev",
+        "project_id": PID, "port": server.AC_DEV_SERVICE_PORT,
+        "cow_successor_verified": True, "source_checkout_verified": True,
+        "live_runtime_custody_verified": True,
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(server, "AC_PROJECT_ID", PID)
+        patch.setattr(server, "_runtime_plane", lambda: "dev")
+        patch.setattr(
+            server, "_operator_supervised_direct_main_dev_world_authority",
+            lambda: dict(world),
+        )
+        patch.setattr(
+            server, "classify_graph_activation_connection",
+            lambda _conn: dict(custody),
+        )
+        assert server._current_full_requested_snapshot_identity(
+            conn, project_id=PID, target_commit_sha=head,
+        )["snapshot_id"] == normal_id
+        patch.setattr(
+            server, "_operator_supervised_direct_main_dev_world_authority",
+            lambda: {**world, "world_hash": "sha256:" + "c" * 64},
+        )
+        assert server._current_full_requested_snapshot_identity(
+            conn, project_id=PID, target_commit_sha=head,
+        )["snapshot_id"] == normal_id
+        for wrong_world in (
+            {**world, "database_identity": {"world_id": "foreign"}},
+            {**world, "loaded_runtime_commit": "f" * 40},
+        ):
+            patch.setattr(
+                server, "_operator_supervised_direct_main_dev_world_authority",
+                lambda current=wrong_world: dict(current),
+            )
+            blocked_world = server._current_full_requested_snapshot_identity(
+                conn, project_id=PID, target_commit_sha=head,
+            )
+            assert blocked_world["status"] == "conflict"
+            assert blocked_world["reason"] == "current_full_force_history_not_verified"
+        patch.setattr(
+            server, "_operator_supervised_direct_main_dev_world_authority",
+            lambda: dict(world),
+        )
+        patch.setattr(
+            server, "classify_graph_activation_connection",
+            lambda _conn: {**custody, "world_id": "foreign"},
+        )
+        blocked_custody = server._current_full_requested_snapshot_identity(
+            conn, project_id=PID, target_commit_sha=head,
+        )
+        assert blocked_custody["status"] == "conflict"
+        assert blocked_custody["reason"] == "current_full_force_history_not_verified"
+    assert server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+        dev_force_graph_only=True,
+    )["snapshot_id"] == force_id
+
+    monkeypatch.setattr(
+        server, "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    body = {
+        "target_commit_sha": head, "run_id": "normal-after-proven-force",
+        "activate": False, "semantic_enrich": False,
+    }
+    before_override = conn.total_changes
+    override_status, override = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID}, "coordinator", method="POST",
+            body={**body, "snapshot_id": "full-caller-chosen-after-force"},
+        ),
+    )
+    assert override_status == 409, override
+    assert override["error"] == "current_full_force_history_requires_service_normal_identity"
+    assert override["rebuild_started"] is False
+    assert conn.total_changes == before_override
+    assert calls == []
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_snapshots WHERE project_id=?",
+        (PID,),
+    ).fetchone()[0] == 1
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=body),
+    )
+    assert status == 201, result
+    assert result["candidate_snapshot_id"] == normal_id
+    assert [call["snapshot_id"] for call in calls] == [normal_id]
+    selected = server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+    )
+    assert selected["status"] == "existing"
+    assert selected["snapshot_id"] == normal_id
+    assert server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+        dev_force_graph_only=True,
+    )["snapshot_id"] == force_id
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=body),
+    )
+    assert replay_status == 200 and replay["rebuild_skipped"] is True
+    assert len(calls) == 1
+    assert conn.execute(
+        "SELECT status FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (PID, force_id),
+    ).fetchone()["status"] == "active"
+
+    activation_body = {
+        **body, "activate": True, "snapshot_id": normal_id,
+        "expected_old_snapshot_id": force_id,
+    }
+    activated_status, activated = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID}, "coordinator", method="POST", body=activation_body,
+        ),
+    )
+    assert activated_status == 200, activated
+    assert activated["active_snapshot_id"] == normal_id
+    activation_replay_status, activation_replay = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID}, "coordinator", method="POST",
+                body=activation_body,
+            ),
+        )
+    )
+    assert activation_replay_status == 200, activation_replay
+    assert activation_replay["idempotent_replay"] is True
+    assert conn.execute(
+        "SELECT status FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (PID, force_id),
+    ).fetchone()["status"] == "superseded"
+    assert server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+    )["snapshot_id"] == normal_id
+    assert server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+        dev_force_graph_only=True,
+    )["status"] == "conflict"
+    force_event = conn.execute(
+        "SELECT reconcile_event_id FROM graph_current_full_reconcile_provenance "
+        "WHERE project_id=? AND snapshot_id=?",
+        (PID, force_id),
+    ).fetchone()["reconcile_event_id"]
+    conn.execute(
+        "UPDATE task_timeline_events SET event_type='graph.reconcile' WHERE id=?",
+        (force_event,),
+    )
+    assert server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+    )["status"] == "conflict"
+    conn.execute(
+        "UPDATE task_timeline_events SET event_type='graph.dev_force_graph_reconcile' WHERE id=?",
+        (force_event,),
+    )
+    assert server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+    )["snapshot_id"] == normal_id
+
+    store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-extra-legacy", commit_sha=head,
+        snapshot_kind="full", graph_json=_graph(), notes="{}",
+    )
+    conn.commit()
+    before = conn.total_changes
+    denied_status, denied = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body={
+            **body, "run_id": "normal-after-force-extra",
+        }),
+    )
+    assert denied_status == 409
+    assert denied["error"] == "current_full_commit_snapshot_identity_ambiguous"
+    assert denied["rebuild_started"] is False
+    assert conn.total_changes == before
+    assert len(calls) == 1
+
+
+def test_default_current_full_does_not_accept_forged_force_note(
+    conn, monkeypatch, tmp_path,
+):
+    head, _calls = _stub_current_full_reconcile(
+        monkeypatch, tmp_path, fixed_snapshot_id=None,
+    )
+    force_id = server._current_full_deterministic_snapshot_id(head)
+    store.create_graph_snapshot(
+        conn, PID, snapshot_id=force_id, commit_sha=head,
+        snapshot_kind="full", graph_json=_graph(), notes=json.dumps({
+            "current_full_reconcile": {
+                "dev_force_graph_only": True,
+                "normal_update_path": False,
+            },
+        }),
+    )
+    conn.commit()
+    selected = server._current_full_requested_snapshot_identity(
+        conn, project_id=PID, target_commit_sha=head,
+    )
+    assert selected["status"] == "conflict"
+    assert selected["reason"] == "current_full_force_history_not_verified"
+    assert selected["snapshot_id"] == force_id
+    assert selected["snapshot_id"] != server._current_full_normal_after_force_snapshot_id(head)
 
 
 def test_explicit_current_full_candidates_remain_distinct_without_third_build(

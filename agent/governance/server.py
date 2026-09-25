@@ -100075,8 +100075,7 @@ def _dev_active_source_graph_read_authority(
         active = store.get_active_graph_snapshot(conn, project_id) or {}
         snapshot_id = str(active.get("snapshot_id") or "")
         if not (
-            snapshot_id == _current_full_deterministic_snapshot_id(head)
-            and str(active.get("commit_sha") or "").lower() == head
+            str(active.get("commit_sha") or "").lower() == head
             and str(active.get("snapshot_kind") or "") == "full"
             and str(active.get("status") or "") == "active"
         ):
@@ -100114,6 +100113,13 @@ def _dev_active_source_graph_read_authority(
         normal = binding.get("verified") is True
         if not (force_only or normal):
             return {**blocked, "reason": "active_provenance_unverified"}
+        selected = _current_full_requested_snapshot_identity(
+            conn, project_id=project_id, target_commit_sha=head,
+            dev_force_graph_only=force_only,
+        )
+        if (selected.get("status") != "existing"
+                or selected.get("snapshot_id") != snapshot_id):
+            return {**blocked, "reason": "active_full_snapshot_not_exact_head"}
         terminal = store.current_full_active_terminal_tuple(
             conn, project_id=project_id, run_id=run_id,
             target_commit_sha=head, expected_scope=dict(scope),
@@ -100451,8 +100457,9 @@ def _dev_direct_graph_bootstrap_reconcile_authority(
         and str(active_status_rows[0]["snapshot_kind"] or "").strip()
         == "full"
     )
-    canonical_target_snapshot_id = _current_full_deterministic_snapshot_id(
-        target_commit
+    canonical_target_snapshot_id = str(
+        target_identity.get("canonical_snapshot_id")
+        or _current_full_deterministic_snapshot_id(target_commit)
     )
     active_provenance_exact = bool(
         active_binding.get("verified") is True
@@ -102096,17 +102103,142 @@ def _current_full_deterministic_snapshot_id(commit_sha: str) -> str:
     return f"full-{commit[:12]}-{digest[:12]}"
 
 
+def _current_full_normal_after_force_snapshot_id(commit_sha: str) -> str:
+    """Separate the normal generation from an occupied force-only identity."""
+
+    commit = str(commit_sha or "").strip().lower()
+    digest = hashlib.sha256(f"full-normal-after-force:{commit}".encode("utf-8")).hexdigest()
+    return f"full-{commit[:12]}-{digest[:12]}"
+
+
+def _current_full_proven_force_snapshot_history(
+    conn, *, project_id: str, snapshot: Mapping[str, Any],
+) -> bool:
+    """Read the server's complete force receipt, including superseded history.
+
+    A snapshot note alone is never force proof.  The binding checks the
+    immutable provenance row and its hash; the metric and timeline must also
+    identify the same force completion and scope.  Supersession only changes
+    snapshot status and the active ref, so verify those historical rows using
+    their original active status without changing the database.
+    """
+
+    from . import graph_snapshot_store as store
+
+    status = str(snapshot.get("status") or "")
+    if status not in {"active", "superseded"}:
+        return False
+    original = dict(snapshot)
+    active_ref_row = conn.execute(
+        "SELECT snapshot_id FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+        (project_id,),
+    ).fetchone()
+    active_ref_id = str(active_ref_row["snapshot_id"] or "") if active_ref_row else ""
+    if (status == "active" and active_ref_id != original.get("snapshot_id")) or (
+        status == "superseded" and active_ref_id == original.get("snapshot_id")
+    ):
+        return False
+    binding = store._current_full_snapshot_provenance_binding(
+        conn, project_id, {**original, "status": "active"},
+    )
+    if binding.get("force_verified") is not True:
+        return False
+    marker = binding.get("marker") or {}
+    route = marker.get("route_evidence") or {}
+    if not isinstance(route, Mapping):
+        return False
+    snapshot_id = str(original.get("snapshot_id") or "")
+    commit = str(original.get("commit_sha") or "")
+    run_id = str(route.get("reconcile_run_id") or "")
+    scope = _current_full_reconcile_idempotency_scope(route)
+    if not (run_id and scope.get("project_id") == project_id
+            and scope.get("backlog_id") and scope.get("task_id")):
+        return False
+    if project_id == AC_PROJECT_ID:
+        if _runtime_plane() != "dev":
+            return False
+        try:
+            world = _operator_supervised_direct_main_dev_world_authority()
+            custody = classify_graph_activation_connection(conn)
+        except (GovernanceError, OSError, sqlite3.Error, ValueError):
+            return False
+        if not (
+            world.get("accepted") is True
+            and str(world.get("target_head_commit") or "").lower() == commit
+            and str(world.get("loaded_runtime_commit") or "").lower() == commit
+            and str(route.get("loaded_commit") or "").lower() == commit
+            and bool(str(route.get("dev_world_hash") or "").strip())
+            and isinstance(route.get("dev_database_identity"), Mapping)
+            and dict(route["dev_database_identity"])
+            == dict(world.get("database_identity") or {})
+            and custody.get("runtime_plane") == "dev"
+            and custody.get("world_id") == "ac-dev"
+            and custody.get("project_id") == project_id
+            and int(custody.get("port") or 0) == AC_DEV_SERVICE_PORT
+            and custody.get("cow_successor_verified") is True
+            and custody.get("source_checkout_verified") is True
+            and custody.get("live_runtime_custody_verified") is True
+        ):
+            return False
+    metric_row = conn.execute(
+        "SELECT * FROM reconcile_run_metrics WHERE project_id=? AND run_id=? AND snapshot_id=?",
+        (project_id, run_id, snapshot_id),
+    ).fetchone()
+    metric = dict(metric_row) if metric_row else {}
+    evidence = _json_loads(metric.get("evidence_json"), {})
+    if not isinstance(evidence, Mapping) or not (
+        metric.get("evidence_json") == store._json(dict(evidence))
+        and set(evidence) == store._CURRENT_FULL_COMPLETE_EVIDENCE_KEYS
+        and metric.get("status") == "complete"
+        and metric.get("commit_sha") == commit
+        and metric.get("snapshot_kind") == "full"
+        and metric.get("strategy") == "current_full_reconcile"
+        and metric.get("graph_delta_mode") == "dev_force_graph_only"
+        and evidence.get("phase") == "atomic_finalize_complete"
+        and evidence.get("idempotency_scope") == scope
+        and evidence.get("provenance_id") == binding.get("provenance_id")
+        and evidence.get("reconcile_event_id") == binding.get("reconcile_event_id")
+        and evidence.get("request_id") == marker.get("request_id")
+        and evidence.get("activate_requested") is True
+    ):
+        return False
+    event_row = conn.execute(
+        "SELECT * FROM task_timeline_events WHERE project_id=? AND id=?",
+        (project_id, binding.get("reconcile_event_id")),
+    ).fetchone()
+    event = dict(event_row) if event_row else {}
+    payload = _json_loads(event.get("payload_json"), {})
+    return bool(
+        isinstance(payload, Mapping)
+        and event.get("event_type") == "graph.dev_force_graph_reconcile"
+        and event.get("event_kind") == "graph_only"
+        and event.get("phase") == "graph"
+        and event.get("status") == "recorded"
+        and event.get("backlog_id") == scope["backlog_id"]
+        and event.get("task_id") == scope["task_id"]
+        and event.get("commit_sha") == commit
+        and payload.get("snapshot_id") == snapshot_id
+        and payload.get("active_snapshot_id") == snapshot_id
+        and payload.get("target_commit_sha") == commit
+        and payload.get("run_id") == run_id
+        and payload.get("dev_force_graph_only") is True
+        and payload.get("graph_reconciled") is False
+        and not payload.get("contract_evidence")
+    )
+
+
 def _current_full_requested_snapshot_identity(
     conn,
     *,
     project_id: str,
     target_commit_sha: str,
     explicit_snapshot_id: str = "",
+    dev_force_graph_only: bool = False,
 ) -> dict[str, Any]:
     """Select one default identity without silently choosing legacy duplicates."""
 
     explicit = str(explicit_snapshot_id or "").strip()
-    if explicit:
+    if explicit and dev_force_graph_only:
         return {
             "status": "explicit",
             "snapshot_id": explicit,
@@ -102115,13 +102247,96 @@ def _current_full_requested_snapshot_identity(
     canonical = _current_full_deterministic_snapshot_id(target_commit_sha)
     rows = conn.execute(
         """
-        SELECT snapshot_id, status FROM graph_snapshots
+        SELECT * FROM graph_snapshots
         WHERE project_id = ? AND commit_sha = ? AND snapshot_kind = 'full'
         ORDER BY created_at ASC, snapshot_id ASC
         """,
         (project_id, target_commit_sha),
     ).fetchall()
-    if len(rows) > 1:
+    force_rows = [
+        row for row in rows
+        if _current_full_proven_force_snapshot_history(
+            conn, project_id=project_id, snapshot=dict(row),
+        )
+    ]
+    if not dev_force_graph_only:
+        proven_ids = {str(row["snapshot_id"] or "") for row in force_rows}
+        for row in rows:
+            snapshot_id = str(row["snapshot_id"] or "")
+            if snapshot_id in proven_ids:
+                continue
+            notes = _json_loads(row["notes"], {})
+            marker = (
+                notes.get("current_full_reconcile")
+                if isinstance(notes, Mapping)
+                else {}
+            )
+            force_marker = (
+                isinstance(marker, Mapping)
+                and marker.get("dev_force_graph_only") is True
+            )
+            force_metric = conn.execute(
+                "SELECT 1 FROM reconcile_run_metrics WHERE project_id=? "
+                "AND snapshot_id=? AND graph_delta_mode='dev_force_graph_only' LIMIT 1",
+                (project_id, snapshot_id),
+            ).fetchone()
+            if force_marker or force_metric:
+                return {
+                    "status": "conflict",
+                    "reason": "current_full_force_history_not_verified",
+                    "snapshot_id": snapshot_id,
+                    "canonical_snapshot_id": canonical,
+                }
+    if len(force_rows) > 1:
+        return {
+            "status": "conflict",
+            "reason": "current_full_commit_snapshot_identity_ambiguous",
+            "snapshot_id": canonical,
+            "canonical_snapshot_id": canonical,
+            "existing_snapshot_ids": [str(row["snapshot_id"] or "") for row in rows],
+        }
+    if explicit and not force_rows:
+        return {
+            "status": "explicit",
+            "snapshot_id": explicit,
+            "canonical_snapshot_id": "",
+        }
+    if force_rows:
+        force_id = str(force_rows[0]["snapshot_id"] or "")
+        normal_id = _current_full_normal_after_force_snapshot_id(target_commit_sha)
+        normal_rows = [row for row in rows if row["snapshot_id"] != force_id]
+        if explicit and explicit != normal_id:
+            return {
+                "status": "conflict",
+                "reason": "current_full_force_history_requires_service_normal_identity",
+                "snapshot_id": normal_id,
+                "canonical_snapshot_id": normal_id,
+            }
+        if (dev_force_graph_only
+                and str(force_rows[0]["status"] or "") == "active"
+                and (not normal_rows or (
+                    len(normal_rows) == 1
+                    and str(normal_rows[0]["snapshot_id"] or "") == normal_id
+                ))):
+            return {
+                "status": "existing", "snapshot_id": force_id,
+                "canonical_snapshot_id": canonical,
+                "legacy_identity_selected": force_id != canonical,
+            }
+        if not dev_force_graph_only:
+            if not normal_rows and normal_id != force_id:
+                return {
+                    "status": "missing", "snapshot_id": normal_id,
+                    "canonical_snapshot_id": normal_id,
+                    "legacy_identity_selected": False,
+                }
+            if len(normal_rows) == 1 and str(normal_rows[0]["snapshot_id"] or "") == normal_id:
+                return {
+                    "status": "existing", "snapshot_id": normal_id,
+                    "canonical_snapshot_id": normal_id,
+                    "legacy_identity_selected": False,
+                }
+    if len(rows) > 1 or (dev_force_graph_only and rows):
         return {
             "status": "conflict",
             "reason": "current_full_commit_snapshot_identity_ambiguous",
@@ -103706,6 +103921,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             project_id=project_id,
             target_commit_sha=target_commit,
             explicit_snapshot_id=explicit_snapshot_id,
+            dev_force_graph_only=dev_force_graph,
         )
         if snapshot_identity.get("status") == "conflict":
             return 409, {
@@ -182885,6 +183101,7 @@ def _onboard_route_guide_service_response(conn, **kwargs) -> dict[str, Any]:
             candidate = _current_full_requested_snapshot_identity(
                 conn, project_id=AC_PROJECT_ID,
                 target_commit_sha=world["target_head_commit"],
+                dev_force_graph_only=True,
             )
             candidate_id = str(candidate.get("snapshot_id") or "")
             candidate_row = (
