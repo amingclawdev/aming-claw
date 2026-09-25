@@ -155323,20 +155323,6 @@ def _onboard_parentless_direct_main_graph_query_guidance(
         )
         if conn is not None else {}
     )
-    root_source = "registered_canonical_project_root"
-    if world_ref.get("accepted") is True:
-        try:
-            registered_root = Path(project_service.resolve_project_root(
-                project_id, None, fallback_self=True,
-            )).resolve()
-            if Path(world_ref["target_project_root"]).resolve() != registered_root:
-                root_source = (
-                    "pinned_direct_runtime_binding"
-                    if direct_selection.get("source") == "pinned_record"
-                    else "verified_linked_active_main_owner"
-                )
-        except (OSError, TypeError, ValueError):
-            pass
     if conn is not None and requested_snapshot_id not in {"", "active"}:
         try:
             from . import graph_snapshot_store
@@ -155517,7 +155503,7 @@ def _onboard_parentless_direct_main_graph_query_guidance(
             "commit_source": (
                 "operator_supervised_direct_main.pre_mutation_world_ref"
             ),
-            "root_source": root_source,
+            "root_source": "operator_supervised_direct_main.pre_mutation_world_ref",
             "snapshot_commit_must_match_world_ref": True,
             "mismatch_creates_trace": False,
         },
@@ -212067,6 +212053,89 @@ def _handle_task_timeline_append(ctx: RequestContext):
                         if strict_direct_selection.get("source") == "pinned_record" else None,
                     )
                 )
+            if (
+                strict_direct_requested
+                and strict_direct_selection.get("source") == "pinned_record"
+                and direct_main_pre_mutation_world_ref.get("accepted") is not True
+            ):
+                # A historical receipt is still readable after its linked owner
+                # moves. This path returns only the exact admitted request; the
+                # live-world gate below remains mandatory for every new write.
+                admitted_events = _operator_supervised_direct_main_bound_pre_mutation_events(
+                    conn, project_id=project_id, backlog_id=direct_backlog_id,
+                    contract_execution_id=strict_direct_execution_id,
+                )
+                if admitted_events:
+                    requested_fingerprint = _operator_supervised_direct_main_pre_mutation_fingerprint(
+                        provisional_event
+                    )
+                    admitted_fingerprints = {
+                        str((event.get("payload") or {}).get(
+                            "observer_direct_pre_mutation_authority", {}
+                        ).get("pre_mutation_request_fingerprint") or "").strip()
+                        for event in admitted_events
+                    }
+                    if (
+                        len(admitted_events) != 1
+                        or admitted_fingerprints != {requested_fingerprint}
+                    ):
+                        raise GovernanceError(
+                            "operator_supervised_direct_main_pre_mutation_already_admitted",
+                            "Direct Main permits one immutable pre-mutation admission per execution",
+                            409,
+                            {"contract_execution_id": strict_direct_execution_id,
+                             "accepted_event_ids": [event.get("id") for event in admitted_events],
+                             "accepted_request_fingerprints": sorted(admitted_fingerprints),
+                             "requested_fingerprint": requested_fingerprint,
+                             "zero_write_rejection": True, "writes_performed": False},
+                        )
+                    pinned = strict_direct_selection.get("record") or {}
+                    binding = (pinned.get("metadata") or {}).get(
+                        "operator_supervised_direct_main_runtime_binding"
+                    ) or {}
+                    binding_hash = str(binding.get("binding_hash") or "")
+                    receipt = admitted_events[0]
+                    receipt_payload = receipt.get("payload") or {}
+                    receipt_binding = receipt_payload.get("direct_contract_runtime_binding") or {}
+                    route_authority = _operator_supervised_direct_main_route_authority(
+                        conn, project_id=project_id, backlog_id=direct_backlog_id,
+                        contract_execution_id=strict_direct_execution_id,
+                        route_token_ref=str(direct_identity.get("route_token_ref") or ""),
+                    )
+                    runtime_lines = [
+                        line for line in pinned.get("completed_lines") or []
+                        if isinstance(line, Mapping)
+                        and line.get("line_id") == "observer_direct_implementation_exception"
+                    ]
+                    replay_verified = bool(
+                        receipt.get("status") == "accepted"
+                        and receipt.get("phase") == "pre_mutation"
+                        and receipt_binding.get("binding_hash") == binding_hash
+                        and binding_hash == stable_sha256({
+                            key: value for key, value in binding.items()
+                            if key != "binding_hash"
+                        })
+                        and route_authority.get("accepted") is True
+                        and pinned.get("route_token_ref") == direct_identity.get("route_token_ref")
+                        and binding.get("route_identity") == route_authority.get("route_identity")
+                        and len(runtime_lines) == 1
+                        and (runtime_lines[0].get("payload") or {}).get(
+                            "pre_mutation_request_fingerprint"
+                        ) == requested_fingerprint
+                    )
+                    if not replay_verified:
+                        raise GovernanceError(
+                            "operator_supervised_direct_main_pinned_world_invalid",
+                            "The admitted Direct receipt no longer matches its immutable binding",
+                            409, {"zero_write_rejection": True, "writes_performed": False},
+                        )
+                    replay = dict(receipt)
+                    replay.update({
+                        "idempotent_replay": True, "writes_performed": False,
+                        "mutation_performed": False,
+                        "replay_source": "operator_supervised_direct_main_single_admission",
+                    })
+                    return replay
             pre_mutation_graph_trace_gate = (
                 _contract_runtime_parentless_direct_main_append_graph_trace_gate(
                     conn,

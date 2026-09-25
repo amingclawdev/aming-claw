@@ -127750,7 +127750,7 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "commit_source": (
             "operator_supervised_direct_main.pre_mutation_world_ref"
         ),
-        "root_source": "registered_canonical_project_root",
+        "root_source": "operator_supervised_direct_main.pre_mutation_world_ref",
         "snapshot_commit_must_match_world_ref": True,
         "mismatch_creates_trace": False,
     }
@@ -227242,7 +227242,7 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_across_wip(
     assert guide["dev_local_graph_bootstrap"][
         "per_wip_reconcile_provenance_required"
     ] is False
-    assert guide["next_legal_action"]["id"] == "operator_supervised_direct_main_graph_first", guide
+    assert guide["next_legal_action"]["line_id"] == "observer_bind_direct_scope"
     assert guide["next_legal_action"].get("mcp_tool") != (
         "graph_current_full_reconcile"
     )
@@ -237144,7 +237144,7 @@ def test_fresh_direct_selects_proven_linked_active_main_owner(
     assert guide["contract_execution_id"] == case["direct_task_id"]
     assert guide["next_legal_action"]["id"] == "operator_supervised_direct_main_graph_first", guide
     graph = guide["next_legal_action"]["graph_query_close_authority"]
-    assert graph["server_derived_world_ref"]["root_source"] == "verified_linked_active_main_owner"
+    assert graph["server_derived_world_ref"]["root_source"] == "operator_supervised_direct_main.pre_mutation_world_ref"
     assert graph["copy_safe_graph_query"]["ready"] is True, graph
     assert graph["copy_safe_graph_query"]["arguments"]["snapshot_id"] == "active"
     query = server.handle_graph_governance_query(
@@ -237217,7 +237217,7 @@ def test_fresh_direct_selects_proven_linked_active_main_owner(
         target_files=case["direct_row_files"], conn=conn,
         selected_direct={"source": "pinned_record", "record": record},
     )
-    assert pinned_graph["server_derived_world_ref"]["root_source"] == "pinned_direct_runtime_binding"
+    assert pinned_graph["server_derived_world_ref"]["root_source"] == "operator_supervised_direct_main.pre_mutation_world_ref"
     assert server._contract_runtime(conn).store.get(case["direct_task_id"])["metadata"][
         "operator_supervised_direct_main_runtime_binding"
     ]["binding_hash"] == pinned_hash
@@ -237346,6 +237346,60 @@ def test_fresh_direct_selects_proven_linked_active_main_owner(
     assert server._operator_supervised_direct_main_world_ref(
         project_id=PID, conn=conn, pinned_record=completed,
     )["accepted"] is False
+    with pytest.raises(GovernanceError) as live_rejected:
+        server._operator_supervised_direct_main_start_runtime(
+            conn, project_id=PID, backlog_id=case["direct_backlog_id"],
+            task_id=case["direct_task_id"],
+            route_token_ref=case["direct_route_token_ref"],
+            world_ref=server._operator_supervised_direct_main_world_ref(
+                project_id=PID, conn=conn, pinned_record=completed,
+            ),
+        )
+    assert live_rejected.value.code == "operator_supervised_direct_main_pinned_world_invalid"
+    before_revision = completed["execution_state_revision"]
+    before_events = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE project_id=? AND task_id=?",
+        (PID, case["direct_task_id"]),
+    ).fetchone()[0]
+    before_traces = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id=? AND task_id=?",
+        (PID, case["direct_task_id"]),
+    ).fetchone()[0]
+    before_changes = conn.total_changes
+    replay = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID}, "observer", method="POST",
+            body=copy.deepcopy(pre_mutation),
+        )
+    )
+    assert replay["id"] == admitted["id"]
+    assert replay["idempotent_replay"] is True
+    assert replay["writes_performed"] is False
+    assert replay["payload"] == admitted["payload"]
+    assert conn.total_changes == before_changes
+    altered = copy.deepcopy(pre_mutation)
+    altered["payload"]["reason"] = "changed request after owner drift"
+    with pytest.raises(GovernanceError) as altered_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID}, "observer", method="POST", body=altered,
+            )
+        )
+    assert altered_rejected.value.code == (
+        "operator_supervised_direct_main_pre_mutation_already_admitted"
+    )
+    assert conn.total_changes == before_changes
+    assert server._contract_runtime(conn).store.get(case["direct_task_id"])[
+        "execution_state_revision"
+    ] == before_revision
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE project_id=? AND task_id=?",
+        (PID, case["direct_task_id"]),
+    ).fetchone()[0] == before_events
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id=? AND task_id=?",
+        (PID, case["direct_task_id"]),
+    ).fetchone()[0] == before_traces
     subprocess.run(
         ["git", "reset", "--hard", close_commit], cwd=case["owner"],
         check=True, capture_output=True, text=True,
