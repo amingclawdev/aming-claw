@@ -99885,6 +99885,19 @@ def _dev_direct_exact_active_provenance_authority(
         if isinstance(event_payload.get("runtime_context_scope"), Mapping)
         else {}
     )
+    # Current-full's event producer omits the top-level project_id for
+    # source-free maintenance. Only the exact project-scoped durable row may
+    # supply that genuinely absent field; a present value must match as-is.
+    event_project_id = (
+        event_payload["project_id"]
+        if "project_id" in event_payload
+        else event.get("project_id")
+    )
+    source_free_event_project_verified = bool(
+        len(event_rows) == 1
+        and isinstance(event_project_id, str)
+        and event_project_id == project_id
+    )
 
     scope_fields = ("project_id", "backlog_id", "task_id")
 
@@ -99938,7 +99951,11 @@ def _dev_direct_exact_active_provenance_authority(
         and source_free_event_scope_shape
         and scope_values(route_runtime_scope) == activation_scope
         and scope_values(event_runtime_scope) == activation_scope
-        and scope_values(event_payload) == activation_scope
+        and source_free_event_project_verified
+        and scope_values(event_payload).get("backlog_id")
+        == activation_scope.get("backlog_id")
+        and scope_values(event_payload).get("task_id")
+        == activation_scope.get("task_id")
         and route_runtime_scope.get("source")
         == "parallel_branch_runtime_context"
         and route_runtime_scope.get("authority_source")

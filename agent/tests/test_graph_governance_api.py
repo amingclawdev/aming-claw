@@ -227312,37 +227312,41 @@ def _record_source_free_current_full_provenance(
         "source": "parallel_branch_runtime_context",
         "server_derived": True,
     }
-    event = task_timeline.record_event(
+    event = server._record_pending_scope_reconcile_contract_event(
         conn,
         project_id=project_id,
-        backlog_id=source_scope["backlog_id"],
-        task_id=source_scope["task_id"],
-        event_type="graph.reconcile",
-        event_kind="reconcile",
-        phase="reconcile",
-        actor="observer",
-        status="passed",
-        payload={
-            "schema_version": "graph_reconcile_contract_evidence.v1",
-            "requirement_id": "reconcile",
-            "actor_role": "observer",
-            "target_commit_sha": commit_sha,
+        body={**source_scope, "contract_actor": "observer"},
+        result={
+            "ok": True,
+            "status": "active",
+            "strategy": "current_full_reconcile",
+            "current_full_reconcile": True,
+            "activated": True,
             "snapshot_id": snapshot_id,
             "active_snapshot_id": snapshot_id,
-            "reconcile_mode": "current_full",
-            "current_full_reconcile": True,
-            "reconciled_commit_sha": commit_sha,
-            "canonical_head_commit": commit_sha,
-            "merged_head_commit": commit_sha,
+            "head_commit": commit_sha,
             "active_graph_commit": commit_sha,
-            "canonical_head_verified": True,
-            "active_snapshot_verified": True,
-            "graph_reconciled": True,
-            **source_scope,
-            "runtime_context_scope": event_scope,
+            "activation_verification": {
+                "verified": True,
+                "active_graph_commit": commit_sha,
+                "active_snapshot_id": snapshot_id,
+            },
         },
-        commit_sha=commit_sha,
+        target_commit_sha=commit_sha,
+        runtime_context_scope=source_scope,
+        declared_actor_role="observer",
     )
+    assert event
+    event_payload = json.loads(
+        conn.execute(
+            "SELECT payload_json FROM task_timeline_events WHERE id=? AND project_id=?",
+            (event["id"], project_id),
+        ).fetchone()[0]
+    )
+    assert "project_id" not in event_payload
+    assert event_payload["backlog_id"] == source_scope["backlog_id"]
+    assert event_payload["task_id"] == source_scope["task_id"]
+    assert event_payload["runtime_context_scope"] == event_scope
     route_runtime_scope = {
         **source_scope,
         "source": "parallel_branch_runtime_context",
@@ -227634,6 +227638,97 @@ def test_dev_direct_fresh_bind_recognizes_exact_canonical_active_across_wip(
         assert conn.total_changes == tampered_changes
         conn.execute(restore[0], restore[1])
         conn.commit()
+
+    if prior_activation_kind == "source_free":
+        source_payload = json.loads(event_row["payload_json"])
+        assert "project_id" not in source_payload
+        assert source_payload["runtime_context_scope"]["project_id"] == (
+            case["project_id"]
+        )
+        matching_payload = {**source_payload, "project_id": case["project_id"]}
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+            (json.dumps(matching_payload, sort_keys=True), event_id),
+        )
+        conn.commit()
+        matching_before = tuple(conn.iterdump())
+        matching_changes = conn.total_changes
+        matching_guide = server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=request_body,
+            )
+        )
+        assert matching_guide["dev_local_graph_bootstrap"]["state"] == (
+            "exact_active"
+        )
+        assert matching_guide["dev_local_graph_bootstrap"][
+            "graph_query_ready"
+        ] is True
+        assert tuple(conn.iterdump()) == matching_before
+        assert conn.total_changes == matching_changes
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+            (event_row["payload_json"], event_id),
+        )
+        conn.commit()
+
+        bad_payloads = (
+            {**source_payload, "project_id": None},
+            {**source_payload, "project_id": ""},
+            {**source_payload, "project_id": [case["project_id"]]},
+            {**source_payload, "project_id": "foreign-project"},
+            {**source_payload, "project_id": f" {case['project_id']} "},
+            {**source_payload, "backlog_id": "foreign-backlog"},
+            {**source_payload, "task_id": "foreign-task"},
+            {**source_payload, "target_commit_sha": "f" * 40},
+            {**source_payload, "snapshot_id": "foreign-snapshot"},
+            {
+                **source_payload,
+                "runtime_context_scope": {
+                    **source_payload["runtime_context_scope"],
+                    "project_id": "foreign-project",
+                },
+            },
+        )
+        for bad_payload in bad_payloads:
+            assert_tamper_rejected(
+                statement=(
+                    "UPDATE task_timeline_events SET payload_json=? WHERE id=?"
+                ),
+                params=(json.dumps(bad_payload, sort_keys=True), event_id),
+                restore=(
+                    "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+                    (event_row["payload_json"], event_id),
+                ),
+            )
+        assert_tamper_rejected(
+            statement=(
+                "UPDATE task_timeline_events SET project_id=? WHERE id=?"
+            ),
+            params=("foreign-project", event_id),
+            restore=(
+                "UPDATE task_timeline_events SET project_id=? WHERE id=?",
+                (case["project_id"], event_id),
+            ),
+        )
+        route_evidence = json.loads(provenance_row["route_evidence_json"])
+        route_evidence["runtime_context_scope"]["project_id"] = (
+            "foreign-project"
+        )
+        assert_tamper_rejected(
+            statement=(
+                "UPDATE graph_current_full_reconcile_provenance "
+                "SET route_evidence_json=? WHERE provenance_id=?"
+            ),
+            params=(json.dumps(route_evidence, sort_keys=True), provenance_id),
+            restore=(
+                "UPDATE graph_current_full_reconcile_provenance "
+                "SET route_evidence_json=? WHERE provenance_id=?",
+                (provenance_row["route_evidence_json"], provenance_id),
+            ),
+        )
 
     assert_tamper_rejected(
         statement=(
