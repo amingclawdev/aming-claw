@@ -366,6 +366,32 @@ class CFamilyAdapter:
             unique_matches = sorted(set(matches))
             return unique_matches[0] if len(unique_matches) == 1 else ""
 
+        def objc_selector_at_offset(data: bytes, offset: int, name: str) -> bool:
+            """Match a method selector at Clang's leading +/- location."""
+            if offset < 0 or offset >= len(data):
+                return False
+            prefix = re.match(rb"[+-]\s*\([^\n)]+\)\s*", data[offset:])
+            if prefix is None:
+                return False
+            start = offset + prefix.end()
+            if ":" not in name:
+                token = name.encode("utf-8")
+                return data[start:start + len(token)] == token and not re.match(rb"[\w:]", data[start + len(token):start + len(token) + 1])
+            parts = name.split(":")
+            if parts[-1] or any(not part for part in parts[:-1]):
+                return False
+            declaration = data[start:start + 4096].split(b"{", 1)[0].split(b";", 1)[0]
+            first = parts[0].encode("utf-8") + b":"
+            if not declaration.startswith(first):
+                return False
+            position = len(first)
+            for part in parts[1:-1]:
+                match = re.search(rb"\b" + re.escape(part.encode("utf-8")) + rb":", declaration[position:])
+                if match is None:
+                    return False
+                position += match.end()
+            return True
+
         def walk_declarations(
             node: Any,
             scope: tuple[str, ...] = (),
@@ -397,8 +423,15 @@ class CFamilyAdapter:
                         offset = int(offset_value)
                     except (OSError, TypeError, ValueError):
                         continue
-                    window = data[max(0, offset - 1): min(len(data), offset + len(name) + 1)]
-                    if name.encode("utf-8") in window:
+                    if kind == "ObjCMethodDecl":
+                        line_value = row.get("line")
+                        if line_value is not None and int(line_value) != data.count(b"\n", 0, offset) + 1:
+                            continue
+                        matched = objc_selector_at_offset(data, offset, name)
+                    else:
+                        window = data[max(0, offset - 1): min(len(data), offset + len(name) + 1)]
+                        matched = name.encode("utf-8") in window
+                    if matched:
                         main_tu_evidence = True
                         break
             # Main-TU declarations often omit ``file`` but have an offset.
@@ -479,7 +512,7 @@ class CFamilyAdapter:
                     decl_by_clang_id[symbol["clang_id"]] = symbol
             nested_scope = scope
             nested_internal_linkage = inherited_internal_linkage
-            if kind in {"NamespaceDecl", "CXXRecordDecl", "RecordDecl", "ObjCInterfaceDecl", "ObjCCategoryDecl"} and name:
+            if kind in {"NamespaceDecl", "CXXRecordDecl", "RecordDecl", "ObjCInterfaceDecl", "ObjCImplementationDecl", "ObjCCategoryDecl"} and name:
                 nested_scope = (*scope, name)
             if kind == "NamespaceDecl" and not name:
                 nested_internal_linkage = True

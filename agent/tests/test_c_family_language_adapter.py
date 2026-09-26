@@ -167,6 +167,74 @@ def test_objective_cpp_sdk_and_failed_sdk_are_structured(c_family_runtime):
     assert failed["diagnostics"]
 
 
+def test_objc_selector_locations_keep_main_tu_and_header_owners(c_family_runtime):
+    project = c_family_runtime["project"] / "objc-selector-owner"
+    project.mkdir()
+    header = project / "Window.h"
+    header.write_text(
+        "@interface Window\n"
+        "- (void)refreshForegroundWindow;\n"
+        "- (void)inspectorSelectReference:(id)reference context:(id)context;\n"
+        "@end\n",
+        encoding="utf-8",
+    )
+    source = project / "Window.mm"
+    source.write_text(
+        '#include "Window.h"\n'
+        "@implementation Window\n"
+        "- (void)refreshForegroundWindow {}\n"
+        "- (void)inspectorSelectReference:(id)reference context:(id)context {}\n"
+        "@end\n"
+        "int free_cpp() { return 1; }\n",
+        encoding="utf-8",
+    )
+    (project / "compile_commands.json").write_text(json.dumps([{
+        "directory": str(project),
+        "file": str(source),
+        "arguments": [str(CLANGXX), "-x", "objective-c++", "-I", str(project), "-c", str(source)],
+    }]), encoding="utf-8")
+    action = action_for_file(load_compilation_actions(project), source)
+    assert action is not None
+    result = CFamilyAdapter(action, helper_path=str(c_family_runtime["helper"]), clang_path=str(CLANGXX)).analyze_action()
+    assert result["status"] == "ok", result["diagnostics"]
+    for selector, declaration_line, definition_line in (
+        ("refreshForegroundWindow", 2, 3),
+        ("inspectorSelectReference:context:", 3, 4),
+    ):
+        occurrences = [row for row in result["symbols"] if row["name"] == selector]
+        assert {(Path(row["file"]).name, row["lineno"], row["is_definition"]) for row in occurrences} == {
+            ("Window.h", declaration_line, False), ("Window.mm", definition_line, True),
+        }
+        assert any(row["location_file_omitted"] for row in occurrences if row["is_definition"])
+        assert any(row["location_file_omitted"] for row in occurrences if not row["is_definition"])
+        assert len({row["symbol_id"] for row in occurrences}) == 1
+        assert len({row["qualified_name"] for row in occurrences}) == 1
+    assert any(row["name"] == "free_cpp" and Path(row["file"]) == source for row in result["symbols"])
+
+
+def test_objc_omitted_owner_requires_exact_main_tu_location(tmp_path):
+    source = tmp_path / "Main.mm"
+    contents = "+ (void)shared {}\n- (void)select:(id)value context:(id)context {}\n"
+    source.write_text(contents, encoding="utf-8")
+    selector_offset = contents.index("- (void)")
+
+    def method(name, loc):
+        return {"kind": "ObjCMethodDecl", "name": name, "loc": loc, "type": {"qualType": "void"}}
+
+    payload = {"kind": "TranslationUnitDecl", "inner": [
+        method("shared", {"offset": 0, "line": 1}),
+        method("select:context:", {"offset": selector_offset, "line": 2}),
+        method("select:other:", {"offset": selector_offset, "line": 2}),
+        method("wrongLine", {"offset": selector_offset, "line": 1}),
+        method("select:context:", {"offset": selector_offset, "line": 2, "includedFrom": {"file": str(source)}}),
+        method("select:context:", {"offset": selector_offset, "line": 2, "file": str(tmp_path / "SDK" / "Foreign.h")}),
+    ]}
+    result = CFamilyAdapter({"file": str(source), "language": "objective-cpp"})._from_ast(payload, [], include_trace=[])
+    assert [(row["name"], row["lineno"], row["file"]) for row in result["symbols"]] == [
+        ("shared", 1, str(source)), ("select:context:", 2, str(source)),
+    ]
+
+
 def test_test_translation_units_keep_separate_direct_and_unbound_facts(c_family_runtime):
     bound = _adapter(c_family_runtime, "overlay_test.cc").analyze_action()
     unbound = _adapter(c_family_runtime, "unbound_test.cc").analyze_action()
