@@ -198851,6 +198851,294 @@ def test_fixed_base_failures_share_timeline_and_contract_runtime_authority(
     )
 
 
+def test_direct_main_overlay_binds_parent_comparison_through_authenticated_qa(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path, name="direct-main-overlay-comparison"
+    )
+    canonical_root = fixture.root
+    base_commit = fixture.main_head
+    candidate_root = tmp_path / "direct-main-overlay-candidate"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "direct-overlay", str(candidate_root), base_commit],
+        cwd=canonical_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    changed_path = candidate_root / "agent" / "governance" / "server.py"
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_text("DIRECT_OVERLAY_COMPARISON = True\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=candidate_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "direct overlay candidate"],
+        cwd=candidate_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(candidate_root)
+    backlog_id = "AC-DIRECT-MAIN-OVERLAY-COMPARISON"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        record_failed_qa=False,
+        observer_authoritative_implementation=True,
+        implementation_commit_sha=candidate_commit,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, explicit_root=None, **_kwargs: (
+            Path(explicit_root).resolve() if explicit_root else canonical_root
+        ),
+    )
+    _activate_basic_graph(conn, "full-direct-overlay-base", commit_sha=base_commit)
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+        commit_sha=candidate_commit,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{lineage['task_id']}",
+        f"commit:{candidate_commit}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn, "qa:direct-overlay-comparison", PID, "qa", scope=qa_scope
+    )
+    conn.commit()
+    query_body = {
+        "snapshot_id": "active",
+        "tool": "query_schema",
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "backlog_id": backlog_id,
+        "task_id": lineage["task_id"],
+        "commit_sha": candidate_commit,
+        "project_root": str(candidate_root),
+    }
+    query_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=query_body,
+    )
+    query_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:direct-overlay-comparison",
+            "scope": qa_scope,
+        }
+    )
+    queried = server.handle_graph_governance_query(query_ctx)
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": queried["trace_id"]})
+    )["trace"]
+    identity = trace["graph_query_identity"]
+    exact_tuple = server._qa_exact_candidate_diff_identity(
+        canonical_root,
+        base_commit_sha=base_commit,
+        candidate_commit_sha=candidate_commit,
+        comparison_base_commit_source=server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+    )
+    qa_body = {
+        "backlog_id": backlog_id,
+        "task_id": lineage["task_id"],
+        "event_type": "qa.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "qa:direct-overlay-comparison",
+        "status": "passed",
+        "commit_sha": candidate_commit,
+        "payload": {
+            "schema_version": "qa_independent_verification.v1",
+            "graph_trace_ids": [queried["trace_id"]],
+            "candidate_commit_sha": candidate_commit,
+            "full_suite_claim": "not_claimed",
+            "row_scoped_qa_pass": True,
+            "targeted_scope_only": True,
+            "used_as_pass": False,
+            "qa_acceptance": {
+                "passed": True,
+                "targeted_scope_only": True,
+                "used_as_pass": False,
+            },
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "observer_impersonation": False,
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "schema_version": "contract_runtime.external_no_pass_baseline_ledger.v2",
+                "base_commit_sha": base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "base_failure_identities": ["fixed_on_candidate", "inherited_non_green"],
+                "candidate_failure_identities": ["inherited_non_green"],
+                "fixed_base_failure_identities": ["fixed_on_candidate"],
+                "base_reproduction": {
+                    "reproduced": 2,
+                    "total": 2,
+                    "failure_identities": ["fixed_on_candidate", "inherited_non_green"],
+                },
+                "candidate_suite_counts": {
+                    "baseline_known_non_green": 2,
+                    "failed": 1,
+                    "passed": 1,
+                },
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "refs": [queried["trace_id"]],
+            }
+        },
+    }
+    qa_ctx = _ctx_with_role(
+        {"project_id": PID}, "qa", method="POST", body=qa_body
+    )
+    qa_ctx._session = dict(query_ctx._session)
+    trace_count = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    for field, wrong_value in (
+        ("task_id", "wrong-direct-overlay-task"),
+        ("commit_sha", base_commit),
+    ):
+        wrong_ctx = _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body={**query_body, field: wrong_value},
+        )
+        wrong_ctx._session = dict(query_ctx._session)
+        with pytest.raises(GovernanceError):
+            server.handle_graph_governance_query(wrong_ctx)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+            (PID,),
+        ).fetchone()[0] == trace_count
+
+    forged_base_body = json.loads(json.dumps(qa_body))
+    forged_base_body["artifact_refs"]["external_no_pass_baseline_ledger"][
+        "base_commit_sha"
+    ] = "f" * 40
+    forged_base_ctx = _ctx_with_role(
+        {"project_id": PID}, "qa", method="POST", body=forged_base_body
+    )
+    forged_base_ctx._session = dict(query_ctx._session)
+    with pytest.raises(GovernanceError) as forged_base:
+        server.handle_task_timeline_append(forged_base_ctx)
+    assert forged_base.value.code == "qa_graph_review_context_mismatch"
+    assert forged_base.value.details["field"] == "comparison_base_commit_sha"
+
+    forged_trace_body = json.loads(json.dumps(qa_body))
+    forged_trace_body["payload"]["graph_trace_ids"] = ["gqt-forged-overlay"]
+    forged_trace_ctx = _ctx_with_role(
+        {"project_id": PID}, "qa", method="POST", body=forged_trace_body
+    )
+    forged_trace_ctx._session = dict(query_ctx._session)
+    with pytest.raises(GovernanceError):
+        server.handle_task_timeline_append(forged_trace_ctx)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == trace_count
+
+    accepted = None
+    consumer_error = None
+    try:
+        accepted = server.handle_task_timeline_append(qa_ctx)
+    except GovernanceError as exc:
+        consumer_error = exc
+    assert consumer_error is None, (
+        "authenticated overlay QA rejected its parent comparison proof: "
+        f"{consumer_error.code} {consumer_error.details}"
+    )
+    assert trace["graph_basis"] == "canonical_base_plus_candidate_diff"
+    assert identity["comparison_authority_required"] is True
+    assert identity["comparison_base_commit_sha"] == base_commit
+    assert identity["comparison_base_commit_source"] == exact_tuple[
+        "comparison_base_commit_source"
+    ]
+    assert identity["comparison_base_commit_lineage_source"] == (
+        server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+    )
+    assert identity["changed_files"] == exact_tuple["changed_files"]
+    assert identity["candidate_diff_hash"] == exact_tuple["candidate_diff_hash"]
+    assert identity["changed_files_source"] == exact_tuple["changed_files_source"]
+    assert accepted["payload"]["source_backed_contract_gate_authority"][
+        "qa_session_proof"
+    ]["comparison_base_commit_sha"] == base_commit
+
+    direct_row = conn.execute(
+        "SELECT * FROM task_timeline_events WHERE project_id = ? AND backlog_id = ? "
+        "AND task_id = ? AND event_kind = 'observer_direct_implementation_exception'",
+        (PID, backlog_id, lineage["task_id"]),
+    ).fetchone()
+    direct_columns = [column for column in direct_row.keys() if column != "id"]
+    duplicate_id = conn.execute(
+        "INSERT INTO task_timeline_events ("
+        + ", ".join(direct_columns)
+        + ") VALUES ("
+        + ", ".join("?" for _ in direct_columns)
+        + ")",
+        tuple(direct_row[column] for column in direct_columns),
+    ).lastrowid
+    with pytest.raises(GovernanceError) as ambiguous:
+        server.handle_graph_governance_query(query_ctx)
+    assert ambiguous.value.code == "qa_candidate_overlay_comparison_authority_rejected"
+    assert ambiguous.value.details["authority_machine_reason"] == (
+        "exact_candidate_direct_main_boundary_ambiguous"
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == trace_count
+    trace_row = conn.execute(
+        "SELECT t.*, s.commit_sha AS snapshot_commit_sha "
+        "FROM graph_query_traces t JOIN graph_snapshots s "
+        "ON s.snapshot_id = t.snapshot_id AND s.project_id = t.project_id "
+        "WHERE t.trace_id = ?",
+        (queried["trace_id"],),
+    ).fetchone()
+    _, consumer_mismatches = server._qa_reverify_candidate_trace_context(
+        conn, project_id=PID, row=trace_row, body=qa_body
+    )
+    assert any(item["field"] == "comparison_authority" for item in consumer_mismatches)
+
+    conn.execute("DELETE FROM task_timeline_events WHERE id = ?", (duplicate_id,))
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE project_id = ? AND backlog_id = ? "
+        "AND task_id = ? AND event_kind = 'implementation'",
+        (PID, backlog_id, lineage["task_id"]),
+    )
+    with pytest.raises(GovernanceError) as missing:
+        server.handle_graph_governance_query(query_ctx)
+    assert missing.value.code == "qa_candidate_overlay_comparison_authority_rejected"
+    assert missing.value.details["authority_machine_reason"] == (
+        "exact_candidate_direct_main_implementation_missing"
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == trace_count
+
+
 def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_and_rejects_forged_base(
     conn,
     monkeypatch,

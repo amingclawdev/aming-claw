@@ -13811,6 +13811,8 @@ _QA_EXACT_COMPARISON_FAILURE_REASONS = frozenset(
         "exact_candidate_comparison_source_invalid",
         "exact_candidate_comparison_diff_unavailable",
         "exact_candidate_comparison_diff_hash_unavailable",
+        "overlay_comparison_base_mismatch",
+        "overlay_comparison_tuple_mismatch",
     }
 )
 _QA_OVERLAY_OVERSIZED_SOURCE_POLICY = "oversized_supported_source"
@@ -16864,6 +16866,10 @@ def _qa_candidate_diff_context(
     base_commit_sha: str,
     candidate_commit_sha: str,
     allow_historical_audit_descendant: bool = False,
+    comparison_base_commit_sha: str = "",
+    comparison_base_commit_source: str = "",
+    comparison_base_commit_lineage_source: str = "",
+    comparison_authority_required: bool = False,
 ) -> dict[str, Any]:
     from . import graph_query_trace
 
@@ -16871,6 +16877,44 @@ def _qa_candidate_diff_context(
     canonical_root = Path(canonical_project_root).resolve()
     base_commit_sha = str(base_commit_sha or "").strip().lower()
     candidate_commit_sha = str(candidate_commit_sha or "").strip().lower()
+    comparison_base_commit_sha = str(
+        comparison_base_commit_sha or ""
+    ).strip().lower()
+    comparison_base_commit_source = str(
+        comparison_base_commit_source or ""
+    ).strip()
+    comparison_base_commit_lineage_source = str(
+        comparison_base_commit_lineage_source or ""
+    ).strip()
+    comparison_authority_required = bool(comparison_authority_required)
+    if comparison_authority_required and not comparison_base_commit_sha:
+        _qa_overlay_fail(
+            "exact_candidate_comparison_base_required",
+            "managed candidate overlay requires a trusted comparison base",
+            identity_mismatches=[{
+                "field": "comparison_base_commit_sha",
+                "expected": "full distinct trusted ContractRuntime comparison base",
+                "actual": "",
+            }],
+        )
+    comparison_diff: dict[str, Any] = {}
+    if comparison_base_commit_sha:
+        comparison_diff = _qa_exact_candidate_diff_identity(
+            canonical_root,
+            base_commit_sha=comparison_base_commit_sha,
+            candidate_commit_sha=candidate_commit_sha,
+            comparison_base_commit_source=comparison_base_commit_source,
+        )
+        if comparison_base_commit_sha != base_commit_sha:
+            _qa_overlay_fail(
+                "overlay_comparison_base_mismatch",
+                "canonical overlay base differs from the persisted comparison base",
+                identity_mismatches=[{
+                    "field": "comparison_base_commit_sha",
+                    "expected": base_commit_sha,
+                    "actual": comparison_base_commit_sha,
+                }],
+            )
 
     for field, commit_sha in (
         ("base_commit_sha", base_commit_sha),
@@ -16906,6 +16950,16 @@ def _qa_candidate_diff_context(
         require_canonical_base_head=not allow_historical_audit_descendant,
         require_query_review_head=not allow_historical_audit_descendant,
     )
+    if comparison_authority_required:
+        root_identity["comparison_authority_required"] = True
+    if comparison_diff:
+        root_identity.update({
+            "comparison_base_commit_sha": comparison_base_commit_sha,
+            "comparison_base_commit_source": comparison_base_commit_source,
+            "comparison_base_commit_lineage_source": (
+                comparison_base_commit_lineage_source
+            ),
+        })
     if allow_historical_audit_descendant:
         canonical_head_commit = str(
             root_identity.get("canonical_head_commit") or ""
@@ -17185,6 +17239,27 @@ def _qa_candidate_diff_context(
             normalized = str(candidate_path or "")
             if normalized and normalized not in changed_files:
                 changed_files.append(normalized)
+    candidate_diff_hash = f"sha256:{hashlib.sha256(diff.stdout).hexdigest()}"
+    if comparison_diff and (
+        changed_files != comparison_diff["changed_files"]
+        or candidate_diff_hash != comparison_diff["candidate_diff_hash"]
+    ):
+        _qa_overlay_fail(
+            "overlay_comparison_tuple_mismatch",
+            "canonical overlay diff differs from the persisted comparison tuple",
+            identity_mismatches=[
+                {
+                    "field": field,
+                    "expected": comparison_diff[field],
+                    "actual": actual,
+                }
+                for field, actual in (
+                    ("changed_files", changed_files),
+                    ("candidate_diff_hash", candidate_diff_hash),
+                )
+                if actual != comparison_diff[field]
+            ],
+        )
     root_identity_hash = stable_sha256(root_identity)
     graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
         "canonical_base_plus_candidate_diff",
@@ -17192,8 +17267,17 @@ def _qa_candidate_diff_context(
     )
     return {
         "changed_files": changed_files,
-        "candidate_diff_hash": f"sha256:{hashlib.sha256(diff.stdout).hexdigest()}",
-        "changed_files_source": "server_git_diff_name_status_z_m",
+        "candidate_diff_hash": candidate_diff_hash,
+        "changed_files_source": (
+            comparison_diff["changed_files_source"]
+            if comparison_diff else "server_git_diff_name_status_z_m"
+        ),
+        "comparison_base_commit_sha": comparison_base_commit_sha,
+        "comparison_base_commit_source": comparison_base_commit_source,
+        "comparison_base_commit_lineage_source": (
+            comparison_base_commit_lineage_source
+        ),
+        "comparison_authority_required": comparison_authority_required,
         "candidate_overlay": overlay,
         "candidate_overlay_hash": stable_sha256(overlay),
         "graph_basis_decision": graph_basis_decision,
@@ -19906,6 +19990,58 @@ def _qa_reverify_candidate_trace_context(
 
     if review_context.get("graph_basis") != "canonical_base_plus_candidate_diff":
         return review_context, mismatches
+    comparison_proof = {
+        "backlog_id": str(row["backlog_id"] or "").strip(),
+        "task_id": str(row["task_id"] or "").strip(),
+        "commit_sha": review_context["candidate_commit_sha"],
+    }
+    current_required = _qa_exact_candidate_comparison_authority_required(
+        conn,
+        project_id=project_id,
+        proof=comparison_proof,
+    )
+    persisted_required = review_context["comparison_authority_required"]
+    if current_required != persisted_required:
+        mismatches.append({
+            "trace_id": trace_id,
+            "field": "comparison_authority_required",
+            "expected": current_required,
+            "actual": persisted_required,
+        })
+    current_authority = _qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=project_id,
+        proof=comparison_proof,
+    )
+    current_fields = {
+        "comparison_base_commit_sha": str(
+            current_authority.get("commit_sha") or ""
+        ).strip().lower(),
+        "comparison_base_commit_source": str(
+            current_authority.get("source") or ""
+        ).strip(),
+        "comparison_base_commit_lineage_source": str(
+            current_authority.get("lineage_source") or ""
+        ).strip(),
+    }
+    if current_required and not current_fields["comparison_base_commit_sha"]:
+        mismatches.append({
+            "trace_id": trace_id,
+            "field": "comparison_authority",
+            "expected": "current unambiguous server-owned lineage",
+            "actual": str(current_authority.get("machine_reason") or "missing"),
+        })
+    for field, expected in current_fields.items():
+        actual = review_context[field]
+        if actual != expected:
+            mismatches.append({
+                "trace_id": trace_id,
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+            })
+    if mismatches:
+        return review_context, mismatches
     active = graph_snapshot_store.get_active_graph_snapshot(conn, project_id) or {}
     active_snapshot_id = str(active.get("snapshot_id") or "").strip()
     active_commit_sha = str(active.get("commit_sha") or "").strip().lower()
@@ -19994,6 +20130,16 @@ def _qa_reverify_candidate_trace_context(
             allow_historical_audit_descendant=(
                 historical_audit_only or post_merge_verified
             ),
+            comparison_base_commit_sha=current_fields[
+                "comparison_base_commit_sha"
+            ],
+            comparison_base_commit_source=current_fields[
+                "comparison_base_commit_source"
+            ],
+            comparison_base_commit_lineage_source=current_fields[
+                "comparison_base_commit_lineage_source"
+            ],
+            comparison_authority_required=current_required,
         )
     except _QACandidateOverlayError as exc:
         mismatches.append(
@@ -20012,6 +20158,10 @@ def _qa_reverify_candidate_trace_context(
         "changed_files_source",
         "candidate_overlay_hash",
         "repository_identity_hash",
+        "comparison_base_commit_sha",
+        "comparison_base_commit_source",
+        "comparison_base_commit_lineage_source",
+        "comparison_authority_required",
     ]
     if not historical_audit_only and not post_merge_verified:
         immutable_reverification_fields.extend(
@@ -21345,6 +21495,37 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                     project_id=ctx.get_project_id(),
                 )
             if review_context.get("requires_candidate_diff"):
+                comparison_authority = (
+                    _qa_exact_candidate_runtime_comparison_authority(
+                        conn,
+                        project_id=ctx.get_project_id(),
+                        proof=proof,
+                    )
+                )
+                comparison_authority_required = (
+                    _qa_exact_candidate_comparison_authority_required(
+                        conn,
+                        project_id=ctx.get_project_id(),
+                        proof=proof,
+                    )
+                )
+                if (
+                    comparison_authority_required
+                    and not comparison_authority.get("commit_sha")
+                ):
+                    _qa_overlay_fail(
+                        "exact_candidate_comparison_base_required",
+                        "managed candidate overlay requires one unambiguous server-owned comparison base",
+                        authority_machine_reason=str(
+                            comparison_authority.get("machine_reason") or "missing"
+                        ),
+                        identity_mismatches=list(
+                            comparison_authority.get("identity_mismatches") or []
+                        ),
+                        fail_closed=True,
+                        zero_write_rejection=True,
+                        writes_performed=False,
+                    )
                 review_context.update(
                     _qa_candidate_diff_context(
                         query_root,
@@ -21355,6 +21536,18 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                         ),
                         candidate_commit_sha=str(
                             review_context.get("candidate_commit_sha") or ""
+                        ),
+                        comparison_base_commit_sha=str(
+                            comparison_authority.get("commit_sha") or ""
+                        ),
+                        comparison_base_commit_source=str(
+                            comparison_authority.get("source") or ""
+                        ),
+                        comparison_base_commit_lineage_source=str(
+                            comparison_authority.get("lineage_source") or ""
+                        ),
+                        comparison_authority_required=(
+                            comparison_authority_required
                         ),
                     )
                 )
@@ -21496,9 +21689,13 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         except _QACandidateOverlayError as exc:
             if exc.reason in _QA_EXACT_COMPARISON_FAILURE_REASONS:
                 raise GovernanceError(
-                    "qa_exact_candidate_comparison_authority_rejected",
                     (
-                        "Exact-candidate review requires a complete, trusted "
+                        "qa_candidate_overlay_comparison_authority_rejected"
+                        if review_context.get("requires_candidate_diff")
+                        else "qa_exact_candidate_comparison_authority_rejected"
+                    ),
+                    (
+                        "Candidate review requires a complete, trusted "
                         "comparison authority before the graph query can run"
                     ),
                     409,
