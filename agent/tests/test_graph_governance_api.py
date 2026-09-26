@@ -35087,6 +35087,55 @@ def test_direct_main_reconcile_qa_candidate_target_identity_is_basis_bounded():
         ) is False
 
 
+def test_direct_main_reconcile_accepts_only_trusted_runtime_comparison_diff():
+    target_commit = "c" * 40
+    base_commit = "b" * 40
+    proof = {
+        "graph_basis": "canonical_base_plus_candidate_diff",
+        "snapshot_commit_sha": base_commit,
+        "base_commit_sha": base_commit,
+        "candidate_commit_sha": target_commit,
+        "candidate_diff_hash": _fake_sha("direct-runtime-comparison-diff"),
+        "changed_files": ["agent/governance/server.py"],
+        "changed_files_source": (
+            "server_runtime_context_base_to_exact_candidate_diff"
+        ),
+        "candidate_overlay_hash": _fake_sha("direct-runtime-comparison-overlay"),
+        "comparison_authority_required": True,
+        "comparison_base_commit_sha": base_commit,
+        "comparison_base_commit_source": (
+            server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+        ),
+        "comparison_base_commit_lineage_source": (
+            server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+        ),
+    }
+    matches = server._operator_supervised_direct_main_reconcile_qa_candidate_matches_target
+    assert matches(proof, target_commit=target_commit) is True
+
+    for field, invalid_value in (
+        ("comparison_authority_required", False),
+        ("comparison_base_commit_sha", ""),
+        ("comparison_base_commit_sha", "a" * 40),
+        ("comparison_base_commit_sha", target_commit),
+        ("comparison_base_commit_source", "caller_claim"),
+        ("comparison_base_commit_lineage_source", "caller_claim"),
+        ("changed_files_source", "caller_claim"),
+        ("snapshot_commit_sha", target_commit),
+        ("base_commit_sha", target_commit),
+        ("candidate_commit_sha", base_commit),
+        ("candidate_diff_hash", "sha256:" + hashlib.sha256(b"").hexdigest()),
+        ("changed_files", []),
+        ("candidate_overlay_hash", ""),
+        ("graph_basis", "incomplete_graph"),
+    ):
+        assert matches({**proof, field: invalid_value}, target_commit=target_commit) is False, field
+
+    missing = dict(proof)
+    del missing["comparison_authority_required"]
+    assert matches(missing, target_commit=target_commit) is False
+
+
 def _append_observer_materialized_qa_verification(
     conn,
     *,

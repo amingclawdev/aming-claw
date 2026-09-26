@@ -165209,6 +165209,9 @@ def _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
     changed_files_source = str(
         proof.get("changed_files_source") or ""
     ).strip()
+    comparison_base = str(
+        proof.get("comparison_base_commit_sha") or ""
+    ).strip().lower()
     nonempty_diff = bool(
         re.fullmatch(r"sha256:[0-9a-f]{64}", candidate_diff_hash)
         and candidate_diff_hash
@@ -165221,6 +165224,20 @@ def _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
     )
 
     if graph_basis == "canonical_base_plus_candidate_diff":
+        trusted_comparison_diff = bool(
+            changed_files_source
+            == "server_runtime_context_base_to_exact_candidate_diff"
+            and proof.get("comparison_authority_required") is True
+            and re.fullmatch(full_commit, comparison_base)
+            and comparison_base == base_commit
+            and comparison_base != target_commit
+            and str(proof.get("comparison_base_commit_source") or "").strip()
+            == _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+            and str(
+                proof.get("comparison_base_commit_lineage_source") or ""
+            ).strip()
+            == _QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+        )
         return bool(
             re.fullmatch(full_commit, base_commit)
             and snapshot_commit == base_commit
@@ -165228,7 +165245,10 @@ def _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
             and candidate_commit == target_commit
             and nonempty_diff
             and bounded_changes
-            and changed_files_source == "server_git_diff_name_status_z_m"
+            and (
+                changed_files_source == "server_git_diff_name_status_z_m"
+                or trusted_comparison_diff
+            )
             and re.fullmatch(
                 r"sha256:[0-9a-f]{64}",
                 str(proof.get("candidate_overlay_hash") or "")
@@ -165239,9 +165259,6 @@ def _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
 
     if graph_basis != "exact_candidate_snapshot":
         return False
-    comparison_base = str(
-        proof.get("comparison_base_commit_sha") or ""
-    ).strip().lower()
     return bool(
         snapshot_commit == target_commit
         and base_commit == target_commit
