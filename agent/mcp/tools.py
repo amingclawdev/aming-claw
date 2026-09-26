@@ -6672,6 +6672,7 @@ TOOLS: list[dict] = [
                 "project_root": {"type": "string"},
                 "repo_root": {"type": "string"},
                 "include_unowned": {"type": "boolean", "default": True},
+                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"], "default": "all"},
             },
             "required": ["project_id"],
         },
@@ -6691,8 +6692,11 @@ TOOLS: list[dict] = [
                 "task_id": {"type": "string"},
                 "reason": {"type": "string"},
                 "remove_branch": {"type": "boolean", "default": False},
+                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"]},
+                "plan_hash": {"type": "string"},
+                "plan_revision": {"type": "integer"},
             },
-            "required": ["project_id", "candidate_ids"],
+            "required": ["project_id", "candidate_ids", "dimension", "plan_hash", "plan_revision"],
         },
     },
     {
@@ -9427,8 +9431,12 @@ class ToolDispatcher:
             )
 
         if name == "stale_artifact_cleanup":
+            if str(args.get("dimension") or "all") not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"}:
+                return {"ok": False, "error": "cleanup_dimension_invalid"}
             pid = args["project_id"]
             query = {}
+            if args.get("dimension"):
+                query["dimension"] = args["dimension"]
             for key in ("project_root", "repo_root"):
                 if args.get(key):
                     query[key] = args[key]
@@ -9438,6 +9446,8 @@ class ToolDispatcher:
             return self._api("GET", f"/api/graph-governance/{pid}/stale-artifact-cleanup{qs}")
 
         if name == "stale_artifact_cleanup_apply":
+            if str(args.get("dimension") or "") not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"}:
+                return {"ok": False, "error": "cleanup_dimension_invalid"}
             pid = args["project_id"]
             body = {
                 key: value

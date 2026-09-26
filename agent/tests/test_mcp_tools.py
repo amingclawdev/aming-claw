@@ -5521,6 +5521,7 @@ def test_mcp_graph_tools_route_to_governance_api():
             "project_id": "aming-claw",
             "repo_root": "/repo",
             "include_unowned": False,
+            "dimension": "graph_snapshots",
         },
     )
     dispatcher.dispatch(
@@ -5529,6 +5530,9 @@ def test_mcp_graph_tools_route_to_governance_api():
             "project_id": "aming-claw",
             "repo_root": "/repo",
             "candidate_ids": ["batch_worktree:abc"],
+            "dimension": "worktrees",
+            "plan_hash": "sha256:" + "a" * 64,
+            "plan_revision": 1,
             "actor": "observer",
             "reason": "terminal cleanup",
         },
@@ -5575,7 +5579,7 @@ def test_mcp_graph_tools_route_to_governance_api():
     )
     assert recorder.calls[3] == (
         "GET",
-        "/api/graph-governance/aming-claw/stale-artifact-cleanup?repo_root=%2Frepo&include_unowned=false",
+        "/api/graph-governance/aming-claw/stale-artifact-cleanup?dimension=graph_snapshots&repo_root=%2Frepo&include_unowned=false",
         None,
     )
     assert recorder.calls[4] == (
@@ -5584,6 +5588,9 @@ def test_mcp_graph_tools_route_to_governance_api():
         {
             "repo_root": "/repo",
             "candidate_ids": ["batch_worktree:abc"],
+            "dimension": "worktrees",
+            "plan_hash": "sha256:" + "a" * 64,
+            "plan_revision": 1,
             "actor": "observer",
             "reason": "terminal cleanup",
         },
@@ -8528,3 +8535,37 @@ def test_mcp_tools_ac_endpoint_is_dev_only(monkeypatch):
     monkeypatch.setenv("GOVERNANCE_URL", "http://127.0.0.1:40000")
     with pytest.raises(ValueError, match="40008"):
         tools._governance_url()
+
+
+def test_cleanup_dimensions_match_both_mcp_dispatchers_and_reject_unknown(monkeypatch):
+    expected = ["worktrees", "graph_snapshots", "governance_index",
+                "state_reconcile", "all"]
+    for registry in (TOOLS, governance_mcp_server.TOOLS):
+        for name in ("stale_artifact_cleanup", "stale_artifact_cleanup_apply"):
+            tool = next(item for item in registry if item.get("name") == name)
+            assert tool["inputSchema"]["properties"]["dimension"]["enum"] == expected
+        apply = next(item for item in registry
+                     if item.get("name") == "stale_artifact_cleanup_apply")
+        assert {"dimension", "plan_hash", "plan_revision"} <= set(apply["inputSchema"]["required"])
+
+    recorder = _Recorder()
+    managed = _dispatcher(recorder)
+    result = managed.dispatch("stale_artifact_cleanup", {
+        "project_id": "aming-claw", "dimension": "unknown",
+    })
+    assert result["error"] == "cleanup_dimension_invalid"
+    assert recorder.calls == []
+
+    calls = []
+    monkeypatch.setattr(governance_mcp_server, "_http",
+                        lambda method, path, body=None: calls.append((method, path, body)) or {"ok": True})
+    rejected = governance_mcp_server._dispatch_tool("stale_artifact_cleanup_apply", {
+        "project_id": "aming-claw", "dimension": "../outside",
+        "candidate_ids": ["x"], "plan_hash": "sha256:x", "plan_revision": 1,
+    })
+    assert rejected["error"] == "cleanup_dimension_invalid"
+    assert calls == []
+    governance_mcp_server._dispatch_tool("stale_artifact_cleanup", {
+        "project_id": "aming-claw", "dimension": "graph_snapshots",
+    })
+    assert calls == [("GET", "/api/graph-governance/aming-claw/stale-artifact-cleanup?dimension=graph_snapshots", None)]

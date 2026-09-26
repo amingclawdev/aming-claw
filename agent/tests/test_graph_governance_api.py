@@ -53,6 +53,7 @@ from agent.governance import reconcile_feedback
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
 from agent.governance import server
 from agent.governance import state_reconcile
+from agent.governance import stale_artifact_cleanup
 from agent.governance import task_timeline
 from agent.governance import dashboard_read_cache
 from agent.governance import db as governance_db
@@ -9202,7 +9203,9 @@ def test_release_preflight_protects_snapshots_referenced_by_graph_traces(
         task_id="release-preflight-task",
     )
 
-    assert observed["extra_bundle_snapshot_ids"] == {referenced_snapshot}
+    # Formal release retains its independent exact-trace protection in addition
+    # to the shared selector's own reference census.
+    assert observed == {"extra_bundle_snapshot_ids": {referenced_snapshot}}
     assert result["retention"]["candidate_count"] == 0
     assert conn.total_changes == before
 
@@ -103296,10 +103299,23 @@ def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_pat
     )
     strategy = batch_jobs.BranchStrategy(**created["branch_strategy"])
     batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    import shutil
+    shutil.rmtree(Path(strategy.worktree_path) / ".aming-claw", ignore_errors=True)
     batch_jobs.record_task_batch_state(conn, created["task_id"], "abandoned")
     conn.commit()
 
     dry_run = server.handle_graph_governance_stale_artifact_cleanup(_ctx({"project_id": PID}))
+    rejected_dimension = server.handle_graph_governance_stale_artifact_cleanup(
+        _ctx({"project_id": PID}, query={"dimension": "../outside"})
+    )
+    assert rejected_dimension[0] == 400
+    assert rejected_dimension[1]["error"] == "cleanup_dimension_invalid"
+    graph_only = server.handle_graph_governance_stale_artifact_cleanup(
+        _ctx({"project_id": PID}, query={"dimension": "graph_snapshots"})
+    )
+    assert graph_only["dimension"] == "graph_snapshots"
+    assert graph_only["summary"]["candidate_count"] <= stale_artifact_cleanup.PREVIEW_LIMIT
+    assert all(item["artifact_type"] == "graph_snapshot_dir" for item in graph_only["candidates"])
 
     candidate = next(item for item in dry_run["candidates"] if item["artifact_type"] == "batch_worktree")
     assert candidate["safe_to_apply"] is True
@@ -103310,6 +103326,9 @@ def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_pat
             method="POST",
             body={
                 "candidate_ids": [candidate["candidate_id"]],
+                "plan_hash": dry_run["plan_hash"],
+                "plan_revision": dry_run["plan_revision"],
+                "dimension": dry_run["dimension"],
                 "actor": "test",
                 "reason": "api cleanup",
             },

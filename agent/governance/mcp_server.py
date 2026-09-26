@@ -3526,6 +3526,43 @@ TOOLS: list[dict] = [
             ],
         },
     },
+    {
+        "name": "stale_artifact_cleanup",
+        "description": "Bounded read-only stale artifact cleanup preview by dimension.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"], "default": "all"},
+                "include_unowned": {"type": "boolean", "default": True},
+                "project_root": {"type": "string"},
+                "repo_root": {"type": "string"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "stale_artifact_cleanup_apply",
+        "description": "Apply exact fresh safe candidate IDs under governance authorization.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"]},
+                "candidate_ids": {"type": "array", "items": {"type": "string"}},
+                "plan_hash": {"type": "string"},
+                "plan_revision": {"type": "integer"},
+                "actor": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "remove_branch": {"type": "boolean", "default": False},
+                "project_root": {"type": "string"},
+                "repo_root": {"type": "string"},
+            },
+            "required": ["project_id", "dimension", "candidate_ids", "plan_hash", "plan_revision"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -4506,6 +4543,21 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         }
         body.setdefault("caller_role", "observer")
         return _http("POST", f"/api/projects/{pid}/observer/route-context/renew", body)
+
+    if name in {"stale_artifact_cleanup", "stale_artifact_cleanup_apply"}:
+        dimension = str(args.get("dimension") or ("all" if name == "stale_artifact_cleanup" else ""))
+        if dimension not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"}:
+            return {"ok": False, "error": "cleanup_dimension_invalid"}
+        pid = args["project_id"]
+        path = f"/api/graph-governance/{pid}/stale-artifact-cleanup"
+        if name == "stale_artifact_cleanup":
+            query = {"dimension": dimension}
+            for key in ("project_root", "repo_root", "include_unowned"):
+                if key in args:
+                    query[key] = args[key]
+            return _http("GET", path + "?" + urllib.parse.urlencode(query))
+        body = {key: value for key, value in args.items() if key != "project_id" and value is not None}
+        return _http("POST", path + "/apply", body)
 
     raise ValueError(f"Unknown tool: {name!r}")
 

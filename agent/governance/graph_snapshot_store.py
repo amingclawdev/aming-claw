@@ -9,8 +9,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
 import sqlite3
+import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1737,29 +1739,208 @@ def _bundle_referenced_snapshot_ids() -> set[str]:
     These are treated as sealed full baselines and must never be deleted.
     """
     from .self_graph_bundle_check import SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH
-    import sys as _sys
     referenced: set[str] = set()
     # Walk the installed package tree to locate bundle manifests
     pkg_root = Path(__file__).resolve().parents[2]
     candidates: list[Path] = [pkg_root / SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH]
     # Also search shared-volume for other project bundle manifests if accessible
-    try:
-        from .db import _governance_root
-        groot = _governance_root()
-        if groot.exists():
-            for manifest_path in groot.rglob("self-graph-bundle-manifest.json"):
-                candidates.append(manifest_path)
-    except Exception:  # noqa: BLE001
-        pass
+    from .db import _governance_root
+    groot = _governance_root()
+    if groot.exists():
+        if groot.is_symlink() or not groot.is_dir():
+            raise ValueError("bundle_manifest_inventory_unreadable")
+        def unreadable(exc: OSError) -> None:
+            raise ValueError("bundle_manifest_inventory_unreadable") from exc
+        seen = 0
+        for directory, subdirs, files in os.walk(groot, onerror=unreadable):
+            seen += len(subdirs) + len(files)
+            if seen > 100000 or any((Path(directory) / name).is_symlink() for name in subdirs):
+                raise ValueError("bundle_manifest_inventory_unbounded")
+            if "self-graph-bundle-manifest.json" in files:
+                candidates.append(Path(directory) / "self-graph-bundle-manifest.json")
     for manifest_path in candidates:
+        if manifest_path.is_symlink():
+            raise ValueError("bundle_manifest_reference_unreadable")
+        if not manifest_path.exists():
+            if manifest_path == candidates[0]:
+                raise ValueError("bundle_manifest_reference_unavailable")
+            continue
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("bundle manifest is not an object")
             sid = str(manifest.get("snapshot_id") or "").strip()
             if sid:
                 referenced.add(sid)
-        except Exception:  # noqa: BLE001
-            pass
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise ValueError("bundle_manifest_reference_unreadable") from exc
     return referenced
+
+
+def snapshot_retention_reference_state(
+    conn: sqlite3.Connection, project_id: str,
+) -> dict[str, Any]:
+    """Collect bounded durable identities used by every retention entrypoint."""
+    protected: dict[str, set[str]] = {}
+    refusals: list[str] = []
+
+    def collect(table: str, columns: tuple[str, ...], reason: str,
+                *, required: bool = False) -> None:
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not exists:
+                if required:
+                    refusals.append(f"{table}_unavailable")
+                return
+            available = {str(row["name"]) for row in conn.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()}
+            selected = [column for column in columns if column in available]
+            if required and ("project_id" not in available or len(selected) != len(columns)):
+                refusals.append(f"{table}_schema_incomplete")
+                return
+            if not selected:
+                return
+            def quoted(value: str) -> str:
+                return '"' + value.replace('"', '""') + '"'
+
+            quoted_table = quoted(table)
+            scoped = "project_id=? AND " if "project_id" in available else ""
+            union = " UNION ".join(
+                f"SELECT {quoted(column)} AS snapshot_id FROM {quoted_table} "
+                f"WHERE {scoped}{quoted(column)}!=''"
+                for column in selected
+            )
+            rows = conn.execute(
+                f"SELECT snapshot_id FROM ({union}) ORDER BY snapshot_id LIMIT 2001",
+                tuple(project_id for _ in selected) if scoped else (),
+            ).fetchall()
+            if len(rows) > 2000:
+                refusals.append(f"{table}_reference_window_unbounded")
+                return
+            for row in rows:
+                sid = str(row["snapshot_id"] or "")
+                if sid:
+                    protected.setdefault(sid, set()).add(reason)
+        except (sqlite3.Error, TypeError, ValueError):
+            refusals.append(f"{table}_reference_unreadable")
+
+    collect("graph_query_traces", ("snapshot_id", "canonical_base_snapshot_id"),
+            "graph_trace_reference", required=True)
+    collect("graph_ref_events", ("old_snapshot_id", "new_snapshot_id"),
+            "graph_ref_history")
+    collect("graph_current_full_reconcile_provenance", ("snapshot_id",),
+            "current_full_provenance")
+    collect("reconcile_run_metrics", ("snapshot_id",), "reconcile_run_reference")
+    collect("graph_reconcile_metric_physical_identities", ("snapshot_id",),
+            "reconcile_identity_reference")
+    collect("graph_reconcile_run_terminalizations",
+            ("source_snapshot_id", "replacement_snapshot_id"),
+            "reconcile_terminalization_reference")
+    collect("parallel_branch_batch_runtimes", ("rollback_snapshot_id",),
+            "batch_rollback_reference")
+    collect("graph_snapshots", ("parent_snapshot_id",),
+            "snapshot_parent_reference", required=True)
+    # Other backlog, timeline, QA, contract, reconcile, merge and close ledgers
+    # may carry identities in typed columns or JSON, sometimes without a
+    # project_id column in a project-owned DB. Bound and inspect all of them.
+    # The snapshot row's own identity is not an external retention reference;
+    # all other ledgers, including graph indexes with caller-authored metadata,
+    # are inspected rather than exempted by table-name heuristics.
+    intrinsic = {"graph_snapshots"}
+    self_identity_tables = {
+        "graph_nodes_index", "graph_edges_index", "graph_drift_ledger",
+        "graph_c_family_compilation_actions", "graph_c_family_symbols",
+        "graph_c_family_occurrences", "graph_c_family_relations",
+        "graph_c_family_diagnostics",
+    }
+
+    try:
+        known_ids = {str(row["snapshot_id"]) for row in conn.execute(
+            "SELECT snapshot_id FROM graph_snapshots WHERE project_id=?", (project_id,)
+        ).fetchall()}
+        root = _snapshot_root(project_id, "_sentinel").parent
+        if root.exists():
+            known_ids.update(child.name for child in root.iterdir() if child.is_dir())
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        known_ids = set()
+        refusals.append("reference_identity_inventory_unavailable")
+
+    def walk(value: Any, reason: str) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key).endswith("snapshot_id") and isinstance(child, str) and child:
+                    protected.setdefault(child, set()).add(reason)
+                if str(key).endswith("snapshot_ids") and isinstance(child, list):
+                    for sid in child:
+                        if isinstance(sid, str) and sid:
+                            protected.setdefault(sid, set()).add(reason)
+                walk(child, reason)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, reason)
+        elif isinstance(value, str) and value in known_ids:
+            protected.setdefault(value, set()).add(reason)
+
+    try:
+        tables = [str(row["name"]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()]
+        for table in tables:
+            if table in intrinsic:
+                continue
+            quoted = '"' + table.replace('"', '""') + '"'
+            schema_rows = conn.execute(
+                f"PRAGMA table_info({quoted})"
+            ).fetchall()
+            columns = {str(row["name"]) for row in schema_rows}
+            identity = tuple(sorted(col for col in columns
+                                    if col.endswith("snapshot_id")
+                                    and not (table in self_identity_tables
+                                             and col == "snapshot_id")))
+            if identity:
+                collect(table, identity, f"durable_{table}_reference")
+            text_columns = sorted(str(row["name"]) for row in schema_rows
+                                  if "TEXT" in str(row["type"] or "").upper()
+                                  and not (table in self_identity_tables
+                                           and str(row["name"]) == "snapshot_id"))
+            if not text_columns:
+                continue
+            selected = ",".join('"' + col.replace('"', '""') + '"'
+                                for col in text_columns)
+            where = " WHERE project_id=?" if "project_id" in columns else ""
+            rows = conn.execute(
+                f"SELECT {selected} FROM {quoted}{where} LIMIT 2001",
+                (project_id,) if where else (),
+            ).fetchall()
+            if len(rows) > 2000:
+                refusals.append(f"{table}_payload_window_unbounded")
+                continue
+            for row in rows:
+                for col in text_columns:
+                    raw = row[col]
+                    if raw is None or raw == "":
+                        continue
+                    if not isinstance(raw, str) or len(raw) > 65536:
+                        refusals.append(f"{table}_payload_unreadable")
+                        continue
+                    for sid in known_ids:
+                        if sid and sid in raw:
+                            protected.setdefault(sid, set()).add(
+                                f"durable_{table}_text_reference"
+                            )
+                    if not raw.lstrip().startswith(("{", "[")):
+                        continue
+                    try:
+                        walk(json.loads(raw), f"durable_{table}_payload_reference")
+                    except (ValueError, TypeError, RecursionError):
+                        refusals.append(f"{table}_payload_unreadable")
+    except (sqlite3.Error, TypeError, ValueError):
+        refusals.append("durable_reference_census_unavailable")
+    return {"protected": {sid: sorted(reasons) for sid, reasons in protected.items()},
+            "complete": not refusals, "refusal_reasons": sorted(set(refusals))}
 
 
 def select_snapshot_retention_candidates(
@@ -1795,6 +1976,11 @@ def select_snapshot_retention_candidates(
 
     def _protect(sid: str, reason: str) -> None:
         protected_ids.setdefault(sid, []).append(reason)
+
+    reference_state = snapshot_retention_reference_state(conn, project_id)
+    for sid, reasons in reference_state["protected"].items():
+        for reason in reasons:
+            _protect(sid, reason)
 
     # Rule 1: active snapshot
     active_row = conn.execute(
@@ -1856,7 +2042,12 @@ def select_snapshot_retention_candidates(
         _protect(str(most_recent_full["snapshot_id"]), "most_recent_full_baseline")
 
     # Rule 4: bundle-referenced snapshot ids
-    bundle_refs = _bundle_referenced_snapshot_ids()
+    try:
+        bundle_refs = _bundle_referenced_snapshot_ids()
+    except (OSError, ValueError):
+        bundle_refs = set()
+        reference_state["complete"] = False
+        reference_state["refusal_reasons"].append("bundle_manifest_reference_unreadable")
     if extra_bundle_snapshot_ids:
         bundle_refs = bundle_refs | set(extra_bundle_snapshot_ids)
     for sid in bundle_refs:
@@ -1871,7 +2062,8 @@ def select_snapshot_retention_candidates(
         if snap_root.exists():
             disk_snapshot_ids = {d.name for d in snap_root.iterdir() if d.is_dir()}
     except OSError:
-        pass
+        reference_state["complete"] = False
+        reference_state["refusal_reasons"].append("snapshot_dir_inventory_unavailable")
 
     # Gather all snapshot ids in DB
     db_rows = conn.execute(
@@ -1879,8 +2071,17 @@ def select_snapshot_retention_candidates(
         (project_id,),
     ).fetchall()
     db_by_id: dict[str, dict[str, Any]] = {str(row["snapshot_id"]): dict(row) for row in db_rows}
+    for sid, row in db_by_id.items():
+        status = str(row.get("status") or "").lower()
+        if status != "superseded":
+            _protect(sid, "candidate_status" if status == "candidate"
+                     else "non_superseded_or_unknown_status")
+    for sid in disk_snapshot_ids - set(db_by_id):
+        _protect(sid, "disk_only_ownership_unverified")
 
-    all_ids = (disk_snapshot_ids | set(db_by_id.keys())) - set(protected_ids.keys())
+    if not reference_state["complete"]:
+        for sid in disk_snapshot_ids | set(db_by_id):
+            _protect(sid, "reference_authority_incomplete")
 
     protected_list: list[dict[str, Any]] = []
     for sid, reasons in protected_ids.items():
@@ -1895,6 +2096,7 @@ def select_snapshot_retention_candidates(
             "dir_exists": dir_path.exists(),
         })
 
+    all_ids = (disk_snapshot_ids | set(db_by_id.keys())) - set(protected_ids.keys())
     candidates_list: list[dict[str, Any]] = []
     from datetime import timezone as _tz
     now_ts = datetime.now(_tz.utc)
@@ -1935,6 +2137,8 @@ def select_snapshot_retention_candidates(
         "candidate_count": len(candidates_list),
         "protected": protected_list,
         "candidates": candidates_list,
+        "reference_authority_complete": reference_state["complete"],
+        "global_refusal_reasons": reference_state["refusal_reasons"],
     }
 
 
@@ -1946,6 +2150,7 @@ def run_snapshot_retention_gc(
     dry_run: bool = True,
     actor: str = "retention_gc",
     extra_bundle_snapshot_ids: set[str] | None = None,
+    destructive_authorized: bool = False,
 ) -> dict[str, Any]:
     """Run retention GC on graph-snapshot companion dirs.
 
@@ -1954,13 +2159,45 @@ def run_snapshot_retention_gc(
     Returns a dict with deleted_dirs, freed_bytes, candidates, and errors.
     """
     import shutil as _shutil
+    def directory_identity(path: Path) -> tuple[int, int, int] | None:
+        try:
+            if path.resolve(strict=True) != path.absolute():
+                return None
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                return None
+            return info.st_dev, info.st_ino, info.st_mode
+        except (OSError, RuntimeError):
+            return None
+
     selection = select_snapshot_retention_candidates(
         conn,
         project_id,
         keep_last_n=keep_last_n,
         extra_bundle_snapshot_ids=extra_bundle_snapshot_ids,
     )
+    if not dry_run and (not destructive_authorized or not selection["reference_authority_complete"]):
+        return {
+            "ok": False, "project_id": project_id, "dry_run": False,
+            "actor": actor, "error": "snapshot_retention_authority_incomplete",
+            "refusal_reasons": selection["global_refusal_reasons"] or ["locked_fence_required"],
+            "deleted_count": 0, "freed_bytes": 0, "deleted_dirs": [],
+            "errors": [], "protected": selection["protected"],
+            "candidates": selection["candidates"],
+        }
     snap_root = _snapshot_root(project_id, "_sentinel").parent
+    initial_identities = {
+        str(item["snapshot_id"]): directory_identity(snap_root / str(item["snapshot_id"]))
+        for item in selection["candidates"]
+    }
+    if not dry_run and any(identity is None for identity in initial_identities.values()):
+        return {
+            "ok": False, "project_id": project_id, "dry_run": False,
+            "actor": actor, "error": "snapshot_retention_path_identity_unverified",
+            "deleted_count": 0, "freed_bytes": 0, "deleted_dirs": [],
+            "errors": [], "protected": selection["protected"],
+            "candidates": selection["candidates"],
+        }
 
     deleted_dirs: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -1979,8 +2216,24 @@ def run_snapshot_retention_gc(
             })
             freed_bytes += size_bytes
             continue
-        if not dir_path.exists():
-            continue
+        # A selection is advisory. Recompute the complete authority and physical
+        # identity under the caller's release/build locks before each deletion.
+        from .server import _graph_release_build_fence_state
+        try:
+            fresh = select_snapshot_retention_candidates(
+                conn, project_id, keep_last_n=keep_last_n,
+                extra_bundle_snapshot_ids=extra_bundle_snapshot_ids,
+            )
+            fence = _graph_release_build_fence_state(conn, project_id)
+        except Exception:  # noqa: BLE001 - a later census failure cannot authorize deletion
+            errors.append({"snapshot_id": sid, "error": "snapshot_retention_recheck_unavailable"})
+            break
+        fresh_ids = {str(item["snapshot_id"]) for item in fresh["candidates"]}
+        if (not fresh["reference_authority_complete"] or not fence["clear"]
+                or sid not in fresh_ids
+                or directory_identity(dir_path) != initial_identities[sid]):
+            errors.append({"snapshot_id": sid, "error": "snapshot_retention_item_drift_refused"})
+            break
         try:
             _shutil.rmtree(dir_path)
             deleted_dirs.append({
@@ -3218,15 +3471,11 @@ def activate_graph_snapshot(
     # target-ref activation. This is advisory-only; never blocks activation.
     gc_result: dict[str, Any] | None = None
     if target_ref_activation and post_commit_hooks:
-        try:
-            gc_result = run_snapshot_retention_gc(
-                conn,
-                project_id,
-                dry_run=False,
-                actor=f"post_activate:{actor}",
-            )
-        except Exception as exc:  # noqa: BLE001 - advisory; activation already done
-            gc_result = {"ok": False, "error": str(exc), "dry_run": False}
+        gc_result = {
+            "ok": False, "dry_run": False, "deleted_count": 0,
+            "deleted_dirs": [], "freed_bytes": 0,
+            "error": "snapshot_retention_locked_authority_required",
+        }
     result["retention_gc"] = gc_result
     return result
 

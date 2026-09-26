@@ -4837,9 +4837,9 @@ def test_retention_gc_dry_run_does_not_delete(conn, tmp_path):
     result = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=True)
     assert result["dry_run"] is True
     assert stale_dir.exists(), "dry-run must not delete any dirs"
-    # The dry-run result should list it as a candidate
-    candidate_ids = {item["snapshot_id"] for item in result["candidates"]}
-    assert "scope-orphan-dry-001" in candidate_ids, "orphan dir should appear as a candidate"
+    # A missing trace census keeps even a disk-only orphan protected.
+    protected = {item["snapshot_id"]: item for item in result["protected"]}
+    assert "reference_authority_incomplete" in protected["scope-orphan-dry-001"]["reasons"]
 
 
 def test_retention_gc_apply_deletes_candidates_and_protects_active(conn, tmp_path):
@@ -4862,9 +4862,12 @@ def test_retention_gc_apply_deletes_candidates_and_protects_active(conn, tmp_pat
     assert active_dir.exists(), "active companion dir should exist"
 
     result = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=False)
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["error"] == "snapshot_retention_authority_incomplete"
     # Active snapshot dir must survive
     assert active_dir.exists(), "active snapshot dir must never be deleted"
+    assert all((tmp_path / PID / "graph-snapshots" / item["snapshot_id"]).exists()
+               for item in old_snaps)
     # No errors
     assert result["errors"] == []
 
@@ -4882,9 +4885,135 @@ def test_retention_gc_is_idempotent(conn, tmp_path):
 
     r1 = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=False)
     r2 = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=False)
-    assert r1["ok"] is True
-    assert r2["ok"] is True
+    assert r1["ok"] is False
+    assert r2["ok"] is False
+    assert r1["deleted_count"] == r2["deleted_count"] == 0
     assert r2["errors"] == [], "second GC run must not produce errors"
+
+
+def test_retention_selector_protects_both_trace_columns_and_candidate_status(conn):
+    _ensure_schema(conn)
+    conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
+    first = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-trace-first", commit_sha="a", snapshot_kind="scope",
+    )
+    second = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-trace-base", commit_sha="b", snapshot_kind="scope",
+    )
+    candidate = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-candidate", commit_sha="c", snapshot_kind="scope",
+    )
+    for item in (first, second):
+        conn.execute("UPDATE graph_snapshots SET status='superseded' WHERE project_id=? AND snapshot_id=?",
+                     (PID, item["snapshot_id"]))
+    conn.execute("UPDATE graph_snapshots SET status='candidate' WHERE project_id=? AND snapshot_id=?",
+                 (PID, candidate["snapshot_id"]))
+    conn.execute("INSERT INTO graph_query_traces VALUES (?,?,?)",
+                 (PID, first["snapshot_id"], second["snapshot_id"]))
+    selection = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0)
+    protected = {item["snapshot_id"]: item["reasons"] for item in selection["protected"]}
+    assert "graph_trace_reference" in protected[first["snapshot_id"]]
+    assert "graph_trace_reference" in protected[second["snapshot_id"]]
+    assert "candidate_status" in protected[candidate["snapshot_id"]]
+    assert not {first["snapshot_id"], second["snapshot_id"], candidate["snapshot_id"]} & {
+        item["snapshot_id"] for item in selection["candidates"]
+    }
+
+
+def test_retention_reference_overflow_fails_closed(conn, tmp_path):
+    _ensure_schema(conn)
+    conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-overflow", commit_sha="a", snapshot_kind="scope",
+    )
+    conn.executemany("INSERT INTO graph_query_traces VALUES (?,?,?)", [
+        (PID, f"trace-{idx:04d}", "") for idx in range(2001)
+    ])
+    selection = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0)
+    assert selection["reference_authority_complete"] is False
+    assert "graph_query_traces_reference_window_unbounded" in selection["global_refusal_reasons"]
+    assert "reference_authority_incomplete" in next(
+        item["reasons"] for item in selection["protected"]
+        if item["snapshot_id"] == snapshot["snapshot_id"]
+    )
+    result = store.run_snapshot_retention_gc(
+        conn, PID, keep_last_n=0, dry_run=False, destructive_authorized=True,
+    )
+    assert result["deleted_count"] == 0
+    assert (tmp_path / PID / "graph-snapshots" / snapshot["snapshot_id"]).exists()
+
+
+def test_retention_explicit_fixture_authority_can_remove_unreferenced_superseded_dir(conn, tmp_path):
+    _ensure_schema(conn)
+    conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
+    old = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-safe-fixture", commit_sha="a", snapshot_kind="scope",
+    )
+    conn.execute("UPDATE graph_snapshots SET status='superseded' WHERE project_id=? AND snapshot_id=?",
+                 (PID, old["snapshot_id"]))
+    old_dir = tmp_path / PID / "graph-snapshots" / old["snapshot_id"]
+    selection = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0)
+    assert selection["reference_authority_complete"] is True
+    assert old["snapshot_id"] in {item["snapshot_id"] for item in selection["candidates"]}
+    refused = store.run_snapshot_retention_gc(conn, PID, keep_last_n=0, dry_run=False)
+    assert refused["deleted_count"] == 0
+    assert old_dir.exists()
+    applied = store.run_snapshot_retention_gc(
+        conn, PID, keep_last_n=0, dry_run=False, destructive_authorized=True,
+    )
+    assert applied["deleted_count"] == 1
+    assert not old_dir.exists()
+
+
+def test_retention_rechecks_each_item_and_reports_partial_refusal(conn, tmp_path, monkeypatch):
+    _ensure_schema(conn)
+    conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
+    for sid in ("scope-a-recheck", "scope-b-recheck"):
+        store.create_graph_snapshot(conn, PID, snapshot_id=sid, commit_sha=sid,
+                                    snapshot_kind="scope")
+        conn.execute("UPDATE graph_snapshots SET status='superseded' "
+                     "WHERE project_id=? AND snapshot_id=?", (PID, sid))
+    original = store.select_snapshot_retention_candidates
+    calls = 0
+
+    def changed(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            conn.execute("INSERT INTO graph_query_traces VALUES (?,?,?)",
+                         (PID, "scope-b-recheck", ""))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "select_snapshot_retention_candidates", changed)
+    result = store.run_snapshot_retention_gc(
+        conn, PID, keep_last_n=0, dry_run=False, destructive_authorized=True,
+    )
+    assert result["ok"] is False
+    assert result["deleted_count"] == 1
+    assert result["errors"][0]["error"] == "snapshot_retention_item_drift_refused"
+    assert not (tmp_path / PID / "graph-snapshots" / "scope-a-recheck").exists()
+    assert (tmp_path / PID / "graph-snapshots" / "scope-b-recheck").exists()
+
+
+def test_retention_census_reads_unscoped_qa_payload_arrays_and_fails_on_malformed(conn):
+    _ensure_schema(conn)
+    conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scope-qa-payload", commit_sha="a", snapshot_kind="scope",
+    )
+    conn.execute("UPDATE graph_snapshots SET status='superseded' WHERE project_id=? AND snapshot_id=?",
+                 (PID, snapshot["snapshot_id"]))
+    conn.execute("CREATE TABLE qa_custody_without_project (payload_json TEXT)")
+    conn.execute("INSERT INTO qa_custody_without_project VALUES (?)",
+                 (json.dumps({"snapshot_ids": [snapshot["snapshot_id"]]}),))
+    selection = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0)
+    reasons = next(item["reasons"] for item in selection["protected"]
+                   if item["snapshot_id"] == snapshot["snapshot_id"])
+    assert any("qa_custody_without_project" in reason for reason in reasons)
+    conn.execute("INSERT INTO qa_custody_without_project VALUES ('{bad json')")
+    unavailable = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0)
+    assert unavailable["reference_authority_complete"] is False
+    assert "qa_custody_without_project_payload_unreadable" in unavailable["global_refusal_reasons"]
 
 
 def test_write_companion_files_enospc_raises_actionable_error(conn, tmp_path, monkeypatch):
@@ -5226,7 +5355,8 @@ def test_current_full_state_projects_later_canonical_commit_after_merge(conn):
         after_later_activation["active_snapshot_id"]
         == later_snapshot["snapshot_id"]
     )
-    assert after_later_activation["active_snapshot_verified"] is True
+    # A plain later activation has no current-full provenance of its own.
+    assert after_later_activation["active_snapshot_verified"] is False
 
     historical_target_only = store.current_full_reconcile_state(
         conn,

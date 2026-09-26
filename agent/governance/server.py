@@ -1626,7 +1626,7 @@ def _graph_release_recovery_retention_preflight(
     terminalized_count = 0
     retention_apply: Mapping[str, Any] = {}
     if apply:
-        with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+        with sqlite_write_lock(), _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
             with _CURRENT_FULL_BUILD_KEYS_LOCK:
                 locked_fence = _graph_release_build_fence_state(conn, project)
                 if not locked_fence["clear"]:
@@ -1653,6 +1653,7 @@ def _graph_release_recovery_retention_preflight(
                     dry_run=False,
                     actor="release_preflight",
                     extra_bundle_snapshot_ids=referenced_snapshot_ids,
+                    destructive_authorized=True,
                 )
     available_after = (
         _release_available_bytes(active_root.parent)
@@ -90143,13 +90144,16 @@ def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.dry-run")
-        return stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
-            conn,
-            project_id,
-            repo_root_path=root,
-            include_unowned=_query_bool(ctx.query, "include_unowned", True),
-            dimension=str(ctx.query.get("dimension") or ""),
-        )
+        try:
+            return stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+                conn,
+                project_id,
+                repo_root_path=root,
+                include_unowned=_query_bool(ctx.query, "include_unowned", True),
+                dimension=str(ctx.query.get("dimension") or ""),
+            )
+        except stale_artifact_cleanup.StaleArtifactCleanupError as exc:
+            return 400, exc.payload
     finally:
         conn.close()
 
@@ -90176,6 +90180,8 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
                 reason=str(ctx.body.get("reason") or ""),
                 remove_branch=_query_bool(ctx.body, "remove_branch", False),
                 dimension=str(ctx.body.get("dimension") or ""),
+                plan_hash=str(ctx.body.get("plan_hash") or ""),
+                plan_revision=ctx.body.get("plan_revision"),
             )
         except stale_artifact_cleanup.StaleArtifactCleanupError as exc:
             return 400, exc.payload
@@ -105247,7 +105253,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "error": str(exc),
             }
         try:
-            with _CURRENT_FULL_BUILD_KEYS_LOCK:
+            with sqlite_write_lock(), _CURRENT_FULL_BUILD_KEYS_LOCK:
                 build_fence = _graph_release_build_fence_state(
                     conn,
                     project_id,
@@ -105270,6 +105276,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         dry_run=False,
                         actor=f"post_activate:{str(body.get('actor') or 'dashboard_user')}",
                         extra_bundle_snapshot_ids=referenced_snapshot_ids,
+                        destructive_authorized=True,
                     )
                     conn.commit()
         except Exception as exc:

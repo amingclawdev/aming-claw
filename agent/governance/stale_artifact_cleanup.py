@@ -6,8 +6,12 @@ import hashlib
 import json
 import shutil
 import sqlite3
+import stat
+import subprocess
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from . import batch_jobs
@@ -22,7 +26,16 @@ ACTION_REMOVE_STALE_GRAPH_SNAPSHOT = "remove_stale_graph_snapshot"
 
 DIMENSION_WORKTREES = "worktrees"
 DIMENSION_GRAPH_SNAPSHOTS = "graph_snapshots"
-ALL_DIMENSIONS = {DIMENSION_WORKTREES, DIMENSION_GRAPH_SNAPSHOTS}
+DIMENSION_GOVERNANCE_INDEX = "governance_index"
+DIMENSION_STATE_RECONCILE = "state_reconcile"
+DIMENSION_ALL = "all"
+ALL_DIMENSIONS = {
+    DIMENSION_WORKTREES, DIMENSION_GRAPH_SNAPSHOTS,
+    DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE, DIMENSION_ALL,
+}
+PLAN_REVISION = 1
+PREVIEW_LIMIT = 160
+_DESTRUCTIVE_CLEANUP_LOCK = RLock()
 
 TERMINAL_BACKLOG_STATUSES = {
     "ABANDONED",
@@ -43,6 +56,143 @@ class StaleArtifactCleanupError(ValueError):
     def __init__(self, message: str, payload: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.payload = payload or {"ok": False, "error": message}
+
+
+def _dimension(value: str) -> str:
+    selected = str(value or DIMENSION_ALL).strip().lower()
+    if selected not in ALL_DIMENSIONS:
+        raise StaleArtifactCleanupError("cleanup_dimension_invalid")
+    return selected
+
+
+def _plan_hash(project_id: str, dimension: str, candidates: list[dict[str, Any]]) -> str:
+    items = [{
+        "candidate_id": item.get("candidate_id"),
+        "artifact_type": item.get("artifact_type"),
+        "path": item.get("path"),
+        "snapshot_id": item.get("snapshot_id"),
+        "safe_to_apply": item.get("safe_to_apply"),
+        "refusal_reasons": item.get("refusal_reasons"),
+        "evidence": item.get("evidence"),
+    } for item in candidates]
+    payload = {"project_id": project_id, "dimension": dimension,
+               "plan_revision": PLAN_REVISION, "candidates": items}
+    return "sha256:" + hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def _path_identity(path: str) -> dict[str, int] | None:
+    """Bind a projected directory to its physical inode, rejecting symlinks."""
+    if not path:
+        return None
+    target = Path(path)
+    try:
+        if target.resolve(strict=True) != target.absolute():
+            return None
+        info = target.lstat()
+    except (OSError, RuntimeError):
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return None
+    return {"device": info.st_dev, "inode": info.st_ino,
+            "mode": info.st_mode}
+
+
+def _worktree_clean(path: str) -> bool:
+    target = Path(path)
+    if not (target / ".git").is_file() or (target / ".git").is_symlink():
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "status", "--porcelain", "--ignored=matching",
+             "--untracked-files=all"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        return result.returncode == 0 and not result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _derived_preview(project_id: str, dimension: str) -> tuple[list[dict[str, Any]], bool, int, int]:
+    """Inventory generated caches without granting removal authority."""
+    from .db import _governance_root
+
+    root = _governance_root() / project_id / (
+        "governance-index" if dimension == DIMENSION_GOVERNANCE_INDEX
+        else "state-reconcile"
+    )
+    if not root.exists():
+        return [], False, 0, 0
+    if root.is_symlink() or not root.is_dir():
+        return [{
+            "candidate_id": _candidate_id(dimension, "invalid_root"),
+            "artifact_type": dimension, "action": "retain_derived_cache",
+            "path": str(root), "safe_to_apply": False,
+            "refusal_reasons": ["derived_root_unreadable_or_symlink"],
+            "evidence": {"size_bytes": 0},
+        }], False, 1, 0
+    try:
+        children = sorted(root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return [{
+            "candidate_id": _candidate_id(dimension, "unreadable"),
+            "artifact_type": dimension, "action": "retain_derived_cache",
+            "path": str(root), "safe_to_apply": False,
+            "refusal_reasons": ["derived_root_unreadable"],
+            "evidence": {"size_bytes": 0},
+        }], False, 1, 0
+    result: list[dict[str, Any]] = []
+    total_bytes = 0
+    for child in children:
+        identity: dict[str, Any] = {}
+        summary = child / ("summary.json" if dimension == DIMENSION_GOVERNANCE_INDEX
+                           else "trace/summary.json")
+        if (child.is_dir() and not child.is_symlink() and not summary.is_symlink()
+                and summary.is_file()):
+            try:
+                if summary.stat().st_size <= 16384:
+                    identity = _json_dict(summary.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError):
+                pass
+        if (dimension == DIMENSION_STATE_RECONCILE and child.is_dir()
+                and not child.is_symlink()):
+            run_input = child / "trace/steps/001-run-input/input.json"
+            try:
+                chain = (child / "trace", child / "trace/steps",
+                         child / "trace/steps/001-run-input", run_input)
+                if (all(not entry.is_symlink() for entry in chain)
+                        and run_input.is_file()
+                        and run_input.stat().st_size <= 16384):
+                    source = _json_dict(run_input.read_text(encoding="utf-8"))
+                    identity["commit_sha"] = str(source.get("commit_sha") or "")
+            except (OSError, UnicodeError):
+                pass
+        size = 0
+        try:
+            if child.is_symlink():
+                size = 0
+            elif child.is_file():
+                size = child.stat().st_size
+            elif child.is_dir() and not child.is_symlink():
+                size = sum(p.stat().st_size for p in child.rglob("*") if p.is_file() and not p.is_symlink())
+            created_at = datetime.fromtimestamp(child.stat().st_mtime, timezone.utc).isoformat()
+        except OSError:
+            created_at = ""
+        total_bytes += size
+        result.append({
+            "candidate_id": _candidate_id(dimension, child.name),
+            "artifact_type": dimension, "action": "retain_derived_cache",
+            "path": str(child), "safe_to_apply": False,
+            "refusal_reasons": ["stage_b_archive_rebuild_required"] +
+                (["derived_path_symlink_refused"] if child.is_symlink() else []) +
+                (["source_identity_unverified"] if not identity.get("commit_sha") else []),
+            "evidence": {"run_id": str(identity.get("run_id") or child.name),
+                         "snapshot_id": str(identity.get("active_snapshot_id") or identity.get("snapshot_id") or ""),
+                         "commit_sha": str(identity.get("commit_sha") or ""),
+                         "created_at": created_at, "size_bytes": size},
+        })
+    return result[:PREVIEW_LIMIT], len(children) > PREVIEW_LIMIT, len(children), total_bytes
 
 
 def cleanup_recommendation(project_id: str) -> dict[str, Any]:
@@ -210,9 +360,9 @@ def _fetch_related_graph_traces(
     *,
     task_ids: set[str],
     backlog_ids: set[str],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     if not _table_exists(conn, "graph_query_traces"):
-        return []
+        return [], 0
     columns = [
         "trace_id",
         "snapshot_id",
@@ -227,7 +377,7 @@ def _fetch_related_graph_traces(
         "created_at",
         "updated_at",
     ]
-    rows = conn.execute(
+    cursor = conn.execute(
         """
         SELECT trace_id, snapshot_id, query_source, query_purpose, run_id,
                parent_task_id, runtime_context_id, task_id, worker_role,
@@ -237,15 +387,19 @@ def _fetch_related_graph_traces(
          ORDER BY created_at, trace_id
         """,
         (project_id,),
-    ).fetchall()
+    )
     retained: list[dict[str, Any]] = []
-    for row in rows:
-        item = _row_to_dict(row, columns)
-        task_id = str(item.get("task_id") or "")
-        parent_task_id = str(item.get("parent_task_id") or "")
-        if task_id in task_ids or parent_task_id in task_ids or parent_task_id in backlog_ids:
-            retained.append(item)
-    return retained
+    count = 0
+    while rows := cursor.fetchmany(256):
+        for row in rows:
+            item = _row_to_dict(row, columns)
+            task_id = str(item.get("task_id") or "")
+            parent_task_id = str(item.get("parent_task_id") or "")
+            if task_id in task_ids or parent_task_id in task_ids or parent_task_id in backlog_ids:
+                count += 1
+                if len(retained) < PREVIEW_LIMIT:
+                    retained.append(item)
+    return retained, count
 
 
 def _count_related_timeline_events(
@@ -257,23 +411,18 @@ def _count_related_timeline_events(
 ) -> int:
     if not _table_exists(conn, "task_timeline_events"):
         return 0
-    clauses = []
-    params: list[Any] = [project_id]
-    if task_ids:
-        placeholders = ",".join("?" for _ in task_ids)
-        clauses.append(f"task_id IN ({placeholders})")
-        params.extend(sorted(task_ids))
-    if backlog_ids:
-        placeholders = ",".join("?" for _ in backlog_ids)
-        clauses.append(f"backlog_id IN ({placeholders})")
-        params.extend(sorted(backlog_ids))
-    if not clauses:
+    if not task_ids and not backlog_ids:
         return 0
-    row = conn.execute(
-        f"SELECT COUNT(*) AS count FROM task_timeline_events WHERE project_id=? AND ({' OR '.join(clauses)})",
-        params,
-    ).fetchone()
-    return int(row["count"] if hasattr(row, "keys") else row[0])
+    cursor = conn.execute(
+        "SELECT task_id,backlog_id FROM task_timeline_events WHERE project_id=?",
+        (project_id,),
+    )
+    count = 0
+    while rows := cursor.fetchmany(256):
+        for row in rows:
+            if str(row["task_id"] or "") in task_ids or str(row["backlog_id"] or "") in backlog_ids:
+                count += 1
+    return count
 
 
 def _build_graph_snapshot_candidates(
@@ -282,32 +431,47 @@ def _build_graph_snapshot_candidates(
 ) -> list[dict[str, Any]]:
     """Return graph-snapshot dimension candidates in the same conservative model as worktrees."""
     from .graph_snapshot_store import select_snapshot_retention_candidates
+    from .server import _graph_release_build_fence_state
     try:
         selection = select_snapshot_retention_candidates(conn, project_id)
-    except Exception as exc:  # noqa: BLE001
+        fence = _graph_release_build_fence_state(conn, project_id)
+    except Exception:  # noqa: BLE001 - preview fails closed without leaking source paths
         return [{
-            "candidate_id": _candidate_id("graph_snapshots_error", str(exc)),
+            "candidate_id": _candidate_id("graph_snapshots_error", project_id),
             "artifact_type": "graph_snapshot_dir",
             "action": ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
             "snapshot_id": "",
             "path": "",
             "safe_to_apply": False,
-            "refusal_reasons": [f"retention_selection_error:{exc}"],
-            "evidence": {"error": str(exc)},
+            "refusal_reasons": ["retention_selection_unavailable"],
+            "evidence": {"error": "retention_selection_unavailable"},
         }]
     candidates: list[dict[str, Any]] = []
     for item in selection.get("candidates", []):
         sid = str(item.get("snapshot_id") or "")
-        dir_path = str(item.get("dir_exists") and item.get("snapshot_id") or "")
         from .graph_snapshot_store import _snapshot_root
         actual_path = str(_snapshot_root(project_id, sid)) if sid else ""
         exists = bool(item.get("dir_exists"))
-        safe = bool(exists and sid)
+        status = str(item.get("status") or "")
+        identity = _path_identity(actual_path)
+        safe = bool(exists and sid and item.get("in_db")
+                    and status == "superseded"
+                    and selection.get("reference_authority_complete") is True
+                    and fence.get("clear") is True
+                    and identity is not None)
         refusal_reasons: list[str] = []
         if not exists:
             refusal_reasons.append("snapshot_dir_missing")
         if not sid:
             refusal_reasons.append("snapshot_id_empty")
+        if not item.get("in_db") or status != "superseded":
+            refusal_reasons.append("snapshot_ownership_or_status_unverified")
+        if selection.get("reference_authority_complete") is not True:
+            refusal_reasons.extend(selection.get("global_refusal_reasons") or ["reference_authority_incomplete"])
+        if fence.get("clear") is not True:
+            refusal_reasons.append("global_current_full_build_fence_active")
+        if exists and identity is None:
+            refusal_reasons.append("snapshot_path_identity_unverified")
         candidates.append({
             "candidate_id": _candidate_id("graph_snapshot", sid or actual_path),
             "artifact_type": "graph_snapshot_dir",
@@ -324,6 +488,7 @@ def _build_graph_snapshot_candidates(
                 "size_bytes": int(item.get("size_bytes") or 0),
                 "in_db": bool(item.get("in_db")),
                 "exists": exists,
+                "path_identity": identity,
                 "append_only_evidence_retained": True,
             },
         })
@@ -346,6 +511,7 @@ def _build_graph_snapshot_candidates(
                 "created_at": str(item.get("created_at") or ""),
                 "protected": True,
                 "exists": bool(item.get("dir_exists")),
+                "path_identity": _path_identity(actual_path),
                 "append_only_evidence_retained": True,
             },
         })
@@ -362,11 +528,57 @@ def build_stale_artifact_cleanup_projection(
 ) -> dict[str, Any]:
     """Return a dry-run projection; no artifacts or append-only evidence are deleted.
 
-    Pass dimension='graph_snapshots' to scope to graph-snapshot candidates only.
-    Pass dimension='worktrees' (or omit) to scope to worktree candidates only.
-    Omitting dimension includes both (full projection).
+    A named dimension scopes the bounded preview. Omission includes all four
+    dimensions; derived caches remain preview-only until Stage B.
     """
-    dim = str(dimension or "").strip().lower()
+    dim = _dimension(dimension)
+    if dim in {DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE}:
+        derived, truncated, total, total_bytes = _derived_preview(project_id, dim)
+        return {
+            "ok": True, "mode": "dry_run", "dry_run": True,
+            "project_id": project_id, "dimension": dim,
+            "plan_revision": PLAN_REVISION,
+            "plan_hash": _plan_hash(project_id, dim, derived),
+            "summary": {"candidate_count": len(derived), "safe_apply_count": 0,
+                        "total_candidate_count": total,
+                        "unsafe_candidate_count": total,
+                        "size_bytes": total_bytes,
+                        "truncated": truncated,
+                        "dimensions": {dim: {"count": total, "visible_count": len(derived),
+                                             "safe_count": 0, "size_bytes": total_bytes,
+                                             "refused_count": total, "truncated": truncated}}},
+            "candidates": derived,
+            "append_only_retained": {"policy": "retain_append_only_evidence", "deleted": False},
+            "cleanup": cleanup_recommendation(project_id),
+        }
+    if dim == DIMENSION_GRAPH_SNAPSHOTS:
+        graph_items = _build_graph_snapshot_candidates(conn, project_id)
+        total = len(graph_items)
+        visible = graph_items[:PREVIEW_LIMIT]
+        safe = sum(item.get("safe_to_apply") is True for item in graph_items)
+        total_bytes = sum(int((item.get("evidence") or {}).get("size_bytes") or 0)
+                          for item in graph_items)
+        return {
+            "ok": True, "mode": "dry_run", "dry_run": True,
+            "project_id": project_id, "dimension": dim,
+            "plan_revision": PLAN_REVISION,
+            "plan_hash": _plan_hash(project_id, dim, visible),
+            "summary": {"candidate_count": len(visible),
+                        "total_candidate_count": total,
+                        "safe_apply_count": safe,
+                        "unsafe_candidate_count": total - safe,
+                        "graph_snapshot_count": len(visible),
+                        "graph_snapshot_safe_count": safe,
+                        "size_bytes": total_bytes,
+                        "truncated": total > PREVIEW_LIMIT,
+                        "dimensions": {dim: {"count": total, "visible_count": len(visible),
+                                             "safe_count": safe, "size_bytes": total_bytes,
+                                             "refused_count": total - safe,
+                                             "truncated": total > PREVIEW_LIMIT}}},
+            "candidates": visible,
+            "append_only_retained": {"policy": "retain_append_only_evidence", "deleted": False},
+            "cleanup": cleanup_recommendation(project_id),
+        }
 
     root = batch_jobs.repo_root(repo_root_path)
     stale_report = batch_jobs.report_stale_worktrees(conn, project_id, repo_root_path=root)
@@ -398,18 +610,28 @@ def build_stale_artifact_cleanup_projection(
         active_rows = active_tasks_by_path.get(path, [])
         active_backlog_rows = active_backlog_refs_by_path.get(path, [])
         path_safe = _path_under_worktrees(root, path)
+        identity = _path_identity(path)
+        clean_worktree = _worktree_clean(path) if path_safe and identity else False
         safe = bool(
-            path_safe and terminal_rows and not active_rows and not active_backlog_rows
+            path_safe and identity and clean_worktree and terminal_rows
+            and len(terminal_rows) <= PREVIEW_LIMIT
+            and not active_rows and not active_backlog_rows
         )
         refusal_reasons = []
         if not path_safe:
             refusal_reasons.append("path_outside_worktrees")
+        if identity is None:
+            refusal_reasons.append("path_identity_unverified")
+        if not clean_worktree:
+            refusal_reasons.append("worktree_dirty_or_unregistered")
         if active_rows:
             refusal_reasons.append("referenced_by_active_batch_task")
         if active_backlog_rows:
             refusal_reasons.append("referenced_by_active_backlog_row")
         if not terminal_rows:
             refusal_reasons.append("missing_terminal_batch_task_evidence")
+        if len(terminal_rows) > PREVIEW_LIMIT:
+            refusal_reasons.append("terminal_task_reference_window_unbounded")
         active_backlog_evidence = [
             {
                 "backlog_id": str(item.get("bug_id") or ""),
@@ -418,7 +640,7 @@ def build_stale_artifact_cleanup_projection(
                 "current_task_id": str(item.get("current_task_id") or ""),
                 "root_task_id": str(item.get("root_task_id") or ""),
             }
-            for item in active_backlog_rows
+            for item in active_backlog_rows[:PREVIEW_LIMIT]
         ]
         if safe or include_unowned:
             candidates.append({
@@ -440,16 +662,22 @@ def build_stale_artifact_cleanup_projection(
                 },
                 "evidence": {
                     "path_under_worktrees": path_safe,
-                    "terminal_task_ids": [str(item.get("task_id") or "") for item in terminal_rows],
+                    "terminal_task_ids": [str(item.get("task_id") or "")
+                                          for item in terminal_rows[:PREVIEW_LIMIT]],
+                    "terminal_task_count": len(terminal_rows),
                     "terminal_batch_statuses": sorted(
-                        {str(item.get("batch_status") or "") for item in terminal_rows}
+                        {str(item.get("batch_status") or "") for item in terminal_rows[:PREVIEW_LIMIT]}
                     ),
-                    "active_task_ids": [str(item.get("task_id") or "") for item in active_rows],
+                    "active_task_ids": [str(item.get("task_id") or "")
+                                        for item in active_rows[:PREVIEW_LIMIT]],
+                    "active_task_count": len(active_rows),
                     "active_backlog_ids": [
-                        str(item.get("bug_id") or "") for item in active_backlog_rows
+                        str(item.get("bug_id") or "") for item in active_backlog_rows[:PREVIEW_LIMIT]
                     ],
+                    "active_backlog_count": len(active_backlog_rows),
                     "active_backlog_references": active_backlog_evidence,
                     "exists": Path(path).exists(),
+                    "path_identity": identity,
                     "append_only_evidence_retained": True,
                 },
             })
@@ -461,13 +689,16 @@ def build_stale_artifact_cleanup_projection(
             continue
         terminal = bool(row.get("is_terminal"))
         path_safe = _path_under_worktrees(root, path)
+        identity = _path_identity(path)
         active_rows = active_tasks_by_path.get(path, [])
-        safe = bool(terminal and path_safe and not active_rows)
+        safe = bool(terminal and path_safe and identity and not active_rows)
         refusal_reasons = []
         if not terminal:
             refusal_reasons.append("backlog_row_not_terminal")
         if not path_safe:
             refusal_reasons.append("path_outside_worktrees")
+        if identity is None:
+            refusal_reasons.append("path_identity_unverified")
         if active_rows:
             refusal_reasons.append("referenced_by_active_batch_task")
         if terminal:
@@ -484,11 +715,12 @@ def build_stale_artifact_cleanup_projection(
                 "status": str(row.get("status") or ""),
                 "runtime_state": str(row.get("runtime_state") or ""),
                 "worktree_branch": str(row.get("worktree_branch") or ""),
+                "path_identity": identity,
                 "append_only_evidence_retained": True,
             },
         })
 
-    retained_traces = _fetch_related_graph_traces(
+    retained_traces, retained_trace_count = _fetch_related_graph_traces(
         conn,
         project_id,
         task_ids=terminal_task_ids,
@@ -511,17 +743,66 @@ def build_stale_artifact_cleanup_projection(
     else:
         all_candidates = candidates + snapshot_candidates
 
-    safe_count = sum(1 for item in all_candidates if item.get("safe_to_apply"))
-    unsafe_count = len(all_candidates) - safe_count
+    derived_truncated = False
+    derived_counts: dict[str, tuple[int, int]] = {}
+    if dim == DIMENSION_ALL:
+        for derived_dim in (DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE):
+            derived, truncated, _total, _bytes = _derived_preview(project_id, derived_dim)
+            derived_counts[derived_dim] = (_total, _bytes)
+            all_candidates.extend(derived)
+            derived_truncated = derived_truncated or truncated
+    total_candidates = len(all_candidates) + sum(
+        count - sum(item.get("artifact_type") == key for item in all_candidates)
+        for key, (count, _bytes) in derived_counts.items()
+    )
+    truncated = derived_truncated or total_candidates > PREVIEW_LIMIT
+    total_bytes = sum(int((item.get("evidence") or {}).get("size_bytes") or 0)
+                      for item in all_candidates)
+    total_bytes += sum(max(0, byte_count - sum(
+        int((item.get("evidence") or {}).get("size_bytes") or 0)
+        for item in all_candidates if item.get("artifact_type") == key))
+        for key, (_count, byte_count) in derived_counts.items())
+    def in_dimension(item: dict[str, Any], key: str) -> bool:
+        kind = str(item.get("artifact_type") or "")
+        return (kind in {"batch_worktree", "backlog_worktree_reference"}
+                if key == DIMENSION_WORKTREES else
+                kind == "graph_snapshot_dir" if key == DIMENSION_GRAPH_SNAPSHOTS else
+                kind == key)
+    dimension_summary = {}
+    for key in (DIMENSION_WORKTREES, DIMENSION_GRAPH_SNAPSHOTS,
+                DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE):
+        members = [item for item in all_candidates if in_dimension(item, key)]
+        count = derived_counts[key][0] if key in derived_counts else len(members)
+        byte_count = derived_counts[key][1] if key in derived_counts else sum(
+            int((item.get("evidence") or {}).get("size_bytes") or 0) for item in members)
+        safe_count = sum(item.get("safe_to_apply") is True for item in members)
+        dimension_summary[key] = {
+            "count": count, "visible_count": min(len(members), PREVIEW_LIMIT),
+            "safe_count": safe_count, "refused_count": count - safe_count,
+            "size_bytes": byte_count, "truncated": truncated,
+        }
+    all_candidates = all_candidates[:PREVIEW_LIMIT]
+    for key, values in dimension_summary.items():
+        values["visible_count"] = sum(in_dimension(item, key) for item in all_candidates)
+        values["truncated"] = values["count"] > values["visible_count"]
+
+    safe_count = sum(value["safe_count"] for value in dimension_summary.values())
+    unsafe_count = sum(value["refused_count"] for value in dimension_summary.values())
     return {
         "ok": True,
         "mode": "dry_run",
         "dry_run": True,
         "project_id": project_id,
         "repo_root": str(root),
-        "dimension": dim or "all",
+        "dimension": dim,
+        "plan_revision": PLAN_REVISION,
+        "plan_hash": _plan_hash(project_id, dim, all_candidates),
         "summary": {
             "candidate_count": len(all_candidates),
+            "total_candidate_count": total_candidates,
+            "truncated": truncated,
+            "size_bytes": total_bytes,
+            "dimensions": dimension_summary,
             "safe_apply_count": safe_count,
             "unsafe_candidate_count": unsafe_count,
             "stale_worktree_count": len(stale_paths),
@@ -533,7 +814,7 @@ def build_stale_artifact_cleanup_projection(
             "graph_snapshot_safe_count": sum(
                 1 for item in snapshot_candidates if item.get("safe_to_apply")
             ),
-            "append_only_graph_trace_count": len(retained_traces),
+            "append_only_graph_trace_count": retained_trace_count,
             "append_only_timeline_event_count": timeline_event_count,
         },
         "candidates": all_candidates,
@@ -542,6 +823,7 @@ def build_stale_artifact_cleanup_projection(
             "action": ACTION_RETAIN_APPEND_ONLY_EVIDENCE,
             "graph_query_traces": retained_traces,
             "graph_trace_ids": [str(item.get("trace_id") or "") for item in retained_traces],
+            "graph_query_traces_truncated": retained_trace_count > len(retained_traces),
             "task_timeline_event_count": timeline_event_count,
             "deleted": False,
         },
@@ -632,22 +914,27 @@ def _remove_worktree(
             project_id=str(metadata.get("project_id") or ""),
         )
     if (safe_path / ".git").exists():
-        return batch_jobs.abandon_worktree(
-            strategy,
-            repo_root_path=repo_root_path,
-            remove_branch=remove_branch,
+        if not _worktree_clean(str(safe_path)):
+            raise StaleArtifactCleanupError("worktree_dirty_or_unverifiable_refused")
+        removal = subprocess.run(
+            ["git", "-C", str(repo_root_path), "worktree", "remove", str(safe_path)],
+            capture_output=True, text=True, timeout=30, check=False,
         )
-    shutil.rmtree(safe_path)
-    return {
-        "removed": True,
-        "branch_removed": False,
-        "worktree_path": str(safe_path),
-        "branch": strategy.work_branch,
-        "removal": "rmtree_safe_worktrees_child",
-    }
+        if removal.returncode:
+            raise StaleArtifactCleanupError("worktree_remove_refused")
+        branch_removed = False
+        if remove_branch and strategy.work_branch:
+            branch = subprocess.run(
+                ["git", "-C", str(repo_root_path), "branch", "-d", strategy.work_branch],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            branch_removed = branch.returncode == 0
+        return {"removed": True, "branch_removed": branch_removed,
+                "worktree_path": str(safe_path), "branch": strategy.work_branch}
+    raise StaleArtifactCleanupError("unregistered_worktree_directory_refused")
 
 
-def apply_stale_artifact_cleanup(
+def _apply_stale_artifact_cleanup_locked(
     conn: sqlite3.Connection,
     project_id: str,
     *,
@@ -659,22 +946,33 @@ def apply_stale_artifact_cleanup(
     reason: str = "",
     remove_branch: bool = False,
     dimension: str = "",
+    plan_hash: str = "",
+    plan_revision: int = 0,
 ) -> dict[str, Any]:
     """Apply explicit safe cleanup candidates and record timeline evidence."""
 
+    dim = _dimension(dimension)
     projection = build_stale_artifact_cleanup_projection(
         conn,
         project_id,
         repo_root_path=repo_root_path,
         include_unowned=True,
-        dimension=dimension,
+        dimension=dim,
     )
+    if (type(plan_revision) is not int or plan_revision != PLAN_REVISION
+            or plan_hash != projection["plan_hash"]
+            or projection["summary"].get("truncated")):
+        raise StaleArtifactCleanupError("stale_cleanup_plan_refused", {
+            "ok": False, "error": "stale_cleanup_plan_refused",
+            "current_plan_hash": projection["plan_hash"],
+            "current_plan_revision": PLAN_REVISION,
+        })
     if not candidate_ids:
         payload = {
             "ok": False,
             "error": "candidate_ids_required",
             "message": "apply requires explicit candidate_ids from dry-run projection",
-            "projection": projection,
+            "plan_hash": projection["plan_hash"],
         }
         raise StaleArtifactCleanupError("candidate_ids_required", payload)
 
@@ -686,20 +984,51 @@ def apply_stale_artifact_cleanup(
         payload = {
             "ok": False,
             "error": "unsafe_stale_artifact_cleanup_refused",
-            "unknown_candidate_ids": unknown,
-            "unsafe_candidates": unsafe,
-            "projection": projection,
+            "unknown_candidate_count": len(unknown),
+            "unsafe_candidate_count": len(unsafe),
+            "plan_hash": projection["plan_hash"],
         }
         raise StaleArtifactCleanupError("unsafe_stale_artifact_cleanup_refused", payload)
 
     root = batch_jobs.repo_root(repo_root_path)
     cleanup_id = f"stale-cleanup-{uuid.uuid4().hex[:12]}"
     applied: list[dict[str, Any]] = []
+
+    def partial_refusal(error: str) -> StaleArtifactCleanupError:
+        payload = {"ok": False, "error": error, "cleanup_id": cleanup_id,
+                   "applied_count": len(applied),
+                   "applied_candidate_ids": [item["candidate_id"] for item in applied],
+                   "requested_actor": actor,
+                   "transactional_limit": "earlier physical removals cannot be rolled back"}
+        if applied:
+            task_timeline.record_event(
+                conn, project_id=project_id, backlog_id=backlog_id, task_id=task_id,
+                event_type="governance.stale_artifact_cleanup.apply",
+                phase="cleanup", event_kind="stale_artifact_cleanup",
+                actor="system", status="partial", payload=payload,
+            )
+            conn.commit()
+        return StaleArtifactCleanupError(error, payload)
+
     task_rows = _fetch_batch_task_rows(conn, project_id)
     task_meta_by_id = {str(row.get("task_id") or ""): row.get("metadata") or {} for row in task_rows}
 
     for candidate_id in sorted(requested):
         candidate = by_id[candidate_id]
+        fresh = build_stale_artifact_cleanup_projection(
+            conn, project_id, repo_root_path=repo_root_path,
+            include_unowned=True, dimension=dim,
+        )
+        fresh_item = next((item for item in fresh["candidates"]
+                           if item["candidate_id"] == candidate_id), None)
+        if (fresh_item is None or fresh_item.get("safe_to_apply") is not True
+                or fresh_item.get("path") != candidate.get("path")
+                or fresh_item.get("snapshot_id") != candidate.get("snapshot_id")
+                or fresh_item.get("evidence") != candidate.get("evidence")
+                or not str(candidate.get("path") or "")
+                or _path_identity(str(candidate["path"])) !=
+                    (candidate.get("evidence") or {}).get("path_identity")):
+            raise partial_refusal("stale_cleanup_item_drift_refused")
         cleanup_record = {
             "cleanup_id": cleanup_id,
             "candidate_id": candidate_id,
@@ -713,12 +1042,15 @@ def apply_stale_artifact_cleanup(
         if candidate["action"] == ACTION_REMOVE_BATCH_WORKTREE:
             terminal_task_ids = list((candidate.get("evidence") or {}).get("terminal_task_ids") or [])
             metadata = task_meta_by_id.get(str(terminal_task_ids[0]), {}) if terminal_task_ids else {}
-            removal = _remove_worktree(
-                repo_root_path=root,
-                path=str(candidate.get("path") or ""),
-                metadata=metadata,
-                remove_branch=remove_branch,
-            )
+            try:
+                removal = _remove_worktree(
+                    repo_root_path=root,
+                    path=str(candidate.get("path") or ""),
+                    metadata=metadata,
+                    remove_branch=remove_branch,
+                )
+            except StaleArtifactCleanupError as exc:
+                raise partial_refusal(str(exc)) from exc
             cleanup_record["result"] = removal
             for terminal_task_id in terminal_task_ids:
                 _append_task_cleanup_history(conn, str(terminal_task_id), cleanup_record=cleanup_record)
@@ -752,10 +1084,11 @@ def apply_stale_artifact_cleanup(
         event_type="governance.stale_artifact_cleanup.apply",
         phase="cleanup",
         event_kind="stale_artifact_cleanup",
-        actor=actor,
+        actor="system",
         status="applied",
         payload={
             "cleanup_id": cleanup_id,
+            "requested_actor": actor,
             "reason": reason,
             "candidate_ids": sorted(requested),
             "applied_count": len(applied),
@@ -775,3 +1108,31 @@ def apply_stale_artifact_cleanup(
         "timeline_event": timeline_event,
         "append_only_retained": projection.get("append_only_retained", {}),
     }
+
+
+def apply_stale_artifact_cleanup(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    repo_root_path: str | Path,
+    candidate_ids: list[str],
+    actor: str = "observer",
+    backlog_id: str = "",
+    task_id: str = "",
+    reason: str = "",
+    remove_branch: bool = False,
+    dimension: str = "",
+    plan_hash: str = "",
+    plan_revision: int = 0,
+) -> dict[str, Any]:
+    """Apply only a fresh, exact plan while serializing destructive work."""
+    from .db import sqlite_write_lock
+    from .server import _CURRENT_FULL_BUILD_KEYS_LOCK
+
+    with _DESTRUCTIVE_CLEANUP_LOCK, sqlite_write_lock(), _CURRENT_FULL_BUILD_KEYS_LOCK:
+        return _apply_stale_artifact_cleanup_locked(
+            conn, project_id, repo_root_path=repo_root_path,
+            candidate_ids=candidate_ids, actor=actor, backlog_id=backlog_id,
+            task_id=task_id, reason=reason, remove_branch=remove_branch,
+            dimension=dimension, plan_hash=plan_hash, plan_revision=plan_revision,
+        )
