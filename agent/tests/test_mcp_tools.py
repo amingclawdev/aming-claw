@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.governance import mcp_server as governance_mcp_server
+from agent.governance import stale_artifact_cleanup
 from agent.mcp import server as plugin_mcp_server
 from agent.mcp import tools as mcp_tools
 from agent.mcp.schema_contract import (
@@ -8569,3 +8570,112 @@ def test_cleanup_dimensions_match_both_mcp_dispatchers_and_reject_unknown(monkey
         "project_id": "aming-claw", "dimension": "graph_snapshots",
     })
     assert calls == [("GET", "/api/graph-governance/aming-claw/stale-artifact-cleanup?dimension=graph_snapshots", None)]
+
+
+def test_cleanup_preview_actual_managed_and_standalone_frames_are_bounded(
+    monkeypatch,
+):
+    huge_trace = {"trace_id": "gqt-huge", "run_id": ("雪\\\"\n") * 200_000}
+    full = {
+        "ok": True, "mode": "dry_run", "dry_run": True,
+        "project_id": "aming-claw", "dimension": "worktrees",
+        "plan_hash": "sha256:" + "a" * 64, "plan_revision": 1,
+        "summary": {"append_only_graph_trace_count": 1},
+        "candidates": [{"candidate_id": "worktrees:exact-id", "safe_to_apply": True}],
+        "append_only_retained": {
+            "graph_query_traces": [huge_trace],
+            "graph_trace_ids": ["gqt-huge"],
+        },
+    }
+    bounded = stale_artifact_cleanup._bounded_cleanup_projection(full)
+    assert bounded["ok"] is True
+    assert bounded["plan_hash"] == full["plan_hash"]
+    assert bounded["candidates"] == full["candidates"]
+    assert bounded["append_only_retained"]["graph_query_traces_omitted_count"] == 1
+    request_id = "z" * (4 * 1024 - 2)
+    sizes = stale_artifact_cleanup.cleanup_response_wire_bytes(bounded)
+    assert sizes["managed_mcp"] <= 224 * 1024
+    assert sizes["standalone_mcp"] <= 224 * 1024
+
+    managed_output = io.StringIO()
+    monkeypatch.setattr(plugin_mcp_server.sys, "stdout", managed_output)
+    plugin_mcp_server._response(request_id, {"content": [{
+        "type": "text", "text": json.dumps(bounded, ensure_ascii=False, indent=2),
+    }]})
+    managed_frame = managed_output.getvalue().encode("utf-8").rstrip(b"\n")
+    assert len(managed_frame) == sizes["managed_mcp"]
+    assert json.loads(json.loads(managed_frame)["result"]["content"][0]["text"]) == bounded
+
+    standalone_output = io.StringIO()
+    monkeypatch.setattr(governance_mcp_server.sys, "stdout", standalone_output)
+    monkeypatch.setattr(governance_mcp_server, "_dispatch_tool",
+                        lambda *_args: bounded)
+    governance_mcp_server._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup",
+                   "arguments": {"project_id": "aming-claw"}},
+    }))
+    standalone_frame = standalone_output.getvalue().encode("utf-8").rstrip(b"\n")
+    assert len(standalone_frame) == sizes["standalone_mcp"]
+    assert json.loads(json.loads(standalone_frame)["result"]["content"][0]["text"]) == bounded
+
+
+def test_standalone_cleanup_apply_oversized_id_never_dispatches(monkeypatch):
+    calls = []
+    monkeypatch.setattr(governance_mcp_server, "_dispatch_tool",
+                        lambda *args: calls.append(args))
+    output = io.StringIO()
+    monkeypatch.setattr(governance_mcp_server.sys, "stdout", output)
+    request_id = "x" * 1_000_000
+    governance_mcp_server._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup_apply",
+                   "arguments": {"project_id": "aming-claw"}},
+    }))
+    frame = output.getvalue().encode("utf-8")
+    response = json.loads(frame)
+    assert calls == []
+    assert response["id"] is None
+    assert response["error"]["message"] == "cleanup_request_id_frame_refused"
+    assert response["error"]["data"]["writes_performed"] is False
+    assert len(frame) < 256 * 1024
+    assert request_id[:100] not in output.getvalue()
+
+
+@pytest.mark.parametrize("tool_name,error_type", [
+    ("stale_artifact_cleanup", ValueError),
+    ("stale_artifact_cleanup_apply", RuntimeError),
+])
+def test_standalone_cleanup_exception_frame_is_bounded_and_truthful(
+    monkeypatch, tool_name, error_type,
+):
+    diagnostic = "雪\\\"\n" * 250_000
+
+    def fail_dispatch(*_args):
+        raise error_type(diagnostic)
+
+    monkeypatch.setattr(governance_mcp_server, "_dispatch_tool", fail_dispatch)
+    output = io.StringIO()
+    monkeypatch.setattr(governance_mcp_server.sys, "stdout", output)
+    request_id = "q" * (4 * 1024 - 2)
+    governance_mcp_server._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": tool_name, "arguments": {"project_id": "aming-claw"}},
+    }))
+    frame = output.getvalue().encode("utf-8")
+    response = json.loads(frame)
+    assert len(frame) <= 256 * 1024
+    assert response["id"] == request_id
+    assert response["error"]["message"] == "cleanup_dispatch_error"
+    data = response["error"]["data"]
+    assert data["diagnostic_sha256"] == "sha256:" + hashlib.sha256(
+        diagnostic.encode("utf-8"),
+    ).hexdigest()
+    assert data["safe_retry"] is False
+    if tool_name.endswith("_apply"):
+        assert data["writes_performed"] is None
+        assert data["write_disposition"] == "ambiguous"
+    else:
+        assert data["writes_performed"] is False
+        assert data["write_disposition"] == "not_written"
+    assert diagnostic[:100] not in output.getvalue()

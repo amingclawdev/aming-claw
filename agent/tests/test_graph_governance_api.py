@@ -103340,6 +103340,62 @@ def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_pat
     assert not (repo / ".worktrees" / "batch-cleanup-api").exists()
 
 
+def test_stale_cleanup_http_exception_frames_are_finite(monkeypatch, conn, tmp_path):
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_a, **_k: tmp_path)
+    monkeypatch.setattr(server, "_require_graph_governance_operator",
+                        lambda *_a, **_k: {"role": "observer"})
+    diagnostic = "雪\\\"\n" * 250_000
+
+    def fail_preview(*_a, **_k):
+        raise RuntimeError(diagnostic)
+
+    monkeypatch.setattr(stale_artifact_cleanup,
+                        "build_stale_artifact_cleanup_projection", fail_preview)
+    status, body = server.handle_graph_governance_stale_artifact_cleanup(
+        _ctx({"project_id": PID}),
+    )
+    assert status == 500
+    assert body["writes_performed"] is False
+    assert body["diagnostic_sha256"] == "sha256:" + hashlib.sha256(
+        diagnostic.encode("utf-8"),
+    ).hexdigest()
+    assert len(json.dumps(body, ensure_ascii=False).encode("utf-8")) <= 224 * 1024
+
+    def fail_apply(*_a, **_k):
+        raise RuntimeError(diagnostic)
+
+    monkeypatch.setattr(stale_artifact_cleanup,
+                        "apply_stale_artifact_cleanup", fail_apply)
+    status, body = server.handle_graph_governance_stale_artifact_cleanup_apply(
+        _ctx({"project_id": PID}, method="POST", body={"candidate_ids": ["x"]}),
+    )
+    assert status == 500
+    assert body["writes_performed"] is None
+    assert body["write_disposition"] == "ambiguous"
+    assert body["safe_retry"] is False
+    assert len(json.dumps(body, ensure_ascii=False).encode("utf-8")) <= 224 * 1024
+
+    def fail_after_one(*_a, **_k):
+        raise stale_artifact_cleanup.StaleArtifactCleanupError("partial", {
+            "ok": False, "error": "partial", "diagnostic": diagnostic,
+            "writes_performed": True, "applied_count": 1,
+            "applied_candidate_ids": ["worktrees:already-removed"],
+        })
+
+    monkeypatch.setattr(stale_artifact_cleanup,
+                        "apply_stale_artifact_cleanup", fail_after_one)
+    status, body = server.handle_graph_governance_stale_artifact_cleanup_apply(
+        _ctx({"project_id": PID}, method="POST", body={"candidate_ids": ["x"]}),
+    )
+    assert status == 400
+    assert body["writes_performed"] is True
+    assert body["write_disposition"] == "written"
+    assert body["applied_count"] == 1
+    assert body["applied_candidate_ids"] == ["worktrees:already-removed"]
+    assert len(json.dumps(body, ensure_ascii=False).encode("utf-8")) <= 224 * 1024
+
+
 def test_graph_governance_semantic_feedback_and_enrich_api(conn, tmp_path):
     project = tmp_path / "project"
     primary = project / "agent" / "governance" / "server.py"

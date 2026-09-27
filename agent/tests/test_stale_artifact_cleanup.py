@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import io
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -10,9 +12,14 @@ import pytest
 
 from agent.governance import batch_jobs
 from agent.governance import graph_query_trace
+from agent.governance import graph_snapshot_store
+from agent.governance import mcp_server as governance_mcp_server
+from agent.governance import server as governance_server
 from agent.governance import stale_artifact_cleanup
 from agent.governance import task_timeline
 from agent.governance.db import _ensure_schema
+from agent.mcp import server as managed_mcp_server
+from agent.mcp.server import AmingClawMCP
 
 
 def _conn() -> sqlite3.Connection:
@@ -480,6 +487,625 @@ def test_retained_trace_preview_is_bounded_but_total_count_is_exact(tmp_path):
     assert preview["summary"]["append_only_graph_trace_count"] == (
         stale_artifact_cleanup.PREVIEW_LIMIT + 5
     )
+
+
+@pytest.mark.parametrize("run_id", [
+    "x" * 1_000_000,
+    ("雪\\\"\n") * 200_000,
+], ids=["ascii-million", "unicode-escaped-million"])
+def test_cleanup_preview_bounds_complete_frames_without_changing_plan(
+    tmp_path, run_id,
+):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    created, _strategy = _terminal_batch_with_worktree(
+        conn, repo, batch_id="oversized-trace",
+    )
+    _insert_graph_trace(
+        conn, project_id="proj", trace_id="gqt-oversized",
+        task_id=created["task_id"],
+    )
+    conn.execute("UPDATE graph_query_traces SET run_id=? WHERE trace_id=?",
+                 (run_id, "gqt-oversized"))
+    conn.commit()
+    full = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+        response_budget=False,
+    )
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    assert preview["ok"] is True
+    assert preview["plan_hash"] == full["plan_hash"]
+    assert preview["candidates"] == full["candidates"]
+    assert preview["summary"]["append_only_graph_trace_count"] == 1
+    retained = preview["append_only_retained"]
+    assert retained["graph_query_traces"] == []
+    assert retained["graph_trace_ids"] == []
+    assert retained["graph_query_traces_omitted_count"] == 1
+    assert retained["graph_query_traces_truncated"] is True
+    sizes = stale_artifact_cleanup.cleanup_response_wire_bytes(preview)
+    assert all(size <= 224 * 1024 for size in sizes.values())
+    assert run_id not in json.dumps(preview, ensure_ascii=False)
+
+
+def test_cleanup_essential_identity_overflow_has_no_executable_plan(
+    tmp_path, monkeypatch,
+):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    oversized_id = "candidate-" + "x" * 300_000
+    monkeypatch.setattr(stale_artifact_cleanup,
+                        "_build_graph_snapshot_candidates", lambda *_: [{
+        "candidate_id": oversized_id,
+        "artifact_type": "graph_snapshot_dir",
+        "action": "remove_stale_graph_snapshot",
+        "path": str(repo / "snapshot"),
+        "safe_to_apply": True,
+        "refusal_reasons": [],
+        "evidence": {"size_bytes": 1},
+    }])
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    assert preview["error"] == "cleanup_response_identity_overflow"
+    assert preview["apply_plan_available"] is False
+    assert preview["candidates"] == []
+    assert oversized_id not in json.dumps(preview)
+    assert all(size <= 224 * 1024 for size in
+               stale_artifact_cleanup.cleanup_response_wire_bytes(preview).values())
+    request_id = "z" * (4 * 1024 - 2)
+    expected_http = json.dumps({**preview, "request_id": "req-" + "x" * 12},
+                               ensure_ascii=False).encode("utf-8")
+    assert len(expected_http) == stale_artifact_cleanup.cleanup_response_wire_bytes(
+        preview,
+    )["http"]
+    managed = object.__new__(AmingClawMCP)
+    monkeypatch.setattr(managed, "_dispatch_tool_call", lambda *_a: preview)
+    managed_output = io.StringIO()
+    monkeypatch.setattr(managed_mcp_server.sys, "stdout", managed_output)
+    managed._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup",
+                   "arguments": {"project_id": "proj", "dimension": "graph_snapshots"}},
+    }))
+    managed_frame = managed_output.getvalue().encode("utf-8").rstrip(b"\n")
+    assert len(managed_frame) <= 224 * 1024
+    assert json.loads(json.loads(managed_frame)["result"]["content"][0]["text"]) == preview
+    standalone_output = io.StringIO()
+    monkeypatch.setattr(governance_mcp_server.sys, "stdout", standalone_output)
+    monkeypatch.setattr(governance_mcp_server, "_dispatch_tool", lambda *_a: preview)
+    governance_mcp_server._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup",
+                   "arguments": {"project_id": "proj", "dimension": "graph_snapshots"}},
+    }))
+    standalone_frame = standalone_output.getvalue().encode("utf-8").rstrip(b"\n")
+    assert len(standalone_frame) <= 224 * 1024
+    assert json.loads(json.loads(standalone_frame)["result"]["content"][0]["text"]) == preview
+
+
+def test_cleanup_essential_refusal_reason_overflow_has_no_plan(
+    tmp_path, monkeypatch,
+):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    exact_reason = "required-refusal-" + ("雪\\\"\n" * 100_000)
+    monkeypatch.setattr(stale_artifact_cleanup,
+                        "_build_graph_snapshot_candidates", lambda *_: [{
+        "candidate_id": "graph_snapshot_protected:exact-id",
+        "artifact_type": "graph_snapshot_dir",
+        "action": "remove_stale_graph_snapshot",
+        "snapshot_id": "exact-id", "path": str(repo / "snapshot"),
+        "safe_to_apply": False,
+        "refusal_reasons": [exact_reason],
+        "evidence": {"created_at": "2026-09-27T00:00:00Z",
+                     "size_bytes": None, "size_bytes_status": "unreadable"},
+    }])
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    assert preview["ok"] is False
+    assert preview["error"] == "cleanup_response_identity_overflow"
+    assert preview["apply_plan_available"] is False
+    assert preview["candidates"] == []
+    assert exact_reason not in json.dumps(preview, ensure_ascii=False)
+    assert all(size <= 224 * 1024 for size in
+               stale_artifact_cleanup.cleanup_response_wire_bytes(preview).values())
+
+
+def test_protected_snapshot_size_is_nofollow_bounded_and_repeatable(tmp_path):
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    measured = snapshot_root / "measured"
+    (measured / "nested").mkdir(parents=True)
+    with (measured / "nested" / "graph.json").open("wb") as handle:
+        handle.truncate(535_104_567)
+    assert stale_artifact_cleanup._snapshot_directory_size(
+        str(measured), remaining_entries=[100],
+    ) == (535_104_567, "measured")
+    assert stale_artifact_cleanup._snapshot_directory_size(
+        str(snapshot_root / "absent"), remaining_entries=[100],
+    ) == (0, "verified_absent")
+
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"private")
+    (measured / "nested" / "linked").symlink_to(outside)
+    assert stale_artifact_cleanup._snapshot_directory_size(
+        str(measured), remaining_entries=[100],
+    )[0] is None
+    (measured / "nested" / "linked").unlink()
+    assert stale_artifact_cleanup._snapshot_directory_size(
+        str(measured), remaining_entries=[1],
+    ) == (None, "entry_budget_exceeded")
+    (snapshot_root / "linked-root").symlink_to(measured, target_is_directory=True)
+    assert stale_artifact_cleanup._snapshot_directory_size(
+        str(snapshot_root / "linked-root"), remaining_entries=[100],
+    )[0] is None
+
+
+def test_protected_snapshot_size_refuses_child_swap_to_symlink(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "snapshots"
+    nested = root / "one" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "graph.json").write_bytes(b"{}")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_bytes(b"private")
+    actual_open = os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == "nested" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            nested.rename(root / "one" / "nested-old")
+            nested.symlink_to(outside, target_is_directory=True)
+        return actual_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(stale_artifact_cleanup.os, "open", swap_before_open)
+        size, status = stale_artifact_cleanup._snapshot_directory_size(
+            str(root / "one"), remaining_entries=[100],
+        )
+    assert swapped is True
+    assert size is None
+    assert status == "unreadable"
+
+
+def test_protected_snapshot_size_closes_child_fd_if_fstat_fails(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "snapshots" / "one"
+    (root / "nested").mkdir(parents=True)
+    actual_open = os.open
+    actual_fstat = os.fstat
+    opened_child = []
+
+    def track_open(path, flags, *args, **kwargs):
+        descriptor = actual_open(path, flags, *args, **kwargs)
+        if path == "nested":
+            opened_child.append(descriptor)
+        return descriptor
+
+    def fail_child_fstat(descriptor):
+        if descriptor in opened_child:
+            raise OSError("simulated child fstat failure")
+        return actual_fstat(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(stale_artifact_cleanup.os, "open", track_open)
+        patch.setattr(stale_artifact_cleanup.os, "fstat", fail_child_fstat)
+        assert stale_artifact_cleanup._snapshot_directory_size(
+            str(root), remaining_entries=[100],
+        ) == (None, "unreadable")
+    assert len(opened_child) == 1
+    with pytest.raises(OSError):
+        actual_fstat(opened_child[0])
+
+
+def test_protected_snapshot_size_refuses_parent_swap_to_symlink(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    (root / "one").mkdir()
+    (root / "one" / "graph.json").write_bytes(b"{}")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "one").mkdir()
+    (outside / "one" / "private").write_bytes(b"private")
+    actual_open = os.open
+    swapped = False
+
+    def swap_parent(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == "snapshots" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            root.rename(tmp_path / "snapshots-old")
+            root.symlink_to(outside, target_is_directory=True)
+        return actual_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(stale_artifact_cleanup.os, "open", swap_parent)
+        size, status = stale_artifact_cleanup._snapshot_directory_size(
+            str(root / "one"), remaining_entries=[100],
+        )
+    assert swapped is True
+    assert size is None
+    assert status == "parent_unverified"
+
+
+def test_protected_unknown_bytes_never_appear_as_zero_total(
+    tmp_path, monkeypatch,
+):
+    conn = _conn()
+    repo = _git_repo(tmp_path)
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    (root / "measured").mkdir()
+    (root / "measured" / "graph.json").write_bytes(b"12345")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    protected = [{
+        "snapshot_id": sid, "reasons": ["active_snapshot"],
+        "snapshot_kind": "full", "status": "active",
+        "created_at": "2026-09-27T00:00:00Z", "dir_exists": True,
+    } for sid in ("measured", "linked")]
+    monkeypatch.setattr(graph_snapshot_store, "select_snapshot_retention_candidates",
+                        lambda *_a, **_kw: {"candidates": [], "protected": protected,
+                                       "reference_authority_complete": True})
+    monkeypatch.setattr(graph_snapshot_store, "_snapshot_root",
+                        lambda _project, sid: root / sid)
+    monkeypatch.setattr(governance_server, "_graph_release_build_fence_state",
+                        lambda *_a: {"clear": True})
+    first = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    again = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    assert first["plan_hash"] == again["plan_hash"]
+    assert first["summary"]["size_bytes"] is None
+    assert first["summary"]["known_size_bytes"] == 5
+    assert first["summary"]["unknown_size_count"] == 1
+    assert first["summary"]["size_bytes_complete"] is False
+    by_id = {item["snapshot_id"]: item for item in first["candidates"]}
+    assert by_id["measured"]["evidence"]["size_bytes"] == 5
+    assert by_id["linked"]["evidence"]["size_bytes"] is None
+    monkeypatch.setattr(stale_artifact_cleanup, "_derived_preview",
+                        lambda *_a: ([], False, 0, 0))
+    all_view = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="all",
+    )
+    assert all_view["summary"]["size_bytes"] is None
+    assert all_view["summary"]["known_size_bytes"] == 5
+    assert all_view["summary"]["unknown_size_count"] == 1
+    assert all_view["summary"]["dimensions"]["graph_snapshots"]["size_bytes"] is None
+
+
+def test_graph_snapshot_ids_must_be_single_components_before_path_access(
+    tmp_path, monkeypatch,
+):
+    conn = _conn()
+    repo = _git_repo(tmp_path)
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    invalid = ("../outside", str(tmp_path / "absolute"), "nested/child")
+    monkeypatch.setattr(graph_snapshot_store, "select_snapshot_retention_candidates",
+                        lambda *_a, **_kw: {
+                            "candidates": [{"snapshot_id": invalid[0],
+                                            "status": "superseded", "in_db": True,
+                                            "dir_exists": True}],
+                            "protected": [{"snapshot_id": sid,
+                                           "reasons": ["active_snapshot"],
+                                           "dir_exists": True}
+                                          for sid in invalid[1:]],
+                            "reference_authority_complete": True,
+                        })
+    accessed = []
+
+    def guarded_root(_project, sid):
+        accessed.append(sid)
+        return root / sid
+
+    monkeypatch.setattr(graph_snapshot_store, "_snapshot_root", guarded_root)
+    monkeypatch.setattr(governance_server, "_graph_release_build_fence_state",
+                        lambda *_a: {"clear": True})
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    assert accessed == []
+    assert {item["snapshot_id"] for item in preview["candidates"]} == set(invalid)
+    for item in preview["candidates"]:
+        assert item["safe_to_apply"] is False
+        assert item["path"] == ""
+        assert item["evidence"]["size_bytes"] is None
+        assert item["evidence"]["size_bytes_status"] == "snapshot_id_path_invalid"
+        assert "snapshot_id_path_invalid" in item["refusal_reasons"]
+    assert "protected:active_snapshot" in next(
+        item["refusal_reasons"] for item in preview["candidates"]
+        if item["snapshot_id"] == invalid[1]
+    )
+    assert preview["summary"]["size_bytes"] is None
+    assert preview["summary"]["unknown_size_count"] == 3
+
+
+def test_unprotected_snapshot_scan_error_is_unknown_not_zero(
+    tmp_path, monkeypatch,
+):
+    conn = _conn()
+    repo = _git_repo(tmp_path)
+    snapshot = tmp_path / "snapshots" / "superseded"
+    snapshot.mkdir(parents=True)
+    monkeypatch.setattr(graph_snapshot_store, "select_snapshot_retention_candidates",
+                        lambda *_a, **_kw: {"candidates": [{
+                            "snapshot_id": "superseded", "status": "superseded",
+                            "in_db": True, "dir_exists": True, "size_bytes": 0,
+                        }], "protected": [], "reference_authority_complete": True})
+    monkeypatch.setattr(graph_snapshot_store, "_snapshot_root",
+                        lambda *_a: snapshot)
+    monkeypatch.setattr(governance_server, "_graph_release_build_fence_state",
+                        lambda *_a: {"clear": True})
+    monkeypatch.setattr(stale_artifact_cleanup, "_snapshot_directory_size",
+                        lambda *_a, **_kw: (None, "unreadable"))
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    item = preview["candidates"][0]
+    assert item["evidence"]["size_bytes"] is None
+    assert item["evidence"]["size_bytes_status"] == "unreadable"
+    assert preview["summary"]["size_bytes"] is None
+    assert preview["summary"]["unknown_size_count"] == 1
+
+
+def test_cleanup_preview_skips_selector_rglob_and_bounds_large_eligible_tree(
+    tmp_path, monkeypatch,
+):
+    conn = _conn()
+    repo = _git_repo(tmp_path)
+    sid = "superseded-large"
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr(graph_snapshot_store, "_snapshot_root",
+                        lambda _project, snapshot_id: snapshot_root / snapshot_id)
+    created = graph_snapshot_store.create_graph_snapshot(
+        conn, "proj", snapshot_id=sid, commit_sha="a", snapshot_kind="scope",
+    )
+    conn.execute("UPDATE graph_snapshots SET status='superseded' "
+                 "WHERE project_id=? AND snapshot_id=?", ("proj", created["snapshot_id"]))
+    monkeypatch.setattr(graph_snapshot_store, "get_snapshot_retention_config",
+                        lambda *_a, **_kw: {"keep_last_n": 0})
+    monkeypatch.setattr(graph_snapshot_store, "snapshot_retention_reference_state",
+                        lambda *_a: {"protected": {}, "complete": True,
+                                     "refusal_reasons": []})
+    monkeypatch.setattr(graph_snapshot_store,
+                        "_bundle_referenced_snapshot_ids", lambda: set())
+    monkeypatch.setattr(governance_server, "_graph_release_build_fence_state",
+                        lambda *_a: {"clear": True})
+    directory = snapshot_root / sid
+    for number in range(4_097):
+        (directory / f"entry-{number:04d}").write_bytes(b"x")
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"private")
+    (directory / "linked").symlink_to(outside)
+    actual_rglob = Path.rglob
+
+    def forbid_selector_size_walk(path, pattern):
+        if path == directory:
+            raise AssertionError("unbounded selector size scan was invoked")
+        return actual_rglob(path, pattern)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "rglob", forbid_selector_size_walk)
+        preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+            conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+        )
+    item = next(item for item in preview["candidates"]
+                if item["snapshot_id"] == sid)
+    assert item["evidence"]["size_bytes"] is None
+    assert item["evidence"]["size_bytes_status"] in {
+        "entry_budget_exceeded", "nonregular_or_symlink_entry",
+    }
+    assert preview["summary"]["size_bytes"] is None
+    assert preview["summary"]["unknown_size_count"] == 1
+
+
+@pytest.mark.parametrize("candidate_count", [129, 136])
+def test_129_protected_graph_rows_compact_only_optional_diagnostics(
+    tmp_path, monkeypatch, candidate_count,
+):
+    conn = _conn()
+    repo = _git_repo(tmp_path)
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    safe_id = "superseded-safe"
+    safe_directory = snapshot_root / safe_id
+    safe_directory.mkdir()
+    (safe_directory / "graph.json").write_bytes(b"{}")
+    protected = []
+    for number in range(candidate_count):
+        snapshot_id = f"full-{number:03d}-" + "s" * 34
+        directory = snapshot_root / snapshot_id
+        directory.mkdir()
+        (directory / "graph.json").write_bytes(b"{}")
+        protected.append({
+            "snapshot_id": snapshot_id,
+            "reasons": [f"reference:{number:03d}:{part:02d}:" + "r" * 51
+                        for part in range(8)],
+            "snapshot_kind": "full", "status": "active",
+            "created_at": "2026-09-27T00:00:00Z", "dir_exists": True,
+        })
+    monkeypatch.setattr(graph_snapshot_store, "select_snapshot_retention_candidates",
+                        lambda *_a, **_kw: {"candidates": [{
+                            "snapshot_id": safe_id, "snapshot_kind": "full",
+                            "status": "superseded", "created_at": "2026-09-26T00:00:00Z",
+                            "age_days": 1, "size_bytes": 2, "in_db": True,
+                            "dir_exists": True,
+                        }], "protected": protected,
+                                       "reference_authority_complete": True})
+    monkeypatch.setattr(graph_snapshot_store, "_snapshot_root",
+                        lambda _project, sid: snapshot_root / sid)
+    monkeypatch.setattr(governance_server, "_graph_release_build_fence_state",
+                        lambda *_a: {"clear": True})
+    raw = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+        response_budget=False,
+    )
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    repeat = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    assert stale_artifact_cleanup.cleanup_response_wire_bytes(raw)["managed_mcp"] > 224 * 1024
+    assert preview["ok"] is True
+    assert len(preview["candidates"]) == candidate_count + 1
+    assert preview["candidate_diagnostics"]["graph_unsafe_rows_compacted"] == candidate_count
+    assert preview["plan_hash"] == raw["plan_hash"] == repeat["plan_hash"]
+    assert preview["summary"] == raw["summary"] == repeat["summary"]
+    assert preview["summary"]["size_bytes"] == candidate_count * 2 + 2
+    assert preview["summary"]["unknown_size_count"] == 0
+    request_id = "z" * (4 * 1024 - 2)
+    expected_http = json.dumps({**preview, "request_id": "req-" + "x" * 12},
+                               ensure_ascii=False).encode("utf-8")
+    assert len(expected_http) == stale_artifact_cleanup.cleanup_response_wire_bytes(
+        preview,
+    )["http"]
+    managed = object.__new__(AmingClawMCP)
+    monkeypatch.setattr(managed, "_dispatch_tool_call", lambda *_a: preview)
+    managed_output = io.StringIO()
+    monkeypatch.setattr(managed_mcp_server.sys, "stdout", managed_output)
+    managed._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup",
+                   "arguments": {"project_id": "proj", "dimension": "graph_snapshots"}},
+    }))
+    managed_frame = managed_output.getvalue().encode("utf-8").rstrip(b"\n")
+    assert len(managed_frame) <= 224 * 1024
+    assert json.loads(json.loads(managed_frame)["result"]["content"][0]["text"]) == preview
+    standalone_output = io.StringIO()
+    monkeypatch.setattr(governance_mcp_server.sys, "stdout", standalone_output)
+    monkeypatch.setattr(governance_mcp_server, "_dispatch_tool", lambda *_a: preview)
+    governance_mcp_server._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup",
+                   "arguments": {"project_id": "proj", "dimension": "graph_snapshots"}},
+    }))
+    standalone_frame = standalone_output.getvalue().encode("utf-8").rstrip(b"\n")
+    assert len(standalone_frame) <= 224 * 1024
+    assert json.loads(json.loads(standalone_frame)["result"]["content"][0]["text"]) == preview
+    for source, shown in zip(raw["candidates"], preview["candidates"]):
+        for key in ("candidate_id", "snapshot_id", "artifact_type", "action",
+                    "safe_to_apply", "refusal_reasons"):
+            assert shown[key] == source[key]
+        assert shown["evidence"]["created_at"] == source["evidence"]["created_at"]
+        assert shown["evidence"]["size_bytes"] == source["evidence"]["size_bytes"]
+        if source["safe_to_apply"]:
+            assert shown["path"] == str(safe_directory)
+            assert shown["evidence"]["path_identity"] == source["evidence"]["path_identity"]
+        else:
+            assert "path" not in shown
+            assert "path_identity" not in shown["evidence"]
+    assert all(size <= 224 * 1024 for size in
+               stale_artifact_cleanup.cleanup_response_wire_bytes(preview).values())
+    if candidate_count == 129:
+        safe_candidate = next(item for item in preview["candidates"]
+                              if item["safe_to_apply"])
+        applied = stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+            candidate_ids=[safe_candidate["candidate_id"]],
+            plan_hash=preview["plan_hash"],
+            plan_revision=preview["plan_revision"],
+        )
+        assert applied["ok"] is True
+        assert applied["applied_candidate_ids"] == [safe_candidate["candidate_id"]]
+        assert not safe_directory.exists()
+
+
+def test_cleanup_apply_refuses_unrepresentable_ids_before_any_removal(
+    tmp_path, monkeypatch,
+):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    candidate_id = "snapshot:" + "x" * 300_000
+    snapshot = repo / "snapshot"
+    snapshot.mkdir()
+    monkeypatch.setattr(stale_artifact_cleanup,
+                        "_build_graph_snapshot_candidates", lambda *_: [{
+        "candidate_id": candidate_id,
+        "artifact_type": "graph_snapshot_dir",
+        "action": stale_artifact_cleanup.ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
+        "path": str(snapshot), "snapshot_id": "snapshot-safe",
+        "safe_to_apply": True, "refusal_reasons": [],
+        "evidence": {"size_bytes": 0},
+    }])
+    raw = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+        response_budget=False,
+    )
+    removals = []
+    monkeypatch.setattr(stale_artifact_cleanup.shutil, "rmtree",
+                        lambda path: removals.append(path))
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as err:
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+            candidate_ids=[candidate_id], plan_hash=raw["plan_hash"],
+            plan_revision=raw["plan_revision"],
+        )
+    assert err.value.payload["error"] == "cleanup_response_identity_overflow"
+    assert err.value.payload["writes_performed"] is False
+    assert removals == []
+    assert snapshot.is_dir()
+
+
+def test_cleanup_partial_failure_hashes_oversized_diagnostic_and_reports_ids(
+    tmp_path, monkeypatch,
+):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    _terminal_batch_with_worktree(conn, repo, batch_id="partial-oversize-a")
+    _terminal_batch_with_worktree(conn, repo, batch_id="partial-oversize-b")
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidates = sorted(
+        (item for item in preview["candidates"]
+         if item["action"] == stale_artifact_cleanup.ACTION_REMOVE_BATCH_WORKTREE
+         and item["safe_to_apply"]),
+        key=lambda item: item["candidate_id"],
+    )
+    assert len(candidates) == 2
+    original_remove = stale_artifact_cleanup._remove_worktree
+    attempts = []
+
+    def remove_once_then_fail(**kwargs):
+        attempts.append(kwargs["path"])
+        if len(attempts) == 2:
+            raise stale_artifact_cleanup.StaleArtifactCleanupError("Z" * 1_000_000)
+        return original_remove(**kwargs)
+
+    monkeypatch.setattr(stale_artifact_cleanup, "_remove_worktree",
+                        remove_once_then_fail)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as err:
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="worktrees",
+            candidate_ids=[item["candidate_id"] for item in candidates],
+            plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
+        )
+    payload = err.value.payload
+    assert payload["error"] == "stale_cleanup_item_error"
+    assert payload["applied_count"] == 1
+    assert payload["applied_candidate_ids"] == [candidates[0]["candidate_id"]]
+    assert payload["writes_performed"] is True
+    assert payload["diagnostic_sha256"].startswith("sha256:")
+    assert all(size <= 224 * 1024 for size in
+               stale_artifact_cleanup.cleanup_response_wire_bytes(payload).values())
+    assert not Path(candidates[0]["path"]).exists()
+    assert Path(candidates[1]["path"]).exists()
 
 
 def test_later_item_active_backlog_drift_stops_further_deletion(tmp_path, monkeypatch):

@@ -21,6 +21,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -4588,6 +4589,19 @@ def _error_response(req_id: Any, code: int, message: str, data: Any = None) -> N
     _write({"jsonrpc": "2.0", "id": req_id, "error": err})
 
 
+def _cleanup_dispatch_error(req_id: Any, code: int, exc: Exception, *, apply: bool) -> None:
+    """Keep cleanup exception frames finite without claiming an unknown write outcome."""
+    diagnostic = str(exc)
+    _error_response(req_id, code, "cleanup_dispatch_error", {
+        "diagnostic_sha256": "sha256:" + hashlib.sha256(
+            diagnostic.encode("utf-8", errors="replace"),
+        ).hexdigest(),
+        "writes_performed": None if apply else False,
+        "write_disposition": "ambiguous" if apply else "not_written",
+        "safe_retry": False,
+    })
+
+
 def _notification(method: str, params: dict) -> None:
     """Send a server-initiated notification (no id field)."""
     _write({"jsonrpc": "2.0", "method": method, "params": params})
@@ -4655,18 +4669,77 @@ def _handle(raw: str) -> None:
     if method == "tools/call":
         tool_name = params.get("name", "")
         tool_args = params.get("arguments") or {}
+        cleanup_tool = tool_name in {
+            "stale_artifact_cleanup", "stale_artifact_cleanup_apply",
+        }
+        if cleanup_tool:
+            encoded_id = json.dumps(
+                req_id, ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            if (type(req_id) not in {str, int}
+                    or len(encoded_id) > 4 * 1024):
+                _error_response(None, INVALID_PARAMS,
+                                "cleanup_request_id_frame_refused", {
+                    "writes_performed": False,
+                    "safe_retry": False,
+                    "request_id_sha256": "sha256:" + hashlib.sha256(
+                        encoded_id,
+                    ).hexdigest(),
+                })
+                return
         try:
             result = _dispatch_tool(tool_name, tool_args)
-            _response(req_id, {
+            mcp_result = {
                 "content": [
                     {"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)},
                 ],
-            })
+            }
+            if cleanup_tool:
+                complete = json.dumps(
+                    {"jsonrpc": "2.0", "id": req_id, "result": mcp_result},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+                if len(complete) > 256 * 1024:
+                    written = result.get("writes_performed") if isinstance(result, dict) else None
+                    refusal = {
+                        "ok": False, "error": "cleanup_response_frame_refused",
+                        "writes_performed": written if type(written) is bool else None,
+                        "write_disposition": (
+                            "written" if written is True else "not_written"
+                            if written is False else "ambiguous"
+                        ),
+                        "safe_retry": False,
+                        "applied_count": result.get("applied_count") if isinstance(result, dict) else None,
+                        "applied_candidate_ids": result.get("applied_candidate_ids", []) if isinstance(result, dict) else [],
+                    }
+                    mcp_result = {"content": [{"type": "text", "text": json.dumps(
+                        refusal, ensure_ascii=False, indent=2,
+                    )}]}
+                    if len(json.dumps({"jsonrpc": "2.0", "id": req_id,
+                                       "result": mcp_result}, ensure_ascii=False,
+                                      separators=(",", ":")).encode("utf-8")) > 256 * 1024:
+                        _error_response(None, INTERNAL_ERROR,
+                                        "cleanup_response_identity_overflow", {
+                            "write_disposition": refusal["write_disposition"],
+                            "writes_performed": refusal["writes_performed"],
+                            "safe_retry": False,
+                            "applied_count": refusal["applied_count"],
+                        })
+                        return
+            _response(req_id, mcp_result)
         except ValueError as exc:
-            _error_response(req_id, METHOD_NOT_FOUND, str(exc))
+            if cleanup_tool:
+                _cleanup_dispatch_error(req_id, METHOD_NOT_FOUND, exc,
+                                        apply=tool_name == "stale_artifact_cleanup_apply")
+            else:
+                _error_response(req_id, METHOD_NOT_FOUND, str(exc))
         except Exception as exc:
             log.exception("Tool dispatch error: %s", tool_name)
-            _error_response(req_id, INTERNAL_ERROR, str(exc))
+            if cleanup_tool:
+                _cleanup_dispatch_error(req_id, INTERNAL_ERROR, exc,
+                                        apply=tool_name == "stale_artifact_cleanup_apply")
+            else:
+                _error_response(req_id, INTERNAL_ERROR, str(exc))
         return
 
     # -----------------------------------------------------------------------

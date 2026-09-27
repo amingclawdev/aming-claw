@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import tracemalloc
+from pathlib import Path
 
 import pytest
 
@@ -4918,6 +4919,36 @@ def test_retention_selector_protects_both_trace_columns_and_candidate_status(con
     assert not {first["snapshot_id"], second["snapshot_id"], candidate["snapshot_id"]} & {
         item["snapshot_id"] for item in selection["candidates"]
     }
+
+
+def test_retention_selector_scan_error_does_not_claim_known_zero(conn, monkeypatch):
+    _ensure_schema(conn)
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id="scan-unreadable", commit_sha="a", snapshot_kind="scope",
+    )
+    conn.execute("UPDATE graph_snapshots SET status='superseded' WHERE project_id=? AND snapshot_id=?",
+                 (PID, snapshot["snapshot_id"]))
+    monkeypatch.setattr(store, "get_snapshot_retention_config",
+                        lambda *_a, **_kw: {"keep_last_n": 0})
+    monkeypatch.setattr(store, "snapshot_retention_reference_state",
+                        lambda *_a: {"protected": {}, "complete": True,
+                                     "refusal_reasons": []})
+    monkeypatch.setattr(store, "_bundle_referenced_snapshot_ids", lambda: set())
+    actual_rglob = Path.rglob
+
+    def fail_selected_scan(path, pattern):
+        if path.name == "scan-unreadable":
+            raise OSError("simulated snapshot scan failure")
+        return actual_rglob(path, pattern)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "rglob", fail_selected_scan)
+        selection = store.select_snapshot_retention_candidates(
+            conn, PID, keep_last_n=0,
+        )
+    selected = next(row for row in selection["candidates"]
+                    if row["snapshot_id"] == "scan-unreadable")
+    assert selected["size_bytes"] is None
 
 
 def test_retention_reference_overflow_fails_closed(conn, tmp_path):

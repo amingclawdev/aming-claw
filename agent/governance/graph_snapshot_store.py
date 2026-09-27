@@ -1442,6 +1442,12 @@ def _snapshot_root(project_id: str, snapshot_id: str) -> Path:
     return _governance_root() / project_id / "graph-snapshots" / snapshot_id
 
 
+def _snapshot_id_is_component(snapshot_id: str) -> bool:
+    """Reject reference strings that could escape the snapshot inventory."""
+    return (bool(snapshot_id) and snapshot_id not in {".", ".."}
+            and not any(char in snapshot_id for char in ("/", "\\", "\x00")))
+
+
 def snapshot_companion_dir(project_id: str, snapshot_id: str) -> Path:
     return _snapshot_root(project_id, snapshot_id)
 
@@ -1949,6 +1955,7 @@ def select_snapshot_retention_candidates(
     *,
     keep_last_n: int | None = None,
     extra_bundle_snapshot_ids: set[str] | None = None,
+    measure_sizes: bool = True,
 ) -> dict[str, Any]:
     """Compute retention selection without performing any deletion.
 
@@ -2086,14 +2093,14 @@ def select_snapshot_retention_candidates(
     protected_list: list[dict[str, Any]] = []
     for sid, reasons in protected_ids.items():
         row = db_by_id.get(sid, {})
-        dir_path = snap_root / sid
+        dir_exists = (snap_root / sid).exists() if _snapshot_id_is_component(sid) else False
         protected_list.append({
             "snapshot_id": sid,
             "reasons": sorted(set(reasons)),
             "snapshot_kind": str(row.get("snapshot_kind") or "unknown"),
             "status": str(row.get("status") or "unknown"),
             "created_at": str(row.get("created_at") or ""),
-            "dir_exists": dir_path.exists(),
+            "dir_exists": dir_exists,
         })
 
     all_ids = (disk_snapshot_ids | set(db_by_id.keys())) - set(protected_ids.keys())
@@ -2102,7 +2109,8 @@ def select_snapshot_retention_candidates(
     now_ts = datetime.now(_tz.utc)
     for sid in sorted(all_ids):
         row = db_by_id.get(sid, {})
-        dir_path = snap_root / sid
+        valid_id = _snapshot_id_is_component(sid)
+        dir_path = snap_root / sid if valid_id else None
         # Compute age
         age_days: float | None = None
         created_at_str = str(row.get("created_at") or "")
@@ -2113,12 +2121,14 @@ def select_snapshot_retention_candidates(
             except (ValueError, OSError):
                 pass
         # Compute size
-        size_bytes = 0
-        if dir_path.exists():
+        size_bytes = None
+        if measure_sizes and dir_path is not None and dir_path.exists():
             try:
                 size_bytes = sum(f.stat().st_size for f in dir_path.rglob("*") if f.is_file())
             except OSError:
-                size_bytes = 0
+                size_bytes = None
+        elif measure_sizes and dir_path is not None:
+            size_bytes = 0
         candidates_list.append({
             "snapshot_id": sid,
             "snapshot_kind": str(row.get("snapshot_kind") or "unknown"),
@@ -2126,7 +2136,7 @@ def select_snapshot_retention_candidates(
             "created_at": created_at_str,
             "age_days": round(age_days, 2) if age_days is not None else None,
             "size_bytes": size_bytes,
-            "dir_exists": dir_path.exists(),
+            "dir_exists": dir_path.exists() if dir_path is not None else False,
             "in_db": sid in db_by_id,
         })
 

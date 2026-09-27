@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import stat
@@ -36,6 +37,255 @@ ALL_DIMENSIONS = {
 PLAN_REVISION = 1
 PREVIEW_LIMIT = 160
 _DESTRUCTIVE_CLEANUP_LOCK = RLock()
+_CLEANUP_HTTP_MAX_BYTES = 224 * 1024
+_CLEANUP_MCP_FRAME_TARGET_BYTES = 224 * 1024
+_CLEANUP_MCP_ID_JSON_MAX_BYTES = 4 * 1024
+_SNAPSHOT_SIZE_MAX_ENTRIES_PER_DIR = 4_096
+_SNAPSHOT_SIZE_MAX_ENTRIES_PER_PREVIEW = 50_000
+
+
+def _open_directory_chain_nofollow(path: Path, flags: int) -> int:
+    """Anchor every absolute path component without traversing a symlink."""
+    absolute = path.absolute()
+    directory_fd = os.open(absolute.anchor, flags)
+    try:
+        for component in absolute.parts[1:]:
+            child_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd
+    except OSError:
+        os.close(directory_fd)
+        raise
+
+
+def _snapshot_directory_size(
+    path: str, *, remaining_entries: list[int],
+) -> tuple[int | None, str]:
+    """Stat a snapshot tree without following links or reading file contents.
+
+    A fixed entry budget makes the same static inventory produce the same
+    estimate; elapsed execution time never enters a candidate or plan hash.
+    This is apparent file bytes per directory entry (hard links count twice),
+    not a claim about physically reclaimable storage.
+    """
+    target = Path(path).absolute()
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        return None, "nofollow_unavailable"
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        parent_fd = _open_directory_chain_nofollow(target.parent, flags)
+    except OSError:
+        return None, "parent_unverified"
+    try:
+        try:
+            root_stat = os.stat(target.name, dir_fd=parent_fd,
+                                follow_symlinks=False)
+        except FileNotFoundError:
+            return 0, "verified_absent"
+        except OSError:
+            return None, "unreadable"
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return None, "path_unverified"
+        try:
+            root_fd = os.open(target.name, flags, dir_fd=parent_fd)
+        except OSError:
+            return None, "path_unverified"
+    finally:
+        os.close(parent_fd)
+    total = 0
+    seen = 0
+    pending: list[int] = []
+    try:
+        pending.append(root_fd)
+        opened_root = os.fstat(root_fd)
+        if ((opened_root.st_dev, opened_root.st_ino)
+                != (root_stat.st_dev, root_stat.st_ino)):
+            return None, "path_changed"
+        while pending:
+            directory_fd = pending.pop()
+            try:
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        seen += 1
+                        remaining_entries[0] -= 1
+                        if (seen > _SNAPSHOT_SIZE_MAX_ENTRIES_PER_DIR
+                                or remaining_entries[0] < 0):
+                            return None, "entry_budget_exceeded"
+                        child = os.stat(entry.name, dir_fd=directory_fd,
+                                        follow_symlinks=False)
+                        if stat.S_ISREG(child.st_mode):
+                            total += child.st_size
+                        elif stat.S_ISDIR(child.st_mode):
+                            child_fd = os.open(entry.name, flags,
+                                               dir_fd=directory_fd)
+                            # Own the descriptor before fstat: a failed fstat
+                            # must still be closed by the common finalizer.
+                            pending.append(child_fd)
+                            opened = os.fstat(child_fd)
+                            if ((opened.st_dev, opened.st_ino)
+                                    != (child.st_dev, child.st_ino)):
+                                return None, "path_changed"
+                        else:
+                            return None, "nonregular_or_symlink_entry"
+            finally:
+                os.close(directory_fd)
+        try:
+            verification_parent_fd = _open_directory_chain_nofollow(
+                target.parent, flags,
+            )
+            try:
+                final_stat = os.stat(target.name, dir_fd=verification_parent_fd,
+                                     follow_symlinks=False)
+            finally:
+                os.close(verification_parent_fd)
+        except OSError:
+            return None, "path_changed"
+        if (not stat.S_ISDIR(final_stat.st_mode)
+                or final_stat.st_dev != root_stat.st_dev
+                or final_stat.st_ino != root_stat.st_ino):
+            return None, "path_changed"
+        return total, "measured"
+    except OSError:
+        return None, "unreadable"
+    finally:
+        for directory_fd in pending:
+            os.close(directory_fd)
+
+
+def cleanup_response_wire_bytes(result: dict[str, Any]) -> dict[str, int]:
+    """Measure the real HTTP and double-encoded MCP cleanup result shapes.
+
+    The managed MCP entry point admits IDs whose JSON encoding is at most
+    4 KiB. A maximal ASCII ID has the same encoded size as any admitted ID;
+    its value cannot reduce the final frame's byte count.
+    """
+
+    # The HTTP handler appends its fixed-width req-<12 hex> identity after the
+    # cleanup handler returns; include that final field in the measurement.
+    http_body = json.dumps({**result, "request_id": "req-" + "x" * 12},
+                           ensure_ascii=False).encode("utf-8")
+    text_body = json.dumps(result, ensure_ascii=False, indent=2)
+    maximal_id = "x" * (_CLEANUP_MCP_ID_JSON_MAX_BYTES - 2)
+    frame = {
+        "jsonrpc": "2.0", "id": maximal_id,
+        "result": {"content": [{"type": "text", "text": text_body}]},
+    }
+    mcp_frame = json.dumps(
+        frame, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    return {"http": len(http_body), "managed_mcp": len(mcp_frame),
+            "standalone_mcp": len(mcp_frame)}
+
+
+def _cleanup_response_fits(result: dict[str, Any]) -> bool:
+    sizes = cleanup_response_wire_bytes(result)
+    return (sizes["http"] <= _CLEANUP_HTTP_MAX_BYTES
+            and sizes["managed_mcp"] <= _CLEANUP_MCP_FRAME_TARGET_BYTES
+            and sizes["standalone_mcp"] <= _CLEANUP_MCP_FRAME_TARGET_BYTES)
+
+
+def _bounded_cleanup_projection(result: dict[str, Any]) -> dict[str, Any]:
+    if _cleanup_response_fits(result):
+        return result
+    retained = result.get("append_only_retained")
+    if isinstance(retained, dict) and (
+        retained.get("graph_query_traces") or retained.get("graph_trace_ids")
+    ):
+        trace_ids = list(retained.get("graph_trace_ids") or [])
+        count = int((result.get("summary") or {}).get(
+            "append_only_graph_trace_count") or len(trace_ids))
+        digest = hashlib.sha256(json.dumps(
+            trace_ids, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        result = {**result, "append_only_retained": {
+            **retained, "graph_query_traces": [], "graph_trace_ids": [],
+            "graph_query_traces_truncated": count > 0,
+            "graph_query_traces_omitted_count": count,
+            "graph_trace_ids_sha256": "sha256:" + digest,
+        }}
+        if _cleanup_response_fits(result):
+            return result
+    # The complete semantic candidates have already been hashed. A protected
+    # graph row is not executable; its path and physical diagnostics are
+    # optional display fields, whereas its exact identity and refusal are not.
+    compacted = 0
+    visible_candidates = []
+    for item in result.get("candidates") or []:
+        if (item.get("artifact_type") == "graph_snapshot_dir"
+                and item.get("safe_to_apply") is False):
+            evidence = item.get("evidence") or {}
+            preserved_evidence = {
+                key: evidence[key] for key in (
+                    "snapshot_kind", "status", "created_at", "age_days",
+                    "size_bytes", "size_bytes_status", "run_id",
+                    "snapshot_id", "commit_sha",
+                ) if key in evidence
+            }
+            visible_candidates.append({
+                key: value for key, value in item.items()
+                if key not in {"path", "evidence", "details"}
+            } | {"evidence": preserved_evidence})
+            compacted += 1
+        else:
+            visible_candidates.append(item)
+    if compacted:
+        result = {**result, "candidates": visible_candidates,
+                  "candidate_diagnostics": {
+                      "graph_unsafe_rows_compacted": compacted,
+                      "path_and_physical_evidence_omitted": True,
+                  }}
+        if _cleanup_response_fits(result):
+            return result
+    refusal = {
+        "ok": False, "error": "cleanup_response_identity_overflow",
+        "mode": "dry_run", "dry_run": True,
+        "dimension": result.get("dimension"),
+        "plan_hash": result.get("plan_hash"),
+        "plan_revision": result.get("plan_revision"),
+        "apply_plan_available": False, "candidates": [],
+        "writes_performed": False, "safe_retry": False,
+    }
+    if not _cleanup_response_fits(refusal):
+        # Even a caller-controlled dimension must not enlarge the refusal.
+        refusal.pop("dimension", None)
+    return refusal
+
+
+def bounded_cleanup_error_payload(
+    payload: dict[str, Any], *, apply: bool,
+) -> dict[str, Any]:
+    """Bound a cleanup refusal while preserving known physical-write facts."""
+    if _cleanup_response_fits(payload):
+        return payload
+    encoded = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    written = payload.get("writes_performed")
+    if type(written) is not bool:
+        written = None if apply else False
+    ids = payload.get("applied_candidate_ids")
+    if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+        ids = []
+    count = payload.get("applied_count")
+    if type(count) is not int or count < 0:
+        count = len(ids) if ids else None
+    refusal = {
+        "ok": False, "error": "cleanup_response_frame_refused",
+        "writes_performed": written,
+        "write_disposition": (
+            "written" if written is True else "not_written"
+            if written is False else "ambiguous"
+        ),
+        "safe_retry": False,
+        "applied_count": count,
+        "applied_candidate_ids": ids,
+        "diagnostic_sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+    if not _cleanup_response_fits(refusal):
+        refusal["applied_candidate_ids_sha256"] = "sha256:" + hashlib.sha256(
+            json.dumps(ids, ensure_ascii=False).encode("utf-8"),
+        ).hexdigest()
+        refusal.pop("applied_candidate_ids")
+    return refusal
 
 TERMINAL_BACKLOG_STATUSES = {
     "ABANDONED",
@@ -433,7 +683,11 @@ def _build_graph_snapshot_candidates(
     from .graph_snapshot_store import select_snapshot_retention_candidates
     from .server import _graph_release_build_fence_state
     try:
-        selection = select_snapshot_retention_candidates(conn, project_id)
+        # The selector's legacy size walk is unbounded and can follow child
+        # symlinks. This preview measures every selected row itself below.
+        selection = select_snapshot_retention_candidates(
+            conn, project_id, measure_sizes=False,
+        )
         fence = _graph_release_build_fence_state(conn, project_id)
     except Exception:  # noqa: BLE001 - preview fails closed without leaking source paths
         return [{
@@ -447,14 +701,20 @@ def _build_graph_snapshot_candidates(
             "evidence": {"error": "retention_selection_unavailable"},
         }]
     candidates: list[dict[str, Any]] = []
+    # One deterministic read budget covers both eligible and protected rows.
+    remaining_size_entries = [_SNAPSHOT_SIZE_MAX_ENTRIES_PER_PREVIEW]
     for item in selection.get("candidates", []):
         sid = str(item.get("snapshot_id") or "")
-        from .graph_snapshot_store import _snapshot_root
-        actual_path = str(_snapshot_root(project_id, sid)) if sid else ""
+        from .graph_snapshot_store import _snapshot_root, _snapshot_id_is_component
+        valid_id = _snapshot_id_is_component(sid)
+        actual_path = str(_snapshot_root(project_id, sid)) if valid_id else ""
         exists = bool(item.get("dir_exists"))
         status = str(item.get("status") or "")
         identity = _path_identity(actual_path)
-        safe = bool(exists and sid and item.get("in_db")
+        size_bytes, size_status = _snapshot_directory_size(
+            actual_path, remaining_entries=remaining_size_entries,
+        ) if valid_id else (None, "snapshot_id_path_invalid")
+        safe = bool(exists and valid_id and item.get("in_db")
                     and status == "superseded"
                     and selection.get("reference_authority_complete") is True
                     and fence.get("clear") is True
@@ -464,6 +724,8 @@ def _build_graph_snapshot_candidates(
             refusal_reasons.append("snapshot_dir_missing")
         if not sid:
             refusal_reasons.append("snapshot_id_empty")
+        elif not valid_id:
+            refusal_reasons.append("snapshot_id_path_invalid")
         if not item.get("in_db") or status != "superseded":
             refusal_reasons.append("snapshot_ownership_or_status_unverified")
         if selection.get("reference_authority_complete") is not True:
@@ -485,18 +747,29 @@ def _build_graph_snapshot_candidates(
                 "status": str(item.get("status") or ""),
                 "created_at": str(item.get("created_at") or ""),
                 "age_days": item.get("age_days"),
-                "size_bytes": int(item.get("size_bytes") or 0),
+                "size_bytes": size_bytes,
+                "size_bytes_status": size_status,
                 "in_db": bool(item.get("in_db")),
                 "exists": exists,
                 "path_identity": identity,
                 "append_only_evidence_retained": True,
             },
         })
-    # Also surface protected as refusals (informational)
-    for item in selection.get("protected", []):
+    # Also surface protected as refusals (informational). Read-only estimates
+    # use one deterministic entry budget for the complete graph preview.
+    for item in sorted(selection.get("protected", []),
+                       key=lambda row: str(row.get("snapshot_id") or "")):
         sid = str(item.get("snapshot_id") or "")
-        from .graph_snapshot_store import _snapshot_root
-        actual_path = str(_snapshot_root(project_id, sid)) if sid else ""
+        from .graph_snapshot_store import _snapshot_root, _snapshot_id_is_component
+        valid_id = _snapshot_id_is_component(sid)
+        actual_path = str(_snapshot_root(project_id, sid)) if valid_id else ""
+        size_bytes, size_status = _snapshot_directory_size(
+            actual_path, remaining_entries=remaining_size_entries,
+        ) if valid_id else (None, "snapshot_id_path_invalid")
+        protection_reasons = [f"protected:{r}" for r in
+                              (item.get("reasons") or ["protected"])]
+        if not valid_id:
+            protection_reasons.append("snapshot_id_path_invalid")
         candidates.append({
             "candidate_id": _candidate_id("graph_snapshot_protected", sid),
             "artifact_type": "graph_snapshot_dir",
@@ -504,11 +777,13 @@ def _build_graph_snapshot_candidates(
             "snapshot_id": sid,
             "path": actual_path,
             "safe_to_apply": False,
-            "refusal_reasons": [f"protected:{r}" for r in (item.get("reasons") or ["protected"])],
+            "refusal_reasons": protection_reasons,
             "evidence": {
                 "snapshot_kind": str(item.get("snapshot_kind") or ""),
                 "status": str(item.get("status") or ""),
                 "created_at": str(item.get("created_at") or ""),
+                "size_bytes": size_bytes,
+                "size_bytes_status": size_status,
                 "protected": True,
                 "exists": bool(item.get("dir_exists")),
                 "path_identity": _path_identity(actual_path),
@@ -518,6 +793,18 @@ def _build_graph_snapshot_candidates(
     return candidates
 
 
+def _candidate_size_totals(items: list[dict[str, Any]]) -> tuple[int, int]:
+    known = 0
+    unknown = 0
+    for item in items:
+        size = (item.get("evidence") or {}).get("size_bytes")
+        if type(size) is int and size >= 0:
+            known += size
+        else:
+            unknown += 1
+    return known, unknown
+
+
 def build_stale_artifact_cleanup_projection(
     conn: sqlite3.Connection,
     project_id: str,
@@ -525,6 +812,7 @@ def build_stale_artifact_cleanup_projection(
     repo_root_path: str | Path,
     include_unowned: bool = True,
     dimension: str = "",
+    response_budget: bool = True,
 ) -> dict[str, Any]:
     """Return a dry-run projection; no artifacts or append-only evidence are deleted.
 
@@ -534,7 +822,7 @@ def build_stale_artifact_cleanup_projection(
     dim = _dimension(dimension)
     if dim in {DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE}:
         derived, truncated, total, total_bytes = _derived_preview(project_id, dim)
-        return {
+        result = {
             "ok": True, "mode": "dry_run", "dry_run": True,
             "project_id": project_id, "dimension": dim,
             "plan_revision": PLAN_REVISION,
@@ -551,14 +839,14 @@ def build_stale_artifact_cleanup_projection(
             "append_only_retained": {"policy": "retain_append_only_evidence", "deleted": False},
             "cleanup": cleanup_recommendation(project_id),
         }
+        return _bounded_cleanup_projection(result) if response_budget else result
     if dim == DIMENSION_GRAPH_SNAPSHOTS:
         graph_items = _build_graph_snapshot_candidates(conn, project_id)
         total = len(graph_items)
         visible = graph_items[:PREVIEW_LIMIT]
         safe = sum(item.get("safe_to_apply") is True for item in graph_items)
-        total_bytes = sum(int((item.get("evidence") or {}).get("size_bytes") or 0)
-                          for item in graph_items)
-        return {
+        total_bytes, unknown_sizes = _candidate_size_totals(graph_items)
+        result = {
             "ok": True, "mode": "dry_run", "dry_run": True,
             "project_id": project_id, "dimension": dim,
             "plan_revision": PLAN_REVISION,
@@ -569,16 +857,24 @@ def build_stale_artifact_cleanup_projection(
                         "unsafe_candidate_count": total - safe,
                         "graph_snapshot_count": len(visible),
                         "graph_snapshot_safe_count": safe,
-                        "size_bytes": total_bytes,
+                        "size_bytes": total_bytes if not unknown_sizes else None,
+                        "known_size_bytes": total_bytes,
+                        "unknown_size_count": unknown_sizes,
+                        "size_bytes_complete": unknown_sizes == 0,
                         "truncated": total > PREVIEW_LIMIT,
                         "dimensions": {dim: {"count": total, "visible_count": len(visible),
-                                             "safe_count": safe, "size_bytes": total_bytes,
+                                             "safe_count": safe,
+                                             "size_bytes": total_bytes if not unknown_sizes else None,
+                                             "known_size_bytes": total_bytes,
+                                             "unknown_size_count": unknown_sizes,
+                                             "size_bytes_complete": unknown_sizes == 0,
                                              "refused_count": total - safe,
                                              "truncated": total > PREVIEW_LIMIT}}},
             "candidates": visible,
             "append_only_retained": {"policy": "retain_append_only_evidence", "deleted": False},
             "cleanup": cleanup_recommendation(project_id),
         }
+        return _bounded_cleanup_projection(result) if response_budget else result
 
     root = batch_jobs.repo_root(repo_root_path)
     stale_report = batch_jobs.report_stale_worktrees(conn, project_id, repo_root_path=root)
@@ -756,8 +1052,7 @@ def build_stale_artifact_cleanup_projection(
         for key, (count, _bytes) in derived_counts.items()
     )
     truncated = derived_truncated or total_candidates > PREVIEW_LIMIT
-    total_bytes = sum(int((item.get("evidence") or {}).get("size_bytes") or 0)
-                      for item in all_candidates)
+    total_bytes, unknown_sizes = _candidate_size_totals(all_candidates)
     total_bytes += sum(max(0, byte_count - sum(
         int((item.get("evidence") or {}).get("size_bytes") or 0)
         for item in all_candidates if item.get("artifact_type") == key))
@@ -773,13 +1068,17 @@ def build_stale_artifact_cleanup_projection(
                 DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE):
         members = [item for item in all_candidates if in_dimension(item, key)]
         count = derived_counts[key][0] if key in derived_counts else len(members)
-        byte_count = derived_counts[key][1] if key in derived_counts else sum(
-            int((item.get("evidence") or {}).get("size_bytes") or 0) for item in members)
+        known_member_bytes, unknown_member_sizes = _candidate_size_totals(members)
+        byte_count = derived_counts[key][1] if key in derived_counts else known_member_bytes
         safe_count = sum(item.get("safe_to_apply") is True for item in members)
         dimension_summary[key] = {
             "count": count, "visible_count": min(len(members), PREVIEW_LIMIT),
             "safe_count": safe_count, "refused_count": count - safe_count,
-            "size_bytes": byte_count, "truncated": truncated,
+            "size_bytes": byte_count if not unknown_member_sizes else None,
+            "known_size_bytes": byte_count,
+            "unknown_size_count": unknown_member_sizes,
+            "size_bytes_complete": unknown_member_sizes == 0,
+            "truncated": truncated,
         }
     all_candidates = all_candidates[:PREVIEW_LIMIT]
     for key, values in dimension_summary.items():
@@ -788,7 +1087,7 @@ def build_stale_artifact_cleanup_projection(
 
     safe_count = sum(value["safe_count"] for value in dimension_summary.values())
     unsafe_count = sum(value["refused_count"] for value in dimension_summary.values())
-    return {
+    result = {
         "ok": True,
         "mode": "dry_run",
         "dry_run": True,
@@ -801,7 +1100,10 @@ def build_stale_artifact_cleanup_projection(
             "candidate_count": len(all_candidates),
             "total_candidate_count": total_candidates,
             "truncated": truncated,
-            "size_bytes": total_bytes,
+            "size_bytes": total_bytes if not unknown_sizes else None,
+            "known_size_bytes": total_bytes,
+            "unknown_size_count": unknown_sizes,
+            "size_bytes_complete": unknown_sizes == 0,
             "dimensions": dimension_summary,
             "safe_apply_count": safe_count,
             "unsafe_candidate_count": unsafe_count,
@@ -829,6 +1131,7 @@ def build_stale_artifact_cleanup_projection(
         },
         "cleanup": cleanup_recommendation(project_id),
     }
+    return _bounded_cleanup_projection(result) if response_budget else result
 
 
 def _append_task_cleanup_history(
@@ -958,6 +1261,7 @@ def _apply_stale_artifact_cleanup_locked(
         repo_root_path=repo_root_path,
         include_unowned=True,
         dimension=dim,
+        response_budget=False,
     )
     if (type(plan_revision) is not int or plan_revision != PLAN_REVISION
             or plan_hash != projection["plan_hash"]
@@ -993,12 +1297,63 @@ def _apply_stale_artifact_cleanup_locked(
     root = batch_jobs.repo_root(repo_root_path)
     cleanup_id = f"stale-cleanup-{uuid.uuid4().hex[:12]}"
     applied: list[dict[str, Any]] = []
+    public_applied = [
+        {"candidate_id": candidate_id, "action": by_id[candidate_id]["action"]}
+        for candidate_id in sorted(requested)
+    ]
+    public_retained = dict(projection.get("append_only_retained") or {})
+
+    def public_result_template(retained: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ok": True, "mode": "apply", "dry_run": False,
+            "project_id": project_id, "cleanup_id": cleanup_id,
+            "applied_count": len(public_applied),
+            "applied_candidate_ids": sorted(requested),
+            "applied": public_applied,
+            "timeline_event": {"id": 99999999999999999999},
+            "append_only_retained": retained,
+        }
+
+    if not _cleanup_response_fits(public_result_template(public_retained)):
+        trace_ids = list(public_retained.get("graph_trace_ids") or [])
+        count = int(projection["summary"].get("append_only_graph_trace_count")
+                    or len(trace_ids))
+        public_retained.update({
+            "graph_query_traces": [], "graph_trace_ids": [],
+            "graph_query_traces_truncated": count > 0,
+            "graph_query_traces_omitted_count": count,
+            "graph_trace_ids_sha256": "sha256:" + hashlib.sha256(
+                json.dumps(trace_ids, ensure_ascii=False,
+                           separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        })
+    partial_template = {
+        "ok": False, "error": "e" * 80,
+        "cleanup_id": cleanup_id,
+        "applied_count": len(public_applied),
+        "applied_candidate_ids": sorted(requested),
+        "diagnostic_sha256": "sha256:" + "0" * 64,
+        "transactional_limit": "earlier physical removals cannot be rolled back",
+        "writes_performed": True,
+    }
+    if (not _cleanup_response_fits(public_result_template(public_retained))
+            or not _cleanup_response_fits(partial_template)):
+        raise StaleArtifactCleanupError("cleanup_response_identity_overflow", {
+            "ok": False, "error": "cleanup_response_identity_overflow",
+            "apply_plan_available": False, "writes_performed": False,
+            "safe_retry": False,
+        })
 
     def partial_refusal(error: str) -> StaleArtifactCleanupError:
-        payload = {"ok": False, "error": error, "cleanup_id": cleanup_id,
+        code = (error if len(error) <= 80 and error.replace("_", "").isalnum()
+                else "stale_cleanup_item_error")
+        payload = {"ok": False, "error": code, "cleanup_id": cleanup_id,
                    "applied_count": len(applied),
                    "applied_candidate_ids": [item["candidate_id"] for item in applied],
-                   "requested_actor": actor,
+                   "diagnostic_sha256": "sha256:" + hashlib.sha256(
+                       error.encode("utf-8", errors="replace")
+                   ).hexdigest(),
+                   "writes_performed": bool(applied),
                    "transactional_limit": "earlier physical removals cannot be rolled back"}
         if applied:
             task_timeline.record_event(
@@ -1008,7 +1363,7 @@ def _apply_stale_artifact_cleanup_locked(
                 actor="system", status="partial", payload=payload,
             )
             conn.commit()
-        return StaleArtifactCleanupError(error, payload)
+        return StaleArtifactCleanupError(code, payload)
 
     task_rows = _fetch_batch_task_rows(conn, project_id)
     task_meta_by_id = {str(row.get("task_id") or ""): row.get("metadata") or {} for row in task_rows}
@@ -1017,7 +1372,7 @@ def _apply_stale_artifact_cleanup_locked(
         candidate = by_id[candidate_id]
         fresh = build_stale_artifact_cleanup_projection(
             conn, project_id, repo_root_path=repo_root_path,
-            include_unowned=True, dimension=dim,
+            include_unowned=True, dimension=dim, response_budget=False,
         )
         fresh_item = next((item for item in fresh["candidates"]
                            if item["candidate_id"] == candidate_id), None)
@@ -1104,9 +1459,10 @@ def _apply_stale_artifact_cleanup_locked(
         "project_id": project_id,
         "cleanup_id": cleanup_id,
         "applied_count": len(applied),
-        "applied": applied,
-        "timeline_event": timeline_event,
-        "append_only_retained": projection.get("append_only_retained", {}),
+        "applied_candidate_ids": [item["candidate_id"] for item in applied],
+        "applied": public_applied,
+        "timeline_event": {"id": timeline_event["id"]},
+        "append_only_retained": public_retained,
     }
 
 

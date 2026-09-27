@@ -113,6 +113,7 @@ def _resource_path_candidates(spec: ResourcePathSpec) -> tuple[str, ...]:
 # JSON-RPC error codes
 PARSE_ERROR = -32700
 METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 MCP_RESPONSE_FRAME_MAX_BYTES = 256 * 1024
 MCP_WORKER_GUIDE_FRAME_TARGET_BYTES = 48 * 1024
@@ -997,6 +998,22 @@ class AmingClawMCP:
         if method == "tools/call":
             tool_name = params.get("name", "")
             tool_args = params.get("arguments") or {}
+            if tool_name in {"stale_artifact_cleanup", "stale_artifact_cleanup_apply"}:
+                encoded_id = json.dumps(
+                    req_id, ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+                if (type(req_id) not in {str, int}
+                        or len(encoded_id) > 4 * 1024):
+                    _error_response(None, INVALID_PARAMS,
+                                    "cleanup_request_id_frame_refused", {
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                        "safe_retry": False,
+                        "request_id_sha256": "sha256:" + hashlib.sha256(
+                            encoded_id,
+                        ).hexdigest(),
+                    })
+                    return
             try:
                 result = self._dispatch_tool_call(tool_name, tool_args)
                 compact_worker_guide = tool_name == "runtime_context_worker_guide"

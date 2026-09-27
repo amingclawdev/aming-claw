@@ -90152,15 +90152,32 @@ def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.dry-run")
         try:
-            return stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+            result = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
                 conn,
                 project_id,
                 repo_root_path=root,
                 include_unowned=_query_bool(ctx.query, "include_unowned", True),
                 dimension=str(ctx.query.get("dimension") or ""),
             )
+            if (stale_artifact_cleanup.cleanup_response_wire_bytes(result)["http"]
+                    > stale_artifact_cleanup._CLEANUP_HTTP_MAX_BYTES):
+                return 400, {
+                    "ok": False, "error": "cleanup_response_encoding_refused",
+                    "apply_plan_available": False, "writes_performed": False,
+                }
+            return result
         except stale_artifact_cleanup.StaleArtifactCleanupError as exc:
-            return 400, exc.payload
+            return 400, stale_artifact_cleanup.bounded_cleanup_error_payload(
+                exc.payload, apply=False,
+            )
+        except Exception as exc:
+            return 500, stale_artifact_cleanup.bounded_cleanup_error_payload({
+                "ok": False, "error": "cleanup_preview_error",
+                "diagnostic_sha256": "sha256:" + hashlib.sha256(
+                    str(exc).encode("utf-8", errors="replace"),
+                ).hexdigest(),
+                "writes_performed": False,
+            }, apply=False)
     finally:
         conn.close()
 
@@ -90176,7 +90193,7 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.apply")
         try:
-            return stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            result = stale_artifact_cleanup.apply_stale_artifact_cleanup(
                 conn,
                 project_id,
                 repo_root_path=root,
@@ -90190,8 +90207,32 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
                 plan_hash=str(ctx.body.get("plan_hash") or ""),
                 plan_revision=ctx.body.get("plan_revision"),
             )
+            if (stale_artifact_cleanup.cleanup_response_wire_bytes(result)["http"]
+                    > stale_artifact_cleanup._CLEANUP_HTTP_MAX_BYTES):
+                return 500, stale_artifact_cleanup.bounded_cleanup_error_payload({
+                    "ok": False, "error": "cleanup_postwrite_response_frame_refused",
+                    "writes_performed": bool(result.get("applied_count")),
+                    "write_disposition": (
+                        "written" if result.get("applied_count") else "not_written"
+                    ),
+                    "applied_count": result.get("applied_count"),
+                    "applied_candidate_ids": result.get("applied_candidate_ids", []),
+                    "safe_retry": False,
+                }, apply=True)
+            return result
         except stale_artifact_cleanup.StaleArtifactCleanupError as exc:
-            return 400, exc.payload
+            return 400, stale_artifact_cleanup.bounded_cleanup_error_payload(
+                exc.payload, apply=True,
+            )
+        except Exception as exc:
+            return 500, stale_artifact_cleanup.bounded_cleanup_error_payload({
+                "ok": False, "error": "cleanup_apply_error",
+                "diagnostic_sha256": "sha256:" + hashlib.sha256(
+                    str(exc).encode("utf-8", errors="replace"),
+                ).hexdigest(),
+                "writes_performed": None,
+                "write_disposition": "ambiguous", "safe_retry": False,
+            }, apply=True)
     finally:
         conn.close()
 

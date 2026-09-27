@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -30,6 +31,57 @@ from agent.mcp.tools import ToolDispatcher
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("request_id", [
+    "x" * 1_000_000,
+    ("雪\\\"\n") * 200_000,
+], ids=["ascii-million", "unicode-escaped-million"])
+@pytest.mark.parametrize("tool_name", [
+    "stale_artifact_cleanup", "stale_artifact_cleanup_apply",
+])
+def test_managed_cleanup_apply_rejects_oversized_id_before_dispatch(
+    monkeypatch, request_id, tool_name,
+):
+    mcp = object.__new__(AmingClawMCP)
+    calls = []
+    monkeypatch.setattr(mcp, "_dispatch_tool_call",
+                        lambda *args: calls.append(args))
+    output = io.StringIO()
+    monkeypatch.setattr(plugin_mcp_server.sys, "stdout", output)
+    mcp._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": tool_name,
+                   "arguments": {"project_id": "aming-claw"}},
+    }, ensure_ascii=False))
+    frame = output.getvalue().encode("utf-8")
+    response = json.loads(frame)
+    assert calls == []
+    assert len(frame) < plugin_mcp_server.MCP_RESPONSE_FRAME_MAX_BYTES
+    assert response["id"] is None
+    assert response["error"]["message"] == "cleanup_request_id_frame_refused"
+    assert response["error"]["data"]["writes_performed"] is False
+    assert request_id[:100] not in output.getvalue()
+
+
+def test_managed_cleanup_apply_preserves_ordinary_id_and_dispatch(monkeypatch):
+    mcp = object.__new__(AmingClawMCP)
+    calls = []
+    monkeypatch.setattr(mcp, "_dispatch_tool_call",
+                        lambda name, args: calls.append((name, args)) or {
+                            "ok": True, "writes_performed": False,
+                        })
+    output = io.StringIO()
+    monkeypatch.setattr(plugin_mcp_server.sys, "stdout", output)
+    mcp._handle(json.dumps({
+        "jsonrpc": "2.0", "id": "req-cleanup-ordinary", "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup_apply",
+                   "arguments": {"project_id": "aming-claw"}},
+    }))
+    response = json.loads(output.getvalue())
+    assert calls == [("stale_artifact_cleanup_apply", {"project_id": "aming-claw"})]
+    assert response["id"] == "req-cleanup-ordinary"
+    assert json.loads(response["result"]["content"][0]["text"])["ok"] is True
 
 
 def test_stdio_parallel_allocate_stages_auth_and_never_serializes_nested_raw():
