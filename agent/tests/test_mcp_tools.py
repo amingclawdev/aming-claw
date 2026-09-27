@@ -3,13 +3,17 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from threading import Event, Thread
 from types import SimpleNamespace
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from agent.governance import mcp_server as governance_mcp_server
 from agent.governance import stale_artifact_cleanup
+from agent.governance import server as governance_server
 from agent.mcp import server as plugin_mcp_server
 from agent.mcp import tools as mcp_tools
 from agent.mcp.schema_contract import (
@@ -8571,6 +8575,77 @@ def test_cleanup_dimensions_match_both_mcp_dispatchers_and_reject_unknown(monkey
     })
     assert calls == [("GET", "/api/graph-governance/aming-claw/stale-artifact-cleanup?dimension=graph_snapshots", None,
                       {"timeout_seconds": 45})]
+
+
+@pytest.mark.parametrize("surface", ["managed", "standalone"])
+def test_existing_cleanup_mcp_surface_reaches_archive_first_positive(
+    tmp_path, monkeypatch, surface,
+):
+    from agent.tests.test_stale_artifact_cleanup import (
+        _conn, _git_repo, _merged_batch_with_worktree,
+    )
+
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    _created, strategy = _merged_batch_with_worktree(
+        conn, repo, project_id="aming-claw", batch_id="mcp-" + surface,
+    )
+    archive_root = tmp_path / "archive-volume"
+    archive_root.mkdir()
+    monkeypatch.setenv(stale_artifact_cleanup.ARCHIVE_ROOT_ENV, str(archive_root))
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount", lambda path: Path(path) == archive_root or real_ismount(path))
+
+    class NoClose:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(governance_server, "get_connection", lambda _pid: NoClose())
+    monkeypatch.setattr(governance_server, "_graph_governance_project_root", lambda *_a, **_kw: repo)
+    monkeypatch.setattr(governance_server, "_require_graph_governance_operator",
+                        lambda *_a, **_kw: {"role": "observer"})
+
+    def http(method, path, body=None, **_kw):
+        parsed = urlsplit(path)
+        query = {key: value[0] for key, value in parse_qs(parsed.query).items()}
+        context = governance_server.RequestContext(
+            None, method, {"project_id": "aming-claw"}, query, body or {},
+            "req-fixture", "", "",
+        )
+        if method == "GET":
+            result = governance_server.handle_graph_governance_stale_artifact_cleanup(context)
+        else:
+            result = governance_server.handle_graph_governance_stale_artifact_cleanup_apply(context)
+        return result[1] if isinstance(result, tuple) else result
+
+    if surface == "managed":
+        dispatcher = _dispatcher(_Recorder())
+        monkeypatch.setattr(dispatcher, "_governance_api_with_timeout", http)
+        call = dispatcher.dispatch
+    else:
+        monkeypatch.setattr(governance_mcp_server, "_http", http)
+        call = governance_mcp_server._dispatch_tool
+    preview = call("stale_artifact_cleanup", {
+        "project_id": "aming-claw", "dimension": "worktrees",
+    })
+    candidate = next(item for item in preview["candidates"]
+                     if item["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is True, candidate["refusal_reasons"]
+    assert Path(strategy.worktree_path).exists()
+    result = call("stale_artifact_cleanup_apply", {
+        "project_id": "aming-claw", "dimension": "worktrees",
+        "candidate_ids": [candidate["candidate_id"]],
+        "plan_hash": preview["plan_hash"],
+        "plan_revision": preview["plan_revision"],
+    })
+    assert result["state"] == "pruned", result
+    assert result["archive"]["restore_proof"]["verified"] is True
+    assert not Path(strategy.worktree_path).exists()
+    assert all(size <= 224 * 1024 for size in
+               stale_artifact_cleanup.cleanup_response_wire_bytes(result).values())
 
 
 def test_cleanup_transport_timeout_is_scoped_and_apply_truth_is_ambiguous(monkeypatch):

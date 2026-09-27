@@ -1005,3 +1005,54 @@ def report_stale_worktrees(
         if resolved not in active_paths:
             stale.append(str(child))
     return {"stale_count": len(stale), "stale_worktrees": stale}
+
+
+def merged_worktree_git_identity(
+    repo_root_path: str | Path, worktree_path: str | Path,
+    *, work_branch: str, target_branch: str,
+) -> dict[str, Any]:
+    """Read an exact registered worktree and its merge ancestry; fail closed.
+
+    This is only Git evidence. Callers must separately prove governance
+    ownership, reference freedom, clean files and archive restoreability.
+    """
+    root = repo_root(repo_root_path)
+    path = ensure_worktree_path_safe(root, worktree_path)
+    result: dict[str, Any] = {"verified": False, "reason": "git_identity_unknown"}
+    if not work_branch or not target_branch or path.is_symlink():
+        return result
+    try:
+        raw = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain", "-z"],
+            capture_output=True, timeout=30, check=True,
+        ).stdout.decode("utf-8", errors="strict")
+        records = raw.strip("\0").split("\0\0")
+        matches = []
+        for record in records:
+            fields = record.split("\0")
+            if fields and fields[0] == f"worktree {path}":
+                matches.append(fields)
+        if len(matches) != 1 or f"branch refs/heads/{work_branch}" not in matches[0]:
+            return {**result, "reason": "worktree_registration_or_branch_mismatch"}
+        head = _git_output(["rev-parse", "HEAD"], cwd=path).strip()
+        branch_head = _git_output(["rev-parse", f"refs/heads/{work_branch}"], cwd=root).strip()
+        target_head = _git_output(["rev-parse", f"refs/heads/{target_branch}"], cwd=root).strip()
+        tree = _git_output(["rev-parse", "HEAD^{tree}"], cwd=path).strip()
+        if head != branch_head or not all(len(value) == 40 for value in (head, target_head, tree)):
+            return {**result, "reason": "branch_head_or_object_unknown"}
+        ancestor = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", head, target_head],
+            capture_output=True, timeout=30, check=False,
+        )
+        if ancestor.returncode != 0:
+            return {**result, "reason": "merge_target_ancestry_unverified"}
+        common = _git_output(["rev-parse", "--git-common-dir"], cwd=path).strip()
+        common_path = (path / common).resolve(strict=True)
+        root_common = (root / _git_output(["rev-parse", "--git-common-dir"], cwd=root).strip()).resolve(strict=True)
+        if common_path != root_common:
+            return {**result, "reason": "git_common_dir_mismatch"}
+        return {"verified": True, "reason": "", "head": head, "tree": tree,
+                "branch": work_branch, "target_branch": target_branch,
+                "target_head": target_head, "git_common_dir": str(root_common)}
+    except (OSError, UnicodeError, subprocess.SubprocessError, ValueError):
+        return result

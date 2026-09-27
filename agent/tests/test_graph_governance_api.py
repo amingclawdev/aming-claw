@@ -103960,8 +103960,21 @@ def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_pat
     batch_jobs.create_worktree(strategy, repo_root_path=repo)
     import shutil
     shutil.rmtree(Path(strategy.worktree_path) / ".aming-claw", ignore_errors=True)
-    batch_jobs.record_task_batch_state(conn, created["task_id"], "abandoned")
+    worktree = Path(strategy.worktree_path)
+    (worktree / "archive.txt").write_text("api archive proof\n", encoding="utf-8")
+    subprocess.run(["git", "add", "archive.txt"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "api archive fixture"], cwd=worktree,
+                   check=True, capture_output=True)
+    subprocess.run(["git", "merge", "--no-ff", "-m", "merge api fixture",
+                    strategy.work_branch], cwd=repo, check=True, capture_output=True)
+    batch_jobs.record_task_batch_state(conn, created["task_id"], "merged")
     conn.commit()
+    archive_root = tmp_path / "archive-volume"
+    archive_root.mkdir()
+    monkeypatch.setenv(stale_artifact_cleanup.ARCHIVE_ROOT_ENV, str(archive_root))
+    import os
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount", lambda path: Path(path) == archive_root or real_ismount(path))
 
     dry_run = server.handle_graph_governance_stale_artifact_cleanup(_ctx({"project_id": PID}))
     rejected_dimension = server.handle_graph_governance_stale_artifact_cleanup(
@@ -103996,6 +104009,8 @@ def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_pat
 
     assert applied["ok"] is True
     assert applied["applied_count"] == 1
+    assert applied["state"] == "pruned"
+    assert applied["archive"]["restore_proof"]["verified"] is True
     assert not (repo / ".worktrees" / "batch-cleanup-api").exists()
 
 

@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +37,8 @@ ALL_DIMENSIONS = {
     DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE, DIMENSION_ALL,
 }
 PLAN_REVISION = 1
+ARCHIVE_PLAN_REVISION = 1
+ARCHIVE_ROOT_ENV = "AMING_CLAW_WORKTREE_ARCHIVE_ROOT"
 PREVIEW_LIMIT = 160
 _DESTRUCTIVE_CLEANUP_LOCK = RLock()
 _CLEANUP_HTTP_MAX_BYTES = 224 * 1024
@@ -816,6 +820,7 @@ def build_stale_artifact_cleanup_projection(
     include_unowned: bool = True,
     dimension: str = "",
     response_budget: bool = True,
+    archive_enrichment: bool = True,
 ) -> dict[str, Any]:
     """Return a dry-run projection; no artifacts or append-only evidence are deleted.
 
@@ -882,6 +887,18 @@ def build_stale_artifact_cleanup_projection(
     root = batch_jobs.repo_root(repo_root_path)
     stale_report = batch_jobs.report_stale_worktrees(conn, project_id, repo_root_path=root)
     stale_paths = {_resolve_path(path) for path in stale_report.get("stale_worktrees", [])}
+    preview_paths = set(stale_paths)
+    if archive_enrichment:
+        # Registered active checkouts are protection facts too. Include them
+        # as refused candidates instead of silently omitting them from the
+        # worktree preview.
+        try:
+            preview_paths.update(
+                path for path in _registered_worktree_paths(root)
+                if _path_under_worktrees(root, path)
+            )
+        except StaleArtifactCleanupError:
+            pass
     task_rows = _fetch_batch_task_rows(conn, project_id)
     backlog_rows = _fetch_backlog_rows(conn)
 
@@ -904,18 +921,21 @@ def build_stale_artifact_cleanup_projection(
             active_backlog_refs_by_path.setdefault(path, []).append(row)
 
     candidates: list[dict[str, Any]] = []
-    for path in sorted(stale_paths):
+    for path in sorted(preview_paths):
         terminal_rows = terminal_tasks_by_path.get(path, [])
         active_rows = active_tasks_by_path.get(path, [])
         active_backlog_rows = active_backlog_refs_by_path.get(path, [])
         path_safe = _path_under_worktrees(root, path)
         identity = _path_identity(path)
         clean_worktree = _worktree_clean(path) if path_safe and identity else False
-        safe = bool(
+        legacy_safe = bool(
             path_safe and identity and clean_worktree and terminal_rows
             and len(terminal_rows) <= PREVIEW_LIMIT
             and not active_rows and not active_backlog_rows
         )
+        # Stage A could delete a clean terminal worktree without merge or
+        # restore proof. Its public apply must no longer be a bypass.
+        safe = False
         refusal_reasons = []
         if not path_safe:
             refusal_reasons.append("path_outside_worktrees")
@@ -931,6 +951,8 @@ def build_stale_artifact_cleanup_projection(
             refusal_reasons.append("missing_terminal_batch_task_evidence")
         if len(terminal_rows) > PREVIEW_LIMIT:
             refusal_reasons.append("terminal_task_reference_window_unbounded")
+        if legacy_safe:
+            refusal_reasons.append("archive_and_restore_proof_required")
         active_backlog_evidence = [
             {
                 "backlog_id": str(item.get("bug_id") or ""),
@@ -953,10 +975,10 @@ def build_stale_artifact_cleanup_projection(
                     "active_backlog_reference_count": len(active_backlog_rows),
                     "blocked_by_active_backlog_reference": bool(active_backlog_rows),
                     "operator_note": (
-                        "Worktree removal is blocked while any active/non-terminal "
-                        "backlog row still references the same path."
-                        if active_backlog_rows
-                        else ""
+                        "An active backlog still references this path."
+                        if active_backlog_rows else
+                        "Configure an external archive volume and resolve every "
+                        "listed protection reason before requesting guarded cleanup."
                     ),
                 },
                 "evidence": {
@@ -980,6 +1002,14 @@ def build_stale_artifact_cleanup_projection(
                     "append_only_evidence_retained": True,
                 },
             })
+
+    if archive_enrichment:
+        archive = _archive_root_descriptor()
+        candidates = [
+            _archive_candidate(conn, project_id, root, item, archive)
+            if item.get("artifact_type") == "batch_worktree" else item
+            for item in candidates
+        ]
 
     terminal_backlog_ids: set[str] = set()
     for row in backlog_rows:
@@ -1266,6 +1296,12 @@ def _apply_stale_artifact_cleanup_locked(
         dimension=dim,
         response_budget=False,
     )
+    if _bounded_cleanup_projection(dict(projection)).get("apply_plan_available") is False:
+        raise StaleArtifactCleanupError("cleanup_response_identity_overflow", {
+            "ok": False, "error": "cleanup_response_identity_overflow",
+            "apply_plan_available": False, "writes_performed": False,
+            "safe_retry": False,
+        })
     if (type(plan_revision) is not int or plan_revision != PLAN_REVISION
             or plan_hash != projection["plan_hash"]
             or projection["summary"].get("truncated")):
@@ -1296,6 +1332,53 @@ def _apply_stale_artifact_cleanup_locked(
             "plan_hash": projection["plan_hash"],
         }
         raise StaleArtifactCleanupError("unsafe_stale_artifact_cleanup_refused", payload)
+
+    archive_items = [by_id[item] for item in requested
+                     if by_id[item].get("artifact_type") == "batch_worktree"]
+    if archive_items:
+        if len(requested) != 1 or len(archive_items) != 1 or remove_branch:
+            raise StaleArtifactCleanupError("single_archive_candidate_required", {
+                "ok": False, "error": "single_archive_candidate_required",
+                "writes_performed": False,
+                "next_step": "Select one merged worktree and keep its branch for recovery.",
+            })
+        candidate_id = str(archive_items[0]["candidate_id"])
+        try:
+            published = archive_merged_worktree(
+                conn, project_id, repo_root_path=repo_root_path,
+                candidate_id=candidate_id, plan_hash=plan_hash,
+                plan_revision=plan_revision,
+            )
+        except StaleArtifactCleanupError as exc:
+            raise StaleArtifactCleanupError("archive_before_prune_refused", {
+                "ok": False, "error": "archive_before_prune_refused",
+                "cause": str(exc), "candidate_id": candidate_id,
+                "source_removed": False, "writes_performed": None,
+                "write_disposition": "ambiguous", "safe_retry": False,
+                "next_step": "Keep the worktree and inspect the archive index before retrying.",
+            }) from exc
+        try:
+            pruned = prune_archived_merged_worktree(
+                conn, project_id, repo_root_path=repo_root_path,
+                candidate_id=candidate_id, plan_hash=plan_hash,
+                plan_revision=plan_revision, generation=published["generation"],
+            )
+        except StaleArtifactCleanupError as exc:
+            raise StaleArtifactCleanupError("archive_only_prune_refused", {
+                "ok": False, "error": "archive_only_prune_refused",
+                "cause": str(exc), "state": "archive_only_or_partial_uncertain",
+                "candidate_id": candidate_id,
+                "generation": published["generation"],
+                "source_path_present": Path(str(archive_items[0].get("path") or "")).exists(),
+                "writes_performed": True, "safe_retry": False,
+                "next_step": "Read the archive index and source path before retrying prune.",
+            }) from exc
+        return {"ok": pruned["ok"], "mode": "apply", "dry_run": False,
+                "project_id": project_id, "applied_count": 1,
+                "applied_candidate_ids": [candidate_id],
+                "state": pruned["state"], "generation": published["generation"],
+                "archive": published, "prune": pruned,
+                "writes_performed": True}
 
     root = batch_jobs.repo_root(repo_root_path)
     cleanup_id = f"stale-cleanup-{uuid.uuid4().hex[:12]}"
@@ -1495,3 +1578,658 @@ def apply_stale_artifact_cleanup(
             task_id=task_id, reason=reason, remove_branch=remove_branch,
             dimension=dimension, plan_hash=plan_hash, plan_revision=plan_revision,
         )
+
+
+def _archive_root_descriptor() -> dict[str, Any]:
+    """Bind the configured external volume, including its mount and inode."""
+    configured = os.environ.get(ARCHIVE_ROOT_ENV, "").strip()
+    if not configured or not Path(configured).is_absolute():
+        return {"verified": False, "reason": "archive_root_not_configured"}
+    path = Path(configured)
+    identity = _path_identity(str(path))
+    if identity is None:
+        return {"verified": False, "reason": "archive_root_unavailable_or_symlink"}
+    try:
+        mount = path
+        while not os.path.ismount(mount):
+            if mount == mount.parent:
+                break
+            mount = mount.parent
+        mount_info = mount.stat()
+        usage = shutil.disk_usage(path)
+        if mount == Path(path.anchor) or not os.access(path, os.W_OK | os.X_OK):
+            return {"verified": False, "reason": "archive_volume_or_acl_unverified"}
+        return {"verified": True, "path": str(path), "identity": identity,
+                "mount": str(mount), "mount_device": mount_info.st_dev,
+                "mount_inode": mount_info.st_ino, "free_bytes": usage.free}
+    except OSError:
+        return {"verified": False, "reason": "archive_volume_unavailable"}
+
+
+def _archive_root_matches(expected: dict[str, Any], *, bytes_needed: int = 0) -> bool:
+    fresh = _archive_root_descriptor()
+    return bool(expected.get("verified") and fresh.get("verified")
+                and all(fresh.get(key) == expected.get(key) for key in
+                        ("path", "identity", "mount", "mount_device", "mount_inode"))
+                and int(fresh.get("free_bytes") or 0) >= bytes_needed)
+
+
+def _archive_reference_reasons(
+    conn: sqlite3.Connection, *, path: str, branch: str, head: str,
+    task_id: str, project_id: str,
+) -> list[str]:
+    """Conservatively scan present governance tables for protected references.
+
+    Unknown schemas, unreadable rows and unbounded scans refuse. The owning
+    terminal task is the sole allowed reference; every other exact identity
+    mention is protected until a more specific authority can prove otherwise.
+    """
+    reasons: set[str] = set()
+    try:
+        names = [str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )]
+        if len(names) > 512:
+            return ["reference_inventory_unbounded"]
+        tokens = (path, branch, head, task_id)
+        scanned = 0
+        for name in names:
+            # Names come from SQLite schema, but quote defensively.
+            quoted = '"' + name.replace('"', '""') + '"'
+            cursor = conn.execute(f"SELECT * FROM {quoted}")
+            columns = [item[0] for item in cursor.description]
+            while rows := cursor.fetchmany(256):
+                scanned += len(rows)
+                if scanned > 250_000:
+                    return ["reference_inventory_unbounded"]
+                for row in rows:
+                    record = dict(zip(columns, row))
+                    if name == "tasks" and str(record.get("task_id") or "") == task_id:
+                        continue
+                    if name == "backlog_bugs" and (
+                        str(record.get("worktree_path") or "") == path
+                        and str(record.get("status") or "").upper() in TERMINAL_BACKLOG_STATUSES
+                        and not str(record.get("current_task_id") or "")
+                    ):
+                        continue
+                    # Do not treat a project-wide row as a reference. Search
+                    # exact path/branch/commit and task identifier in payloads.
+                    body = "\n".join(str(value) for value in record.values()
+                                     if isinstance(value, (str, bytes)))
+                    if any(token and token in body for token in tokens):
+                        reasons.add("referenced_by_" + name)
+                        if len(reasons) >= 16:
+                            return sorted(reasons)
+    except (sqlite3.Error, ValueError):
+        return ["reference_inventory_unavailable"]
+    return sorted(reasons)
+
+
+def _archive_candidate(
+    conn: sqlite3.Connection, project_id: str, root: Path,
+    item: dict[str, Any], archive: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = item.get("evidence") or {}
+    terminal_ids = evidence.get("terminal_task_ids") or []
+    reasons = [reason for reason in item.get("refusal_reasons") or []
+               if reason != "archive_and_restore_proof_required"]
+    git: dict[str, Any] = {"verified": False, "reason": "task_identity_unknown"}
+    task_id = str(terminal_ids[0]) if len(terminal_ids) == 1 else ""
+    metadata: dict[str, Any] = {}
+    if not task_id:
+        reasons.append("single_terminal_task_required")
+    else:
+        row = next((row for row in _fetch_batch_task_rows(conn, project_id)
+                    if row.get("task_id") == task_id), None)
+        metadata = row.get("metadata") or {} if row else {}
+        if not row or str(row.get("batch_status") or "") not in {"merged", "redeployed"}:
+            reasons.append("terminal_merged_task_required")
+        branch = str(metadata.get("work_branch") or "")
+        target = str(metadata.get("target_branch") or "")
+        if _resolve_path(metadata.get("worktree_path")) != item.get("path"):
+            reasons.append("task_worktree_identity_mismatch")
+        try:
+            git = batch_jobs.merged_worktree_git_identity(
+                root, str(item.get("path") or ""), work_branch=branch,
+                target_branch=target,
+            )
+        except (OSError, ValueError, batch_jobs.BatchJobError):
+            pass
+        if git.get("verified") is not True:
+            reasons.append(str(git.get("reason") or "git_identity_unknown"))
+        else:
+            reasons.extend(_archive_reference_reasons(
+                conn, path=str(item["path"]), branch=branch,
+                head=str(git["head"]), task_id=task_id,
+                project_id=project_id,
+            ))
+    if archive.get("verified") is not True:
+        reasons.append(str(archive.get("reason") or "archive_root_unknown"))
+    size, size_status = _snapshot_directory_size(
+        str(item.get("path") or ""), remaining_entries=[50_000],
+    ) if evidence.get("path_identity") else (None, "path_identity_unverified")
+    if size_status != "measured":
+        reasons.append("source_size_" + size_status)
+    if size is not None and archive.get("verified"):
+        # A full bundle and independent cold clone need additional space.
+        needed = max(64 * 1024 * 1024, size * 4)
+        if int(archive.get("free_bytes") or 0) < needed:
+            reasons.append("archive_capacity_insufficient")
+    result = {**item, "safe_to_apply": not reasons,
+              "refusal_reasons": sorted(set(reasons)),
+              "action": "archive_merged_worktree_then_guarded_prune",
+              "evidence": {**evidence, "task_id": task_id,
+                           "branch": git.get("branch", ""),
+                           "head": git.get("head", ""),
+                           "tree": git.get("tree", ""),
+                           "merge_target": git.get("target_branch", ""),
+                           "merge_target_head": git.get("target_head", ""),
+                           "git_common_dir": git.get("git_common_dir", ""),
+                           "size_bytes": size, "size_bytes_status": size_status,
+                           "archive_root": {key: value for key, value in archive.items()
+                                            if key != "free_bytes"}}}
+    return result
+
+
+def build_merged_worktree_archive_projection(
+    conn: sqlite3.Connection, project_id: str, *, repo_root_path: str | Path,
+) -> dict[str, Any]:
+    root = batch_jobs.repo_root(repo_root_path)
+    base = build_stale_artifact_cleanup_projection(
+        conn, project_id, repo_root_path=root, dimension=DIMENSION_WORKTREES,
+        response_budget=False, archive_enrichment=False,
+    )
+    archive = _archive_root_descriptor()
+    items = [_archive_candidate(conn, project_id, root, item, archive)
+             for item in base["candidates"]
+             if item.get("artifact_type") == "batch_worktree"]
+    result = {"ok": True, "mode": "dry_run", "dry_run": True,
+              "project_id": project_id, "dimension": "merged_worktree_archive",
+              "plan_revision": ARCHIVE_PLAN_REVISION,
+              "plan_hash": _plan_hash(project_id, "merged_worktree_archive", items),
+              "summary": {"candidate_count": len(items),
+                          "safe_apply_count": sum(i["safe_to_apply"] for i in items),
+                          "truncated": bool(base["summary"].get("truncated"))},
+              "archive_root": archive, "candidates": items,
+              "next_step": "Archive one eligible candidate, verify its bundle, then request guarded prune."}
+    return _bounded_cleanup_projection(result)
+
+
+def _archive_json_bytes(value: dict[str, Any]) -> bytes:
+    return (json.dumps(value, sort_keys=True, ensure_ascii=False,
+                       separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _archive_fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _registered_worktree_paths(root: Path) -> list[str]:
+    try:
+        output = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain", "-z"],
+            capture_output=True, timeout=30, check=True,
+        ).stdout.decode("utf-8", errors="strict")
+    except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
+        raise StaleArtifactCleanupError("protected_worktree_inventory_unavailable") from exc
+    return [field[9:] for field in output.split("\0") if field.startswith("worktree ")]
+
+
+def _registered_protected_worktrees(root: Path, excluded: Path) -> dict[str, dict[str, int]]:
+    """Capture physical identities of every other registered checkout."""
+    result: dict[str, dict[str, int]] = {}
+    for raw_path in _registered_worktree_paths(root):
+        path = Path(raw_path)
+        if path == excluded:
+            continue
+        identity = _path_identity(str(path))
+        if identity is None:
+            raise StaleArtifactCleanupError("protected_worktree_identity_unverified")
+        result[str(path)] = identity
+        if len(result) > 1000:
+            raise StaleArtifactCleanupError("protected_worktree_inventory_unbounded")
+    return result
+
+
+def _archive_governance_evidence_readback(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Read protected database, sidecar, graph and timeline facts only."""
+    database = ""
+    for row in conn.execute("PRAGMA database_list"):
+        if row[1] == "main":
+            database = str(row[2] or "")
+            break
+    paths: dict[str, dict[str, int] | None] = {}
+    if database:
+        for suffix in ("", "-wal", "-shm"):
+            file = Path(database + suffix)
+            try:
+                info = file.lstat()
+            except FileNotFoundError:
+                paths[suffix or "database"] = None
+            else:
+                if not stat.S_ISREG(info.st_mode):
+                    raise StaleArtifactCleanupError("governance_database_identity_unverified")
+                paths[suffix or "database"] = {
+                    "device": info.st_dev, "inode": info.st_ino,
+                    "size": info.st_size,
+                }
+    counts = {}
+    for table in ("graph_query_traces", "graph_snapshots",
+                  "contract_runtime_executions", "task_timeline_events"):
+        if _table_exists(conn, table):
+            counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    return {"database_path": database, "paths": paths, "counts": counts}
+
+
+def _archive_write_atomic(path: Path, data: bytes) -> None:
+    temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _archive_fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _archive_file_digest(path: Path) -> tuple[int, str]:
+    sha = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            sha.update(chunk)
+            size += len(chunk)
+    return size, "sha256:" + sha.hexdigest()
+
+
+def _archive_source_members(path: Path) -> list[dict[str, Any]]:
+    members: list[dict[str, Any]] = []
+    for parent, dirs, files in os.walk(path, followlinks=False):
+        if Path(parent) == path and ".git" in dirs:
+            dirs.remove(".git")
+        dirs.sort()
+        files.sort()
+        for name in dirs:
+            child = Path(parent) / name
+            if child.is_symlink() or not child.is_dir():
+                raise StaleArtifactCleanupError("archive_source_nonregular_entry")
+        for name in files:
+            child = Path(parent) / name
+            relative = child.relative_to(path).as_posix()
+            if relative == ".git":
+                continue
+            info = child.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise StaleArtifactCleanupError("archive_source_nonregular_entry")
+            size, digest = _archive_file_digest(child)
+            if size != info.st_size or child.lstat().st_mtime_ns != info.st_mtime_ns:
+                raise StaleArtifactCleanupError("archive_source_drift")
+            members.append({"path": relative, "size": size,
+                            "mtime_ns": info.st_mtime_ns,
+                            "mode": stat.S_IMODE(info.st_mode),
+                            "sha256": digest})
+            if len(members) > 50_000:
+                raise StaleArtifactCleanupError("archive_member_budget_exceeded")
+    return members
+
+
+def _archive_verify_members(root: Path, members: list[dict[str, Any]]) -> None:
+    actual = _archive_source_members(root)
+    # Cold clones intentionally have new mtimes. Compare paths, bytes and
+    # hashes; mtimes are recorded and checked for the archived copy itself.
+    expected_content = [(m["path"], m["size"], m["mode"], m["sha256"]) for m in members]
+    actual_content = [(m["path"], m["size"], m["mode"], m["sha256"]) for m in actual]
+    if actual_content != expected_content:
+        raise StaleArtifactCleanupError("archive_member_hash_mismatch")
+
+
+def _archive_cold_restore(bundle: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Verify both copied members and self-contained Git objects in isolation."""
+    data_root = bundle / "members"
+    members = manifest["members"]
+    _archive_verify_members(data_root, members)
+    with tempfile.TemporaryDirectory(prefix="ac-archive-restore-") as temp:
+        checkout = Path(temp) / "checkout"
+        cloned = subprocess.run(
+            ["git", "clone", "--quiet", "--no-checkout", str(bundle / "objects.bundle"),
+             str(checkout)], capture_output=True, text=True, timeout=120, check=False,
+        )
+        if cloned.returncode:
+            raise StaleArtifactCleanupError("archive_git_objects_unrestorable")
+        checked = subprocess.run(
+            ["git", "-C", str(checkout), "checkout", "--quiet", "--detach",
+             manifest["head"]], capture_output=True, text=True, timeout=120,
+            check=False,
+        )
+        if checked.returncode:
+            raise StaleArtifactCleanupError("archive_git_checkout_unrestorable")
+        head = batch_jobs.git_commit(checkout)
+        tree = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD^{tree}"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip()
+        if head != manifest["head"] or tree != manifest["tree"]:
+            raise StaleArtifactCleanupError("archive_git_identity_mismatch")
+        _archive_verify_members(checkout, members)
+    return {"verified": True, "head": manifest["head"],
+            "tree": manifest["tree"], "member_count": len(members)}
+
+
+def _archive_index_path(archive_root: Path, project_id: str, candidate_id: str) -> Path:
+    if (not project_id or not candidate_id
+            or any(part in {"", ".", ".."} for part in (project_id, candidate_id))
+            or any("/" in part or "\\" in part for part in (project_id, candidate_id))):
+        raise StaleArtifactCleanupError("archive_identity_invalid")
+    return archive_root / project_id / "merged-worktrees" / "index" / (candidate_id + ".json")
+
+
+def _archive_load_index(index_path: Path) -> dict[str, Any] | None:
+    if not index_path.exists():
+        return None
+    if index_path.is_symlink() or index_path.stat().st_size > 65536:
+        raise StaleArtifactCleanupError("archive_index_unverified")
+    try:
+        value = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise StaleArtifactCleanupError("archive_index_unverified") from exc
+    if not isinstance(value, dict):
+        raise StaleArtifactCleanupError("archive_index_unverified")
+    return value
+
+
+def _archive_resolve_published(
+    archive_root: Path, project_id: str, candidate_id: str,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    index_path = _archive_index_path(archive_root, project_id, candidate_id)
+    index = _archive_load_index(index_path)
+    if not index or index.get("candidate_id") != candidate_id:
+        raise StaleArtifactCleanupError("published_archive_index_missing")
+    generation = str(index.get("generation") or "")
+    if not re.fullmatch(r"gen-[0-9a-f]{32}", generation):
+        raise StaleArtifactCleanupError("published_archive_generation_invalid")
+    bundle = archive_root / project_id / "merged-worktrees" / "bundles" / generation
+    if (bundle.is_symlink() or not bundle.is_dir()
+            or bundle.parent != index_path.parent.parent / "bundles"):
+        raise StaleArtifactCleanupError("published_archive_bundle_missing")
+    manifest_path = bundle / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise StaleArtifactCleanupError("published_archive_manifest_missing")
+    raw = manifest_path.read_bytes()
+    if "sha256:" + hashlib.sha256(raw).hexdigest() != index.get("manifest_sha256"):
+        raise StaleArtifactCleanupError("published_archive_manifest_hash_mismatch")
+    manifest = json.loads(raw)
+    if manifest.get("candidate_id") != candidate_id or manifest.get("project_id") != project_id:
+        raise StaleArtifactCleanupError("published_archive_manifest_identity_mismatch")
+    return bundle, manifest, index
+
+
+def _archive_fresh_candidate(
+    conn: sqlite3.Connection, project_id: str, root: Path,
+    *, candidate_id: str, plan_hash: str, plan_revision: int,
+) -> dict[str, Any]:
+    projection = None
+    for dimension in ("merged_worktree_archive", DIMENSION_WORKTREES, DIMENSION_ALL):
+        current = (build_merged_worktree_archive_projection(
+            conn, project_id, repo_root_path=root,
+        ) if dimension == "merged_worktree_archive" else
+            build_stale_artifact_cleanup_projection(
+                conn, project_id, repo_root_path=root, dimension=dimension,
+                response_budget=False,
+            ))
+        if (current.get("plan_hash") == plan_hash
+                and current.get("apply_plan_available") is not False
+                and _bounded_cleanup_projection(dict(current)).get("apply_plan_available") is not False
+                and not (current.get("summary") or {}).get("truncated")):
+            projection = current
+            break
+    if plan_revision != ARCHIVE_PLAN_REVISION or projection is None:
+        raise StaleArtifactCleanupError("stale_archive_plan_refused")
+    candidate = next((item for item in projection["candidates"]
+                      if item["candidate_id"] == candidate_id), None)
+    if candidate is None or candidate.get("safe_to_apply") is not True:
+        raise StaleArtifactCleanupError("archive_candidate_ineligible", {
+            "ok": False, "error": "archive_candidate_ineligible",
+            "refusal_reasons": candidate.get("refusal_reasons") if candidate else ["candidate_not_found"],
+            "writes_performed": False,
+            "next_step": "Resolve the protection reason and request a fresh preview.",
+        })
+    return candidate
+
+
+def archive_merged_worktree(
+    conn: sqlite3.Connection, project_id: str, *, repo_root_path: str | Path,
+    candidate_id: str, plan_hash: str, plan_revision: int,
+) -> dict[str, Any]:
+    """Publish a portable verified bundle and durable project index first."""
+    from .db import sqlite_write_lock
+    from .server import _CURRENT_FULL_BUILD_KEYS_LOCK
+
+    with _DESTRUCTIVE_CLEANUP_LOCK, sqlite_write_lock(), _CURRENT_FULL_BUILD_KEYS_LOCK:
+        root = batch_jobs.repo_root(repo_root_path)
+        candidate = _archive_fresh_candidate(
+            conn, project_id, root, candidate_id=candidate_id,
+            plan_hash=plan_hash, plan_revision=plan_revision,
+        )
+        evidence = candidate["evidence"]
+        source = Path(candidate["path"])
+        archive_desc = evidence["archive_root"]
+        size = int(evidence["size_bytes"])
+        if not _archive_root_matches(
+            archive_desc, bytes_needed=max(64 * 1024 * 1024, size * 4),
+        ):
+            raise StaleArtifactCleanupError("archive_volume_capacity_or_identity_drift")
+        archive_root = Path(archive_desc["path"])
+        index_path = _archive_index_path(archive_root, project_id, candidate_id)
+        existing = _archive_load_index(index_path)
+        if existing:
+            bundle, manifest, index = _archive_resolve_published(
+                archive_root, project_id, candidate_id,
+            )
+            if manifest.get("plan_hash") != plan_hash or index.get("state") not in {"archive_only", "pruned"}:
+                raise StaleArtifactCleanupError("archive_index_conflict")
+            proof = _archive_cold_restore(bundle, manifest)
+            return {"ok": True, "state": index["state"], "replay": True,
+                    "candidate_id": candidate_id, "generation": index["generation"],
+                    "restore_proof": proof, "writes_performed": False}
+
+        workspace = archive_root / project_id / "merged-worktrees"
+        staging_parent = workspace / "staging"
+        bundle_parent = workspace / "bundles"
+        # Every created path is under the configured archive volume. Source
+        # remains physically unchanged through archive publication.
+        for directory in (workspace.parent, workspace, staging_parent,
+                          bundle_parent, index_path.parent):
+            directory.mkdir(exist_ok=True)
+            if directory.is_symlink():
+                raise StaleArtifactCleanupError("archive_directory_symlink_refused")
+        generation = "gen-" + uuid.uuid4().hex
+        staging = staging_parent / generation
+        bundle = bundle_parent / generation
+        staging.mkdir(mode=0o700)
+        try:
+            members = _archive_source_members(source)
+            if (_path_identity(str(source)) != evidence["path_identity"]
+                    or not _worktree_clean(str(source))):
+                raise StaleArtifactCleanupError("archive_source_drift")
+            data_root = staging / "members"
+            data_root.mkdir()
+            for member in members:
+                relative = Path(member["path"])
+                destination = data_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with (source / relative).open("rb") as read, destination.open("xb") as write:
+                    shutil.copyfileobj(read, write, length=1024 * 1024)
+                    write.flush()
+                    os.fsync(write.fileno())
+                os.chmod(destination, member["mode"])
+                os.utime(destination, ns=(member["mtime_ns"], member["mtime_ns"]))
+                if _archive_file_digest(destination) != (member["size"], member["sha256"]):
+                    raise StaleArtifactCleanupError("archive_copy_hash_mismatch")
+            dirs_to_sync = [Path(parent) for parent, _dirs, _files in os.walk(data_root)]
+            for directory in reversed(dirs_to_sync):
+                _archive_fsync_directory(directory)
+            bundle_result = subprocess.run(
+                ["git", "-C", str(root), "bundle", "create",
+                 str(staging / "objects.bundle"),
+                 "refs/heads/" + evidence["branch"]],
+                capture_output=True, text=True, timeout=120, check=False,
+            )
+            if bundle_result.returncode:
+                raise StaleArtifactCleanupError("archive_git_bundle_failed")
+            with (staging / "objects.bundle").open("rb") as handle:
+                os.fsync(handle.fileno())
+            manifest = {
+                "schema_version": "merged_worktree_archive.v1",
+                "project_id": project_id, "candidate_id": candidate_id,
+                "task_id": evidence["task_id"], "branch": evidence["branch"],
+                "head": evidence["head"], "tree": evidence["tree"],
+                "merge_target": evidence["merge_target"],
+                "merge_target_head": evidence["merge_target_head"],
+                "source_path": str(source), "source_identity": evidence["path_identity"],
+                "archive_root": archive_desc, "plan_hash": plan_hash,
+                "plan_revision": plan_revision, "generation": generation,
+                "rebuild": {"method": "git_bundle_clone_detached_checkout",
+                            "object_bundle": "objects.bundle", "commit": evidence["head"]},
+                "members": members,
+            }
+            _archive_write_atomic(staging / "manifest.json", _archive_json_bytes(manifest))
+            _archive_cold_restore(staging, manifest)
+            if not _archive_root_matches(archive_desc):
+                raise StaleArtifactCleanupError("archive_volume_identity_drift")
+            _archive_fsync_directory(staging)
+            os.replace(staging, bundle)
+            _archive_fsync_directory(bundle_parent)
+            # The bundle is independently restorable before the index grants
+            # any prune authority. An index failure leaves source untouched.
+            proof = _archive_cold_restore(bundle, manifest)
+            index = {"schema_version": "merged_worktree_archive_index.v1",
+                     "project_id": project_id, "candidate_id": candidate_id,
+                     "generation": generation, "state": "archive_only",
+                     "plan_hash": plan_hash, "plan_revision": plan_revision,
+                     "archive_root": archive_desc,
+                     "manifest_sha256": "sha256:" + hashlib.sha256(
+                         (bundle / "manifest.json").read_bytes()).hexdigest(),
+                     "published_at": _utc_now(), "restore_proof": proof}
+            _archive_write_atomic(index_path, _archive_json_bytes(index))
+            return {"ok": True, "state": "archive_only", "replay": False,
+                    "candidate_id": candidate_id, "generation": generation,
+                    "restore_proof": proof, "writes_performed": True}
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise StaleArtifactCleanupError("archive_publish_failed") from exc
+
+
+def prune_archived_merged_worktree(
+    conn: sqlite3.Connection, project_id: str, *, repo_root_path: str | Path,
+    candidate_id: str, plan_hash: str, plan_revision: int, generation: str,
+) -> dict[str, Any]:
+    """Recheck all authority under the destructive lock, then remove once."""
+    from .db import sqlite_write_lock
+    from .server import _CURRENT_FULL_BUILD_KEYS_LOCK
+
+    with _DESTRUCTIVE_CLEANUP_LOCK, sqlite_write_lock(), _CURRENT_FULL_BUILD_KEYS_LOCK:
+        root = batch_jobs.repo_root(repo_root_path)
+        archive_desc = _archive_root_descriptor()
+        if not archive_desc.get("verified"):
+            raise StaleArtifactCleanupError("archive_volume_unavailable")
+        archive_root = Path(archive_desc["path"])
+        bundle, manifest, index = _archive_resolve_published(
+            archive_root, project_id, candidate_id,
+        )
+        if (index.get("generation") != generation
+                or manifest.get("plan_hash") != plan_hash
+                or manifest.get("plan_revision") != plan_revision
+                or not _archive_root_matches(manifest["archive_root"])):
+            raise StaleArtifactCleanupError("archive_prune_authority_mismatch")
+        if index.get("state") == "pruned":
+            proof = _archive_cold_restore(bundle, manifest)
+            if Path(manifest["source_path"]).exists():
+                raise StaleArtifactCleanupError("archive_replay_source_reappeared")
+            return {"ok": True, "state": "pruned", "replay": True,
+                    "candidate_id": candidate_id, "generation": generation,
+                    "restore_proof": proof, "writes_performed": False}
+        if index.get("state") != "archive_only":
+            raise StaleArtifactCleanupError("archive_prune_state_uncertain")
+        source = Path(manifest["source_path"])
+        if not source.exists():
+            # Crash after physical removal but before the index receipt. Do
+            # not repeat removal; keep the uncertainty visible for recovery.
+            index["state"] = "partial_uncertain"
+            _archive_write_atomic(_archive_index_path(archive_root, project_id, candidate_id),
+                                  _archive_json_bytes(index))
+            raise StaleArtifactCleanupError("archive_prune_partial_uncertain")
+        candidate = _archive_fresh_candidate(
+            conn, project_id, root, candidate_id=candidate_id,
+            plan_hash=plan_hash, plan_revision=plan_revision,
+        )
+        evidence = candidate["evidence"]
+        if (candidate["path"] != manifest["source_path"]
+                or evidence["path_identity"] != manifest["source_identity"]
+                or evidence["head"] != manifest["head"]
+                or evidence["tree"] != manifest["tree"]
+                or evidence["branch"] != manifest["branch"]
+                or evidence["merge_target_head"] != manifest["merge_target_head"]):
+            raise StaleArtifactCleanupError("archive_prune_source_drift")
+        proof = _archive_cold_restore(bundle, manifest)
+        protected_before = _registered_protected_worktrees(root, source)
+        governance_before = _archive_governance_evidence_readback(conn)
+        free_before = shutil.disk_usage(source).free
+        # Existing helper uses the non-forced Git worktree command. Branch
+        # removal is forbidden for this archive protocol.
+        removal = _remove_worktree(
+            repo_root_path=root, path=str(source),
+            metadata={"work_branch": evidence["branch"],
+                      "worktree_path": str(source)}, remove_branch=False,
+        )
+        if not removal.get("removed"):
+            raise StaleArtifactCleanupError("archive_prune_removal_uncertain")
+        index["state"] = "pruned"
+        index["pruned_at"] = _utc_now()
+        index["free_space_delta_bytes"] = shutil.disk_usage(source.parent).free - free_before
+        index["post_prune_restore_proof"] = _archive_cold_restore(bundle, manifest)
+        index["source_absent"] = not source.exists()
+        index["source_registration_absent"] = str(source) not in _registered_worktree_paths(root)
+        index["protected_worktrees_unchanged"] = all(
+            _path_identity(path) == identity for path, identity in protected_before.items()
+        )
+        governance_after = _archive_governance_evidence_readback(conn)
+        index["governance_evidence_readback"] = governance_after
+        index["governance_evidence_preserved"] = (
+            governance_before["database_path"] == governance_after["database_path"]
+            and all(
+                (governance_before["paths"].get("database") or {}).get(key)
+                == (governance_after["paths"].get("database") or {}).get(key)
+                for key in ("device", "inode")
+            )
+            and all(governance_after["counts"].get(name, -1) >= count
+                    for name, count in governance_before["counts"].items())
+        )
+        index["archive_readback"] = bool((bundle / "manifest.json").is_file())
+        if (not index["source_absent"] or not index["source_registration_absent"]
+                or not index["protected_worktrees_unchanged"]
+                or not index["governance_evidence_preserved"]
+                or not index["archive_readback"]):
+            index["state"] = "partial_uncertain"
+        _archive_write_atomic(_archive_index_path(archive_root, project_id, candidate_id),
+                              _archive_json_bytes(index))
+        task_timeline.record_event(
+            conn, project_id=project_id, task_id=manifest["task_id"],
+            event_type="governance.stale_artifact_cleanup.apply",
+            phase="cleanup", event_kind="stale_artifact_cleanup",
+            actor="system", status="applied" if index["state"] == "pruned" else "partial",
+            payload={"candidate_id": candidate_id, "generation": generation,
+                     "archive_protocol": "merged_worktree_archive.v1",
+                     "head": manifest["head"], "tree": manifest["tree"],
+                     "index_state": index["state"]},
+        )
+        conn.commit()
+        return {"ok": index["state"] == "pruned", "state": index["state"],
+                "replay": False, "candidate_id": candidate_id,
+                "generation": generation, "restore_proof": proof,
+                "free_space_delta_bytes": index["free_space_delta_bytes"],
+                "writes_performed": True}

@@ -62,6 +62,319 @@ def _terminal_batch_with_worktree(conn, repo, *, project_id="proj", batch_id="cl
     return created, strategy
 
 
+def _merged_batch_with_worktree(conn, repo, *, batch_id="archive", project_id="proj"):
+    created = batch_jobs.create_batch_task(
+        conn, project_id, "merged archive candidate", repo_root_path=repo,
+        batch_id=batch_id, base_commit=batch_jobs.git_commit(repo),
+    )
+    strategy = batch_jobs.BranchStrategy(**created["branch_strategy"])
+    batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    worktree = Path(strategy.worktree_path)
+    shutil.rmtree(worktree / ".aming-claw", ignore_errors=True)
+    (worktree / "archive.txt").write_text("portable evidence\n", encoding="utf-8")
+    subprocess.run(["git", "add", "archive.txt"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "archive fixture"], cwd=worktree,
+                   check=True, capture_output=True)
+    subprocess.run(["git", "merge", "--no-ff", "-m", "merge fixture",
+                    strategy.work_branch], cwd=repo, check=True, capture_output=True)
+    batch_jobs.record_task_batch_state(conn, created["task_id"], "merged")
+    conn.commit()
+    return created, strategy
+
+
+def test_merged_worktree_archive_publish_prune_restore_and_replay(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    created, strategy = _merged_batch_with_worktree(conn, repo)
+    archive_root = tmp_path / "archive-volume"
+    archive_root.mkdir()
+    monkeypatch.setenv(stale_artifact_cleanup.ARCHIVE_ROOT_ENV, str(archive_root))
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount", lambda path: Path(path) == archive_root or real_ismount(path))
+    preview = stale_artifact_cleanup.build_merged_worktree_archive_projection(
+        conn, "proj", repo_root_path=repo,
+    )
+    candidate = preview["candidates"][0]
+    assert candidate["safe_to_apply"] is True, candidate["refusal_reasons"]
+    bare = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    assert next(i for i in bare["candidates"] if i["artifact_type"] == "batch_worktree")["safe_to_apply"] is True
+    published = stale_artifact_cleanup.archive_merged_worktree(
+        conn, "proj", repo_root_path=repo,
+        candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"],
+    )
+    assert published["state"] == "archive_only"
+    assert Path(strategy.worktree_path).exists()
+    pruned = stale_artifact_cleanup.prune_archived_merged_worktree(
+        conn, "proj", repo_root_path=repo,
+        candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"], generation=published["generation"],
+    )
+    assert pruned["state"] == "pruned"
+    assert not Path(strategy.worktree_path).exists()
+    replay = stale_artifact_cleanup.prune_archived_merged_worktree(
+        conn, "proj", repo_root_path=repo,
+        candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"], generation=published["generation"],
+    )
+    assert replay["replay"] is True
+    assert replay["writes_performed"] is False
+
+
+def _archive_fixture(tmp_path, monkeypatch, *, batch_id="negative"):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    created, strategy = _merged_batch_with_worktree(conn, repo, batch_id=batch_id)
+    archive_root = tmp_path / "archive-volume"
+    archive_root.mkdir()
+    monkeypatch.setenv(stale_artifact_cleanup.ARCHIVE_ROOT_ENV, str(archive_root))
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount", lambda path: Path(path) == archive_root or real_ismount(path))
+    return repo, conn, created, strategy, archive_root
+
+
+def test_archive_preview_shows_active_registered_worktree_as_protected(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    created = batch_jobs.create_batch_task(
+        conn, "proj", "active", repo_root_path=repo,
+        batch_id="active-archive", base_commit=batch_jobs.git_commit(repo),
+    )
+    strategy = batch_jobs.BranchStrategy(**created["branch_strategy"])
+    batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    archive_root = tmp_path / "archive-volume"
+    archive_root.mkdir()
+    monkeypatch.setenv(stale_artifact_cleanup.ARCHIVE_ROOT_ENV, str(archive_root))
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount", lambda path: Path(path) == archive_root or real_ismount(path))
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is False
+    assert "referenced_by_active_batch_task" in candidate["refusal_reasons"]
+    assert Path(strategy.worktree_path).exists()
+
+
+@pytest.mark.parametrize("kind", ["session", "lease", "cex", "queue"])
+def test_archive_preview_refuses_live_governance_reference(tmp_path, monkeypatch, kind):
+    repo, conn, created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    if kind == "session":
+        conn.execute(
+            "INSERT INTO sessions (session_id,principal_id,project_id,role,scope_json,token_hash,"
+            "status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("ses-protected", "qa", "proj", "qa", str(strategy.worktree_path),
+             "hash-protected", "active", "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
+        )
+        table = "sessions"
+    else:
+        table = "fixture_" + kind + "_refs"
+        conn.execute(f"CREATE TABLE {table} (reference TEXT)")
+        conn.execute(f"INSERT INTO {table} VALUES (?)", (str(strategy.worktree_path),))
+    conn.commit()
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is False
+    assert "referenced_by_" + table in candidate["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError):
+        stale_art_cleanup_apply(conn, repo, candidate, preview)
+    assert Path(strategy.worktree_path).exists()
+    assert list(archive_root.iterdir()) == []
+
+
+def stale_art_cleanup_apply(conn, repo, candidate, preview):
+    return stale_artifact_cleanup.apply_stale_artifact_cleanup(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+        candidate_ids=[candidate["candidate_id"]],
+        plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
+    )
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("acl", "archive_volume_or_acl_unverified"),
+    ("capacity", "archive_capacity_insufficient"),
+])
+def test_archive_preflight_refuses_acl_or_capacity(tmp_path, monkeypatch, fault, reason):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    if fault == "acl":
+        actual_access = os.access
+        monkeypatch.setattr(os, "access", lambda path, mode: False if Path(path) == archive_root
+                            else actual_access(path, mode))
+    else:
+        actual_usage = shutil.disk_usage
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: actual_usage(path)._replace(free=1)
+                            if Path(path) == archive_root else actual_usage(path))
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is False
+    assert reason in candidate["refusal_reasons"]
+    assert Path(strategy.worktree_path).exists()
+
+
+def test_archive_copy_hash_failure_leaves_source_and_no_index(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    original_digest = stale_artifact_cleanup._archive_file_digest
+
+    def corrupt_copy(path):
+        size, digest = original_digest(path)
+        return (size, "sha256:" + "0" * 64) if "staging" in path.parts else (size, digest)
+
+    monkeypatch.setattr(stale_artifact_cleanup, "_archive_file_digest", corrupt_copy)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="archive_before_prune_refused") as refused:
+        stale_art_cleanup_apply(conn, repo, candidate, preview)
+    assert refused.value.payload["cause"] == "archive_copy_hash_mismatch"
+    assert refused.value.payload["source_removed"] is False
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_archive_index_failure_leaves_source_and_published_bundle_unpruned(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    original_write = stale_artifact_cleanup._archive_write_atomic
+
+    def fail_index(path, data):
+        if path.parent.name == "index":
+            raise OSError("fixture index write failure")
+        return original_write(path, data)
+
+    monkeypatch.setattr(stale_artifact_cleanup, "_archive_write_atomic", fail_index)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="archive_before_prune_refused") as refused:
+        stale_art_cleanup_apply(conn, repo, candidate, preview)
+    assert refused.value.payload["cause"] == "archive_publish_failed"
+    assert Path(strategy.worktree_path).exists()
+    assert list(archive_root.rglob("bundles/*/manifest.json"))
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_archive_plan_and_volume_drift_refuse_without_source_deletion(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    (Path(strategy.worktree_path) / "drift.txt").write_text("untracked")
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="stale_cleanup_plan_refused"):
+        stale_art_cleanup_apply(conn, repo, candidate, preview)
+    (Path(strategy.worktree_path) / "drift.txt").unlink()
+    archive_root.rename(tmp_path / "archive-disconnected")
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="stale_cleanup_plan_refused"):
+        stale_art_cleanup_apply(conn, repo, candidate, preview)
+    assert Path(strategy.worktree_path).exists()
+
+
+def test_archive_crash_after_remove_replay_never_repeats_removal(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    published = stale_artifact_cleanup.archive_merged_worktree(
+        conn, "proj", repo_root_path=repo,
+        candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"],
+    )
+    original_write = stale_artifact_cleanup._archive_write_atomic
+
+    def crash_before_receipt(path, data):
+        if path.parent.name == "index" and b'"state":"pruned"' in data:
+            raise OSError("fixture crash before durable prune receipt")
+        return original_write(path, data)
+
+    monkeypatch.setattr(stale_artifact_cleanup, "_archive_write_atomic", crash_before_receipt)
+    with pytest.raises(OSError, match="fixture crash"):
+        stale_artifact_cleanup.prune_archived_merged_worktree(
+            conn, "proj", repo_root_path=repo,
+            candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+            plan_revision=preview["plan_revision"], generation=published["generation"],
+        )
+    assert not Path(strategy.worktree_path).exists()
+    monkeypatch.setattr(stale_artifact_cleanup, "_archive_write_atomic", original_write)
+    monkeypatch.setattr(stale_artifact_cleanup, "_remove_worktree",
+                        lambda **_kw: pytest.fail("replay must not remove again"))
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="archive_prune_partial_uncertain"):
+        stale_artifact_cleanup.prune_archived_merged_worktree(
+            conn, "proj", repo_root_path=repo,
+            candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+            plan_revision=preview["plan_revision"], generation=published["generation"],
+        )
+    index = stale_artifact_cleanup._archive_load_index(
+        stale_artifact_cleanup._archive_index_path(archive_root, "proj", candidate["candidate_id"])
+    )
+    assert index["state"] == "partial_uncertain"
+
+
+@pytest.mark.parametrize("drift", ["head", "inode"])
+def test_archive_apply_rejects_head_or_inode_drift_before_copy(tmp_path, monkeypatch, drift):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    source = Path(strategy.worktree_path)
+    if drift == "head":
+        (source / "new-head.txt").write_text("drift\n", encoding="utf-8")
+        subprocess.run(["git", "add", "new-head.txt"], cwd=source, check=True)
+        subprocess.run(["git", "commit", "-m", "new head"], cwd=source,
+                       check=True, capture_output=True)
+    else:
+        source.rename(source.with_name(source.name + "-held"))
+        source.mkdir()
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="stale_cleanup_plan_refused"):
+        stale_art_cleanup_apply(conn, repo, candidate, preview)
+    assert source.exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_archive_public_frame_overflow_refuses_plan_and_removal(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    original = stale_artifact_cleanup._archive_candidate
+
+    def oversized(*args, **kwargs):
+        candidate = original(*args, **kwargs)
+        candidate["evidence"]["unrepresentable_identity"] = "雪\\\"\n" * 150_000
+        return candidate
+
+    monkeypatch.setattr(stale_artifact_cleanup, "_archive_candidate", oversized)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    assert preview["error"] == "cleanup_response_identity_overflow"
+    assert preview["apply_plan_available"] is False
+    assert preview["candidates"] == []
+    sizes = stale_artifact_cleanup.cleanup_response_wire_bytes(preview)
+    assert all(size <= 224 * 1024 for size in sizes.values())
+    candidate_id = stale_artifact_cleanup._candidate_id("batch_worktree", str(strategy.worktree_path))
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="cleanup_response_identity_overflow"):
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="worktrees",
+            candidate_ids=[candidate_id], plan_hash=preview["plan_hash"],
+            plan_revision=preview["plan_revision"],
+        )
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
 def _insert_backlog_ref(conn, *, bug_id, worktree_path, status="CLOSED", branch="codex/batch-cleanup"):
     now = batch_jobs.utc_now()
     conn.execute(
@@ -135,12 +448,13 @@ def test_dry_run_projects_stale_worktree_backlog_and_retained_trace(tmp_path):
 
     assert projection["dry_run"] is True
     assert projection["summary"]["stale_worktree_count"] == 1
-    assert projection["summary"]["safe_apply_count"] == 2
+    assert projection["summary"]["safe_apply_count"] == 1
     assert projection["summary"]["backlog_reference_count"] == 1
     assert projection["append_only_retained"]["graph_trace_ids"] == ["gqt-clean"]
     assert projection["append_only_retained"]["task_timeline_event_count"] == 1
     by_type = {item["artifact_type"]: item for item in projection["candidates"]}
-    assert by_type["batch_worktree"]["safe_to_apply"] is True
+    assert by_type["batch_worktree"]["safe_to_apply"] is False
+    assert "terminal_merged_task_required" in by_type["batch_worktree"]["refusal_reasons"]
     assert by_type["backlog_worktree_reference"]["safe_to_apply"] is True
 
 
@@ -227,7 +541,7 @@ def test_apply_refuses_unowned_stale_worktree(tmp_path):
     assert orphan.exists()
 
 
-def test_apply_terminal_candidates_removes_worktree_updates_metadata_and_retains_trace(tmp_path):
+def test_legacy_apply_only_clears_terminal_reference_and_retains_worktree(tmp_path):
     repo = _git_repo(tmp_path)
     conn = _conn()
     created, strategy = _terminal_batch_with_worktree(conn, repo, batch_id="apply")
@@ -255,15 +569,15 @@ def test_apply_terminal_candidates_removes_worktree_updates_metadata_and_retains
     )
 
     assert result["ok"] is True
-    assert result["applied_count"] == 2
-    assert not (repo / ".worktrees" / "batch-apply").exists()
+    assert result["applied_count"] == 1
+    assert (repo / ".worktrees" / "batch-apply").exists()
     meta = json.loads(
         conn.execute(
             "SELECT metadata_json FROM tasks WHERE task_id=?",
             (created["task_id"],),
         ).fetchone()["metadata_json"]
     )
-    assert meta["stale_artifact_cleanup"]["cleanup_id"] == result["cleanup_id"]
+    assert "stale_artifact_cleanup" not in meta
     backlog = conn.execute(
         "SELECT worktree_path, worktree_branch, takeover_json FROM backlog_bugs WHERE bug_id='OPT-APPLY'"
     ).fetchone()
@@ -296,7 +610,8 @@ def test_preflight_batch_worktree_warning_references_cleanup_workflow(tmp_path):
 def test_mixed_safe_and_unsafe_plan_is_physical_zero_write(tmp_path, monkeypatch):
     repo = _git_repo(tmp_path)
     conn = _conn()
-    _terminal_batch_with_worktree(conn, repo, batch_id="mixed")
+    _created, strategy = _terminal_batch_with_worktree(conn, repo, batch_id="mixed")
+    _insert_backlog_ref(conn, bug_id="OPT-MIXED", worktree_path=strategy.worktree_path)
     orphan = repo / ".worktrees" / "orphan"
     orphan.mkdir(parents=True)
     preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
@@ -328,7 +643,7 @@ def test_stale_plan_and_unknown_dimension_reject_without_removal(tmp_path, monke
     preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
         conn, "proj", repo_root_path=repo, dimension="worktrees",
     )
-    candidate = next(item for item in preview["candidates"] if item["safe_to_apply"])
+    candidate = next(item for item in preview["candidates"] if item["artifact_type"] == "batch_worktree")
     _insert_backlog_ref(conn, bug_id="OPT-NEW", worktree_path=strategy.worktree_path,
                         status="OPEN")
     monkeypatch.setattr(stale_artifact_cleanup, "_remove_worktree",
@@ -396,7 +711,7 @@ def test_same_path_inode_replacement_between_plan_and_item_check_is_zero_write(
     preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
         conn, "proj", repo_root_path=repo, dimension="worktrees",
     )
-    candidate = next(item for item in preview["candidates"] if item["safe_to_apply"])
+    candidate = next(item for item in preview["candidates"] if item["artifact_type"] == "batch_worktree")
     original_build = stale_artifact_cleanup.build_stale_artifact_cleanup_projection
     calls = 0
 
@@ -419,7 +734,7 @@ def test_same_path_inode_replacement_between_plan_and_item_check_is_zero_write(
             candidate_ids=[candidate["candidate_id"]],
             plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
         )
-    assert rejected.value.payload["error"] == "stale_cleanup_item_drift_refused"
+    assert rejected.value.payload["error"] == "unsafe_stale_artifact_cleanup_refused"
     assert Path(strategy.worktree_path).exists()
 
 
@@ -1108,24 +1423,12 @@ def test_cleanup_partial_failure_hashes_oversized_diagnostic_and_reports_ids(
     preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
         conn, "proj", repo_root_path=repo, dimension="worktrees",
     )
-    candidates = sorted(
-        (item for item in preview["candidates"]
-         if item["action"] == stale_artifact_cleanup.ACTION_REMOVE_BATCH_WORKTREE
-         and item["safe_to_apply"]),
-        key=lambda item: item["candidate_id"],
-    )
+    candidates = sorted((item for item in preview["candidates"]
+                         if item["artifact_type"] == "batch_worktree"),
+                        key=lambda item: item["candidate_id"])
     assert len(candidates) == 2
-    original_remove = stale_artifact_cleanup._remove_worktree
-    attempts = []
-
-    def remove_once_then_fail(**kwargs):
-        attempts.append(kwargs["path"])
-        if len(attempts) == 2:
-            raise stale_artifact_cleanup.StaleArtifactCleanupError("Z" * 1_000_000)
-        return original_remove(**kwargs)
-
     monkeypatch.setattr(stale_artifact_cleanup, "_remove_worktree",
-                        remove_once_then_fail)
+                        lambda **_kwargs: pytest.fail("bare worktree removal reached"))
     with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as err:
         stale_artifact_cleanup.apply_stale_artifact_cleanup(
             conn, "proj", repo_root_path=repo, dimension="worktrees",
@@ -1133,14 +1436,9 @@ def test_cleanup_partial_failure_hashes_oversized_diagnostic_and_reports_ids(
             plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
         )
     payload = err.value.payload
-    assert payload["error"] == "stale_cleanup_item_error"
-    assert payload["applied_count"] == 1
-    assert payload["applied_candidate_ids"] == [candidates[0]["candidate_id"]]
-    assert payload["writes_performed"] is True
-    assert payload["diagnostic_sha256"].startswith("sha256:")
-    assert all(size <= 224 * 1024 for size in
-               stale_artifact_cleanup.cleanup_response_wire_bytes(payload).values())
-    assert not Path(candidates[0]["path"]).exists()
+    assert payload["error"] == "unsafe_stale_artifact_cleanup_refused"
+    assert payload["unsafe_candidate_count"] == 2
+    assert Path(candidates[0]["path"]).exists()
     assert Path(candidates[1]["path"]).exists()
 
 
@@ -1152,37 +1450,22 @@ def test_later_item_active_backlog_drift_stops_further_deletion(tmp_path, monkey
     preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
         conn, "proj", repo_root_path=repo, dimension="worktrees",
     )
-    candidates = sorted((item for item in preview["candidates"] if item["safe_to_apply"]),
+    candidates = sorted((item for item in preview["candidates"] if item["artifact_type"] == "batch_worktree"),
                         key=lambda item: item["candidate_id"])
     assert len(candidates) == 2
-    original = stale_artifact_cleanup.build_stale_artifact_cleanup_projection
-    calls = 0
-
-    def changed(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 3:
-            _insert_backlog_ref(conn, bug_id="OPT-LATE-LEASE",
-                                worktree_path=candidates[1]["path"], status="OPEN")
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(stale_artifact_cleanup, "build_stale_artifact_cleanup_projection", changed)
+    _insert_backlog_ref(conn, bug_id="OPT-LATE-LEASE",
+                        worktree_path=candidates[1]["path"], status="OPEN")
+    monkeypatch.setattr(stale_artifact_cleanup, "_remove_worktree",
+                        lambda **_kwargs: pytest.fail("bare worktree removal reached"))
     with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
-                       match="stale_cleanup_item_drift_refused"):
+                       match="stale_cleanup_plan_refused"):
         stale_artifact_cleanup.apply_stale_artifact_cleanup(
             conn, "proj", repo_root_path=repo, dimension="worktrees",
             candidate_ids=[item["candidate_id"] for item in candidates],
             plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
         )
-    # A later drift cannot roll back an earlier physical removal; the caller
-    # receives a refusal and must inspect the surviving item before retrying.
-    assert not Path(candidates[0]["path"]).exists()
+    assert Path(candidates[0]["path"]).exists()
     assert Path(candidates[1]["path"]).exists()
-    event = conn.execute(
-        "SELECT status,payload_json FROM task_timeline_events "
-        "WHERE event_type='governance.stale_artifact_cleanup.apply'"
+    assert not conn.execute(
+        "SELECT 1 FROM task_timeline_events WHERE event_type='governance.stale_artifact_cleanup.apply'"
     ).fetchone()
-    assert event["status"] == "partial"
-    assert json.loads(event["payload_json"])["applied_candidate_ids"] == [
-        candidates[0]["candidate_id"]
-    ]

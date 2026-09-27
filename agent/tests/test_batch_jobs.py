@@ -276,6 +276,34 @@ def test_worktree_create_abandon_and_stale_report(tmp_path):
     assert not (repo / ".worktrees" / "batch-batch-007").exists()
 
 
+def test_merged_worktree_git_identity_requires_registration_branch_and_ancestry(tmp_path):
+    repo = _git_repo(tmp_path)
+    worktree = repo / ".worktrees" / "archive-check"
+    worktree.parent.mkdir()
+    subprocess.run(["git", "worktree", "add", "-b", "archive-check", str(worktree)],
+                   cwd=repo, check=True, capture_output=True)
+    (worktree / "archive.txt").write_text("member\n", encoding="utf-8")
+    subprocess.run(["git", "add", "archive.txt"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "worktree change"], cwd=worktree,
+                   check=True, capture_output=True)
+    before = batch_jobs.merged_worktree_git_identity(
+        repo, worktree, work_branch="archive-check", target_branch="main",
+    )
+    assert before["verified"] is False
+    assert before["reason"] == "merge_target_ancestry_unverified"
+    subprocess.run(["git", "merge", "--no-ff", "-m", "merge fixture", "archive-check"],
+                   cwd=repo, check=True, capture_output=True)
+    after = batch_jobs.merged_worktree_git_identity(
+        repo, worktree, work_branch="archive-check", target_branch="main",
+    )
+    assert after["verified"] is True
+    assert len(after["head"]) == len(after["tree"]) == 40
+    wrong_branch = batch_jobs.merged_worktree_git_identity(
+        repo, worktree, work_branch="main", target_branch="main",
+    )
+    assert wrong_branch["verified"] is False
+
+
 def test_batch_merge_dry_run_records_ready_for_review(tmp_path):
     repo = _git_repo(tmp_path)
     _write_project_graph(repo)
