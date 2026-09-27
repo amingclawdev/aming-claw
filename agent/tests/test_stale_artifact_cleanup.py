@@ -560,6 +560,14 @@ def test_cleanup_essential_identity_overflow_has_no_executable_plan(
     assert len(expected_http) == stale_artifact_cleanup.cleanup_response_wire_bytes(
         preview,
     )["http"]
+    http_handler = object.__new__(governance_server.GovernanceHandler)
+    http_handler.wfile = io.BytesIO()
+    http_handler.send_response = lambda _code: None
+    http_handler.send_header = lambda _name, _value: None
+    http_handler.end_headers = lambda: None
+    http_handler._respond(200, {**preview, "request_id": "req-" + "x" * 12})
+    assert http_handler.wfile.getvalue() == expected_http
+    assert len(expected_http) <= 224 * 1024
     managed = object.__new__(AmingClawMCP)
     monkeypatch.setattr(managed, "_dispatch_tool_call", lambda *_a: preview)
     managed_output = io.StringIO()
@@ -571,6 +579,9 @@ def test_cleanup_essential_identity_overflow_has_no_executable_plan(
     }))
     managed_frame = managed_output.getvalue().encode("utf-8").rstrip(b"\n")
     assert len(managed_frame) <= 224 * 1024
+    assert len(managed_frame) == stale_artifact_cleanup.cleanup_response_wire_bytes(
+        preview,
+    )["managed_mcp"]
     assert json.loads(json.loads(managed_frame)["result"]["content"][0]["text"]) == preview
     standalone_output = io.StringIO()
     monkeypatch.setattr(governance_mcp_server.sys, "stdout", standalone_output)
@@ -582,6 +593,9 @@ def test_cleanup_essential_identity_overflow_has_no_executable_plan(
     }))
     standalone_frame = standalone_output.getvalue().encode("utf-8").rstrip(b"\n")
     assert len(standalone_frame) <= 224 * 1024
+    assert len(standalone_frame) == stale_artifact_cleanup.cleanup_response_wire_bytes(
+        preview,
+    )["standalone_mcp"]
     assert json.loads(json.loads(standalone_frame)["result"]["content"][0]["text"]) == preview
 
 
@@ -914,7 +928,7 @@ def test_cleanup_preview_skips_selector_rglob_and_bounds_large_eligible_tree(
     assert preview["summary"]["unknown_size_count"] == 1
 
 
-@pytest.mark.parametrize("candidate_count", [129, 136])
+@pytest.mark.parametrize("candidate_count", [129, 131, 136])
 def test_129_protected_graph_rows_compact_only_optional_diagnostics(
     tmp_path, monkeypatch, candidate_count,
 ):
@@ -934,7 +948,7 @@ def test_129_protected_graph_rows_compact_only_optional_diagnostics(
         (directory / "graph.json").write_bytes(b"{}")
         protected.append({
             "snapshot_id": snapshot_id,
-            "reasons": [f"reference:{number:03d}:{part:02d}:" + "r" * 51
+            "reasons": [f"reference:{number:03d}:{part:02d}:" + "r" * 100 + "雪\\\"\n"
                         for part in range(8)],
             "snapshot_kind": "full", "status": "active",
             "created_at": "2026-09-27T00:00:00Z", "dir_exists": True,
@@ -970,11 +984,26 @@ def test_129_protected_graph_rows_compact_only_optional_diagnostics(
     assert preview["summary"]["size_bytes"] == candidate_count * 2 + 2
     assert preview["summary"]["unknown_size_count"] == 0
     request_id = "z" * (4 * 1024 - 2)
+    pretty_frame = json.dumps({
+        "jsonrpc": "2.0", "id": request_id,
+        "result": {"content": [{"type": "text", "text": json.dumps(
+            preview, ensure_ascii=False, indent=2,
+        )}]},
+    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(pretty_frame) > 224 * 1024
     expected_http = json.dumps({**preview, "request_id": "req-" + "x" * 12},
                                ensure_ascii=False).encode("utf-8")
     assert len(expected_http) == stale_artifact_cleanup.cleanup_response_wire_bytes(
         preview,
     )["http"]
+    http_handler = object.__new__(governance_server.GovernanceHandler)
+    http_handler.wfile = io.BytesIO()
+    http_handler.send_response = lambda _code: None
+    http_handler.send_header = lambda _name, _value: None
+    http_handler.end_headers = lambda: None
+    http_handler._respond(200, {**preview, "request_id": "req-" + "x" * 12})
+    assert http_handler.wfile.getvalue() == expected_http
+    assert len(expected_http) <= 224 * 1024
     managed = object.__new__(AmingClawMCP)
     monkeypatch.setattr(managed, "_dispatch_tool_call", lambda *_a: preview)
     managed_output = io.StringIO()
@@ -986,6 +1015,9 @@ def test_129_protected_graph_rows_compact_only_optional_diagnostics(
     }))
     managed_frame = managed_output.getvalue().encode("utf-8").rstrip(b"\n")
     assert len(managed_frame) <= 224 * 1024
+    assert len(managed_frame) == stale_artifact_cleanup.cleanup_response_wire_bytes(
+        preview,
+    )["managed_mcp"]
     assert json.loads(json.loads(managed_frame)["result"]["content"][0]["text"]) == preview
     standalone_output = io.StringIO()
     monkeypatch.setattr(governance_mcp_server.sys, "stdout", standalone_output)
@@ -997,6 +1029,9 @@ def test_129_protected_graph_rows_compact_only_optional_diagnostics(
     }))
     standalone_frame = standalone_output.getvalue().encode("utf-8").rstrip(b"\n")
     assert len(standalone_frame) <= 224 * 1024
+    assert len(standalone_frame) == stale_artifact_cleanup.cleanup_response_wire_bytes(
+        preview,
+    )["standalone_mcp"]
     assert json.loads(json.loads(standalone_frame)["result"]["content"][0]["text"]) == preview
     for source, shown in zip(raw["candidates"], preview["candidates"]):
         for key in ("candidate_id", "snapshot_id", "artifact_type", "action",
@@ -1004,6 +1039,7 @@ def test_129_protected_graph_rows_compact_only_optional_diagnostics(
             assert shown[key] == source[key]
         assert shown["evidence"]["created_at"] == source["evidence"]["created_at"]
         assert shown["evidence"]["size_bytes"] == source["evidence"]["size_bytes"]
+        assert shown["evidence"]["size_bytes_status"] == source["evidence"]["size_bytes_status"]
         if source["safe_to_apply"]:
             assert shown["path"] == str(safe_directory)
             assert shown["evidence"]["path_identity"] == source["evidence"]["path_identity"]

@@ -4550,15 +4550,41 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         if dimension not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"}:
             return {"ok": False, "error": "cleanup_dimension_invalid"}
         pid = args["project_id"]
+        if _mcp_bound_project_id() == "aming-claw" and pid != "aming-claw":
+            return {"ok": False, "error": "mcp_world_project_scope_mismatch",
+                    "writes_performed": False, "safe_retry": False}
         path = f"/api/graph-governance/{pid}/stale-artifact-cleanup"
         if name == "stale_artifact_cleanup":
             query = {"dimension": dimension}
             for key in ("project_root", "repo_root", "include_unowned"):
                 if key in args:
                     query[key] = args[key]
-            return _http("GET", path + "?" + urllib.parse.urlencode(query))
+            result = _http("GET", path + "?" + urllib.parse.urlencode(query),
+                           timeout_seconds=45)
+            if _is_timeout_result(result):
+                if (type(result.get("writes_performed")) is bool
+                        or result.get("write_disposition") in ("written", "not_written")):
+                    return result
+                return {"ok": False, "error": "request_timeout",
+                        "timeout_seconds": 45, "writes_performed": False,
+                        "write_disposition": "not_written", "safe_retry": False}
+            return result
         body = {key: value for key, value in args.items() if key != "project_id" and value is not None}
-        return _http("POST", path + "/apply", body)
+        result = _http("POST", path + "/apply", body, timeout_seconds=45)
+        if _is_timeout_result(result):
+            if (type(result.get("writes_performed")) is bool
+                    or result.get("write_disposition") in ("written", "not_written")):
+                return result
+            # A timeout can occur after the server applies some or all rows.
+            bounded = {"ok": False, "error": "request_timeout",
+                       "timeout_seconds": 45, "writes_performed": None,
+                       "write_disposition": "ambiguous", "safe_retry": False}
+            if type(result.get("applied_count")) is int:
+                bounded["applied_count"] = result["applied_count"]
+            if isinstance(result.get("applied_candidate_ids"), list):
+                bounded["applied_candidate_ids"] = result["applied_candidate_ids"]
+            return bounded
+        return result
 
     raise ValueError(f"Unknown tool: {name!r}")
 
@@ -4691,7 +4717,11 @@ def _handle(raw: str) -> None:
             result = _dispatch_tool(tool_name, tool_args)
             mcp_result = {
                 "content": [
-                    {"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)},
+                    {"type": "text", "text": json.dumps(
+                        result, ensure_ascii=False,
+                        separators=(",", ":") if cleanup_tool else None,
+                        indent=None if cleanup_tool else 2,
+                    )},
                 ],
             }
             if cleanup_tool:

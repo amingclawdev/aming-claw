@@ -8559,7 +8559,7 @@ def test_cleanup_dimensions_match_both_mcp_dispatchers_and_reject_unknown(monkey
 
     calls = []
     monkeypatch.setattr(governance_mcp_server, "_http",
-                        lambda method, path, body=None: calls.append((method, path, body)) or {"ok": True})
+                        lambda method, path, body=None, **kw: calls.append((method, path, body, kw)) or {"ok": True})
     rejected = governance_mcp_server._dispatch_tool("stale_artifact_cleanup_apply", {
         "project_id": "aming-claw", "dimension": "../outside",
         "candidate_ids": ["x"], "plan_hash": "sha256:x", "plan_revision": 1,
@@ -8569,7 +8569,161 @@ def test_cleanup_dimensions_match_both_mcp_dispatchers_and_reject_unknown(monkey
     governance_mcp_server._dispatch_tool("stale_artifact_cleanup", {
         "project_id": "aming-claw", "dimension": "graph_snapshots",
     })
-    assert calls == [("GET", "/api/graph-governance/aming-claw/stale-artifact-cleanup?dimension=graph_snapshots", None)]
+    assert calls == [("GET", "/api/graph-governance/aming-claw/stale-artifact-cleanup?dimension=graph_snapshots", None,
+                      {"timeout_seconds": 45})]
+
+
+def test_cleanup_transport_timeout_is_scoped_and_apply_truth_is_ambiguous(monkeypatch):
+    managed = _dispatcher(_Recorder())
+    managed_calls = []
+
+    def managed_timeout(method, path, data=None, *, timeout_seconds):
+        managed_calls.append((method, path, data, timeout_seconds))
+        return {"ok": False, "error": "request_timeout", "message": "timed out"}
+
+    monkeypatch.setattr(managed, "_governance_api_with_timeout", managed_timeout)
+    preview = managed.dispatch("stale_artifact_cleanup", {
+        "project_id": "aming-claw", "dimension": "graph_snapshots",
+    })
+    applied = managed.dispatch("stale_artifact_cleanup_apply", {
+        "project_id": "aming-claw", "dimension": "graph_snapshots",
+        "candidate_ids": ["exact-id"], "plan_hash": "sha256:exact",
+        "plan_revision": 1,
+    })
+    assert preview["error"] == "request_timeout"
+    assert preview["writes_performed"] is False
+    assert preview["write_disposition"] == "not_written"
+    assert preview["safe_retry"] is False
+    assert [call[0] for call in managed_calls] == ["GET", "POST"]
+    assert [call[3] for call in managed_calls] == [45, 45]
+    assert applied == {"ok": False, "error": "request_timeout",
+                       "timeout_seconds": 45, "writes_performed": None,
+                       "write_disposition": "ambiguous", "safe_retry": False}
+
+    standalone_calls = []
+
+    def standalone_timeout(method, path, body=None, **kw):
+        standalone_calls.append((method, path, body, kw))
+        return {"ok": False, "error": "request_timeout", "message": "timed out"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", standalone_timeout)
+    standalone_preview = governance_mcp_server._dispatch_tool(
+        "stale_artifact_cleanup", {"project_id": "aming-claw",
+                                   "dimension": "graph_snapshots"},
+    )
+    standalone_apply = governance_mcp_server._dispatch_tool(
+        "stale_artifact_cleanup_apply", {"project_id": "aming-claw",
+                                         "dimension": "graph_snapshots",
+                                         "candidate_ids": ["exact-id"],
+                                         "plan_hash": "sha256:exact",
+                                         "plan_revision": 1},
+    )
+    assert standalone_preview["error"] == "request_timeout"
+    assert standalone_preview["writes_performed"] is False
+    assert standalone_preview["write_disposition"] == "not_written"
+    assert standalone_preview["safe_retry"] is False
+    assert [call[0] for call in standalone_calls] == ["GET", "POST"]
+    assert [call[3] for call in standalone_calls] == [
+        {"timeout_seconds": 45}, {"timeout_seconds": 45},
+    ]
+    assert standalone_apply == applied
+
+    partial = {"ok": False, "error": "partial_apply",
+               "writes_performed": True, "applied_candidate_ids": ["exact-id"]}
+    monkeypatch.setattr(managed, "_governance_api_with_timeout",
+                        lambda *_a, **_kw: partial)
+    monkeypatch.setattr(governance_mcp_server, "_http",
+                        lambda *_a, **_kw: partial)
+    assert managed.dispatch("stale_artifact_cleanup_apply", {
+        "project_id": "aming-claw", "dimension": "graph_snapshots",
+    }) is partial
+    assert governance_mcp_server._dispatch_tool("stale_artifact_cleanup_apply", {
+        "project_id": "aming-claw", "dimension": "graph_snapshots",
+    }) is partial
+
+    for explicit_write in (False, True):
+        server_result = {"ok": False, "error": "server_timeout_after_check",
+                         "writes_performed": explicit_write,
+                         "applied_count": 1 if explicit_write else 0,
+                         "applied_candidate_ids": ["exact-id"] if explicit_write else []}
+        monkeypatch.setattr(managed, "_governance_api_with_timeout",
+                            lambda *_a, **_kw: server_result)
+        monkeypatch.setattr(governance_mcp_server, "_http",
+                            lambda *_a, **_kw: server_result)
+        assert managed.dispatch("stale_artifact_cleanup_apply", {
+            "project_id": "aming-claw", "dimension": "graph_snapshots",
+        }) is server_result
+        assert governance_mcp_server._dispatch_tool(
+            "stale_artifact_cleanup_apply", {
+                "project_id": "aming-claw", "dimension": "graph_snapshots",
+            },
+        ) is server_result
+
+    partial_without_bool = {"ok": False, "error": "server_timeout_after_partial",
+                            "applied_count": 1,
+                            "applied_candidate_ids": ["exact-id"]}
+    monkeypatch.setattr(managed, "_governance_api_with_timeout",
+                        lambda *_a, **_kw: partial_without_bool)
+    monkeypatch.setattr(governance_mcp_server, "_http",
+                        lambda *_a, **_kw: partial_without_bool)
+    managed_unknown = managed.dispatch("stale_artifact_cleanup_apply", {
+        "project_id": "aming-claw", "dimension": "graph_snapshots",
+    })
+    standalone_unknown = governance_mcp_server._dispatch_tool(
+        "stale_artifact_cleanup_apply", {
+            "project_id": "aming-claw", "dimension": "graph_snapshots",
+        },
+    )
+    for result in (managed_unknown, standalone_unknown):
+        assert result["writes_performed"] is None
+        assert result["write_disposition"] == "ambiguous"
+        assert result["applied_count"] == 1
+        assert result["applied_candidate_ids"] == ["exact-id"]
+        assert result["safe_retry"] is False
+
+
+def test_cleanup_real_bound_owner_timeout_and_wrong_world_zero_http(monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "aming-claw")
+    monkeypatch.delenv("GOVERNANCE_URL", raising=False)
+    host = object.__new__(plugin_mcp_server.AmingClawMCP)
+    host.project_id = "aming-claw"
+    host.gov_url = "http://127.0.0.1:40008"
+    managed = ToolDispatcher(host._http, None)
+    requests = []
+
+    def timed_out_urlopen(request, *, timeout):
+        requests.append((request.full_url, request.get_method(), timeout))
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(plugin_mcp_server.urllib.request, "urlopen",
+                        timed_out_urlopen)
+    preview = managed.dispatch("stale_artifact_cleanup", {
+        "project_id": "aming-claw", "dimension": "graph_snapshots",
+    })
+    applied = managed.dispatch("stale_artifact_cleanup_apply", {
+        "project_id": "aming-claw", "dimension": "graph_snapshots",
+        "candidate_ids": ["exact-id"], "plan_hash": "sha256:exact",
+        "plan_revision": 1,
+    })
+    assert [(method, timeout) for _, method, timeout in requests] == [
+        ("GET", 45), ("POST", 45),
+    ]
+    assert all(url.startswith("http://127.0.0.1:40008/")
+               for url, _, _ in requests)
+    assert preview["writes_performed"] is False
+    assert applied["writes_performed"] is None
+    assert applied["write_disposition"] == "ambiguous"
+    assert applied["safe_retry"] is False
+
+    before = len(requests)
+    for tool in ("stale_artifact_cleanup", "stale_artifact_cleanup_apply"):
+        assert managed.dispatch(tool, {
+            "project_id": "foreign-project", "dimension": "graph_snapshots",
+        })["error"] == "mcp_world_project_scope_mismatch"
+        assert governance_mcp_server._dispatch_tool(tool, {
+            "project_id": "foreign-project", "dimension": "graph_snapshots",
+        })["error"] == "mcp_world_project_scope_mismatch"
+    assert len(requests) == before
 
 
 def test_cleanup_preview_actual_managed_and_standalone_frames_are_bounded(
@@ -8599,9 +8753,13 @@ def test_cleanup_preview_actual_managed_and_standalone_frames_are_bounded(
 
     managed_output = io.StringIO()
     monkeypatch.setattr(plugin_mcp_server.sys, "stdout", managed_output)
-    plugin_mcp_server._response(request_id, {"content": [{
-        "type": "text", "text": json.dumps(bounded, ensure_ascii=False, indent=2),
-    }]})
+    managed = object.__new__(plugin_mcp_server.AmingClawMCP)
+    monkeypatch.setattr(managed, "_dispatch_tool_call", lambda *_args: bounded)
+    managed._handle(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup",
+                   "arguments": {"project_id": "aming-claw"}},
+    }))
     managed_frame = managed_output.getvalue().encode("utf-8").rstrip(b"\n")
     assert len(managed_frame) == sizes["managed_mcp"]
     assert json.loads(json.loads(managed_frame)["result"]["content"][0]["text"]) == bounded

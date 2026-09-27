@@ -8272,6 +8272,16 @@ class ToolDispatcher:
     ) -> dict:
         """Call governance with an endpoint-specific timeout when the host exposes it."""
         bound_owner = getattr(self._api, "__self__", None)
+        scoped_request = getattr(bound_owner, "_http_with_timeout", None)
+        if callable(scoped_request):
+            self._governance_url()  # Preserve dev-plane URL verification.
+            try:
+                return scoped_request(
+                    method, path, data, timeout_seconds=timeout_seconds,
+                )
+            except (TimeoutError, socket.timeout) as exc:
+                return {"ok": False, "error": "request_timeout",
+                        "message": str(exc), "timeout_seconds": timeout_seconds}
         request_json = getattr(bound_owner, "_request_json", None) if bound_owner is not None else None
         if callable(request_json):
             url = f"{self._governance_url()}{path}"
@@ -9443,7 +9453,18 @@ class ToolDispatcher:
             if "include_unowned" in args:
                 query["include_unowned"] = "true" if args.get("include_unowned") else "false"
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
-            return self._api("GET", f"/api/graph-governance/{pid}/stale-artifact-cleanup{qs}")
+            result = self._governance_api_with_timeout(
+                "GET", f"/api/graph-governance/{pid}/stale-artifact-cleanup{qs}",
+                timeout_seconds=45,
+            )
+            if _is_timeout_result(result):
+                if (type(result.get("writes_performed")) is bool
+                        or result.get("write_disposition") in ("written", "not_written")):
+                    return result
+                return {"ok": False, "error": "request_timeout",
+                        "timeout_seconds": 45, "writes_performed": False,
+                        "write_disposition": "not_written", "safe_retry": False}
+            return result
 
         if name == "stale_artifact_cleanup_apply":
             if str(args.get("dimension") or "") not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"}:
@@ -9454,11 +9475,27 @@ class ToolDispatcher:
                 for key, value in args.items()
                 if key != "project_id" and value is not None
             }
-            return self._api(
+            result = self._governance_api_with_timeout(
                 "POST",
                 f"/api/graph-governance/{pid}/stale-artifact-cleanup/apply",
                 body,
+                timeout_seconds=45,
             )
+            if _is_timeout_result(result):
+                if (type(result.get("writes_performed")) is bool
+                        or result.get("write_disposition") in ("written", "not_written")):
+                    return result
+                # The request may have reached the server before transport
+                # timed out. A client timeout is never a safe retry receipt.
+                bounded = {"ok": False, "error": "request_timeout",
+                           "timeout_seconds": 45, "writes_performed": None,
+                           "write_disposition": "ambiguous", "safe_retry": False}
+                if type(result.get("applied_count")) is int:
+                    bounded["applied_count"] = result["applied_count"]
+                if isinstance(result.get("applied_candidate_ids"), list):
+                    bounded["applied_candidate_ids"] = result["applied_candidate_ids"]
+                return bounded
+            return result
 
         if name == "graph_query":
             timeout_seconds = _contract_runtime_mcp_timeout_seconds(args)

@@ -881,12 +881,18 @@ class AmingClawMCP:
         return self.dispatcher.dispatch(tool_name, tool_args)
 
     def _http(self, method: str, path: str, data: dict = None) -> dict:
+        return self._http_with_timeout(method, path, data, timeout_seconds=15)
+
+    def _http_with_timeout(
+        self, method: str, path: str, data: dict = None, *, timeout_seconds: int,
+    ) -> dict:
+        """Keep the ordinary world-scope guard on endpoint-specific reads."""
         claims = _mcp_path_project_claims(path) + _mcp_project_claims(data or {})
         scope_error = self._world_scope_error(claims)
         if scope_error is not None:
             return scope_error
         url = f"{self.gov_url}{path}"
-        return self._request_json(method, url, data, timeout=15)
+        return self._request_json(method, url, data, timeout=timeout_seconds)
 
     def _manager_http(self, method: str, path: str, data: dict = None) -> dict:
         url = f"{self.manager_url}{path}"
@@ -1017,11 +1023,15 @@ class AmingClawMCP:
             try:
                 result = self._dispatch_tool_call(tool_name, tool_args)
                 compact_worker_guide = tool_name == "runtime_context_worker_guide"
+                compact_cleanup = tool_name in {
+                    "stale_artifact_cleanup", "stale_artifact_cleanup_apply",
+                }
                 result_text = json.dumps(
                     result,
                     ensure_ascii=False,
-                    separators=(",", ":") if compact_worker_guide else None,
-                    indent=None if compact_worker_guide else 2,
+                    separators=(",", ":")
+                    if compact_worker_guide or compact_cleanup else None,
+                    indent=None if compact_worker_guide or compact_cleanup else 2,
                 )
                 _response(
                     req_id,

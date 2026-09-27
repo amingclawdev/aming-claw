@@ -165,7 +165,10 @@ def cleanup_response_wire_bytes(result: dict[str, Any]) -> dict[str, int]:
     # cleanup handler returns; include that final field in the measurement.
     http_body = json.dumps({**result, "request_id": "req-" + "x" * 12},
                            ensure_ascii=False).encode("utf-8")
-    text_body = json.dumps(result, ensure_ascii=False, indent=2)
+    # Both cleanup MCP adapters embed this exact compact JSON text inside a
+    # second JSON-RPC frame. Pretty-print whitespace would make a representable
+    # source-shaped inventory exceed the bounded outer frame.
+    text_body = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     maximal_id = "x" * (_CLEANUP_MCP_ID_JSON_MAX_BYTES - 2)
     frame = {
         "jsonrpc": "2.0", "id": maximal_id,
