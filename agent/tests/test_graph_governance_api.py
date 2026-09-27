@@ -104017,6 +104017,137 @@ def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_pat
     assert not (repo / ".worktrees" / "batch-cleanup-api").exists()
 
 
+@pytest.mark.parametrize("dispatcher_kind", ["managed", "standalone"])
+def test_derived_pair_public_mcp_dispatch_and_http_frame(tmp_path, monkeypatch, dispatcher_kind):
+    from urllib.parse import parse_qs, urlsplit
+    from agent.tests.test_stale_artifact_cleanup import _new_terminal_derived_pair
+    from agent.governance import mcp_server as standalone_mcp
+    from agent.mcp import server as managed_mcp
+    from agent.mcp.server import AmingClawMCP
+    from agent.mcp.tools import ToolDispatcher
+
+    repo, connection, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "get_connection", lambda _id: _NoCloseConn(connection))
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_a, **_k: repo)
+    monkeypatch.setattr(server, "_require_graph_governance_operator",
+                        lambda *_a, **_k: {"role": "observer"})
+
+    def bridge(method, path, data=None, **_kwargs):
+        parsed = urlsplit(path)
+        query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+        ctx = _ctx({"project_id": "proj"}, method=method, query=query, body=data or {})
+        result = (server.handle_graph_governance_stale_artifact_cleanup(ctx)
+                  if method == "GET" else
+                  server.handle_graph_governance_stale_artifact_cleanup_apply(ctx))
+        if isinstance(result, tuple):
+            code, body = result
+            assert code == 200, body
+            return body
+        return result
+
+    if dispatcher_kind == "managed":
+        dispatcher = ToolDispatcher(bridge, None, project_id="proj")
+        monkeypatch.setattr(dispatcher, "_governance_api_with_timeout", bridge)
+        mcp = object.__new__(AmingClawMCP)
+        monkeypatch.setattr(mcp, "_dispatch_tool_call", dispatcher.dispatch)
+        output = io.StringIO()
+        monkeypatch.setattr(managed_mcp.sys, "stdout", output)
+        invoke = mcp._handle
+    else:
+        monkeypatch.setattr(standalone_mcp, "_http", bridge)
+        output = io.StringIO()
+        monkeypatch.setattr(standalone_mcp.sys, "stdout", output)
+        invoke = standalone_mcp._handle
+
+    def call(name, arguments):
+        output.seek(0)
+        output.truncate()
+        invoke(json.dumps({"jsonrpc": "2.0", "id": "fixture", "method": "tools/call",
+                           "params": {"name": name, "arguments": arguments}}))
+        frame = output.getvalue().encode("utf-8").rstrip(b"\n")
+        assert len(frame) <= 224 * 1024
+        return json.loads(json.loads(frame)["result"]["content"][0]["text"])
+
+    preview = call("stale_artifact_cleanup", {"project_id": "proj",
+                                               "dimension": "governance_index"})
+    candidate = preview["candidates"][0]
+    assert candidate["safe_to_apply"] is True
+    http_body = {**preview, "request_id": "req-" + "x" * 12}
+    handler = object.__new__(server.GovernanceHandler)
+    handler.wfile = io.BytesIO()
+    handler.send_response = lambda _code: None
+    handler.send_header = lambda _name, _value: None
+    handler.end_headers = lambda: None
+    handler._respond(200, http_body)
+    assert len(handler.wfile.getvalue()) <= 224 * 1024
+    result = call("stale_artifact_cleanup_apply", {
+        "project_id": "proj", "dimension": "governance_index",
+        "candidate_ids": [candidate["candidate_id"]],
+        "plan_hash": preview["plan_hash"], "plan_revision": preview["plan_revision"],
+    })
+    assert result["state"] == "pruned"
+    assert result["restore_rebuild"]["independent_rebuild"] is True
+
+
+def test_derived_pair_public_unpaired_preview_and_mid_tree_receipt(tmp_path, monkeypatch):
+    from agent.tests.test_stale_artifact_cleanup import _new_terminal_derived_pair
+    from agent.governance import db as governance_db
+    import shutil
+
+    repo, connection, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "get_connection", lambda _id: _NoCloseConn(connection))
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_a, **_k: repo)
+    monkeypatch.setattr(server, "_require_graph_governance_operator",
+                        lambda *_a, **_k: {"role": "observer"})
+    first = governance_db._governance_root() / "proj" / "governance-index" / "paired-run"
+    second = governance_db._governance_root() / "proj" / "state-reconcile" / "paired-run"
+    for dimension in ("governance_index", "state_reconcile", "all"):
+        view = server.handle_graph_governance_stale_artifact_cleanup(
+            _ctx({"project_id": "proj"}, query={"dimension": dimension}))
+        assert isinstance(view, dict)
+        assert len([item for item in view["candidates"]
+                    if item.get("artifact_type") == "derived_run_pair"]) == 1
+    preview = server.handle_graph_governance_stale_artifact_cleanup(
+        _ctx({"project_id": "proj"}, query={"dimension": "governance_index"}))
+    candidate = next(item for item in preview["candidates"]
+                     if item["artifact_type"] == "derived_run_pair")
+    original_remove = shutil.rmtree
+
+    def fail_first(path, *args, **kwargs):
+        if Path(path) == first:
+            (first / "summary.json").unlink()
+            raise OSError("injected first-tree partial")
+        return original_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(stale_artifact_cleanup.shutil, "rmtree", fail_first)
+    status, payload = server.handle_graph_governance_stale_artifact_cleanup_apply(
+        _ctx({"project_id": "proj"}, method="POST", body={
+            "candidate_ids": [candidate["candidate_id"]],
+            "plan_hash": preview["plan_hash"],
+            "plan_revision": preview["plan_revision"],
+            "dimension": "governance_index",
+        }))
+    assert status == 400
+    assert payload["state"] == payload["write_disposition"] == "partial"
+    assert payload["partially_removed_members"] == ["governance_index"]
+    assert "summary.json" in payload["missing_files"]["governance_index"]
+    assert payload["archive_verified"] is True
+    assert first.is_dir() and second.is_dir()
+    assert stale_artifact_cleanup.cleanup_response_wire_bytes(payload)["http"] <= 224 * 1024
+    restored = stale_artifact_cleanup.recover_derived_run_pair_from_archive(
+        "proj", candidate["candidate_id"])
+    assert restored["state"] == "restored_after_partial"
+    shutil.rmtree(second)
+    for dimension in ("governance_index", "state_reconcile", "all"):
+        view = server.handle_graph_governance_stale_artifact_cleanup(
+            _ctx({"project_id": "proj"}, query={"dimension": dimension}))
+        pair = next(item for item in view["candidates"]
+                    if item.get("artifact_type") == "derived_run_pair")
+        assert pair["candidate_id"] == candidate["candidate_id"]
+        assert pair["safe_to_apply"] is False
+        assert "missing_or_unpaired:state_reconcile" in pair["refusal_reasons"]
+
+
 def test_stale_cleanup_http_exception_frames_are_finite(monkeypatch, conn, tmp_path):
     monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
     monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_a, **_k: tmp_path)

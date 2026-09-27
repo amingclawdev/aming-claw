@@ -779,6 +779,30 @@ def persist_governance_index(
         "inventory_rows_persisted": inventory_count,
         "artifacts": {name: str(path) for name, path in artifacts.items()},
         "generated_at": _utc_now(),
+        # A future reclaim may only use a paired trace carrying an executable
+        # recipe. This generation-time record pins the exact index inputs; a
+        # legacy summary without it is never inferred to be reconstructable.
+        "derived_rebuild_inputs": {
+            "schema_version": 1,
+            "project_root": str(index.get("project_root") or ""),
+            "checkout_provenance": index.get("checkout_provenance") or {},
+            "run_id": run_id,
+            "snapshot_id": (index.get("active_snapshot") or {}).get("snapshot_id", ""),
+            "commit_sha": index.get("commit_sha") or "",
+            "index_scope": index.get("index_scope") or "",
+            "input_digests": {
+                name: _hash_payload(index.get(key) or default)
+                for name, key, default in (
+                    ("profile", "profile", {}),
+                    ("file_inventory", "file_inventory", []),
+                    ("symbol_index", "symbol_index", {}),
+                    ("doc_index", "doc_index", {}),
+                    ("doc_asset_state", "doc_asset_state", {}),
+                    ("feature_index", "feature_index", {}),
+                    ("coverage_state", "coverage_state", {}),
+                )
+            },
+        },
     }
     _write_json(artifacts["summary_path"], summary)
     return summary

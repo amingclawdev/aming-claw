@@ -480,6 +480,10 @@ def test_state_only_full_reconcile_reuses_phase_parsed_modules_for_governance_in
 
     assert result["ok"] is True
     assert captured["parsed_modules_present"] is True
+    supported_trace_dir = Path(result["trace"]["steps"][0]["input"]["path"]).parents[2]
+    supported_recipe = json.loads((supported_trace_dir / "derived-rebuild.json").read_text())
+    assert supported_recipe["recipe"] == "state_only_full_reconcile.v1"
+    assert supported_recipe["canonical_output"]["graph_stats"] == result["graph_stats"]
     assert captured["parsed_module_count"] > 0
     trace_dir = Path(result["trace"]["steps"][0]["input"]["path"]).parents[2]
     build_graph_output = (
@@ -522,6 +526,10 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     assert result["trace"]["step_count"] >= 7
     trace_dir = Path(result["trace"]["steps"][0]["input"]["path"]).parents[2]
     assert (trace_dir / "summary.json").exists()
+    rebuild = json.loads((trace_dir / "derived-rebuild.json").read_text())
+    assert rebuild["recipe"] == "unsupported"
+    assert rebuild["run_id"] == result["run_id"]
+    assert rebuild["canonical_output"]["graph_stats"] == result["graph_stats"]
     assert (trace_dir / "steps" / "001-run-input" / "input.json").exists()
     assert (trace_dir / "steps" / "002-build-graph-v2" / "output.json").exists()
     run_input = json.loads((trace_dir / "steps" / "001-run-input" / "input.json").read_text(encoding="utf-8"))

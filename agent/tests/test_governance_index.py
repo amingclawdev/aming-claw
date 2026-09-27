@@ -220,6 +220,10 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
 
     assert summary["inventory_rows_persisted"] == len(index["file_inventory"])
     assert summary["feature_count"] == 1
+    pinned = summary["derived_rebuild_inputs"]
+    assert pinned["run_id"] == "index-abc1234-test"
+    assert pinned["commit_sha"] == "abc1234"
+    assert pinned["input_digests"]["file_inventory"].startswith("sha256:")
     for path in summary["artifacts"].values():
         assert Path(path).exists()
     profile_payload = json.loads(Path(summary["artifacts"]["profile_path"]).read_text(encoding="utf-8"))
@@ -238,6 +242,25 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     assert persisted["file_hash"].startswith("sha256:")
     assert json.loads(persisted["attached_node_ids"]) == ["L7.service"]
     assert persisted["attachment_role"] == "doc"
+
+
+def test_index_summary_pins_generation_inputs_without_graph_activation(conn, tmp_path):
+    project = tmp_path / "project-pinned"
+    project.mkdir()
+    _write_project(project)
+    index = build_governance_index(
+        conn, PID, project, run_id="pinned-index", commit_sha="abc1234",
+        include_active_graph=False,
+    )
+    summary = persist_governance_index(
+        conn, PID, index, artifact_root=tmp_path / "pinned-artifacts",
+        persist_inventory=False,
+    )
+    pinned = summary["derived_rebuild_inputs"]
+    assert pinned["run_id"] == "pinned-index"
+    assert pinned["commit_sha"] == "abc1234"
+    assert pinned["input_digests"]["file_inventory"].startswith("sha256:")
+    assert json.loads(Path(summary["artifacts"]["summary_path"]).read_text()) == summary
 
 
 def test_build_governance_index_can_use_candidate_graph_before_activation(conn, tmp_path):

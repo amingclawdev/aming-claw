@@ -11,6 +11,8 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
+import tarfile
 import tempfile
 import uuid
 from contextlib import closing, contextmanager, nullcontext
@@ -39,6 +41,7 @@ ALL_DIMENSIONS = {
     DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE, DIMENSION_ALL,
 }
 PLAN_REVISION = 1
+DERIVED_PAIR_PLAN_REVISION = 2
 ARCHIVE_PLAN_REVISION = 1
 ARCHIVE_ROOT_ENV = "AMING_CLAW_WORKTREE_ARCHIVE_ROOT"
 # A missing store cannot prove absence of a session, lease, CEX, queue, or
@@ -367,7 +370,10 @@ def _plan_hash(project_id: str, dimension: str, candidates: list[dict[str, Any]]
         "evidence": item.get("evidence"),
     } for item in candidates]
     payload = {"project_id": project_id, "dimension": dimension,
-               "plan_revision": PLAN_REVISION, "candidates": items}
+               "plan_revision": (DERIVED_PAIR_PLAN_REVISION if any(
+                   item.get("artifact_type") == "derived_run_pair" for item in candidates
+               ) else PLAN_REVISION),
+               "candidates": items}
     return "sha256:" + hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str,
     ).encode("utf-8")).hexdigest()
@@ -484,6 +490,279 @@ def _derived_preview(project_id: str, dimension: str) -> tuple[list[dict[str, An
                          "created_at": created_at, "size_bytes": size},
         })
     return result[:PREVIEW_LIMIT], len(children) > PREVIEW_LIMIT, len(children), total_bytes
+
+
+def _derived_pair_candidate_id(run_id: str) -> str:
+    return _candidate_id("derived_run_pair", run_id)
+
+
+def _derived_tree_facts(path: Path) -> dict[str, Any]:
+    """Bounded, no-follow inventory; logical bytes never stand in for reclaimed bytes."""
+    members = _archive_source_members(path)
+    allocated = 0
+    logical = 0
+    member_allocated: dict[str, int] = {}
+    seen: set[tuple[int, int]] = set()
+    for member in members:
+        info = (path / member["path"]).lstat()
+        logical += info.st_size
+        member_allocated[member["path"]] = info.st_blocks * 512
+        key = (info.st_dev, info.st_ino)
+        if key not in seen:
+            allocated += info.st_blocks * 512
+            seen.add(key)
+    return {"members": members, "logical_bytes": logical,
+            "member_allocated_bytes": member_allocated,
+            "allocated_bytes": allocated, "identity": _path_identity(str(path))}
+
+
+def _derived_rebuild_source_reason(provenance: dict[str, Any], commit: str) -> str:
+    source = Path(str(provenance.get("project_root") or ""))
+    if (_path_identity(str(source)) is None or not (source / ".git").exists()
+            or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+        return "derived_rebuild_source_unavailable"
+    try:
+        head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=30, check=False)
+        clean = subprocess.run(["git", "-C", str(source), "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "derived_rebuild_source_unavailable"
+    if (head.returncode or head.stdout.strip() != commit
+            or clean.returncode or clean.stdout.strip()):
+        return "derived_rebuild_source_commit_drift"
+    return ""
+
+
+def _derived_exact_reference_reasons(
+    conn: sqlite3.Connection, project_id: str, run_id: str,
+    snapshot_id: str, source_paths: dict[str, str],
+) -> list[str]:
+    """Check live exact identities. Historical event text is retained evidence."""
+    reasons = _archive_reference_inventory_reasons(conn, project_id=project_id)
+    if reasons:
+        return reasons
+    if project_id == "aming-claw":
+        _stable_facts, stable_reasons = _stable_release_queue_reference_facts(
+            tokens=(run_id, snapshot_id, *source_paths.values()),
+        )
+        reasons.extend(reason for reason in stable_reasons
+                       if reason != "referenced_by_stable_release_operator_head_queue_events")
+        if reasons:
+            return sorted(set(reasons))
+    if not _table_exists(conn, "graph_snapshots"):
+        return ["reference_inventory_missing:graph_snapshots"]
+    try:
+        for required in ("graph_snapshot_refs", "pending_scope_reconcile",
+                         "graph_current_full_build_claim_history"):
+            if not _table_exists(conn, required):
+                return ["reference_inventory_missing:" + required]
+        rows = conn.execute(
+            "SELECT status FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+            (project_id, snapshot_id),
+        ).fetchall()
+        if len(rows) != 1:
+            return ["snapshot_identity_missing_or_ambiguous"]
+        if str(rows[0][0] or "").lower() not in {"superseded", "retired"}:
+            reasons.append("protected:snapshot_not_terminal")
+        if conn.execute(
+            "SELECT 1 FROM graph_snapshot_refs WHERE project_id=? AND snapshot_id=? LIMIT 1",
+            (project_id, snapshot_id),
+        ).fetchone():
+            reasons.append("protected:current_graph_ref")
+        newest = conn.execute(
+            "SELECT snapshot_id FROM graph_snapshots WHERE project_id=? "
+            "ORDER BY created_at DESC, snapshot_id DESC LIMIT 1", (project_id,),
+        ).fetchone()
+        if newest and newest[0] == snapshot_id:
+            reasons.append("protected:newest_snapshot")
+        if conn.execute(
+            "SELECT 1 FROM pending_scope_reconcile WHERE project_id=? AND snapshot_id=? "
+            "AND lower(status) NOT IN ('complete','failed','cancelled','superseded') LIMIT 1",
+            (project_id, snapshot_id),
+        ).fetchone():
+            reasons.append("protected:nonterminal_reconcile")
+        if conn.execute(
+            "SELECT 1 FROM graph_current_full_build_claim_history "
+            "WHERE project_id=? AND (snapshot_id=? OR run_id=?) AND status='active' LIMIT 1",
+            (project_id, snapshot_id, run_id),
+        ).fetchone():
+            reasons.append("protected:active_build_claim")
+        # Project and commit alone occur in normal history and are deliberately
+        # absent from these tokens. Only an exact live run/path/snapshot link
+        # can prevent reclaim after the archive preserves historical evidence.
+        tokens = {run_id, snapshot_id, *source_paths.values()}
+        history = {"task_timeline_events",
+                   "release_operator_head_queue_events"}
+        scanned = 0
+        for table in sorted(_ARCHIVE_REFERENCE_COLUMNS):
+            if table in history or (project_id == "aming-claw" and table in _STABLE_QUEUE_REFERENCE_TABLES):
+                continue
+            quoted = '"' + table.replace('"', '""') + '"'
+            cursor = conn.execute(f"SELECT * FROM {quoted}")
+            cols = [column[0] for column in cursor.description]
+            while chunk := cursor.fetchmany(256):
+                scanned += len(chunk)
+                if scanned > 250_000:
+                    return ["reference_inventory_unbounded"]
+                for row in chunk:
+                    record = dict(zip(cols, row))
+                    if table == "session_context":
+                        task_id = str(record.get("task_id") or "")
+                        task = conn.execute("SELECT status FROM tasks WHERE task_id=? LIMIT 1",
+                                            (task_id,)).fetchone()
+                        if task is None:
+                            return ["reference_inventory_unknown:session_context.task"]
+                        if str(task[0] or "").lower() in {
+                            "complete", "completed", "closed", "done", "failed",
+                            "cancelled", "abandoned", "superseded", "merged", "fixed",
+                        }:
+                            continue
+                    if table == "contract_runtime_executions":
+                        try:
+                            contract = _json_dict(record.get("record_json"))
+                            guide = contract.get("runtime_guide")
+                        except (TypeError, ValueError):
+                            return ["reference_inventory_corrupt:contract_runtime_executions.record_json"]
+                        if not isinstance(guide, dict) or "next_legal_action" not in guide:
+                            return ["reference_inventory_schema_incomplete:contract_runtime_executions.runtime_guide"]
+                        if guide["next_legal_action"] is None:
+                            continue
+                    status = str(record.get("status") or "").lower()
+                    if status in {"complete", "completed", "closed", "done", "failed",
+                                  "cancelled", "abandoned", "superseded", "merged", "fixed",
+                                  "succeeded", "success", "ok"}:
+                        continue
+                    for key, value in record.items():
+                        if key.endswith("_json") and value not in (None, "", b""):
+                            try:
+                                json.loads(value)
+                            except (TypeError, ValueError, UnicodeError):
+                                return ["reference_inventory_corrupt:" + table + "." + key]
+                    values = [str(value) for value in record.values() if isinstance(value, (str, bytes))]
+                    if any(token == value or token in value for token in tokens for value in values):
+                        reasons.append("referenced_by_" + table)
+                        break
+        return sorted(set(reasons))
+    except sqlite3.Error:
+        return ["reference_inventory_unavailable"]
+
+
+def _derived_pair_preview(
+    conn: sqlite3.Connection, project_id: str,
+) -> tuple[list[dict[str, Any]], bool, int, int]:
+    """One canonical candidate per run, shared by both named views and all."""
+    from .db import _governance_root
+
+    base = _governance_root() / project_id
+    roots = {DIMENSION_GOVERNANCE_INDEX: base / "governance-index",
+             DIMENSION_STATE_RECONCILE: base / "state-reconcile"}
+    names: set[str] = set()
+    refusal: list[str] = []
+    for kind, root in roots.items():
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            refusal.append("derived_root_unreadable_or_symlink:" + kind)
+            continue
+        if root.exists():
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                refusal.append("derived_root_unreadable:" + kind)
+                continue
+            if len(children) > PREVIEW_LIMIT:
+                return [], True, len(children), 0
+            names.update(child.name for child in children)
+    if refusal:
+        return [{"candidate_id": _derived_pair_candidate_id("inventory_error"),
+                 "artifact_type": "derived_run_pair", "action": "archive_derived_run_pair",
+                 "safe_to_apply": False, "refusal_reasons": refusal,
+                 "evidence": {"project_id": project_id}}], False, 1, 0
+    if len(names) > PREVIEW_LIMIT:
+        return [], True, len(names), 0
+    archive_root = _archive_root_descriptor()
+    source_readiness: dict[tuple[str, str], str] = {}
+    candidates: list[dict[str, Any]] = []
+    total_bytes = 0
+    for run_id in sorted(names):
+        paths = {kind: root / run_id for kind, root in roots.items()}
+        reasons: list[str] = []
+        facts: dict[str, Any] = {}
+        for kind, path in paths.items():
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id) or run_id in {".", ".."}:
+                reasons.append("run_id_path_invalid")
+                break
+            if not path.exists() or path.is_symlink() or not path.is_dir():
+                reasons.append("missing_or_unpaired:" + kind)
+                if path.is_symlink():
+                    reasons.append("derived_path_symlink_refused:" + kind)
+                continue
+            try:
+                facts[kind] = _derived_tree_facts(path)
+                if facts[kind]["identity"] is None:
+                    reasons.append("source_path_identity_unverified:" + kind)
+            except (OSError, StaleArtifactCleanupError):
+                reasons.append("source_unreadable_or_unbounded:" + kind)
+        index_summary: dict[str, Any] = {}
+        trace_summary: dict[str, Any] = {}
+        provenance: dict[str, Any] = {}
+        if len(facts) == 2:
+            try:
+                index_summary = _json_dict((paths[DIMENSION_GOVERNANCE_INDEX] / "summary.json").read_text())
+                trace_summary = _json_dict((paths[DIMENSION_STATE_RECONCILE] / "trace/summary.json").read_text())
+                provenance = _json_dict((paths[DIMENSION_STATE_RECONCILE] / "trace/derived-rebuild.json").read_text())
+            except (OSError, ValueError, UnicodeError):
+                reasons.append("legacy_missing_rebuild_provenance")
+        snapshot_id = str(trace_summary.get("snapshot_id") or "")
+        commit = str(index_summary.get("commit_sha") or "")
+        if len(facts) == 2:
+            if (index_summary.get("run_id") != run_id or trace_summary.get("run_id") != run_id
+                    or not snapshot_id or index_summary.get("active_snapshot_id") != snapshot_id
+                    or not commit or provenance.get("run_id") != run_id
+                    or provenance.get("snapshot_id") != snapshot_id
+                    or provenance.get("commit_sha") != commit):
+                reasons.append("pair_identity_mismatch")
+            if trace_summary.get("status") != "ok":
+                reasons.append("run_not_terminal")
+            if provenance.get("recipe") != "state_only_full_reconcile.v1":
+                reasons.append("rebuild_recipe_unsupported")
+            else:
+                source_key = (str(provenance.get("project_root") or ""), commit)
+                if source_key not in source_readiness:
+                    source_readiness[source_key] = _derived_rebuild_source_reason(
+                        provenance, commit,
+                    )
+                if source_readiness[source_key]:
+                    reasons.append(source_readiness[source_key])
+            reasons.extend(_derived_exact_reference_reasons(
+                conn, project_id, run_id, snapshot_id,
+                {kind: str(path) for kind, path in paths.items()},
+            ))
+        if not archive_root.get("verified"):
+            reasons.append(str(archive_root.get("reason") or "archive_root_unverified"))
+        logical = sum(value["logical_bytes"] for value in facts.values())
+        allocated = sum(value["allocated_bytes"] for value in facts.values())
+        total_bytes += logical
+        if archive_root.get("verified") and int(archive_root.get("free_bytes") or 0) < logical * 2:
+            reasons.append("archive_capacity_insufficient")
+        candidates.append({
+            "candidate_id": _derived_pair_candidate_id(run_id),
+            "artifact_type": "derived_run_pair", "action": "archive_derived_run_pair",
+            "path": str(paths[DIMENSION_GOVERNANCE_INDEX]),
+            "source_paths": {kind: str(path) for kind, path in paths.items()},
+            "safe_to_apply": not reasons, "refusal_reasons": sorted(set(reasons)),
+            "evidence": {"project_id": project_id, "run_id": run_id,
+                         "paired": all(path.exists() and path.is_dir() and not path.is_symlink()
+                                       for path in paths.values()),
+                         "snapshot_id": snapshot_id, "commit_sha": commit,
+                         "status": str(trace_summary.get("status") or "unknown"),
+                         "size_bytes": logical, "logical_bytes": logical,
+                         "allocated_bytes": allocated,
+                         "source_volume": {kind: value["identity"] for kind, value in facts.items()},
+                         "archive_volume": {key: value for key, value in archive_root.items()
+                                            if key != "free_bytes"},
+                         "rebuild_recipe": provenance.get("recipe") or "unsupported"},
+        })
+    return candidates, False, len(candidates), total_bytes
 
 
 def cleanup_recommendation(project_id: str) -> dict[str, Any]:
@@ -863,20 +1142,26 @@ def build_stale_artifact_cleanup_projection(
     """
     dim = _dimension(dimension)
     if dim in {DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE}:
-        derived, truncated, total, total_bytes = _derived_preview(project_id, dim)
+        derived, truncated, total, total_bytes = _derived_pair_preview(conn, project_id)
+        # An orphaned half is still the canonical pair candidate. Only an
+        # entirely empty pair inventory needs the old standalone preview.
+        paired_view = bool(derived)
+        if not paired_view:
+            derived, truncated, total, total_bytes = _derived_preview(project_id, dim)
+        safe = sum(item.get("safe_to_apply") is True for item in derived)
         result = {
             "ok": True, "mode": "dry_run", "dry_run": True,
             "project_id": project_id, "dimension": dim,
-            "plan_revision": PLAN_REVISION,
+            "plan_revision": DERIVED_PAIR_PLAN_REVISION if paired_view else PLAN_REVISION,
             "plan_hash": _plan_hash(project_id, dim, derived),
-            "summary": {"candidate_count": len(derived), "safe_apply_count": 0,
+            "summary": {"candidate_count": len(derived), "safe_apply_count": safe,
                         "total_candidate_count": total,
-                        "unsafe_candidate_count": total,
+                        "unsafe_candidate_count": total - safe,
                         "size_bytes": total_bytes,
                         "truncated": truncated,
                         "dimensions": {dim: {"count": total, "visible_count": len(derived),
-                                             "safe_count": 0, "size_bytes": total_bytes,
-                                             "refused_count": total, "truncated": truncated}}},
+                                             "safe_count": safe, "size_bytes": total_bytes,
+                                             "refused_count": total - safe, "truncated": truncated}}},
             "candidates": derived,
             "append_only_retained": {"policy": "retain_append_only_evidence", "deleted": False},
             "cleanup": cleanup_recommendation(project_id),
@@ -1120,29 +1405,42 @@ def build_stale_artifact_cleanup_projection(
         all_candidates = candidates + snapshot_candidates
 
     derived_truncated = False
+    paired_all = False
     derived_counts: dict[str, tuple[int, int]] = {}
     if dim == DIMENSION_ALL:
-        for derived_dim in (DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE):
-            derived, truncated, _total, _bytes = _derived_preview(project_id, derived_dim)
-            derived_counts[derived_dim] = (_total, _bytes)
+        derived, derived_truncated, derived_total, derived_bytes = _derived_pair_preview(conn, project_id)
+        paired_all = bool(derived)
+        if paired_all:
             all_candidates.extend(derived)
-            derived_truncated = derived_truncated or truncated
+            for derived_dim in (DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE):
+                derived_counts[derived_dim] = (derived_total, derived_bytes)
+        else:
+            derived_truncated = False
+            for derived_dim in (DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE):
+                legacy, legacy_truncated, legacy_total, legacy_bytes = _derived_preview(project_id, derived_dim)
+                all_candidates.extend(legacy)
+                derived_counts[derived_dim] = (legacy_total, legacy_bytes)
+                derived_truncated = derived_truncated or legacy_truncated
     total_candidates = len(all_candidates) + sum(
-        count - sum(item.get("artifact_type") == key for item in all_candidates)
-        for key, (count, _bytes) in derived_counts.items()
+        max(0, count - len([item for item in all_candidates if item.get("artifact_type") in {
+            "derived_run_pair", DIMENSION_GOVERNANCE_INDEX}]))
+        for key, (count, _bytes) in derived_counts.items() if key == DIMENSION_GOVERNANCE_INDEX
     )
     truncated = derived_truncated or total_candidates > PREVIEW_LIMIT
     total_bytes, unknown_sizes = _candidate_size_totals(all_candidates)
-    total_bytes += sum(max(0, byte_count - sum(
-        int((item.get("evidence") or {}).get("size_bytes") or 0)
-        for item in all_candidates if item.get("artifact_type") == key))
-        for key, (_count, byte_count) in derived_counts.items())
+    if not paired_all:
+        total_bytes += sum(max(0, byte_count - sum(
+            int((item.get("evidence") or {}).get("size_bytes") or 0)
+            for item in all_candidates if item.get("artifact_type") == key))
+            for key, (_count, byte_count) in derived_counts.items())
     def in_dimension(item: dict[str, Any], key: str) -> bool:
         kind = str(item.get("artifact_type") or "")
         return (kind in {"batch_worktree", "backlog_worktree_reference"}
                 if key == DIMENSION_WORKTREES else
                 kind == "graph_snapshot_dir" if key == DIMENSION_GRAPH_SNAPSHOTS else
-                kind == key)
+                kind in {"derived_run_pair", key} if key in {
+                    DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE}
+                else kind == key)
     dimension_summary = {}
     for key in (DIMENSION_WORKTREES, DIMENSION_GRAPH_SNAPSHOTS,
                 DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE):
@@ -1335,6 +1633,14 @@ def _apply_stale_artifact_cleanup_locked(
     """Apply explicit safe cleanup candidates and record timeline evidence."""
 
     dim = _dimension(dimension)
+    if (dim in {DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE}
+            and len(candidate_ids) == 1 and plan_hash
+            and plan_revision == DERIVED_PAIR_PLAN_REVISION):
+        replay = _derived_pair_replay(project_id, candidate_ids[0], dim, plan_hash)
+        if replay is not None:
+            return {"ok": True, "mode": "apply", "dry_run": False,
+                    "project_id": project_id, "applied_count": 0,
+                    "applied_candidate_ids": [], **replay}
     projection = build_stale_artifact_cleanup_projection(
         conn,
         project_id,
@@ -1351,13 +1657,14 @@ def _apply_stale_artifact_cleanup_locked(
             "apply_plan_available": False, "writes_performed": False,
             "safe_retry": False,
         })
-    if (type(plan_revision) is not int or plan_revision != PLAN_REVISION
+    expected_revision = projection.get("plan_revision", PLAN_REVISION)
+    if (type(plan_revision) is not int or plan_revision != expected_revision
             or plan_hash != projection["plan_hash"]
             or projection["summary"].get("truncated")):
         raise StaleArtifactCleanupError("stale_cleanup_plan_refused", {
             "ok": False, "error": "stale_cleanup_plan_refused",
             "current_plan_hash": projection["plan_hash"],
-            "current_plan_revision": PLAN_REVISION,
+            "current_plan_revision": expected_revision,
         })
     if not candidate_ids:
         payload = {
@@ -1381,6 +1688,26 @@ def _apply_stale_artifact_cleanup_locked(
             "plan_hash": projection["plan_hash"],
         }
         raise StaleArtifactCleanupError("unsafe_stale_artifact_cleanup_refused", payload)
+
+    derived_items = [by_id[item] for item in requested
+                     if by_id[item].get("artifact_type") == "derived_run_pair"]
+    if derived_items:
+        if len(requested) != 1 or len(derived_items) != 1 or remove_branch:
+            raise StaleArtifactCleanupError("single_derived_pair_required", {
+                "ok": False, "error": "single_derived_pair_required",
+                "writes_performed": False,
+            })
+        with (_stable_queue_exclusive_fence() if project_id == "aming-claw"
+              else nullcontext()):
+            receipt = _derived_pair_archive_and_prune(
+                conn, project_id, derived_items[0], repo_root_path=repo_root_path,
+                dimension=dim, plan_hash=plan_hash, backlog_id=backlog_id,
+                task_id=task_id, actor=actor,
+            )
+        return {"ok": True, "mode": "apply", "dry_run": False,
+                "project_id": project_id, "applied_count": 1,
+                "applied_candidate_ids": [derived_items[0]["candidate_id"]],
+                **receipt}
 
     archive_items = [by_id[item] for item in requested
                      if by_id[item].get("artifact_type") == "batch_worktree"]
@@ -2180,6 +2507,643 @@ def _archive_cold_restore(bundle: Path, manifest: dict[str, Any]) -> dict[str, A
         _archive_verify_members(checkout, members)
     return {"verified": True, "head": manifest["head"],
             "tree": manifest["tree"], "member_count": len(members)}
+
+
+def _derived_rebuild_proof(restored_root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Recompute index and trace semantics from the pinned restored inputs."""
+    from .governance_index import _hash_payload
+    from .reconcile_file_inventory import summarize_file_inventory
+
+    index_dir = restored_root / "governance-index" / manifest["run_id"]
+    trace_dir = restored_root / "state-reconcile" / manifest["run_id"] / "trace"
+    summary = _json_dict((index_dir / "summary.json").read_text(encoding="utf-8"))
+    trace = _json_dict((trace_dir / "summary.json").read_text(encoding="utf-8"))
+    recipe = _json_dict((trace_dir / "derived-rebuild.json").read_text(encoding="utf-8"))
+    for field in ("project_id", "run_id", "snapshot_id", "commit_sha"):
+        if recipe.get(field) != manifest.get(field):
+            raise StaleArtifactCleanupError("derived_rebuild_identity_mismatch")
+    if (recipe.get("recipe") != "state_only_full_reconcile.v1"
+            or summary.get("run_id") != manifest["run_id"]
+            or summary.get("active_snapshot_id") != manifest["snapshot_id"]
+            or summary.get("commit_sha") != manifest["commit_sha"]
+            or trace.get("status") != "ok"
+            or trace.get("snapshot_id") != manifest["snapshot_id"]):
+        raise StaleArtifactCleanupError("derived_rebuild_unsupported_or_incomplete")
+    inputs = recipe.get("index_inputs") or {}
+    if inputs != summary.get("derived_rebuild_inputs") or not inputs.get("input_digests"):
+        raise StaleArtifactCleanupError("derived_rebuild_inputs_mismatch")
+    names = {
+        "profile": "project-profile.json", "file_inventory": "file-inventory.json",
+        "symbol_index": "symbol-index.json", "doc_index": "doc-index.json",
+        "doc_asset_state": "doc-asset-state.json", "feature_index": "feature-index.json",
+        "coverage_state": "coverage-state.json",
+    }
+    decoded: dict[str, Any] = {}
+    for key, filename in names.items():
+        path = index_dir / filename
+        if path.is_symlink() or not path.is_file():
+            raise StaleArtifactCleanupError("derived_rebuild_member_missing")
+        decoded[key] = json.loads(path.read_text(encoding="utf-8"))
+        if _hash_payload(decoded[key]) != inputs["input_digests"].get(key):
+            raise StaleArtifactCleanupError("derived_rebuild_index_digest_mismatch")
+    rebuilt_inventory = summarize_file_inventory(decoded["file_inventory"])
+    if rebuilt_inventory != summary.get("file_inventory_summary"):
+        raise StaleArtifactCleanupError("derived_rebuild_inventory_mismatch")
+    steps = trace.get("steps") or []
+    pinned_steps = recipe.get("trace_steps") or []
+    if not steps or len(steps) != len(pinned_steps):
+        raise StaleArtifactCleanupError("derived_rebuild_trace_incomplete")
+    for offset, (step, pinned) in enumerate(zip(steps, pinned_steps), start=1):
+        if {key: step.get(key) for key in ("index", "name", "status")} != pinned:
+            raise StaleArtifactCleanupError("derived_rebuild_trace_mismatch")
+        slug = f"{offset:03d}-{step.get('name')}"
+        folder = trace_dir / "steps" / slug
+        if (step.get("index") != offset or folder.is_symlink()
+                or not all((folder / name).is_file() and not (folder / name).is_symlink()
+                           for name in ("input.json", "output.json", "step.json"))):
+            raise StaleArtifactCleanupError("derived_rebuild_trace_incomplete")
+        readback = _json_dict((folder / "step.json").read_text(encoding="utf-8"))
+        if readback != step:
+            raise StaleArtifactCleanupError("derived_rebuild_trace_mismatch")
+        for field, filename in (("input", "input.json"), ("output", "output.json")):
+            digest = _archive_file_digest(folder / filename)[1].removeprefix("sha256:")
+            if (step.get(field) or {}).get("sha256") != digest:
+                raise StaleArtifactCleanupError("derived_rebuild_trace_digest_mismatch")
+    canonical = {"inventory": rebuilt_inventory,
+                 "index_input_digests": inputs["input_digests"],
+                 "trace_steps": pinned_steps,
+                 "run_id": manifest["run_id"], "snapshot_id": manifest["snapshot_id"]}
+    return {"verified": True, "canonical_digest": "sha256:" + hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":"),
+                   default=str).encode("utf-8")).hexdigest(),
+            "step_count": len(steps)}
+
+
+def _derived_pair_index_path(archive_root: Path, project_id: str, candidate_id: str) -> Path:
+    if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", project_id)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", candidate_id)):
+        raise StaleArtifactCleanupError("archive_identity_invalid")
+    return archive_root / project_id / "derived-run-pairs" / "index" / (candidate_id + ".json")
+
+
+def _derived_pinned_source_archive(path: Path, provenance: dict[str, Any], commit: str) -> dict[str, Any]:
+    """Package the exact clean Git tree used by the supported rebuild recipe."""
+    source = Path(str(provenance.get("project_root") or ""))
+    readiness = _derived_rebuild_source_reason(provenance, commit)
+    if readiness:
+        raise StaleArtifactCleanupError(readiness)
+    inventory = subprocess.run(["git", "-C", str(source), "ls-tree", "-r", "-l", "-z", "HEAD"],
+                               capture_output=True, timeout=30, check=False)
+    if inventory.returncode:
+        raise StaleArtifactCleanupError("derived_rebuild_source_unreadable")
+    entries = inventory.stdout.split(b"\0")
+    if len(entries) > 50_001:
+        raise StaleArtifactCleanupError("derived_rebuild_source_unbounded")
+    total = 0
+    for entry in entries:
+        if not entry:
+            continue
+        try:
+            size = int(entry.split(b"\t", 1)[0].split()[-1])
+        except (IndexError, ValueError):
+            raise StaleArtifactCleanupError("derived_rebuild_source_unreadable") from None
+        total += size
+        if total > 512 * 1024 * 1024:
+            raise StaleArtifactCleanupError("derived_rebuild_source_unbounded")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(path.parent).free < total + 1024 * 1024:
+        raise StaleArtifactCleanupError("derived_rebuild_archive_capacity_insufficient")
+    with path.open("xb") as handle:
+        exported = subprocess.run(["git", "-C", str(source), "archive", "--format=tar", "HEAD"],
+                                  stdout=handle, stderr=subprocess.PIPE, timeout=120,
+                                  check=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if exported.returncode or path.stat().st_size > 768 * 1024 * 1024:
+        raise StaleArtifactCleanupError("derived_rebuild_source_archive_failed")
+    return {"sha256": _archive_file_digest(path)[1], "size": path.stat().st_size,
+            "commit_sha": commit, "file_count": len(entries) - 1}
+
+
+def _derived_execute_rebuild(bundle: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Run the pinned full-reconcile recipe in a fresh process and temp root."""
+    tar_path = bundle / "inputs" / "source.tar"
+    input_archive = manifest.get("source_archive") or {}
+    if (_archive_file_digest(tar_path)[1] != input_archive.get("sha256")
+            or tar_path.stat().st_size != input_archive.get("size")):
+        raise StaleArtifactCleanupError("derived_rebuild_source_archive_mismatch")
+    with tempfile.TemporaryDirectory(prefix="ac-derived-rebuild-") as temporary:
+        root = Path(temporary)
+        checkout = root / "checkout"
+        checkout.mkdir()
+        with tarfile.open(tar_path, "r:") as archive:
+            members = archive.getmembers()
+            if len(members) > 50_000:
+                raise StaleArtifactCleanupError("derived_rebuild_source_unbounded")
+            for member in members:
+                relative = Path(member.name)
+                if (relative.is_absolute() or ".." in relative.parts
+                        or not (member.isdir() or member.isfile())):
+                    raise StaleArtifactCleanupError("derived_rebuild_source_path_invalid")
+            archive.extractall(checkout, filter="data")
+        for args in (("init", "-q"), ("config", "user.email", "rebuild@example.invalid"),
+                     ("config", "user.name", "Derived Rebuild"), ("add", "."),
+                     ("commit", "-qm", "isolated pinned source")):
+            command = subprocess.run(["git", "-C", str(checkout), *args],
+                                     capture_output=True, timeout=60, check=False)
+            if command.returncode:
+                raise StaleArtifactCleanupError("derived_rebuild_checkout_failed")
+        # The child has its own in-memory DB and all governance writes point
+        # into this temporary directory. It cannot inherit a live server DB.
+        script = (
+            "import json,sqlite3,sys,pathlib\n"
+            "from agent.governance import db,state_reconcile\n"
+            "db._governance_root=lambda: pathlib.Path(sys.argv[1])\n"
+            "c=sqlite3.connect(':memory:'); c.row_factory=sqlite3.Row; db._ensure_schema(c)\n"
+            "r=state_reconcile.run_state_only_full_reconcile(c,sys.argv[2],sys.argv[3],"
+            "run_id=sys.argv[4],commit_sha=sys.argv[5],snapshot_id=sys.argv[6],"
+            "semantic_enrich=False,activate=False)\n"
+            "s=r['governance_index']; t=r['trace']\n"
+            "print(json.dumps({'file_inventory_summary':s.get('file_inventory_summary') or {},"
+            "'feature_count':s.get('feature_count'),'graph_stats':r.get('graph_stats') or {},"
+            "'trace_steps':[{'index':x.get('index'),'name':x.get('name'),"
+            "'status':x.get('status')} for x in t.get('steps') or []]},sort_keys=True))\n"
+        )
+        environment = dict(os.environ)
+        package_root = str(Path(__file__).resolve().parents[2])
+        environment["PYTHONPATH"] = package_root + os.pathsep + environment.get("PYTHONPATH", "")
+        rebuilt = subprocess.run(
+            [sys.executable, "-c", script, str(root / "governance"),
+             manifest["project_id"], str(checkout), manifest["run_id"],
+             manifest["commit_sha"], manifest["snapshot_id"]],
+            capture_output=True, text=True, timeout=180, check=False, env=environment,
+        )
+        if rebuilt.returncode:
+            raise StaleArtifactCleanupError("derived_rebuild_execution_failed")
+        try:
+            return json.loads(rebuilt.stdout.strip().splitlines()[-1])
+        except (IndexError, ValueError):
+            raise StaleArtifactCleanupError("derived_rebuild_output_invalid") from None
+
+
+def _derived_pair_read_index(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    if path.is_symlink() or path.stat().st_size > 65536:
+        raise StaleArtifactCleanupError("derived_archive_index_unverified")
+    value = _json_dict(path.read_text(encoding="utf-8"))
+    if value.get("schema_version") != 1:
+        raise StaleArtifactCleanupError("derived_archive_index_unverified")
+    return value
+
+
+def _derived_pair_replay(
+    project_id: str, candidate_id: str, dimension: str, plan_hash: str,
+) -> dict[str, Any] | None:
+    descriptor = _archive_root_descriptor()
+    if not descriptor.get("verified"):
+        return None
+    index_path = _derived_pair_index_path(Path(descriptor["path"]), project_id, candidate_id)
+    index = _derived_pair_read_index(index_path)
+    if index is None or index.get("state") != "pruned":
+        return None
+    if (index.get("plan_hash") != plan_hash
+            or index.get("dimension") != dimension
+            or index.get("archive_volume") != {key: value for key, value in descriptor.items()
+                                                if key != "free_bytes"}):
+        raise StaleArtifactCleanupError("derived_replay_index_mismatch")
+    bundle = Path(str(index.get("bundle") or ""))
+    expected_bundle = index_path.parent.parent / "bundles" / str(index.get("generation") or "")
+    if (bundle != expected_bundle or _path_identity(str(bundle)) is None
+            or not re.fullmatch(r"[0-9a-f]{32}", str(index.get("generation") or ""))):
+        raise StaleArtifactCleanupError("derived_replay_archive_unverified")
+    manifest_path = bundle / "manifest.json"
+    if (bundle.is_symlink() or manifest_path.is_symlink()
+            or not manifest_path.is_file()):
+        raise StaleArtifactCleanupError("derived_replay_archive_unverified")
+    data = manifest_path.read_bytes()
+    if "sha256:" + hashlib.sha256(data).hexdigest() != index.get("manifest_sha256"):
+        raise StaleArtifactCleanupError("derived_replay_archive_unverified")
+    manifest = _json_dict(data.decode("utf-8"))
+    if (manifest.get("project_id") != project_id
+            or manifest.get("candidate_id") != candidate_id
+            or any(Path(path).exists() for path in (manifest.get("source_paths") or {}).values())):
+        raise StaleArtifactCleanupError("derived_replay_sources_unverified")
+    proof = _derived_pair_restore_proof(bundle, manifest)
+    return {"state": "replay", "candidate_id": candidate_id,
+            "generation": index.get("generation"), "index_path": str(index_path),
+            "restore_rebuild": proof, "writes_performed": False,
+            "reclaimed_allocated_bytes": 0}
+
+
+def _derived_pair_restore_proof(bundle: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Cold restore at original relative paths, then independently read back."""
+    members_root = bundle / "members"
+    for kind, relative in ((DIMENSION_GOVERNANCE_INDEX, "governance-index"),
+                           (DIMENSION_STATE_RECONCILE, "state-reconcile")):
+        _archive_verify_members(members_root / relative / manifest["run_id"],
+                                manifest["members"][kind])
+    with tempfile.TemporaryDirectory(prefix="ac-derived-pair-restore-") as temporary:
+        restored = Path(temporary)
+        for relative in ("governance-index", "state-reconcile"):
+            source = members_root / relative / manifest["run_id"]
+            target = restored / relative / manifest["run_id"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, target, symlinks=True)
+        for kind, relative in ((DIMENSION_GOVERNANCE_INDEX, "governance-index"),
+                               (DIMENSION_STATE_RECONCILE, "state-reconcile")):
+            _archive_verify_members(restored / relative / manifest["run_id"],
+                                    manifest["members"][kind])
+        readback = _derived_rebuild_proof(restored, manifest)
+        recipe = _json_dict((restored / "state-reconcile" / manifest["run_id"] /
+                             "trace/derived-rebuild.json").read_text(encoding="utf-8"))
+        rebuilt = _derived_execute_rebuild(bundle, manifest)
+        if ({key: rebuilt.get(key) for key in ("file_inventory_summary", "feature_count", "graph_stats")}
+                != recipe.get("canonical_output")
+                or rebuilt.get("trace_steps") != recipe.get("trace_steps")):
+            raise StaleArtifactCleanupError("derived_rebuild_canonical_digest_mismatch")
+        return {**readback, "independent_rebuild": True,
+                "rebuild_digest": "sha256:" + hashlib.sha256(json.dumps(
+                    rebuilt, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()}
+
+
+def _derived_pair_source_readback(
+    source_paths: dict[str, Path], manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Read physical source state after an interrupted recursive removal.
+
+    A directory still present with one missing file is partial, even when
+    rmtree raised before returning and no whole-tree removal was recorded.
+    """
+    result: dict[str, Any] = {"removed_members": [], "remaining_members": [],
+                              "partially_removed_members": [], "members": {}}
+    for kind, path in source_paths.items():
+        expected = {item["path"]: item for item in manifest["members"][kind]}
+        if not path.exists() and not path.is_symlink():
+            result["removed_members"].append(kind)
+            result["members"][kind] = {
+                "exists": False, "missing_files": sorted(expected),
+                "remaining_files": [], "changed_files": [], "extra_files": [],
+                "allocated_bytes_remaining": 0, "identity": None,
+            }
+            continue
+        result["remaining_members"].append(kind)
+        if path.is_symlink() or not path.is_dir():
+            raise StaleArtifactCleanupError("derived_source_readback_unverified")
+        facts = _derived_tree_facts(path)
+        actual = {item["path"]: item for item in facts["members"]}
+        changed = sorted(name for name in expected.keys() & actual.keys()
+                         if any(expected[name][field] != actual[name][field]
+                                for field in ("size", "mode", "sha256")))
+        missing = sorted(expected.keys() - actual.keys())
+        extra = sorted(actual.keys() - expected.keys())
+        if missing or changed or extra:
+            result["partially_removed_members"].append(kind)
+        result["members"][kind] = {
+            "exists": True, "missing_files": missing,
+            "remaining_files": sorted(actual), "changed_files": changed,
+            "extra_files": extra, "allocated_bytes_remaining": facts["allocated_bytes"],
+            "identity": facts["identity"],
+        }
+    result["state"] = ("partial" if result["removed_members"]
+                       or result["partially_removed_members"] else "archive_only")
+    return result
+
+
+def recover_derived_run_pair_from_archive(project_id: str, candidate_id: str) -> dict[str, Any]:
+    """Restore only missing archived source files after a partial prune.
+
+    The published bundle is independently rebuilt first. Existing bytes and
+    directories are never overwritten; any drift makes recovery refuse.
+    """
+    from .db import _governance_root
+
+    descriptor = _archive_root_descriptor()
+    if not descriptor.get("verified"):
+        raise StaleArtifactCleanupError("derived_recovery_archive_unverified")
+    index_path = _derived_pair_index_path(Path(descriptor["path"]), project_id, candidate_id)
+    index = _derived_pair_read_index(index_path)
+    if not index or index.get("state") != "partial":
+        raise StaleArtifactCleanupError("derived_recovery_index_not_partial")
+    generation = str(index.get("generation") or "")
+    bundle = index_path.parent.parent / "bundles" / generation
+    if (not re.fullmatch(r"[0-9a-f]{32}", generation)
+            or index.get("bundle") != str(bundle) or bundle.is_symlink()):
+        raise StaleArtifactCleanupError("derived_recovery_archive_unverified")
+    manifest_path = bundle / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise StaleArtifactCleanupError("derived_recovery_archive_unverified")
+    data = manifest_path.read_bytes()
+    if "sha256:" + hashlib.sha256(data).hexdigest() != index.get("manifest_sha256"):
+        raise StaleArtifactCleanupError("derived_recovery_archive_unverified")
+    manifest = _json_dict(data.decode("utf-8"))
+    if (manifest.get("project_id") != project_id
+            or manifest.get("candidate_id") != candidate_id
+            or manifest.get("generation") != generation
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
+                                str(manifest.get("run_id") or ""))):
+        raise StaleArtifactCleanupError("derived_recovery_archive_unverified")
+    base = _governance_root() / project_id
+    paths = {DIMENSION_GOVERNANCE_INDEX: base / "governance-index" / manifest["run_id"],
+             DIMENSION_STATE_RECONCILE: base / "state-reconcile" / manifest["run_id"]}
+    if manifest.get("source_paths") != {kind: str(path) for kind, path in paths.items()}:
+        raise StaleArtifactCleanupError("derived_recovery_source_path_mismatch")
+    proof = _derived_pair_restore_proof(bundle, manifest)
+    readback = _derived_pair_source_readback(paths, manifest)
+    if readback["state"] != "partial":
+        raise StaleArtifactCleanupError("derived_recovery_source_not_partial")
+    for kind, facts in readback["members"].items():
+        if (facts["changed_files"] or facts["extra_files"]
+                or (facts["exists"] and facts["identity"] != manifest["source_volume"][kind])):
+            raise StaleArtifactCleanupError("derived_recovery_source_drift")
+    # Recheck immediately before writing; concurrent changes fail closed.
+    if _derived_pair_source_readback(paths, manifest) != readback:
+        raise StaleArtifactCleanupError("derived_recovery_source_drift")
+    for kind, path in paths.items():
+        source = bundle / "members" / ("governance-index" if kind == DIMENSION_GOVERNANCE_INDEX
+                                       else "state-reconcile") / manifest["run_id"]
+        if not readback["members"][kind]["exists"]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, path, symlinks=False)
+        else:
+            for relative in readback["members"][kind]["missing_files"]:
+                target = path / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with (source / relative).open("rb") as original, target.open("xb") as restored:
+                    shutil.copyfileobj(original, restored)
+                    restored.flush()
+                    os.fsync(restored.fileno())
+                shutil.copymode(source / relative, target)
+                _archive_fsync_directory(target.parent)
+        _archive_verify_members(path, manifest["members"][kind])
+        _archive_fsync_directory(path)
+        _archive_fsync_directory(path.parent)
+    final = _derived_pair_source_readback(paths, manifest)
+    if final["state"] != "archive_only":
+        raise StaleArtifactCleanupError("derived_recovery_readback_incomplete")
+    index.update(state="restored_after_partial", removed_members=[],
+                 remaining_members=list(paths), recovery_verified=True)
+    _archive_write_atomic(index_path, _archive_json_bytes(index))
+    return {"ok": True, "state": "restored_after_partial", "candidate_id": candidate_id,
+            "index_path": str(index_path), "restore_rebuild": proof,
+            "source_readback": final}
+
+
+def _derived_pair_archive_and_prune(
+    conn: sqlite3.Connection, project_id: str, candidate: dict[str, Any],
+    *, repo_root_path: str | Path, dimension: str, plan_hash: str,
+    backlog_id: str, task_id: str, actor: str,
+) -> dict[str, Any]:
+    """Publish a verified pair before either guarded source removal."""
+    from .db import _governance_root
+
+    candidate_id = str(candidate["candidate_id"])
+    run_id = str(candidate["evidence"]["run_id"])
+    descriptor = _archive_root_descriptor()
+    if not descriptor.get("verified") or descriptor.get("identity") != candidate["evidence"].get("archive_volume", {}).get("identity"):
+        raise StaleArtifactCleanupError("derived_archive_volume_changed")
+    archive_root = Path(descriptor["path"])
+    index_path = _derived_pair_index_path(archive_root, project_id, candidate_id)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    if _path_identity(str(index_path.parent)) is None:
+        raise StaleArtifactCleanupError("derived_archive_index_path_unverified")
+    current = _derived_pair_read_index(index_path)
+    if current is not None:
+        if current.get("candidate_id") != candidate_id or current.get("run_id") != run_id:
+            raise StaleArtifactCleanupError("derived_archive_index_conflict")
+        if current.get("state") == "pruned":
+            return {"ok": True, "state": "replay", "candidate_id": candidate_id,
+                    "writes_performed": False, "reclaimed_allocated_bytes": 0,
+                    "index_path": str(index_path)}
+        raise StaleArtifactCleanupError("derived_archive_exists_review_required")
+    source_paths = {kind: Path(path) for kind, path in candidate["source_paths"].items()}
+    protected_before = _archive_governance_evidence_readback(conn)
+    database_path = str(protected_before.get("database_path") or "")
+    if database_path and any(
+        Path(database_path + suffix).is_relative_to(source)
+        for source in source_paths.values() for suffix in ("", "-wal", "-shm")
+    ):
+        raise StaleArtifactCleanupError("derived_protected_database_path_refused")
+    member_facts = {kind: _derived_tree_facts(path) for kind, path in source_paths.items()}
+    for kind, facts in member_facts.items():
+        if facts["identity"] != candidate["evidence"]["source_volume"].get(kind):
+            raise StaleArtifactCleanupError("derived_source_identity_changed")
+    needed = sum(item["logical_bytes"] for item in member_facts.values()) * 2
+    if not _archive_root_matches(descriptor, bytes_needed=needed):
+        raise StaleArtifactCleanupError("derived_archive_capacity_or_mount_changed")
+    generation = uuid.uuid4().hex
+    bundles = index_path.parent.parent / "bundles"
+    bundles.mkdir(parents=True, exist_ok=True)
+    if _path_identity(str(bundles)) is None:
+        raise StaleArtifactCleanupError("derived_archive_bundle_path_unverified")
+    staging = bundles / (".staging-" + generation)
+    bundle = bundles / generation
+    staging.mkdir(mode=0o700)
+    manifest = {
+        "schema_version": 1, "project_id": project_id, "run_id": run_id,
+        "snapshot_id": candidate["evidence"]["snapshot_id"],
+        "commit_sha": candidate["evidence"]["commit_sha"],
+        "candidate_id": candidate_id, "generation": generation,
+        "source_paths": candidate["source_paths"],
+        "source_volume": candidate["evidence"]["source_volume"],
+        "archive_volume": candidate["evidence"]["archive_volume"],
+        "members": {kind: item["members"] for kind, item in member_facts.items()},
+    }
+    try:
+        provenance_path = source_paths[DIMENSION_STATE_RECONCILE] / "trace/derived-rebuild.json"
+        provenance = _json_dict(provenance_path.read_text(encoding="utf-8"))
+        manifest["source_archive"] = _derived_pinned_source_archive(
+            staging / "inputs" / "source.tar", provenance, manifest["commit_sha"],
+        )
+        for kind, relative in ((DIMENSION_GOVERNANCE_INDEX, "governance-index"),
+                               (DIMENSION_STATE_RECONCILE, "state-reconcile")):
+            target = staging / "members" / relative / run_id
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source_paths[kind], target, symlinks=True)
+            _archive_verify_members(target, manifest["members"][kind])
+            for member in manifest["members"][kind]:
+                with (target / member["path"]).open("rb") as handle:
+                    os.fsync(handle.fileno())
+            _archive_fsync_directory(target)
+            _archive_fsync_directory(target.parent)
+        _archive_write_atomic(staging / "manifest.json", _archive_json_bytes(manifest))
+        _derived_pair_restore_proof(staging, manifest)
+        if not _archive_root_matches(descriptor):
+            raise StaleArtifactCleanupError("derived_archive_volume_changed")
+        os.replace(staging, bundle)
+        _archive_fsync_directory(bundles)
+        published = {"schema_version": 1, "candidate_id": candidate_id,
+                     "run_id": run_id, "generation": generation,
+                     "plan_hash": plan_hash, "dimension": dimension,
+                     "archive_volume": candidate["evidence"]["archive_volume"],
+                     "state": "archive_only", "bundle": str(bundle),
+                     "manifest_sha256": "sha256:" + hashlib.sha256(
+                         _archive_json_bytes(manifest)).hexdigest(),
+                     "removed_members": [], "remaining_members": sorted(source_paths)}
+        _archive_write_atomic(index_path, _archive_json_bytes(published))
+    except Exception as exc:
+        # A published bundle without its index is never prune authority.
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise StaleArtifactCleanupError("derived_archive_preprune_refused", {
+            "ok": False, "error": "derived_archive_preprune_refused",
+            "cause": str(exc), "source_removed": False,
+            "writes_performed": bundle.exists(), "write_disposition": (
+                "archive_only" if bundle.exists() else "not_written"),
+            "safe_retry": False,
+        }) from exc
+
+    removed: list[str] = []
+    before_free = shutil.disk_usage(_governance_root()).free
+    try:
+        for kind in (DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE):
+            if not removed:
+                fresh = build_stale_artifact_cleanup_projection(
+                    conn, project_id, repo_root_path=repo_root_path,
+                    dimension=dimension, response_budget=False,
+                )
+                match = next((row for row in fresh.get("candidates") or []
+                              if row.get("candidate_id") == candidate_id), None)
+                if (match is None or not match.get("safe_to_apply")
+                        or fresh.get("plan_hash") != plan_hash):
+                    raise StaleArtifactCleanupError("derived_preprune_cas_refused")
+            references = _derived_exact_reference_reasons(
+                conn, project_id, run_id, manifest["snapshot_id"],
+                {name: str(path) for name, path in source_paths.items()},
+            )
+            if (references or _derived_tree_facts(source_paths[kind]) != member_facts[kind]
+                    or not _archive_root_matches(descriptor)):
+                raise StaleArtifactCleanupError("derived_preprune_cas_refused")
+            _derived_pair_restore_proof(bundle, manifest)
+            shutil.rmtree(source_paths[kind])
+            removed.append(kind)
+            published["state"] = "partial" if len(removed) < 2 else "pruned"
+            published["removed_members"] = list(removed)
+            published["remaining_members"] = [item for item in source_paths if item not in removed]
+            _archive_write_atomic(index_path, _archive_json_bytes(published))
+        after_free = shutil.disk_usage(_governance_root()).free
+        proof = _derived_pair_restore_proof(bundle, manifest)
+        if any(path.exists() for path in source_paths.values()):
+            raise StaleArtifactCleanupError("derived_prune_readback_incomplete")
+        protected_after = _archive_governance_evidence_readback(conn)
+        if (protected_after.get("database_path") != protected_before.get("database_path")
+                or protected_after.get("counts") != protected_before.get("counts")
+                or any((protected_after.get("paths") or {}).get(name, {}).get("inode") !=
+                       (protected_before.get("paths") or {}).get(name, {}).get("inode")
+                       for name in (protected_before.get("paths") or {})
+                       if (protected_before.get("paths") or {}).get(name) is not None)):
+            raise StaleArtifactCleanupError("derived_protected_evidence_readback_changed")
+        receipt = {"ok": True, "state": "pruned", "candidate_id": candidate_id,
+                   "generation": generation, "index_path": str(index_path),
+                   "removed_members": removed, "remaining_members": [],
+                   "source_allocated_bytes_before": sum(item["allocated_bytes"] for item in member_facts.values()),
+                   "free_space_delta_bytes": after_free - before_free,
+                   "reclaimed_allocated_bytes": max(0, min(
+                       sum(item["allocated_bytes"] for item in member_facts.values()),
+                       after_free - before_free)),
+                   "restore_rebuild": proof, "writes_performed": True}
+        task_timeline.record_event(
+            conn, project_id=project_id, backlog_id=backlog_id, task_id=task_id,
+            event_type="governance.stale_artifact_cleanup.apply", phase="cleanup",
+            event_kind="stale_artifact_cleanup", actor="system", status="applied",
+            payload={"requested_actor": actor, **receipt},
+        )
+        conn.commit()
+        return receipt
+    except Exception as exc:
+        readback: dict[str, Any] | None = None
+        readback_error = ""
+        proof: dict[str, Any] | None = None
+        proof_error = ""
+        try:
+            readback = _derived_pair_source_readback(source_paths, manifest)
+        except Exception as read_exc:
+            readback_error = str(read_exc)
+        try:
+            proof = _derived_pair_restore_proof(bundle, manifest)
+        except Exception as proof_exc:
+            proof_error = str(proof_exc)
+        published["state"] = (readback["state"] if readback and proof else "uncertain")
+        published["removed_members"] = (readback["removed_members"] if readback else list(removed))
+        published["remaining_members"] = (readback["remaining_members"] if readback else
+                                          [item for item in source_paths if item not in removed])
+        after_free = shutil.disk_usage(_governance_root()).free
+        removed_allocated = sum(member_facts[item]["allocated_bytes"]
+                                for item in published["removed_members"])
+        if readback:
+            removed_allocated += sum(
+                member_facts[kind]["member_allocated_bytes"][name]
+                for kind, facts in readback["members"].items()
+                if kind not in readback["removed_members"]
+                for name in facts["missing_files"]
+            )
+        readback_path = ""
+        readback_digest = ""
+        if readback is not None:
+            receipt = {"schema_version": 1, "project_id": project_id,
+                       "candidate_id": candidate_id, "generation": generation,
+                       "source_paths": {kind: str(path) for kind, path in source_paths.items()},
+                       "source_readback": readback,
+                       "archive_verified": proof is not None,
+                       "archive_rebuild_digest": (proof or {}).get("rebuild_digest"),
+                       "archive_verification_error": proof_error}
+            try:
+                receipt_dir = bundle / "receipts"
+                receipt_dir.mkdir(mode=0o700, exist_ok=True)
+                receipt_file = receipt_dir / ("source-readback-" + uuid.uuid4().hex + ".json")
+                receipt_data = _archive_json_bytes(receipt)
+                _archive_write_atomic(receipt_file, receipt_data)
+                readback_path = str(receipt_file)
+                readback_digest = "sha256:" + hashlib.sha256(receipt_data).hexdigest()
+            except Exception as receipt_exc:
+                readback_error = str(receipt_exc)
+                published["state"] = "uncertain"
+        published["source_readback_path"] = readback_path
+        published["source_readback_sha256"] = readback_digest
+        published["archive_verified"] = proof is not None
+        try:
+            _archive_write_atomic(index_path, _archive_json_bytes(published))
+        except OSError:
+            published["state"] = "uncertain"
+        failure = {
+            "ok": False, "error": "derived_archive_or_prune_incomplete",
+            "cause": str(exc), "state": published["state"],
+            "candidate_id": candidate_id, "generation": generation,
+            "removed_members": published["removed_members"],
+            "remaining_members": published["remaining_members"],
+            "partially_removed_members": (readback or {}).get("partially_removed_members", []),
+            "missing_files": {kind: facts["missing_files"][:20]
+                              for kind, facts in (readback or {}).get("members", {}).items()},
+            "missing_file_counts": {kind: len(facts["missing_files"])
+                                    for kind, facts in (readback or {}).get("members", {}).items()},
+            "source_readback_path": readback_path,
+            "source_readback_sha256": readback_digest,
+            "source_readback_error": readback_error,
+            "archive_verified": proof is not None,
+            "archive_rebuild_digest": (proof or {}).get("rebuild_digest"),
+            "archive_verification_error": proof_error,
+            "index_path": str(index_path), "bundle": str(bundle),
+            "removed_allocated_bytes_before": removed_allocated,
+            "free_space_delta_bytes": after_free - before_free,
+            "reclaimed_allocated_bytes": max(0, min(removed_allocated,
+                                                     after_free - before_free)),
+            "writes_performed": True, "write_disposition": published["state"],
+            "safe_retry": False,
+            "recovery": ("Use recover_derived_run_pair_from_archive for guarded restore/readback."
+                         if published["state"] == "partial" else
+                         "Review the archive and source readback before recovery."),
+        }
+        try:
+            task_timeline.record_event(
+                conn, project_id=project_id, backlog_id=backlog_id, task_id=task_id,
+                event_type="governance.stale_artifact_cleanup.apply", phase="cleanup",
+                event_kind="stale_artifact_cleanup", actor="system", status="failed",
+                payload={"requested_actor": actor, **failure},
+            )
+            conn.commit()
+        except Exception:
+            failure["timeline_receipt_uncertain"] = True
+        raise StaleArtifactCleanupError("derived_archive_or_prune_incomplete", failure) from exc
 
 
 def _archive_index_path(archive_root: Path, project_id: str, candidate_id: str) -> Path:

@@ -1283,13 +1283,14 @@ def test_derived_cache_dimensions_are_bounded_preview_only(tmp_path, monkeypatch
         assert preview["summary"]["safe_apply_count"] == 0
         assert preview["plan_hash"].startswith("sha256:")
         for item in preview["candidates"]:
-            assert item["refusal_reasons"] == ["stage_b_archive_rebuild_required"]
+            assert item["artifact_type"] == "derived_run_pair"
+            assert "missing_or_unpaired:state_reconcile" in item["refusal_reasons"]
             assert item["safe_to_apply"] is False
     index_item = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
         conn, "proj", repo_root_path=repo, dimension="governance_index",
     )["candidates"][0]
-    assert index_item["evidence"]["commit_sha"] == "a" * 40
-    assert index_item["evidence"]["snapshot_id"] == "full-test"
+    assert index_item["evidence"]["run_id"] == "run-1"
+    assert index_item["evidence"]["paired"] is False
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "summary.json").write_text(json.dumps({"commit_sha": "secret"}),
@@ -1299,8 +1300,502 @@ def test_derived_cache_dimensions_are_bounded_preview_only(tmp_path, monkeypatch
     linked = next(item for item in stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
         conn, "proj", repo_root_path=repo, dimension="governance_index",
     )["candidates"] if item["path"] == str(link))
-    assert "derived_path_symlink_refused" in linked["refusal_reasons"]
+    assert "derived_path_symlink_refused:governance_index" in linked["refusal_reasons"]
     assert linked["evidence"]["commit_sha"] == ""
+
+
+def _new_terminal_derived_pair(tmp_path, monkeypatch):
+    from agent.governance import db, state_reconcile
+
+    monkeypatch.setattr(db, "_governance_root", lambda: tmp_path / "governance")
+    repo = _git_repo(tmp_path)
+    source = repo / "agent" / "service.py"
+    source.parent.mkdir()
+    source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "source"], cwd=repo,
+                   check=True, capture_output=True)
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                            check=True, capture_output=True, text=True).stdout.strip()
+    conn = _conn()
+    generated = state_reconcile.run_state_only_full_reconcile(
+        conn, "proj", repo, run_id="paired-run", commit_sha=commit,
+        snapshot_id="full-paired-run", semantic_enrich=False, activate=False,
+    )
+    assert generated["ok"]
+    conn.execute("UPDATE graph_snapshots SET status='superseded' "
+                 "WHERE project_id='proj' AND snapshot_id='full-paired-run'")
+    original = dict(conn.execute(
+        "SELECT * FROM graph_snapshots WHERE project_id='proj' AND snapshot_id='full-paired-run'",
+    ).fetchone())
+    original.update(snapshot_id="full-newer", status="active", created_at="9999-01-01T00:00:00Z")
+    columns = list(original)
+    conn.execute("INSERT INTO graph_snapshots (" + ",".join(columns) + ") VALUES (" +
+                 ",".join("?" for _ in columns) + ")", list(original.values()))
+    conn.commit()
+    archive = tmp_path / "archive-volume"
+    archive.mkdir()
+    monkeypatch.setenv(stale_artifact_cleanup.ARCHIVE_ROOT_ENV, str(archive))
+    real_mount = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount",
+                        lambda path: Path(path) == archive or real_mount(path))
+    return repo, conn, archive
+
+
+def test_new_terminal_derived_pair_public_preview_and_prune(tmp_path, monkeypatch):
+    repo, conn, archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    views = [stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension=dimension,
+    ) for dimension in ("governance_index", "state_reconcile")]
+    assert len(views[0]["candidates"]) == len(views[1]["candidates"]) == 1
+    candidate = views[0]["candidates"][0]
+    assert candidate["candidate_id"] == views[1]["candidates"][0]["candidate_id"]
+    assert candidate["safe_to_apply"] is True, candidate["refusal_reasons"]
+    all_view = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="all",
+    )
+    assert sum(row["candidate_id"] == candidate["candidate_id"]
+               for row in all_view["candidates"]) == 1
+    applied = stale_artifact_cleanup.apply_stale_artifact_cleanup(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+        candidate_ids=[candidate["candidate_id"]],
+        plan_hash=views[0]["plan_hash"], plan_revision=views[0]["plan_revision"],
+    )
+    assert applied["state"] == "pruned"
+    assert applied["restore_rebuild"]["independent_rebuild"] is True
+    assert not Path(candidate["source_paths"]["governance_index"]).exists()
+    assert not Path(candidate["source_paths"]["state_reconcile"]).exists()
+    assert Path(applied["index_path"]).is_file()
+    replay = stale_artifact_cleanup.apply_stale_artifact_cleanup(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+        candidate_ids=[candidate["candidate_id"]],
+        plan_hash=views[0]["plan_hash"], plan_revision=views[0]["plan_revision"],
+    )
+    assert replay["state"] == "replay"
+    assert replay["applied_count"] == 0
+    assert replay["writes_performed"] is False
+
+
+def test_derived_pair_exact_live_reference_and_legacy_refuse(tmp_path, monkeypatch):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = lambda: stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )["candidates"][0]
+    assert preview()["safe_to_apply"] is True
+    conn.execute("INSERT INTO graph_snapshot_refs "
+                 "(project_id,ref_name,snapshot_id,commit_sha,updated_at) "
+                 "VALUES ('proj','candidate','full-paired-run','x','now')")
+    assert "protected:current_graph_ref" in preview()["refusal_reasons"]
+    conn.execute("DELETE FROM graph_snapshot_refs WHERE ref_name='candidate'")
+    conn.execute(
+        "INSERT INTO sessions (session_id,principal_id,project_id,role,scope_json,"
+        "token_hash,status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("qa-pair", "qa", "proj", "qa",
+         json.dumps({"snapshot_id": "full-paired-run"}), "qa-pair-hash",
+         "active", "now", "later"),
+    )
+    assert "referenced_by_sessions" in preview()["refusal_reasons"]
+    conn.execute("DELETE FROM sessions WHERE session_id='qa-pair'")
+    conn.execute("UPDATE graph_snapshots SET status='active' "
+                 "WHERE project_id='proj' AND snapshot_id='full-paired-run'")
+    assert "protected:snapshot_not_terminal" in preview()["refusal_reasons"]
+    conn.execute("UPDATE graph_snapshots SET status='superseded' "
+                 "WHERE project_id='proj' AND snapshot_id='full-paired-run'")
+    provenance = (tmp_path / "governance" / "proj" / "state-reconcile" /
+                  "paired-run" / "trace" / "derived-rebuild.json")
+    provenance.unlink()
+    candidate = preview()
+    assert candidate["safe_to_apply"] is False
+    assert "legacy_missing_rebuild_provenance" in candidate["refusal_reasons"]
+
+
+def test_derived_pair_newest_and_active_build_claim_refuse(tmp_path, monkeypatch):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = lambda: stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="state_reconcile",
+    )["candidates"][0]
+    conn.execute("DELETE FROM graph_snapshots WHERE project_id='proj' AND snapshot_id='full-newer'")
+    assert "protected:newest_snapshot" in preview()["refusal_reasons"]
+    conn.execute(
+        "INSERT INTO graph_current_full_build_claim_history "
+        "(claim_id,project_id,snapshot_id,run_id,commit_sha,status,manager_epoch,"
+        "manager_pid,manager_started_at,manager_start_identity,acquired_at) "
+        "VALUES (?,?,?,?,?,'active',?,?,?,?,?)",
+        ("pair-active-claim", "proj", "full-paired-run", "paired-run", "commit",
+         "epoch", 999, "now", "fixture", "now"),
+    )
+    reasons = preview()["refusal_reasons"]
+    assert "protected:newest_snapshot" in reasons
+    assert "protected:active_build_claim" in reasons
+
+
+@pytest.mark.parametrize("store", [
+    "observer_command_queue", "parallel_branch_runtime_contexts",
+    "contract_runtime_executions",
+])
+def test_derived_pair_live_unique_reference_refuses_then_terminal_clears(
+    tmp_path, monkeypatch, store,
+):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = lambda: stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    approved = preview()
+    candidate = approved["candidates"][0]
+    assert candidate["safe_to_apply"] is True
+    paths = {kind: Path(path) for kind, path in candidate["source_paths"].items()}
+    before = {kind: stale_artifact_cleanup._derived_tree_facts(path)
+              for kind, path in paths.items()}
+    if store == "observer_command_queue":
+        conn.execute(
+            "INSERT INTO observer_command_queue "
+            "(command_id,project_id,command_type,payload_json,status,created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            ("pair-command", "proj", "review", json.dumps({
+                "run_id": "paired-run", "snapshot_id": "full-paired-run",
+                "source_path": str(paths["governance_index"]),
+            }), "queued", "now"),
+        )
+    elif store == "parallel_branch_runtime_contexts":
+        conn.execute(
+            "INSERT INTO parallel_branch_runtime_contexts "
+            "(project_id,task_id,runtime_context_id,worktree_path,lease_id,"
+            "lease_expires_at,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("proj", "pair-runtime-task", "pair-runtime", str(paths["state_reconcile"]),
+             "pair-lease", "9999-01-01T00:00:00Z", "running", "now", "now"),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO contract_runtime_executions "
+            "(contract_execution_id,project_id,backlog_id,contract_id,version,"
+            "revision,execution_state_revision,record_json,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("pair-cex", "proj", "pair-backlog", "pair-contract", "1", "1", 1,
+             json.dumps({"runtime_guide": {"next_legal_action": {
+                 "run_id": "paired-run", "snapshot_id": "full-paired-run",
+                 "source_path": str(paths["governance_index"]),
+             }}}), "now", "now"),
+        )
+    conn.commit()
+    blocked = preview()["candidates"][0]
+    assert blocked["safe_to_apply"] is False
+    assert "referenced_by_" + store in blocked["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError):
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash=approved["plan_hash"], plan_revision=approved["plan_revision"],
+        )
+    for kind, path in paths.items():
+        assert stale_artifact_cleanup._derived_tree_facts(path) == before[kind]
+    if store == "observer_command_queue":
+        conn.execute("UPDATE observer_command_queue SET status='completed' "
+                     "WHERE command_id='pair-command'")
+    elif store == "parallel_branch_runtime_contexts":
+        conn.execute("UPDATE parallel_branch_runtime_contexts SET status='complete' "
+                     "WHERE task_id='pair-runtime-task'")
+    else:
+        conn.execute("UPDATE contract_runtime_executions SET record_json=? "
+                     "WHERE contract_execution_id='pair-cex'", (json.dumps({
+                         "runtime_guide": {"next_legal_action": None},
+                         "historical_run_id": "paired-run",
+                     }),))
+    conn.commit()
+    cleared = preview()["candidates"][0]
+    assert cleared["safe_to_apply"] is True, cleared["refusal_reasons"]
+    for kind, path in paths.items():
+        assert stale_artifact_cleanup._derived_tree_facts(path) == before[kind]
+
+
+def test_derived_pair_archive_acl_refuses_before_source_removal(tmp_path, monkeypatch):
+    repo, conn, archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = lambda: stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    approved = preview()
+    candidate = approved["candidates"][0]
+    assert candidate["safe_to_apply"] is True
+    before = {kind: stale_artifact_cleanup._derived_tree_facts(Path(path))
+              for kind, path in candidate["source_paths"].items()}
+    original_access = os.access
+    monkeypatch.setattr(os, "access", lambda path, mode: (
+        False if Path(path) == archive else original_access(path, mode)))
+    blocked = preview()["candidates"][0]
+    assert blocked["safe_to_apply"] is False
+    assert "archive_volume_or_acl_unverified" in blocked["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError):
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash=approved["plan_hash"], plan_revision=approved["plan_revision"],
+        )
+    for kind, path in candidate["source_paths"].items():
+        assert stale_artifact_cleanup._derived_tree_facts(Path(path)) == before[kind]
+    assert not list(archive.rglob("index/*.json"))
+
+
+def test_derived_pair_invalid_and_symlink_escape_sources_never_prune(tmp_path, monkeypatch):
+    repo, conn, archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    root = governance_db._governance_root() / "proj"
+    outside = tmp_path / "outside-derived-pair"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("protected", encoding="utf-8")
+    escape = root / "governance-index" / "escape-run"
+    escape.symlink_to(outside, target_is_directory=True)
+    invalid = root / "governance-index" / "bad run"
+    invalid.mkdir()
+    (invalid / "summary.json").write_text("{}", encoding="utf-8")
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    candidates = {item["evidence"]["run_id"]: item for item in preview["candidates"]}
+    assert "derived_path_symlink_refused:governance_index" in candidates["escape-run"]["refusal_reasons"]
+    assert "run_id_path_invalid" in candidates["bad run"]["refusal_reasons"]
+    for run_id in ("escape-run", "bad run"):
+        assert candidates[run_id]["safe_to_apply"] is False
+        with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+            stale_artifact_cleanup.apply_stale_artifact_cleanup(
+                conn, "proj", repo_root_path=repo, dimension="governance_index",
+                candidate_ids=[candidates[run_id]["candidate_id"]],
+                plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
+            )
+        assert error.value.payload["error"] == "unsafe_stale_artifact_cleanup_refused"
+    assert sentinel.read_text(encoding="utf-8") == "protected"
+    assert escape.is_symlink() and invalid.is_dir()
+    assert all(Path(path).is_dir() for path in candidates["paired-run"]["source_paths"].values())
+    assert not list(archive.rglob("index/*.json"))
+
+
+def test_derived_pair_stale_plan_and_reference_race_preserve_sources(tmp_path, monkeypatch):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    candidate = preview["candidates"][0]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="stale_cleanup_plan_refused"):
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash="sha256:old", plan_revision=preview["plan_revision"],
+        )
+    original_write = stale_artifact_cleanup._archive_write_atomic
+
+    def race(path, data):
+        original_write(path, data)
+        if path.name == candidate["candidate_id"] + ".json":
+            conn.execute("INSERT OR REPLACE INTO graph_snapshot_refs "
+                         "(project_id,ref_name,snapshot_id,commit_sha,updated_at) "
+                         "VALUES ('proj','candidate','full-paired-run','x','now')")
+
+    monkeypatch.setattr(stale_artifact_cleanup, "_archive_write_atomic", race)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
+        )
+    assert error.value.payload["state"] == "archive_only"
+    assert not error.value.payload["removed_members"]
+    assert all(Path(path).exists() for path in candidate["source_paths"].values())
+
+
+def test_derived_pair_second_prune_failure_reports_physical_partial(tmp_path, monkeypatch):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    candidate = preview["candidates"][0]
+    original_remove = shutil.rmtree
+    second = Path(candidate["source_paths"]["state_reconcile"])
+
+    def fail_second(path, *args, **kwargs):
+        if Path(path) == second:
+            raise OSError("injected second source failure")
+        return original_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(stale_artifact_cleanup.shutil, "rmtree", fail_second)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
+        )
+    payload = error.value.payload
+    assert payload["state"] == "partial"
+    assert payload["removed_members"] == ["governance_index"]
+    assert payload["remaining_members"] == ["state_reconcile"]
+    assert not Path(candidate["source_paths"]["governance_index"]).exists()
+    assert second.exists()
+    assert Path(payload["bundle"]).is_dir()
+    assert payload["removed_allocated_bytes_before"] >= 0
+    assert isinstance(payload["free_space_delta_bytes"], int)
+    assert 0 <= payload["reclaimed_allocated_bytes"] <= payload["removed_allocated_bytes_before"]
+    assert not payload.get("timeline_receipt_uncertain")
+    assert conn.execute("SELECT COUNT(*) FROM task_timeline_events "
+                        "WHERE event_type='governance.stale_artifact_cleanup.apply'").fetchone()[0] == 1
+    restored = stale_artifact_cleanup.recover_derived_run_pair_from_archive(
+        "proj", candidate["candidate_id"],
+    )
+    assert restored["state"] == "restored_after_partial"
+    assert Path(candidate["source_paths"]["governance_index"]).is_dir()
+
+
+def test_derived_pair_first_prune_mid_tree_failure_records_and_restores_files(tmp_path, monkeypatch):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    candidate = preview["candidates"][0]
+    first = Path(candidate["source_paths"]["governance_index"])
+    summary = first / "summary.json"
+    original_remove = shutil.rmtree
+
+    def fail_mid_tree(path, *args, **kwargs):
+        if Path(path) == first:
+            summary.unlink()
+            raise OSError("injected mid-tree failure")
+        return original_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(stale_artifact_cleanup.shutil, "rmtree", fail_mid_tree)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
+        )
+    payload = error.value.payload
+    assert payload["state"] == payload["write_disposition"] == "partial"
+    assert payload["removed_members"] == []
+    assert payload["remaining_members"] == ["governance_index", "state_reconcile"]
+    assert payload["partially_removed_members"] == ["governance_index"]
+    assert "summary.json" in payload["missing_files"]["governance_index"]
+    assert payload["removed_allocated_bytes_before"] > 0
+    assert payload["archive_verified"] is True
+    assert Path(payload["bundle"]).is_dir()
+    receipt_path = Path(payload["source_readback_path"])
+    assert receipt_path.is_file()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert "summary.json" in receipt["source_readback"]["members"]["governance_index"]["missing_files"]
+    assert receipt["archive_verified"] is True
+    assert not summary.exists()
+    unexpected = first / "unexpected.txt"
+    unexpected.write_text("do not overwrite", encoding="utf-8")
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="derived_recovery_source_drift"):
+        stale_artifact_cleanup.recover_derived_run_pair_from_archive(
+            "proj", candidate["candidate_id"],
+        )
+    assert unexpected.read_text(encoding="utf-8") == "do not overwrite"
+    assert not summary.exists()
+    unexpected.unlink()
+    recovered = stale_artifact_cleanup.recover_derived_run_pair_from_archive(
+        "proj", candidate["candidate_id"],
+    )
+    assert recovered["state"] == "restored_after_partial"
+    assert recovered["restore_rebuild"]["independent_rebuild"] is True
+    assert summary.is_file()
+    assert recovered["source_readback"]["state"] == "archive_only"
+    assert json.loads(Path(payload["index_path"]).read_text())["state"] == "restored_after_partial"
+
+
+def test_derived_pair_missing_half_stays_canonical_unsafe_in_named_and_all(tmp_path, monkeypatch):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    governance = governance_db._governance_root() / "proj"
+    shutil.rmtree(governance / "state-reconcile" / "paired-run")
+    ids = []
+    for dimension in ("governance_index", "state_reconcile", "all"):
+        view = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+            conn, "proj", repo_root_path=repo, dimension=dimension,
+        )
+        candidates = [item for item in view["candidates"]
+                      if item.get("artifact_type") == "derived_run_pair"]
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        ids.append(candidate["candidate_id"])
+        assert candidate["safe_to_apply"] is False
+        assert "missing_or_unpaired:state_reconcile" in candidate["refusal_reasons"]
+    assert len(set(ids)) == 1
+
+
+@pytest.mark.parametrize("failure", ["partial_copy", "hash_corrupt", "index_crash"])
+def test_derived_pair_preprune_archive_failure_keeps_both_sources(
+    tmp_path, monkeypatch, failure,
+):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    candidate = preview["candidates"][0]
+    before = {kind: stale_artifact_cleanup._derived_tree_facts(Path(path))
+              for kind, path in candidate["source_paths"].items()}
+    original_copy = shutil.copytree
+    original_write = stale_artifact_cleanup._archive_write_atomic
+
+    def corrupt_copy(source, target, *args, **kwargs):
+        if Path(source) == Path(candidate["source_paths"]["governance_index"]):
+            if failure == "partial_copy":
+                Path(target).mkdir()
+                (Path(target) / "summary.json").write_text("partial", encoding="utf-8")
+                raise OSError("injected interrupted archive copy")
+            copied = original_copy(source, target, *args, **kwargs)
+            (Path(target) / "summary.json").write_text("corrupt", encoding="utf-8")
+            return copied
+        return original_copy(source, target, *args, **kwargs)
+
+    def crash_index(path, data):
+        if Path(path).name == candidate["candidate_id"] + ".json":
+            raise OSError("injected index publication crash")
+        return original_write(path, data)
+
+    if failure == "index_crash":
+        monkeypatch.setattr(stale_artifact_cleanup, "_archive_write_atomic", crash_index)
+    else:
+        monkeypatch.setattr(stale_artifact_cleanup.shutil, "copytree", corrupt_copy)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
+        )
+    assert error.value.payload["error"] == "derived_archive_preprune_refused"
+    assert error.value.payload["source_removed"] is False
+    for kind, path in candidate["source_paths"].items():
+        assert stale_artifact_cleanup._derived_tree_facts(Path(path)) == before[kind]
+
+
+def test_derived_pair_symlink_capacity_and_remount_refuse(tmp_path, monkeypatch):
+    repo, conn, archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = lambda: stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    first = preview()
+    candidate = first["candidates"][0]
+    source = Path(candidate["source_paths"]["governance_index"])
+    outside = tmp_path / "outside"
+    outside.write_text("protected", encoding="utf-8")
+    (source / "escape").symlink_to(outside)
+    unsafe = preview()["candidates"][0]
+    assert unsafe["safe_to_apply"] is False
+    assert "source_unreadable_or_unbounded:governance_index" in unsafe["refusal_reasons"]
+    (source / "escape").unlink()
+    original_usage = shutil.disk_usage
+    monkeypatch.setattr(stale_artifact_cleanup.shutil, "disk_usage",
+                        lambda path: type("Usage", (), {"free": 0})()
+                        if Path(path) == archive else original_usage(path))
+    capacity = preview()["candidates"][0]
+    assert "archive_capacity_insufficient" in capacity["refusal_reasons"]
+    monkeypatch.setattr(stale_artifact_cleanup.shutil, "disk_usage", original_usage)
+    monkeypatch.setattr(os.path, "ismount", lambda _path: False)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError):
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash=first["plan_hash"], plan_revision=first["plan_revision"],
+        )
+    assert outside.read_text(encoding="utf-8") == "protected"
+    assert all(Path(path).exists() for path in candidate["source_paths"].values())
 
 
 def test_same_path_inode_replacement_between_plan_and_item_check_is_zero_write(

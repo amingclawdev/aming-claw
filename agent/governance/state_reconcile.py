@@ -183,6 +183,41 @@ def _governance_state_dir(project_id: str, run_id: str) -> Path:
     return _governance_root() / project_id / "state-reconcile" / run_id
 
 
+def _persist_derived_pair_rebuild_inputs(
+    state_dir: Path, *, project_id: str, run_id: str, snapshot_id: str,
+    commit_sha: str, project_root: Path, index_summary: dict[str, Any],
+    trace_summary: dict[str, Any], mode: str,
+    graph_stats: dict[str, Any] | None = None,
+    rebuild_supported: bool = False,
+) -> None:
+    """Pin the pair's generation inputs only after both companions finish."""
+    from agent.governance.reconcile_trace import write_json
+
+    payload = {
+        "schema_version": 1, "recipe": (
+            "state_only_full_reconcile.v1" if rebuild_supported
+            else "unsupported"
+        ),
+        "project_id": project_id, "run_id": run_id,
+        "snapshot_id": snapshot_id, "commit_sha": commit_sha,
+        "project_root": str(project_root), "mode": mode,
+        "rebuild_options": {"semantic_enrich": False, "activate": False}
+        if rebuild_supported else {},
+        "index_inputs": index_summary.get("derived_rebuild_inputs") or {},
+        "canonical_output": {
+            "file_inventory_summary": index_summary.get("file_inventory_summary") or {},
+            "feature_count": index_summary.get("feature_count"),
+            "graph_stats": graph_stats or {},
+        },
+        "trace_steps": [
+            {"index": step.get("index"), "name": step.get("name"),
+             "status": step.get("status")}
+            for step in trace_summary.get("steps") or []
+        ],
+    }
+    write_json(state_dir / "trace" / "derived-rebuild.json", payload)
+
+
 def _project_graph_structure_hints(project_root: str | Path, candidate_graph: dict[str, Any]) -> dict[str, Any]:
     hint_index = load_graph_structure_hints(project_root)
     projection = build_hint_projection(candidate_graph, hint_index)
@@ -3428,6 +3463,16 @@ def run_state_only_full_reconcile(
             status="skipped",
         )
     trace_summary = trace.finalize(status="ok")
+    _persist_derived_pair_rebuild_inputs(
+        state_dir, project_id=project_id, run_id=rid, snapshot_id=sid,
+        commit_sha=commit, project_root=root,
+        index_summary=governance_index_summary, trace_summary=trace_summary,
+        mode="full", graph_stats=graph_payload_stats(candidate_graph),
+        rebuild_supported=(snapshot_kind == "full" and not semantic_enrich
+                           and not activate and not notes_extra
+                           and semantic_use_ai in (None, False)
+                           and not graph_exclude_paths and not graph_ignore_globs),
+    )
     return {
         "ok": True,
         "project_id": project_id,
@@ -4180,6 +4225,12 @@ def _run_incremental_metadata_scope_reconcile_candidate(
         )
         conn.commit()
     trace_summary = trace.finalize(status="ok")
+    _persist_derived_pair_rebuild_inputs(
+        state_dir, project_id=project_id, run_id=rid, snapshot_id=sid,
+        commit_sha=target, project_root=root,
+        index_summary=governance_index_summary, trace_summary=trace_summary,
+        mode="scope",
+    )
     return {
         "ok": True,
         "project_id": project_id,
