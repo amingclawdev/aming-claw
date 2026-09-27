@@ -181669,8 +181669,13 @@ def test_rev10_materialized_scope_revision_preserves_finished_sibling_and_worker
 
 @pytest.mark.parametrize("tamper", ["runtime_drift"])
 @pytest.mark.parametrize(
-    "result_mode",
-    ["mixed", "mixed_reversed", "all_passed"],
+    ("result_mode", "file_order"),
+    [
+        ("mixed", "canonical"),
+        ("mixed_reversed", "canonical"),
+        ("all_passed", "canonical"),
+        ("all_passed", "independently_reordered"),
+    ],
 )
 def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_pass(
     release_conn,
@@ -181679,6 +181684,7 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
     request,
     tamper,
     result_mode,
+    file_order,
 ):
     assert tamper == "runtime_drift"
     conn = release_conn
@@ -181700,14 +181706,43 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
             "live_runtime_custody_verified": True,
         },
     )
+    reordered_files = [
+        "agent/governance/server.py",
+        "agent/tests/order-a.py",
+        "agent/tests/order-b.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    target_files = (
+        reordered_files
+        if file_order == "independently_reordered"
+        else [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ]
+    )
     case = _prepare_ac_dev_entered_parallel_lane_routes(
         conn,
         monkeypatch,
         tmp_path,
-        target_files=[
-            "agent/governance/server.py",
-            "agent/tests/test_graph_governance_api.py",
-        ],
+        target_files=target_files,
+        test_files=(
+            [
+                "agent/tests/order-a.py",
+                "agent/tests/order-b.py",
+                "agent/tests/test_graph_governance_api.py",
+            ]
+            if file_order == "independently_reordered" else None
+        ),
+        lane_owned_files=(
+            [
+                [
+                    "agent/tests/order-b.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ],
+                ["agent/governance/server.py", "agent/tests/order-a.py"],
+            ]
+            if file_order == "independently_reordered" else None
+        ),
     )
     project_id = case["project_id"]
     execution_id = case["execution_id"]
@@ -182246,6 +182281,240 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
     else:
         assert all(result["passed"] is True for result in results_by_lane)
 
+    if file_order == "independently_reordered":
+        assert [list(lane["owned_files"]) for lane in case["plan"]["lanes"]] == [
+            ["agent/tests/order-b.py", "agent/tests/test_graph_governance_api.py"],
+            ["agent/governance/server.py", "agent/tests/order-a.py"],
+        ]
+        canonical_root = Path(case["world"]["target_project_root"])
+        subprocess.run(
+            ["git", "branch", "main", case["world"]["target_head_commit"]],
+            cwd=canonical_root, check=True, capture_output=True, text=True,
+        )
+        target_head = batch_jobs.git_commit(canonical_root)
+
+        def public_premerge_dry_run(queue_item):
+            context = get_branch_context(conn, project_id, queue_item["task_id"])
+            assert context is not None
+            return server.handle_graph_governance_parallel_branch_merge_execute(
+                _ctx(
+                    {"project_id": project_id},
+                    method="POST",
+                    body={
+                        "repo_root_path": str(context.target_project_root),
+                        "merge_queue_id": queue_item["merge_queue_id"],
+                        "queue_item_id": queue_item["queue_item_id"],
+                        "task_id": queue_item["task_id"],
+                        "branch_ref": queue_item["branch_ref"],
+                        "target_ref": queue_item["target_ref"],
+                        "source_contract_execution_id": execution_id,
+                        "observer_route_token_ref": case["parent_route"]["route_token_ref"],
+                        "dry_run": True,
+                        "allow_target_ref_mutation": False,
+                        "evidence": {
+                            "backlog_acceptance": {
+                                "status": "satisfied", "caller_supplied": True,
+                            },
+                        },
+                    },
+                )
+            )
+
+        # The fixture starts with a sorted parent route. A native upsert of
+        # the same OPEN row then exercises two independent, equivalent orders
+        # after the producer has durably finished and queued both workers.
+        row_orders = (
+            (
+                [
+                    "agent/tests/test_graph_governance_api.py",
+                    "agent/tests/order-b.py",
+                    "agent/tests/order-a.py",
+                    "agent/governance/server.py",
+                ],
+                [
+                    "agent/tests/test_graph_governance_api.py",
+                    "agent/tests/order-b.py",
+                    "agent/tests/order-a.py",
+                ],
+            ),
+            (
+                [
+                    "agent/tests/order-a.py",
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                    "agent/tests/order-b.py",
+                ],
+                [
+                    "agent/tests/order-b.py",
+                    "agent/tests/test_graph_governance_api.py",
+                    "agent/tests/order-a.py",
+                ],
+            ),
+        )
+        frozen_record = server._contract_runtime_store(conn).get(execution_id)
+        for row_target_files, row_test_files in row_orders:
+            upserted = server.handle_backlog_upsert(
+                _ctx(
+                    {"project_id": project_id, "bug_id": case["backlog_id"]},
+                    method="POST",
+                    body={
+                        "target_files": row_target_files,
+                        "test_files": row_test_files,
+                    },
+                )
+            )
+            assert upserted["ok"] is True, upserted
+            assert upserted["action"] == "upserted"
+            row = conn.execute(
+                "SELECT target_files, test_files FROM backlog_bugs WHERE bug_id=?",
+                (case["backlog_id"],),
+            ).fetchone()
+            assert json.loads(row["target_files"]) == row_target_files
+            assert json.loads(row["test_files"]) == row_test_files
+            assert server._contract_runtime_store(conn).get(execution_id) == frozen_record
+            assert server._backlog_acceptance_scope_authority(
+                conn, case["backlog_id"]
+            )[1] != sorted(target_files)
+            protected, ordered_authority = read_premerge_acceptance()
+            assert protected is True
+            assert ordered_authority["status"] == "satisfied", ordered_authority
+            for queued in queue_results:
+                before_dry_run = conn.total_changes
+                dry_run = public_premerge_dry_run(queued["queue_item"])
+                assert dry_run["ok"] is True, dry_run
+                assert dry_run["dry_run"] is True
+                assert dry_run["executed"] is False
+                assert dry_run["gate_plan"]["merge_gate_passed"] is False
+                git_preview = next(
+                    row for row in dry_run["gate_plan"]["evidence"]
+                    if row["key"] == "git_conflict_check"
+                )
+                assert git_preview["passed"] is True, git_preview
+                acceptance = next(
+                    row for row in dry_run["gate_plan"]["evidence"]
+                    if row["key"] == "backlog_acceptance"
+                )
+                assert acceptance["passed"] is True
+                assert acceptance["detail"]["db_verified"] is True
+                assert acceptance["detail"]["acceptance_scope"][
+                    "owned_files_union"
+                ] == sorted(target_files)
+                assert acceptance["detail"]["caller_claims_trusted"] is False
+                assert conn.total_changes == before_dry_run
+                assert batch_jobs.git_commit(canonical_root) == target_head
+
+        backlog_row = conn.execute(
+            "SELECT target_files, test_files, acceptance_criteria "
+            "FROM backlog_bugs WHERE bug_id=?",
+            (case["backlog_id"],),
+        ).fetchone()
+        assert backlog_row is not None
+        original_row = dict(backlog_row)
+
+        def assert_public_backlog_block(label, expected_reason):
+            before_rejection = conn.total_changes
+            protected, blocked = read_premerge_acceptance()
+            assert protected is True
+            assert blocked["status"] == "blocked", (label, blocked)
+            assert blocked["reason"] == expected_reason, (label, blocked)
+            rejected_dry_run = public_premerge_dry_run(selected)
+            assert rejected_dry_run["ok"] is True, (label, rejected_dry_run)
+            assert rejected_dry_run["dry_run"] is True
+            assert rejected_dry_run["executed"] is False
+            assert rejected_dry_run["gate_plan"]["merge_gate_passed"] is False
+            rejected_acceptance = next(
+                row for row in rejected_dry_run["gate_plan"]["evidence"]
+                if row["key"] == "backlog_acceptance"
+            )
+            assert rejected_acceptance["passed"] is False
+            assert rejected_acceptance["detail"]["reason"] == expected_reason
+            assert conn.total_changes == before_rejection
+            assert batch_jobs.git_commit(canonical_root) == target_head
+
+        for label, column, replacement in (
+            (
+                "missing_row_file", "target_files",
+                json.dumps(target_files[1:]),
+            ),
+            (
+                "extra_row_file", "target_files",
+                json.dumps([*target_files, "agent/tests/unowned.py"]),
+            ),
+            (
+                "criteria_changed", "acceptance_criteria",
+                json.dumps([{"id": "new-criterion", "required_scope": {
+                    "kind": "files", "files": [target_files[0]],
+                }}]),
+            ),
+        ):
+            conn.execute(
+                f"UPDATE backlog_bugs SET {column}=? WHERE bug_id=?",
+                (replacement, case["backlog_id"]),
+            )
+            conn.commit()
+            assert_public_backlog_block(
+                label,
+                "rev10_frozen_backlog_acceptance_scope_not_fully_covered",
+            )
+            conn.execute(
+                f"UPDATE backlog_bugs SET {column}=? WHERE bug_id=?",
+                (original_row[column], case["backlog_id"]),
+            )
+            conn.commit()
+
+        selected_context = get_branch_context(conn, project_id, selected["task_id"])
+        assert selected_context is not None
+        conn.execute(
+            "UPDATE parallel_branch_runtime_contexts SET worker_slot_id=? "
+            "WHERE project_id=? AND runtime_context_id=?",
+            ("foreign-slot", project_id, selected_context.runtime_context_id),
+        )
+        conn.commit()
+        assert_public_backlog_block(
+            "runtime_identity", "rev10_runtime_queue_dispatch_identity_mismatch"
+        )
+        conn.execute(
+            "UPDATE parallel_branch_runtime_contexts SET worker_slot_id=? "
+            "WHERE project_id=? AND runtime_context_id=?",
+            (
+                selected_context.worker_slot_id, project_id,
+                selected_context.runtime_context_id,
+            ),
+        )
+        conn.commit()
+
+        selected_lane = next(
+            lane for lane in authority["workers"]
+            if lane["runtime_context_id"] == selected_context.runtime_context_id
+        )
+        finish_binding = conn.execute(
+            "SELECT * FROM backlog_contract_chain_bindings "
+            "WHERE project_id=? AND contract_execution_id=? AND source_ref=?",
+            (
+                project_id, execution_id,
+                selected_lane["finish_gate_acceptance"]["acceptance_ref"],
+            ),
+        ).fetchone()
+        assert finish_binding is not None
+        conn.execute(
+            "DELETE FROM backlog_contract_chain_bindings WHERE id=?",
+            (finish_binding["id"],),
+        )
+        conn.commit()
+        assert_public_backlog_block(
+            "durable_finish_binding", "rev10_worker_finish_gate_not_db_accepted"
+        )
+        binding_columns = list(finish_binding.keys())
+        conn.execute(
+            f"INSERT INTO backlog_contract_chain_bindings "
+            f"({', '.join(binding_columns)}) VALUES "
+            f"({', '.join('?' for _ in binding_columns)})",
+            tuple(finish_binding[column] for column in binding_columns),
+        )
+        conn.commit()
+        assert read_premerge_acceptance()[1]["status"] == "satisfied"
+        return
+
     if result_mode != "mixed":
         _complete_rev10_two_lane_close_ready_through_normal_facades(
             conn,
@@ -182657,6 +182926,7 @@ def test_rev10_complete_baseline_ledger_rejects_semantic_mismatch(
             request,
             "runtime_drift",
             "mixed",
+            "canonical",
         )
 
 
@@ -215660,6 +215930,7 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
     backlog_id: str,
     real_git_world: bool = False,
     target_files: list[str] | None = None,
+    test_files: list[str] | None = None,
 ):
     project_id = "aming-claw"
     _initialize_ac_dev_guide_schema(conn)
@@ -215669,9 +215940,9 @@ def _prepare_ac_dev_mf_parallel_route_precursor(
         "docs/dev/stable-external-probe-intake.md",
     ]
     conn.execute(
-        "UPDATE backlog_bugs SET status='OPEN', target_files=?, test_files='[]' "
+        "UPDATE backlog_bugs SET status='OPEN', target_files=?, test_files=? "
         "WHERE bug_id=?",
-        (json.dumps(target_files), backlog_id),
+        (json.dumps(target_files), json.dumps(test_files or []), backlog_id),
     )
     conn.commit()
     root = tmp_path / "ac-dev-mf-parallel-route"
@@ -216479,13 +216750,15 @@ def test_ac_dev_mf_parallel_guide_bounded_task_negative_no_worker_write(
 
 
 def _prepare_ac_dev_entered_parallel_lane_routes(
-    conn, monkeypatch, tmp_path, *, target_files=None
+    conn, monkeypatch, tmp_path, *, target_files=None, test_files=None,
+    lane_owned_files=None,
 ):
     case = _prepare_ac_dev_mf_parallel_route_precursor(
         conn, monkeypatch, tmp_path,
         backlog_id="AC-DEV-ENTERED-PARALLEL-LANE-ROUTES",
         real_git_world=True,
         target_files=target_files,
+        test_files=test_files,
     )
     project_id, backlog_id = case["project_id"], case["backlog_id"]
     repository_root = Path(case["world"]["target_project_root"])
@@ -216522,8 +216795,11 @@ def _prepare_ac_dev_entered_parallel_lane_routes(
             "metadata": {"required_worker_count": 2, "lane_intents": [
                 {"task_id": f"entered-parallel-lane-{index}",
                  "worker_id": f"worker-{index}", "worker_slot_id": f"slot-{index}",
-                 "owned_files": [path]}
-                for index, path in enumerate(case["target_files"], start=1)
+                 "owned_files": list(files)}
+                for index, files in enumerate(
+                    lane_owned_files or ([path] for path in case["target_files"]),
+                    start=1,
+                )
             ]},
         },
     ))

@@ -89731,9 +89731,9 @@ def _contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance(
     if not (
         not acceptance_errors and current_closure.get("accepted") is True
         and stable_sha256(criteria) == stable_sha256(frozen_criteria)
-        and owned_union == _runtime_context_public_file_values(
+        and owned_union == sorted(_runtime_context_public_file_values(
             current_closure.get("row_declared_files") or []
-        )
+        ))
     ):
         return blocked("rev10_frozen_backlog_acceptance_scope_not_fully_covered")
 
