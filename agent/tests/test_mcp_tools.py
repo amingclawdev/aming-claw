@@ -8581,20 +8581,11 @@ def test_cleanup_dimensions_match_both_mcp_dispatchers_and_reject_unknown(monkey
 def test_existing_cleanup_mcp_surface_reaches_archive_first_positive(
     tmp_path, monkeypatch, surface,
 ):
-    from agent.tests.test_stale_artifact_cleanup import (
-        _conn, _git_repo, _merged_batch_with_worktree,
-    )
+    from agent.tests.test_stale_artifact_cleanup import _ac_cross_world_archive_fixture
 
-    repo = _git_repo(tmp_path)
-    conn = _conn()
-    _created, strategy = _merged_batch_with_worktree(
-        conn, repo, project_id="aming-claw", batch_id="mcp-" + surface,
+    repo, conn, _created, strategy, archive_root, _stable_path = (
+        _ac_cross_world_archive_fixture(tmp_path, monkeypatch)
     )
-    archive_root = tmp_path / "archive-volume"
-    archive_root.mkdir()
-    monkeypatch.setenv(stale_artifact_cleanup.ARCHIVE_ROOT_ENV, str(archive_root))
-    real_ismount = os.path.ismount
-    monkeypatch.setattr(os.path, "ismount", lambda path: Path(path) == archive_root or real_ismount(path))
 
     class NoClose:
         def __getattr__(self, name):

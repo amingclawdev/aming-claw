@@ -16,7 +16,7 @@ import uuid
 import hashlib
 import traceback
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -221299,6 +221299,12 @@ def handle_health(ctx: RequestContext):
         "branch": runtime_plane_identity["branch"],
         "runtime_commit": runtime_plane_identity["commit"],
         "stable_anchor_commit": runtime_plane_identity["stable_anchor_commit"],
+        # Loaded stable code advertises the queue writer's inode flock protocol.
+        # A DEV cleanup reader accepts this only through verified stable health.
+        "ac_release_queue_writer_fence": (
+            "ac_stable_release_queue_flock.v1"
+            if runtime_plane_identity["plane"] == "stable" else ""
+        ),
     }
 
 
@@ -236327,6 +236333,13 @@ def handle_integration_epoch_worldref_seal_linear_unlock(ctx: RequestContext):
         conn.close()
 
 
+@contextmanager
+def _deferred_stable_release_queue_connection(database_identity):
+    """Open the stable signoff connection only after the queue fence is held."""
+    with closing(_ac_stable_release_control_connection(database_identity)) as conn:
+        yield conn
+
+
 @route("GET", "/api/projects/{project_id}/release-operator-head-queue")
 @route("POST", "/api/projects/{project_id}/release-operator-head-queue")
 def handle_project_release_operator_head_queue(ctx: RequestContext):
@@ -236365,16 +236378,22 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
     stable_signoff = (_runtime_plane() == "stable" and project_id == AC_PROJECT_ID
                       and ctx.method == "POST" and bool(ctx.token) and bool(signoff))
     if stable_signoff:
-        from contextlib import closing
         from . import db
         physical = db.verified_stable_database_binding()
         if (signoff.get("stable_database_identity") != physical["stable_database_identity"]
                 or signoff.get("stable_anchor_commit") != physical["stable_head"]):
             raise ValidationError("operator signoff stable preimage differs from the live binding")
-        connection_context = closing(_ac_stable_release_control_connection(physical["stable_database_identity"]))
+        connection_context = _deferred_stable_release_queue_connection(
+            physical["stable_database_identity"],
+        )
     else:
         connection_context = DBContext(project_id)
-    with connection_context as conn:
+    if _runtime_plane() == "stable" and project_id == AC_PROJECT_ID and ctx.method == "POST":
+        from . import stale_artifact_cleanup
+        queue_fence = stale_artifact_cleanup._stable_queue_exclusive_fence()
+    else:
+        queue_fence = nullcontext()
+    with queue_fence, connection_context as conn:
         if ctx.method == "GET":
             return {
                 "ok": True,

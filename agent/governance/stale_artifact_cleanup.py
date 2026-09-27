@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import tempfile
 import uuid
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -39,6 +41,38 @@ ALL_DIMENSIONS = {
 PLAN_REVISION = 1
 ARCHIVE_PLAN_REVISION = 1
 ARCHIVE_ROOT_ENV = "AMING_CLAW_WORKTREE_ARCHIVE_ROOT"
+# A missing store cannot prove absence of a session, lease, CEX, queue, or
+# unique-evidence reference. This inventory is intentionally explicit: newly
+# added stores are still scanned when present, and a schema change to one of
+# these required stores fails closed until its reference columns are reviewed.
+_ARCHIVE_REFERENCE_COLUMNS: dict[str, frozenset[str]] = {
+    "sessions": frozenset({"session_id", "project_id", "status", "scope_json", "metadata_json"}),
+    "observer_sessions": frozenset({"session_id", "project_id", "status", "cwd", "capabilities_json"}),
+    "tasks": frozenset({"task_id", "project_id", "status", "metadata_json"}),
+    "backlog_bugs": frozenset({"bug_id", "status", "worktree_path", "worktree_branch",
+                               "current_task_id", "root_task_id", "takeover_json"}),
+    "task_attempts": frozenset({"task_id", "status", "result_json"}),
+    "task_timeline_events": frozenset({"task_id", "backlog_id", "payload_json", "artifact_refs_json"}),
+    "graph_query_traces": frozenset({"task_id", "parent_task_id", "runtime_context_id", "status"}),
+    "contract_runtime_executions": frozenset({"contract_execution_id", "project_id",
+                                                "backlog_id", "record_json"}),
+    "parallel_branch_runtime_contexts": frozenset({"task_id", "runtime_context_id",
+                                                    "worktree_path", "branch_ref", "lease_id",
+                                                    "lease_expires_at", "status"}),
+    "parallel_branch_merge_queue_items": frozenset({"task_id", "branch_ref", "branch_head", "status"}),
+    "parallel_branch_batch_items": frozenset({"task_id", "worktree_path", "branch_ref", "status"}),
+    "observer_command_queue": frozenset({"payload_json", "target_session_id", "status"}),
+    "ai_output_queue": frozenset({"target_id", "lease_token", "lease_expires_at", "status"}),
+    "reconcile_sessions": frozenset({"session_id", "snapshot_path", "status"}),
+    "session_context": frozenset({"task_id", "content", "metadata_json"}),
+    "release_operator_head_queue": frozenset({"project_id", "backlog_id", "position"}),
+    "release_operator_head_queue_events": frozenset({"backlog_id", "before_json", "after_json"}),
+    "managed_ref_contexts": frozenset({"ref_name", "ref_head_commit", "status", "evidence_json"}),
+}
+_STABLE_QUEUE_REFERENCE_TABLES = frozenset({
+    "release_operator_head_queue", "release_operator_head_queue_events",
+})
+_STABLE_QUEUE_FENCE_PROTOCOL = "ac_stable_release_queue_flock.v1"
 PREVIEW_LIMIT = 160
 _DESTRUCTIVE_CLEANUP_LOCK = RLock()
 _CLEANUP_HTTP_MAX_BYTES = 224 * 1024
@@ -884,6 +918,19 @@ def build_stale_artifact_cleanup_projection(
         }
         return _bounded_cleanup_projection(result) if response_budget else result
 
+    inventory_reasons = _archive_reference_inventory_reasons(conn, project_id=project_id)
+    if ("reference_inventory_unavailable" in inventory_reasons
+            or any(reason.endswith(":tasks") for reason in inventory_reasons)):
+        return {
+            "ok": False, "error": "archive_reference_inventory_refused",
+            "mode": "dry_run", "dry_run": True, "project_id": project_id,
+            "dimension": dim, "plan_revision": PLAN_REVISION,
+            "apply_plan_available": False, "candidates": [],
+            "refusal_reasons": inventory_reasons,
+            "writes_performed": False, "safe_retry": False,
+            "next_step": "Restore the required governance reference inventory and request a fresh preview.",
+        }
+
     root = batch_jobs.repo_root(repo_root_path)
     stale_report = batch_jobs.report_stale_worktrees(conn, project_id, repo_root_path=root)
     stale_paths = {_resolve_path(path) for path in stale_report.get("stale_worktrees", [])}
@@ -1296,6 +1343,8 @@ def _apply_stale_artifact_cleanup_locked(
         dimension=dim,
         response_budget=False,
     )
+    if projection.get("apply_plan_available") is False or projection.get("ok") is False:
+        raise StaleArtifactCleanupError("archive_reference_inventory_refused", projection)
     if _bounded_cleanup_projection(dict(projection)).get("apply_plan_available") is False:
         raise StaleArtifactCleanupError("cleanup_response_identity_overflow", {
             "ok": False, "error": "cleanup_response_identity_overflow",
@@ -1614,24 +1663,214 @@ def _archive_root_matches(expected: dict[str, Any], *, bytes_needed: int = 0) ->
                 and int(fresh.get("free_bytes") or 0) >= bytes_needed)
 
 
+def _archive_reference_inventory_reasons(
+    conn: sqlite3.Connection, *, project_id: str = "",
+) -> list[str]:
+    """A missing or unreadable required store cannot prove reference absence."""
+    try:
+        names = {str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )}
+        if len(names) > 512:
+            return ["reference_inventory_unbounded"]
+        required_tables = set(_ARCHIVE_REFERENCE_COLUMNS)
+        if project_id == "aming-claw":
+            # AC release queue authority lives only in the verified stable DB.
+            required_tables -= _STABLE_QUEUE_REFERENCE_TABLES
+        missing = sorted(required_tables - names)
+        if missing:
+            return ["reference_inventory_missing:" + name for name in missing]
+        for name in sorted(required_tables):
+            required = _ARCHIVE_REFERENCE_COLUMNS[name]
+            if not required <= _table_columns(conn, name):
+                return ["reference_inventory_schema_incomplete:" + name]
+            quoted = '"' + name.replace('"', '""') + '"'
+            try:
+                conn.execute(f"SELECT * FROM {quoted} LIMIT 1").fetchone()
+            except sqlite3.Error:
+                return ["reference_inventory_unreadable:" + name]
+    except sqlite3.Error:
+        return ["reference_inventory_unavailable"]
+    return []
+
+
+def _stable_release_queue_reference_facts(
+    *, tokens: tuple[str, ...],
+) -> tuple[dict[str, Any], list[str]]:
+    """Read AC's release queue from its verified stable authority, never DEV."""
+    from . import db
+
+    try:
+        binding = db.verified_stable_database_binding()
+        if (binding.get("health") or {}).get("ac_release_queue_writer_fence") != _STABLE_QUEUE_FENCE_PROTOCOL:
+            return {}, ["stable_queue_writer_fence_unavailable"]
+        db._revalidate_stable_database_binding(binding)
+        database = Path(str(binding["database_path"]))
+        lock_directory_identity = _stable_queue_lock_directory_identity(binding)
+        digest = hashlib.sha256()
+        count = 0
+        scanned_bytes = 0
+        references: set[str] = set()
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)) as stable:
+            stable.execute("PRAGMA query_only=ON")
+            stable.execute("BEGIN")
+            for name in sorted(_STABLE_QUEUE_REFERENCE_TABLES):
+                required = _ARCHIVE_REFERENCE_COLUMNS[name] | {"project_id"}
+                columns = _table_columns(stable, name)
+                if not required <= columns:
+                    return {}, ["stable_queue_inventory_missing_or_incomplete:" + name]
+                digest.update(name.encode("utf-8"))
+                digest.update(json.dumps(sorted(columns)).encode("utf-8"))
+                cursor = stable.execute(
+                    f'SELECT * FROM "{name}" WHERE project_id=? ORDER BY rowid',
+                    (db.AC_PROJECT_ID,),
+                )
+                field_names = [item[0] for item in cursor.description]
+                while rows := cursor.fetchmany(256):
+                    for row in rows:
+                        count += 1
+                        if count > 250_000:
+                            return {}, ["stable_queue_inventory_unbounded"]
+                        record = dict(zip(field_names, row))
+                        for column, value in record.items():
+                            if value is not None and not isinstance(value, (str, int, float)):
+                                return {}, ["stable_queue_inventory_corrupt:" + name + "." + column]
+                            if column.endswith("_json") and value not in (None, ""):
+                                try:
+                                    json.loads(value)
+                                except (TypeError, ValueError, UnicodeError):
+                                    return {}, ["stable_queue_inventory_corrupt:" + name + "." + column]
+                        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                                             ensure_ascii=False).encode("utf-8")
+                        scanned_bytes += len(encoded)
+                        if len(encoded) > 1024 * 1024 or scanned_bytes > 16 * 1024 * 1024:
+                            return {}, ["stable_queue_inventory_unbounded"]
+                        digest.update(encoded)
+                        body = "\n".join(str(value) for value in record.values() if value is not None)
+                        if any(token and token in body for token in tokens):
+                            references.add("referenced_by_stable_" + name)
+            stable.execute("COMMIT")
+        db._revalidate_stable_database_binding(binding)
+        if _stable_queue_lock_directory_identity(binding) != lock_directory_identity:
+            return {}, ["stable_queue_lock_directory_identity_drift"]
+        return {
+            "schema_version": "merged_worktree_stable_queue_facts.v1",
+            "stable_database_identity": dict(binding["stable_database_identity"]),
+            "lock_directory_identity": lock_directory_identity,
+            "stable_head": str(binding["stable_head"]),
+            "queue_sha256": "sha256:" + digest.hexdigest(),
+            "row_count": count,
+        }, sorted(references)
+    except (OSError, sqlite3.Error, RuntimeError, ValueError, KeyError, TypeError):
+        return {}, ["stable_queue_inventory_unavailable"]
+
+
+def _stable_queue_lock_directory_identity(binding: dict[str, Any]) -> dict[str, int]:
+    database = Path(str(binding["database_path"]))
+    parent = database.parent
+    metadata = parent.stat(follow_symlinks=False)
+    if (parent.is_symlink() or not stat.S_ISDIR(metadata.st_mode)
+            or parent.resolve(strict=True) != parent
+            or metadata.st_dev != binding["stable_database_identity"]["device"]):
+        raise RuntimeError("verified stable queue lock directory identity invalid")
+    return {"device": int(metadata.st_dev), "inode": int(metadata.st_ino)}
+
+
+def _stable_queue_file_identity_valid(binding: dict[str, Any]) -> bool:
+    path = Path(str(binding["database_path"]))
+    expected = binding["stable_database_identity"]
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        current = path.stat(follow_symlinks=False)
+        return bool(
+            stat.S_ISREG(opened.st_mode)
+            and (opened.st_dev, opened.st_ino) == (expected["device"], expected["inode"])
+            and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+        )
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _stable_queue_exclusive_fence():
+    """Coordinate new stable queue writers and AC prune on one verified inode.
+
+    This does not freeze runtime deployment. Production prune still requires a
+    separately controlled AC runtime transition hold and loaded new stable.
+    """
+    from . import db
+
+    try:
+        binding = db.verified_stable_database_binding()
+        if (binding.get("health") or {}).get("ac_release_queue_writer_fence") != _STABLE_QUEUE_FENCE_PROTOCOL:
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_unavailable")
+        db._revalidate_stable_database_binding(binding)
+        path = Path(str(binding["database_path"]))
+        parent_identity = _stable_queue_lock_directory_identity(binding)
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+        fd = os.open(path.parent, flags)
+    except (OSError, RuntimeError, KeyError, TypeError, AttributeError) as exc:
+        raise StaleArtifactCleanupError("stable_queue_writer_fence_unavailable") from exc
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_busy") from exc
+        opened = os.fstat(fd)
+        current = _stable_queue_lock_directory_identity(binding)
+        if (opened.st_dev, opened.st_ino) != (parent_identity["device"], parent_identity["inode"]):
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_identity_drift")
+        if current != parent_identity:
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_identity_drift")
+        if not _stable_queue_file_identity_valid(binding):
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_identity_drift")
+        db._revalidate_stable_database_binding(binding)
+        fresh = db.verified_stable_database_binding()
+        if (fresh.get("stable_head") != binding.get("stable_head")
+                or fresh.get("stable_database_identity") != binding.get("stable_database_identity")
+                or fresh.get("process_identity") != binding.get("process_identity")
+                or (fresh.get("health") or {}).get("ac_release_queue_writer_fence")
+                != _STABLE_QUEUE_FENCE_PROTOCOL):
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_identity_drift")
+        yield binding
+        db._revalidate_stable_database_binding(binding)
+        if _stable_queue_lock_directory_identity(binding) != parent_identity:
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_identity_drift")
+        if not _stable_queue_file_identity_valid(binding):
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_identity_drift")
+        fresh = db.verified_stable_database_binding()
+        if (fresh.get("stable_head") != binding.get("stable_head")
+                or fresh.get("stable_database_identity") != binding.get("stable_database_identity")
+                or fresh.get("process_identity") != binding.get("process_identity")
+                or (fresh.get("health") or {}).get("ac_release_queue_writer_fence")
+                != _STABLE_QUEUE_FENCE_PROTOCOL):
+            raise StaleArtifactCleanupError("stable_queue_writer_fence_identity_drift")
+    finally:
+        os.close(fd)
+
+
 def _archive_reference_reasons(
     conn: sqlite3.Connection, *, path: str, branch: str, head: str,
-    task_id: str, project_id: str,
+    task_id: str, project_id: str, backlog_id: str = "",
 ) -> list[str]:
-    """Conservatively scan present governance tables for protected references.
+    """Conservatively scan required and present governance reference stores.
 
     Unknown schemas, unreadable rows and unbounded scans refuse. The owning
     terminal task is the sole allowed reference; every other exact identity
     mention is protected until a more specific authority can prove otherwise.
     """
     reasons: set[str] = set()
+    inventory_reasons = _archive_reference_inventory_reasons(conn, project_id=project_id)
+    if inventory_reasons:
+        return inventory_reasons
     try:
         names = [str(row[0]) for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )]
         if len(names) > 512:
             return ["reference_inventory_unbounded"]
-        tokens = (path, branch, head, task_id)
+        tokens = (path, branch, head, task_id, backlog_id)
         scanned = 0
         for name in names:
             # Names come from SQLite schema, but quote defensively.
@@ -1644,6 +1883,15 @@ def _archive_reference_reasons(
                     return ["reference_inventory_unbounded"]
                 for row in rows:
                     record = dict(zip(columns, row))
+                    if name in _ARCHIVE_REFERENCE_COLUMNS:
+                        for column, value in record.items():
+                            if column.endswith("_json") and value not in (None, "", b""):
+                                if not isinstance(value, (str, bytes)):
+                                    return ["reference_inventory_corrupt:" + name + "." + column]
+                                try:
+                                    json.loads(value)
+                                except (TypeError, ValueError, UnicodeError):
+                                    return ["reference_inventory_corrupt:" + name + "." + column]
                     if name == "tasks" and str(record.get("task_id") or "") == task_id:
                         continue
                     if name == "backlog_bugs" and (
@@ -1673,9 +1921,11 @@ def _archive_candidate(
     terminal_ids = evidence.get("terminal_task_ids") or []
     reasons = [reason for reason in item.get("refusal_reasons") or []
                if reason != "archive_and_restore_proof_required"]
+    reasons.extend(_archive_reference_inventory_reasons(conn, project_id=project_id))
     git: dict[str, Any] = {"verified": False, "reason": "task_identity_unknown"}
     task_id = str(terminal_ids[0]) if len(terminal_ids) == 1 else ""
     metadata: dict[str, Any] = {}
+    stable_queue_facts: dict[str, Any] = {}
     if not task_id:
         reasons.append("single_terminal_task_required")
     else:
@@ -1702,7 +1952,14 @@ def _archive_candidate(
                 conn, path=str(item["path"]), branch=branch,
                 head=str(git["head"]), task_id=task_id,
                 project_id=project_id,
+                backlog_id=str(metadata.get("bug_id") or ""),
             ))
+            if project_id == "aming-claw":
+                stable_queue_facts, stable_queue_reasons = _stable_release_queue_reference_facts(
+                    tokens=(str(item["path"]), branch, str(git["head"]), task_id,
+                            str(metadata.get("bug_id") or "")),
+                )
+                reasons.extend(stable_queue_reasons)
     if archive.get("verified") is not True:
         reasons.append(str(archive.get("reason") or "archive_root_unknown"))
     size, size_status = _snapshot_directory_size(
@@ -1719,6 +1976,7 @@ def _archive_candidate(
               "refusal_reasons": sorted(set(reasons)),
               "action": "archive_merged_worktree_then_guarded_prune",
               "evidence": {**evidence, "task_id": task_id,
+                           "backlog_id": str(metadata.get("bug_id") or ""),
                            "branch": git.get("branch", ""),
                            "head": git.get("head", ""),
                            "tree": git.get("tree", ""),
@@ -1726,6 +1984,7 @@ def _archive_candidate(
                            "merge_target_head": git.get("target_head", ""),
                            "git_common_dir": git.get("git_common_dir", ""),
                            "size_bytes": size, "size_bytes_status": size_status,
+                           "stable_queue": stable_queue_facts,
                            "archive_root": {key: value for key, value in archive.items()
                                             if key != "free_bytes"}}}
     return result
@@ -1739,6 +1998,8 @@ def build_merged_worktree_archive_projection(
         conn, project_id, repo_root_path=root, dimension=DIMENSION_WORKTREES,
         response_budget=False, archive_enrichment=False,
     )
+    if base.get("ok") is False:
+        return base
     archive = _archive_root_descriptor()
     items = [_archive_candidate(conn, project_id, root, item, archive)
              for item in base["candidates"]
@@ -2092,6 +2353,7 @@ def archive_merged_worktree(
                 "merge_target": evidence["merge_target"],
                 "merge_target_head": evidence["merge_target_head"],
                 "source_path": str(source), "source_identity": evidence["path_identity"],
+                "stable_queue": evidence.get("stable_queue") or {},
                 "archive_root": archive_desc, "plan_hash": plan_hash,
                 "plan_revision": plan_revision, "generation": generation,
                 "rebuild": {"method": "git_bundle_clone_detached_checkout",
@@ -2173,63 +2435,78 @@ def prune_archived_merged_worktree(
                 or evidence["head"] != manifest["head"]
                 or evidence["tree"] != manifest["tree"]
                 or evidence["branch"] != manifest["branch"]
-                or evidence["merge_target_head"] != manifest["merge_target_head"]):
+                or evidence["merge_target_head"] != manifest["merge_target_head"]
+                or evidence.get("stable_queue") != manifest.get("stable_queue")):
             raise StaleArtifactCleanupError("archive_prune_source_drift")
         proof = _archive_cold_restore(bundle, manifest)
         protected_before = _registered_protected_worktrees(root, source)
-        governance_before = _archive_governance_evidence_readback(conn)
-        free_before = shutil.disk_usage(source).free
-        # Existing helper uses the non-forced Git worktree command. Branch
-        # removal is forbidden for this archive protocol.
-        removal = _remove_worktree(
-            repo_root_path=root, path=str(source),
-            metadata={"work_branch": evidence["branch"],
-                      "worktree_path": str(source)}, remove_branch=False,
-        )
-        if not removal.get("removed"):
-            raise StaleArtifactCleanupError("archive_prune_removal_uncertain")
-        index["state"] = "pruned"
-        index["pruned_at"] = _utc_now()
-        index["free_space_delta_bytes"] = shutil.disk_usage(source.parent).free - free_before
-        index["post_prune_restore_proof"] = _archive_cold_restore(bundle, manifest)
-        index["source_absent"] = not source.exists()
-        index["source_registration_absent"] = str(source) not in _registered_worktree_paths(root)
-        index["protected_worktrees_unchanged"] = all(
-            _path_identity(path) == identity for path, identity in protected_before.items()
-        )
-        governance_after = _archive_governance_evidence_readback(conn)
-        index["governance_evidence_readback"] = governance_after
-        index["governance_evidence_preserved"] = (
-            governance_before["database_path"] == governance_after["database_path"]
-            and all(
-                (governance_before["paths"].get("database") or {}).get(key)
-                == (governance_after["paths"].get("database") or {}).get(key)
-                for key in ("device", "inode")
+        with (_stable_queue_exclusive_fence() if project_id == "aming-claw"
+              else nullcontext()):
+            governance_before = _archive_governance_evidence_readback(conn)
+            free_before = shutil.disk_usage(source).free
+            if project_id == "aming-claw":
+                queue_facts, queue_reasons = _stable_release_queue_reference_facts(
+                    tokens=(str(source), evidence["branch"], evidence["head"],
+                            evidence["task_id"], evidence["backlog_id"]),
+                )
+                if queue_reasons or queue_facts != evidence["stable_queue"]:
+                    raise StaleArtifactCleanupError("stable_queue_prune_authority_drift", {
+                        "ok": False, "error": "stable_queue_prune_authority_drift",
+                        "refusal_reasons": queue_reasons or ["stable_queue_inventory_changed"],
+                        "writes_performed": False,
+                        "next_step": "Keep the worktree and request a fresh archive preview.",
+                    })
+            # Existing helper uses the non-forced Git worktree command. Branch
+            # removal is forbidden for this archive protocol.
+            removal = _remove_worktree(
+                repo_root_path=root, path=str(source),
+                metadata={"work_branch": evidence["branch"],
+                          "worktree_path": str(source)}, remove_branch=False,
             )
-            and all(governance_after["counts"].get(name, -1) >= count
-                    for name, count in governance_before["counts"].items())
-        )
-        index["archive_readback"] = bool((bundle / "manifest.json").is_file())
-        if (not index["source_absent"] or not index["source_registration_absent"]
-                or not index["protected_worktrees_unchanged"]
-                or not index["governance_evidence_preserved"]
-                or not index["archive_readback"]):
-            index["state"] = "partial_uncertain"
-        _archive_write_atomic(_archive_index_path(archive_root, project_id, candidate_id),
-                              _archive_json_bytes(index))
-        task_timeline.record_event(
-            conn, project_id=project_id, task_id=manifest["task_id"],
-            event_type="governance.stale_artifact_cleanup.apply",
-            phase="cleanup", event_kind="stale_artifact_cleanup",
-            actor="system", status="applied" if index["state"] == "pruned" else "partial",
-            payload={"candidate_id": candidate_id, "generation": generation,
-                     "archive_protocol": "merged_worktree_archive.v1",
-                     "head": manifest["head"], "tree": manifest["tree"],
-                     "index_state": index["state"]},
-        )
-        conn.commit()
-        return {"ok": index["state"] == "pruned", "state": index["state"],
-                "replay": False, "candidate_id": candidate_id,
-                "generation": generation, "restore_proof": proof,
-                "free_space_delta_bytes": index["free_space_delta_bytes"],
-                "writes_performed": True}
+            if not removal.get("removed"):
+                raise StaleArtifactCleanupError("archive_prune_removal_uncertain")
+            index["state"] = "pruned"
+            index["pruned_at"] = _utc_now()
+            index["free_space_delta_bytes"] = shutil.disk_usage(source.parent).free - free_before
+            index["post_prune_restore_proof"] = _archive_cold_restore(bundle, manifest)
+            index["source_absent"] = not source.exists()
+            index["source_registration_absent"] = str(source) not in _registered_worktree_paths(root)
+            index["protected_worktrees_unchanged"] = all(
+                _path_identity(path) == identity for path, identity in protected_before.items()
+            )
+            governance_after = _archive_governance_evidence_readback(conn)
+            index["governance_evidence_readback"] = governance_after
+            index["governance_evidence_preserved"] = (
+                governance_before["database_path"] == governance_after["database_path"]
+                and all(
+                    (governance_before["paths"].get("database") or {}).get(key)
+                    == (governance_after["paths"].get("database") or {}).get(key)
+                    for key in ("device", "inode")
+                )
+                and all(governance_after["counts"].get(name, -1) >= count
+                        for name, count in governance_before["counts"].items())
+            )
+            index["archive_readback"] = bool((bundle / "manifest.json").is_file())
+            if (not index["source_absent"] or not index["source_registration_absent"]
+                    or not index["protected_worktrees_unchanged"]
+                    or not index["governance_evidence_preserved"]
+                    or not index["archive_readback"]):
+                index["state"] = "partial_uncertain"
+            _archive_write_atomic(_archive_index_path(archive_root, project_id, candidate_id),
+                                  _archive_json_bytes(index))
+            task_timeline.record_event(
+                conn, project_id=project_id, task_id=manifest["task_id"],
+                event_type="governance.stale_artifact_cleanup.apply",
+                phase="cleanup", event_kind="stale_artifact_cleanup",
+                actor="system", status="applied" if index["state"] == "pruned" else "partial",
+                payload={"candidate_id": candidate_id, "generation": generation,
+                         "archive_protocol": "merged_worktree_archive.v1",
+                         "head": manifest["head"], "tree": manifest["tree"],
+                         "index_state": index["state"]},
+            )
+            conn.commit()
+            return {"ok": index["state"] == "pruned", "state": index["state"],
+                    "replay": False, "candidate_id": candidate_id,
+                    "generation": generation, "restore_proof": proof,
+                    "free_space_delta_bytes": index["free_space_delta_bytes"],
+                    "writes_performed": True}

@@ -103931,6 +103931,9 @@ def test_pending_scope_recover_stale_endpoint_marks_running_failed(conn, monkeyp
 
 
 def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_path):
+    SQLiteContractExecutionStore(conn).ensure_schema()
+    graph_query_trace.ensure_schema(conn)
+    server._ensure_release_operator_head_queue_schema(conn)
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
@@ -103990,7 +103993,7 @@ def test_stale_artifact_cleanup_api_dry_run_and_apply(conn, monkeypatch, tmp_pat
     assert all(item["artifact_type"] == "graph_snapshot_dir" for item in graph_only["candidates"])
 
     candidate = next(item for item in dry_run["candidates"] if item["artifact_type"] == "batch_worktree")
-    assert candidate["safe_to_apply"] is True
+    assert candidate["safe_to_apply"] is True, candidate["refusal_reasons"]
 
     applied = server.handle_graph_governance_stale_artifact_cleanup_apply(
         _ctx(

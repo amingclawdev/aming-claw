@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import sys
 import shutil
 import sqlite3
 import subprocess
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from agent.governance import batch_jobs
+from agent.governance import db as governance_db
 from agent.governance import graph_query_trace
 from agent.governance import graph_snapshot_store
 from agent.governance import mcp_server as governance_mcp_server
@@ -18,6 +20,7 @@ from agent.governance import server as governance_server
 from agent.governance import stale_artifact_cleanup
 from agent.governance import task_timeline
 from agent.governance.db import _ensure_schema
+from agent.governance.contracts.runtime import SQLiteContractExecutionStore
 from agent.mcp import server as managed_mcp_server
 from agent.mcp.server import AmingClawMCP
 
@@ -27,6 +30,8 @@ def _conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
     graph_query_trace.ensure_schema(conn)
+    conn.executescript(SQLiteContractExecutionStore.SCHEMA_SQL)
+    governance_server._ensure_release_operator_head_queue_schema(conn)
     return conn
 
 
@@ -135,6 +140,446 @@ def _archive_fixture(tmp_path, monkeypatch, *, batch_id="negative"):
     return repo, conn, created, strategy, archive_root
 
 
+def _ac_cross_world_archive_fixture(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    # The AC DEV source intentionally has no release queue. Its authority is
+    # the separate verified stable database, represented by this read-only fixture.
+    for table in sorted(stale_artifact_cleanup._STABLE_QUEUE_REFERENCE_TABLES):
+        conn.execute(f'DROP TABLE "{table}"')
+    created, strategy = _merged_batch_with_worktree(
+        conn, repo, batch_id="ac-cross-world", project_id="aming-claw",
+    )
+    stable_directory = tmp_path / "stable-world"
+    stable_directory.mkdir()
+    stable_path = stable_directory / "stable-authority.db"
+    with sqlite3.connect(stable_path) as stable:
+        governance_server._ensure_release_operator_head_queue_schema(stable)
+        stable.commit()
+    identity = stable_path.stat()
+    binding = {
+        "database_path": str(stable_path),
+        "stable_database_identity": {"device": identity.st_dev, "inode": identity.st_ino},
+        "stable_head": batch_jobs.git_commit(repo),
+        "health": {"ac_release_queue_writer_fence":
+                   stale_artifact_cleanup._STABLE_QUEUE_FENCE_PROTOCOL},
+    }
+    monkeypatch.setattr(governance_db, "verified_stable_database_binding", lambda: binding)
+
+    def revalidate(current):
+        now = Path(current["database_path"]).stat(follow_symlinks=False)
+        if (now.st_dev, now.st_ino) != (
+            current["stable_database_identity"]["device"],
+            current["stable_database_identity"]["inode"],
+        ):
+            raise RuntimeError("verified stable database identity changed")
+
+    monkeypatch.setattr(governance_db, "_revalidate_stable_database_binding", revalidate)
+    archive_root = tmp_path / "archive-volume"
+    archive_root.mkdir()
+    monkeypatch.setenv(stale_artifact_cleanup.ARCHIVE_ROOT_ENV, str(archive_root))
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount", lambda path: Path(path) == archive_root or real_ismount(path))
+    return repo, conn, created, strategy, archive_root, stable_path
+
+
+def test_ac_dev_archive_reads_verified_stable_queue_and_prunes(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root, stable_path = _ac_cross_world_archive_fixture(
+        tmp_path, monkeypatch,
+    )
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is True, candidate["refusal_reasons"]
+    assert candidate["evidence"]["stable_queue"]["row_count"] == 0
+    assert candidate["evidence"]["stable_queue"]["stable_database_identity"]["inode"] == stable_path.stat().st_ino
+    with stale_artifact_cleanup._stable_queue_exclusive_fence():
+        locked_facts, locked_reasons = stale_artifact_cleanup._stable_release_queue_reference_facts(
+            tokens=(str(strategy.worktree_path), candidate["evidence"]["branch"],
+                    candidate["evidence"]["head"], candidate["evidence"]["task_id"], ""),
+        )
+    assert locked_reasons == []
+    assert locked_facts == candidate["evidence"]["stable_queue"]
+    applied = stale_artifact_cleanup.apply_stale_artifact_cleanup(
+        conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+        candidate_ids=[candidate["candidate_id"]], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"],
+    )
+    assert applied["state"] == "pruned"
+    assert not Path(strategy.worktree_path).exists()
+    assert list(archive_root.rglob("index/*.json"))
+
+
+def test_ac_dev_http_cleanup_archives_and_prunes_with_separate_stable_queue(
+    tmp_path, monkeypatch,
+):
+    repo, conn, _created, strategy, archive_root, _stable_path = (
+        _ac_cross_world_archive_fixture(tmp_path, monkeypatch)
+    )
+
+    class NoClose:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(governance_server, "get_connection", lambda _project: NoClose())
+    monkeypatch.setattr(governance_server, "_graph_governance_project_root",
+                        lambda *_args, **_kwargs: repo)
+    monkeypatch.setattr(governance_server, "_require_graph_governance_operator",
+                        lambda *_args, **_kwargs: {"role": "observer"})
+    preview_context = governance_server.RequestContext(
+        None, "GET", {"project_id": "aming-claw"}, {"dimension": "worktrees"},
+        {}, "req-ac-preview", "", "",
+    )
+    preview = governance_server.handle_graph_governance_stale_artifact_cleanup(preview_context)
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is True
+    apply_context = governance_server.RequestContext(
+        None, "POST", {"project_id": "aming-claw"}, {},
+        {"dimension": "worktrees", "candidate_ids": [candidate["candidate_id"]],
+         "plan_hash": preview["plan_hash"], "plan_revision": preview["plan_revision"]},
+        "req-ac-apply", "", "",
+    )
+    applied = governance_server.handle_graph_governance_stale_artifact_cleanup_apply(
+        apply_context,
+    )
+    assert applied["state"] == "pruned", applied
+    assert not Path(strategy.worktree_path).exists()
+    assert list(archive_root.rglob("index/*.json"))
+    assert all(size <= 224 * 1024 for size in
+               stale_artifact_cleanup.cleanup_response_wire_bytes(applied).values())
+
+
+def test_ac_dev_archive_refuses_stable_queue_change_and_binding_loss(tmp_path, monkeypatch):
+    repo, conn, created, strategy, archive_root, stable_path = _ac_cross_world_archive_fixture(
+        tmp_path, monkeypatch,
+    )
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is True
+    with sqlite3.connect(stable_path) as stable:
+        stable.execute(
+            "INSERT INTO release_operator_head_queue "
+            "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+            ("aming-claw", created["task_id"], 1, batch_jobs.utc_now(), batch_jobs.utc_now()),
+        )
+        stable.commit()
+    changed = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+    )
+    changed_candidate = next(i for i in changed["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert changed_candidate["safe_to_apply"] is False
+    assert "referenced_by_stable_release_operator_head_queue" in changed_candidate["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+            candidate_ids=[candidate["candidate_id"]], plan_hash=preview["plan_hash"],
+            plan_revision=preview["plan_revision"],
+        )
+    assert error.value.payload["error"] == "stale_cleanup_plan_refused"
+    monkeypatch.setattr(governance_db, "verified_stable_database_binding",
+                        lambda: (_ for _ in ()).throw(RuntimeError("binding unavailable")))
+    lost = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+    )
+    lost_candidate = next(i for i in lost["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert lost_candidate["safe_to_apply"] is False
+    assert "stable_queue_inventory_unavailable" in lost_candidate["refusal_reasons"]
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("missing", "stable_queue_inventory_missing_or_incomplete:release_operator_head_queue_events"),
+    ("corrupt", "stable_queue_inventory_corrupt:release_operator_head_queue_events.after_json"),
+])
+def test_ac_dev_archive_refuses_missing_or_corrupt_stable_queue(
+    tmp_path, monkeypatch, fault, reason,
+):
+    repo, conn, _created, strategy, archive_root, stable_path = _ac_cross_world_archive_fixture(
+        tmp_path, monkeypatch,
+    )
+    with sqlite3.connect(stable_path) as stable:
+        if fault == "missing":
+            stable.execute("DROP TABLE release_operator_head_queue_events")
+        else:
+            stable.execute(
+                "INSERT INTO release_operator_head_queue_events "
+                "(project_id,action,backlog_id,actor,reason,before_json,after_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                ("aming-claw", "insert", "unrelated", "fixture", "", "{}", "{bad",
+                 batch_jobs.utc_now()),
+            )
+        stable.commit()
+    refused = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in refused["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is False
+    assert reason in candidate["refusal_reasons"]
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_ac_dev_archive_rechecks_stable_queue_immediately_before_prune(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root, stable_path = _ac_cross_world_archive_fixture(
+        tmp_path, monkeypatch,
+    )
+    preview = stale_artifact_cleanup.build_merged_worktree_archive_projection(
+        conn, "aming-claw", repo_root_path=repo,
+    )
+    candidate = preview["candidates"][0]
+    assert candidate["safe_to_apply"] is True
+    published = stale_artifact_cleanup.archive_merged_worktree(
+        conn, "aming-claw", repo_root_path=repo,
+        candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"],
+    )
+    original_readback = stale_artifact_cleanup._archive_governance_evidence_readback
+    changed = False
+
+    def change_queue_after_plan(connection):
+        nonlocal changed
+        if not changed:
+            with sqlite3.connect(stable_path) as stable:
+                stable.execute(
+                    "INSERT INTO release_operator_head_queue "
+                    "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+                    ("aming-claw", "unrelated-backlog", 1, batch_jobs.utc_now(),
+                     batch_jobs.utc_now()),
+                )
+                stable.commit()
+            changed = True
+        return original_readback(connection)
+
+    monkeypatch.setattr(stale_artifact_cleanup, "_archive_governance_evidence_readback",
+                        change_queue_after_plan)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_artifact_cleanup.prune_archived_merged_worktree(
+            conn, "aming-claw", repo_root_path=repo,
+            candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+            plan_revision=preview["plan_revision"], generation=published["generation"],
+        )
+    assert error.value.payload["error"] == "stable_queue_prune_authority_drift"
+    assert Path(strategy.worktree_path).exists()
+    assert list(archive_root.rglob("index/*.json"))
+
+
+def test_ac_dev_archive_refuses_old_marker_and_wrong_stable_identity(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root, _stable_path = _ac_cross_world_archive_fixture(
+        tmp_path, monkeypatch,
+    )
+    binding = governance_db.verified_stable_database_binding()
+    marker = binding["health"].pop("ac_release_queue_writer_fence")
+    old = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in old["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert "stable_queue_writer_fence_unavailable" in candidate["refusal_reasons"]
+    binding["health"]["ac_release_queue_writer_fence"] = marker
+    binding["stable_database_identity"]["inode"] += 1
+    wrong = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "aming-claw", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in wrong["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert "stable_queue_inventory_unavailable" in candidate["refusal_reasons"]
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_ac_stable_directory_lock_allows_sqlite_and_excludes_other_process(
+    tmp_path, monkeypatch,
+):
+    _repo, _conn, _created, _strategy, _archive_root, stable_path = (
+        _ac_cross_world_archive_fixture(tmp_path, monkeypatch)
+    )
+    child = (
+        "import fcntl,os,sys; "
+        "fd=os.open(sys.argv[1],os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); "
+        "\ntry: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); print('acquired')"
+        "\nexcept BlockingIOError: print('busy')"
+    )
+    with stale_artifact_cleanup._stable_queue_exclusive_fence():
+        with sqlite3.connect(stable_path) as stable:
+            stable.execute("BEGIN IMMEDIATE")
+            stable.execute(
+                "INSERT INTO release_operator_head_queue "
+                "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+                ("aming-claw", "fixture-write", 1, batch_jobs.utc_now(), batch_jobs.utc_now()),
+            )
+            stable.commit()
+            assert stable.execute(
+                "SELECT backlog_id FROM release_operator_head_queue WHERE project_id=?",
+                ("aming-claw",),
+            ).fetchone()[0] == "fixture-write"
+        writer = (
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+            "c.execute('BEGIN IMMEDIATE'); "
+            "c.execute('INSERT INTO release_operator_head_queue "
+            "(project_id,backlog_id,position,inserted_at,updated_at) "
+            "VALUES (?,?,?,?,?)',('aming-claw','cross-process-write',2,'now','now')); "
+            "c.commit(); "
+            "print(c.execute('SELECT backlog_id FROM release_operator_head_queue "
+            "WHERE backlog_id=?',('cross-process-write',)).fetchone()[0])"
+        )
+        written = subprocess.run([sys.executable, "-c", writer, str(stable_path)],
+                                 capture_output=True, text=True, check=True)
+        assert written.stdout.strip() == "cross-process-write"
+        with sqlite3.connect(stable_path.as_uri() + "?mode=ro", uri=True) as readonly:
+            assert readonly.execute("SELECT COUNT(*) FROM release_operator_head_queue").fetchone()[0] == 2
+        busy = subprocess.run([sys.executable, "-c", child, str(stable_path.parent)],
+                              capture_output=True, text=True, check=True)
+        assert busy.stdout.strip() == "busy"
+    acquired = subprocess.run([sys.executable, "-c", child, str(stable_path.parent)],
+                              capture_output=True, text=True, check=True)
+    assert acquired.stdout.strip() == "acquired"
+
+
+def test_ac_stable_directory_lock_detects_replaced_parent(tmp_path, monkeypatch):
+    _repo, _conn, _created, _strategy, _archive_root, stable_path = (
+        _ac_cross_world_archive_fixture(tmp_path, monkeypatch)
+    )
+    original_parent = stable_path.parent
+    moved_parent = tmp_path / "stable-world-moved"
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        with stale_artifact_cleanup._stable_queue_exclusive_fence():
+            original_parent.rename(moved_parent)
+            original_parent.mkdir()
+            os.link(moved_parent / stable_path.name, stable_path)
+    assert str(error.value) == "stable_queue_writer_fence_identity_drift"
+
+
+def test_ac_dev_prune_refuses_other_process_holding_stable_queue_lock(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root, stable_path = _ac_cross_world_archive_fixture(
+        tmp_path, monkeypatch,
+    )
+    preview = stale_artifact_cleanup.build_merged_worktree_archive_projection(
+        conn, "aming-claw", repo_root_path=repo,
+    )
+    candidate = preview["candidates"][0]
+    published = stale_artifact_cleanup.archive_merged_worktree(
+        conn, "aming-claw", repo_root_path=repo,
+        candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"],
+    )
+    child = (
+        "import fcntl,os,sys; "
+        "fd=os.open(sys.argv[1],os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); "
+        "fcntl.flock(fd,fcntl.LOCK_EX); print('locked',flush=True); "
+        "sys.stdin.readline(); os.close(fd)"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", child, str(stable_path.parent)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+            stale_artifact_cleanup.prune_archived_merged_worktree(
+                conn, "aming-claw", repo_root_path=repo,
+                candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+                plan_revision=preview["plan_revision"], generation=published["generation"],
+            )
+        assert str(error.value) == "stable_queue_writer_fence_busy"
+        assert Path(strategy.worktree_path).exists()
+        assert list(archive_root.rglob("index/*.json"))
+    finally:
+        holder.communicate(input="\n", timeout=5)
+    assert holder.returncode == 0
+    pruned = stale_artifact_cleanup.prune_archived_merged_worktree(
+        conn, "aming-claw", repo_root_path=repo,
+        candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"], generation=published["generation"],
+    )
+    assert pruned["state"] == "pruned"
+
+
+def test_stable_queue_post_enters_lock_before_connection_and_releases_on_return(
+    tmp_path, monkeypatch,
+):
+    _repo, _conn, _created, _strategy, _archive_root, stable_path = (
+        _ac_cross_world_archive_fixture(tmp_path, monkeypatch)
+    )
+    monkeypatch.setattr(governance_server, "_runtime_plane", lambda: "stable")
+    observed = []
+
+    class GuardedConnection:
+        def __enter__(self):
+            with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+                with stale_artifact_cleanup._stable_queue_exclusive_fence():
+                    pass
+            assert str(error.value) == "stable_queue_writer_fence_busy"
+            observed.append("entered_under_lock")
+            self.conn = sqlite3.connect(stable_path)
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute(
+                "INSERT INTO release_operator_head_queue "
+                "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+                ("aming-claw", "route-lock-fixture", 1, batch_jobs.utc_now(),
+                 batch_jobs.utc_now()),
+            )
+            return self.conn
+
+        def __exit__(self, _kind, _value, _traceback):
+            self.conn.commit()
+            self.conn.close()
+            observed.append("closed_under_lock")
+
+    monkeypatch.setattr(governance_server, "DBContext", lambda _project: GuardedConnection())
+    ctx = governance_server.RequestContext(
+        None, "POST", {"project_id": "aming-claw"}, {}, {"action": "invalid"},
+        "req-stable-route", "", "",
+    )
+    status, body = governance_server.handle_project_release_operator_head_queue(ctx)
+    assert status == 400
+    assert body["error"] == "invalid_release_operator_head_queue_action"
+    assert observed == ["entered_under_lock", "closed_under_lock"]
+    with stale_artifact_cleanup._stable_queue_exclusive_fence():
+        pass
+
+    binding = governance_db.verified_stable_database_binding()
+    monkeypatch.setattr(governance_server, "_ac_stable_promotion_signoff_body", lambda _body: {
+        "stable_database_identity": binding["stable_database_identity"],
+        "stable_anchor_commit": binding["stable_head"],
+    })
+
+    def open_signoff_connection(_identity):
+        with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+            with stale_artifact_cleanup._stable_queue_exclusive_fence():
+                pass
+        assert str(error.value) == "stable_queue_writer_fence_busy"
+        observed.append("signoff_opened_after_lock")
+        return sqlite3.connect(stable_path)
+
+    monkeypatch.setattr(governance_server, "_ac_stable_release_control_connection",
+                        open_signoff_connection)
+    signoff_ctx = governance_server.RequestContext(
+        None, "POST", {"project_id": "aming-claw"}, {}, {"action": "invalid"},
+        "req-signoff-route", "fixture-token", "",
+    )
+    status, _body = governance_server.handle_project_release_operator_head_queue(signoff_ctx)
+    assert status == 400
+    assert observed[-1] == "signoff_opened_after_lock"
+    with stale_artifact_cleanup._stable_queue_exclusive_fence():
+        pass
+
+    def fail_signoff_open(_identity):
+        raise RuntimeError("fixture connection failure")
+
+    monkeypatch.setattr(governance_server, "_ac_stable_release_control_connection",
+                        fail_signoff_open)
+    with pytest.raises(RuntimeError, match="fixture connection failure"):
+        governance_server.handle_project_release_operator_head_queue(signoff_ctx)
+    with stale_artifact_cleanup._stable_queue_exclusive_fence():
+        pass
+
+
 def test_archive_preview_shows_active_registered_worktree_as_protected(tmp_path, monkeypatch):
     repo = _git_repo(tmp_path)
     conn = _conn()
@@ -158,6 +603,162 @@ def test_archive_preview_shows_active_registered_worktree_as_protected(tmp_path,
     assert Path(strategy.worktree_path).exists()
 
 
+@pytest.mark.parametrize("missing_table", sorted(stale_artifact_cleanup._ARCHIVE_REFERENCE_COLUMNS))
+def test_archive_missing_required_reference_store_refuses_public_apply_without_deletion(
+    tmp_path, monkeypatch, missing_table,
+):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    approved = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in approved["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is True
+    conn.execute(f'DROP TABLE "{missing_table}"')
+    conn.commit()
+    refused = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    if missing_table == "tasks":
+        assert refused["error"] == "archive_reference_inventory_refused"
+        assert refused["apply_plan_available"] is False
+        reasons = refused["refusal_reasons"]
+    else:
+        refused_candidate = next(i for i in refused["candidates"]
+                                 if i["artifact_type"] == "batch_worktree")
+        assert refused_candidate["safe_to_apply"] is False
+        reasons = refused_candidate["refusal_reasons"]
+    assert "reference_inventory_missing:" + missing_table in reasons
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_art_cleanup_apply(conn, repo, candidate, approved)
+    assert error.value.payload["error"] == (
+        "archive_reference_inventory_refused" if missing_table == "tasks"
+        else "stale_cleanup_plan_refused"
+    )
+    if missing_table != "tasks":
+        with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as fresh_error:
+            stale_art_cleanup_apply(conn, repo, refused_candidate, refused)
+        assert fresh_error.value.payload["error"] == "unsafe_stale_artifact_cleanup_refused"
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+@pytest.mark.parametrize("table", [
+    "sessions", "parallel_branch_runtime_contexts",
+    "contract_runtime_executions", "release_operator_head_queue",
+])
+def test_archive_partial_required_reference_schema_refuses_public_apply(
+    tmp_path, monkeypatch, table,
+):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    approved = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in approved["candidates"] if i["artifact_type"] == "batch_worktree")
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'CREATE TABLE "{table}" (fixture_only TEXT)')
+    conn.commit()
+    refused = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    refused_candidate = next(i for i in refused["candidates"]
+                             if i["artifact_type"] == "batch_worktree")
+    assert refused_candidate["safe_to_apply"] is False
+    assert "reference_inventory_schema_incomplete:" + table in refused_candidate["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_art_cleanup_apply(conn, repo, candidate, approved)
+    assert error.value.payload["error"] == "stale_cleanup_plan_refused"
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as fresh_error:
+        stale_art_cleanup_apply(conn, repo, refused_candidate, refused)
+    assert fresh_error.value.payload["error"] == "unsafe_stale_artifact_cleanup_refused"
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+@pytest.mark.parametrize("table", [
+    "sessions", "parallel_branch_runtime_contexts",
+    "contract_runtime_executions", "release_operator_head_queue",
+])
+def test_archive_unreadable_required_reference_store_refuses_public_apply(
+    tmp_path, monkeypatch, table,
+):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    approved = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in approved["candidates"] if i["artifact_type"] == "batch_worktree")
+
+    def deny_reference_read(action, arg1, _arg2, _database, _trigger):
+        if action == sqlite3.SQLITE_READ and arg1 == table:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(deny_reference_read)
+    refused = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    refused_candidate = next(i for i in refused["candidates"]
+                             if i["artifact_type"] == "batch_worktree")
+    assert refused_candidate["safe_to_apply"] is False
+    assert "reference_inventory_unreadable:" + table in refused_candidate["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_art_cleanup_apply(conn, repo, candidate, approved)
+    assert error.value.payload["error"] == "stale_cleanup_plan_refused"
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as fresh_error:
+        stale_art_cleanup_apply(conn, repo, refused_candidate, refused)
+    assert fresh_error.value.payload["error"] == "unsafe_stale_artifact_cleanup_refused"
+    conn.set_authorizer(None)
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_archive_corrupt_session_json_refuses_public_apply(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    conn.execute(
+        "INSERT INTO sessions (session_id,principal_id,project_id,role,scope_json,token_hash,"
+        "status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("ses-corrupt", "qa", "proj", "qa", "{bad", "hash-corrupt", "active",
+         "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
+    )
+    conn.commit()
+    refused = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in refused["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is False
+    assert "reference_inventory_corrupt:sessions.scope_json" in candidate["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_art_cleanup_apply(conn, repo, candidate, refused)
+    assert error.value.payload["error"] == "unsafe_stale_artifact_cleanup_refused"
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_archive_release_queue_backlog_only_reference_refuses(tmp_path, monkeypatch):
+    repo, conn, created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    row = conn.execute("SELECT metadata_json FROM tasks WHERE task_id=?",
+                       (created["task_id"],)).fetchone()
+    metadata = json.loads(row[0])
+    metadata["bug_id"] = "OPT-QUEUED-ARCHIVE"
+    conn.execute("UPDATE tasks SET metadata_json=? WHERE task_id=?",
+                 (json.dumps(metadata), created["task_id"]))
+    conn.execute(
+        "INSERT INTO release_operator_head_queue "
+        "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+        ("proj", "OPT-QUEUED-ARCHIVE", 1, batch_jobs.utc_now(), batch_jobs.utc_now()),
+    )
+    conn.commit()
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = next(i for i in preview["candidates"] if i["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is False
+    assert "referenced_by_release_operator_head_queue" in candidate["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError):
+        stale_art_cleanup_apply(conn, repo, candidate, preview)
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
 @pytest.mark.parametrize("kind", ["session", "lease", "cex", "queue"])
 def test_archive_preview_refuses_live_governance_reference(tmp_path, monkeypatch, kind):
     repo, conn, created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
@@ -165,7 +766,7 @@ def test_archive_preview_refuses_live_governance_reference(tmp_path, monkeypatch
         conn.execute(
             "INSERT INTO sessions (session_id,principal_id,project_id,role,scope_json,token_hash,"
             "status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            ("ses-protected", "qa", "proj", "qa", str(strategy.worktree_path),
+            ("ses-protected", "qa", "proj", "qa", json.dumps({"worktree_path": str(strategy.worktree_path)}),
              "hash-protected", "active", "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
         )
         table = "sessions"
