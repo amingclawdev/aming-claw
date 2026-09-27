@@ -101291,6 +101291,9 @@ def _install_mf_sub_multitrace_contract_runtime(
     tmp_path,
     *,
     suffix,
+    activate_snapshot=True,
+    current_full_run_id="",
+    per_lane_assigned_roots=False,
 ):
     execution_id = f"cex-mf-sub-multitrace-{suffix}"
     backlog_id = f"AC-MF-SUB-MULTITRACE-{suffix.upper()}"
@@ -101298,10 +101301,23 @@ def _install_mf_sub_multitrace_contract_runtime(
     target_root.mkdir()
     target_commit = "a" * 40
     active_snapshot_id = f"full-mf-sub-multitrace-{suffix}"
+    build_claim = None
+    if current_full_run_id:
+        build_claim = store.acquire_current_full_build_claim(
+            conn, PID,
+            run_id=current_full_run_id,
+            snapshot_id=active_snapshot_id,
+            commit_sha=target_commit,
+            manager_epoch="historical-ready-epoch",
+            manager_pid=4242,
+            manager_started_at="2026-09-27T00:00:00Z",
+            manager_start_identity="historical-ready-manager",
+        )
     _activate_basic_graph(
         conn,
         active_snapshot_id,
         commit_sha=target_commit,
+        activate=activate_snapshot,
     )
     (target_root / "graph_query_fixture.py").write_text(
         "def handle_graph_governance_query():\n"
@@ -101321,6 +101337,9 @@ def _install_mf_sub_multitrace_contract_runtime(
     ):
         task_id = f"mf-sub-multitrace-{suffix}-worker-{index}"
         token = f"mf-sub-multitrace-{suffix}-session-{index}"
+        lane_root = target_root / f"lane-{index}"
+        if per_lane_assigned_roots:
+            lane_root.mkdir()
         context = _insert_mf_parallel_source_backed_runtime_context(
             conn,
             backlog_id=backlog_id,
@@ -101328,8 +101347,10 @@ def _install_mf_sub_multitrace_contract_runtime(
             parent_task_id=execution_id,
             fence_token=f"fence-{task_id}",
             token=token,
-            worktree_path=str(target_root / f"lane-{index}"),
-            target_project_root=str(target_root),
+            worktree_path=str(lane_root),
+            target_project_root=str(
+                lane_root if per_lane_assigned_roots else target_root
+            ),
             base_commit=target_commit,
             target_head_commit=target_commit,
             merge_queue_id=f"mq-{task_id}",
@@ -101626,6 +101647,7 @@ def _install_mf_sub_multitrace_contract_runtime(
         "active_snapshot_id": active_snapshot_id,
         "lanes": lanes,
         "record": record,
+        "build_claim": build_claim,
     }
 
 
@@ -101647,7 +101669,7 @@ def _mf_sub_multitrace_query_body(fixture, lane_index, *, tool, args=None):
         "fence_token": context.fence_token,
         "session_token": lane["token"],
         "session_token_ref": runtime_context_session_token_ref(context),
-        "target_project_root": fixture["target_root"],
+        "target_project_root": context.target_project_root,
         **lane["route_identity"],
     }
 
@@ -101947,6 +101969,236 @@ def test_mf_sub_complete_graph_trace_accepts_historical_exact_frozen_world(
     assert graph_evidence["source_details"][
         "global_active_ref_authoritative"
     ] is False
+
+
+@pytest.mark.parametrize("historical_status", ("superseded", "abandoned"))
+def test_mf_sub_current_full_historical_baseline_requires_ready_activation(
+    conn, monkeypatch, tmp_path, historical_status,
+):
+    fixture = _install_mf_sub_multitrace_contract_runtime(
+        conn, monkeypatch, tmp_path,
+        suffix=f"current-full-history-{historical_status}",
+        activate_snapshot=False,
+        current_full_run_id="historical-ready-run",
+    )
+    frozen_snapshot_id = fixture["active_snapshot_id"]
+    # Build a real ready claim/metric before activating the frozen snapshot.
+    # Then supersede it through the normal graph-ref transition.
+    run_id = "historical-ready-run"
+    conn.execute(
+        "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+        (json.dumps({"run_id": run_id}), PID, frozen_snapshot_id),
+    )
+    conn.commit()
+    claim = fixture["build_claim"]
+    store.terminalize_current_full_build_claim(
+        conn, PID,
+        claim_id=claim["claim_id"],
+        run_id=run_id,
+        snapshot_id=frozen_snapshot_id,
+        commit_sha=fixture["target_commit"],
+        terminal_status="candidate_ready",
+        manager_start_identity="historical-ready-manager",
+        metric_evidence={"phase": "candidate_ready", "claim_id": claim["claim_id"]},
+    )
+    assert store.current_full_candidate_tuple_from_db(
+        conn, project_id=PID, run_id=run_id,
+        target_commit_sha=fixture["target_commit"],
+        snapshot_id=frozen_snapshot_id,
+    )["valid"] is True
+    store.activate_graph_snapshot(conn, PID, frozen_snapshot_id)
+    conn.commit()
+    _activate_basic_graph(
+        conn, f"{frozen_snapshot_id}-replacement", commit_sha="b" * 40,
+    )
+    if historical_status == "abandoned":
+        conn.execute(
+            "UPDATE graph_snapshots SET status='abandoned' "
+            "WHERE project_id=? AND snapshot_id=?",
+            (PID, frozen_snapshot_id),
+        )
+        conn.commit()
+    assert conn.execute(
+        "SELECT 1 FROM graph_ref_events WHERE project_id=? AND ref_name='active' "
+        "AND new_snapshot_id=? AND new_commit=?",
+        (PID, frozen_snapshot_id, fixture["target_commit"]),
+    ).fetchone() is not None
+    body = _mf_sub_multitrace_query_body(
+        fixture, 0, tool="query_schema", args={},
+    )
+    body["snapshot_id"] = frozen_snapshot_id
+    before = _mf_sub_multitrace_contract_state(fixture["record"])
+    result = server.handle_graph_governance_query(
+        _ctx_with_role({"project_id": PID}, "mf_sub", method="POST", body=body)
+    )
+    gate = result["mf_sub_graph_query_canonical_gate"]
+    if historical_status == "superseded":
+        assert gate["ok"] is True
+        assert result["contract_runtime_canonical_line"]["status"] == "completed"
+    else:
+        assert gate["ok"] is False
+        assert gate["error"] == "mf_sub_snapshot_not_historical_authority"
+        assert result["contract_runtime_canonical_line"]["status"] == (
+            "graph_query_canonical_gate_rejected"
+        )
+        assert _mf_sub_multitrace_contract_state(fixture["record"]) == before
+
+
+@pytest.mark.parametrize("case", (
+    "assigned", "wrong_root", "missing_provenance", "tampered_provenance",
+    "failed_claim", "nonready_claim", "abandoned",
+))
+def test_mf_sub_atomic_second_lane_candidate_binds_assigned_root(
+    conn, monkeypatch, tmp_path, case,
+):
+    fixture = _install_mf_sub_multitrace_contract_runtime(
+        conn, monkeypatch, tmp_path,
+        suffix=f"atomic-second-candidate-{case}",
+        per_lane_assigned_roots=True,
+    )
+    lanes = fixture["lanes"]
+    workers = []
+    for lane in lanes:
+        context = lane["context"]
+        workers.append({
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": fixture["execution_id"],
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "target_project_root": context.target_project_root,
+            "worktree_path": context.worktree_path,
+            "branch_ref": context.branch_ref,
+            "base_commit": context.base_commit,
+            "target_head_commit": context.target_head_commit,
+            "merge_queue_id": context.merge_queue_id,
+            "owned_files": list(context.owned_files),
+            "route_identity": dict(lane["route_identity"]),
+        })
+    fixture["record"]["completed_lines"].insert(0, {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer",
+        "evidence_kind": "dispatch_bounded_worker",
+        "payload": {
+            "dispatch_ticket_authority": {
+                "schema_version": "mf_parallel.atomic_dispatch_ticket_authority.v1",
+                "source": "observer_route_token_refs",
+                "runtime_context_bound": True,
+                "server_resolved_child_route_identity": True,
+                "all_workers_bound": True,
+                "atomic_dispatch": True,
+            },
+            "bounded_workers": workers,
+        },
+    })
+    assert server._runtime_context_contract_dispatch_matches_worker(
+        conn, fixture["record"], context=lanes[1]["context"],
+        runtime_context_id=lanes[1]["context"].runtime_context_id,
+        task_id=lanes[1]["context"].task_id,
+    ) is True
+
+    first = server.handle_graph_governance_query(_ctx_with_role(
+        {"project_id": PID}, "mf_sub", method="POST",
+        body=_mf_sub_multitrace_query_body(
+            fixture, 0, tool="query_schema", args={},
+        ),
+    ))
+    assert first["contract_runtime_canonical_line"]["status"] == "completed"
+
+    candidate_id = f"full-atomic-second-{case}"
+    run_id = f"atomic-second-run-{case}"
+    materialized_lane = 0 if case == "wrong_root" else 1
+    materialization_root = Path(lanes[materialized_lane]["context"].worktree_path)
+    _init_test_git_repo(materialization_root)
+    claim = store.acquire_current_full_build_claim(
+        conn, PID, run_id=run_id, snapshot_id=candidate_id,
+        commit_sha=fixture["target_commit"],
+        manager_epoch="atomic-second-epoch", manager_pid=4242,
+        manager_started_at="2026-09-27T00:00:00Z",
+        manager_start_identity="atomic-second-manager",
+    )
+    checkout = describe_checkout(
+        materialization_root, project_id=PID,
+        commit_sha=fixture["target_commit"],
+    )
+    snapshot = store.create_graph_snapshot(
+        conn, PID, snapshot_id=candidate_id,
+        commit_sha=fixture["target_commit"], snapshot_kind="full",
+        graph_json=_graph(),
+        notes=json.dumps({"run_id": run_id, "checkout_provenance": checkout}),
+    )
+    store.index_graph_snapshot(
+        conn, PID, snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+    store.terminalize_current_full_build_claim(
+        conn, PID, claim_id=claim["claim_id"], run_id=run_id,
+        snapshot_id=candidate_id, commit_sha=fixture["target_commit"],
+        terminal_status="candidate_ready",
+        manager_start_identity="atomic-second-manager",
+        metric_evidence={"phase": "candidate_ready", "claim_id": claim["claim_id"]},
+    )
+    if case in {"missing_provenance", "tampered_provenance"}:
+        notes = json.loads(conn.execute(
+            "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, candidate_id),
+        ).fetchone()[0])
+        if case == "missing_provenance":
+            notes.pop("checkout_provenance")
+        else:
+            notes["checkout_provenance"]["execution_root"] = str(
+                lanes[0]["context"].worktree_path
+            )
+        conn.execute(
+            "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+            (json.dumps(notes), PID, candidate_id),
+        )
+    elif case in {"failed_claim", "nonready_claim"}:
+        terminal = "failed" if case == "failed_claim" else ""
+        status = "released" if case == "failed_claim" else "active"
+        conn.execute(
+            "UPDATE graph_current_full_build_claim_history "
+            "SET status=?, terminal_status=? WHERE claim_id=?",
+            (status, terminal, claim["claim_id"]),
+        )
+        conn.execute(
+            "UPDATE reconcile_run_metrics SET status=? WHERE project_id=? "
+            "AND run_id=? AND snapshot_id=?",
+            ("failed" if case == "failed_claim" else "running",
+             PID, run_id, candidate_id),
+        )
+    elif case == "abandoned":
+        conn.execute(
+            "UPDATE graph_snapshots SET status='abandoned' "
+            "WHERE project_id=? AND snapshot_id=?",
+            (PID, candidate_id),
+        )
+    conn.commit()
+    body = _mf_sub_multitrace_query_body(
+        fixture, 1, tool="query_schema", args={},
+    )
+    body["snapshot_id"] = candidate_id
+    before = _mf_sub_multitrace_contract_state(fixture["record"])
+    result = server.handle_graph_governance_query(_ctx_with_role(
+        {"project_id": PID}, "mf_sub", method="POST", body=body,
+    ))
+    gate = result["mf_sub_graph_query_canonical_gate"]
+    if case == "assigned":
+        assert gate["ok"] is True
+        assert result["contract_runtime_canonical_line"]["status"] == "completed"
+    else:
+        assert gate["ok"] is False
+        assert gate["error"] == (
+            "mf_sub_snapshot_not_historical_authority"
+            if case == "abandoned"
+            else "mf_sub_current_full_candidate_not_ready"
+            if case in {"failed_claim", "nonready_claim"}
+            else "mf_sub_candidate_execution_root_mismatch"
+        )
+        assert _mf_sub_multitrace_contract_state(fixture["record"]) == before
 
 
 @pytest.mark.parametrize("mismatch", ("graph_commit", "snapshot_kind"))
@@ -200991,6 +201243,58 @@ def test_ac_dev_direct_failed_qa_guide_http_issue_archive_only(
     assert conn.execute(
         "SELECT COUNT(*) FROM observer_route_token_refs"
     ).fetchone()[0] == route_count
+
+
+@pytest.mark.parametrize(
+    "report_shape,expected",
+    [
+        ("native_alias_only", True),
+        ("both_consistent", True),
+        ("conflicting_alias", False),
+        ("incomplete_alias", False),
+        ("malformed_alias_digest", False),
+    ],
+)
+def test_ac_dev_failed_qa_archive_projects_only_consistent_event_report(
+    conn, monkeypatch, tmp_path, report_shape, expected,
+):
+    case = _prepare_ac_dev_failed_qa_archive_case(conn, monkeypatch, tmp_path)
+    event_id = int(case["lineage"]["failed_qa_source_ref"].split(":")[1])
+    row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id=?", (event_id,)
+    ).fetchone()
+    payload = json.loads(row["payload_json"])
+    report_ref = payload.pop("report_ref")
+    report_digest = payload.pop("report_sha256")
+    payload["qa_report_ref"] = report_ref
+    payload["qa_report_sha256"] = report_digest
+    if report_shape == "both_consistent":
+        payload["report_ref"] = report_ref
+        payload["report_sha256"] = report_digest
+    elif report_shape == "conflicting_alias":
+        payload["report_ref"] = "qa-report:different-event"
+        payload["report_sha256"] = report_digest
+    elif report_shape == "incomplete_alias":
+        payload.pop("qa_report_sha256")
+    elif report_shape == "malformed_alias_digest":
+        payload["qa_report_sha256"] = "sha256:malformed"
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+        (json.dumps(payload, sort_keys=True), event_id),
+    )
+    conn.commit()
+
+    source = server._ac_dev_failed_qa_archive_source(
+        conn,
+        project_id="aming-claw",
+        backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+    )
+    assert bool(source) is expected
+    if expected:
+        assert source["state"]["qa_report_ref"] == report_ref
+        assert source["state"]["qa_report_sha256"] == report_digest
+        assert source["state"]["failed_qa_status"] == "failed"
 
 
 @pytest.mark.parametrize("attack", [

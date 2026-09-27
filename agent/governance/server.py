@@ -96354,12 +96354,250 @@ def _runtime_context_mf_sub_graph_query_canonical_gate(
         )
 
     active_binding_exact = bool(
-        active_ref_snapshot_id
+        queried_snapshot_status == "active"
+        and active_ref_snapshot_id
         and active_ref_snapshot_id == resolved_snapshot_id
         and active_snapshot_id == resolved_snapshot_id
         and active_ref_commit == queried_snapshot_commit
         and active_snapshot_commit == queried_snapshot_commit
     )
+    if (
+        not active_binding_exact
+        and queried_snapshot_status not in {"candidate", "superseded"}
+    ):
+        return reject(
+            "mf_sub_snapshot_not_historical_authority",
+            "only a candidate or a superseded full baseline can be historical worker authority",
+            snapshot_id=resolved_snapshot_id,
+            snapshot_status=queried_snapshot_status,
+        )
+    if not active_binding_exact:
+        try:
+            candidate_notes = _json_loads(queried_snapshot.get("notes"), {})
+            candidate_notes = (
+                candidate_notes if isinstance(candidate_notes, Mapping) else {}
+            )
+            candidate_claim_count = int(conn.execute(
+                "SELECT COUNT(*) FROM graph_current_full_build_claim_history "
+                "WHERE project_id=? AND snapshot_id=?",
+                (project_id, resolved_snapshot_id),
+            ).fetchone()[0])
+            historical_activation = (
+                conn.execute(
+                    "SELECT 1 FROM graph_ref_events WHERE project_id=? "
+                    "AND ref_name='active' AND new_snapshot_id=? "
+                    "AND new_commit=? LIMIT 1",
+                    (project_id, resolved_snapshot_id, queried_snapshot_commit),
+                ).fetchone()
+                if queried_snapshot_status == "superseded"
+                else None
+            )
+        except (sqlite3.Error, TypeError, ValueError):
+            return reject(
+                "mf_sub_candidate_claim_authority_unavailable",
+                "candidate claim history could not be verified",
+                snapshot_id=resolved_snapshot_id,
+            )
+        if queried_snapshot_status == "superseded" and historical_activation is None:
+            return reject(
+                "mf_sub_historical_snapshot_activation_missing",
+                "superseded baseline has no persisted active-ref activation",
+                snapshot_id=resolved_snapshot_id,
+            )
+        historical_current_full = bool(
+            candidate_claim_count
+            or candidate_notes.get("run_id")
+            or candidate_notes.get("full_reconcile_anchor")
+        )
+        if historical_current_full and queried_snapshot_status != "candidate":
+            # A ready current-full candidate can later be activated and then
+            # superseded.  Preserve that frozen baseline, but do not let a
+            # failed/abandoned build acquire historical authority merely by
+            # changing its snapshot status.
+            historical_ready = False
+            if queried_snapshot_status == "superseded":
+                try:
+                    ready_tuple = (
+                        graph_snapshot_store.current_full_candidate_tuple_from_db(
+                            conn,
+                            project_id=project_id,
+                            run_id=str(candidate_notes.get("run_id") or ""),
+                            target_commit_sha=queried_snapshot_commit,
+                            snapshot_id=resolved_snapshot_id,
+                            expected_snapshot_status="superseded",
+                        )
+                    )
+                    historical_ready = (
+                        ready_tuple.get("valid") is True
+                        and historical_activation is not None
+                    )
+                except (OSError, sqlite3.Error, TypeError, ValueError):
+                    historical_ready = False
+            if not historical_ready:
+                return reject(
+                    "mf_sub_current_full_candidate_not_ready",
+                    "failed or abandoned current-full build is not a frozen baseline",
+                    snapshot_id=resolved_snapshot_id,
+                    snapshot_status=queried_snapshot_status,
+                )
+    if not active_binding_exact and queried_snapshot_status == "candidate":
+        # The trace proves what was read, not which worker owns the files from
+        # which the candidate was built.  Join the persisted allocator/dispatch
+        # assignment to the snapshot's actual materialization checkout before
+        # this read can advance a worker-owned ContractRuntime line.
+        assigned_root = str(getattr(context, "worktree_path", "") or "").strip()
+        target_root = _runtime_context_effective_target_project_root(context)
+        runtime_context_id = str(
+            getattr(context, "runtime_context_id", "") or ""
+        ).strip()
+        task_id = str(getattr(context, "task_id", "") or "").strip()
+        parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+        try:
+            parent_record = _contract_runtime(conn).store.get(parent_task_id)
+            selected_dispatch = _contract_runtime_current_dispatch_authority_line(
+                parent_record
+            )
+            dispatch_line = (
+                selected_dispatch.get("line")
+                if isinstance(selected_dispatch.get("line"), Mapping)
+                else {}
+            )
+            dispatch = (
+                selected_dispatch.get("payload")
+                if isinstance(selected_dispatch.get("payload"), Mapping)
+                else {}
+            )
+            ticket = (
+                dispatch.get("dispatch_ticket_authority")
+                if isinstance(dispatch.get("dispatch_ticket_authority"), Mapping)
+                else {}
+            )
+            assigned_fields = {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "target_project_root": str(target_root),
+                "worktree_path": assigned_root,
+                "worker_id": str(getattr(context, "worker_id", "") or ""),
+                "worker_slot_id": str(
+                    getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ),
+                "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+                "base_commit": str(getattr(context, "base_commit", "") or ""),
+                "target_head_commit": str(
+                    getattr(context, "target_head_commit", "") or ""
+                ),
+                "merge_queue_id": str(
+                    getattr(context, "merge_queue_id", "") or ""
+                ),
+            }
+            dispatch_bound = bool(
+                selected_dispatch.get("status") == "selected"
+                and str(parent_record.get("project_id") or "") == project_id
+                and str(parent_record.get("backlog_id") or "")
+                == str(getattr(context, "backlog_id", "") or "")
+                and str(dispatch_line.get("actor_role") or "") == "observer"
+                and str(dispatch_line.get("line_id") or "")
+                == "observer_dispatch_bounded_workers"
+                and dispatch.get("schema_version")
+                == "mf_parallel.dispatch_bounded_worker.v1"
+                and ticket.get("schema_version")
+                in {
+                    "mf_parallel.dispatch_ticket_authority.v1",
+                    "mf_parallel.atomic_dispatch_ticket_authority.v1",
+                }
+                and ticket.get("source") == "observer_route_token_refs"
+                and ticket.get("runtime_context_bound") is True
+                and ticket.get("server_resolved_child_route_identity") is True
+                and all(
+                    expected
+                    and str(dispatch.get(field) or "").strip() == expected
+                    for field, expected in assigned_fields.items()
+                )
+            )
+            dispatch_bound = dispatch_bound or (
+                _runtime_context_contract_dispatch_matches_worker(
+                    conn,
+                    parent_record,
+                    context=context,
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                )
+            )
+            notes = _json_loads(queried_snapshot.get("notes"), {})
+            notes = notes if isinstance(notes, Mapping) else {}
+            checkout = notes.get("checkout_provenance")
+            checkout = checkout if isinstance(checkout, Mapping) else {}
+            materialization = (
+                graph_snapshot_store.snapshot_materialization_provenance(
+                    queried_snapshot
+                )
+            )
+            materialization_git = materialization.get("git")
+            materialization_git = (
+                materialization_git
+                if isinstance(materialization_git, Mapping)
+                else {}
+            )
+
+            def normalized_root(value: Any) -> str:
+                raw = str(value or "").strip()
+                return str(Path(raw).expanduser().resolve(strict=True)) if raw else ""
+
+            assigned = normalized_root(assigned_root)
+            target = normalized_root(target_root)
+            execution = normalized_root(materialization.get("execution_root"))
+            git_root = normalized_root(materialization_git.get("worktree_root"))
+            root_bound = bool(
+                dispatch_bound
+                and assigned
+                and assigned == target == execution == git_root
+                and materialization.get("execution_root_role") == "execution_root"
+                and checkout.get("execution_root_is_ephemeral") is False
+                and str(checkout.get("commit_sha") or "").strip().lower()
+                == queried_snapshot_commit
+            )
+            current_full = bool(
+                candidate_claim_count
+                or notes.get("run_id")
+                or notes.get("full_reconcile_anchor")
+            )
+            ready = True
+            if current_full:
+                ready_tuple = graph_snapshot_store.current_full_candidate_tuple_from_db(
+                    conn,
+                    project_id=project_id,
+                    run_id=str(notes.get("run_id") or ""),
+                    target_commit_sha=queried_snapshot_commit,
+                    snapshot_id=resolved_snapshot_id,
+                )
+                ready = ready_tuple.get("valid") is True
+        except (ContractRuntimeError, KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+            return reject(
+                "mf_sub_candidate_root_authority_unavailable",
+                "candidate worker assignment or materialization could not be verified",
+                graph_trace_id=graph_trace_id,
+                snapshot_id=resolved_snapshot_id,
+            )
+        if not root_bound:
+            return reject(
+                "mf_sub_candidate_execution_root_mismatch",
+                "candidate was not materialized from the assigned worker root",
+                graph_trace_id=graph_trace_id,
+                snapshot_id=resolved_snapshot_id,
+                assigned_worker_root=assigned,
+                materialization_execution_root=execution,
+                accepted_dispatch_bound=dispatch_bound,
+            )
+        if not ready:
+            return reject(
+                "mf_sub_current_full_candidate_not_ready",
+                "candidate current-full build has no ready claim and metric",
+                graph_trace_id=graph_trace_id,
+                snapshot_id=resolved_snapshot_id,
+            )
     snapshot_authority_mode = (
         "active_exact_frozen_world"
         if active_binding_exact
@@ -169827,20 +170065,28 @@ def _onboard_parentless_direct_main_failed_qa_state(
     candidate_snapshot_commit = str(
         qa_proof.get("snapshot_commit_sha") or ""
     ).strip()
-    qa_report_ref = str(qa_payload.get("report_ref") or "").strip()
-    qa_report_sha256 = str(qa_payload.get("report_sha256") or "").strip()
-    if not qa_report_ref or not qa_report_sha256:
+    qa_report_ref = ""
+    qa_report_sha256 = ""
+    if include_archive_proof:
         verification = (
             failed_qa.get("verification")
             if isinstance(failed_qa.get("verification"), Mapping)
             else {}
         )
-        qa_report_ref = qa_report_ref or str(
-            verification.get("report_ref") or ""
-        ).strip()
-        qa_report_sha256 = qa_report_sha256 or str(
-            verification.get("report_sha256") or ""
-        ).strip()
+        report_pairs = []
+        for source in (qa_payload, verification):
+            for prefix in ("", "qa_"):
+                ref = str(source.get(f"{prefix}report_ref") or "").strip()
+                digest = str(source.get(f"{prefix}report_sha256") or "").strip()
+                if bool(ref) != bool(digest):
+                    return {}
+                if ref:
+                    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                        return {}
+                    report_pairs.append((ref, digest))
+        if not report_pairs or len(set(report_pairs)) != 1:
+            return {}
+        qa_report_ref, qa_report_sha256 = report_pairs[0]
 
     try:
         runtime_records = _contract_runtime_store(conn).list_by_backlog(
