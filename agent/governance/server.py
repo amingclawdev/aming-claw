@@ -34,7 +34,12 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 from .errors import GovernanceError, PermissionDeniedError, ValidationError
-from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
+from .dirty_worktree import (
+    CandidateGitStatusError,
+    candidate_dirty_status_from_porcelain_z,
+    filter_dirty_files,
+    parse_git_porcelain_paths,
+)
 import logging
 import sqlite3
 import stat
@@ -91678,19 +91683,30 @@ def _git_output(project_root: Path, args: list[str], *, timeout: int = 5) -> str
 
 
 def _git_dirty_paths(project_root: Path, *, limit: int | None = 50) -> list[str]:
-    raw = _git_output(project_root, ["status", "--porcelain"], timeout=10)
-    paths: list[str] = []
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        path = line[3:].strip() if len(line) > 3 else line.strip()
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1].strip()
-        if path:
-            paths.append(path.replace("\\", "/"))
-        if limit is not None and len(paths) >= limit:
-            break
-    return paths
+    # Candidate cleanliness is decided on the complete porcelain stream. The
+    # legacy ``limit`` argument is retained for callers that patch this helper
+    # in fixture worlds, but is deliberately not a decision-time truncation.
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            capture_output=True,
+            text=False,
+            timeout=10,
+            cwd=project_root,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CandidateGitStatusError("candidate_git_status_unavailable") from exc
+    if result.returncode != 0:
+        raise CandidateGitStatusError("candidate_git_status_unavailable")
+    raw = result.stdout
+    if type(raw) is not bytes or len(raw) > 32 * 1024 * 1024:
+        raise CandidateGitStatusError("candidate_git_status_unavailable")
+    # Every record needs at least four bytes, so len(raw) is a safe upper
+    # bound that preserves every classified path before response capping.
+    status = candidate_dirty_status_from_porcelain_z(
+        raw, diagnostic_limit=len(raw),
+    )
+    return list(status.dirty_files)
 
 
 def _git_refs_for_root(project_root: Path) -> dict[str, Any]:
@@ -104397,15 +104413,28 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
                 "terminal_idempotent_replay_checked": True,
             }
-        dirty_paths = filter_dirty_files(_git_dirty_paths(root)) if require_clean else []
+        try:
+            dirty_paths = _git_dirty_paths(root) if require_clean else []
+        except CandidateGitStatusError as exc:
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": str(exc),
+                "target_commit_sha": target_commit,
+                "head_commit": head_commit,
+                "writes_performed": False,
+                "zero_write_rejection": True,
+                "fail_closed": True,
+            }
         if dirty_paths:
             return 409, {
                 "ok": False,
                 "project_id": project_id,
                 "error": "dirty_worktree",
                 "message": "current-full reconcile requires a clean worktree by default",
-                "dirty_files": dirty_paths,
+                "dirty_files": dirty_paths[:50],
                 "dirty_file_count": len(dirty_paths),
+                "dirty_files_truncated": len(dirty_paths) > 50,
                 "target_commit_sha": target_commit,
                 "head_commit": head_commit,
             }
@@ -104824,6 +104853,17 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             with sqlite_write_lock():
                 conn.execute("BEGIN IMMEDIATE")
                 if dev_force_graph:
+                    try:
+                        locked_dirty_paths = _git_dirty_paths(root)
+                    except CandidateGitStatusError:
+                        conn.rollback()
+                        return 409, {
+                            "ok": False,
+                            "error": "dev_force_graph_locked_git_status_unavailable",
+                            "writes_performed": False,
+                            "zero_write_rejection": True,
+                            "fail_closed": True,
+                        }
                     locked_auth = _require_dev_force_graph_auth(
                         ctx, conn, project_id=project_id,
                     )
@@ -104849,7 +104889,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     if not (
                         locked_world["target_head_commit"] == target_commit
                         and _git_head_commit(root) == target_commit
-                        and not filter_dirty_files(_git_dirty_paths(root))
+                        and not locked_dirty_paths
                         and locked_evidence == route_evidence
                         and locked_active_ref
                         and str(locked_active_ref["snapshot_id"] or "")
@@ -104859,6 +104899,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         return 409, {
                             "ok": False, "error": "dev_force_graph_locked_authority_changed",
                             "writes_performed": False, "zero_write_rejection": True,
+                            "dirty_files": locked_dirty_paths[:50],
+                            "dirty_file_count": len(locked_dirty_paths),
+                            "dirty_files_truncated": len(locked_dirty_paths) > 50,
                         }
                 if dev_graph_bootstrap_authority.get(
                     "existing_candidate_activation_required"

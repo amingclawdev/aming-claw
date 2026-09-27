@@ -99,6 +99,13 @@ def test_dev_force_graph_guide_enrollment_build_activate_and_normal_denial(
     (root / "source.py").write_text("value = 1\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(root), "add", "source.py"], check=True)
     subprocess.run(["git", "-C", str(root), "commit", "-qm", "candidate"], check=True)
+    assigned_root = tmp_path / "assigned-managed-worker"
+    subprocess.run(
+        ["git", "-C", str(root), "worktree", "add", "-q", "-b",
+         "assigned-managed-worker", str(assigned_root)],
+        check=True,
+    )
+    root = assigned_root
     head = subprocess.check_output(
         ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
     ).strip()
@@ -340,12 +347,42 @@ def test_dev_force_graph_guide_enrollment_build_activate_and_normal_denial(
     )
     assert companion_status == 409, companion_denied
     companion.write_bytes(companion_original)
+    generated_cache = root / ".aming-claw/cache/branches/worker"
+    generated_cache.mkdir(parents=True)
+    for index in range(60):
+        (generated_cache / f"record-{index:03}.json").write_text("{}", encoding="utf-8")
     (root / "source.py").write_text("value = 2\n", encoding="utf-8")
     dirty_status, dirty = server.handle_graph_governance_current_full_reconcile(
         _ctx({"project_id": project_id}, method="POST", body=activation_body),
     )
     assert dirty_status == 409 and dirty["error"] == "dirty_worktree"
+    assert dirty["dirty_files"] == ["source.py"]
+    assert dirty["dirty_file_count"] == 1
     (root / "source.py").write_text("value = 1\n", encoding="utf-8")
+    original_dirty_paths = server._git_dirty_paths
+    lock_checks = iter([[], ["late-source.py"]])
+    monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: next(lock_checks))
+    locked_status, locked = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": project_id}, method="POST", body=activation_body),
+    )
+    assert locked_status == 409
+    assert locked["error"] == "dev_force_graph_locked_authority_changed"
+    assert locked["dirty_files"] == ["late-source.py"]
+    assert locked["writes_performed"] is False
+    lock_checks = iter([[], server.CandidateGitStatusError("candidate_git_status_unavailable")])
+    def locked_status_failure(_root):
+        value = next(lock_checks)
+        if isinstance(value, Exception):
+            raise value
+        return value
+    monkeypatch.setattr(server, "_git_dirty_paths", locked_status_failure)
+    unavailable_status, unavailable = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": project_id}, method="POST", body=activation_body),
+    )
+    assert unavailable_status == 409
+    assert unavailable["error"] == "dev_force_graph_locked_git_status_unavailable"
+    assert unavailable["writes_performed"] is False
+    monkeypatch.setattr(server, "_git_dirty_paths", original_dirty_paths)
     old_active_id = store.get_active_graph_snapshot(conn, project_id)["snapshot_id"]
     if audit_failure:
         def reject_audit(*_args, **_kwargs):
@@ -30603,7 +30640,7 @@ def test_current_full_reconcile_ignores_demo_environment_marker_dirty_state(
     monkeypatch.setattr(
         server,
         "_git_dirty_paths",
-        lambda _root: [".aming-claw-demo-environment.json"],
+        lambda _root: [],  # classified untracked generated marker
     )
     monkeypatch.setattr(
         server,
@@ -30637,10 +30674,7 @@ def test_current_full_reconcile_blocks_governed_dirty_file_after_filtering(
     monkeypatch.setattr(
         server,
         "_git_dirty_paths",
-        lambda _root: [
-            ".aming-claw-demo-environment.json",
-            "agent/governance/server.py",
-        ],
+        lambda _root: ["agent/governance/server.py"],
     )
     monkeypatch.setattr(
         server,
@@ -30664,6 +30698,59 @@ def test_current_full_reconcile_blocks_governed_dirty_file_after_filtering(
     assert result["error"] == "dirty_worktree"
     assert result["dirty_files"] == ["agent/governance/server.py"]
     assert result["dirty_file_count"] == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "malformed"])
+def test_current_full_candidate_git_status_failure_is_zero_write(
+    conn, monkeypatch, tmp_path, failure,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    def failed_status(_root):
+        raise server.CandidateGitStatusError(
+            "candidate_git_status_malformed" if failure == "malformed"
+            else "candidate_git_status_unavailable"
+        )
+    monkeypatch.setattr(server, "_git_dirty_paths", failed_status)
+    monkeypatch.setattr(
+        server, "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    before = conn.total_changes
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body={
+            "target_commit_sha": head, "activate": False,
+            "semantic_enrich": False,
+        }),
+    )
+    assert status == 409
+    assert result["error"].startswith("candidate_git_status_")
+    assert result["writes_performed"] is False
+    assert calls == []
+    assert conn.total_changes == before
+
+
+def test_current_full_candidate_caps_only_diagnostics_after_dirty_decision(
+    conn, monkeypatch, tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    governed = [f"source/file-{index:03}.py" for index in range(80)]
+    monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: governed)
+    monkeypatch.setattr(
+        server, "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body={
+            "target_commit_sha": head, "activate": False,
+            "semantic_enrich": False,
+        }),
+    )
+    assert status == 409
+    assert result["error"] == "dirty_worktree"
+    assert result["dirty_file_count"] == 80
+    assert result["dirty_files_truncated"] is True
+    assert result["dirty_files"] == governed[:50]
     assert calls == []
 
 

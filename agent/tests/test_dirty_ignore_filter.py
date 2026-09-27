@@ -11,7 +11,12 @@ import pytest
 from agent.governance import parallel_branch_runtime as pbr
 from agent.governance import server
 from agent.governance.auto_chain import _DIRTY_IGNORE
-from agent.governance.dirty_worktree import filter_dirty_files, is_ignored_dirty_path
+from agent.governance.dirty_worktree import (
+    CandidateGitStatusError,
+    candidate_dirty_status_from_porcelain_z,
+    filter_dirty_files,
+    is_ignored_dirty_path,
+)
 from agent.governance.state_reconcile import _git_dirty_files
 
 
@@ -191,3 +196,116 @@ def test_worker_commit_dirty_diagnostic_is_exact_and_host_safe() -> None:
         "ignored_directory_components": ["__pycache__"],
         "arbitrary_pyc_outside_ignored_components_is_governed": True,
     }
+
+
+def _candidate_git_repo(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    (tmp_path / "source.py").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "source.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    return tmp_path
+
+
+def test_candidate_status_classifies_all_untracked_descendants_before_diagnostic_cap(tmp_path):
+    root = _candidate_git_repo(tmp_path)
+    cache = root / ".aming-claw/cache"
+    cache.mkdir(parents=True)
+    for index in range(60):
+        (cache / f"generated-{index:03}.json").write_text("{}", encoding="utf-8")
+    (root / "late-governed.py").write_text("change\n", encoding="utf-8")
+    status = candidate_dirty_status_from_porcelain_z(
+        subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root,
+        ),
+    )
+    assert status.dirty_files == ("late-governed.py",)
+    assert status.dirty_file_count == 1
+    assert status.ignored_untracked_count == 60
+    assert server._git_dirty_paths(root) == ["late-governed.py"]
+
+
+def test_candidate_status_never_exempts_tracked_cache_or_parent(tmp_path):
+    root = _candidate_git_repo(tmp_path)
+    tracked = root / ".aming-claw/cache/tracked.json"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-f", str(tracked.relative_to(root))], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "tracked cache"], cwd=root, check=True)
+    tracked.write_text("changed\n", encoding="utf-8")
+    (root / ".aming-claw" / "other.json").write_text("{}", encoding="utf-8")
+    assert server._git_dirty_paths(root) == [
+        ".aming-claw/cache/tracked.json", ".aming-claw/other.json",
+    ]
+
+
+def test_candidate_status_preserves_rename_and_literal_special_names(tmp_path):
+    root = _candidate_git_repo(tmp_path)
+    target = "renamed\tline\nquote\"slash\\Unicode-雪.py"
+    (root / "source.py").rename(root / target)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    assert server._git_dirty_paths(root) == sorted(["source.py", target])
+
+
+def test_candidate_status_preserves_untracked_arrow_and_literal_backslash(tmp_path):
+    root = _candidate_git_repo(tmp_path)
+    names = ["a -> b\t雪.txt", ".aming-claw\\cache\\not-a-child.json"]
+    for name in names:
+        (root / name).write_text("untracked\n", encoding="utf-8")
+    assert server._git_dirty_paths(root) == sorted(names)
+
+
+@pytest.mark.parametrize("raw", [
+    b"?? source.py", b"? source.py\0", b"R  target.py\0",
+    b"!! ignored.py\0", b"?? ../outside.py\0", b"  clean.py\0",
+    b"?? bad-\xff.py\0",
+])
+def test_candidate_status_malformed_porcelain_fails_closed(raw):
+    with pytest.raises(CandidateGitStatusError, match="candidate_git_status_malformed"):
+        candidate_dirty_status_from_porcelain_z(raw)
+
+
+def test_candidate_status_caps_diagnostics_after_complete_classification():
+    raw = b"".join(f"?? src/file-{index:03}.py\0".encode() for index in range(80))
+    status = candidate_dirty_status_from_porcelain_z(raw)
+    assert status.dirty_file_count == 80
+    assert status.dirty_files_truncated is True
+    assert len(status.dirty_files) == 50
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "malformed"])
+def test_candidate_git_command_failure_never_looks_clean(monkeypatch, tmp_path, failure):
+    def failed_run(args, **kwargs):
+        assert args == ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+        assert kwargs["text"] is False
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(args, 10)
+        return subprocess.CompletedProcess(
+            args, 1 if failure == "nonzero" else 0,
+            stdout=b"" if failure == "nonzero" else b"?? incomplete",
+            stderr=b"failure" if failure == "nonzero" else b"",
+        )
+    monkeypatch.setattr(server.subprocess, "run", failed_run)
+    with pytest.raises(CandidateGitStatusError, match="candidate_git_status_"):
+        server._git_dirty_paths(tmp_path)
+
+
+def test_candidate_status_is_scoped_to_assigned_linked_worktree(tmp_path):
+    parent = tmp_path / "repo"
+    parent.mkdir()
+    _candidate_git_repo(parent)
+    assigned = tmp_path / "assigned-worker"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "candidate-worker", str(assigned)],
+        cwd=parent, check=True,
+    )
+    cache = assigned / ".aming-claw/cache/branches/worker"
+    cache.mkdir(parents=True)
+    (cache / "graph.branch.overlay.json").write_text("{}", encoding="utf-8")
+    sibling = parent / "sibling-source.py"
+    sibling.write_text("not in assigned root\n", encoding="utf-8")
+    assert server._git_dirty_paths(assigned) == []
+    assert server._git_dirty_paths(parent) == ["sibling-source.py"]
+    (assigned / "source.py").write_text("changed\n", encoding="utf-8")
+    assert server._git_dirty_paths(assigned) == ["source.py"]
