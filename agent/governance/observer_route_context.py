@@ -174,6 +174,7 @@ OBSERVER_ADMIN_CLOSE_EVIDENCE_ACTIONS: tuple[str, ...] = (
     "observer_session_heartbeat",
     "backlog_upsert",
     "backlog_close",
+    "backlog_audit_archive",
     "task_timeline_append",
     "graph_query",
     "graph_current_full_reconcile",

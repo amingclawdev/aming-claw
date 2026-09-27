@@ -197923,6 +197923,11 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
     observer_claim_overrides: Mapping[str, Any] | None = None,
     observer_decision_source: str = "route_token_gate",
     implementation_status: str = "passed",
+    task_id_override: str = "",
+    qa_payload: Mapping[str, Any] | None = None,
+    qa_verification: Mapping[str, Any] | None = None,
+    qa_actor: str = "qa:direct-main-route",
+    project_id: str = PID,
 ) -> dict[str, str]:
     if prepare_backlog:
         _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -197934,7 +197939,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
                 backlog_id,
             ),
         )
-    task_id = server._onboard_service_execution_id(PID, backlog_id)
+    task_id = task_id_override or server._onboard_service_execution_id(project_id, backlog_id)
     commit_sha = implementation_commit_sha
     route_gate = {
         "schema_version": "route_token_mutation_gate.v1",
@@ -197956,7 +197961,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
             f"visible-{backlog_id.lower()}"
         ),
         "scope": {
-            "project_id": PID,
+            "project_id": project_id,
             "backlog_id": backlog_id,
             "task_id": task_id,
         },
@@ -197967,7 +197972,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
         )
     direct_event = task_timeline.record_event(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         task_id=task_id,
         event_type="mf.observer_direct_implementation_exception",
@@ -198203,7 +198208,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
         implementation_payload.update(dict(worker_claim_overrides or {}))
     implementation = task_timeline.record_event(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         task_id=task_id,
         event_type=implementation_event_type,
@@ -198218,17 +198223,19 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
     if record_failed_qa:
         failed_qa = task_timeline.record_event(
             conn,
-            project_id=PID,
+            project_id=project_id,
             backlog_id=backlog_id,
             task_id=task_id,
             event_type="qa.independent_verification",
             event_kind="independent_verification",
             phase="qa",
             status="failed",
-            actor="qa:direct-main-route",
+            actor=qa_actor,
             commit_sha=commit_sha,
-            payload={"observer_impersonation": False},
-            verification={"candidate_new_failures": ["route crossed contract"]},
+            payload=dict(qa_payload or {"observer_impersonation": False}),
+            verification=dict(qa_verification or {
+                "candidate_new_failures": ["route crossed contract"]
+            }),
         )
     conn.commit()
     return {
@@ -200315,6 +200322,490 @@ def _direct_main_failed_qa_audit_archive_body(
         ),
         "actor": "observer",
     }
+
+
+def _prepare_ac_dev_failed_qa_archive_case(conn, monkeypatch, tmp_path):
+    backlog_id = "AC-DEV-DIRECT-FAILED-QA-ARCHIVE-FIXTURE"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn, monkeypatch, tmp_path, backlog_id=backlog_id,
+        real_git_world=True,
+    )
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST",
+             body=prepared["issue_body"])
+    )
+    task_id = prepared["task_id"]
+    commit = prepared["commit"]
+    principal = "qa:ac-dev-direct-failed-archive"
+    scope_ref = server._qa_scope_binding_ref(
+        project_id="aming-claw", backlog_id=backlog_id,
+        task_id=task_id, commit_sha=commit,
+    )
+    qa_session = server.role_service.register(
+        conn, principal, "aming-claw", "qa", scope=[scope_ref],
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    graph_query_trace.ensure_schema(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    snapshot_id = "full-ac-dev-direct-failed-qa"
+    trace_id = "gqt-ac-dev-direct-failed-qa"
+    _insert_exact_qa_graph_query_trace(
+        conn, project_id="aming-claw", trace_id=trace_id,
+        snapshot_id=snapshot_id, candidate_commit_sha=commit,
+        backlog_id=backlog_id, task_id=task_id,
+        target_project_root=str(prepared["root"]), actor=principal,
+        qa_session_id=qa_session["session_id"], activate_snapshot=False,
+    )
+    proof = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session", "role": "qa", "verified": True,
+        "observer_impersonation": False, "db_verified_graph_trace": True,
+        "query_source": "qa", "query_purpose": "independent_verification",
+        "evidence_status": "failed", "authority_scope": "audit_only",
+        "close_satisfying": False, "audit_only": True,
+        "passing_status_required_for_close": True,
+        "project_id": "aming-claw", "backlog_id": backlog_id,
+        "task_id": task_id, "commit_sha": commit,
+        "principal_id": principal, "qa_session_id": qa_session["session_id"],
+        "qa_scope_binding_ref": scope_ref, "snapshot_id": snapshot_id,
+        "snapshot_commit_sha": commit, "graph_trace_ids": [trace_id],
+    }
+    authority = task_timeline.source_backed_qa_session_authority(proof)
+    assert task_timeline._source_backed_qa_session_authority_valid(
+        authority, conn=conn,
+    )
+    report_ref = "qa-report:ac-dev-direct-failed-archive"
+    report_hash = "sha256:" + "b" * 64
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn, backlog_id=backlog_id, prepare_backlog=False,
+        task_id_override=task_id, project_id="aming-claw",
+        implementation_commit_sha=commit, qa_actor=principal,
+        qa_payload={
+            "observer_impersonation": False,
+            "source_backed_contract_gate_authority": authority,
+            "report_ref": report_ref, "report_sha256": report_hash,
+        },
+        qa_verification={"candidate_new_failures": ["AC11 bytes unbounded"]},
+    )
+    conn.execute("UPDATE backlog_bugs SET status='OPEN' WHERE bug_id=?",
+                 (backlog_id,))
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(task_id)
+    record["completed_lines"] = [
+        {"stage_id": stage, "line_id": line,
+         "actor_role": actor, "evidence_kind": kind,
+         "status": "failed" if line == "qa_independent_verification" else "completed",
+         "payload": {"fixture": "accepted direct line"}}
+        for stage, line, actor, kind in (
+            ("route_gate", "observer_bind_direct_scope", "observer", "contract_binding"),
+            ("graph_first", "observer_graph_context", "observer", "graph_trace"),
+            ("pre_mutation", "observer_direct_implementation_exception", "observer", "observer_direct_implementation_exception"),
+            ("implementation", "observer_implementation", "observer", "implementation"),
+            ("qa_graph_context", "qa_graph_context", "qa", "graph_trace"),
+            ("qa", "qa_independent_verification", "qa", "independent_verification"),
+        )
+    ]
+    record["execution_state_revision"] = 7
+    runtime.store.update(task_id, record)
+    conn.commit()
+    source_route = issued["route_token"]
+    session = observer_session.register_session(
+        conn, project_id="aming-claw",
+        capabilities={"route_provenance": {
+            "route_token_ref": issued["route_token_ref"],
+            "route_id": source_route["route_id"],
+            "route_context_hash": source_route["route_context_hash"],
+            "backlog_id": backlog_id, "task_id": task_id, "cex_id": task_id,
+        }},
+    )
+    repair_commit = _commit_test_git_files(
+        prepared["root"], ["archive_route_fix.py"],
+        message="archive route repair loaded after rejected candidate",
+    )
+    repaired_world = _fixed_ac_dev_direct_world(prepared["root"], repair_commit)
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(repaired_world),
+    )
+    return {**prepared, "issued": issued, "lineage": lineage,
+            "observer_session": session, "qa_session": qa_session,
+            "snapshot_id": snapshot_id, "report_ref": report_ref,
+            "report_hash": report_hash, "repair_commit": repair_commit,
+            "repaired_world": repaired_world}
+
+
+def _ac_dev_failed_qa_archive_http_context(body, bearer):
+    ctx = _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    ctx.handler = type("ArchiveBearerHandler", (), {
+        "headers": {"Authorization": f"Bearer {bearer}"},
+    })()
+    return ctx
+
+
+def test_ac_dev_direct_failed_qa_guide_http_issue_archive_only(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_failed_qa_archive_case(conn, monkeypatch, tmp_path)
+    assert case["repair_commit"] != case["commit"]
+    current = server._contract_runtime(conn).current_record(
+        case["task_id"], actor_role="observer",
+    )
+    assert current["runtime_guide"]["readiness_state"] == "terminal_no_pass"
+    disposition = current["runtime_guide"]["terminal_disposition"]
+    assert disposition["source_line_id"] == "qa_independent_verification", disposition
+    state = server._onboard_parentless_direct_main_failed_qa_state(
+        conn, project_id="aming-claw", backlog_id=case["guide"]["backlog_id"],
+    )
+    assert state, "authenticated failed Direct QA state missing"
+    source = server._ac_dev_failed_qa_archive_source(
+        conn, project_id="aming-claw", backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+    )
+    assert source, {
+        "state": state,
+        "world": server._operator_supervised_direct_main_dev_world_authority(),
+        "records": server._operator_supervised_direct_main_strict_records(
+            conn, project_id="aming-claw",
+            backlog_id=case["guide"]["backlog_id"],
+            contract_execution_id=case["task_id"],
+        ),
+        "status": conn.execute("SELECT status FROM backlog_bugs WHERE bug_id=?",
+            (case["guide"]["backlog_id"],)).fetchone()[0],
+    }
+    guide = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": "aming-claw"}, method="POST", body={
+            "backlog_id": case["guide"]["backlog_id"],
+            "role": "observer", "work_type": "operator_supervised_direct_main",
+            "route_token_ref": case["issued"]["route_token_ref"],
+            "observer_session_id": case["observer_session"]["session_id"],
+        })
+    )
+    action = guide["next_legal_action"]
+    assert action["id"] == "direct_failed_qa_archive_route_issue"
+    assert action["transport"] == "http_bearer"
+    assert action["mcp_tool"] == ""
+    assert action["copy_safe_body"]["allowed_actions"] == [
+        "backlog_audit_archive"
+    ]
+    issued = server.handle_observer_route_context_issue(
+        _ac_dev_failed_qa_archive_http_context(
+            action["copy_safe_body"],
+            case["observer_session"]["session_token"],
+        )
+    )
+    assert issued["allowed_actions"] == ["backlog_audit_archive"]
+    assert issued["archive_only"] is True
+    replay = server.handle_observer_route_context_issue(
+        _ac_dev_failed_qa_archive_http_context(
+            action["copy_safe_body"],
+            case["observer_session"]["session_token"],
+        )
+    )
+    assert replay["route_token_ref"] == issued["route_token_ref"]
+    assert replay["idempotent_replay"] is True
+    archive_body = copy.deepcopy(action["archive_action_input"])
+    archive_body["route_token_ref"] = issued["route_token_ref"]
+    archived = server.handle_backlog_audit_archive(
+        _ctx({"project_id": "aming-claw", "bug_id": case["guide"]["backlog_id"]},
+             method="POST", body=archive_body)
+    )
+    assert archived["status"] == "WAIVED"
+    assert archived["audit_archive"]["qa_acceptance"]["passed"] is False
+    assert archived["audit_archive"]["normal_close_gate"]["can_close"] is False
+    assert conn.execute("SELECT status FROM backlog_bugs WHERE bug_id=?",
+        (case["guide"]["backlog_id"],)).fetchone()[0] == "WAIVED"
+    route_count = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as stale:
+        server.handle_observer_route_context_issue(
+            _ac_dev_failed_qa_archive_http_context(
+                action["copy_safe_body"],
+                case["observer_session"]["session_token"],
+            )
+        )
+    assert stale.value.details["zero_write_rejection"] is True
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0] == route_count
+
+
+@pytest.mark.parametrize("attack", [
+    "missing_bearer", "wrong_bearer", "foreign_bearer",
+    "wrong_project", "wrong_backlog", "wrong_cex", "wrong_commit",
+    "wrong_snapshot", "wrong_world", "extra_action", "mixed_envelope",
+    "source_route_revoked", "qa_actor_forged", "qa_actor_other_qa",
+    "qa_proof_tampered",
+    "qa_missing", "row_state_changed", "wrong_runtime_port",
+    "second_bound_session",
+])
+def test_ac_dev_direct_failed_qa_archive_issue_rejects_without_writes(
+    conn, monkeypatch, tmp_path, attack,
+):
+    case = _prepare_ac_dev_failed_qa_archive_case(conn, monkeypatch, tmp_path)
+    source = server._ac_dev_failed_qa_archive_source(
+        conn, project_id="aming-claw",
+        backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+    )
+    body = server._ac_dev_failed_qa_archive_route_issue_body(
+        project_id="aming-claw", backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+        observer_session_id=case["observer_session"]["session_id"],
+        source=source,
+    )
+    bearer = case["observer_session"]["session_token"]
+    if attack == "missing_bearer":
+        bearer = ""
+    elif attack == "wrong_bearer":
+        bearer = "not-the-registered-observer-token"
+    elif attack == "foreign_bearer":
+        foreign = observer_session.register_session(
+            conn, project_id="foreign-project",
+        )
+        bearer = foreign["session_token"]
+    elif attack == "wrong_project":
+        body["project_id"] = "foreign-project"
+    elif attack == "wrong_backlog":
+        body["backlog_id"] = "AC-OTHER-ROW"
+    elif attack == "wrong_cex":
+        body["task_id"] = "cex-direct-main-other"
+    elif attack == "wrong_commit":
+        body["implementation_commit"] = case["repair_commit"]
+    elif attack == "wrong_snapshot":
+        body["candidate_snapshot_id"] = "full-other"
+    elif attack == "wrong_world":
+        body["runtime_world_hash"] = "sha256:" + "0" * 64
+    elif attack == "extra_action":
+        body["allowed_actions"].append("backlog_close")
+    elif attack == "mixed_envelope":
+        body["dev_force_graph_route"] = True
+    elif attack == "source_route_revoked":
+        conn.execute("UPDATE observer_route_token_refs SET status='revoked' "
+            "WHERE route_token_ref=?", (case["issued"]["route_token_ref"],))
+        conn.commit()
+    elif attack == "qa_actor_forged":
+        event_id = int(case["lineage"]["failed_qa_source_ref"].split(":")[1])
+        conn.execute("UPDATE task_timeline_events SET actor='observer' "
+            "WHERE id=?", (event_id,))
+        conn.commit()
+    elif attack == "qa_actor_other_qa":
+        event_id = int(case["lineage"]["failed_qa_source_ref"].split(":")[1])
+        conn.execute("UPDATE task_timeline_events SET actor='qa:other-reviewer' "
+            "WHERE id=?", (event_id,))
+        conn.commit()
+    elif attack == "qa_proof_tampered":
+        event_id = int(case["lineage"]["failed_qa_source_ref"].split(":")[1])
+        conn.execute("UPDATE task_timeline_events SET payload_json='{}' "
+            "WHERE id=?", (event_id,))
+        conn.commit()
+    elif attack == "qa_missing":
+        event_id = int(case["lineage"]["failed_qa_source_ref"].split(":")[1])
+        conn.execute("DELETE FROM task_timeline_events WHERE id=?", (event_id,))
+        conn.commit()
+    elif attack == "row_state_changed":
+        conn.execute("UPDATE backlog_bugs SET status='FIXED' WHERE bug_id=?",
+            (case["guide"]["backlog_id"],))
+        conn.commit()
+    elif attack == "wrong_runtime_port":
+        changed = copy.deepcopy(case["repaired_world"])
+        changed["runtime_port"] = 40000
+        monkeypatch.setattr(server,
+            "_operator_supervised_direct_main_dev_world_authority",
+            lambda: copy.deepcopy(changed))
+    elif attack == "second_bound_session":
+        source_route = case["issued"]["route_token"]
+        observer_session.register_session(
+            conn, project_id="aming-claw",
+            capabilities={"route_provenance": {
+                "route_token_ref": case["issued"]["route_token_ref"],
+                "route_id": source_route["route_id"],
+                "route_context_hash": source_route["route_context_hash"],
+                "backlog_id": case["guide"]["backlog_id"],
+                "task_id": case["task_id"], "cex_id": case["task_id"],
+            }},
+        )
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_observer_route_context_issue(
+            _ac_dev_failed_qa_archive_http_context(body, bearer)
+        )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs WHERE "
+        "allowed_actions_json='[\"backlog_audit_archive\"]'"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("attack", [
+    "reviewer", "snapshot", "report", "wrong_route", "loaded_world",
+    "world_advanced", "session_revoked", "source_route_revoked",
+    "qa_event_removed", "row_state_changed",
+])
+def test_ac_dev_direct_failed_qa_archive_rechecks_after_route_issue(
+    conn, monkeypatch, tmp_path, attack,
+):
+    case = _prepare_ac_dev_failed_qa_archive_case(conn, monkeypatch, tmp_path)
+    source = server._ac_dev_failed_qa_archive_source(
+        conn, project_id="aming-claw", backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+    )
+    issue_body = server._ac_dev_failed_qa_archive_route_issue_body(
+        project_id="aming-claw", backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+        observer_session_id=case["observer_session"]["session_id"],
+        source=source,
+    )
+    issued = server.handle_observer_route_context_issue(
+        _ac_dev_failed_qa_archive_http_context(
+            issue_body, case["observer_session"]["session_token"],
+        )
+    )
+    action = server._ac_dev_failed_qa_archive_guide_action(
+        conn, project_id="aming-claw", backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+        request_body={"observer_session_id": case["observer_session"]["session_id"]},
+    )
+    body = copy.deepcopy(action["archive_action_input"])
+    body["route_token_ref"] = issued["route_token_ref"]
+    if attack == "reviewer":
+        body["qa_acceptance"]["reviewer"] = "qa:someone-else"
+    elif attack == "snapshot":
+        body["graph_snapshot"]["snapshot_id"] = "full-other"
+    elif attack == "report":
+        body["verification"]["report_sha256"] = "sha256:" + "0" * 64
+    elif attack == "wrong_route":
+        body["route_token_ref"] = case["issued"]["route_token_ref"]
+    elif attack == "loaded_world":
+        changed = copy.deepcopy(case["repaired_world"])
+        changed["runtime_stale"] = True
+        monkeypatch.setattr(server,
+            "_operator_supervised_direct_main_dev_world_authority",
+            lambda: copy.deepcopy(changed))
+    elif attack == "world_advanced":
+        newer_commit = _commit_test_git_files(
+            case["root"], ["further_repair.py"], message="advance loaded world",
+        )
+        changed = _fixed_ac_dev_direct_world(case["root"], newer_commit)
+        monkeypatch.setattr(server,
+            "_operator_supervised_direct_main_dev_world_authority",
+            lambda: copy.deepcopy(changed))
+    elif attack == "session_revoked":
+        conn.execute("UPDATE observer_sessions SET status='revoked' "
+            "WHERE session_id=?", (case["observer_session"]["session_id"],))
+        conn.commit()
+    elif attack == "source_route_revoked":
+        conn.execute("UPDATE observer_route_token_refs SET status='revoked' "
+            "WHERE route_token_ref=?", (case["issued"]["route_token_ref"],))
+        conn.commit()
+    elif attack == "qa_event_removed":
+        conn.execute("DELETE FROM task_timeline_events WHERE id=?",
+            (int(case["lineage"]["failed_qa_source_ref"].split(":")[1]),))
+        conn.commit()
+    elif attack == "row_state_changed":
+        conn.execute("UPDATE backlog_bugs SET status='FIXED' WHERE bug_id=?",
+            (case["guide"]["backlog_id"],))
+        conn.commit()
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    with pytest.raises((GovernanceError, ValidationError)):
+        server.handle_backlog_audit_archive(
+            _ctx({"project_id": "aming-claw",
+                  "bug_id": case["guide"]["backlog_id"]},
+                 method="POST", body=body)
+        )
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
+    assert conn.execute("SELECT status FROM backlog_bugs WHERE bug_id=?",
+        (case["guide"]["backlog_id"],)).fetchone()[0] == (
+            "FIXED" if attack == "row_state_changed" else "OPEN"
+        )
+
+
+def test_ac_dev_direct_failed_qa_archive_public_http_dispatch(
+    conn, monkeypatch, tmp_path,
+):
+    case = _prepare_ac_dev_failed_qa_archive_case(conn, monkeypatch, tmp_path)
+    guide = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": "aming-claw"}, method="POST", body={
+            "backlog_id": case["guide"]["backlog_id"],
+            "role": "observer", "work_type": "operator_supervised_direct_main",
+            "route_token_ref": case["issued"]["route_token_ref"],
+            "observer_session_id": case["observer_session"]["session_id"],
+        })
+    )
+    body = guide["next_legal_action"]["copy_safe_body"]
+    handler = _bare_handler()
+    handler.path = "/api/projects/aming-claw/observer/route-context/issue"
+    handler.headers = {
+        "Authorization": f"Bearer {case['observer_session']['session_token']}"
+    }
+    handler._read_body = lambda: copy.deepcopy(body)
+    handler._query_params = lambda: {}
+    captured = {}
+    handler._respond = lambda status, value, *_args: captured.update(
+        status=status, value=value,
+    )
+    handler._handle("POST")
+    assert captured["status"] == 200
+    assert captured["value"]["allowed_actions"] == ["backlog_audit_archive"]
+    assert captured["value"]["raw_route_token_exposed"] is False
+    archive_body = copy.deepcopy(
+        guide["next_legal_action"]["archive_action_input"]
+    )
+    archive_body["route_token_ref"] = captured["value"]["route_token_ref"]
+    archive = _bare_handler()
+    archive.path = (
+        "/api/backlog/aming-claw/" + case["guide"]["backlog_id"]
+        + "/audit-archive"
+    )
+    archive._read_body = lambda: copy.deepcopy(archive_body)
+    archive._query_params = lambda: {}
+    archived = {}
+    archive._respond = lambda status, value, *_args: archived.update(
+        status=status, value=value,
+    )
+    archive._handle("POST")
+    assert archived["status"] == 200
+    assert archived["value"]["status"] == "WAIVED"
+
+
+@pytest.mark.parametrize("bearer", ["", "PRIVATE-WRONG-BEARER-SENTINEL"])
+def test_ac_dev_direct_failed_qa_archive_public_http_requires_bearer(
+    conn, monkeypatch, tmp_path, bearer,
+):
+    case = _prepare_ac_dev_failed_qa_archive_case(conn, monkeypatch, tmp_path)
+    source = server._ac_dev_failed_qa_archive_source(
+        conn, project_id="aming-claw", backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+    )
+    body = server._ac_dev_failed_qa_archive_route_issue_body(
+        project_id="aming-claw", backlog_id=case["guide"]["backlog_id"],
+        execution_id=case["task_id"],
+        observer_session_id=case["observer_session"]["session_id"],
+        source=source,
+    )
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    handler = _bare_handler()
+    handler.path = "/api/projects/aming-claw/observer/route-context/issue"
+    handler.headers = {"Authorization": f"Bearer {bearer}"}
+    handler._read_body = lambda: copy.deepcopy(body)
+    handler._query_params = lambda: {}
+    captured = {}
+    handler._respond = lambda status, value, *_args: captured.update(
+        status=status, value=value,
+    )
+    handler._handle("POST")
+    assert captured["status"] == 409
+    assert captured["value"]["details"]["zero_write_rejection"] is True
+    if bearer:
+        assert bearer not in json.dumps(captured["value"])
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
 
 
 def test_audit_archive_accepts_db_verified_direct_main_failed_qa_terminal(

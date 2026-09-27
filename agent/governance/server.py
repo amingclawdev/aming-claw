@@ -8621,6 +8621,9 @@ def _observer_route_context_issue_request_kind(
     routed as a different dev operation.
     """
 
+    if "dev_direct_failed_qa_archive_route" in body:
+        return "dev_direct_failed_qa_archive_route"
+
     if body.get("dev_force_graph_route") is True:
         return "dev_force_graph_route"
 
@@ -9708,6 +9711,10 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     # Keep the ordinary dev bootstrap behaviour for every other issue shape,
     # but never permit that shortcut to preempt canonical QA validation.
     if _runtime_plane() == "dev":
+        if request_kind == "dev_direct_failed_qa_archive_route":
+            return _handle_ac_dev_failed_qa_archive_route_issue(
+                ctx, project_id=project_id, body=body,
+            )
         if request_kind == "dev_force_graph_route":
             return _handle_dev_force_graph_route_issue(
                 ctx, project_id=project_id, body=body,
@@ -161111,6 +161118,16 @@ def _onboard_operator_supervised_direct_main_runtime_response(
 
     if recovery_action:
         next_action = recovery_action
+    if (
+        not selected_qa and strict_records and project_id == "aming-claw"
+        and dev_world.get("accepted") is True
+    ):
+        failed_archive_action = _ac_dev_failed_qa_archive_guide_action(
+            conn, project_id=project_id, backlog_id=backlog_id,
+            execution_id=execution_id, request_body=request_body,
+        )
+        if failed_archive_action:
+            next_action = failed_archive_action
 
     public_current_record = (
         _operator_supervised_direct_main_public_runtime_record(current_record)
@@ -169423,6 +169440,7 @@ def _onboard_parentless_direct_main_failed_qa_state(
     *,
     project_id: str,
     backlog_id: str,
+    include_archive_proof: bool = False,
 ) -> dict[str, Any]:
     """Project an unresolved parentless direct-main QA failure from raw evidence."""
 
@@ -169548,6 +169566,40 @@ def _onboard_parentless_direct_main_failed_qa_state(
         return {}
     failed_qa_event_id = _event_id(failed_qa)
     failed_qa_source_ref = f"timeline:{failed_qa_event_id}"
+    qa_payload = (
+        failed_qa.get("payload")
+        if isinstance(failed_qa.get("payload"), Mapping)
+        else {}
+    )
+    qa_authority = (
+        qa_payload.get("source_backed_contract_gate_authority")
+        if isinstance(qa_payload.get("source_backed_contract_gate_authority"), Mapping)
+        else {}
+    )
+    qa_proof = (
+        qa_authority.get("qa_session_proof")
+        if isinstance(qa_authority.get("qa_session_proof"), Mapping)
+        else {}
+    )
+    qa_reviewer = str(failed_qa.get("actor") or "").strip()
+    candidate_snapshot_id = str(qa_proof.get("snapshot_id") or "").strip()
+    candidate_snapshot_commit = str(
+        qa_proof.get("snapshot_commit_sha") or ""
+    ).strip()
+    qa_report_ref = str(qa_payload.get("report_ref") or "").strip()
+    qa_report_sha256 = str(qa_payload.get("report_sha256") or "").strip()
+    if not qa_report_ref or not qa_report_sha256:
+        verification = (
+            failed_qa.get("verification")
+            if isinstance(failed_qa.get("verification"), Mapping)
+            else {}
+        )
+        qa_report_ref = qa_report_ref or str(
+            verification.get("report_ref") or ""
+        ).strip()
+        qa_report_sha256 = qa_report_sha256 or str(
+            verification.get("report_sha256") or ""
+        ).strip()
 
     try:
         runtime_records = _contract_runtime_store(conn).list_by_backlog(
@@ -169621,6 +169673,24 @@ def _onboard_parentless_direct_main_failed_qa_state(
         "implementation_commit": implementation_commit,
         "failed_qa_source_ref": failed_qa_source_ref,
         "failed_qa_status": failed_qa_status,
+        **({
+            "qa_reviewer": qa_reviewer,
+            "qa_proof_principal_id": str(qa_proof.get("principal_id") or "").strip(),
+            "qa_proof_project_id": str(qa_proof.get("project_id") or "").strip(),
+            "qa_proof_backlog_id": str(qa_proof.get("backlog_id") or "").strip(),
+            "qa_proof_task_id": str(qa_proof.get("task_id") or "").strip(),
+            "qa_proof_commit": str(qa_proof.get("commit_sha") or "").strip(),
+            "qa_proof_evidence_status": str(
+                qa_proof.get("evidence_status") or ""
+            ).strip().lower(),
+            "qa_proof_audit_only": qa_proof.get("audit_only"),
+            "qa_proof_close_satisfying": qa_proof.get("close_satisfying"),
+            "qa_session_id": str(qa_proof.get("qa_session_id") or "").strip(),
+            "candidate_snapshot_id": candidate_snapshot_id,
+            "candidate_snapshot_commit": candidate_snapshot_commit,
+            "qa_report_ref": qa_report_ref,
+            "qa_report_sha256": qa_report_sha256,
+        } if include_archive_proof else {}),
         "source_generation_terminal": True,
         "same_row_resume_allowed": False,
         "separate_bounded_successor_row_required": True,
@@ -169631,6 +169701,534 @@ def _onboard_parentless_direct_main_failed_qa_state(
             failed_qa_source_ref,
         ],
     }
+
+
+_AC_DEV_FAILED_QA_ARCHIVE_ROUTE_MARKER = "dev_direct_failed_qa_archive_route.v1"
+_AC_DEV_FAILED_QA_ARCHIVE_ACTION = "backlog_audit_archive"
+
+
+def _ac_dev_failed_qa_archive_source(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    execution_id: str,
+) -> dict[str, Any]:
+    """Read exact failed Direct custody; caller claims never establish failure."""
+
+    if _runtime_plane() != "dev" or project_id != "aming-claw":
+        return {}
+    world = _operator_supervised_direct_main_dev_world_authority()
+    if world.get("accepted") is not True:
+        return {}
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id=?", (backlog_id,)
+    ).fetchone()
+    if row is None or str(row["status"] or "").upper() != "OPEN":
+        return {}
+    records = _operator_supervised_direct_main_strict_records(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        contract_execution_id=execution_id, world_authority=world,
+    )
+    if len(records) != 1:
+        return {}
+    record = records[0]
+    if str(record.get("contract_execution_id") or "") != execution_id:
+        return {}
+    try:
+        current = _contract_runtime(conn).current_record(
+            execution_id, actor_role="observer",
+        )
+    except ContractRuntimeError:
+        return {}
+    runtime_guide = (
+        current.get("runtime_guide")
+        if isinstance(current.get("runtime_guide"), Mapping) else {}
+    )
+    terminal = (
+        runtime_guide.get("terminal_disposition")
+        if isinstance(runtime_guide.get("terminal_disposition"), Mapping)
+        else {}
+    )
+    if not all((
+        runtime_guide.get("readiness_state") == "terminal_no_pass",
+        not runtime_guide.get("next_legal_action"),
+        terminal.get("status") == "FAILED",
+        terminal.get("source_stage_id") == "qa",
+        terminal.get("source_line_id") == "qa_independent_verification",
+        terminal.get("source_status") in {"failed", "fail", "rejected"},
+        terminal.get("no_pass_claim") is True,
+        terminal.get("authoritative_pass_synthesized") is False,
+        terminal.get("history_rewrite_allowed") is False,
+        terminal.get("repair_requires_separate_backlog_row") is True,
+    )):
+        return {}
+    state = _onboard_parentless_direct_main_failed_qa_state(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        include_archive_proof=True,
+    )
+    proof_exact = all((
+        state.get("source_generation_terminal") is True,
+        state.get("source_task_id") == execution_id,
+        state.get("qa_proof_project_id") == project_id,
+        state.get("qa_proof_backlog_id") == backlog_id,
+        state.get("qa_proof_task_id") == execution_id,
+        state.get("qa_proof_commit") == state.get("implementation_commit"),
+        state.get("qa_reviewer") == state.get("qa_proof_principal_id"),
+        state.get("qa_proof_evidence_status") in {"failed", "fail", "rejected"},
+        state.get("qa_proof_audit_only") is True,
+        state.get("qa_proof_close_satisfying") is False,
+        state.get("candidate_snapshot_commit") == state.get("implementation_commit"),
+        bool(state.get("implementation_commit")),
+        str(state.get("qa_reviewer") or "").startswith("qa:"),
+        bool(state.get("qa_session_id")),
+        bool(state.get("candidate_snapshot_id")),
+        bool(state.get("qa_report_ref")),
+        bool(re.fullmatch(r"sha256:[0-9a-f]{64}", str(state.get("qa_report_sha256") or ""))),
+    ))
+    if not proof_exact:
+        return {}
+    root = Path(str(world.get("target_project_root") or ""))
+    if not _git_commit_is_ancestor(
+        root, str(state["implementation_commit"]),
+        str(world.get("target_head_commit") or ""),
+    ):
+        return {}
+    from . import observer_route_context
+
+    binding = (
+        record.get("metadata", {}).get(
+            "operator_supervised_direct_main_runtime_binding"
+        ) if isinstance(record.get("metadata"), Mapping) else {}
+    )
+    binding = binding if isinstance(binding, Mapping) else {}
+    immutable_identity = (
+        binding.get("route_identity")
+        if isinstance(binding.get("route_identity"), Mapping) else {}
+    )
+    immutable_ref = str(record.get("route_token_ref") or "").strip()
+    try:
+        active_route = observer_route_context.resolve_route_token_ref_renewal_descendant(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=immutable_ref,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    active_ref = str((active_route or {}).get("route_token_ref") or "").strip()
+    route_authority = _operator_supervised_direct_main_active_route_authority(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        task_id=execution_id, immutable_route_identity=immutable_identity,
+        active_route_token_ref=active_ref,
+        expected_files=sorted(_backlog_declared_direct_file_scope(conn, backlog_id)),
+    )
+    if route_authority.get("passed") is not True:
+        return {}
+    return {
+        "state": state,
+        "world": world,
+        "source_route_token_ref": active_ref,
+        "source_route_identity": dict(
+            route_authority.get("active_route_identity") or {}
+        ),
+        "immutable_source_route_token_ref": immutable_ref,
+        "target_files": sorted(_backlog_declared_direct_file_scope(conn, backlog_id)),
+    }
+
+
+def _ac_dev_failed_qa_archive_route_issue_body(
+    *, project_id: str, backlog_id: str, execution_id: str,
+    observer_session_id: str, source: Mapping[str, Any],
+) -> dict[str, Any]:
+    state = source["state"]
+    return {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "observer_session_id": observer_session_id,
+        "source_route_token_ref": source["source_route_token_ref"],
+        "failed_qa_source_ref": state["failed_qa_source_ref"],
+        "implementation_commit": state["implementation_commit"],
+        "candidate_snapshot_id": state["candidate_snapshot_id"],
+        "runtime_world_hash": source["world"]["world_hash"],
+        "allowed_actions": [_AC_DEV_FAILED_QA_ARCHIVE_ACTION],
+        "dev_direct_failed_qa_archive_route": _AC_DEV_FAILED_QA_ARCHIVE_ROUTE_MARKER,
+    }
+
+
+def _ac_dev_failed_qa_archive_guide_action(
+    conn, *, project_id: str, backlog_id: str, execution_id: str,
+    request_body: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    source = _ac_dev_failed_qa_archive_source(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        execution_id=execution_id,
+    )
+    if not source:
+        return {}
+    session_id = str((request_body or {}).get("observer_session_id") or "").strip()
+    session_bound = False
+    if session_id:
+        from . import observer_route_context
+        try:
+            observer_route_context.resolve_route_token_ref(
+                conn, project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
+                route_token_ref=source["source_route_token_ref"],
+                backlog_id=backlog_id, task_id=execution_id,
+            )
+            session_bound = bool(_unique_active_route_bound_observer_session(
+                conn, project_id=project_id, session_id=session_id,
+                route_token_ref=source["source_route_token_ref"],
+                route_identity=source["source_route_identity"],
+                backlog_id=backlog_id, task_id=execution_id,
+            ))
+        except observer_route_context.RouteTokenRefError:
+            pass
+    issue_body = _ac_dev_failed_qa_archive_route_issue_body(
+        project_id=project_id, backlog_id=backlog_id,
+        execution_id=execution_id, observer_session_id=session_id,
+        source=source,
+    )
+    state = source["state"]
+    report_ref = str(state["qa_report_ref"])
+    archive_body = {
+        "actor": "observer", "source_backlog_id": backlog_id,
+        "observer_session_id": session_id,
+        "commit": state["implementation_commit"],
+        "reason": (
+            "Independent QA rejected this Direct generation; its QA PASS and "
+            "close_ready cannot be reconstructed. Preserve failed source evidence."
+        ),
+        "timeline_precheck": {"can_close": False,
+            "failed_gates": ["independent_verification_failed"]},
+        "failure_audit": {
+            "what_happened": "Independent QA rejected the Direct implementation.",
+            "non_reconstructable_evidence_reason": (
+                "QA PASS and close_ready cannot be backfilled for a rejected "
+                "candidate without fabricating append-only evidence."
+            ),
+        },
+        "qa_acceptance": {
+            "terminal_disposition": "direct_main_failed_qa_terminal",
+            "passed": False, "status": state["failed_qa_status"],
+            "reviewer": state["qa_reviewer"], "reviewer_role": "qa",
+            "tests": [f"failed_qa_report:{report_ref}"],
+            "artifacts": [state["failed_qa_source_ref"],
+                          f"qa_report_sha256:{state['qa_report_sha256']}"],
+            **{key: state[key] for key in (
+                "source_backlog_id", "source_task_id",
+                "source_direct_main_event_ref", "implementation_event_ref",
+                "implementation_commit", "failed_qa_source_ref",
+                "failed_qa_status",
+            )},
+        },
+        "verification": {
+            "failed_qa_source_ref": state["failed_qa_source_ref"],
+            "report_ref": report_ref,
+            "report_sha256": state["qa_report_sha256"],
+        },
+        "graph_snapshot": {
+            "snapshot_id": state["candidate_snapshot_id"],
+            "commit_sha": state["implementation_commit"],
+        },
+    }
+    return {
+        "schema_version": "onboard_route_guide.direct_failed_qa_archive.v1",
+        "id": "direct_failed_qa_archive_route_issue",
+        "action": "observer_route_context_issue",
+        "mcp_tool": "",
+        "transport": "http_bearer",
+        "owner_role": "observer", "requires_role": "observer",
+        "action_input_ready": session_bound,
+        "action_input_missing_fields": (
+            [] if session_bound else ["active_source_route_bound_observer_session"]
+        ),
+        "copy_safe_body": issue_body,
+        "http_request": {
+            "method": "POST",
+            "path": f"/api/projects/{project_id}/observer/route-context/issue",
+            "requires_observer_session_bearer": True,
+        },
+        "archive_action_input": archive_body,
+        "archive_route_token_ref_source": "observer_route_context_issue.route_token_ref",
+        "archive_only": True,
+        "normal_close": False, "close_ready": False,
+        "same_row_resume_allowed": False,
+        "source_generation_terminal": True,
+        "failed_qa_source_ref": state["failed_qa_source_ref"],
+    }
+
+
+def _ac_dev_failed_qa_archive_route_rejection(reason: str) -> GovernanceError:
+    return GovernanceError(
+        "ac_dev_failed_qa_archive_route_rejected",
+        "failed Direct QA archive route requires exact authenticated current authority",
+        409,
+        {"reason": reason, "zero_write_rejection": True,
+         "writes_performed": False, "route_registry_mutated": False,
+         "public_safe": True, "secret_safe": True},
+    )
+
+
+def _ac_dev_failed_qa_archive_route_precheck(
+    conn, *, project_id: str, body: Mapping[str, Any], bearer: str,
+) -> dict[str, Any]:
+    """Rebuild one closed archive route from DB, never from asserted QA facts."""
+
+    from . import observer_route_context
+
+    allowed_keys = {
+        "project_id", "caller_role", "backlog_id", "task_id",
+        "observer_session_id", "source_route_token_ref",
+        "failed_qa_source_ref", "implementation_commit",
+        "candidate_snapshot_id", "runtime_world_hash", "allowed_actions",
+        "dev_direct_failed_qa_archive_route",
+    }
+    if set(body) != allowed_keys or not bearer:
+        raise _ac_dev_failed_qa_archive_route_rejection("closed_shape_or_bearer")
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    execution_id = str(body.get("task_id") or "").strip()
+    session_id = str(body.get("observer_session_id") or "").strip()
+    if not backlog_id or not execution_id or not session_id:
+        raise _ac_dev_failed_qa_archive_route_rejection("identity_missing")
+    source = _ac_dev_failed_qa_archive_source(
+        conn, project_id=project_id, backlog_id=backlog_id,
+        execution_id=execution_id,
+    )
+    if not source:
+        raise _ac_dev_failed_qa_archive_route_rejection("source_not_current_failed_direct")
+    expected = _ac_dev_failed_qa_archive_route_issue_body(
+        project_id=project_id, backlog_id=backlog_id,
+        execution_id=execution_id, observer_session_id=session_id,
+        source=source,
+    )
+    if dict(body) != expected:
+        raise _ac_dev_failed_qa_archive_route_rejection("guide_body_changed")
+    try:
+        session = observer_session.authenticate_session(
+            conn, project_id=project_id, session_id=session_id,
+            session_token=bearer,
+            action=observer_session.ACTION_SESSION_HEARTBEAT,
+        )
+        route = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=source["source_route_token_ref"],
+            backlog_id=backlog_id, task_id=execution_id,
+        )
+    except (observer_session.ObserverSessionError,
+            observer_route_context.RouteTokenRefError) as exc:
+        raise _ac_dev_failed_qa_archive_route_rejection(
+            "session_or_source_route_invalid"
+        ) from exc
+    if (
+        session.get("computed_status") != "active"
+        or not isinstance(route, Mapping)
+        or str(route.get("caller_role") or "") != "observer"
+        or str(route.get("route_id") or "")
+        != str(source["source_route_identity"].get("route_id") or "")
+        or not _unique_active_route_bound_observer_session(
+            conn, project_id=project_id, session_id=session_id,
+            route_token_ref=source["source_route_token_ref"],
+            route_identity=source["source_route_identity"],
+            backlog_id=backlog_id, task_id=execution_id,
+        )
+    ):
+        raise _ac_dev_failed_qa_archive_route_rejection(
+            "observer_source_route_binding_invalid"
+        )
+    return {**source, "backlog_id": backlog_id,
+            "execution_id": execution_id, "session_id": session_id}
+
+
+def _handle_ac_dev_failed_qa_archive_route_issue(
+    ctx: RequestContext, *, project_id: str, body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Issue exactly one short-lived archive-only route under the DB lock."""
+
+    from . import observer_route_context
+
+    try:
+        authorization = str(ctx.handler.headers.get("Authorization", "") or "")
+    except Exception:
+        authorization = ""
+    bearer = (
+        authorization[7:].strip()
+        if authorization.lower().startswith("bearer ") else ""
+    )
+    if not bearer:
+        raise _ac_dev_failed_qa_archive_route_rejection("observer_bearer_required")
+    conn = get_connection(project_id)
+    try:
+        _ac_dev_failed_qa_archive_route_precheck(
+            conn, project_id=project_id, body=body, bearer=bearer,
+        )
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                source = _ac_dev_failed_qa_archive_route_precheck(
+                    conn, project_id=project_id, body=body, bearer=bearer,
+                )
+                backlog_id = source["backlog_id"]
+                execution_id = source["execution_id"]
+                refs = [
+                    _AC_DEV_FAILED_QA_ARCHIVE_ROUTE_MARKER,
+                    f"observer_session:{source['session_id']}",
+                    f"source_route:{source['source_route_token_ref']}",
+                    source["state"]["failed_qa_source_ref"],
+                    f"candidate_snapshot:{source['state']['candidate_snapshot_id']}",
+                    f"implementation_commit:{source['state']['implementation_commit']}",
+                    f"dev_runtime_world:{source['world']['world_hash']}",
+                ]
+                storage_pid = _route_registry_storage_project_id(project_id)
+                prior = []
+                for row in conn.execute(
+                    "SELECT * FROM observer_route_token_refs "
+                    "WHERE project_id=? AND backlog_id=? AND task_id=?",
+                    (storage_pid, backlog_id, execution_id),
+                ).fetchall():
+                    candidate = dict(row)
+                    actions = _json_loads(candidate.get("allowed_actions_json"), [])
+                    evidence = _json_loads(candidate.get("evidence_refs_json"), [])
+                    if actions == [_AC_DEV_FAILED_QA_ARCHIVE_ACTION] or (
+                        isinstance(evidence, list)
+                        and _AC_DEV_FAILED_QA_ARCHIVE_ROUTE_MARKER in evidence
+                    ):
+                        prior.append(candidate)
+                if prior:
+                    if len(prior) != 1:
+                        raise _ac_dev_failed_qa_archive_route_rejection(
+                            "archive_route_lifecycle_ambiguous"
+                        )
+                    existing = prior[0]
+                    evidence = _json_loads(existing.get("evidence_refs_json"), [])
+                    if (
+                        existing.get("status") != "active"
+                        or _json_loads(existing.get("allowed_actions_json"), [])
+                        != [_AC_DEV_FAILED_QA_ARCHIVE_ACTION]
+                        or not isinstance(evidence, list)
+                        or not set(refs).issubset(set(evidence))
+                    ):
+                        raise _ac_dev_failed_qa_archive_route_rejection(
+                            "archive_route_lifecycle_changed"
+                        )
+                    route_ref = str(existing["route_token_ref"])
+                    resolved = observer_route_context.resolve_route_token_ref(
+                        conn, project_id=project_id,
+                        storage_project_id=storage_pid,
+                        route_token_ref=route_ref,
+                        backlog_id=backlog_id, task_id=execution_id,
+                    )
+                    result = {
+                        "ok": True, "route_token_ref": route_ref,
+                        "route_id": resolved["route_id"],
+                        "allowed_actions": [_AC_DEV_FAILED_QA_ARCHIVE_ACTION],
+                        "archive_only": True, "idempotent_replay": True,
+                        "raw_route_token_exposed": False,
+                    }
+                    conn.rollback()
+                    return result
+                issued = observer_route_context.issue_observer_write_route_context(
+                    project_id=project_id, backlog_id=backlog_id,
+                    task_id=execution_id,
+                    target_files=source["target_files"],
+                    allowed_actions=[_AC_DEV_FAILED_QA_ARCHIVE_ACTION],
+                    evidence_refs=refs,
+                    parent_route_identity=source["source_route_identity"],
+                    parent_route_token_ref=source["source_route_token_ref"],
+                    project_root=Path(source["world"]["target_project_root"]),
+                    ttl_hours=1,
+                )
+                token = dict(issued["route_token"])
+                route_ref = str(issued["route_token_ref"])
+                observer_route_context.persist_route_token_ref(
+                    conn, project_id=project_id,
+                    storage_project_id=storage_pid,
+                    route_token_ref=route_ref, token=token, commit=False,
+                )
+                conn.commit()
+                return {
+                    "ok": True, "route_token_ref": route_ref,
+                    "route_id": token["route_id"],
+                    "allowed_actions": [_AC_DEV_FAILED_QA_ARCHIVE_ACTION],
+                    "archive_only": True, "idempotent_replay": False,
+                    "raw_route_token_exposed": False,
+                }
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+    finally:
+        conn.close()
+
+
+def _ac_dev_failed_qa_archive_route_gate(
+    conn, *, project_id: str, backlog_id: str,
+    body: Mapping[str, Any], source: Mapping[str, Any],
+) -> None:
+    """Bind archive itself to the single issued route and current failed Fact."""
+
+    from . import observer_route_context
+
+    state = source["state"]
+    route_ref = str(body.get("route_token_ref") or "").strip()
+    session_id = str(body.get("observer_session_id") or "").strip()
+    if not route_ref or "route_token" in body or "route_waiver" in body:
+        raise _ac_dev_failed_qa_archive_route_rejection("archive_route_ref_required")
+    try:
+        route = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=route_ref,
+            backlog_id=backlog_id, task_id=state["source_task_id"],
+        )
+        observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=source["source_route_token_ref"],
+            backlog_id=backlog_id, task_id=state["source_task_id"],
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        raise _ac_dev_failed_qa_archive_route_rejection(
+            "archive_or_source_route_not_active"
+        ) from exc
+    required_refs = {
+        _AC_DEV_FAILED_QA_ARCHIVE_ROUTE_MARKER,
+        f"observer_session:{session_id}",
+        f"source_route:{source['source_route_token_ref']}",
+        state["failed_qa_source_ref"],
+        f"candidate_snapshot:{state['candidate_snapshot_id']}",
+        f"implementation_commit:{state['implementation_commit']}",
+        f"dev_runtime_world:{source['world']['world_hash']}",
+    }
+    qa = body.get("qa_acceptance") if isinstance(body.get("qa_acceptance"), Mapping) else {}
+    snapshot = body.get("graph_snapshot") if isinstance(body.get("graph_snapshot"), Mapping) else {}
+    verification = body.get("verification") if isinstance(body.get("verification"), Mapping) else {}
+    if not all((
+        isinstance(route, Mapping),
+        route.get("allowed_actions") == [_AC_DEV_FAILED_QA_ARCHIVE_ACTION],
+        required_refs.issubset(set(route.get("evidence_refs") or [])),
+        str(qa.get("reviewer") or "") == state["qa_reviewer"],
+        str(snapshot.get("snapshot_id") or "") == state["candidate_snapshot_id"],
+        str(snapshot.get("commit_sha") or "") == state["implementation_commit"],
+        str(verification.get("report_ref") or "") == state["qa_report_ref"],
+        str(verification.get("report_sha256") or "") == state["qa_report_sha256"],
+        bool(session_id),
+        _ac_dev_read_only_observer_session_authority(
+            conn, project_id=project_id, session_id=session_id,
+        ).get("state") == "active",
+        bool(_unique_active_route_bound_observer_session(
+            conn, project_id=project_id, session_id=session_id,
+            route_token_ref=source["source_route_token_ref"],
+            route_identity=source["source_route_identity"],
+            backlog_id=backlog_id, task_id=state["source_task_id"],
+        )),
+    )):
+        raise _ac_dev_failed_qa_archive_route_rejection(
+            "archive_route_or_failed_evidence_changed"
+        )
 
 
 def _onboard_parentless_direct_main_failed_qa_next_action(
@@ -179960,6 +180558,10 @@ def _onboard_route_guide_compact_service_response(
         selected_role_key == "observer"
         and str(continuation_action.get("mcp_tool") or "")
         == "backlog_audit_archive"
+        and isinstance(
+            next_action.get("irreversible_runtime_audit_terminal_authority"),
+            Mapping,
+        )
         and task_timeline._irreversible_runtime_audit_terminal_authority_valid(
             next_action.get("irreversible_runtime_audit_terminal_authority")
         )
@@ -230147,143 +230749,172 @@ def handle_backlog_audit_archive(ctx: RequestContext):
     now = _utc_now()
     conn = get_connection(pid)
     try:
-        row = conn.execute(
-            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
-            (bug_id,),
-        ).fetchone()
-        if not row:
-            raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
-        if str(row["status"] or "").upper() in _BACKLOG_CLOSED_STATUSES:
-            raise GovernanceError(
-                "invalid_status",
-                f"Bug must be active before audit archive, currently: {row['status']}",
-                422,
-            )
-
-        direct_main_failed_qa_state = (
-            _onboard_parentless_direct_main_failed_qa_state(
-                conn,
-                project_id=pid,
-                backlog_id=bug_id,
-            )
-        )
-        irreversible_runtime_authority_action: dict[str, Any] = {}
-        if not direct_main_failed_qa_state:
-            current_chain = _contract_chain_current_projection(
-                conn,
-                project_id=pid,
-                backlog_id=bug_id,
-                rebuild_if_missing=False,
-            )
-            current_execution_id = str(
-                current_chain.get("current_contract_execution_id") or ""
-            ).strip()
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                current_record = _contract_runtime_store(conn).get(
-                    current_execution_id
+                row = conn.execute(
+                    "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+                    (bug_id,),
+                ).fetchone()
+                if not row:
+                    raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+                if str(row["status"] or "").upper() in _BACKLOG_CLOSED_STATUSES:
+                    raise GovernanceError(
+                        "invalid_status",
+                        f"Bug must be active before audit archive, currently: {row['status']}",
+                        422,
+                    )
+
+                direct_main_failed_qa_state = (
+                    _onboard_parentless_direct_main_failed_qa_state(
+                        conn,
+                        project_id=pid,
+                        backlog_id=bug_id,
+                    )
                 )
-            except ContractRuntimeError:
-                current_record = {}
-            irreversible_runtime_authority_action = (
-                _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
-                    conn,
+                irreversible_runtime_authority_action: dict[str, Any] = {}
+                if not direct_main_failed_qa_state:
+                    current_chain = _contract_chain_current_projection(
+                        conn,
+                        project_id=pid,
+                        backlog_id=bug_id,
+                        rebuild_if_missing=False,
+                    )
+                    current_execution_id = str(
+                        current_chain.get("current_contract_execution_id") or ""
+                    ).strip()
+                    try:
+                        current_record = _contract_runtime_store(conn).get(
+                            current_execution_id
+                        )
+                    except ContractRuntimeError:
+                        current_record = {}
+                    irreversible_runtime_authority_action = (
+                        _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+                            conn,
+                            project_id=pid,
+                            backlog_id=bug_id,
+                            preferred_record=current_record,
+                        )
+                    )
+                payload = _build_backlog_audit_archive_payload(
+                    project_id=pid,
+                    bug_id=bug_id,
+                    body=body,
+                    row=row,
+                    archived_at=now,
+                    direct_main_failed_qa_state=direct_main_failed_qa_state,
+                    irreversible_runtime_authority_action=(
+                        irreversible_runtime_authority_action
+                    ),
+                )
+                actual_direct_failed_qa = bool(
+                    direct_main_failed_qa_state
+                    and str(direct_main_failed_qa_state.get("source_task_id") or "")
+                    .startswith("cex-direct-main-")
+                    and _runtime_plane() == "dev"
+                )
+                if actual_direct_failed_qa:
+                    source = _ac_dev_failed_qa_archive_source(
+                        conn, project_id=pid, backlog_id=bug_id,
+                        execution_id=direct_main_failed_qa_state["source_task_id"],
+                    )
+                    if not source:
+                        raise _ac_dev_failed_qa_archive_route_rejection(
+                            "failed_direct_source_not_current"
+                        )
+                    _ac_dev_failed_qa_archive_route_gate(
+                        conn, project_id=pid, backlog_id=bug_id,
+                        body=body, source=source,
+                    )
+                route_gate = _require_route_token_mutation_gate(
+                    ctx,
+                    action="backlog_audit_archive",
                     project_id=pid,
                     backlog_id=bug_id,
-                    preferred_record=current_record,
+                    task_id=(
+                        str(direct_main_failed_qa_state["source_task_id"])
+                        if actual_direct_failed_qa else ""
+                    ),
                 )
-            )
-        payload = _build_backlog_audit_archive_payload(
-            project_id=pid,
-            bug_id=bug_id,
-            body=body,
-            row=row,
-            archived_at=now,
-            direct_main_failed_qa_state=direct_main_failed_qa_state,
-            irreversible_runtime_authority_action=(
-                irreversible_runtime_authority_action
-            ),
-        )
-        route_gate = _require_route_token_mutation_gate(
-            ctx,
-            action="backlog_audit_archive",
-            project_id=pid,
-            backlog_id=bug_id,
-        )
-        takeover = backlog_runtime.parse_json_object(_row_get(row, "takeover_json", "{}"))
-        takeover["audit_archive"] = payload
-        new_details = str(_row_get(row, "details_md", "") or "") + _backlog_audit_archive_notes(payload)
-        _record_route_token_gate_event(
-            conn,
-            pid,
-            route_gate,
-            backlog_id=bug_id,
-            commit_sha=payload["implementation_commit"],
-        )
-        conn.execute(
-            """UPDATE backlog_bugs
-               SET status = 'WAIVED',
-                   "commit" = ?,
-                   fixed_at = ?,
-                   updated_at = ?,
-                   details_md = ?,
-                   takeover_json = ?
-               WHERE bug_id = ?""",
-            (
-                payload["implementation_commit"],
-                now,
-                now,
-                new_details,
-                backlog_runtime.policy_json(takeover),
-                bug_id,
-            ),
-        )
-        backlog_runtime.update_backlog_runtime(
-            conn,
-            bug_id,
-            "audit_archive",
-            project_id=pid,
-            failure_reason=payload["reason"],
-            result={"commit": payload["implementation_commit"], "route_token_gate": route_gate},
-            runtime_state="audit_archived",
-            takeover=takeover,
-        )
-        _publish_current_task_changed(
-            pid,
-            backlog_id=bug_id,
-            task_id=str(_row_get(row, "current_task_id", "")),
-            source="backlog.audit_archive",
-            runtime_state="audit_archived",
-        )
-        conn.commit()
-        try:
-            audit_service.record(
-                conn,
-                pid,
-                "backlog_audit_archive",
-                actor=body.get("actor", "observer"),
-                bug_id=bug_id,
-                commit=payload["implementation_commit"],
-                details=json.dumps(payload, ensure_ascii=False, sort_keys=True),
-            )
-            conn.commit()
-        except Exception:
-            pass
-        archived_row = conn.execute(
-            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
-            (bug_id,),
-        ).fetchone()
-        return {
-            "ok": True,
-            "project_id": pid,
-            "bug_id": bug_id,
-            "status": "WAIVED",
-            "audit_archive": payload,
-            "route_token_gate": route_gate,
-            "bug": _backlog_full_bug(archived_row) if archived_row else {},
-        }
+                takeover = backlog_runtime.parse_json_object(_row_get(row, "takeover_json", "{}"))
+                takeover["audit_archive"] = payload
+                new_details = str(_row_get(row, "details_md", "") or "") + _backlog_audit_archive_notes(payload)
+                _record_route_token_gate_event(
+                    conn,
+                    pid,
+                    route_gate,
+                    backlog_id=bug_id,
+                    commit_sha=payload["implementation_commit"],
+                )
+                conn.execute(
+                    """UPDATE backlog_bugs
+                       SET status = 'WAIVED',
+                           "commit" = ?,
+                           fixed_at = ?,
+                           updated_at = ?,
+                           details_md = ?,
+                           takeover_json = ?
+                       WHERE bug_id = ?""",
+                    (
+                        payload["implementation_commit"],
+                        now,
+                        now,
+                        new_details,
+                        backlog_runtime.policy_json(takeover),
+                        bug_id,
+                    ),
+                )
+                backlog_runtime.update_backlog_runtime(
+                    conn,
+                    bug_id,
+                    "audit_archive",
+                    project_id=pid,
+                    failure_reason=payload["reason"],
+                    result={"commit": payload["implementation_commit"], "route_token_gate": route_gate},
+                    runtime_state="audit_archived",
+                    takeover=takeover,
+                )
+                _publish_current_task_changed(
+                    pid,
+                    backlog_id=bug_id,
+                    task_id=str(_row_get(row, "current_task_id", "")),
+                    source="backlog.audit_archive",
+                    runtime_state="audit_archived",
+                )
+                conn.commit()
+                try:
+                    audit_service.record(
+                        conn,
+                        pid,
+                        "backlog_audit_archive",
+                        actor=body.get("actor", "observer"),
+                        bug_id=bug_id,
+                        commit=payload["implementation_commit"],
+                        details=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
+                archived_row = conn.execute(
+                    "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+                    (bug_id,),
+                ).fetchone()
+                return {
+                    "ok": True,
+                    "project_id": pid,
+                    "bug_id": bug_id,
+                    "status": "WAIVED",
+                    "audit_archive": payload,
+                    "route_token_gate": route_gate,
+                    "bug": _backlog_full_bug(archived_row) if archived_row else {},
+                }
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
     finally:
         conn.close()
-
 
 def _backlog_triage_zero_write_rejection(
     *,
