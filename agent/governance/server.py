@@ -20709,6 +20709,32 @@ def _operator_supervised_direct_main_nonactive_graph_snapshot_selection(
     decoded_notes = _json_loads(snapshot.get("notes"), {})
     notes_is_mapping = isinstance(decoded_notes, Mapping)
     notes = dict(decoded_notes) if notes_is_mapping else {}
+    try:
+        current_full_claim_count = int(conn.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history "
+            "WHERE project_id=? AND snapshot_id=?",
+            (project_id, snapshot_id),
+        ).fetchone()[0])
+        if current_full_claim_count:
+            candidate_tuple = graph_snapshot_store.current_full_candidate_tuple_from_db(
+                conn,
+                project_id=project_id,
+                run_id=str(notes.get("run_id") or ""),
+                target_commit_sha=expected_commit,
+                snapshot_id=snapshot_id,
+            )
+            if candidate_tuple.get("valid") is not True:
+                return {
+                    **blocked,
+                    "reason": "current_full_candidate_not_ready",
+                    "candidate_tuple_errors": list(candidate_tuple.get("errors") or []),
+                }
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return {
+            **blocked,
+            "reason": "current_full_candidate_authority_unavailable",
+            "resolution_error": type(exc).__name__,
+        }
     checkout_value = notes.get("checkout_provenance")
     checkout_is_mapping = isinstance(checkout_value, Mapping)
     checkout = dict(checkout_value) if checkout_is_mapping else {}
@@ -21488,6 +21514,32 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             snapshot_id,
         ) or {}
         snapshot_commit_sha = str(snapshot.get("commit_sha") or "").strip().lower()
+        snapshot_status = str(snapshot.get("status") or "").strip().lower()
+        if snapshot_status == "abandoned":
+            raise GovernanceError(
+                "qa_graph_snapshot_abandoned",
+                "abandoned graph snapshots cannot support candidate QA",
+                409,
+                {"snapshot_id": snapshot_id, "zero_write_rejection": True},
+            )
+        if snapshot_status == "candidate":
+            claim_rows = conn.execute(
+                "SELECT status, terminal_status FROM "
+                "graph_current_full_build_claim_history "
+                "WHERE project_id=? AND snapshot_id=?",
+                (ctx.get_project_id(), snapshot_id),
+            ).fetchall()
+            if claim_rows and not any(
+                str(row["status"] or "") == "released"
+                and str(row["terminal_status"] or "") == "candidate_ready"
+                for row in claim_rows
+            ):
+                raise GovernanceError(
+                    "qa_current_full_candidate_not_ready",
+                    "current-full candidate build has no ready claim",
+                    409,
+                    {"snapshot_id": snapshot_id, "zero_write_rejection": True},
+                )
         try:
             review_context = graph_snapshot_store.resolve_bounded_qa_graph_basis(
                 conn,
@@ -104659,6 +104711,111 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     request_id=str(ctx.request_id),
                     db_total_changes_delta=request_db_total_changes_delta,
                 )
+            # The builder reads mutable source files. Recheck the complete
+            # governed worktree after its scan, before publishing a reusable
+            # commit-bound candidate claim. This cannot lock out an arbitrary
+            # external writer, but it closes a change during materialization.
+            post_build_head = _git_head_commit(root)
+            post_build_dirty: list[str] = []
+            post_build_status_error = ""
+            try:
+                post_build_dirty = _git_dirty_paths(root)
+            except CandidateGitStatusError as exc:
+                post_build_status_error = str(exc)
+            if (
+                post_build_head != target_commit
+                or post_build_dirty
+                or post_build_status_error
+            ):
+                abandonment_error = ""
+                artifact = store.get_graph_snapshot(
+                    conn, project_id, requested_snapshot_id,
+                ) or {}
+                if str(artifact.get("status") or "") == "candidate":
+                    try:
+                        store.abandon_graph_snapshot(
+                            conn, project_id, requested_snapshot_id,
+                            actor="current_full_reconcile",
+                            reason="source_changed_during_candidate_materialization",
+                        )
+                        conn.commit()
+                    except Exception as exc:
+                        conn.rollback()
+                        abandonment_error = type(exc).__name__
+                try:
+                    store.terminalize_current_full_build_claim(
+                        conn,
+                        project_id,
+                        claim_id=str(build_claim["claim_id"]),
+                        run_id=run_id,
+                        snapshot_id=requested_snapshot_id,
+                        commit_sha=target_commit,
+                        terminal_status="failed",
+                        manager_start_identity=str(
+                            build_manager["manager_start_identity"]
+                        ),
+                        elapsed_ms=build_elapsed_ms,
+                        metric_evidence={
+                            "phase": "candidate_source_changed_after_build",
+                            "head_mismatch": post_build_head != target_commit,
+                            "governed_dirty_file_count": len(post_build_dirty),
+                            "git_status_error": post_build_status_error,
+                            "snapshot_abandonment_error": abandonment_error,
+                            "idempotency_scope": idempotency_scope,
+                        },
+                        created_at=request_started_at,
+                    )
+                except Exception as exc:
+                    conn.rollback()
+                    raise GovernanceError(
+                        "current_full_changed_source_terminalization_failed",
+                        "changed-source candidate could not be terminalized",
+                        500,
+                        {
+                            "run_id": run_id,
+                            "snapshot_id": requested_snapshot_id,
+                            "fail_closed": True,
+                            "candidate_ready": False,
+                            "terminalization_error": type(exc).__name__,
+                        },
+                    ) from exc
+                if abandonment_error:
+                    raise GovernanceError(
+                        "current_full_changed_source_quarantine_failed",
+                        "changed-source candidate claim failed but its snapshot could not be abandoned",
+                        500,
+                        {
+                            "run_id": run_id,
+                            "snapshot_id": requested_snapshot_id,
+                            "candidate_ready": False,
+                            "failed_claim_recorded": True,
+                            "snapshot_quarantined": False,
+                            "writes_performed": True,
+                            "fail_closed": True,
+                        },
+                    )
+                abandoned = store.get_graph_snapshot(
+                    conn, project_id, requested_snapshot_id,
+                ) or {}
+                return 409, {
+                    "ok": False,
+                    "project_id": project_id,
+                    "error": "current_full_candidate_source_changed_after_build",
+                    "run_id": run_id,
+                    "snapshot_id": requested_snapshot_id,
+                    "target_commit_sha": target_commit,
+                    "head_commit": post_build_head,
+                    "dirty_files": post_build_dirty[:50],
+                    "dirty_file_count": len(post_build_dirty),
+                    "dirty_files_truncated": len(post_build_dirty) > 50,
+                    "git_status_error": post_build_status_error,
+                    "candidate_ready": False,
+                    "snapshot_status": str(abandoned.get("status") or "missing"),
+                    "snapshot_abandonment_error": abandonment_error,
+                    "writes_performed": True,
+                    "active_ref_mutated": False,
+                    "fail_closed": True,
+                }
             store.terminalize_current_full_build_claim(
                 conn,
                 project_id,

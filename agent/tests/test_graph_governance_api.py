@@ -30754,6 +30754,326 @@ def test_current_full_candidate_caps_only_diagnostics_after_dirty_decision(
     assert calls == []
 
 
+@pytest.mark.parametrize("drift", ["governed_source", "head"])
+def test_current_full_candidate_build_drift_fails_and_abandons_intermediate(
+    conn, monkeypatch, tmp_path, drift,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("base\n", encoding="utf-8")
+    world = {"head": head}
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: world["head"])
+    monkeypatch.setattr(
+        server, "_git_dirty_paths",
+        lambda _root: ["source.py"] if source.read_text() != "base\n" else [],
+    )
+    build = state_reconcile.run_state_only_full_reconcile
+    def drift_during_build(*args, **kwargs):
+        result = build(*args, **kwargs)
+        if drift == "governed_source":
+            source.write_text("changed during graph scan\n", encoding="utf-8")
+        else:
+            world["head"] = "b" * 40
+        return result
+    monkeypatch.setattr(
+        state_reconcile, "run_state_only_full_reconcile", drift_during_build,
+    )
+    monkeypatch.setattr(
+        server, "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    _activate_basic_graph(conn, "full-before-build-drift", commit_sha="c" * 40)
+    active_before = store.get_active_graph_snapshot(conn, PID)["snapshot_id"]
+    body = {
+        "target_commit_sha": head, "activate": False,
+        "semantic_enrich": False, "run_id": f"build-drift-{drift}",
+    }
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body),
+    )
+    assert status == 409, result
+    assert result["error"] == "current_full_candidate_source_changed_after_build"
+    assert result["candidate_ready"] is False
+    assert result["writes_performed"] is True
+    assert result["snapshot_status"] == "abandoned"
+    assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == active_before
+    assert store.get_graph_snapshot(conn, PID, "full-current")["status"] == "abandoned"
+    claim = conn.execute(
+        "SELECT status, terminal_status FROM graph_current_full_build_claim_history "
+        "WHERE project_id=? AND snapshot_id=?",
+        (PID, "full-current"),
+    ).fetchone()
+    assert tuple(claim) == ("released", "failed")
+    assert conn.execute(
+        "SELECT status FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+        (PID, body["run_id"]),
+    ).fetchone()[0] == "failed"
+    if drift == "governed_source":
+        assert source.read_text() == "changed during graph scan\n"
+    else:
+        assert world["head"] == "b" * 40
+    for retry_body in (body, {**body, "run_id": body["run_id"] + "-new"}):
+        retry_status, retry = server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=retry_body),
+        )
+        assert retry_status == 409, retry
+        assert retry.get("candidate_ready") is not True
+
+    monkeypatch.setattr(
+        server, "_require_bounded_qa_session_authority",
+        lambda *_args, **_kwargs: (
+            {"principal_id": "qa:fixture"},
+            {"commit_sha": head, "backlog_id": "fixture", "task_id": "fixture"},
+        ),
+    )
+    graph_query_trace.ensure_schema(conn)
+    before_traces = conn.execute("SELECT COUNT(*) FROM graph_query_traces").fetchone()[0]
+    with pytest.raises(server.GovernanceError) as qa_rejection:
+        server._require_graph_query_capability(
+            _ctx({"project_id": PID}, method="POST", body={}), conn,
+            {"query_source": "qa", "query_purpose": "independent_verification",
+             "snapshot_id": "full-current", "commit_sha": head,
+             "backlog_id": "fixture", "task_id": "fixture"},
+            "graph_query",
+        )
+    assert qa_rejection.value.code == "qa_graph_snapshot_abandoned"
+    assert conn.execute("SELECT COUNT(*) FROM graph_query_traces").fetchone()[0] == before_traces
+    source.write_text("base\n", encoding="utf-8")
+    world["head"] = head
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", build)
+    monkeypatch.setattr(
+        server, "_current_full_deterministic_snapshot_id",
+        lambda _commit_sha: "full-fresh-after-drift",
+    )
+    monkeypatch.setattr(
+        store, "snapshot_id_for",
+        lambda *_args, **_kwargs: "full-fresh-after-drift",
+    )
+    fresh_status, fresh = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body={
+            **body, "run_id": body["run_id"] + "-fresh",
+            "snapshot_id": "full-fresh-after-drift",
+        }),
+    )
+    assert fresh_status == 201, fresh
+    assert fresh["candidate_snapshot_id"] == "full-fresh-after-drift"
+    assert store.get_graph_snapshot(conn, PID, "full-fresh-after-drift")["status"] == "candidate"
+
+
+def test_current_full_candidate_build_detects_real_git_change_in_assigned_root(
+    conn, monkeypatch, tmp_path,
+):
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    subprocess.run(["git", "init", "-q", str(canonical)], check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=canonical, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=canonical, check=True)
+    (canonical / "source.py").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.py"], cwd=canonical, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=canonical, check=True)
+    assigned = tmp_path / "assigned-worker"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "assigned-worker", str(assigned)],
+        cwd=canonical, check=True,
+    )
+    real_status = server._git_dirty_paths
+    head, _calls = _stub_current_full_reconcile(monkeypatch, assigned)
+    monkeypatch.setattr(server, "_git_dirty_paths", real_status)
+    build = state_reconcile.run_state_only_full_reconcile
+    def mutate_after_graph_scan(*args, **kwargs):
+        result = build(*args, **kwargs)
+        (assigned / "source.py").write_text("governed drift\n", encoding="utf-8")
+        return result
+    monkeypatch.setattr(
+        state_reconcile, "run_state_only_full_reconcile", mutate_after_graph_scan,
+    )
+    monkeypatch.setattr(
+        server, "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    assert real_status(assigned) == []
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body={
+            "target_commit_sha": head, "activate": False,
+            "semantic_enrich": False, "run_id": "assigned-real-git-drift",
+        }),
+    )
+    assert status == 409, result
+    assert result["dirty_files"] == ["source.py"]
+    assert real_status(assigned) == ["source.py"]
+    assert result["snapshot_status"] == "abandoned"
+
+
+def test_current_full_candidate_build_detects_real_git_head_change(
+    conn, monkeypatch, tmp_path,
+):
+    root = tmp_path / "head-race-repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+    source = root / "source.py"
+    source.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+    real_head = server._git_head_commit
+    real_status = server._git_dirty_paths
+    head = real_head(root)
+    _stub_current_full_reconcile(monkeypatch, root)
+    monkeypatch.setattr(server, "_git_head_commit", real_head)
+    monkeypatch.setattr(server, "_git_dirty_paths", real_status)
+    def move_head_during_build(_conn, project_id, _root, **kwargs):
+        snapshot_id = kwargs["snapshot_id"]
+        store.create_graph_snapshot(
+            _conn, project_id, snapshot_id=snapshot_id,
+            commit_sha=head, snapshot_kind="full", graph_json=_graph(),
+            notes=json.dumps({"run_id": kwargs["run_id"]}),
+        )
+        _conn.commit()
+        source.write_text("new commit during graph scan\n", encoding="utf-8")
+        subprocess.run(["git", "add", "source.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "later"], cwd=root, check=True)
+        return {
+            "ok": True, "snapshot_id": snapshot_id,
+            "snapshot_status": "candidate", "run_id": kwargs["run_id"],
+        }
+    monkeypatch.setattr(
+        state_reconcile, "run_state_only_full_reconcile", move_head_during_build,
+    )
+    monkeypatch.setattr(
+        server, "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body={
+            "target_commit_sha": head, "activate": False,
+            "semantic_enrich": False, "run_id": "real-head-drift",
+        }),
+    )
+    assert status == 409, result
+    assert result["error"] == "current_full_candidate_source_changed_after_build"
+    assert result["head_commit"] == real_head(root) != head
+    assert result["dirty_file_count"] == 0
+    assert real_status(root) == []
+    assert result["snapshot_status"] == "abandoned"
+
+
+def test_current_full_candidate_abandon_failure_is_hard_nonready_refusal(
+    conn, monkeypatch, tmp_path,
+):
+    head, _calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    _activate_basic_graph(conn, "full-before-quarantine-failure", commit_sha="c" * 40)
+    dirty = {"after_build": False}
+    monkeypatch.setattr(
+        server, "_git_dirty_paths",
+        lambda _root: ["source.py"] if dirty["after_build"] else [],
+    )
+    build = state_reconcile.run_state_only_full_reconcile
+    def mutate_after_build(*args, **kwargs):
+        result = build(*args, **kwargs)
+        dirty["after_build"] = True
+        return result
+    monkeypatch.setattr(
+        state_reconcile, "run_state_only_full_reconcile", mutate_after_build,
+    )
+    monkeypatch.setattr(
+        store, "abandon_graph_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected")),
+    )
+    monkeypatch.setattr(
+        server, "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    with pytest.raises(server.GovernanceError) as refusal:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body={
+                "target_commit_sha": head, "activate": False,
+                "semantic_enrich": False, "run_id": "quarantine-failure",
+            }),
+        )
+    assert refusal.value.code == "current_full_changed_source_quarantine_failed"
+    assert refusal.value.details["snapshot_quarantined"] is False
+    assert store.get_graph_snapshot(conn, PID, "full-current")["status"] == "candidate"
+    claim = conn.execute(
+        "SELECT terminal_status FROM graph_current_full_build_claim_history "
+        "WHERE project_id=? AND snapshot_id=?",
+        (PID, "full-current"),
+    ).fetchone()
+    assert claim[0] == "failed"
+    dirty["after_build"] = False
+    before_traces = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces"
+    ).fetchone()[0] if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='graph_query_traces'"
+    ).fetchone() else 0
+    selection = server._operator_supervised_direct_main_nonactive_graph_snapshot_selection(
+        conn,
+        project_id=PID,
+        requested_snapshot_id="full-current",
+        selected_direct={
+            "resolved": True, "source": "fresh_registry_authority", "records": [],
+        },
+        world_ref={
+            "accepted": True, "base_commit": head,
+            "target_project_root": str(tmp_path),
+        },
+    )
+    assert selection["accepted"] is False
+    assert selection["reason"] == "current_full_candidate_not_ready"
+    graph_query_trace.ensure_schema(conn)
+    assert conn.execute("SELECT COUNT(*) FROM graph_query_traces").fetchone()[0] == before_traces
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_selected_execution_identity",
+        lambda *_args, **_kwargs: {
+            "resolved": True, "source": "fresh_registry_authority",
+            "records": [], "contract_execution_id": "cex-fixture",
+        },
+    )
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_route_authority",
+        lambda *_args, **_kwargs: {"accepted": True},
+    )
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_world_ref",
+        lambda *_args, **_kwargs: {
+            "accepted": True, "base_commit": head,
+            "target_project_root": str(tmp_path),
+        },
+    )
+    with pytest.raises(server.GovernanceError) as direct_refusal:
+        server._observer_parentless_direct_main_graph_world_authority(
+            conn,
+            project_id=PID,
+            body={
+                "query_source": "observer", "query_purpose": "gate_validation",
+                "snapshot_id": "full-current",
+            },
+            route_proof={
+                "backlog_id": "fixture", "task_id": "cex-fixture",
+                "route_token_ref": "rtok-fixture",
+            },
+            action="graph-governance.query",
+        )
+    assert direct_refusal.value.code == "observer_direct_main_graph_world_mismatch"
+    assert conn.execute("SELECT COUNT(*) FROM graph_query_traces").fetchone()[0] == before_traces
+    monkeypatch.setattr(
+        server, "_require_bounded_qa_session_authority",
+        lambda *_args, **_kwargs: (
+            {"principal_id": "qa:fixture"},
+            {"commit_sha": head, "backlog_id": "fixture", "task_id": "fixture"},
+        ),
+    )
+    with pytest.raises(server.GovernanceError) as qa_refusal:
+        server._require_graph_query_capability(
+            _ctx({"project_id": PID}, method="POST", body={}), conn,
+            {"query_source": "qa", "query_purpose": "independent_verification",
+             "snapshot_id": "full-current", "commit_sha": head,
+             "backlog_id": "fixture", "task_id": "fixture"},
+            "graph_query",
+        )
+    assert qa_refusal.value.code == "qa_current_full_candidate_not_ready"
+
+
 def test_current_full_reconcile_route_proof_reports_missing_scope_fields(
     conn,
     monkeypatch,
