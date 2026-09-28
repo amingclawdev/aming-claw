@@ -44,10 +44,11 @@ PLAN_REVISION = 1
 DERIVED_PAIR_PLAN_REVISION = 2
 ARCHIVE_PLAN_REVISION = 1
 ARCHIVE_ROOT_ENV = "AMING_CLAW_WORKTREE_ARCHIVE_ROOT"
-# A missing store cannot prove absence of a session, lease, CEX, queue, or
-# unique-evidence reference. This inventory is intentionally explicit: newly
-# added stores are still scanned when present, and a schema change to one of
-# these required stores fails closed until its reference columns are reviewed.
+# A missing store cannot prove absence of a session, lease, CEX, or
+# unique-evidence reference. A business project's local queue is the one
+# jointly optional pair, while AC uses its verified stable queue. This
+# inventory is intentionally explicit: newly added stores are still scanned
+# when present, and schema changes to required stores fail closed.
 _ARCHIVE_REFERENCE_COLUMNS: dict[str, frozenset[str]] = {
     "sessions": frozenset({"session_id", "project_id", "status", "scope_json", "metadata_json"}),
     "observer_sessions": frozenset({"session_id", "project_id", "status", "cwd", "capabilities_json"}),
@@ -596,7 +597,9 @@ def _derived_exact_reference_reasons(
                    "release_operator_head_queue_events"}
         scanned = 0
         for table in sorted(_ARCHIVE_REFERENCE_COLUMNS):
-            if table in history or (project_id == "aming-claw" and table in _STABLE_QUEUE_REFERENCE_TABLES):
+            if (table in history
+                    or (table in _STABLE_QUEUE_REFERENCE_TABLES
+                        and (project_id == "aming-claw" or not _table_exists(conn, table)))):
                 continue
             quoted = '"' + table.replace('"', '""') + '"'
             cursor = conn.execute(f"SELECT * FROM {quoted}")
@@ -2001,8 +2004,11 @@ def _archive_reference_inventory_reasons(
         if len(names) > 512:
             return ["reference_inventory_unbounded"]
         required_tables = set(_ARCHIVE_REFERENCE_COLUMNS)
-        if project_id == "aming-claw":
+        if (project_id == "aming-claw"
+                or _STABLE_QUEUE_REFERENCE_TABLES.isdisjoint(names)):
             # AC release queue authority lives only in the verified stable DB.
+            # A business project's local queue is empty only when both optional
+            # tables are absent from this same trusted database snapshot.
             required_tables -= _STABLE_QUEUE_REFERENCE_TABLES
         missing = sorted(required_tables - names)
         if missing:
@@ -2016,6 +2022,29 @@ def _archive_reference_inventory_reasons(
                 conn.execute(f"SELECT * FROM {quoted} LIMIT 1").fetchone()
             except sqlite3.Error:
                 return ["reference_inventory_unreadable:" + name]
+        if project_id != "aming-claw" and _STABLE_QUEUE_REFERENCE_TABLES <= names:
+            # Derived-run scans retain queue events as history, so validate
+            # their complete present inventory before skipping them as refs.
+            try:
+                cursor = conn.execute(
+                    "SELECT before_json, after_json FROM release_operator_head_queue_events"
+                )
+                scanned = 0
+                while rows := cursor.fetchmany(256):
+                    scanned += len(rows)
+                    if scanned > 250_000:
+                        return ["reference_inventory_unbounded"]
+                    for row in rows:
+                        for column, value in zip(("before_json", "after_json"), row):
+                            if value not in (None, "", b""):
+                                if not isinstance(value, (str, bytes)):
+                                    return ["reference_inventory_corrupt:release_operator_head_queue_events." + column]
+                                try:
+                                    json.loads(value)
+                                except (TypeError, ValueError, UnicodeError):
+                                    return ["reference_inventory_corrupt:release_operator_head_queue_events." + column]
+            except sqlite3.Error:
+                return ["reference_inventory_unreadable:release_operator_head_queue_events"]
     except sqlite3.Error:
         return ["reference_inventory_unavailable"]
     return []
@@ -3417,6 +3446,21 @@ def prune_archived_merged_worktree(
                     raise StaleArtifactCleanupError("stable_queue_prune_authority_drift", {
                         "ok": False, "error": "stable_queue_prune_authority_drift",
                         "refusal_reasons": queue_reasons or ["stable_queue_inventory_changed"],
+                        "writes_performed": False,
+                        "next_step": "Keep the worktree and request a fresh archive preview.",
+                    })
+            else:
+                # A business queue may be initialized after preview or archive
+                # publication. Recheck its current exact references at prune.
+                reference_reasons = _archive_reference_reasons(
+                    conn, path=str(source), branch=evidence["branch"],
+                    head=evidence["head"], task_id=evidence["task_id"],
+                    project_id=project_id, backlog_id=evidence["backlog_id"],
+                )
+                if reference_reasons:
+                    raise StaleArtifactCleanupError("archive_prune_authority_drift", {
+                        "ok": False, "error": "archive_prune_authority_drift",
+                        "refusal_reasons": reference_reasons,
                         "writes_performed": False,
                         "next_step": "Keep the worktree and request a fresh archive preview.",
                     })

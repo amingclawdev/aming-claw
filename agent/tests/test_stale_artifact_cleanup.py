@@ -759,6 +759,163 @@ def test_archive_release_queue_backlog_only_reference_refuses(tmp_path, monkeypa
     assert not list(archive_root.rglob("index/*.json"))
 
 
+def test_business_archive_both_local_queue_tables_absent_still_scans_other_refs(
+    tmp_path, monkeypatch,
+):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    for table in stale_artifact_cleanup._STABLE_QUEUE_REFERENCE_TABLES:
+        conn.execute(f'DROP TABLE "{table}"')
+    conn.commit()
+    preview = lambda: stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    approved = preview()
+    candidate = next(row for row in approved["candidates"]
+                     if row["artifact_type"] == "batch_worktree")
+    assert candidate["safe_to_apply"] is True, candidate["refusal_reasons"]
+    conn.execute(
+        "INSERT INTO sessions (session_id,principal_id,project_id,role,scope_json,"
+        "token_hash,status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("queue-absent-ref", "qa", "proj", "qa",
+         json.dumps({"worktree_path": str(strategy.worktree_path)}),
+         "queue-absent-hash", "active", "now", "later"),
+    )
+    conn.commit()
+    blocked = preview()["candidates"][0]
+    assert "referenced_by_sessions" in blocked["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="stale_cleanup_plan_refused"):
+        stale_art_cleanup_apply(conn, repo, candidate, approved)
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_business_archive_queue_created_after_preview_invalidates_apply(
+    tmp_path, monkeypatch,
+):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    for table in stale_artifact_cleanup._STABLE_QUEUE_REFERENCE_TABLES:
+        conn.execute(f'DROP TABLE "{table}"')
+    conn.commit()
+    approved = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = approved["candidates"][0]
+    assert candidate["safe_to_apply"] is True
+    governance_server._ensure_release_operator_head_queue_schema(conn)
+    conn.execute(
+        "INSERT INTO release_operator_head_queue "
+        "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+        ("proj", "unrelated-backlog", 1, "now", "now"),
+    )
+    conn.commit()
+    unrelated = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    assert unrelated["candidates"][0]["safe_to_apply"] is True
+    conn.execute(
+        "INSERT INTO release_operator_head_queue "
+        "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+        ("proj", candidate["evidence"]["task_id"], 2, "now", "now"),
+    )
+    conn.commit()
+    fresh = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    assert "referenced_by_release_operator_head_queue" in fresh["candidates"][0]["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="stale_cleanup_plan_refused"):
+        stale_art_cleanup_apply(conn, repo, candidate, approved)
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
+def test_business_archive_rechecks_queue_immediately_before_prune(tmp_path, monkeypatch):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    for table in stale_artifact_cleanup._STABLE_QUEUE_REFERENCE_TABLES:
+        conn.execute(f'DROP TABLE "{table}"')
+    conn.commit()
+    preview = stale_artifact_cleanup.build_merged_worktree_archive_projection(
+        conn, "proj", repo_root_path=repo,
+    )
+    candidate = preview["candidates"][0]
+    assert candidate["safe_to_apply"] is True
+    published = stale_artifact_cleanup.archive_merged_worktree(
+        conn, "proj", repo_root_path=repo,
+        candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+        plan_revision=preview["plan_revision"],
+    )
+    original_readback = stale_artifact_cleanup._archive_governance_evidence_readback
+    changed = False
+
+    def add_queue_reference_after_fresh_candidate(connection):
+        nonlocal changed
+        if not changed:
+            governance_server._ensure_release_operator_head_queue_schema(connection)
+            connection.execute(
+                "INSERT INTO release_operator_head_queue "
+                "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+                ("proj", candidate["evidence"]["task_id"], 1, "now", "now"),
+            )
+            connection.commit()
+            changed = True
+        return original_readback(connection)
+
+    monkeypatch.setattr(stale_artifact_cleanup, "_archive_governance_evidence_readback",
+                        add_queue_reference_after_fresh_candidate)
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError) as error:
+        stale_artifact_cleanup.prune_archived_merged_worktree(
+            conn, "proj", repo_root_path=repo,
+            candidate_id=candidate["candidate_id"], plan_hash=preview["plan_hash"],
+            plan_revision=preview["plan_revision"], generation=published["generation"],
+        )
+    assert error.value.payload["error"] == "archive_prune_authority_drift"
+    assert "referenced_by_release_operator_head_queue" in error.value.payload["refusal_reasons"]
+    assert Path(strategy.worktree_path).exists()
+    assert list(archive_root.rglob("index/*.json"))
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("malformed", "reference_inventory_schema_incomplete:release_operator_head_queue_events"),
+    ("unreadable", "reference_inventory_unreadable:release_operator_head_queue_events"),
+    ("corrupt", "reference_inventory_corrupt:release_operator_head_queue_events.after_json"),
+])
+def test_business_archive_present_queue_event_inventory_refuses(
+    tmp_path, monkeypatch, fault, reason,
+):
+    repo, conn, _created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
+    approved = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    candidate = approved["candidates"][0]
+    if fault == "malformed":
+        conn.execute("DROP TABLE release_operator_head_queue_events")
+        conn.execute("CREATE TABLE release_operator_head_queue_events (fixture_only TEXT)")
+    elif fault == "corrupt":
+        conn.execute(
+            "INSERT INTO release_operator_head_queue_events "
+            "(project_id,action,backlog_id,actor,before_json,after_json,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            ("proj", "reorder", "other", "tester", "{}", "{bad", "now"),
+        )
+    conn.commit()
+    if fault == "unreadable":
+        conn.set_authorizer(lambda action, arg1, _arg2, _database, _trigger:
+                            sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ
+                            and arg1 == "release_operator_head_queue_events"
+                            else sqlite3.SQLITE_OK)
+    refused = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="worktrees",
+    )
+    assert reason in refused["candidates"][0]["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="stale_cleanup_plan_refused"):
+        stale_art_cleanup_apply(conn, repo, candidate, approved)
+    conn.set_authorizer(None)
+    assert Path(strategy.worktree_path).exists()
+    assert not list(archive_root.rglob("index/*.json"))
+
+
 @pytest.mark.parametrize("kind", ["session", "lease", "cex", "queue"])
 def test_archive_preview_refuses_live_governance_reference(tmp_path, monkeypatch, kind):
     repo, conn, created, strategy, archive_root = _archive_fixture(tmp_path, monkeypatch)
@@ -1374,6 +1531,90 @@ def test_new_terminal_derived_pair_public_preview_and_prune(tmp_path, monkeypatc
     assert replay["state"] == "replay"
     assert replay["applied_count"] == 0
     assert replay["writes_performed"] is False
+
+
+def test_business_derived_pair_optional_queue_absence_and_one_table_refusal(
+    tmp_path, monkeypatch,
+):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = lambda: stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    for table in stale_artifact_cleanup._STABLE_QUEUE_REFERENCE_TABLES:
+        conn.execute(f'DROP TABLE "{table}"')
+    conn.commit()
+    approved = preview()
+    candidate = approved["candidates"][0]
+    assert candidate["safe_to_apply"] is True, candidate["refusal_reasons"]
+    governance_server._ensure_release_operator_head_queue_schema(conn)
+    conn.execute("DROP TABLE release_operator_head_queue_events")
+    conn.commit()
+    refused = preview()["candidates"][0]
+    assert "reference_inventory_missing:release_operator_head_queue_events" in refused["refusal_reasons"]
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError,
+                       match="stale_cleanup_plan_refused"):
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="governance_index",
+            candidate_ids=[candidate["candidate_id"]],
+            plan_hash=approved["plan_hash"], plan_revision=approved["plan_revision"],
+        )
+    assert all(Path(path).exists() for path in candidate["source_paths"].values())
+
+
+def test_business_derived_pair_both_local_queue_tables_absent_can_apply(
+    tmp_path, monkeypatch,
+):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    for table in stale_artifact_cleanup._STABLE_QUEUE_REFERENCE_TABLES:
+        conn.execute(f'DROP TABLE "{table}"')
+    conn.commit()
+    preview = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )
+    candidate = preview["candidates"][0]
+    assert candidate["safe_to_apply"] is True, candidate["refusal_reasons"]
+    applied = stale_artifact_cleanup.apply_stale_artifact_cleanup(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+        candidate_ids=[candidate["candidate_id"]],
+        plan_hash=preview["plan_hash"], plan_revision=preview["plan_revision"],
+    )
+    assert applied["state"] == "pruned"
+    assert all(not Path(path).exists() for path in candidate["source_paths"].values())
+
+
+def test_business_derived_pair_present_queue_exact_refs_and_historical_events(
+    tmp_path, monkeypatch,
+):
+    repo, conn, _archive = _new_terminal_derived_pair(tmp_path, monkeypatch)
+    preview = lambda: stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="governance_index",
+    )["candidates"][0]
+    assert preview()["safe_to_apply"] is True
+    conn.execute(
+        "INSERT INTO release_operator_head_queue "
+        "(project_id,backlog_id,position,inserted_at,updated_at) VALUES (?,?,?,?,?)",
+        ("proj", "unrelated-backlog", 1, "now", "now"),
+    )
+    conn.execute(
+        "INSERT INTO release_operator_head_queue_events "
+        "(project_id,action,backlog_id,actor,before_json,after_json,created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("proj", "reorder", "historical", "tester", "{}",
+         json.dumps({"run_id": "paired-run", "snapshot_id": "full-paired-run"}), "now"),
+    )
+    conn.commit()
+    assert preview()["safe_to_apply"] is True
+    conn.execute("UPDATE release_operator_head_queue SET backlog_id='paired-run' "
+                 "WHERE backlog_id='unrelated-backlog'")
+    conn.commit()
+    blocked = preview()
+    assert "referenced_by_release_operator_head_queue" in blocked["refusal_reasons"]
+    conn.execute("UPDATE release_operator_head_queue SET backlog_id='unrelated-backlog' "
+                 "WHERE backlog_id='paired-run'")
+    conn.execute("UPDATE release_operator_head_queue_events SET after_json='{bad'")
+    conn.commit()
+    corrupt = preview()
+    assert "reference_inventory_corrupt:release_operator_head_queue_events.after_json" in corrupt["refusal_reasons"]
 
 
 def test_derived_pair_exact_live_reference_and_legacy_refuse(tmp_path, monkeypatch):
