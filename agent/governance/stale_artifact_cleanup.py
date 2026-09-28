@@ -1139,6 +1139,7 @@ def build_stale_artifact_cleanup_projection(
     dimension: str = "",
     response_budget: bool = True,
     archive_enrichment: bool = True,
+    _run_selection: Any = None,
 ) -> dict[str, Any]:
     """Return a dry-run projection; no artifacts or append-only evidence are deleted.
 
@@ -1149,7 +1150,9 @@ def build_stale_artifact_cleanup_projection(
     if dim == DIMENSION_GRAPH_SNAPSHOT_DUPLICATES:
         from . import snapshot_cow_cleanup as cow
         try:
-            result = cow.preview(conn, project_id, Path(repo_root_path))
+            result = (_periodic_native_check(conn, project_id, Path(repo_root_path), "preview",
+                                              _run_selection=_run_selection)
+                      if _run_selection is not None else cow.preview(conn, project_id, Path(repo_root_path)))
         except (cow.CowRefusal, OSError, ValueError, sqlite3.Error) as exc:
             raise StaleArtifactCleanupError("snapshot_cow_preview_refused", {
                 "ok": False, "error": "snapshot_cow_preview_refused",
@@ -1964,6 +1967,7 @@ def apply_stale_artifact_cleanup(
     plan_hash: str = "",
     plan_revision: int = 0,
     operation_id: str = "",
+    _run_selection: Any = None,
 ) -> dict[str, Any]:
     """Apply only a fresh, exact plan while serializing destructive work."""
     from .db import sqlite_write_lock
@@ -1973,7 +1977,8 @@ def apply_stale_artifact_cleanup(
         if _dimension(dimension) == DIMENSION_GRAPH_SNAPSHOT_DUPLICATES:
             return _cow_locked(conn, project_id, repo_root_path, "apply",
                                candidate_ids=candidate_ids, plan_hash=plan_hash,
-                               plan_revision=plan_revision, operation_id=operation_id)
+                               plan_revision=plan_revision, operation_id=operation_id,
+                               _run_selection=_run_selection)
         return _apply_stale_artifact_cleanup_locked(
             conn, project_id, repo_root_path=repo_root_path,
             candidate_ids=candidate_ids, actor=actor, backlog_id=backlog_id,
@@ -1993,8 +1998,10 @@ def _cow_locked(conn: sqlite3.Connection, project_id: str, root: str | Path,
             conn.execute("BEGIN IMMEDIATE")
         fence = _stable_queue_exclusive_fence() if project_id == "aming-claw" else nullcontext()
         with fence:
-            result = (cow.apply(conn, project_id, Path(root), **arguments) if mode == "apply"
-                      else cow.recover(conn, project_id, Path(root), **arguments))
+            methods = {"apply": cow.apply, "recover": cow.recover,
+                       "resolution": cow.periodic_resolution, "readiness": cow.periodic_journal_readiness,
+                       "preview": cow.preview, "zero_effect": cow.periodic_zero_effect}
+            result = methods[mode](conn, project_id, Path(root), **arguments)
         if not _cleanup_response_fits(result):
             return bounded_cleanup_error_payload({
                 "ok": False, "error": "cleanup_response_frame_refused",
@@ -2007,6 +2014,7 @@ def _cow_locked(conn: sqlite3.Connection, project_id: str, root: str | Path,
         raise StaleArtifactCleanupError("snapshot_cow_refused", {
             "ok": False, "error": "snapshot_cow_refused", "refusal_reason": str(exc)[:160],
             "operation_id": arguments.get("operation_id"),
+            "native_prejournal_refusal": isinstance(exc, cow.CowPrejournalRefusal),
             "writes_performed": False, "write_disposition": "not_written", "safe_retry": False,
         }) from exc
     finally:
@@ -2022,6 +2030,17 @@ def recover_snapshot_cow_cleanup(conn: sqlite3.Connection, project_id: str, *,
     with _DESTRUCTIVE_CLEANUP_LOCK, sqlite_write_lock(), _CURRENT_FULL_BUILD_KEYS_LOCK:
         return _cow_locked(conn, project_id, repo_root_path, "recover",
                            operation_id=operation_id, action=action)
+
+
+
+def _periodic_native_check(conn: sqlite3.Connection, project_id: str, root: Path,
+                           mode: str, **arguments: Any) -> dict[str, Any]:
+    if mode not in {"resolution", "readiness", "preview", "zero_effect"}:
+        raise ValueError("periodic_native_check_mode_invalid")
+    from .db import sqlite_write_lock
+    from .server import _CURRENT_FULL_BUILD_KEYS_LOCK
+    with _DESTRUCTIVE_CLEANUP_LOCK, sqlite_write_lock(), _CURRENT_FULL_BUILD_KEYS_LOCK:
+        return _cow_locked(conn, project_id, root, mode, **arguments)
 
 
 def _archive_root_descriptor() -> dict[str, Any]:

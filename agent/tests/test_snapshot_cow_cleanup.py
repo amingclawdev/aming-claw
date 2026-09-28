@@ -466,3 +466,71 @@ def test_recovery_journal_failure_visible_to_supported_inspect(cow_fixture, monk
     assert not result["ok"] and result["write_disposition"] == "ambiguous"
     inspect = recover(cow_fixture, plan)
     assert inspect["recovery_pending"]["operation_id"] == plan["operation_id"]
+
+
+def test_internal_selection_narrows_without_engine_hash_or_manual_plan_change(cow_fixture):
+    conn, root, _, config, _ = cow_fixture
+    manual = preview(cow_fixture)
+    selection = cow.RunSelection(('full-old',), 1, 2, 1024 * 1024)
+    internal = cow.preview(conn, 'proj', root, _run_selection=selection)
+    assert internal['config_hash'] == manual['config_hash'] == cow._digest(config['governance']['snapshot_cow_cleanup'])
+    assert internal['plan_hash'] != manual['plan_hash']
+    assert preview(cow_fixture)['plan_hash'] == manual['plan_hash']
+    with pytest.raises(cow.CowRefusal, match='selection_invalid'):
+        cow.preview(conn, 'proj', root, _run_selection=cow.RunSelection(('full-old',), 1, 1, 1024))
+    with pytest.raises(cow.CowRefusal, match='selection_invalid'):
+        cow.preview(conn, 'proj', root, _run_selection=cow.RunSelection(('full-old',), 5, 2, 1024))
+
+
+def test_digest_meter_exact_scope_all_proof_hashes_and_deadline(cow_fixture):
+    _, _, base, *_ = cow_fixture
+    path = base / cow.PAIRS[0][0]
+    expected = cow._metadata(path)
+    meter = cow.DigestMeter(expected['size'] * 2)
+    with cow.digest_budget(meter):
+        cow._hash(path, expected)
+        cow._hash(path, expected)
+        assert meter.consumed == expected['size'] * 2
+        with pytest.raises(cow.CowRefusal, match='budget_exhausted'):
+            cow._hash(path, expected)
+        assert meter.consumed == meter.limit
+    assert cow._DIGEST_METER.get() is None
+    assert cow._hash(path, expected)
+    with cow.digest_budget(cow.DigestMeter(1024 * 1024, deadline=0)):
+        with pytest.raises(cow.CowRefusal, match='deadline_exhausted'):
+            cow._hash(path, expected)
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='isolated native APFS fixture')
+def test_timer_policy_changes_preserve_legacy_receipt_recovery_but_engine_drift_refuses(cow_fixture, monkeypatch):
+    conn, root, _, config, _ = cow_fixture
+    monkeypatch.setattr(cow, '_quiet', lambda *_args: None)
+    plan = preview(cow_fixture)
+    assert apply(cow_fixture, plan)['ok']
+    record = cow._read(cow._journal_path('proj', plan['operation_id']))
+    assert 'run_selection' not in record
+    config['governance']['snapshot_cow_cleanup_periodic'] = {'enabled': False, 'revision': 200}
+    assert apply(cow_fixture, plan)['replay']
+    assert recover(cow_fixture, plan, 'restore')['ok']
+    config['governance']['snapshot_cow_cleanup']['max_pairs'] = 6
+    with pytest.raises(cleanup.StaleArtifactCleanupError):
+        apply(cow_fixture, plan)
+
+
+def test_internal_plan_fresh_pin_and_engine_policy_drift_are_not_bypassed(cow_fixture, monkeypatch):
+    conn, root, _, config, _ = cow_fixture
+    selection = cow.RunSelection(('full-old',), 1, 2, 1024 * 1024)
+    plan = cow.preview(conn, 'proj', root, _run_selection=selection)
+    conn.execute("INSERT INTO graph_snapshot_refs(project_id,ref_name,snapshot_id,updated_at,commit_sha) "
+                 "VALUES('proj','new-pin','full-old','now','fixture')")
+    conn.commit()
+    with pytest.raises(cleanup.StaleArtifactCleanupError):
+        cleanup.apply_stale_artifact_cleanup(conn, 'proj', repo_root_path=root, dimension=cow.DIMENSION,
+            candidate_ids=[r['candidate_id'] for r in plan['candidates']], plan_hash=plan['plan_hash'],
+            plan_revision=plan['plan_revision'], operation_id=plan['operation_id'], _run_selection=selection)
+    assert not cow._state_root('proj').exists()
+    conn.execute("DELETE FROM graph_snapshot_refs WHERE ref_name='new-pin'")
+    conn.commit()
+    config['governance']['snapshot_cow_cleanup']['max_pairs'] = 7
+    with pytest.raises(cow.CowRefusal, match='config_drift'):
+        cow._fresh(conn, 'proj', root, plan, plan['candidates'][0])

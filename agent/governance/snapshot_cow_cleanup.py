@@ -19,6 +19,10 @@ import stat
 import subprocess
 import sys
 import uuid
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,6 +48,67 @@ CLONE_NOFOLLOW_ANY = 0x8
 
 class CowRefusal(ValueError):
     pass
+
+
+class CowPrejournalRefusal(CowRefusal):
+    """Native preflight exited before creating any journal/backup/stage."""
+    pass
+
+
+@dataclass(frozen=True)
+class RunSelection:
+    """Internal immutable narrowing; never accepted from a remote request."""
+    snapshot_ids: tuple[str, ...]
+    max_snapshots: int
+    max_pairs: int
+    max_hash_bytes: int
+
+    def budgets(self, base: dict[str, int]) -> dict[str, int]:
+        requested = {"max_snapshots": self.max_snapshots, "max_pairs": self.max_pairs,
+                     "max_hash_bytes": self.max_hash_bytes}
+        if (not isinstance(self.snapshot_ids, tuple) or not self.snapshot_ids
+                or len(set(self.snapshot_ids)) != len(self.snapshot_ids)
+                or any(not isinstance(sid, str) or not snapshots._snapshot_id_is_component(sid)
+                       for sid in self.snapshot_ids)
+                or any(type(v) is not int or not 1 <= v <= base[k] for k, v in requested.items())
+                or len(self.snapshot_ids) > self.max_snapshots or self.max_pairs < 2 * len(self.snapshot_ids)):
+            raise CowRefusal("cow_run_selection_invalid")
+        return requested
+
+    def receipt(self) -> dict[str, Any]:
+        return {"snapshot_ids": list(self.snapshot_ids), "max_snapshots": self.max_snapshots,
+                "max_pairs": self.max_pairs, "max_hash_bytes": self.max_hash_bytes}
+
+
+@dataclass
+class DigestMeter:
+    limit: int
+    consumed: int = 0
+    deadline: float | None = None
+
+    def checkpoint(self) -> None:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise CowRefusal("cow_periodic_deadline_exhausted")
+
+    def debit(self, count: int) -> None:
+        self.checkpoint()
+        if type(count) is not int or count < 0 or self.consumed + count > self.limit:
+            raise CowRefusal("cow_aggregate_digest_budget_exhausted")
+        self.consumed += count
+
+
+_DIGEST_METER: ContextVar[DigestMeter | None] = ContextVar("cow_digest_meter", default=None)
+
+
+@contextmanager
+def digest_budget(meter: DigestMeter):
+    if type(meter.limit) is not int or not 1 <= meter.limit <= 128 * 1024**3:
+        raise CowRefusal("cow_aggregate_digest_budget_invalid")
+    token = _DIGEST_METER.set(meter)
+    try:
+        yield meter
+    finally:
+        _DIGEST_METER.reset(token)
 
 
 def _digest(value: Any) -> str:
@@ -154,8 +219,22 @@ def _hash(path: Path, expected: dict[str, Any]) -> str:
         if (opened.st_dev, opened.st_ino) != (expected["dev"], expected["ino"]):
             raise CowRefusal("hash_inode_drift")
         digest = hashlib.sha256()
-        while chunk := os.read(descriptor, 1024 * 1024):
+        read_bytes = 0
+        while read_bytes < expected["size"]:
+            meter = _DIGEST_METER.get()
+            count = min(1024 * 1024, expected["size"] - read_bytes)
+            if meter is not None:
+                meter.checkpoint()
+                count = min(count, meter.limit - meter.consumed)
+                if count <= 0:
+                    raise CowRefusal("cow_aggregate_digest_budget_exhausted")
+            chunk = os.read(descriptor, count)
+            if not chunk:
+                raise CowRefusal("hash_preimage_short_read")
+            if meter is not None:
+                meter.debit(len(chunk))
             digest.update(chunk)
+            read_bytes += len(chunk)
     finally:
         os.close(descriptor)
     if not _same(_metadata(path), expected):
@@ -187,9 +266,17 @@ def _write(path: Path, value: dict[str, Any]) -> None:
 
 def _read(path: Path) -> dict[str, Any]:
     _path(path)
-    if not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
-        raise CowRefusal("receipt_unreadable")
-    value = json.loads(path.read_text())
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "r") as handle:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 8 * 1024 * 1024:
+            raise CowRefusal("receipt_unreadable")
+        value = json.load(handle)
+        after = os.fstat(handle.fileno())
+    current = path.lstat()
+    keys = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, k) != getattr(after, k) or getattr(before, k) != getattr(current, k) for k in keys):
+        raise CowRefusal("receipt_read_drift")
     if not isinstance(value, dict):
         raise CowRefusal("receipt_malformed")
     return value
@@ -402,12 +489,17 @@ def _pair(project_id: str, sid: str, relative: tuple[str, str]) -> dict[str, Any
             "snapshot_identity": _metadata(root, directory=True), "safe_to_apply": True}
 
 
-def preview(conn: sqlite3.Connection, project_id: str, root: Path) -> dict[str, Any]:
+def preview(conn: sqlite3.Connection, project_id: str, root: Path, *,
+            _run_selection: RunSelection | None = None) -> dict[str, Any]:
     custody = _custody(conn, project_id, root)
     config = _config(project_id)
     budgets = _budgets(config)
+    if _run_selection is not None:
+        if not isinstance(_run_selection, RunSelection):
+            raise CowRefusal("cow_run_selection_invalid")
+        budgets = _run_selection.budgets(budgets)
     pins = _live_pins(conn, project_id)
-    explicit = config.get("snapshot_ids")
+    explicit = list(_run_selection.snapshot_ids) if _run_selection else config.get("snapshot_ids")
     where, args = "", []
     if explicit is not None:
         if (not isinstance(explicit, list) or not explicit or len(explicit) > budgets["max_snapshots"]
@@ -471,6 +563,8 @@ def preview(conn: sqlite3.Connection, project_id: str, root: Path) -> dict[str, 
         raise CowRefusal("cow_custody_drift")
     plan = {"custody": custody, "budgets": budgets, "config_hash": _digest(config),
             "candidates": rows, "incomplete": incomplete}
+    if _run_selection is not None:
+        plan["run_selection"] = _run_selection.receipt()
     plan_hash = "sha256:" + _digest(plan)
     operation_id = "cowop-" + _digest([custody, plan_hash])[:32]
     for row in rows:
@@ -541,8 +635,11 @@ def _archive(project_id: str, source: Path, bytes_needed: int = 0) -> dict[str, 
     mount = Path(str(config.get("archive_mount") or ""))
     if not path.is_absolute() or not mount.is_absolute() or mount == Path(mount.anchor):
         raise CowRefusal("cow_external_archive_not_configured")
-    _path(path)
-    _path(mount)
+    try:
+        _path(path)
+        _path(mount)
+    except (CowRefusal, OSError) as exc:
+        raise CowRefusal("cow_archive_unavailable") from exc
     if not path.is_relative_to(mount) or not os.path.ismount(mount):
         raise CowRefusal("cow_archive_mount_unverified")
     volume = _volume(path)
@@ -747,6 +844,9 @@ def _verify_backup(project_id: str, row: dict[str, Any], receipt: dict[str, Any]
 
 def _fresh(conn: sqlite3.Connection, project_id: str, root: Path,
            record: dict[str, Any], row: dict[str, Any], *, recovery: bool = False) -> None:
+    meter = _DIGEST_METER.get()
+    if meter is not None:
+        meter.checkpoint()
     if (_custody(conn, project_id, root) != record["custody"]
             or _digest(_config(project_id)) != record["config_hash"]):
         raise CowRefusal("cow_custody_or_config_drift")
@@ -800,7 +900,8 @@ def _result(record: dict[str, Any], *, replay: bool = False) -> dict[str, Any]:
 
 
 def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_ids: list[str],
-          plan_hash: str, plan_revision: int, operation_id: str) -> dict[str, Any]:
+          plan_hash: str, plan_revision: int, operation_id: str,
+          _run_selection: RunSelection | None = None) -> dict[str, Any]:
     if sys.platform != "darwin":
         raise CowRefusal("apfs_platform_unsupported")
     if (type(plan_revision) is not int or plan_revision != REVISION or not candidate_ids
@@ -815,7 +916,8 @@ def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_id
         if (record.get("schema") != "snapshot_cow_operation.v1" or record.get("custody") != custody
                 or record.get("operation_id") != operation_id or record.get("plan_hash") != plan_hash
                 or record.get("candidate_ids") != candidate_ids
-                or record.get("config_hash") != _digest(_config(project_id))):
+                or record.get("config_hash") != _digest(_config(project_id))
+                or record.get("run_selection") != (_run_selection.receipt() if _run_selection else None)):
             raise CowRefusal("cow_operation_scope_or_replay_drift")
         if record["state"] != "complete":
             return {**_result(record), "ok": False, "error": "cow_operation_inspect_required",
@@ -823,7 +925,7 @@ def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_id
         for entry in record["entries"]:
             _completed_readback(project_id, entry)
         return _result(record, replay=True)
-    projection = preview(conn, project_id, root)
+    projection = preview(conn, project_id, root, _run_selection=_run_selection)
     if (projection["operation_id"] != operation_id or projection["plan_hash"] != plan_hash
             or not projection["apply_plan_available"]):
         raise CowRefusal("cow_plan_stale_or_incomplete")
@@ -831,12 +933,15 @@ def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_id
     if any(cid not in candidates or not candidates[cid]["safe_to_apply"] for cid in candidate_ids):
         raise CowRefusal("cow_candidate_not_in_exact_plan")
     rows = [candidates[cid] for cid in candidate_ids]
-    _volume(snapshots._snapshot_root(project_id, rows[0]["snapshot_id"]))
-    # Verify all prerequisites before even creating the local operation ledger.
-    for row in rows:
-        _fresh(conn, project_id, root, projection, row)
-        _archive(project_id, snapshots._snapshot_root(project_id, row["snapshot_id"]),
-                 row["target_metadata"]["size"] * 2 + 1024 * 1024)
+    try:
+        _volume(snapshots._snapshot_root(project_id, rows[0]["snapshot_id"]))
+        # Verify all prerequisites before even creating the local operation ledger.
+        for row in rows:
+            _fresh(conn, project_id, root, projection, row)
+            _archive(project_id, snapshots._snapshot_root(project_id, row["snapshot_id"]),
+                     row["target_metadata"]["size"] * 2 + 1024 * 1024)
+    except CowRefusal as exc:
+        raise CowPrejournalRefusal(str(exc)) from exc
     _state_root(project_id, create=True)
     before = shutil.disk_usage(snapshots._snapshot_root(project_id, rows[0]["snapshot_id"])).free
     record = {"schema": "snapshot_cow_operation.v1", "operation_id": operation_id,
@@ -844,6 +949,8 @@ def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_id
               "plan_hash": plan_hash, "plan_revision": REVISION, "candidate_ids": candidate_ids,
               "entries": [{"candidate": row, "phase": "planned"} for row in rows],
               "state": "running", "filesystem": {"available_before": before}}
+    if _run_selection is not None:
+        record["run_selection"] = _run_selection.receipt()
     try:
         _write(path, record)
         for entry in record["entries"]:
@@ -1014,3 +1121,145 @@ def recover(conn: sqlite3.Connection, project_id: str, root: Path, *, operation_
             recovery_path.with_name(recovery_path.name + ".pending").exists(), "write_disposition":
             "ambiguous" if recovery["state"] != "complete" else "written" if selected else "not_written",
             "backup_retained": True, "original_journal_retained": True, "safe_retry": False}
+
+
+def periodic_resolution(conn: sqlite3.Connection, project_id: str, root: Path, *,
+                        operation_id: str) -> dict[str, Any]:
+    """Read-only terminal proof under the same native facade locks as recovery."""
+    custody = _custody(conn, project_id, root)
+    path = _journal_path(project_id, operation_id)
+    recovery_path = path.with_name(operation_id + '.recovery.json')
+    if any(p.with_name(p.name + '.pending').exists() for p in (path, recovery_path)):
+        raise CowRefusal('cow_resolution_pending')
+    record = _operation(path, project_id)
+    if record.get('custody') != custody or record.get('operation_id') != operation_id:
+        raise CowRefusal('cow_resolution_scope_drift')
+    recovery = _read(recovery_path) if recovery_path.exists() else None
+    recovered = {}
+    if recovery is not None:
+        if (recovery.get('schema') != 'snapshot_cow_recovery.v1'
+                or recovery.get('operation_id') != operation_id
+                or recovery.get('original_journal_hash') != _digest(record)
+                or recovery.get('state') != 'complete'
+                or not isinstance(recovery.get('entries'), list)
+                or len(recovery['entries']) > len(record['entries'])):
+            raise CowRefusal('cow_resolution_recovery_incomplete')
+        for entry in recovery['entries']:
+            cid = entry.get('candidate_id')
+            if cid not in record['candidate_ids'] or cid in recovered or entry.get('phase') != 'complete':
+                raise CowRefusal('cow_resolution_recovery_coverage')
+            recovered[cid] = entry
+    for entry in record['entries']:
+        row = entry['candidate']
+        _fresh(conn, project_id, root, record, row)
+        base = snapshots._snapshot_root(project_id, row['snapshot_id'])
+        # An unjournaled stage can never be waved away by a terminal label.
+        for relative in row['directories']:
+            with os.scandir(_path(base / relative)) as inventory:
+                for index, item in enumerate(inventory):
+                    if index >= 1000 or item.name.startswith('.snapshot-cow-'):
+                        raise CowRefusal('cow_resolution_unknown_stage')
+        target = base / row['target']
+        if recovery is None and record.get('state') == 'complete':
+            if entry.get('phase') != 'complete':
+                raise CowRefusal('cow_resolution_complete_phase_invalid')
+            _completed_readback(project_id, entry)
+        else:
+            restored = recovered.get(row['candidate_id'])
+            expected = restored.get('restored_fingerprint') if restored else row['target_metadata']
+            if (not isinstance(expected, dict) or _metadata(target) != expected
+                    or any(expected[k] != row['target_metadata'][k] for k in PRESERVED)
+                    or _hash(target, expected) != row['sha256']):
+                raise CowRefusal('cow_resolution_target_drift')
+    resolution = ('restored' if recovery is not None else 'complete'
+                  if record.get('state') == 'complete' else 'original_noop')
+    return {'ok': True, 'operation_id': operation_id, 'custody': custody,
+            'plan_hash': record.get('plan_hash'), 'config_hash': record.get('config_hash'),
+            'run_selection': record.get('run_selection'),
+            'original_journal_hash': _digest(record),
+            'recovery_journal_hash': _digest(recovery) if recovery is not None else None,
+            'candidate_ids': record['candidate_ids'],
+            'snapshot_ids': sorted({e['candidate']['snapshot_id'] for e in record['entries']}),
+            'resolution': resolution}
+
+
+def periodic_journal_readiness(conn: sqlite3.Connection, project_id: str, root: Path, *,
+                               acknowledgements: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Fixed, metadata-only inventory. Unknown suffixes are never an empty census."""
+    custody = _custody(conn, project_id, root)
+    directory = _state_root(project_id)
+    if not directory.exists():
+        if acknowledgements:
+            raise CowRefusal('cow_resolution_ack_without_journal')
+        return {'ready': True, 'skipped_snapshot_ids': [], 'skipped_candidate_ids': []}
+    names = set()
+    with os.scandir(_path(directory)) as inventory:
+        for index, item in enumerate(inventory):
+            if index >= 1000:
+                raise CowRefusal('cow_journal_inventory_truncated')
+            if item.is_symlink() or not item.is_file(follow_symlinks=False):
+                raise CowRefusal('cow_journal_inventory_unknown')
+            if not re.fullmatch(r'(cowop-[0-9a-f]{32}(?:\.recovery)?\.json(?:\.pending)?|cow-[0-9a-f]{24}\.complete\.json)', item.name):
+                raise CowRefusal('cow_journal_inventory_unknown')
+            names.add(item.name)
+    if any(name.endswith('.pending') for name in names):
+        raise CowRefusal('cow_journal_pending_inspect_required')
+    originals = {name[:-5] for name in names if re.fullmatch(r'cowop-[0-9a-f]{32}\.json', name)}
+    if any(name[:-14] not in originals for name in names if name.endswith('.recovery.json')):
+        raise CowRefusal('cow_recovery_original_missing')
+    acknowledgements = acknowledgements or {}
+    if set(acknowledgements) - originals:
+        raise CowRefusal('cow_resolution_ack_without_journal')
+    skipped_snapshots, skipped_candidates = set(), set()
+    for operation_id in sorted(originals):
+        record = _operation(directory / (operation_id + '.json'), project_id)
+        if record.get('custody') != custody or record.get('operation_id') != operation_id:
+            raise CowRefusal('cow_journal_custody_drift')
+        recovery_path = directory / (operation_id + '.recovery.json')
+        recovery = _read(recovery_path) if recovery_path.exists() else None
+        ack = acknowledgements.get(operation_id)
+        if ack is not None:
+            proof = ack.get('proof', {})
+            ids = sorted({e['candidate']['snapshot_id'] for e in record['entries']})
+            if (ack.get('schema') != 'snapshot_cow_periodic_release.v1'
+                    or ack.get('custody') != custody or proof.get('custody') != custody
+                    or proof.get('operation_id') != operation_id
+                    or proof.get('plan_hash') != record.get('plan_hash')
+                    or proof.get('config_hash') != record.get('config_hash')
+                    or proof.get('run_selection') != record.get('run_selection')
+                    or proof.get('original_journal_hash') != _digest(record)
+                    or proof.get('recovery_journal_hash') != (_digest(recovery) if recovery is not None else None)
+                    or proof.get('candidate_ids') != record['candidate_ids']
+                    or proof.get('snapshot_ids') != ids
+                    or proof.get('resolution') not in {'complete', 'restored', 'original_noop'}
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(ack.get('held_intent_hash', '')))
+                    or type(ack.get('scheduler_revision')) is not int
+                    or type(ack.get('policy_revision')) is not int
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(ack.get('operator_principal_hash', '')))):
+                raise CowRefusal('cow_resolution_ack_invalid')
+            skipped_snapshots.update(ids)
+            skipped_candidates.update(record['candidate_ids'])
+        elif (recovery is not None or record.get('state') != 'complete'
+              or any(e.get('phase') != 'complete' for e in record['entries'])):
+            raise CowRefusal('cow_operation_inspect_required')
+    return {'ready': True, 'skipped_snapshot_ids': sorted(skipped_snapshots),
+            'skipped_candidate_ids': sorted(skipped_candidates)}
+
+
+def periodic_zero_effect(conn: sqlite3.Connection, project_id: str, root: Path, *,
+                         plan: dict[str, Any], acknowledgements: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Known pre-journal refusal must also prove unchanged files under native locks."""
+    path = _journal_path(project_id, plan['operation_id'])
+    if path.exists() or path.with_name(path.name + '.pending').exists():
+        raise CowRefusal('cow_zero_effect_journal_present')
+    periodic_journal_readiness(conn, project_id, root, acknowledgements=acknowledgements)
+    for row in plan['candidates']:
+        _fresh(conn, project_id, root, plan, row)
+        base = snapshots._snapshot_root(project_id, row['snapshot_id'])
+        if _hash(base / row['target'], row['target_metadata']) != row['sha256']:
+            raise CowRefusal('cow_zero_effect_target_drift')
+        with os.scandir(_path(base / Path(row['target']).parent)) as inventory:
+            for index, item in enumerate(inventory):
+                if index >= 1000 or item.name.startswith('.snapshot-cow-'):
+                    raise CowRefusal('cow_zero_effect_stage_unknown')
+    return {'ok': True, 'zero_effect_verified': True}

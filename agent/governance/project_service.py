@@ -74,11 +74,27 @@ def _load_projects() -> dict:
     raise ValidationError(f"project registry is not valid JSON: {path}: {last_error}")
 
 
-def _save_projects(data: dict):
+def _save_projects(data: dict, *, _periodic_owner: bool = False):
     path = _projects_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_name = ""
     with _PROJECTS_LOCK:
+        if not _periodic_owner:
+            # The periodic owner subtree cannot be overwritten by a legacy
+            # writer that loaded registry metadata before an acknowledged disable.
+            current = _load_projects()
+            for pid, entry in data.get("projects", {}).items():
+                existing = current.get("projects", {}).get(pid, {})
+                owned = ((existing.get("project_config") or {}).get("governance") or {}).get(
+                    "snapshot_cow_cleanup_periodic")
+                config = entry.get("project_config")
+                if isinstance(config, dict):
+                    governance = config.setdefault("governance", {})
+                    if isinstance(governance, dict):
+                        if owned is None:
+                            governance.pop("snapshot_cow_cleanup_periodic", None)
+                        else:
+                            governance["snapshot_cow_cleanup_periodic"] = _copy_json_dict(owned)
         try:
             with tempfile.NamedTemporaryFile(
                 "w",
@@ -94,6 +110,11 @@ def _save_projects(data: dict):
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_name, path)
+            descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         finally:
             if tmp_name:
                 try:
@@ -795,6 +816,49 @@ def set_project_config_metadata(
     entry["project_config_updated_by"] = actor or "system"
     _save_projects(projects)
     return {k: v for k, v in entry.items() if k != "password_hash"}
+
+
+
+def get_snapshot_cow_periodic_policy(project_id: str) -> dict:
+    config = get_project_config_metadata(project_id)
+    governance = config.get("governance") or {}
+    if not isinstance(governance, dict):
+        raise ValidationError("periodic_policy_malformed")
+    value = governance.get("snapshot_cow_cleanup_periodic", {})
+    if not isinstance(value, dict):
+        raise ValidationError("periodic_policy_malformed")
+    return _copy_json_dict(value)
+
+
+def update_snapshot_cow_periodic_policy(project_id: str, policy: dict, *,
+                                        expected_revision: int, principal: str,
+                                        custody: dict) -> dict:
+    """CAS only the owner subtree, then acknowledge a durable exact readback."""
+    from .snapshot_cow_periodic import parse_policy
+    project_id = _normalize_project_id(project_id)
+    parsed = parse_policy(policy, stored=False)
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise ValidationError("periodic_expected_revision_invalid")
+    with _PROJECTS_LOCK:
+        projects = _load_projects()
+        entry = projects["projects"].get(project_id)
+        if not entry:
+            raise ValidationError("periodic_project_unregistered")
+        config = entry.setdefault("project_config", {})
+        governance = config.setdefault("governance", {})
+        old = governance.get("snapshot_cow_cleanup_periodic", {})
+        if (not isinstance(old, dict) or type(old.get("revision", 0)) is not int
+                or old.get("revision", 0) != expected_revision):
+            raise ValidationError("periodic_revision_conflict")
+        value = {**parsed, "revision": expected_revision + 1,
+                 "operator_principal_hash": hashlib.sha256(principal.encode()).hexdigest(),
+                 "custody": _copy_json_dict(custody), "updated_at": _utc_iso()}
+        governance["snapshot_cow_cleanup_periodic"] = value
+        _save_projects(projects, _periodic_owner=True)
+        readback = get_snapshot_cow_periodic_policy(project_id)
+        if readback != value:
+            raise ValidationError("periodic_policy_readback_failed")
+        return readback
 
 
 def recover_dev_project_config_metadata(

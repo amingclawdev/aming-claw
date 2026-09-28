@@ -33,7 +33,7 @@ _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from .errors import GovernanceError, PermissionDeniedError, ValidationError
+from .errors import AuthError, GovernanceError, PermissionDeniedError, ValidationError
 from .dirty_worktree import (
     CandidateGitStatusError,
     candidate_dirty_status_from_porcelain_z,
@@ -90334,6 +90334,77 @@ def handle_graph_governance_stale_artifact_cleanup_recover(ctx: RequestContext):
             }, apply=True)
     finally:
         conn.close()
+
+
+_SNAPSHOT_COW_PERIODIC_CONTROLLER = None
+
+
+def _snapshot_cow_periodic_request(ctx, operation):
+    from . import snapshot_cow_periodic as periodic
+    if not ctx.token:
+        return 401, {"ok": False, "error": "snapshot_cow_auth_required", "writes_performed": False}
+    project_id = ctx.get_project_id()
+    conn = get_connection(project_id)
+    try:
+        session = _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot-cow-periodic." + operation)
+        if ctx.require_auth(conn).get("project_id") != project_id:
+            return 403, {"ok": False, "error": "snapshot_cow_auth_project_mismatch", "writes_performed": False}
+        root = project_service.resolve_project_root(project_id, fallback_self=False)
+        if root is None:
+            return 400, {"ok": False, "error": "periodic_project_unregistered", "writes_performed": False}
+        custody = periodic.service_custody(conn, project_id, root)
+        controller = _SNAPSHOT_COW_PERIODIC_CONTROLLER
+        if controller is None or controller.project_id != project_id or controller.root != Path(root):
+            return 503, {"ok": False, "error": "periodic_controller_unavailable", "writes_performed": False}
+        controller._verify(conn)
+        principal = json.dumps({key: session.get(key) for key in ("project_id", "role", "agent_id", "role_id")},
+                               sort_keys=True, separators=(",", ":"))
+        if operation == "config.put":
+            if not isinstance(ctx.body, dict) or set(ctx.body) != {"policy", "expected_revision"}:
+                return 400, {"ok": False, "error": "periodic_config_fields_invalid", "writes_performed": False}
+            value = project_service.update_snapshot_cow_periodic_policy(project_id, ctx.body["policy"],
+                expected_revision=ctx.body["expected_revision"], principal=principal, custody=custody)
+            controller.configuration_changed()
+            policy = periodic.parse_policy(value)
+        elif operation == "config.get":
+            policy = periodic.parse_policy(project_service.get_snapshot_cow_periodic_policy(project_id))
+        elif operation == "release-hold":
+            return controller.release_hold(conn, ctx.body, principal)
+        else:
+            result = controller.status()
+            result.update(controller.release_status(conn))
+            return result
+        return {"ok": True, "source": "aming_claw_registry", "policy": {
+            key: value for key, value in policy.items() if key in periodic.FIELDS or key == "revision"}}
+    except (AuthError, PermissionDeniedError):
+        raise
+    except (ValueError, ValidationError):
+        return 400, {"ok": False, "error": "periodic_request_refused", "writes_performed": False}
+    except Exception:
+        return 500, {"ok": False, "error": "periodic_request_uncertain", "writes_performed": None,
+                     "next_action": "inspect_configuration_and_native_operation"}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshot-cow-periodic/config")
+def handle_snapshot_cow_periodic_config_get(ctx: RequestContext):
+    return _snapshot_cow_periodic_request(ctx, "config.get")
+
+
+@route("PUT", "/api/graph-governance/{project_id}/snapshot-cow-periodic/config")
+def handle_snapshot_cow_periodic_config_put(ctx: RequestContext):
+    return _snapshot_cow_periodic_request(ctx, "config.put")
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshot-cow-periodic/status")
+def handle_snapshot_cow_periodic_status(ctx: RequestContext):
+    return _snapshot_cow_periodic_request(ctx, "status")
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshot-cow-periodic/release-hold")
+def handle_snapshot_cow_periodic_release_hold(ctx: RequestContext):
+    return _snapshot_cow_periodic_request(ctx, "release-hold")
 
 
 @route("GET", "/api/graph-governance/{project_id}/managed-refs")
@@ -241451,19 +241522,30 @@ def _run_governance_service():
     print(f"Governance v{get_server_version()} (PID {SERVER_PID})")
 
     if _runtime_plane() == "dev":
+        global _SNAPSHOT_COW_PERIODIC_CONTROLLER
         # A repair service shares only the allowlisted AC database.  It never
         # joins stable Redis/event workers, performs startup backfills, or owns
         # the port-40000 lifecycle.
+        from .snapshot_cow_periodic import PeriodicController
+        root = project_service.resolve_project_root("aming-claw", fallback_self=False)
+        if root is None:
+            raise GovernanceSingletonError("periodic_project_unregistered")
+        controller = PeriodicController("aming-claw", root, lambda: get_connection("aming-claw"))
+        _SNAPSHOT_COW_PERIODIC_CONTROLLER = controller
         server = create_server()
         print(
             f"AC dev governance service listening on port {PORT}; "
             "background workers disabled"
         )
         try:
+            controller.start()
             server.serve_forever()
         except KeyboardInterrupt:
             print("\nShutting down AC dev governance...")
-            server.shutdown()
+        finally:
+            controller.stop()
+            server.server_close()
+            _SNAPSHOT_COW_PERIODIC_CONTROLLER = None
         return
 
     # Enable Redis Pub/Sub bridge for EventBus

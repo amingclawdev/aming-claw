@@ -2899,3 +2899,34 @@ def test_later_item_active_backlog_drift_stops_further_deletion(tmp_path, monkey
     assert not conn.execute(
         "SELECT 1 FROM task_timeline_events WHERE event_type='governance.stale_artifact_cleanup.apply'"
     ).fetchone()
+
+
+def test_cow_wrapper_internal_context_is_exact_and_existing_locks_retained(cow_fixture, monkeypatch):
+    from agent.governance import snapshot_cow_cleanup as cow
+    conn, root, *_ = cow_fixture
+    selection = cow.RunSelection(('full-old',), 1, 2, 1024 * 1024)
+    plan = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(conn, 'proj', repo_root_path=root,
+        dimension=cow.DIMENSION, _run_selection=selection)
+    assert len(plan['candidates']) == 2
+    real_apply = cow.apply
+    observed = []
+    def apply(conn, project_id, root, **kwargs):
+        assert kwargs['_run_selection'] is selection
+        assert conn.in_transaction
+        observed.append(True)
+        return real_apply(conn, project_id, root, **kwargs)
+    monkeypatch.setattr(cow, 'apply', apply)
+    monkeypatch.setattr(cow, '_quiet', lambda *_args: None)
+    result = stale_artifact_cleanup.apply_stale_artifact_cleanup(conn, 'proj', repo_root_path=root,
+        dimension=cow.DIMENSION, candidate_ids=[r['candidate_id'] for r in plan['candidates']],
+        plan_hash=plan['plan_hash'], plan_revision=plan['plan_revision'], operation_id=plan['operation_id'],
+        _run_selection=selection)
+    assert observed and result['ok']
+    assert not conn.in_transaction
+
+
+def test_http_cannot_inject_internal_timer_selection(cow_http):
+    # Remote HTTP has no pass-through for arbitrary internal run context.
+    result = cow_http('GET', '/api/graph-governance/proj/stale-artifact-cleanup?'
+                     'dimension=graph_snapshot_duplicates&_run_selection=anything')
+    assert result['ok'] and len(result['candidates']) == 2
