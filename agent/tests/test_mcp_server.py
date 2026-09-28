@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
@@ -10,6 +11,40 @@ import pytest
 
 from agent.governance import mcp_server
 from agent.mcp import server as stdio_mcp_server
+
+
+@pytest.mark.parametrize("surface", ["managed", "standalone"])
+def test_cow_recovery_uses_existing_bounded_cleanup_stdio_envelope(monkeypatch, surface):
+    result = {"ok": False, "dimension": "graph_snapshot_duplicates", "mode": "inspect",
+              "operation_id": "cowop-" + "a" * 32, "state": "partial_or_ambiguous",
+              "applied_count": 1, "writes_performed": False, "safe_retry": False}
+    output = io.StringIO()
+    if surface == "managed":
+        instance = object.__new__(stdio_mcp_server.AmingClawMCP)
+        monkeypatch.setattr(instance, "_dispatch_tool_call", lambda *_a: result)
+        monkeypatch.setattr(stdio_mcp_server.sys, "stdout", output)
+        handle = instance._handle
+    else:
+        monkeypatch.setattr(mcp_server, "_dispatch_tool", lambda *_a: result)
+        monkeypatch.setattr(mcp_server.sys, "stdout", output)
+        handle = mcp_server._handle
+    handle(json.dumps({"jsonrpc": "2.0", "id": "x" * 4094, "method": "tools/call",
+                      "params": {"name": "stale_artifact_cleanup_apply", "arguments": {
+                          "project_id": "proj", "dimension": "graph_snapshot_duplicates",
+                          "mode": "recover", "operation_id": "cowop-" + "a" * 32}}}))
+    frame = output.getvalue().encode().rstrip(b"\n")
+    assert len(frame) <= 224 * 1024
+    assert json.loads(json.loads(frame)["result"]["content"][0]["text"]) == result
+
+
+def test_cow_recovery_schema_is_explicit_on_both_mcp_surfaces():
+    from agent.mcp.tools import TOOLS
+    for registry in (TOOLS, mcp_server.TOOLS):
+        schema = next(t for t in registry if t["name"] == "stale_artifact_cleanup_apply")["inputSchema"]
+        assert "graph_snapshot_duplicates" in schema["properties"]["dimension"]["enum"]
+        assert schema["properties"]["mode"]["enum"] == ["apply", "recover"]
+        assert schema["properties"]["recovery_action"]["default"] == "inspect"
+        assert schema["anyOf"][1]["properties"]["mode"]["const"] == "recover"
 
 
 def test_contract_runtime_bypass_mcp_exposes_only_opaque_cross_plane_authority(

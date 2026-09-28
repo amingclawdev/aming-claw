@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import sys
 from threading import Event, Thread
 from types import SimpleNamespace
 from pathlib import Path
@@ -13,6 +14,36 @@ import pytest
 
 from agent.governance import mcp_server as governance_mcp_server
 from agent.governance import stale_artifact_cleanup
+from agent.tests.test_snapshot_cow_cleanup import cow_fixture
+from agent.tests.test_stale_artifact_cleanup import cow_http
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="small real APFS native adapter fixture")
+@pytest.mark.parametrize("surface", ["managed", "standalone"])
+def test_cow_both_mcp_native_preview_apply_replay_and_recovery(cow_http, monkeypatch, surface):
+    if surface == "managed":
+        dispatcher = _dispatcher(_Recorder())
+        monkeypatch.setattr(dispatcher, "_governance_api_with_timeout", cow_http)
+        call = dispatcher.dispatch
+    else:
+        monkeypatch.delenv("AMING_CLAW_MCP_PROJECT_ID", raising=False)
+        monkeypatch.setattr(governance_mcp_server, "_http", cow_http)
+        call = governance_mcp_server._dispatch_tool
+    common = {"project_id": "proj", "dimension": "graph_snapshot_duplicates"}
+    plan = call("stale_artifact_cleanup", common)
+    body = {**common, "plan_hash": plan["plan_hash"], "plan_revision": plan["plan_revision"],
+            "candidate_ids": [r["candidate_id"] for r in plan["candidates"]],
+            "operation_id": plan["operation_id"]}
+    applied = call("stale_artifact_cleanup_apply", body)
+    assert applied["ok"] and applied["applied_count"] == 2
+    assert call("stale_artifact_cleanup_apply", body)["replay"]
+    inspect = call("stale_artifact_cleanup_apply", {**common, "mode": "recover",
+                                                       "operation_id": plan["operation_id"]})
+    assert inspect["mode"] == "inspect" and not inspect["writes_performed"]
+    restore = call("stale_artifact_cleanup_apply", {**common, "mode": "recover",
+                          "operation_id": plan["operation_id"], "recovery_action": "restore"})
+    assert restore["ok"] and restore["restored_count"] == 2
+    assert all(size <= 224 * 1024 for size in stale_artifact_cleanup.cleanup_response_wire_bytes(inspect).values())
 from agent.governance import server as governance_server
 from agent.mcp import server as plugin_mcp_server
 from agent.mcp import tools as mcp_tools
@@ -8544,14 +8575,15 @@ def test_mcp_tools_ac_endpoint_is_dev_only(monkeypatch):
 
 def test_cleanup_dimensions_match_both_mcp_dispatchers_and_reject_unknown(monkeypatch):
     expected = ["worktrees", "graph_snapshots", "governance_index",
-                "state_reconcile", "all"]
+                "state_reconcile", "all", "graph_snapshot_duplicates"]
     for registry in (TOOLS, governance_mcp_server.TOOLS):
         for name in ("stale_artifact_cleanup", "stale_artifact_cleanup_apply"):
             tool = next(item for item in registry if item.get("name") == name)
             assert tool["inputSchema"]["properties"]["dimension"]["enum"] == expected
         apply = next(item for item in registry
                      if item.get("name") == "stale_artifact_cleanup_apply")
-        assert {"dimension", "plan_hash", "plan_revision"} <= set(apply["inputSchema"]["required"])
+        assert "dimension" in apply["inputSchema"]["required"]
+        assert {"plan_hash", "plan_revision"} <= set(apply["inputSchema"]["anyOf"][0]["required"])
 
     recorder = _Recorder()
     managed = _dispatcher(recorder)

@@ -6672,7 +6672,7 @@ TOOLS: list[dict] = [
                 "project_root": {"type": "string"},
                 "repo_root": {"type": "string"},
                 "include_unowned": {"type": "boolean", "default": True},
-                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"], "default": "all"},
+                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all", "graph_snapshot_duplicates"], "default": "all"},
             },
             "required": ["project_id"],
         },
@@ -6683,6 +6683,9 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "mode": {"type": "string", "enum": ["apply", "recover"], "default": "apply"},
+                "operation_id": {"type": "string"},
+                "recovery_action": {"type": "string", "enum": ["inspect", "restore"], "default": "inspect"},
                 "project_id": {"type": "string"},
                 "project_root": {"type": "string"},
                 "repo_root": {"type": "string"},
@@ -6692,11 +6695,15 @@ TOOLS: list[dict] = [
                 "task_id": {"type": "string"},
                 "reason": {"type": "string"},
                 "remove_branch": {"type": "boolean", "default": False},
-                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"]},
+                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all", "graph_snapshot_duplicates"]},
                 "plan_hash": {"type": "string"},
                 "plan_revision": {"type": "integer"},
             },
-            "required": ["project_id", "candidate_ids", "dimension", "plan_hash", "plan_revision"],
+            "required": ["project_id", "dimension"],
+            "anyOf": [
+                {"required": ["candidate_ids", "plan_hash", "plan_revision"]},
+                {"required": ["mode", "operation_id"], "properties": {"mode": {"const": "recover"}}},
+            ],
         },
     },
     {
@@ -9441,7 +9448,7 @@ class ToolDispatcher:
             )
 
         if name == "stale_artifact_cleanup":
-            if str(args.get("dimension") or "all") not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"}:
+            if str(args.get("dimension") or "all") not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all", "graph_snapshot_duplicates"}:
                 return {"ok": False, "error": "cleanup_dimension_invalid"}
             pid = args["project_id"]
             query = {}
@@ -9467,8 +9474,11 @@ class ToolDispatcher:
             return result
 
         if name == "stale_artifact_cleanup_apply":
-            if str(args.get("dimension") or "") not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"}:
+            if str(args.get("dimension") or "") not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all", "graph_snapshot_duplicates"}:
                 return {"ok": False, "error": "cleanup_dimension_invalid"}
+            mode = str(args.get("mode") or "apply")
+            if mode not in {"apply", "recover"} or (mode == "recover" and args.get("dimension") != "graph_snapshot_duplicates"):
+                return {"ok": False, "error": "cleanup_mode_invalid", "writes_performed": False}
             pid = args["project_id"]
             body = {
                 key: value
@@ -9477,7 +9487,7 @@ class ToolDispatcher:
             }
             result = self._governance_api_with_timeout(
                 "POST",
-                f"/api/graph-governance/{pid}/stale-artifact-cleanup/apply",
+                f"/api/graph-governance/{pid}/stale-artifact-cleanup/{'recover' if mode == 'recover' else 'apply'}",
                 body,
                 timeout_seconds=45,
             )

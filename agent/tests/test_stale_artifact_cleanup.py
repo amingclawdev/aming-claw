@@ -23,6 +23,99 @@ from agent.governance.db import _ensure_schema
 from agent.governance.contracts.runtime import SQLiteContractExecutionStore
 from agent.mcp import server as managed_mcp_server
 from agent.mcp.server import AmingClawMCP
+from agent.tests.test_snapshot_cow_cleanup import cow_fixture
+
+
+@pytest.fixture
+def cow_http(cow_fixture, monkeypatch):
+    from urllib.parse import urlsplit, parse_qs
+    conn, root, *_ = cow_fixture
+    class NoClose:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+        def close(self):
+            pass
+    monkeypatch.setattr(governance_server, "get_connection", lambda _pid: NoClose())
+    monkeypatch.setattr(governance_server, "_graph_governance_project_root", lambda *_a, **_kw: root)
+    monkeypatch.setattr(governance_server.role_service, "authenticate", lambda _conn, token:
+                        {"project_id": "other" if token == "other" else "proj",
+                         "role": "mf_sub" if token == "worker" else "observer"})
+    def request(method, path, body=None, *, token="isolated-authenticated", **_kw):
+        parsed = urlsplit(path)
+        query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+        ctx = governance_server.RequestContext(None, method, {"project_id": "proj"}, query,
+                                              body or {}, "req-isolated-cow", token, "")
+        handler = (governance_server.handle_graph_governance_stale_artifact_cleanup if method == "GET"
+                   else governance_server.handle_graph_governance_stale_artifact_cleanup_recover
+                   if parsed.path.endswith("/recover") else
+                   governance_server.handle_graph_governance_stale_artifact_cleanup_apply)
+        result = handler(ctx)
+        return result[1] if isinstance(result, tuple) else result
+    return request
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="small real APFS fixture")
+def test_cow_http_authenticated_exact_plan_replay_inspect_and_restore(cow_http):
+    path = "/api/graph-governance/proj/stale-artifact-cleanup"
+    plan = cow_http("GET", path + "?dimension=graph_snapshot_duplicates")
+    body = {"dimension": "graph_snapshot_duplicates", "plan_hash": plan["plan_hash"],
+            "plan_revision": plan["plan_revision"], "operation_id": plan["operation_id"],
+            "candidate_ids": [r["candidate_id"] for r in plan["candidates"]]}
+    assert cow_http("POST", path + "/apply", body)["ok"]
+    assert cow_http("POST", path + "/apply", body)["replay"]
+    assert cow_http("POST", path + "/recover", {"operation_id": plan["operation_id"]})["mode"] == "inspect"
+    restored = cow_http("POST", path + "/recover", {"operation_id": plan["operation_id"],
+                                                        "recovery_action": "restore"})
+    assert restored["ok"] and restored["restored_count"] == 2
+
+
+def test_cow_http_auth_and_wrong_project_refuse_before_effect(cow_http):
+    from agent.governance.errors import PermissionDeniedError
+    path = "/api/graph-governance/proj/stale-artifact-cleanup"
+    for method, suffix, body in (("GET", "?dimension=graph_snapshot_duplicates", {}),
+                                  ("POST", "/apply", {"dimension": "graph_snapshot_duplicates"}),
+                                  ("POST", "/recover", {"operation_id": "cowop-" + "0" * 32})):
+        unauth = cow_http(method, path + suffix, body, token="")
+        assert unauth["error"] == "snapshot_cow_auth_required" and not unauth["writes_performed"]
+        assert cow_http(method, path + suffix, body, token="other")["error"] == "snapshot_cow_auth_project_mismatch"
+        with pytest.raises(PermissionDeniedError):
+            cow_http(method, path + suffix, body, token="worker")
+
+
+def test_default_all_never_calls_cow_engine(tmp_path, monkeypatch):
+    from agent.governance import snapshot_cow_cleanup as cow
+    monkeypatch.setattr(cow, "preview", lambda *_a, **_kw: pytest.fail("COW must remain opt-in"))
+    conn = _conn()
+    root = _git_repo(tmp_path)
+    projection = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=root, dimension="all")
+    assert projection["dimension"] == "all"
+    conn.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="small real APFS fixture")
+def test_cow_http_partial_operation_has_supported_inspect_and_restore(cow_http, monkeypatch):
+    from agent.governance import snapshot_cow_cleanup as cow
+    path = "/api/graph-governance/proj/stale-artifact-cleanup"
+    plan = cow_http("GET", path + "?dimension=graph_snapshot_duplicates")
+    real = cow._clone
+    count = [0]
+    def clone(source, stage):
+        count[0] += 1
+        if count[0] == 2:
+            raise OSError("isolated second-pair failure")
+        real(source, stage)
+    monkeypatch.setattr(cow, "_clone", clone)
+    body = {"dimension": "graph_snapshot_duplicates", "plan_hash": plan["plan_hash"],
+            "plan_revision": plan["plan_revision"], "operation_id": plan["operation_id"],
+            "candidate_ids": [r["candidate_id"] for r in plan["candidates"]]}
+    result = cow_http("POST", path + "/apply", body)
+    assert result["applied_count"] == 1 and not result["ok"]
+    inspect = cow_http("POST", path + "/recover", {"operation_id": plan["operation_id"]})
+    assert inspect["applied_count"] == 1 and not inspect["writes_performed"]
+    restored = cow_http("POST", path + "/recover", {"operation_id": plan["operation_id"],
+                                                        "recovery_action": "restore"})
+    assert restored["ok"] and restored["restored_count"] == 1
 
 
 def _conn() -> sqlite3.Connection:

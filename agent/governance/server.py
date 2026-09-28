@@ -90204,10 +90204,16 @@ def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
     project_id = ctx.get_project_id()
     from . import stale_artifact_cleanup
 
+    cow_requested = str(ctx.query.get("dimension") or "").strip().lower() == "graph_snapshot_duplicates"
+    if cow_requested and not ctx.token:
+        return 401, {"ok": False, "error": "snapshot_cow_auth_required", "writes_performed": False}
+
     root = _graph_governance_project_root(project_id, ctx.query)
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.dry-run")
+        if cow_requested and ctx.require_auth(conn).get("project_id") != project_id:
+            return 403, {"ok": False, "error": "snapshot_cow_auth_project_mismatch", "writes_performed": False}
         try:
             result = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
                 conn,
@@ -90245,10 +90251,16 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
     project_id = ctx.get_project_id()
     from . import stale_artifact_cleanup
 
+    cow_requested = str(ctx.body.get("dimension") or "").strip().lower() == "graph_snapshot_duplicates"
+    if cow_requested and not ctx.token:
+        return 401, {"ok": False, "error": "snapshot_cow_auth_required", "writes_performed": False}
+
     root = _graph_governance_project_root(project_id, ctx.body)
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.apply")
+        if cow_requested and ctx.require_auth(conn).get("project_id") != project_id:
+            return 403, {"ok": False, "error": "snapshot_cow_auth_project_mismatch", "writes_performed": False}
         try:
             result = stale_artifact_cleanup.apply_stale_artifact_cleanup(
                 conn,
@@ -90263,6 +90275,7 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
                 dimension=str(ctx.body.get("dimension") or ""),
                 plan_hash=str(ctx.body.get("plan_hash") or ""),
                 plan_revision=ctx.body.get("plan_revision"),
+                operation_id=str(ctx.body.get("operation_id") or ""),
             )
             if (stale_artifact_cleanup.cleanup_response_wire_bytes(result)["http"]
                     > stale_artifact_cleanup._CLEANUP_HTTP_MAX_BYTES):
@@ -90288,6 +90301,35 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
                     str(exc).encode("utf-8", errors="replace"),
                 ).hexdigest(),
                 "writes_performed": None,
+                "write_disposition": "ambiguous", "safe_retry": False,
+            }, apply=True)
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/stale-artifact-cleanup/recover")
+def handle_graph_governance_stale_artifact_cleanup_recover(ctx: RequestContext):
+    """Inspect or explicitly restore only an opaque project-owned COW receipt."""
+    project_id = ctx.get_project_id()
+    from . import stale_artifact_cleanup
+    if not ctx.token:
+        return 401, {"ok": False, "error": "snapshot_cow_auth_required", "writes_performed": False}
+    root = _graph_governance_project_root(project_id, ctx.body)
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.recover")
+        if ctx.require_auth(conn).get("project_id") != project_id:
+            return 403, {"ok": False, "error": "snapshot_cow_auth_project_mismatch", "writes_performed": False}
+        try:
+            return stale_artifact_cleanup.recover_snapshot_cow_cleanup(
+                conn, project_id, repo_root_path=root,
+                operation_id=str(ctx.body.get("operation_id") or ""),
+                action=str(ctx.body.get("recovery_action") or "inspect"))
+        except stale_artifact_cleanup.StaleArtifactCleanupError as exc:
+            return 400, stale_artifact_cleanup.bounded_cleanup_error_payload(exc.payload, apply=True)
+        except Exception:
+            return 500, stale_artifact_cleanup.bounded_cleanup_error_payload({
+                "ok": False, "error": "snapshot_cow_recovery_error", "writes_performed": None,
                 "write_disposition": "ambiguous", "safe_retry": False,
             }, apply=True)
     finally:

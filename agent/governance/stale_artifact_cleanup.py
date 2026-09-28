@@ -33,12 +33,14 @@ ACTION_REMOVE_STALE_GRAPH_SNAPSHOT = "remove_stale_graph_snapshot"
 
 DIMENSION_WORKTREES = "worktrees"
 DIMENSION_GRAPH_SNAPSHOTS = "graph_snapshots"
+DIMENSION_GRAPH_SNAPSHOT_DUPLICATES = "graph_snapshot_duplicates"
 DIMENSION_GOVERNANCE_INDEX = "governance_index"
 DIMENSION_STATE_RECONCILE = "state_reconcile"
 DIMENSION_ALL = "all"
 ALL_DIMENSIONS = {
     DIMENSION_WORKTREES, DIMENSION_GRAPH_SNAPSHOTS,
     DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE, DIMENSION_ALL,
+    DIMENSION_GRAPH_SNAPSHOT_DUPLICATES,
 }
 PLAN_REVISION = 1
 DERIVED_PAIR_PLAN_REVISION = 2
@@ -1144,6 +1146,22 @@ def build_stale_artifact_cleanup_projection(
     dimensions; derived caches remain preview-only until Stage B.
     """
     dim = _dimension(dimension)
+    if dim == DIMENSION_GRAPH_SNAPSHOT_DUPLICATES:
+        from . import snapshot_cow_cleanup as cow
+        try:
+            result = cow.preview(conn, project_id, Path(repo_root_path))
+        except (cow.CowRefusal, OSError, ValueError, sqlite3.Error) as exc:
+            raise StaleArtifactCleanupError("snapshot_cow_preview_refused", {
+                "ok": False, "error": "snapshot_cow_preview_refused",
+                "refusal_reason": str(exc)[:160], "writes_performed": False,
+                "write_disposition": "not_written", "apply_plan_available": False,
+            }) from exc
+        if not _cleanup_response_fits(result):
+            raise StaleArtifactCleanupError("cleanup_response_frame_refused", {
+                "ok": False, "error": "cleanup_response_frame_refused",
+                "writes_performed": False, "apply_plan_available": False,
+            })
+        return result
     if dim in {DIMENSION_GOVERNANCE_INDEX, DIMENSION_STATE_RECONCILE}:
         derived, truncated, total, total_bytes = _derived_pair_preview(conn, project_id)
         # An orphaned half is still the canonical pair candidate. Only an
@@ -1945,18 +1963,65 @@ def apply_stale_artifact_cleanup(
     dimension: str = "",
     plan_hash: str = "",
     plan_revision: int = 0,
+    operation_id: str = "",
 ) -> dict[str, Any]:
     """Apply only a fresh, exact plan while serializing destructive work."""
     from .db import sqlite_write_lock
     from .server import _CURRENT_FULL_BUILD_KEYS_LOCK
 
     with _DESTRUCTIVE_CLEANUP_LOCK, sqlite_write_lock(), _CURRENT_FULL_BUILD_KEYS_LOCK:
+        if _dimension(dimension) == DIMENSION_GRAPH_SNAPSHOT_DUPLICATES:
+            return _cow_locked(conn, project_id, repo_root_path, "apply",
+                               candidate_ids=candidate_ids, plan_hash=plan_hash,
+                               plan_revision=plan_revision, operation_id=operation_id)
         return _apply_stale_artifact_cleanup_locked(
             conn, project_id, repo_root_path=repo_root_path,
             candidate_ids=candidate_ids, actor=actor, backlog_id=backlog_id,
             task_id=task_id, reason=reason, remove_branch=remove_branch,
             dimension=dimension, plan_hash=plan_hash, plan_revision=plan_revision,
         )
+
+
+def _cow_locked(conn: sqlite3.Connection, project_id: str, root: str | Path,
+                mode: str, **arguments: Any) -> dict[str, Any]:
+    from . import snapshot_cow_cleanup as cow
+    owns_transaction = not conn.in_transaction
+    # Retain the native service descriptor; hold SQLite's physical writer lock
+    # as well as process locks so outside DB writers cannot race the live census.
+    try:
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        fence = _stable_queue_exclusive_fence() if project_id == "aming-claw" else nullcontext()
+        with fence:
+            result = (cow.apply(conn, project_id, Path(root), **arguments) if mode == "apply"
+                      else cow.recover(conn, project_id, Path(root), **arguments))
+        if not _cleanup_response_fits(result):
+            return bounded_cleanup_error_payload({
+                "ok": False, "error": "cleanup_response_frame_refused",
+                "operation_id": arguments.get("operation_id"),
+                "writes_performed": result.get("writes_performed"),
+                "write_disposition": result.get("write_disposition"), "safe_retry": False,
+            }, apply=True)
+        return result
+    except (cow.CowRefusal, OSError, ValueError, sqlite3.Error) as exc:
+        raise StaleArtifactCleanupError("snapshot_cow_refused", {
+            "ok": False, "error": "snapshot_cow_refused", "refusal_reason": str(exc)[:160],
+            "operation_id": arguments.get("operation_id"),
+            "writes_performed": False, "write_disposition": "not_written", "safe_retry": False,
+        }) from exc
+    finally:
+        if owns_transaction and conn.in_transaction:
+            conn.rollback()
+
+
+def recover_snapshot_cow_cleanup(conn: sqlite3.Connection, project_id: str, *,
+                                 repo_root_path: str | Path, operation_id: str,
+                                 action: str = "inspect") -> dict[str, Any]:
+    from .db import sqlite_write_lock
+    from .server import _CURRENT_FULL_BUILD_KEYS_LOCK
+    with _DESTRUCTIVE_CLEANUP_LOCK, sqlite_write_lock(), _CURRENT_FULL_BUILD_KEYS_LOCK:
+        return _cow_locked(conn, project_id, repo_root_path, "recover",
+                           operation_id=operation_id, action=action)
 
 
 def _archive_root_descriptor() -> dict[str, Any]:

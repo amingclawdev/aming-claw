@@ -3534,7 +3534,7 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
-                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"], "default": "all"},
+                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all", "graph_snapshot_duplicates"], "default": "all"},
                 "include_unowned": {"type": "boolean", "default": True},
                 "project_root": {"type": "string"},
                 "repo_root": {"type": "string"},
@@ -3548,8 +3548,11 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "mode": {"type": "string", "enum": ["apply", "recover"], "default": "apply"},
+                "operation_id": {"type": "string"},
+                "recovery_action": {"type": "string", "enum": ["inspect", "restore"], "default": "inspect"},
                 "project_id": {"type": "string"},
-                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"]},
+                "dimension": {"type": "string", "enum": ["worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all", "graph_snapshot_duplicates"]},
                 "candidate_ids": {"type": "array", "items": {"type": "string"}},
                 "plan_hash": {"type": "string"},
                 "plan_revision": {"type": "integer"},
@@ -3561,7 +3564,11 @@ TOOLS: list[dict] = [
                 "project_root": {"type": "string"},
                 "repo_root": {"type": "string"},
             },
-            "required": ["project_id", "dimension", "candidate_ids", "plan_hash", "plan_revision"],
+            "required": ["project_id", "dimension"],
+            "anyOf": [
+                {"required": ["candidate_ids", "plan_hash", "plan_revision"]},
+                {"required": ["mode", "operation_id"], "properties": {"mode": {"const": "recover"}}},
+            ],
         },
     },
 ]
@@ -4547,7 +4554,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
 
     if name in {"stale_artifact_cleanup", "stale_artifact_cleanup_apply"}:
         dimension = str(args.get("dimension") or ("all" if name == "stale_artifact_cleanup" else ""))
-        if dimension not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all"}:
+        if dimension not in {"worktrees", "graph_snapshots", "governance_index", "state_reconcile", "all", "graph_snapshot_duplicates"}:
             return {"ok": False, "error": "cleanup_dimension_invalid"}
         pid = args["project_id"]
         if _mcp_bound_project_id() == "aming-claw" and pid != "aming-claw":
@@ -4569,8 +4576,11 @@ def _dispatch_tool(name: str, args: dict) -> Any:
                         "timeout_seconds": 45, "writes_performed": False,
                         "write_disposition": "not_written", "safe_retry": False}
             return result
+        mode = str(args.get("mode") or "apply")
+        if mode not in {"apply", "recover"} or (mode == "recover" and dimension != "graph_snapshot_duplicates"):
+            return {"ok": False, "error": "cleanup_mode_invalid", "writes_performed": False}
         body = {key: value for key, value in args.items() if key != "project_id" and value is not None}
-        result = _http("POST", path + "/apply", body, timeout_seconds=45)
+        result = _http("POST", path + ("/recover" if mode == "recover" else "/apply"), body, timeout_seconds=45)
         if _is_timeout_result(result):
             if (type(result.get("writes_performed")) is bool
                     or result.get("write_disposition") in ("written", "not_written")):
