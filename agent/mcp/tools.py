@@ -8269,6 +8269,27 @@ class ToolDispatcher:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def _cow_governance_api(
+        self, method: str, path: str, data: dict | None = None, *, project_id: str,
+    ) -> dict:
+        """Explicit COW calls use only the process-configured operator credential."""
+        token = str(os.environ.get("GOV_TOKEN") or "").strip()
+        refusal = {"ok": False, "writes_performed": False,
+                   "write_disposition": "not_written", "safe_retry": False}
+        if not token:
+            return {**refusal, "error": "snapshot_cow_auth_required"}
+        if any(ord(character) < 33 or ord(character) > 126 for character in token):
+            return {**refusal, "error": "snapshot_cow_credential_invalid"}
+        bound = str(os.environ.get("AMING_CLAW_MCP_PROJECT_ID")
+                    or os.environ.get("PROJECT_ID") or "").strip()
+        if bound and bound != project_id:
+            return {**refusal, "error": "mcp_world_project_scope_mismatch"}
+        try:
+            return self._api_with_role_token(method, path, data, role_token=token,
+                                             timeout_seconds=45)
+        except ValueError:
+            return {**refusal, "error": "mcp_world_endpoint_rejected"}
+
     def _governance_api_with_timeout(
         self,
         method: str,
@@ -9460,10 +9481,10 @@ class ToolDispatcher:
             if "include_unowned" in args:
                 query["include_unowned"] = "true" if args.get("include_unowned") else "false"
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
-            result = self._governance_api_with_timeout(
-                "GET", f"/api/graph-governance/{pid}/stale-artifact-cleanup{qs}",
-                timeout_seconds=45,
-            )
+            path = f"/api/graph-governance/{pid}/stale-artifact-cleanup{qs}"
+            result = (self._cow_governance_api("GET", path, project_id=pid)
+                      if args.get("dimension") == "graph_snapshot_duplicates" else
+                      self._governance_api_with_timeout("GET", path, timeout_seconds=45))
             if _is_timeout_result(result):
                 if (type(result.get("writes_performed")) is bool
                         or result.get("write_disposition") in ("written", "not_written")):
@@ -9485,12 +9506,10 @@ class ToolDispatcher:
                 for key, value in args.items()
                 if key != "project_id" and value is not None
             }
-            result = self._governance_api_with_timeout(
-                "POST",
-                f"/api/graph-governance/{pid}/stale-artifact-cleanup/{'recover' if mode == 'recover' else 'apply'}",
-                body,
-                timeout_seconds=45,
-            )
+            path = f"/api/graph-governance/{pid}/stale-artifact-cleanup/{'recover' if mode == 'recover' else 'apply'}"
+            result = (self._cow_governance_api("POST", path, body, project_id=pid)
+                      if args.get("dimension") == "graph_snapshot_duplicates" else
+                      self._governance_api_with_timeout("POST", path, body, timeout_seconds=45))
             if _is_timeout_result(result):
                 if (type(result.get("writes_performed")) is bool
                         or result.get("write_disposition") in ("written", "not_written")):

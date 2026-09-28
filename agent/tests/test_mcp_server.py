@@ -11,6 +11,9 @@ import pytest
 
 from agent.governance import mcp_server
 from agent.mcp import server as stdio_mcp_server
+from agent.mcp.tools import ToolDispatcher
+from agent.tests.test_snapshot_cow_cleanup import cow_fixture
+from agent.tests.test_mcp_tools import cow_urllib
 
 
 @pytest.mark.parametrize("surface", ["managed", "standalone"])
@@ -45,6 +48,39 @@ def test_cow_recovery_schema_is_explicit_on_both_mcp_surfaces():
         assert schema["properties"]["mode"]["enum"] == ["apply", "recover"]
         assert schema["properties"]["recovery_action"]["default"] == "inspect"
         assert schema["anyOf"][1]["properties"]["mode"]["const"] == "recover"
+
+
+@pytest.mark.parametrize("surface", ["managed", "standalone"])
+@pytest.mark.parametrize("configured", [True, False])
+def test_cow_actual_authenticated_transport_stdio_frame_is_bounded_and_private(
+    cow_urllib, monkeypatch, surface, configured,
+):
+    requests, tokens = cow_urllib
+    if not configured:
+        monkeypatch.delenv("GOV_TOKEN", raising=False)
+    output = io.StringIO()
+    if surface == "managed":
+        instance = object.__new__(stdio_mcp_server.AmingClawMCP)
+        instance.project_id = "proj"
+        instance.dispatcher = ToolDispatcher(
+            lambda *_a, **_kw: pytest.fail("anonymous managed COW fallback"), None)
+        monkeypatch.setattr(stdio_mcp_server.sys, "stdout", output)
+        handle = instance._handle
+    else:
+        monkeypatch.setattr(mcp_server.sys, "stdout", output)
+        handle = mcp_server._handle
+    handle(json.dumps({"jsonrpc": "2.0", "id": "x" * 4094, "method": "tools/call",
+        "params": {"name": "stale_artifact_cleanup", "arguments": {
+            "project_id": "proj", "dimension": "graph_snapshot_duplicates"}}}))
+    frame = output.getvalue().encode().rstrip(b"\n")
+    payload = json.loads(json.loads(frame)["result"]["content"][0]["text"])
+    assert len(frame) <= 224 * 1024 and tokens["valid"].encode() not in frame
+    if configured:
+        assert payload["ok"] and payload["writes_performed"] is False
+        assert len(requests) == 1 and requests[0][0].get_header("X-gov-token") == tokens["valid"]
+    else:
+        assert payload["error"] == "snapshot_cow_auth_required" and payload["writes_performed"] is False
+        assert len(requests) == (0 if surface == "managed" else 1)
 
 
 def test_contract_runtime_bypass_mcp_exposes_only_opaque_cross_plane_authority(

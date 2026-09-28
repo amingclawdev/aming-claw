@@ -9,6 +9,9 @@ from threading import Event, Thread
 from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+import urllib.request
+import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -18,16 +21,98 @@ from agent.tests.test_snapshot_cow_cleanup import cow_fixture
 from agent.tests.test_stale_artifact_cleanup import cow_http
 
 
+@pytest.fixture
+def cow_urllib(cow_fixture, monkeypatch):
+    """Actual urllib/loopback HTTP; native handlers retain the fixture DB thread."""
+    from agent.governance import server, role_service
+    from agent.governance.errors import GovernanceError
+    conn, root, *_ = cow_fixture
+    class NoClose:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+        def close(self):
+            pass
+    monkeypatch.setattr(server, "get_connection", lambda _pid: NoClose())
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_a, **_kw: root)
+    redis = SimpleNamespace(get_session_by_token=lambda *_a: None,
+        cache_session=lambda *_a: None, cache_token_session=lambda *_a: None,
+        invalidate_session=lambda *_a: None)
+    monkeypatch.setattr(role_service, "get_redis", lambda: redis)
+    tokens = {"valid": "fixture-COW-operator-secret", "stale": "fixture-COW-expired-secret",
+              "project": "fixture-COW-other-project-secret", "worker": "fixture-COW-worker-secret"}
+    for kind, token in tokens.items():
+        conn.execute("INSERT INTO sessions(session_id,principal_id,project_id,role,scope_json,"
+                     "token_hash,status,created_at,expires_at) VALUES(?,?,?,?,?,?,'active','2020',?)",
+                     ("cow-auth-" + kind, "fixture-operator", "other" if kind == "project" else "proj",
+                      "mf_sub" if kind == "worker" else "observer", "[]",
+                      role_service._hash_token(token), "2000" if kind == "stale" else "2999"))
+    conn.commit()
+    requests = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+        def do_GET(self):
+            self.respond()
+        def do_POST(self):
+            self.respond()
+        def respond(self):
+            parsed = urlsplit(self.path)
+            query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+            pid = parsed.path.split("/")[3]
+            ctx = server.RequestContext(None, self.command, {"project_id": pid}, query,
+                body, "req-cow-urllib-fixture", self.headers.get("X-Gov-Token", ""), "")
+            handler = (server.handle_graph_governance_stale_artifact_cleanup if self.command == "GET"
+                       else server.handle_graph_governance_stale_artifact_cleanup_recover
+                       if parsed.path.endswith("/recover") else
+                       server.handle_graph_governance_stale_artifact_cleanup_apply)
+            try:
+                result = handler(ctx)
+                status, payload = result if isinstance(result, tuple) else (200, result)
+            except GovernanceError as exc:
+                status, payload = exc.status, exc.to_dict()
+            encoded = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    httpd.timeout = 2
+    for name in ("AMING_CLAW_MCP_PROJECT_ID", "PROJECT_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GOVERNANCE_URL", f"http://127.0.0.1:{httpd.server_port}")
+    monkeypatch.setenv("GOV_TOKEN", tokens["valid"])
+    real_urlopen = urllib.request.urlopen
+    def urlopen(request, *, timeout):
+        assert isinstance(request, urllib.request.Request)
+        requests.append((request, timeout))
+        outcome = []
+        def client():
+            try:
+                outcome.append(real_urlopen(request, timeout=timeout))
+            except Exception as exc:
+                outcome.append(exc)
+        thread = Thread(target=client, daemon=True)
+        thread.start()
+        httpd.handle_request()
+        thread.join(3)
+        assert not thread.is_alive() and len(outcome) == 1
+        if isinstance(outcome[0], Exception):
+            raise outcome[0]
+        return outcome[0]
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    yield requests, tokens
+    httpd.server_close()
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="small real APFS native adapter fixture")
 @pytest.mark.parametrize("surface", ["managed", "standalone"])
-def test_cow_both_mcp_native_preview_apply_replay_and_recovery(cow_http, monkeypatch, surface):
+def test_cow_both_mcp_native_preview_apply_replay_and_recovery(cow_urllib, monkeypatch, surface):
     if surface == "managed":
         dispatcher = _dispatcher(_Recorder())
-        monkeypatch.setattr(dispatcher, "_governance_api_with_timeout", cow_http)
         call = dispatcher.dispatch
     else:
-        monkeypatch.delenv("AMING_CLAW_MCP_PROJECT_ID", raising=False)
-        monkeypatch.setattr(governance_mcp_server, "_http", cow_http)
         call = governance_mcp_server._dispatch_tool
     common = {"project_id": "proj", "dimension": "graph_snapshot_duplicates"}
     plan = call("stale_artifact_cleanup", common)
@@ -44,6 +129,97 @@ def test_cow_both_mcp_native_preview_apply_replay_and_recovery(cow_http, monkeyp
                           "operation_id": plan["operation_id"], "recovery_action": "restore"})
     assert restore["ok"] and restore["restored_count"] == 2
     assert all(size <= 224 * 1024 for size in stale_artifact_cleanup.cleanup_response_wire_bytes(inspect).values())
+    requests, tokens = cow_urllib
+    assert len(requests) == 5
+    for request, timeout in requests:
+        assert request.get_header("X-gov-token") == tokens["valid"] and timeout == 45
+        assert tokens["valid"] not in request.full_url
+        assert tokens["valid"].encode() not in (request.data or b"")
+    assert tokens["valid"] not in json.dumps([plan, applied, inspect, restore])
+
+
+@pytest.mark.parametrize("surface", ["managed", "standalone"])
+@pytest.mark.parametrize("credential,error", [("missing", "snapshot_cow_auth_required"),
+    ("wrong", "token_invalid"), ("stale", "token_expired"),
+    ("project", "snapshot_cow_auth_project_mismatch"), ("worker", "permission_denied")])
+def test_cow_urllib_credentials_refuse_without_target_effect(cow_urllib, cow_fixture, monkeypatch,
+                                                            surface, credential, error):
+    from agent.governance import snapshot_cow_cleanup as cow
+    before = {target: (cow._metadata(cow_fixture[2] / target),
+                      (cow_fixture[2] / target).read_bytes()) for _, target in cow.PAIRS}
+    requests, tokens = cow_urllib
+    token = tokens.get(credential, "fixture-COW-wrong-secret" if credential == "wrong" else "")
+    monkeypatch.setenv("GOV_TOKEN", token)
+    call = _dispatcher(_Recorder()).dispatch if surface == "managed" else governance_mcp_server._dispatch_tool
+    common = {"project_id": "proj", "dimension": "graph_snapshot_duplicates"}
+    for name, extra in (("stale_artifact_cleanup", {}),
+                        ("stale_artifact_cleanup_apply", {"candidate_ids": ["unused"],
+                            "plan_hash": "sha256:unused", "plan_revision": 1,
+                            "operation_id": "cowop-" + "a" * 32}),
+                        ("stale_artifact_cleanup_apply", {"mode": "recover",
+                            "operation_id": "cowop-" + "a" * 32})):
+        result = call(name, {**common, **extra})
+        assert result["error"] == error and not result.get("ok", False)
+        if token:
+            assert token not in json.dumps(result)
+    assert not cow._state_root("proj").exists()
+    assert list(cow_fixture[4].iterdir()) == []
+    assert before == {target: (cow._metadata(cow_fixture[2] / target),
+                      (cow_fixture[2] / target).read_bytes()) for _, target in cow.PAIRS}
+    for request, timeout in requests:
+        assert timeout == 45 and request.get_header("X-gov-token", "") == token
+        if token:
+            assert token not in request.full_url and token.encode() not in (request.data or b"")
+
+
+@pytest.mark.parametrize("surface", ["managed", "standalone"])
+@pytest.mark.parametrize("mismatch", ["project", "endpoint"])
+def test_cow_auth_project_and_world_mismatch_make_no_http(monkeypatch, surface, mismatch):
+    monkeypatch.setenv("GOV_TOKEN", "fixture-explicit-operator-secret")
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "aming-claw")
+    monkeypatch.setenv("GOVERNANCE_URL", "http://127.0.0.1:40000")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_kw: pytest.fail("cross-world HTTP"))
+    recorder = _Recorder()
+    call = _dispatcher(recorder).dispatch if surface == "managed" else governance_mcp_server._dispatch_tool
+    common = {"project_id": "other" if mismatch == "project" else "aming-claw",
+              "dimension": "graph_snapshot_duplicates"}
+    expected = "mcp_world_project_scope_mismatch" if mismatch == "project" else "mcp_world_endpoint_rejected"
+    for name, extra in (("stale_artifact_cleanup", {}),
+                        ("stale_artifact_cleanup_apply", {"candidate_ids": ["unused"],
+                            "plan_hash": "sha256:unused", "plan_revision": 1}),
+                        ("stale_artifact_cleanup_apply", {"mode": "recover",
+                            "operation_id": "cowop-" + "a" * 32})):
+        result = call(name, {**common, **extra})
+        assert result["error"] == expected and result["writes_performed"] is False
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize("surface", ["managed", "standalone"])
+def test_cow_authenticated_urllib_timeout_keeps_disposition_and_secret_private(monkeypatch, surface):
+    token = "fixture-explicit-operator-secret"
+    monkeypatch.setenv("GOV_TOKEN", token)
+    monkeypatch.setenv("GOVERNANCE_URL", "http://127.0.0.1:40000")
+    monkeypatch.delenv("AMING_CLAW_MCP_PROJECT_ID", raising=False)
+    monkeypatch.delenv("PROJECT_ID", raising=False)
+    requests = []
+    def timeout(request, *, timeout):
+        requests.append((request, timeout))
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(urllib.request, "urlopen", timeout)
+    call = _dispatcher(_Recorder()).dispatch if surface == "managed" else governance_mcp_server._dispatch_tool
+    common = {"project_id": "proj", "dimension": "graph_snapshot_duplicates"}
+    for name, extra in (("stale_artifact_cleanup", {}),
+                        ("stale_artifact_cleanup_apply", {"candidate_ids": ["unused"],
+                            "plan_hash": "sha256:unused", "plan_revision": 1}),
+                        ("stale_artifact_cleanup_apply", {"mode": "recover",
+                            "operation_id": "cowop-" + "a" * 32})):
+        result = call(name, {**common, **extra})
+        assert result["error"] == "request_timeout" and result["safe_retry"] is False
+        assert result["writes_performed"] is (False if name == "stale_artifact_cleanup" else None)
+        assert result["write_disposition"] == ("not_written" if name == "stale_artifact_cleanup" else "ambiguous")
+        assert token not in json.dumps(result)
+    assert all(request.get_header("X-gov-token") == token and timeout == 45
+               for request, timeout in requests)
 from agent.governance import server as governance_server
 from agent.mcp import server as plugin_mcp_server
 from agent.mcp import tools as mcp_tools

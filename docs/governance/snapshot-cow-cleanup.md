@@ -51,6 +51,18 @@ with `dimension="graph_snapshot_duplicates"`, `mode="recover"`,
 the existing bounded cleanup transport and timeout disposition. A transport
 timeout is never a safe retry receipt; inspect the operation first.
 
+For either MCP adapter, explicitly supply an existing observer/coordinator role
+credential through the process environment variable `GOV_TOKEN`. Managed COW
+dispatch requires it and sends it only in the HTTP `X-Gov-Token` header; the
+standalone adapter uses its existing `GOV_TOKEN` header binding. The native
+service validates credential lifetime, operator capability and project scope.
+Keep the credential out of tool arguments, URLs, project configuration, receipts
+and checked-in MCP configuration. Observer-session and route-token references
+are separate identities and cannot substitute for this role credential. No
+credential is issued automatically. Existing project/world and governance URL
+checks remain in force; missing or rejected credentials do not grant anonymous
+COW access. Ordinary cleanup dimensions keep their existing transport.
+
 Before replacement, the service publishes a source-bound metadata/content backup
 and verifies an isolated content/metadata restore on the configured external
 volume. Apply forces `clonefile(CLONE_NOFOLLOW_ANY)` with no copy, symlink or
