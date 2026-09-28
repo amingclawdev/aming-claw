@@ -22,6 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from xml.parsers.expat import ExpatError
 
 from . import graph_snapshot_store as snapshots
 from . import project_service
@@ -494,14 +495,44 @@ def preview(conn: sqlite3.Connection, project_id: str, root: Path) -> dict[str, 
 def _volume(path: Path) -> dict[str, Any]:
     if sys.platform != "darwin":
         raise CowRefusal("apfs_platform_unsupported")
-    _path(path)
-    result = subprocess.run(["diskutil", "info", "-plist", str(path)],
-                            capture_output=True, check=True, timeout=10)
-    info = plistlib.loads(result.stdout)
-    if str(info.get("FilesystemType") or "").lower() != "apfs":
-        raise CowRefusal("apfs_filesystem_required")
-    return {"uuid": info.get("VolumeUUID"), "mount": info.get("MountPoint"),
-            "device": path.stat().st_dev}
+    try:
+        path = _path(path)
+        before = path.lstat()
+        # diskutil accepts a mounted device, but not an arbitrary directory.
+        # df resolves APFS firmlinks too; walking lexical parents does not.
+        inventory = subprocess.run(["df", "-P", str(path)], capture_output=True,
+                                   check=True, timeout=10)
+        lines = inventory.stdout.decode("utf-8").splitlines()
+        node = lines[1].split()[0] if len(lines) == 2 and lines[1].split() else ""
+        if not re.fullmatch(r"/dev/disk[0-9]+(?:s[0-9]+)*", node):
+            raise CowRefusal("cow_volume_device_unverified")
+        device = _path(Path(node)).lstat()
+        if not stat.S_ISBLK(device.st_mode) or device.st_rdev != before.st_dev:
+            raise CowRefusal("cow_volume_device_mismatch")
+        result = subprocess.run(["diskutil", "info", "-plist", node],
+                                capture_output=True, check=True, timeout=10)
+        info = plistlib.loads(result.stdout)
+        if not isinstance(info, dict) or info.get("Error"):
+            raise CowRefusal("cow_volume_unreadable")
+        if str(info.get("FilesystemType") or "").lower() != "apfs":
+            raise CowRefusal("apfs_filesystem_required")
+        mount = Path(str(info.get("MountPoint") or ""))
+        if (info.get("DeviceNode") != node or not info.get("VolumeUUID")
+                or not mount.is_absolute()):
+            raise CowRefusal("cow_volume_identity_unverified")
+        mounted = _path(mount).lstat()
+        after = _path(path).lstat()
+        device_after = _path(Path(node)).lstat()
+        if (not stat.S_ISDIR(mounted.st_mode) or mounted.st_dev != before.st_dev
+                or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                or (device_after.st_dev, device_after.st_ino, device_after.st_rdev)
+                != (device.st_dev, device.st_ino, device.st_rdev)):
+            raise CowRefusal("cow_volume_identity_drift")
+        return {"uuid": info["VolumeUUID"], "mount": str(mount), "device": before.st_dev}
+    except (OSError, subprocess.SubprocessError, ValueError, ExpatError) as exc:
+        if isinstance(exc, CowRefusal):
+            raise
+        raise CowRefusal("cow_volume_unreadable") from exc
 
 
 def _archive(project_id: str, source: Path, bytes_needed: int = 0) -> dict[str, Any]:

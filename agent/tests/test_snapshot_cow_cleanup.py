@@ -4,9 +4,12 @@ from __future__ import annotations
 import json
 import ctypes
 import os
+import plistlib
 import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -15,6 +18,8 @@ from agent.governance import db, graph_query_trace, graph_snapshot_store as snap
 from agent.governance import project_service, server, stale_artifact_cleanup as cleanup
 from agent.governance import snapshot_cow_cleanup as cow
 from agent.governance.contracts.runtime import SQLiteContractExecutionStore
+
+_REAL_VOLUME = cow._volume
 
 
 @pytest.fixture
@@ -308,6 +313,78 @@ def test_external_archive_requires_configured_mount_uuid_and_distinct_device(cow
     monkeypatch.undo()
     with pytest.raises((cow.CowRefusal, OSError)):
         cow._archive("unconfigured", cow_fixture[2])
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="real mounted APFS resolver requires macOS")
+@pytest.mark.parametrize("location", ["internal", "external"])
+def test_volume_resolves_real_nested_mounted_paths(tmp_path, location):
+    if location == "external":
+        configured = os.environ.get("AMING_CLAW_COW_TEST_ARCHIVE_ROOT")
+        if not configured:
+            pytest.skip("isolated external fixture root was not supplied")
+        root = Path(configured)
+    else:
+        root = tmp_path.resolve()
+    with tempfile.TemporaryDirectory(prefix="cow-volume-regression-", dir=root) as temporary:
+        nested = Path(temporary) / "nested path" / "child"
+        nested.mkdir(parents=True)
+        before = nested.stat()
+        volume = cow._volume(nested)
+        # Independent diskutil query of the resolved mounted volume, unmocked.
+        raw = subprocess.run(["diskutil", "info", "-plist", volume["mount"]],
+                             capture_output=True, check=True, timeout=10)
+        info = plistlib.loads(raw.stdout)
+        assert volume == {"uuid": info["VolumeUUID"], "mount": info["MountPoint"],
+                          "device": before.st_dev}
+        assert info["FilesystemType"].lower() == "apfs"
+        assert Path(volume["mount"]).stat().st_dev == before.st_dev
+        assert (nested.stat().st_dev, nested.stat().st_ino) == (before.st_dev, before.st_ino)
+        link = Path(temporary) / "link"
+        link.symlink_to(nested, target_is_directory=True)
+        with pytest.raises(cow.CowRefusal, match="symlink_component"):
+            cow._volume(link)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="mounted-device resolver requires macOS")
+@pytest.mark.parametrize("command", ["df", "diskutil"])
+@pytest.mark.parametrize("failure", ["missing", "exit", "timeout", "malformed", "malformed_xml"])
+def test_volume_command_failures_are_typed_before_writes(tmp_path, monkeypatch, command, failure):
+    real_run = subprocess.run
+    def fail(args, **kwargs):
+        if args[0] != command:
+            return real_run(args, **kwargs)
+        if failure == "missing":
+            raise FileNotFoundError("unavailable volume utility")
+        if failure == "exit":
+            raise subprocess.CalledProcessError(1, args)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(args, 10)
+        if failure == "malformed_xml":
+            return subprocess.CompletedProcess(args, 0, stdout=b'<?xml version="1.0"?><plist><dict>')
+        return subprocess.CompletedProcess(args, 0, stdout=b"unreadable volume inventory")
+    monkeypatch.setattr(cow.subprocess, "run", fail)
+    with pytest.raises(cow.CowRefusal, match="cow_volume_(unreadable|device_unverified)"):
+        cow._volume(tmp_path.resolve())
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="mounted-device resolver requires macOS")
+def test_unreadable_volume_apply_has_zero_write_envelope(cow_fixture, monkeypatch):
+    plan = preview(cow_fixture)
+    real_run = subprocess.run
+    def fail(args, **kwargs):
+        if args[0] == "diskutil":
+            raise subprocess.CalledProcessError(1, args)
+        return real_run(args, **kwargs)
+    monkeypatch.setattr(cow, "_volume", _REAL_VOLUME)
+    monkeypatch.setattr(cow.subprocess, "run", fail)
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        apply(cow_fixture, plan)
+    result = caught.value.payload
+    assert result["ok"] is False and result["refusal_reason"] == "cow_volume_unreadable"
+    assert result["writes_performed"] is False and result["write_disposition"] == "not_written"
+    assert not cow._state_root("proj").exists()
+    assert list(cow_fixture[4].iterdir()) == []
 
 
 def test_opaque_recovery_identity_refuses_arbitrary_path(cow_fixture):
