@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import copy
+import http.client
 import json
 import os
 import shutil
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from http.server import HTTPServer
 
 import pytest
 
@@ -431,6 +434,124 @@ def test_authenticated_policy_status_and_wrong_role_project(controller, tmp_path
     assert cow._digest(cow._config('proj')) == engine_hash
     status = server.handle_snapshot_cow_periodic_status(ctx('operator'))
     assert status['supported'] and not status['configured'] and not status['active']
+
+
+@pytest.fixture
+def periodic_http(monkeypatch):
+    # Keep the real dispatcher/world guard; this isolated project is generic.
+    monkeypatch.setattr(server, '_runtime_plane', lambda: 'generic')
+    httpd = HTTPServer(('127.0.0.1', 0), server.GovernanceHandler)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.01})
+    thread.start()
+
+    def request(method, path, body=None, token=''):
+        conn = http.client.HTTPConnection(*httpd.server_address, timeout=5)
+        try:
+            payload = json.dumps(body) if body is not None else None
+            conn.request(method, path, body=payload,
+                         headers={'Content-Type': 'application/json', 'X-Gov-Token': token})
+            response = conn.getresponse()
+            raw = response.read()
+            headers = dict(response.getheaders())
+            value = json.loads(raw) if headers.get('Content-Type') == 'application/json' else raw
+            return response.status, value, headers
+        finally:
+            conn.close()
+
+    yield request
+    httpd.shutdown()
+    thread.join(5)
+    httpd.server_close()
+    assert not thread.is_alive()
+
+
+def test_real_http_periodic_put_auth_disabled_cas_and_stale_no_mutation(
+        controller, periodic_http, tmp_path, monkeypatch):
+    conn, _, _, config, _ = controller.fixture
+    database = conn.execute('PRAGMA database_list').fetchone()[2]
+    def connection():
+        value = sqlite3.connect(database)
+        value.row_factory = sqlite3.Row
+        return value
+    controller.connection_factory = connection
+    controller.custody_check = lambda conn, pid, root: cow._custody(conn, pid, root)
+    monkeypatch.setattr(server, 'get_connection', lambda _pid: connection())
+    monkeypatch.setattr(server, '_SNAPSHOT_COW_PERIODIC_CONTROLLER', controller)
+    monkeypatch.setattr(periodic, 'service_custody', controller.custody_check)
+    # Real token lookup and permission checks, with an empty in-process cache.
+    cache = SimpleNamespace(get_session_by_token=lambda _hash: None,
+                            cache_session=lambda *_args: None,
+                            cache_token_session=lambda *_args: None)
+    monkeypatch.setattr(server.role_service, 'get_redis', lambda: cache)
+    for token, role, project in [('operator', 'observer', 'proj'),
+                                 ('worker', 'mf_sub', 'proj'),
+                                 ('other', 'observer', 'other')]:
+        conn.execute('INSERT INTO sessions(session_id,principal_id,project_id,role,scope_json,token_hash,'
+                     'status,created_at,expires_at,last_heartbeat,metadata_json) VALUES(?,?,?,?,?,?,?, ?,?,?,?)',
+                     (token, token, project, role, '[]', server.role_service._hash_token(token),
+                      'active', '2020-01-01T00:00:00Z', '2099-01-01T00:00:00Z',
+                      '2020-01-01T00:00:00Z', '{}'))
+    conn.commit()
+    path = tmp_path / 'http-registry.json'
+    monkeypatch.setattr(project_service, '_projects_file', lambda: path)
+    isolated_config = copy.deepcopy(config)
+    isolated_config['governance'].pop('snapshot_cow_cleanup_periodic')
+    project_service._save_projects({'projects': {'proj': {'project_config': isolated_config}}},
+                                  _periodic_owner=True)
+    monkeypatch.setattr(project_service, 'get_project_config_metadata', lambda pid:
+                        copy.deepcopy(project_service._load_projects()['projects'][pid]['project_config']))
+    controller.configuration_changed()
+    engine_hash = cow._digest(cow._config('proj'))
+    url = '/api/graph-governance/proj/snapshot-cow-periodic/config'
+    body = {'policy': {'enabled': False, 'interval_seconds': 120}, 'expected_revision': 0}
+    before = path.read_bytes()
+    for token, expected in [('', 401), ('invalid', 401), ('worker', 403), ('other', 403)]:
+        status, result, headers = periodic_http('PUT', url, body, token)
+        assert status == expected, (status, result)
+        assert 'PUT' in headers['Access-Control-Allow-Methods']
+        assert path.read_bytes() == before
+    status, changed, headers = periodic_http('PUT', url, body, 'operator')
+    assert status == 200, changed
+    assert changed['ok'] and changed['policy']['revision'] == 1
+    assert changed['policy']['enabled'] is False and changed['policy']['interval_seconds'] == 120
+    assert changed['source'] == 'aming_claw_registry' and changed['request_id'].startswith('req-')
+    status, readback, _ = periodic_http('GET', url, token='operator')
+    assert status == 200 and readback['policy'] == changed['policy']
+    before = path.read_bytes()
+    status, refused, _ = periodic_http('PUT', url, body, 'operator')
+    assert status == 400 and refused['error'] == 'periodic_request_refused'
+    assert refused['writes_performed'] is False and path.read_bytes() == before
+    status, refused, _ = periodic_http('PUT', url, {'expected_revision': 1}, 'operator')
+    assert status == 400 and refused['error'] == 'periodic_config_fields_invalid'
+    assert path.read_bytes() == before and cow._digest(cow._config('proj')) == engine_hash
+    assert not controller.status()['configured'] and not controller.status()['active']
+    assert not controller.directory.exists() and not cow._state_root('proj').exists()
+    # No POST config alias; the existing release-hold POST remains a guarded route.
+    assert periodic_http('POST', url, body, 'operator')[0] == 404
+    status, refused, _ = periodic_http('POST', url.replace('/config', '/release-hold'), {}, 'operator')
+    assert status == 400 and refused['writes_performed'] is False
+    assert path.read_bytes() == before
+    for method in ('GET', 'POST', 'PUT', 'DELETE'):
+        status, refused, cors = periodic_http(method, '/api/unknown-put-fixture')
+        assert status == 404 and refused['error'] == 'not_found'
+        assert cors['Access-Control-Allow-Methods'] == headers['Access-Control-Allow-Methods']
+    status, empty, cors = periodic_http('OPTIONS', url)
+    assert status == 204 and empty == b'' and cors['Content-Length'] == '0'
+    assert cors['Access-Control-Allow-Methods'] == headers['Access-Control-Allow-Methods']
+    monkeypatch.setattr(server, '_runtime_plane', lambda: 'dev')
+    status, refused, _ = periodic_http('PUT', url, body, 'operator')
+    assert status == 400 and refused['error'] == 'invalid_request'
+    assert refused['details']['writes_performed'] is False and path.read_bytes() == before
+
+
+@pytest.mark.parametrize('method', ['GET', 'POST', 'DELETE'])
+def test_real_http_existing_dispatch_methods(periodic_http, monkeypatch, method):
+    def echo(ctx):
+        return {'method': ctx.method, 'body': ctx.body, 'query': ctx.query}
+    monkeypatch.setattr(server, 'ROUTES', [(method, '/api/fixture/{project_id}', echo)])
+    status, result, _ = periodic_http(method, '/api/fixture/proj?q=present', {'value': 1})
+    assert status == 200 and result['method'] == method and result['query'] == {'q': 'present'}
+    assert result['body'] == ({'value': 1} if method == 'POST' else {})
 
 
 def test_busy_due_never_overwrites_other_scheduler_intent(controller):

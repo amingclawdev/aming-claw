@@ -5735,7 +5735,7 @@ class GovernanceHandler(BaseHTTPRequestHandler):
 
     CORS_HEADERS = {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": (
             "Content-Type, Authorization, X-Gov-Token, Idempotency-Key, X-Requested-With"
         ),
@@ -5870,7 +5870,7 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "not_found", "message": "Endpoint not found"})
             return
         try:
-            request_body = self._read_body() if method == "POST" else {}
+            request_body = self._read_body() if method in ("POST", "PUT") else {}
             request_query = self._query_params()
             _guard_runtime_world_request(
                 method=method,
@@ -5972,6 +5972,9 @@ class GovernanceHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._handle("POST")
+
+    def do_PUT(self):
+        self._handle("PUT")
 
     def do_DELETE(self):
         self._handle("DELETE")
