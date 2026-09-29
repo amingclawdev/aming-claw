@@ -43801,6 +43801,7 @@ def _runtime_context_finish_submission_bundle(
     current_branch_head_commit: str,
     row_scoped_finish_head_projection: Mapping[str, Any],
     contract_worker_commit_required: bool,
+    verified_base_commit: str,
 ) -> dict[str, Any]:
     """Assemble the one RuntimeContext finish facade from resolved source facts.
 
@@ -43837,6 +43838,9 @@ def _runtime_context_finish_submission_bundle(
         if isinstance(finish_attestation_hint.get("test_results"), Mapping)
         else {}
     )
+    hinted_no_pass_baseline = _runtime_context_finish_no_pass_baseline_claimed(
+        hinted_test_results
+    )
     test_worker_scope = bool(worker_scope_files) and all(
         str(path or "").startswith(("agent/tests/", "tests/"))
         for path in worker_scope_files
@@ -43857,6 +43861,25 @@ def _runtime_context_finish_submission_bundle(
                 hinted_test_results
             )
         )
+    hinted_no_pass_baseline = (
+        hinted_no_pass_baseline
+        or _runtime_context_finish_no_pass_baseline_claimed(hinted_test_results)
+    )
+    if hinted_no_pass_baseline and not _runtime_context_finish_no_pass_producer_accepted(
+        hinted_test_results,
+        expected_baseline_commit=verified_base_commit,
+        require_complete_known_baseline=contract_worker_commit_required,
+    ):
+        finish_hint_source_backed_blocked = True
+        finish_hint_source_backed_resolution = {
+            **finish_hint_source_backed_resolution,
+            "fail_closed": True,
+            "status": "blocked_incomplete_no_pass_baseline",
+            "errors": ["incomplete_no_pass_baseline_and_commands"],
+            "required_source": "RuntimeContext.current_values.base_commit",
+            "required_fields": ["commands", "baseline_comparison"],
+        }
+        hinted_test_results = {}
     hinted_graph_trace_ids = [
         str(item)
         for item in (
@@ -45220,6 +45243,9 @@ def _runtime_context_worker_guide_response(
         current_branch_head_commit=current_branch_head_commit,
         row_scoped_finish_head_projection=row_scoped_finish_head_projection,
         contract_worker_commit_required=contract_worker_commit_required,
+        verified_base_commit=str(
+            runtime_context_current_values.get("base_commit") or ""
+        ).strip(),
     )
     finish_attestation_submission = dict(
         finish_bundle["finish_time_worker_attestation_submission"]
@@ -51616,6 +51642,7 @@ def _runtime_context_bounded_finish_facade_payload(
         current_branch_head_commit=current_branch_head_commit,
         row_scoped_finish_head_projection=row_scoped_finish_head_projection,
         contract_worker_commit_required=contract_worker_commit_required,
+        verified_base_commit=str(context.base_commit or "").strip(),
     )
     if finish_bundle["missing_required_fields"]:
         return {}
@@ -55510,6 +55537,50 @@ def _runtime_context_finish_attestation_test_results_accepted(value: Any) -> boo
     return _runtime_context_test_results_passed(value)
 
 
+def _runtime_context_finish_no_pass_baseline_claimed(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    status = str(value.get("status") or "").strip().lower()
+    return status == _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS or (
+        value.get("no_pass") is True
+        and status != _RUNTIME_CONTEXT_FINISH_ATTESTATION_UNRELATED_SYSTEM_BLOCK_STATUS
+    )
+
+
+def _runtime_context_finish_no_pass_producer_accepted(
+    value: Any, *, expected_baseline_commit: str,
+    require_complete_known_baseline: bool = True,
+) -> bool:
+    """Apply the existing premerge ledger rule before accepting a no-PASS finish."""
+
+    if not _runtime_context_finish_no_pass_baseline_claimed(value):
+        return True
+    acceptance = _contract_runtime_finish_test_results_consumer_acceptance(
+        value, expected_baseline_commit=expected_baseline_commit
+    )
+    return acceptance.get("accepted") is True and (
+        not require_complete_known_baseline
+        or acceptance.get("complete_known_baseline") is True
+    )
+
+
+def _runtime_context_require_finish_no_pass_producer(
+    value: Any, *, expected_baseline_commit: str,
+    require_complete_known_baseline: bool,
+) -> None:
+    if not _runtime_context_finish_no_pass_producer_accepted(
+        value,
+        expected_baseline_commit=expected_baseline_commit,
+        require_complete_known_baseline=require_complete_known_baseline,
+    ):
+        raise ValidationError(
+            "canonical no-PASS finish requires complete commands and "
+            "baseline_comparison bound to the exact verified RuntimeContext "
+            "base_commit; preserve failed command tests, errors and "
+            "classification, and supply the evidence ref/hash"
+        )
+
+
 def _runtime_context_finish_attestation_test_results_payload(
     value: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -55733,6 +55804,12 @@ def _runtime_context_finish_attestation_project_test_results(
         "full_passed": expanded_passed,
         "baseline_passed": base_passed,
     }
+    # A worker may supply the consumer's exact baseline command ledger along
+    # with the legacy count projection. Keep those bytes for the later
+    # RuntimeContext-bound validation; never manufacture missing fields.
+    for field in ("commands", "baseline_comparison"):
+        if field in source:
+            projected[field] = deepcopy(source[field])
     if not _runtime_context_finish_attestation_no_pass_results_accepted(projected):
         return {}
     return _runtime_context_finish_attestation_test_results_payload(projected)
@@ -80472,6 +80549,11 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             raise ValidationError(
                 "finish-time worker attestation requires accepted test_results"
             )
+        _runtime_context_require_finish_no_pass_producer(
+            test_results,
+            expected_baseline_commit=str(context.base_commit or ""),
+            require_complete_known_baseline=canonical_worker_commit_required,
+        )
         test_results = _runtime_context_finish_attestation_test_results_payload(
             test_results
         )
@@ -80987,6 +81069,13 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
                 pass
         expected_test_results = (
             body.get("test_results") if isinstance(body.get("test_results"), Mapping) else {}
+        )
+        _runtime_context_require_finish_no_pass_producer(
+            expected_test_results,
+            expected_baseline_commit=str(context.base_commit or ""),
+            require_complete_known_baseline=bool(
+                finish_order_projection.get("canonical_worker_commit_required")
+            ),
         )
         timeline_events = _runtime_context_service_timeline_events(
             conn,

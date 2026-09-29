@@ -167177,6 +167177,95 @@ def test_finish_attestation_projection_preserves_accepted_pass_and_no_pass():
     }
 
 
+def test_finish_no_pass_producer_matches_existing_consumer_command_rule(tmp_path):
+    base_commit = "a" * 40
+    counts = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 2,
+        "inherited_failed": 2,
+        "baseline_failed": 2,
+        "focused_passed": 6,
+        "full_passed": 23,
+        "baseline_passed": 1,
+        "overall_release_pass_claimed": False,
+    }
+    evidence = b"verified baseline failures from exact fixture"
+    evidence_ref = tmp_path / "baseline-failures.txt"
+    evidence_ref.write_bytes(evidence)
+    complete = {
+        **counts,
+        "commands": [
+            {"command": "pytest focused -q", "status": "passed", "tests": 6},
+            {
+                "command": "pytest full -q",
+                "status": "failed",
+                "tests": 25,
+                "errors": 2,
+                "classification": "preexisting_baseline_errors",
+            },
+        ],
+        "baseline_comparison": {
+            "exact_commit": base_commit,
+            "tests": 3,
+            "errors": 2,
+            "error_names_match": True,
+            "evidence_ref": str(evidence_ref),
+            "sha256": hashlib.sha256(evidence).hexdigest(),
+        },
+    }
+    assert server._runtime_context_finish_no_pass_producer_accepted(
+        complete, expected_baseline_commit=base_commit
+    )
+    assert server._contract_runtime_finish_test_results_consumer_acceptance(
+        counts, expected_baseline_commit=base_commit
+    )["accepted"] is True
+    assert not server._runtime_context_finish_no_pass_producer_accepted(
+        counts, expected_baseline_commit=base_commit
+    )
+    assert server._runtime_context_finish_no_pass_producer_accepted(
+        counts,
+        expected_baseline_commit=base_commit,
+        require_complete_known_baseline=False,
+    )  # Existing noncanonical and historical count-only behavior remains.
+    for candidate in (
+        {key: value for key, value in complete.items() if key != "baseline_comparison"},
+        {**complete, "baseline_comparison": {
+            **complete["baseline_comparison"], "exact_commit": "b" * 40}},
+        {**complete, "baseline_comparison": {
+            **complete["baseline_comparison"], "sha256": "invalid"}},
+        {**complete, "commands": [complete["commands"][0], {
+            **complete["commands"][1], "errors": 3}]},
+        {**complete, "candidate_new_failures": 1},
+    ):
+        assert not server._runtime_context_finish_no_pass_producer_accepted(
+            candidate, expected_baseline_commit=base_commit
+        )
+    assert not server._runtime_context_finish_no_pass_producer_accepted(
+        complete, expected_baseline_commit=""
+    )
+
+    source = {
+        "schema_version": "runtime_context.worker_test_results.v1",
+        "candidate_new_failures": 0,
+        "focused_candidate": {"failed": 0, "passed": 6, "status": "passed"},
+        "expanded_candidate": {"failed": 0, "passed": 23, "status": "passed"},
+        "immutable_base": {
+            "failed": 2, "passed": 1, "status": "expected_red",
+            "selector": "rev8_postmerge_qa_graph_binding or pre_rev8_qa_graph_binding",
+        },
+        "commands": copy.deepcopy(complete["commands"]),
+        "baseline_comparison": copy.deepcopy(complete["baseline_comparison"]),
+    }
+    projected = server._runtime_context_finish_attestation_project_test_results(source)
+    assert projected["commands"] == source["commands"]
+    assert projected["baseline_comparison"] == source["baseline_comparison"]
+    assert server._runtime_context_finish_no_pass_producer_accepted(
+        projected, expected_baseline_commit=base_commit
+    )
+
+
 def test_finish_attestation_projection_requires_exact_truthful_comparison():
     exact = {
         "schema_version": "runtime_context.worker_test_results.v1",
@@ -167460,15 +167549,15 @@ def test_worker_guide_projects_only_test_worker_results_into_accepted_body(
     source_resolution = finish_submission[
         "source_backed_implementation_resolution"
     ]
-    assert finish_submission["actionable"] is True, source_resolution.get("errors")
-    finish_body = finish_submission["copy_safe_body"]
-    projected = finish_body["test_results"]
-
     if should_project:
-        assert projected == (
-            server._runtime_context_finish_attestation_project_test_results(
-                actual_r12s15_results
-            )
+        # The historical count-only result still projects, but this owning
+        # Rev10 worker must supply a complete ledger before the Guide can
+        # propose an immutable finish.
+        assert finish_submission["actionable"] is False
+        assert "incomplete_no_pass_baseline_and_commands" in source_resolution["errors"]
+        assert not finish_submission.get("copy_safe_body")
+        projected = server._runtime_context_finish_attestation_project_test_results(
+            actual_r12s15_results
         )
         assert server._runtime_context_finish_attestation_test_results_accepted(
             projected
@@ -167476,6 +167565,8 @@ def test_worker_guide_projects_only_test_worker_results_into_accepted_body(
         assert projected["no_pass"] is True
         assert projected["overall_release_pass_claimed"] is False
     else:
+        assert finish_submission["actionable"] is True, source_resolution.get("errors")
+        projected = finish_submission["copy_safe_body"]["test_results"]
         assert projected == actual_r12s15_results
         assert server._runtime_context_finish_attestation_test_results_accepted(
             projected
@@ -179360,10 +179451,10 @@ def _fresh_release_fixture_rows(conn, *, extra_tables=()) -> dict[str, list[tupl
 def _normal_mf_parallel_finish_precursor(
     conn, tmp_path, *, backlog_id, worker_task_id, worker_token, worker_fence,
     worker_root, graph_trace_id, test_results, project_id=PID, prepared=None,
+    owned_file="agent/governance/server.py",
 ):
     """Seed only onboarding/allocation; run actual worker evidence producers."""
     if prepared is None:
-        owned_file = "agent/governance/server.py"
         owned_files = [owned_file]
         (worker_root / owned_file).parent.mkdir(parents=True)
         base_commit = _init_test_git_repo(worker_root, filename=owned_file)
@@ -179375,6 +179466,7 @@ def _normal_mf_parallel_finish_precursor(
             conn, backlog_id=backlog_id, task_id="parallel-inflight-dispatch-bridge-parent",
             worker_task_id=worker_task_id, fence_token=worker_fence, token=worker_token,
             worktree_path=str(worker_root), base_commit=base_commit,
+            owned_files=owned_files,
             submit_dispatch=False, parent_task_is_contract_execution=True,
         )
         execution_id = successor["contract_execution_id"]
@@ -179435,6 +179527,8 @@ def _normal_mf_parallel_finish_precursor(
         info_exclude = (worker_root / common_dir).resolve() / "info" / "exclude"
         with info_exclude.open("a", encoding="utf-8") as stream:
             stream.write("\n.aming-claw/\n")
+    if callable(test_results):
+        test_results = test_results(runtime_context)
     parent_task_id = runtime_context.parent_task_id
     path = {"project_id": project_id, "runtime_context_id": runtime_context.runtime_context_id}
     worker_session_id = f"session-{worker_task_id}"
@@ -179765,6 +179859,10 @@ def test_statusless_finish_consumer_accepts_normal_known_baseline(
         "baseline_passed": 215,
         "overall_release_pass_claimed": False,
     }
+    count_only_results = copy.deepcopy(test_results)
+    complete_results = lambda context: _complete_known_baseline_test_results(
+        count_only_results, runtime_context=context, tmp_path=tmp_path
+    )
     successor, runtime_context, head_commit, evidence_events, startup = (
         _normal_mf_parallel_finish_precursor(
             conn,
@@ -179775,9 +179873,10 @@ def test_statusless_finish_consumer_accepts_normal_known_baseline(
             worker_fence=worker_fence,
             worker_root=worker_root,
             graph_trace_id="gqt-rev10-known-baseline-finish",
-            test_results=test_results,
+            test_results=complete_results,
         )
     )
+    test_results = complete_results(runtime_context)
     _, finish_line = _finish_normal_mf_parallel_worker(
         conn,
         project_id=PID,
@@ -179806,6 +179905,17 @@ def test_statusless_finish_consumer_accepts_normal_known_baseline(
     assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
         finish_line,
         expected_worker_identity=identity,
+        expected_baseline_commit=runtime_context.base_commit,
+    ) is True
+    historical_count_only_line = (
+        server._runtime_context_restore_finish_gate_no_pass_results(
+            finish_line, test_results=count_only_results
+        )
+    )
+    assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
+        historical_count_only_line,
+        expected_worker_identity=identity,
+        expected_baseline_commit=runtime_context.base_commit,
     ) is True
     for update in (
         {"candidate_new_failures": 1},
@@ -179826,6 +179936,7 @@ def test_statusless_finish_consumer_accepts_normal_known_baseline(
         assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
             rejected_line,
             expected_worker_identity=identity,
+            expected_baseline_commit=runtime_context.base_commit,
         ) is False
     conflicting_line = copy.deepcopy(finish_line)
     conflicting_line["payload"]["mf_subagent_finish_gate"]["test_results"] = {
@@ -179835,19 +179946,283 @@ def test_statusless_finish_consumer_accepts_normal_known_baseline(
     assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
         conflicting_line,
         expected_worker_identity=identity,
+        expected_baseline_commit=runtime_context.base_commit,
     ) is False
     for field in identity:
         wrong_identity = {**identity, field: f"wrong-{field}"}
         assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
             finish_line,
             expected_worker_identity=wrong_identity,
+            expected_baseline_commit=runtime_context.base_commit,
         ) is False
     current_failure = copy.deepcopy(finish_line)
     current_failure["payload"]["qa_status"] = "failed"
     assert server._contract_runtime_statusless_worker_finish_gate_acceptance(
         current_failure,
         expected_worker_identity=identity,
+        expected_baseline_commit=runtime_context.base_commit,
     ) is False
+
+
+@pytest.mark.parametrize(
+    "ledger_shape", ["commands_without_comparison", "absent_both", "wrong_baseline"]
+)
+def test_finish_parity_rejects_incomplete_command_ledger_before_attestation(
+    release_conn, tmp_path, ledger_shape
+):
+    conn = release_conn
+    backlog_id = "AC-FINISH-PARITY-INCOMPLETE-COMMANDS"
+    worker_task_id = "finish-parity-incomplete-worker"
+    worker_token = "finish-parity-incomplete-token"
+    worker_fence = "fence-finish-parity-incomplete"
+    worker_root = tmp_path / worker_task_id
+    counts = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 2,
+        "inherited_failed": 2,
+        "baseline_failed": 2,
+        "focused_passed": 6,
+        "full_passed": 23,
+        "baseline_passed": 1,
+        "overall_release_pass_claimed": False,
+    }
+    def results_for_context(context):
+        if ledger_shape == "absent_both":
+            return copy.deepcopy(counts)
+        results = _complete_known_baseline_test_results(
+            counts, runtime_context=context, tmp_path=tmp_path
+        )
+        if ledger_shape == "commands_without_comparison":
+            results.pop("baseline_comparison")
+        else:
+            results["baseline_comparison"]["exact_commit"] = "f" * 40
+        return results
+
+    successor, context, _, _, _ = _normal_mf_parallel_finish_precursor(
+        conn, tmp_path, backlog_id=backlog_id, worker_task_id=worker_task_id,
+        worker_token=worker_token, worker_fence=worker_fence,
+        worker_root=worker_root, graph_trace_id="gqt-finish-parity-incomplete",
+        test_results=results_for_context,
+    )
+    results = results_for_context(context)
+    record = server._contract_runtime_store(conn).get(successor["contract_execution_id"])
+    implementation = next(
+        line for line in record["completed_lines"]
+        if line.get("line_id") == "worker_implementation"
+    )
+    assert implementation["payload"]["test_results"] == results
+    if "commands" in results:
+        assert implementation["payload"]["tests"] == results["commands"]
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub", query={
+                "parent_task_id": context.parent_task_id,
+                "fence_token": worker_fence,
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(context),
+                "target_project_root": str(worker_root),
+                "view": "all",
+            },
+        )
+    )
+    submission = guide["actionable_payloads"]["finish_time_worker_attestation_submission"]
+    assert submission["actionable"] is False
+    assert submission["status"] == "blocked_incomplete_no_pass_baseline"
+    assert submission["copy_safe_body"] == {}
+    assert submission["source_backed_implementation_resolution"]["required_source"] == (
+        "RuntimeContext.current_values.base_commit"
+    )
+    assert not any(
+        line.get("line_id") in {"worker_finish_time_attestation", "worker_finish_gate"}
+        for line in record["completed_lines"]
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_merge_queue_items "
+        "WHERE project_id = ? AND task_id = ?",
+        (PID, context.task_id),
+    ).fetchone()[0] == 0
+
+
+def test_finish_parity_attestation_and_finish_refuse_changed_results(
+    release_conn, tmp_path
+):
+    conn = release_conn
+    backlog_id = "AC-FINISH-PARITY-ATTESTATION-REFUSAL"
+    worker_task_id = "finish-parity-attestation-worker"
+    worker_token = "finish-parity-attestation-token"
+    worker_fence = "fence-finish-parity-attestation"
+    worker_root = tmp_path / worker_task_id
+    counts = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 2,
+        "inherited_failed": 2,
+        "baseline_failed": 2,
+        "focused_passed": 6,
+        "full_passed": 23,
+        "baseline_passed": 1,
+        "overall_release_pass_claimed": False,
+    }
+    def complete_results(context):
+        return _complete_known_baseline_test_results(
+            counts, runtime_context=context, tmp_path=tmp_path
+        )
+
+    successor, context, head_commit, evidence_events, startup = (
+        _normal_mf_parallel_finish_precursor(
+            conn, tmp_path, backlog_id=backlog_id, worker_task_id=worker_task_id,
+            worker_token=worker_token, worker_fence=worker_fence,
+            worker_root=worker_root, graph_trace_id="gqt-finish-parity-attestation",
+            test_results=complete_results,
+        )
+    )
+    results = complete_results(context)
+    path = {"project_id": PID, "runtime_context_id": context.runtime_context_id}
+    worker_query = {
+        "parent_task_id": context.parent_task_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "target_project_root": str(worker_root),
+    }
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(path, "mf_sub", query=worker_query)
+    )
+    assert guide["canonical_executable_action"]["mcp_tool"] == (
+        "runtime_context_finish_time_worker_attestation"
+    )
+    attestation_body = {
+        **guide["canonical_executable_action"]["copy_safe_body"],
+        **worker_query,
+        "worker_session_id": f"session-{worker_task_id}",
+        "filer_principal": f"session-{worker_task_id}",
+        "worker_transcript_ref": startup["worker_transcript_ref"],
+        "worker_transcript_path": startup["worker_transcript_path"],
+        "harness_type": "codex",
+        "graph_trace_ids": [startup["graph_trace_id"]],
+        "read_receipt_event_id": evidence_events["read_receipt"],
+        "read_receipt_hash": startup["read_receipt_hash"],
+        "head_commit": head_commit,
+        "actual_cwd": str(worker_root),
+        "actual_git_root": str(worker_root),
+        "test_results": results,
+    }
+    wrong_base = copy.deepcopy(results)
+    wrong_base["baseline_comparison"]["exact_commit"] = "f" * 40
+    for invalid in (wrong_base, {**results, "candidate_new_failures": 1}):
+        with pytest.raises(server.ValidationError):
+            server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+                _ctx_with_role(
+                    path, "mf_sub", method="POST",
+                    body={**attestation_body, "test_results": invalid},
+                )
+            )
+    record = server._contract_runtime_store(conn).get(successor["contract_execution_id"])
+    assert not any(
+        line.get("line_id") == "worker_finish_time_attestation"
+        for line in record["completed_lines"]
+    )
+
+    accepted = server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+        _ctx_with_role(path, "mf_sub", method="POST", body=attestation_body)
+    )
+    assert accepted["ok"] is True
+    finish_body = copy.deepcopy(accepted["finish_gate_submission"]["body"])
+    finish_body.update(worker_query)
+    finish_body["test_results"] = wrong_base
+    with pytest.raises(server.ValidationError):
+        server.handle_graph_governance_runtime_context_finish_gate(
+            _ctx_with_role(path, "mf_sub", method="POST", body=finish_body)
+        )
+    record = server._contract_runtime_store(conn).get(successor["contract_execution_id"])
+    assert not any(
+        line.get("line_id") == "worker_finish_gate"
+        for line in record["completed_lines"]
+    )
+
+
+def test_finish_parity_test_worker_guide_keeps_verified_command_ledger(
+    release_conn, tmp_path
+):
+    worker_task_id = "finish-parity-test-worker-guide"
+    worker_token = "finish-parity-test-worker-token"
+    worker_fence = "fence-finish-parity-test-worker"
+    worker_root = tmp_path / worker_task_id
+
+    def raw_results(context):
+        source = {
+            "schema_version": "runtime_context.worker_test_results.v1",
+            "candidate_new_failures": 0,
+            "focused_candidate": {"failed": 0, "passed": 6, "status": "passed"},
+            "expanded_candidate": {"failed": 0, "passed": 23, "status": "passed"},
+            "immutable_base": {
+                "failed": 2, "passed": 1, "status": "expected_red",
+                "selector": (
+                    "rev8_postmerge_qa_graph_binding or "
+                    "pre_rev8_qa_graph_binding"
+                ),
+            },
+            "old_world_reuse": False,
+            "qa_claim": False,
+            "release_claim": False,
+        }
+        counts = server._runtime_context_finish_attestation_project_test_results(
+            source
+        )
+        complete = _complete_known_baseline_test_results(
+            counts, runtime_context=context, tmp_path=tmp_path
+        )
+        source["commands"] = complete["commands"]
+        source["baseline_comparison"] = complete["baseline_comparison"]
+        return source
+
+    successor, context, _, _, _ = _normal_mf_parallel_finish_precursor(
+        release_conn, tmp_path,
+        backlog_id="AC-FINISH-PARITY-TEST-WORKER-GUIDE",
+        worker_task_id=worker_task_id,
+        worker_token=worker_token,
+        worker_fence=worker_fence,
+        worker_root=worker_root,
+        graph_trace_id="gqt-finish-parity-test-worker-guide",
+        test_results=raw_results,
+        owned_file="agent/tests/test_graph_governance_api.py",
+    )
+    expected = raw_results(context)
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub", query={
+                "parent_task_id": context.parent_task_id,
+                "fence_token": worker_fence,
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(context),
+                "target_project_root": str(worker_root),
+                "view": "all",
+            },
+        )
+    )
+    submission = guide["actionable_payloads"]["finish_time_worker_attestation_submission"]
+    assert submission["actionable"] is True, submission
+    projected = submission["copy_safe_body"]["test_results"]
+    assert projected["commands"] == expected["commands"]
+    assert projected["baseline_comparison"] == expected["baseline_comparison"]
+    assert projected["baseline_comparison"]["exact_commit"] == context.base_commit
+    assert projected["overall_release_pass_claimed"] is False
+    assert server._contract_runtime_finish_test_results_consumer_acceptance(
+        projected, expected_baseline_commit=context.base_commit
+    )["complete_known_baseline"] is True
+    record = server._contract_runtime_store(release_conn).get(
+        successor["contract_execution_id"]
+    )
+    implementation = next(
+        line for line in record["completed_lines"]
+        if line.get("line_id") == "worker_implementation"
+    )
+    assert implementation["payload"]["tests"] == expected["commands"]
 
 
 def _complete_rev10_two_lane_close_ready_through_normal_facades(
@@ -182925,6 +183300,75 @@ def test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_
     )
 
 
+@pytest.mark.parametrize("result_mode", ["mixed", "all_passed"])
+def test_finish_parity_owning_producers_reach_premerge_with_exact_results(
+    release_conn, monkeypatch, tmp_path, request, result_mode
+):
+    """Stop the existing real two-lane producer at its first premerge read."""
+
+    original_premerge = (
+        server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance
+    )
+
+    class PremergeAccepted(Exception):
+        pass
+
+    def observe_premerge(conn, *args, **kwargs):
+        protected, authority = original_premerge(conn, *args, **kwargs)
+        assert protected is True
+        assert authority["status"] == "satisfied", authority
+        assert authority["passed"] is True and authority["db_verified"] is True
+        assert len(authority["workers"]) == 2
+        record = server._contract_runtime_store(conn).get(
+            kwargs["source_contract_execution_id"]
+        )
+        implementations = [
+            line for line in record["completed_lines"]
+            if line.get("line_id") == "worker_implementation"
+        ]
+        assert len(implementations) == 2
+        if result_mode == "mixed":
+            inherited = [
+                line for line in implementations
+                if line["payload"]["test_results"].get("no_pass") is True
+            ]
+            assert len(inherited) == 1
+            line = inherited[0]
+            results = line["payload"]["test_results"]
+            context = get_branch_context(conn, kwargs["project_id"], line["task_id"])
+            assert context is not None
+            assert results["baseline_comparison"]["exact_commit"] == context.base_commit
+            assert results["commands"][1]["status"] == "failed"
+            assert results["commands"][1]["errors"] == results["baseline_failed"]
+            assert results["commands"][1]["tests"] == (
+                results["full_passed"] + results["full_failed"]
+            )
+            assert results["commands"][1]["classification"] == (
+                "preexisting_baseline_errors"
+            )
+            assert line["payload"]["tests"] == results["commands"]
+            assert server._contract_runtime_finish_test_results_consumer_acceptance(
+                results, expected_baseline_commit=context.base_commit
+            )["complete_known_baseline"] is True
+        else:
+            assert all(
+                line["payload"]["test_results"].get("passed") is True
+                for line in implementations
+            )
+        raise PremergeAccepted()
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance",
+        observe_premerge,
+    )
+    with pytest.raises(PremergeAccepted):
+        test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_pass(
+            release_conn, monkeypatch, tmp_path, request,
+            "runtime_drift", result_mode, "canonical",
+        )
+
+
 @pytest.mark.parametrize(
     ("mismatch", "value"),
     [
@@ -182963,80 +183407,29 @@ def test_rev10_complete_baseline_ledger_rejects_semantic_mismatch(
     class SemanticMismatchObserved(Exception):
         pass
 
-    def physical_transition_count(conn, record, completed_line_index):
-        identity = {
-            "project_id": record["project_id"],
-            "backlog_id": record["backlog_id"],
-            "contract_execution_id": record["contract_execution_id"],
-            "contract_id": record["contract_id"],
-            "contract_chain_id": record["contract_chain_id"],
-            "parent_contract_execution_id": record[
-                "parent_contract_execution_id"
-            ],
-            "root_contract_execution_id": record["root_contract_execution_id"],
-        }
-        target_count = completed_line_index + 1
-        matches = []
-        for row in conn.execute(
-            "SELECT execution_state_revision, source_ref, source_hash "
-            "FROM backlog_contract_chain_bindings "
-            "WHERE project_id = ? AND contract_execution_id = ?",
-            (record["project_id"], record["contract_execution_id"]),
-        ).fetchall():
-            revision = int(row["execution_state_revision"] or 0)
-            if (
-                row["source_ref"]
-                == f"contract_runtime:{record['contract_execution_id']}:revision:{revision}"
-                and row["source_hash"]
-                == server.stable_sha256(
-                    {
-                        **identity,
-                        "execution_state_revision": revision,
-                        "completed_line_count": target_count,
-                    }
-                )
-            ):
-                matches.append(row)
-        return len(matches)
+    original_bundle = server._runtime_context_finish_submission_bundle
 
-    def observe_premerge(conn, *args, **kwargs):
-        record = server._contract_runtime_store(conn).get(
-            kwargs["source_contract_execution_id"]
+    def observe_finish_bundle(*args, **kwargs):
+        bundle = original_bundle(*args, **kwargs)
+        submission = bundle["finish_time_worker_attestation_submission"]
+        if submission["status"] != "blocked_incomplete_no_pass_baseline":
+            return bundle
+        record = server._contract_runtime_store(release_conn).get(
+            kwargs["finish_contract_execution_id"]
         )
-        context = get_branch_context(
-            conn,
-            kwargs["project_id"],
-            kwargs["task_id"],
+        assert not any(
+            line.get("line_id") in {
+                "worker_finish_time_attestation", "worker_finish_gate"
+            }
+            for line in record["completed_lines"]
         )
-        assert context is not None
-        completion_indexes = {
-            line_id: [
-                index
-                for index, line in enumerate(record["completed_lines"])
-                if line.get("line_id") == line_id
-                and line.get("runtime_context_id") == context.runtime_context_id
-            ]
-            for line_id in (
-                "worker_finish_time_attestation",
-                "worker_finish_gate",
-            )
-        }
-        assert all(len(indexes) == 1 for indexes in completion_indexes.values())
-        assert all(
-            physical_transition_count(conn, record, indexes[0]) == 1
-            for indexes in completion_indexes.values()
-        )
-        durable_tables = (
-            "parallel_branch_runtime_contexts",
-            "parallel_branch_merge_queue_items",
-        )
-        before = _fresh_release_fixture_rows(conn, extra_tables=durable_tables)
-        protected, blocked = original_premerge(conn, *args, **kwargs)
-        after = _fresh_release_fixture_rows(conn, extra_tables=durable_tables)
-        assert after == before
-        assert protected is True
-        assert blocked["status"] == "blocked", blocked
-        assert blocked["reason"] == "rev10_worker_finish_attestation_mismatch"
+        assert submission["actionable"] is False
+        assert submission["copy_safe_body"] == {}
+        assert release_conn.execute(
+            "SELECT COUNT(*) FROM parallel_branch_merge_queue_items "
+            "WHERE project_id = ? AND task_id = ?",
+            (PID, kwargs["task_id"]),
+        ).fetchone()[0] == 0
         raise SemanticMismatchObserved()
 
     monkeypatch.setattr(
@@ -183045,19 +183438,12 @@ def test_rev10_complete_baseline_ledger_rejects_semantic_mismatch(
         mismatched_results,
     )
     monkeypatch.setattr(
-        server,
-        "_contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance",
-        observe_premerge,
+        server, "_runtime_context_finish_submission_bundle", observe_finish_bundle
     )
     with pytest.raises(SemanticMismatchObserved):
         test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_pass(
-            release_conn,
-            monkeypatch,
-            tmp_path,
-            request,
-            "runtime_drift",
-            "mixed",
-            "canonical",
+            release_conn, monkeypatch, tmp_path, request,
+            "runtime_drift", "mixed", "canonical",
         )
 
 
