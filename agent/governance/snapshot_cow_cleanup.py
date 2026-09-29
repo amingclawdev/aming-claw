@@ -336,7 +336,9 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
     required = {"graph_snapshots": {"project_id", "snapshot_id", "snapshot_kind", "status", "created_at"},
                 "graph_snapshot_refs": {"project_id", "snapshot_id", "ref_name"},
                 "pending_scope_reconcile": {"project_id", "snapshot_id", "status"},
-                "graph_current_full_build_claim_history": {"project_id", "snapshot_id", "status"},
+                "graph_current_full_build_claim_history": {"project_id", "snapshot_id", "status",
+                    "released_at", "terminal_status", "claim_id", "run_id", "commit_sha",
+                    "manager_epoch", "manager_pid", "manager_started_at", "manager_start_identity", "acquired_at"},
                 "graph_query_traces": {"project_id", "snapshot_id", "status", "canonical_base_snapshot_id"},
                 "reconcile_run_metrics": {"project_id", "snapshot_id", "status"},
                 "graph_semantic_jobs": {"project_id", "snapshot_id", "status", "lease_expires_at"}}
@@ -407,6 +409,36 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
                 statuses = tuple(sorted(TERMINAL | SEMANTIC_JOB_TERMINAL_STATUSES))
             predicate = "lower(coalesce(status,'')) NOT IN (" + ",".join("?" for _ in statuses) + ")"
             args.extend(statuses)
+            if table == "graph_current_full_build_claim_history":
+                # Recognize the atomic native release only with complete owner
+                # identity and UTC proof. No historical manager-liveness check.
+                # Filter in SQL before LIMIT; NULL/malformed proof stays live.
+                released = ["status COLLATE BINARY='released'",
+                            "terminal_status COLLATE BINARY IN ('candidate_ready','failed')",
+                            "typeof(manager_pid)='integer' AND manager_pid>0",
+                            "length(commit_sha) IN (40,64) AND commit_sha NOT GLOB '*[^0-9a-f]*'",
+                            "length(manager_start_identity)=71 "
+                            "AND substr(manager_start_identity,1,7) COLLATE BINARY='sha256:' "
+                            "AND substr(manager_start_identity,8) NOT GLOB '*[^0-9a-f]*'"]
+                # TEXT affinity permits BLOB; string functions can truncate at
+                # NUL. Require actual TEXT without NUL for every textual proof.
+                # Match Python str.strip(), including Unicode whitespace and
+                # U+001C..U+001F separators, while preserving interior Unicode.
+                strip_chars = ("char(9,10,11,12,13,28,29,30,31,32,133,160,5760,"
+                               "8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,"
+                               "8232,8233,8239,8287,12288)")
+                for field in ("claim_id", "project_id", "snapshot_id", "run_id", "manager_epoch",
+                              "commit_sha", "manager_start_identity", "released_at", "manager_started_at",
+                              "acquired_at", "status", "terminal_status"):
+                    released.append(f"typeof({field})='text' AND length({field})>0 "
+                        f"AND {field}=trim({field},{strip_chars}) COLLATE BINARY "
+                        f"AND instr({field},char(0))=0")
+                for field in ("released_at", "manager_started_at", "acquired_at"):
+                    # Julian round-trip rejects invalid calendar days and 24:00
+                    # normalization, which direct strftime can silently accept.
+                    released.append(f"length({field})=20 AND substr({field},1,4)>='0001' "
+                        f"AND strftime('%Y-%m-%dT%H:%M:%SZ',julianday({field}))={field} COLLATE BINARY")
+                predicate = "(" + predicate + " AND NOT coalesce(" + " AND ".join(released) + ",0))"
             if "lease_expires_at" in columns:
                 predicate = "(" + predicate + " OR coalesce(lease_expires_at,'')>?)"
                 args.append(datetime.now(timezone.utc).isoformat())

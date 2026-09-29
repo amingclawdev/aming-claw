@@ -146,6 +146,261 @@ def test_completed_audit_reference_is_history_but_live_ref_protects(cow_fixture)
     assert preview(cow_fixture)["candidates"] == []
 
 
+# Read-only native row from reviewer-candidate-claim-readonly.json,
+# SHA256 faa9d07fe4ce1311601dab31739a49e0f2ed4a2bce1a032d8ff0b957add56bf3.
+# Only the project is remapped into the isolated fixture; no live DB is opened.
+_OBSERVED_RELEASED_CLAIM = {
+    "acquired_at": "2026-09-06T04:54:06Z",
+    "claim_id": "gcfclaim-37d2e8ac3b6542c6a042",
+    "commit_sha": "63472f630faad83701d69a799a81a9452208b7e9",
+    "manager_epoch": "govgen-f49aa54ffa6d4b84ac97da0223b4208a",
+    "manager_pid": 78113,
+    "manager_start_identity": "sha256:71fab283b80412c3c4216ee5ec2562f0c221b09a6fc832f4061e51a6dc7838d9",
+    "manager_started_at": "2026-09-06T04:42:17Z",
+    "project_id": "aming-claw",
+    "released_at": "2026-09-06T04:58:21Z",
+    "run_id": "current-full-mcp-1755abf70c3bd306",
+    "snapshot_id": "full-63472f630faa-44e17fae3823",
+    "status": "released",
+    "terminal_status": "candidate_ready",
+}
+
+
+def _insert_claim(conn, **overrides):
+    claim = {**_OBSERVED_RELEASED_CLAIM, "project_id": "proj", "snapshot_id": "full-old", **overrides}
+    conn.execute("INSERT INTO graph_current_full_build_claim_history (" + ",".join(claim) + ") "
+                 "VALUES (" + ",".join("?" for _ in claim) + ")", tuple(claim.values()))
+    conn.commit()
+    return claim
+
+
+@pytest.mark.parametrize("outcome", ["candidate_ready", "failed"])
+def test_observed_canonical_released_claim_admits_small_native_preview(cow_fixture, outcome):
+    conn, _, base, config, _ = cow_fixture
+    sid = _OBSERVED_RELEASED_CLAIM["snapshot_id"]
+    base.rename(base.with_name(sid))
+    conn.execute("UPDATE graph_snapshots SET snapshot_id=?,commit_sha=?,created_at=? "
+                 "WHERE snapshot_id='full-old'", (sid, _OBSERVED_RELEASED_CLAIM["commit_sha"],
+                                                "2026-09-06T04:57:19Z"))
+    conn.execute("UPDATE graph_snapshots SET created_at='2026-09-29T00:00:00Z' "
+                 "WHERE snapshot_id='full-active'")
+    claim = _insert_claim(conn, snapshot_id=sid, terminal_status=outcome)
+    before_changes, before_config = conn.total_changes, json.dumps(config, sort_keys=True)
+    plan = preview(cow_fixture)
+    assert plan["apply_plan_available"] and len(plan["candidates"]) == 2
+    assert {r["snapshot_id"] for r in plan["candidates"]} == {sid}
+    assert plan["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert dict(conn.execute("SELECT * FROM graph_current_full_build_claim_history").fetchone()) == claim
+    assert json.dumps(config, sort_keys=True) == before_config
+    assert not cow._state_root("proj").exists()
+
+
+def test_native_failed_claim_terminalization_is_history(cow_fixture):
+    conn = cow_fixture[0]
+    claim = _insert_claim(conn, status="active", released_at="", terminal_status="")
+    released = snapshots.terminalize_current_full_build_claim(
+        conn, "proj", claim_id=claim["claim_id"], run_id=claim["run_id"], snapshot_id="full-old",
+        commit_sha=claim["commit_sha"], manager_start_identity=claim["manager_start_identity"],
+        terminal_status="failed")
+    assert released["status"] == "released" and released["terminal_status"] == "failed"
+    assert len(preview(cow_fixture)["candidates"]) == 2
+    assert dict(conn.execute("SELECT * FROM graph_current_full_build_claim_history").fetchone()) == released
+
+
+@pytest.mark.parametrize("overrides", [
+    {"status": None}, {"status": ""}, {"status": "unknown"}, {"status": "RELEASED"},
+    {"terminal_status": None}, {"terminal_status": ""}, {"terminal_status": "unknown"},
+    {"terminal_status": "complete"}, {"terminal_status": "CANDIDATE_READY"},
+    {"released_at": None}, {"released_at": ""}, {"released_at": "not-a-date"},
+    {"released_at": "2026-02-30T04:58:21Z"}, {"released_at": "2026-09-06T24:00:00Z"},
+    {"released_at": "2026-09-06T04:58:60Z"}, {"released_at": "0000-01-01T00:00:00Z"},
+    {"released_at": "2026-09-06T04:58:21"}, {"released_at": "2026-09-06T04:58:21+00:00"},
+    {"released_at": "2026-09-06T04:58:21.000Z"}, {"released_at": "2026-09-06T04:58:21z"},
+    {"released_at": " 2026-09-06T04:58:21Z"},
+    *({field: value} for field in ("claim_id", "run_id", "commit_sha", "manager_epoch",
+                                   "manager_start_identity", "manager_started_at", "acquired_at")
+      for value in (None, "", " ")),
+    {"claim_id": "\x00broken"}, {"run_id": "run\n"}, {"manager_epoch": "\tepoch"},
+    {"commit_sha": "63472f6"}, {"commit_sha": "z" * 40}, {"commit_sha": "a" * 41},
+    {"manager_start_identity": "sha256:invalid"}, {"manager_start_identity": "sha256:" + "z" * 64},
+    {"manager_pid": None}, {"manager_pid": 0}, {"manager_pid": -1}, {"manager_pid": "unknown"},
+    {"manager_started_at": "2026-02-30T04:42:17Z"}, {"acquired_at": "2026-09-06T04:54:06"},
+])
+def test_incomplete_or_noncanonical_released_claim_remains_protective(cow_fixture, overrides):
+    conn = cow_fixture[0]
+    # A damaged/legacy store can contain NULL even though the native schema
+    # forbids it. Preserve every native field while loosening fixture constraints.
+    conn.executescript("CREATE TABLE claim_fixture AS SELECT * FROM graph_current_full_build_claim_history; "
+                       "DROP TABLE graph_current_full_build_claim_history; "
+                       "ALTER TABLE claim_fixture RENAME TO graph_current_full_build_claim_history;")
+    _insert_claim(conn, **overrides)
+    assert preview(cow_fixture)["candidates"] == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("commit_sha", b"a" * 40), ("commit_sha", b"a" * 64),
+    ("commit_sha", "a" * 40 + "\x00malformed"), ("commit_sha", "a" * 64 + "\x00malformed"),
+    ("manager_start_identity", "sha256:" + "a" * 64 + "\x00malformed"),
+    *((field, ("full-old" if field == "snapshot_id" else _OBSERVED_RELEASED_CLAIM[field]).encode()) for field in
+      ("claim_id", "snapshot_id", "run_id", "manager_epoch", "manager_start_identity",
+       "released_at", "manager_started_at", "acquired_at", "status", "terminal_status")),
+    *((field, _OBSERVED_RELEASED_CLAIM[field] + "\x00malformed") for field in
+      ("released_at", "manager_started_at", "acquired_at", "status", "terminal_status")),
+])
+def test_native_text_affinity_cannot_make_blob_or_nul_proof_canonical(cow_fixture, field, value):
+    conn = cow_fixture[0]
+    # Keep native schema: TEXT affinity can still store BLOB. SQLite string
+    # length/GLOB/substr can also ignore a NUL suffix in a stored TEXT value.
+    claim = _insert_claim(conn, **{field: value})
+    stored_type = conn.execute("SELECT typeof(" + field + ") FROM graph_current_full_build_claim_history").fetchone()[0]
+    assert stored_type == ("blob" if isinstance(value, bytes) else "text")
+    before_changes = conn.total_changes
+    assert preview(cow_fixture)["candidates"] == []
+    assert conn.total_changes == before_changes
+    assert dict(conn.execute("SELECT * FROM graph_current_full_build_claim_history").fetchone()) == claim
+
+
+@pytest.mark.parametrize("field", ["claim_id", "run_id", "manager_epoch"])
+def test_owner_identity_boundaries_match_complete_native_strip_set(cow_fixture, field):
+    conn = cow_fixture[0]
+    claim = _insert_claim(conn)
+    # Behavioral oracle is the producer's actual Python normalization, including
+    # control separators and Unicode whitespace; interior characters stay valid.
+    whitespace = [chr(point) for point in range(sys.maxunicode + 1) if chr(point).isspace()]
+    for space in whitespace:
+        for raw in (space, space + "owner", "owner" + space, "owner" + space + "identity"):
+            conn.execute("UPDATE graph_current_full_build_claim_history SET " + field + "=?", (raw,))
+            conn.commit()
+            claim[field] = raw
+            before_changes = conn.total_changes
+            pins = cow._live_pins(conn, "proj")
+            if not raw.strip() or raw.strip() != raw:
+                with pytest.raises(cow.CowRefusal, match="cow_snapshot_live_or_retained"):
+                    cow._eligible(conn, "proj", "full-old", pins)
+            else:
+                cow._eligible(conn, "proj", "full-old", pins)
+            assert conn.total_changes == before_changes
+            assert dict(conn.execute("SELECT * FROM graph_current_full_build_claim_history").fetchone()) == claim
+
+
+def test_native_acquire_normalizes_boundaries_and_preserves_internal_unicode(cow_fixture):
+    conn, _, base, _, _ = cow_fixture
+    sid = "full-native-normalized"
+    base.rename(base.with_name(sid))
+    conn.execute("DELETE FROM graph_snapshots WHERE snapshot_id='full-old'")
+    conn.commit()
+    claim = snapshots.acquire_current_full_build_claim(
+        conn, "\u00a0proj\u3000", run_id="\u00a0run\u00a0identity\u3000",
+        snapshot_id="\u2003" + sid + "\x1c", commit_sha=_OBSERVED_RELEASED_CLAIM["commit_sha"],
+        manager_epoch="\u2003epoch\u2003identity\x1c", manager_pid=_OBSERVED_RELEASED_CLAIM["manager_pid"],
+        manager_started_at=_OBSERVED_RELEASED_CLAIM["manager_started_at"],
+        manager_start_identity=_OBSERVED_RELEASED_CLAIM["manager_start_identity"])
+    assert claim["project_id"] == "proj" and claim["snapshot_id"] == sid
+    assert claim["run_id"] == "run\u00a0identity" and claim["manager_epoch"] == "epoch\u2003identity"
+    released = snapshots.terminalize_current_full_build_claim(
+        conn, "proj", claim_id=claim["claim_id"], run_id=claim["run_id"], snapshot_id=sid,
+        commit_sha=claim["commit_sha"], manager_start_identity=claim["manager_start_identity"],
+        terminal_status="failed")
+    conn.execute("INSERT INTO graph_snapshots(project_id,snapshot_id,snapshot_kind,status,created_at,commit_sha) "
+                 "VALUES('proj',?,'full','superseded','2020-01-01',?)", (sid, claim["commit_sha"]))
+    conn.commit()
+    assert len(preview(cow_fixture)["candidates"]) == 2
+    assert dict(conn.execute("SELECT * FROM graph_current_full_build_claim_history").fetchone()) == released
+
+
+@pytest.mark.parametrize("column", ["released_at", "terminal_status", "claim_id", "run_id", "commit_sha",
+                                    "manager_epoch", "manager_pid", "manager_started_at",
+                                    "manager_start_identity", "acquired_at"])
+def test_released_claim_schema_missing_proof_refuses(cow_fixture, column):
+    conn = cow_fixture[0]
+    _insert_claim(conn)
+    # Rebuild a partial legacy fixture schema, including omissions of indexed
+    # identity columns; never use a schema bypass or the original governance DB.
+    fields = [r[1] for r in conn.execute("PRAGMA table_info(graph_current_full_build_claim_history)")
+              if r[1] != column]
+    conn.executescript("CREATE TABLE claim_fixture AS SELECT " + ",".join(fields) +
+                       " FROM graph_current_full_build_claim_history; "
+                       "DROP TABLE graph_current_full_build_claim_history; "
+                       "ALTER TABLE claim_fixture RENAME TO graph_current_full_build_claim_history;")
+    conn.commit()
+    with pytest.raises(cow.CowRefusal, match="cow_live_schema_incomplete:graph_current_full_build_claim_history"):
+        cow._live_pins(conn, "proj")
+
+
+@pytest.mark.parametrize("fence", ["same_sid_active", "process"])
+def test_released_history_never_overrides_current_full_writer(cow_fixture, monkeypatch, fence):
+    conn = cow_fixture[0]
+    _insert_claim(conn)
+    if fence == "same_sid_active":
+        _insert_claim(conn, claim_id="active-same-sid", run_id="active-run", status="active",
+                      released_at="", terminal_status="")
+    else:
+        monkeypatch.setattr(server, "_CURRENT_FULL_BUILD_KEYS", {("proj", "fixture-current-full")})
+    with pytest.raises(cow.CowRefusal, match="cow_current_full_writer_active"):
+        cow._live_pins(conn, "proj")
+
+
+@pytest.mark.parametrize("reference", ["active_ref", "newest", "retention", "pending", "backlog", "qa", "lease"])
+def test_independent_reference_wins_over_released_claim(cow_fixture, reference):
+    conn, _, _, config, _ = cow_fixture
+    _insert_claim(conn)
+    if reference == "active_ref":
+        conn.execute("UPDATE graph_snapshot_refs SET snapshot_id='full-old'")
+    elif reference == "newest":
+        conn.execute("UPDATE graph_snapshots SET created_at='2999' WHERE snapshot_id='full-old'")
+    elif reference == "retention":
+        config["governance"]["snapshot_retention"]["keep_last_n"] = 2
+    elif reference == "pending":
+        conn.execute("INSERT INTO pending_scope_reconcile(project_id,commit_sha,queued_at,status,snapshot_id) "
+                     "VALUES('proj','fixture','2026','pending','full-old')")
+    elif reference == "backlog":
+        conn.execute("INSERT INTO backlog_bugs(bug_id,status,takeover_json,created_at,updated_at) "
+                     "VALUES('fixture','OPEN','{\"snapshot_id\":\"full-old\"}','2026','2026')")
+    elif reference == "qa":
+        conn.execute("CREATE TABLE fixture_qa_sessions(project_id,snapshot_id,status)")
+        conn.execute("INSERT INTO fixture_qa_sessions VALUES('proj','full-old','active')")
+    else:
+        conn.execute("INSERT INTO graph_semantic_jobs(project_id,snapshot_id,node_id,status,lease_expires_at) "
+                     "VALUES('proj','full-old','fixture','ai_complete','2999-01-01T00:00:00+00:00')")
+    conn.commit()
+    assert preview(cow_fixture)["candidates"] == []
+
+
+def test_released_claim_with_present_future_lease_stays_protective(cow_fixture):
+    conn = cow_fixture[0]
+    conn.execute("ALTER TABLE graph_current_full_build_claim_history ADD COLUMN lease_expires_at TEXT")
+    _insert_claim(conn, lease_expires_at="2999-01-01T00:00:00+00:00")
+    assert preview(cow_fixture)["candidates"] == []
+
+
+def test_released_label_in_other_store_stays_protective(cow_fixture):
+    conn = cow_fixture[0]
+    _insert_claim(conn)
+    conn.execute("INSERT INTO graph_query_traces(trace_id,project_id,snapshot_id,query_source,query_purpose,"
+                 "status,created_at,updated_at) VALUES('fixture','proj','full-old','test','test','released','2026','2026')")
+    conn.commit()
+    assert preview(cow_fixture)["candidates"] == []
+    assert "released" not in cow.TERMINAL
+
+
+def test_released_histories_do_not_consume_bounded_live_row_budget(cow_fixture, monkeypatch):
+    conn = cow_fixture[0]
+    monkeypatch.setattr(cow, "MAX_LIVE_ROWS", 2)
+    for index in range(7):
+        _insert_claim(conn, claim_id=f"history-{index}", run_id=f"run-{index}",
+                      terminal_status="candidate_ready" if index % 2 else "failed")
+    assert len(preview(cow_fixture)["candidates"]) == 2
+    assert conn.execute("SELECT COUNT(*) FROM graph_current_full_build_claim_history").fetchone()[0] == 7
+    # Valid histories must not hide a later live row or dilute its own budget.
+    _insert_claim(conn, claim_id="unknown", run_id="unknown-run", status="unknown")
+    assert preview(cow_fixture)["candidates"] == []
+    for index in range(2):
+        _insert_claim(conn, claim_id=f"unknown-{index}", run_id=f"unknown-run-{index}", status="unknown")
+    with pytest.raises(cow.CowRefusal, match="cow_live_window_unbounded:graph_current_full_build_claim_history"):
+        cow._live_pins(conn, "proj")
+
+
 def test_source_symlink_hardlink_and_hash_difference_refuse(cow_fixture):
     _, _, base, *_ = cow_fixture
     source, target = (base / rel for rel in cow.PAIRS[0])
