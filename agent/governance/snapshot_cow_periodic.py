@@ -21,7 +21,7 @@ from .errors import ValidationError
 
 GiB = 1024**3
 FIELDS = {'enabled', 'interval_seconds', 'snapshot_ids', 'exclude_snapshot_ids',
-          'max_snapshots_per_run', 'max_pairs_per_run', 'max_hash_bytes_per_run'}
+          'max_snapshots_per_run', 'max_pairs_per_run', 'max_hash_bytes_per_run', 'max_run_seconds'}
 AUDIT_FIELDS = {'revision', 'operator_principal_hash', 'custody', 'updated_at'}
 ENVIRONMENTAL = {'cow_external_archive_not_configured', 'cow_archive_unavailable',
                  'cow_archive_mount_unverified', 'cow_archive_volume_mismatch',
@@ -42,7 +42,8 @@ def parse_policy(value: dict[str, Any], *, stored: bool = True) -> dict[str, Any
     result = {'enabled': enabled}
     for key, default, lower, upper in (
         ('interval_seconds', 3600, 60, 86400), ('max_snapshots_per_run', 1, 1, 20),
-        ('max_pairs_per_run', 2, 2, 40), ('max_hash_bytes_per_run', 64 * GiB, 1, 128 * GiB)):
+        ('max_pairs_per_run', 2, 2, 40), ('max_hash_bytes_per_run', 64 * GiB, 1, 128 * GiB),
+        ('max_run_seconds', 60, 1, 600)):
         item = value.get(key, default)
         if type(item) is not int or not lower <= item <= upper:
             raise ValidationError('periodic_budget_invalid:' + key)
@@ -327,7 +328,7 @@ class PeriodicController:
                 readiness = self._readiness(conn)
                 self._inflight = True
                 meter = cow.DigestMeter(policy['max_hash_bytes_per_run'],
-                                        deadline=time.monotonic() + 60)
+                                        deadline=time.monotonic() + policy['max_run_seconds'])
                 base_budgets = cow._budgets(cow._config(self.project_id))
                 snapshot_limit = min(policy['max_snapshots_per_run'], base_budgets['max_snapshots'])
                 pair_limit = min(policy['max_pairs_per_run'], base_budgets['max_pairs'])
@@ -572,6 +573,7 @@ class PeriodicController:
             'effect_classification': state.get('effect_classification', 'unknown'),
             'observed_net_delta': state.get('observed_net_delta'), 'digest_bytes': state.get('digest_bytes', 0),
             'effective_max_snapshots_per_run': 1, 'effective_complete_pairs_per_snapshot': 2,
+            'effective_max_run_seconds': policy['max_run_seconds'] if policy else None,
             'scheduler_revision': state['revision'], 'scheduler_receipt_hash': cow._digest(state),
             'hold_release_available': False,
             'next_action': ('inspect_native_operation_then_release_hold' if state.get('operation_id') else

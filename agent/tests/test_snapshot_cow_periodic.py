@@ -76,6 +76,88 @@ def test_policy_strict_rejects_incompatible_and_client_authority(bad):
         periodic.parse_policy(bad, stored=False)
 
 
+@pytest.mark.parametrize('value', [1, 60, 600])
+def test_run_time_budget_policy_boundaries_and_old_default(value):
+    assert periodic.parse_policy({}, stored=False)['max_run_seconds'] == 60
+    assert periodic.parse_policy({}, stored=True)['max_run_seconds'] == 60
+    assert periodic.parse_policy({'max_run_seconds': value}, stored=False)['max_run_seconds'] == value
+
+
+@pytest.mark.parametrize('bad', [True, False, 1.5, '60', None, 0, -1, 601, [], {}])
+def test_run_time_budget_policy_invalid_no_registry_write(tmp_path, monkeypatch, bad):
+    path = tmp_path / 'budget-registry.json'
+    monkeypatch.setattr(project_service, '_projects_file', lambda: path)
+    project_service._save_projects({'projects': {'proj': {'project_config': {}}}})
+    before = path.read_bytes()
+    with pytest.raises(ValidationError):
+        project_service.update_snapshot_cow_periodic_policy('proj', {'max_run_seconds': bad},
+            expected_revision=0, principal='fixture operator', custody={'fixture': True})
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('budget,elapsed,complete', [(None, 61, False), (300, 61, True), (300, 300, False)])
+@pytest.mark.parametrize('next_budget', [1, 600])
+def test_run_time_budget_native_proof_and_frozen_inflight(
+        controller, monkeypatch, budget, elapsed, complete, next_budget):
+    # Inject an already admitted policy at the controller boundary so the old
+    # scheduler specifically fails its hardcoded60 deadline, independently of
+    # parser support. Native selection, apply, clone, digest and proofs remain real.
+    admitted = periodic.parse_policy(controller.policy)
+    if budget is not None:
+        admitted['max_run_seconds'] = budget
+    monkeypatch.setattr(controller, '_policy', lambda: copy.deepcopy(admitted))
+    now = [1000.0]
+    monkeypatch.setattr(periodic.time, 'monotonic', lambda: now[0])
+    proofs = []
+    original = cow._completed_readback
+    def proof(*args):
+        meter = cow._DIGEST_METER.get()
+        assert meter is not None
+        proofs.append(meter)
+        if len(proofs) == 1:
+            # A prospective budget change plus disablement during actual work
+            # can neither shorten nor extend the original aggregate deadline.
+            admitted.update(enabled=False, revision=2, max_run_seconds=next_budget)
+            controller.configuration_changed()
+            assert controller.status()['active'] and not controller.status()['configured']
+            now[0] += elapsed
+        return original(*args)
+    monkeypatch.setattr(cow, '_completed_readback', proof)
+    assert controller.due() is complete
+    assert proofs and all(meter is proofs[0] for meter in proofs)
+    assert proofs[0].deadline == 1000.0 + (60 if budget is None else budget)
+    assert proofs[0].consumed > 0
+    assert controller._state['policy_revision'] == 1
+    assert controller._state['run_selection']['max_snapshots'] == 1
+    assert controller._state['run_selection']['max_pairs'] == 2
+    assert controller.status()['effective_max_run_seconds'] == next_budget
+    assert controller.status()['next_due_at'] is None and not controller.status()['active']
+    journal = cow._journal_path('proj', controller._state['operation_id'])
+    if complete:
+        assert elapsed > 60 and len(proofs) >= 2
+        assert controller._state['outcome'] == 'complete' and cow._read(journal)['state'] == 'complete'
+        return
+    assert controller.status()['inspect_required']
+    assert cow._read(journal)['state'] == 'partial_or_ambiguous'
+    before = {path: path.read_bytes() for path in (controller.state_path, journal)}
+    # A later enabled larger budget/restart preserves exact held intent and
+    # journal bytes, and never calls apply again or creates a release receipt.
+    controller.policy.update(enabled=True, revision=3, max_run_seconds=600)
+    restarted = periodic.PeriodicController('proj', controller.root, controller.connection_factory,
+        custody_check=controller.custody_check, monotonic=controller.monotonic)
+    restarted._verify(controller.fixture[0])
+    restarted._state = restarted._load()
+    restarted._supported = True
+    restarted._refresh_schedule()
+    monkeypatch.setattr(cleanup, 'apply_stale_artifact_cleanup',
+                        lambda *_a, **_k: pytest.fail('held run replayed'))
+    controller.clock[0] += controller.policy['interval_seconds']
+    assert not restarted.tick() and restarted.status()['inspect_required']
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (controller.directory / 'releases').exists()
+    restarted.stop()
+
+
 def test_disabled_and_first_due_no_catchup(controller):
     assert not controller.tick()
     assert controller.status()['configured'] and not controller.status()['active']
@@ -503,7 +585,8 @@ def test_real_http_periodic_put_auth_disabled_cas_and_stale_no_mutation(
     controller.configuration_changed()
     engine_hash = cow._digest(cow._config('proj'))
     url = '/api/graph-governance/proj/snapshot-cow-periodic/config'
-    body = {'policy': {'enabled': False, 'interval_seconds': 120}, 'expected_revision': 0}
+    body = {'policy': {'enabled': False, 'interval_seconds': 120, 'max_run_seconds': 300},
+            'expected_revision': 0}
     before = path.read_bytes()
     for token, expected in [('', 401), ('invalid', 401), ('worker', 403), ('other', 403)]:
         status, result, headers = periodic_http('PUT', url, body, token)
@@ -514,9 +597,26 @@ def test_real_http_periodic_put_auth_disabled_cas_and_stale_no_mutation(
     assert status == 200, changed
     assert changed['ok'] and changed['policy']['revision'] == 1
     assert changed['policy']['enabled'] is False and changed['policy']['interval_seconds'] == 120
+    assert changed['policy']['max_run_seconds'] == 300
     assert changed['source'] == 'aming_claw_registry' and changed['request_id'].startswith('req-')
     status, readback, _ = periodic_http('GET', url, token='operator')
     assert status == 200 and readback['policy'] == changed['policy']
+    status, effective, _ = periodic_http('GET', url.replace('/config', '/status'), token='operator')
+    assert status == 200 and effective['effective_max_run_seconds'] == 300
+    before = path.read_bytes()
+    for bad in (True, False, 1.5, '60', None, 0, -1, 601, [], {}):
+        status, refused, _ = periodic_http('PUT', url,
+            {'policy': {'enabled': False, 'max_run_seconds': bad}, 'expected_revision': 1}, 'operator')
+        assert status == 400 and refused['writes_performed'] is False
+        assert path.read_bytes() == before
+    for revision, boundary in ((1, 1), (2, 600)):
+        status, changed, _ = periodic_http('PUT', url,
+            {'policy': {'enabled': False, 'max_run_seconds': boundary},
+             'expected_revision': revision}, 'operator')
+        assert status == 200 and changed['policy']['max_run_seconds'] == boundary
+        status, readback, _ = periodic_http('GET', url, token='operator')
+        assert status == 200 and readback['policy'] == changed['policy']
+        assert controller.status()['effective_max_run_seconds'] == boundary
     before = path.read_bytes()
     status, refused, _ = periodic_http('PUT', url, body, 'operator')
     assert status == 400 and refused['error'] == 'periodic_request_refused'

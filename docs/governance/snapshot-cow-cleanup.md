@@ -112,6 +112,7 @@ these endpoints, with the exact project `aming-claw`:
   update entrance for this timer.
 - `GET .../snapshot-cow-periodic/status` distinguishes source `supported`,
   persisted `configured`, and actually in-flight `active`. It reports cadence,
+  effective configured `max_run_seconds`,
   effective window, timestamps, outcome, operation ID, candidate/refusal counts,
   cursor/sweep completeness, digest bytes, hold status and the next action.
   It omits credentials, absolute storage paths and broad configuration blobs.
@@ -138,9 +139,22 @@ including repeated fresh, backup, copy verification and completion proofs,
 debits a scoped run meter. A 64 GiB aggregate cap admits a candidate window of
 about 1.60 GiB when the engine has separately been configured to admit that
 size; 128 GiB can admit the 4 GiB native hard maximum. This arithmetic is not
-proof of candidate eligibility, timing or physical space benefit. A 60-second
-internal deadline gates page admission and native proof checkpoints; it never
-forces cancellation of an irreversible file replacement or filesystem syscall.
+proof of candidate eligibility, timing or physical space benefit.
+
+`max_run_seconds` is a strict integer from 1 to 600, defaulting to 60 when
+absent, including in existing stored policies. Booleans and other types refuse.
+Each newly admitted run freezes one absolute monotonic deadline from this
+budget. The same deadline gates page admission and all scoped native proof
+checkpoints; it is never reset between phases or extended by a policy change
+or disablement during the run. It cannot cancel an irreversible file replacement
+or a filesystem syscall already in progress.
+
+Changing the budget applies prospectively. Restart or a larger budget cannot
+extend, replay, or release a held failed run; explicit native inspection/recovery
+and the existing exact hold-release proof remain required. A larger budget,
+such as 300 seconds, needs separate live qualification for a future operation.
+It does not turn a failed 60-second attempt into a successful canary or prove
+physical space benefit or historical candidate eligibility.
 
 The first due time is now plus the interval, including after enablement or
 cadence changes. There is no startup replay or accumulated catch-up queue.
