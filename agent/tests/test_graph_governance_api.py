@@ -197019,6 +197019,21 @@ def _worldref_production_git_repo(tmp_path):
     )
 
 
+def _worldref_native_main_git_repo(tmp_path):
+    root, _branch, base_head, target_head = _worldref_production_git_repo(
+        tmp_path
+    )
+    subprocess.run(
+        ["git", "update-ref", "refs/heads/main", target_head],
+        cwd=root, check=True,
+    )
+    # A colliding tag must never take precedence over the managed branch.
+    subprocess.run(
+        ["git", "tag", "main", base_head], cwd=root, check=True,
+    )
+    return root, base_head, target_head
+
+
 def _stub_worldref_seal_git(monkeypatch, tmp_path, *, head="b" * 40):
     monkeypatch.setattr(
         server.project_service,
@@ -197437,6 +197452,226 @@ def test_worldref_symbolic_target_projects_formal_seal_from_real_git_repo(
     assert get_integration_epoch(conn, PID, epoch.batch_id).status == (
         "aborted_with_exception"
     )
+
+
+def test_worldref_native_bare_main_selects_and_seals_exact_branch(
+    conn, monkeypatch, tmp_path,
+):
+    root, base_head, target_head = _worldref_native_main_git_repo(tmp_path)
+    epoch = _worldref_seal_server_fixture(
+        conn, current_head=base_head, target_ref="main",
+    )
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root", lambda *_a, **_k: root,
+    )
+    action = server._server_integration_epoch_resume_payload(conn, epoch)
+    assert action["id"] == "integration_epoch_worldref_seal_linear_unlock"
+    assert action["action_input"]["target_ref"] == "main"
+    assert action["action_input"]["target_world_head"] == target_head
+    assert action["action_input"]["epoch_world_head"] == base_head
+    monkeypatch.setattr(
+        server, "_require_integration_epoch_release_authority",
+        lambda *_a, **_k: {
+            "role": "observer", "principal_id": "native-main-observer",
+            "role_source": "observer_session_route_token_ref",
+        },
+    )
+    sealed = server.handle_integration_epoch_worldref_seal_linear_unlock(
+        _ctx({"project_id": PID, "batch_id": epoch.batch_id}, method="POST",
+             body=action["action_input"])
+    )
+    assert sealed["ok"] is True
+    assert sealed["replayed"] is False
+    after = get_integration_epoch(conn, PID, epoch.batch_id)
+    assert after.status == "aborted_with_exception"
+    assert after.target_ref == "main"
+    assert after.current_head == base_head
+
+
+@pytest.mark.parametrize("change", ["moved", "missing", "noncommit", "dirty"])
+def test_worldref_native_main_second_read_refuses_drift_without_writes(
+    conn, monkeypatch, tmp_path, change,
+):
+    root, base_head, target_head = _worldref_native_main_git_repo(tmp_path)
+    epoch = _worldref_seal_server_fixture(
+        conn, current_head=base_head, target_ref="main",
+    )
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root", lambda *_a, **_k: root,
+    )
+    action = server._server_integration_epoch_resume_payload(conn, epoch)
+    assert action["id"] == "integration_epoch_worldref_seal_linear_unlock"
+    monkeypatch.setattr(
+        server, "_require_integration_epoch_release_authority",
+        lambda *_a, **_k: {
+            "role": "observer", "principal_id": "native-main-drift-observer",
+            "role_source": "observer_session_route_token_ref",
+        },
+    )
+    if change == "moved":
+        tree = subprocess.run(
+            ["git", "show", "-s", "--format=%T", target_head],
+            cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        replacement = subprocess.run(
+            ["git", "commit-tree", tree, "-p", target_head, "-m", "moved"],
+            cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    elif change == "noncommit":
+        replacement = subprocess.run(
+            ["git", "hash-object", "base.txt"],
+            cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    else:
+        replacement = ""
+    production_git_output = server._git_output
+    reads = 0
+
+    def change_after_first_read(project_root, args, *, timeout=5):
+        nonlocal reads
+        value = production_git_output(project_root, args, timeout=timeout)
+        if args == ["rev-parse", "--verify", "--end-of-options",
+                    "refs/heads/main^{commit}"]:
+            reads += 1
+            if reads == 1:
+                if change == "moved":
+                    subprocess.run(
+                        ["git", "update-ref", "refs/heads/main", replacement,
+                         target_head], cwd=root, check=True,
+                    )
+                elif change == "noncommit":
+                    (root / ".git" / "refs" / "heads" / "main").write_text(
+                        f"{replacement}\n", encoding="ascii",
+                    )
+                elif change == "missing":
+                    subprocess.run(
+                        ["git", "update-ref", "-d", "refs/heads/main",
+                         target_head], cwd=root, check=True,
+                    )
+                else:
+                    (root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        return value
+
+    monkeypatch.setattr(server, "_git_output", change_after_first_read)
+    status, refusal = server.handle_integration_epoch_worldref_seal_linear_unlock(
+        _ctx({"project_id": PID, "batch_id": epoch.batch_id}, method="POST",
+             body=action["action_input"])
+    )
+    assert status == 409
+    assert refusal["error"] == (
+        "integration_epoch_worldref_seal_clean_world_required" if change == "dirty"
+        else "integration_epoch_worldref_seal_target_ref_drift"
+    )
+    assert refusal["zero_write_rejection"] is True
+    assert reads == (1 if change == "dirty" else 2)
+    assert get_integration_epoch(conn, PID, epoch.batch_id) == epoch
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_integration_epoch_worldref_seals "
+        "WHERE project_id = ? AND batch_id = ?", (PID, epoch.batch_id),
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("change", ["missing", "noncommit", "dirty", "unregistered"])
+def test_worldref_native_main_first_read_requires_valid_clean_branch(
+    conn, monkeypatch, tmp_path, change,
+):
+    root, base_head, _target_head = _worldref_native_main_git_repo(tmp_path)
+    epoch = _worldref_seal_server_fixture(
+        conn, current_head=base_head, target_ref="main",
+    )
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root",
+        lambda *_a, **_k: None if change == "unregistered" else root,
+    )
+    if change == "missing":
+        subprocess.run(
+            ["git", "update-ref", "-d", "refs/heads/main"],
+            cwd=root, check=True,
+        )
+    elif change == "noncommit":
+        blob = subprocess.run(
+            ["git", "hash-object", "base.txt"], cwd=root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        (root / ".git" / "refs" / "heads" / "main").write_text(
+            f"{blob}\n", encoding="ascii",
+        )
+    elif change == "dirty":
+        (root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+    before = conn.total_changes
+    action = server._server_integration_epoch_resume_payload(conn, epoch)
+    assert action["id"] == "integration_epoch_worldref_seal_refused"
+    assert action["writes_performed"] is False
+    assert get_integration_epoch(conn, PID, epoch.batch_id) == epoch
+    assert conn.total_changes == before
+
+
+def test_worldref_native_main_refuses_target_outside_old_epoch_ancestry(
+    conn, monkeypatch, tmp_path,
+):
+    root, base_head, _target_head = _worldref_native_main_git_repo(tmp_path)
+    tree = subprocess.run(
+        ["git", "show", "-s", "--format=%T", base_head],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    unrelated = subprocess.run(
+        ["git", "commit-tree", tree, "-m", "unrelated"],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", "refs/heads/main", unrelated],
+        cwd=root, check=True,
+    )
+    epoch = _worldref_seal_server_fixture(
+        conn, current_head=base_head, target_ref="main",
+    )
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root", lambda *_a, **_k: root,
+    )
+    monkeypatch.setattr(
+        server, "_require_integration_epoch_release_authority",
+        lambda *_a, **_k: {
+            "role": "observer", "principal_id": "native-main-ancestry-observer",
+            "role_source": "observer_session_route_token_ref",
+        },
+    )
+    request = {
+        "project_id": PID, "batch_id": epoch.batch_id, "epoch_id": epoch.epoch_id,
+        "target_ref": "main",
+    }
+    status, refusal = server.handle_integration_epoch_worldref_seal_linear_unlock(
+        _ctx({"project_id": PID, "batch_id": epoch.batch_id}, method="POST",
+             body=request)
+    )
+    assert status == 409
+    assert refusal["error"] == "integration_epoch_worldref_seal_target_not_descendant"
+    assert get_integration_epoch(conn, PID, epoch.batch_id) == epoch
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_integration_epoch_worldref_seals "
+        "WHERE project_id = ? AND batch_id = ?", (PID, epoch.batch_id),
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("bad_ref", [
+    "HEAD", "codex/worldref-production", "refs/tags/main",
+    "refs/heads/main^", "refs/heads/main@{1}", "refs/heads/missing",
+])
+def test_worldref_epoch_target_alias_does_not_widen_ref_grammar(
+    conn, monkeypatch, tmp_path, bad_ref,
+):
+    root, base_head, _target_head = _worldref_native_main_git_repo(tmp_path)
+    epoch = _worldref_seal_server_fixture(
+        conn, current_head=base_head, target_ref=bad_ref,
+    )
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root", lambda *_a, **_k: root,
+    )
+    before = conn.total_changes
+    action = server._server_integration_epoch_resume_payload(conn, epoch)
+    assert action["id"] == "integration_epoch_worldref_seal_refused"
+    assert action["writes_performed"] is False
+    assert get_integration_epoch(conn, PID, epoch.batch_id) == epoch
+    assert conn.total_changes == before
 
 
 def test_worldref_symbolic_target_move_between_reads_is_zero_write(

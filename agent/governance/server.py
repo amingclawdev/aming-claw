@@ -91814,6 +91814,18 @@ def _integration_epoch_pending_merge_action(conn, epoch) -> dict[str, Any]:
     return {}
 
 
+def _integration_epoch_worldref_resolve_target_commit(
+    repo_root: Path, target_ref: str
+) -> str:
+    """Resolve the one bare branch name stored by native integration epochs."""
+
+    return _parallel_branch_resolve_canonical_commit(
+        repo_root,
+        "refs/heads/main" if target_ref == "main" else target_ref,
+        field="target_ref",
+    )
+
+
 def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
     """Project incomplete-fanin reconcile input from canonical Git HEAD."""
 
@@ -91922,10 +91934,8 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
             else:
                 try:
                     target_world_head = (
-                        _parallel_branch_resolve_canonical_commit(
-                            root,
-                            epoch.target_ref,
-                            field="target_ref",
+                        _integration_epoch_worldref_resolve_target_commit(
+                            root, epoch.target_ref
                         ).lower()
                     )
                 except Exception:
@@ -237080,10 +237090,8 @@ def handle_integration_epoch_worldref_seal_linear_unlock(ctx: RequestContext):
                 "zero_write_rejection": True,
             }
         try:
-            first_target_head = _parallel_branch_resolve_canonical_commit(
-                root,
-                epoch.target_ref,
-                field="target_ref",
+            first_target_head = _integration_epoch_worldref_resolve_target_commit(
+                root, epoch.target_ref
             ).lower()
         except Exception:
             first_target_head = ""
@@ -237112,11 +237120,20 @@ def handle_integration_epoch_worldref_seal_linear_unlock(ctx: RequestContext):
         conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            second_target_head = _parallel_branch_resolve_canonical_commit(
-                root,
-                epoch.target_ref,
-                field="target_ref",
-            ).lower()
+            if not _git_clean_worktree_verified(root):
+                raise IntegrationEpochWorldRefSealError(
+                    "integration_epoch_worldref_seal_clean_world_required",
+                    "target worktree changed during seal precheck",
+                )
+            try:
+                second_target_head = _integration_epoch_worldref_resolve_target_commit(
+                    root, epoch.target_ref
+                ).lower()
+            except Exception as exc:
+                raise IntegrationEpochWorldRefSealError(
+                    "integration_epoch_worldref_seal_target_ref_drift",
+                    "canonical target ref became unavailable during seal precheck",
+                ) from exc
             if second_target_head != first_target_head:
                 raise IntegrationEpochWorldRefSealError(
                     "integration_epoch_worldref_seal_target_ref_drift",
