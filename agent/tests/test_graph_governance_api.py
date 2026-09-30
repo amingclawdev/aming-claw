@@ -5135,6 +5135,8 @@ def test_direct_qa_http_facade_paired_transition_and_zero_write_rejections(
     with pytest.raises(GovernanceError):
         append(copy.deepcopy(body), token_override="invalid-qa-session-token")
     assert conn.total_changes == before
+
+
     generic = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": world["task_id"]},
@@ -241645,3 +241647,431 @@ def test_rev10_postmerge_current_full_refuses_stale_or_foreign_route(
         "postmerge_route_scope_mismatch", "route_token_ref_scope_mismatch",
     }
     assert conn.total_changes == before
+
+def _legacy_operator_current_full_recovery_world(conn, monkeypatch, tmp_path):
+    """A real main worktree and durable legacy activation, without provenance."""
+
+    from agent.governance.checkout_provenance import describe_checkout
+    from agent.governance.graph_rule_fingerprint import build_graph_rule_fingerprint
+
+    owner = tmp_path / "owner"
+    registered = tmp_path / "registered"
+    owner.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(owner)], check=True)
+    subprocess.run(["git", "-C", str(owner), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(owner), "config", "user.name", "Test"], check=True)
+    (owner / "source.py").write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(owner), "add", "source.py"], check=True)
+    subprocess.run(["git", "-C", str(owner), "commit", "-qm", "source"], check=True)
+    subprocess.run(
+        ["git", "-C", str(owner), "worktree", "add", "-q", "-b", "registered", str(registered)],
+        check=True,
+    )
+    head = subprocess.check_output(
+        ["git", "-C", str(owner), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    snapshot_id = "full-legacy-operator-recovery"
+    origin_run_id = "seethis-main-owner-bootstrap-20260930-02"
+    run_id = "seethis-main-owner-activate-20260930-01"
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(
+        server.project_service, "resolve_project_root",
+        lambda _project_id, *_args, **_kwargs: registered,
+    )
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_args: registered)
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _CountingNoCloseConn(conn))
+    monkeypatch.setattr(
+        store, "_graph_activation_policy_for_connection",
+        lambda _conn: {
+            "runtime_plane": "stable", "active_graph_activation_allowed": True,
+            "project_id": PID,
+        },
+    )
+    store.ensure_schema(conn)
+    store.create_graph_snapshot(
+        conn, PID, snapshot_id="full-legacy-prior-active", commit_sha=head,
+        snapshot_kind="full", graph_json=_graph(),
+    )
+    store.activate_graph_snapshot(
+        conn, PID, "full-legacy-prior-active", auto_rebuild_projection=False,
+        post_commit_hooks=False, schema_ready=True,
+    )
+    fingerprint = build_graph_rule_fingerprint(owner, commit_sha=head)
+    notes = {
+        "run_id": origin_run_id,
+        "checkout_provenance": describe_checkout(owner, project_id=PID),
+        "graph_rule_fingerprint": fingerprint,
+        "full_reconcile_anchor": {
+            "project_id": PID, "snapshot_id": snapshot_id,
+            "anchor_commit": head, "reconcile_mode": "full",
+            "structure_rule_fingerprint": fingerprint["fingerprint"],
+            "rebuild_input_fingerprint": fingerprint["rebuild_input_fingerprint"],
+        },
+    }
+    store.create_graph_snapshot(
+        conn, PID, snapshot_id=snapshot_id, commit_sha=head,
+        snapshot_kind="full", graph_json=_graph(), notes=json.dumps(notes),
+    )
+    conn.execute(
+        "INSERT INTO graph_current_full_build_claim_history "
+        "(claim_id,project_id,snapshot_id,run_id,commit_sha,status,manager_epoch,"
+        "manager_pid,manager_started_at,manager_start_identity,acquired_at,released_at,terminal_status) "
+        "VALUES (?,?,?,?,?,'released','test-manager',1,?,?,?,?,'candidate_ready')",
+        ("claim-legacy-operator", PID, snapshot_id, origin_run_id, head,
+         "2026-09-30T00:00:00Z", "test-manager:1",
+         "2026-09-30T00:00:00Z", "2026-09-30T00:01:00Z"),
+    )
+    activation = store.activate_graph_snapshot(
+        conn, PID, snapshot_id, auto_rebuild_projection=False,
+        post_commit_hooks=False, schema_ready=True,
+    )
+    original_evidence = {
+        "phase": "atomic_finalize_complete", "activate_requested": True,
+        "idempotency_scope": {}, "request_id": "req-original-operator",
+        "reconcile_event_id": 0, "provenance_id": "",
+    }
+    store.record_reconcile_run_metric(
+        conn, PID, run_id=run_id, snapshot_id=snapshot_id,
+        commit_sha=head, snapshot_kind="full", strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild", status="complete", elapsed_ms=1,
+        evidence=original_evidence, created_at="2026-09-30T00:00:00Z",
+        schema_ready=True,
+    )
+    conn.commit()
+    body = {
+        "project_id": PID, "recover_operator_provenance": True,
+        "snapshot_id": snapshot_id, "run_id": run_id,
+        "recovery_run_id": "seethis-main-owner-provenance-repair-20260930-01",
+        "target_commit_sha": head, "expected_old_snapshot_id": snapshot_id,
+        "project_root": str(owner.resolve()),
+    }
+    return {
+        "owner": owner, "registered": registered, "head": head,
+        "snapshot_id": snapshot_id, "run_id": run_id, "body": body,
+        "activation": activation,
+    }
+
+
+def test_operator_current_full_atomic_event_provenance_and_terminal_replay(
+    monkeypatch, tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    conn = sqlite3.connect(tmp_path / "operator-atomic.sqlite")
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    store.ensure_schema(conn)
+    conn.commit()
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _CountingNoCloseConn(conn))
+    monkeypatch.setattr(
+        store, "_graph_activation_policy_for_connection",
+        lambda _conn: {
+            "runtime_plane": "stable", "active_graph_activation_allowed": True,
+            "project_id": PID,
+        },
+    )
+    body = {
+        "target_commit_sha": head, "run_id": "operator-atomic-run",
+        "activate": True, "semantic_enrich": False,
+    }
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=body)
+    )
+    assert status == 201, result
+    assert result["activated"] is True
+    terminal = store.current_full_active_terminal_tuple(
+        conn, project_id=PID, run_id=body["run_id"],
+        target_commit_sha=head, expected_scope={}, snapshot_id="full-current",
+    )
+    assert terminal["valid"] is True, terminal["errors"]
+    assert terminal["operator_event_id"].startswith("gref-")
+    operator_event = conn.execute(
+        "SELECT * FROM graph_ref_events WHERE event_id=?",
+        (terminal["operator_event_id"],),
+    ).fetchone()
+    assert operator_event["operation_type"] == "operator_reconcile"
+    assert terminal["reconcile_event_id"] == 0
+    assert terminal["provenance"]["provenance_id"]
+    assert len(calls) == 1
+    before = conn.total_changes
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=body)
+    )
+    assert replay_status == 200, replay
+    assert conn.total_changes == before
+    assert len(calls) == 1
+    conn.execute(
+        "UPDATE graph_ref_events SET old_commit='forged' WHERE project_id=? AND event_id=?",
+        (PID, terminal["operator_event_id"]),
+    )
+    conn.commit()
+    forged_terminal = store.current_full_active_terminal_tuple(
+        conn, project_id=PID, run_id=body["run_id"],
+        target_commit_sha=head, expected_scope={}, snapshot_id="full-current",
+    )
+    assert forged_terminal["valid"] is False
+    assert "terminal_operator_event_invalid" in forged_terminal["errors"]
+    conn.close()
+
+
+def test_operator_current_full_atomic_failure_rolls_back_activation_and_event(
+    monkeypatch, tmp_path,
+):
+    head, _calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    conn = sqlite3.connect(tmp_path / "operator-rollback.sqlite")
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    store.ensure_schema(conn)
+    conn.commit()
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _CountingNoCloseConn(conn))
+    monkeypatch.setattr(
+        store, "_graph_activation_policy_for_connection",
+        lambda _conn: {
+            "runtime_plane": "stable", "active_graph_activation_allowed": True,
+            "project_id": PID,
+        },
+    )
+    def unavailable(*_args, **_kwargs):
+        raise ValueError("provenance sink unavailable")
+    monkeypatch.setattr(store, "record_current_full_reconcile_provenance", unavailable)
+    body = {
+        "target_commit_sha": head, "run_id": "operator-rollback-run",
+        "activate": True, "semantic_enrich": False,
+    }
+    with pytest.raises(ValueError, match="provenance sink unavailable"):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=body)
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+        (PID,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id=? "
+        "AND operation_type='operator_reconcile'", (PID,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance WHERE project_id=?",
+        (PID,),
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_operator_current_full_recovery_preserves_history_and_cannot_grant_direct_pass(
+    conn, monkeypatch, tmp_path,
+):
+    case = _legacy_operator_current_full_recovery_world(conn, monkeypatch, tmp_path)
+    metric_before = dict(conn.execute(
+        "SELECT * FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+        (PID, case["run_id"]),
+    ).fetchone())
+    ref_before = dict(conn.execute(
+        "SELECT * FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+        (PID,),
+    ).fetchone())
+    status, recovered = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=case["body"])
+    )
+    assert status == 201, recovered
+    assert recovered["recovery_verified"] is True
+    assert dict(conn.execute(
+        "SELECT * FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+        (PID, case["run_id"]),
+    ).fetchone()) == metric_before
+    assert dict(conn.execute(
+        "SELECT * FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+        (PID,),
+    ).fetchone()) == ref_before
+    active = store.get_active_graph_snapshot(conn, PID)
+    binding = store._current_full_snapshot_provenance_binding(conn, PID, active)
+    assert binding["recovery_verified"] is True
+    assert binding["verified"] is False
+    assert binding["force_verified"] is False
+    original_terminal = store.current_full_active_terminal_tuple(
+        conn, project_id=PID, run_id=case["run_id"],
+        target_commit_sha=case["head"], expected_scope={},
+        snapshot_id=case["snapshot_id"],
+    )
+    assert original_terminal["valid"] is False
+    assert "terminal_metric_operator_event_missing" in original_terminal["errors"]
+    original_state = server._current_full_reconcile_existing_run(
+        conn, store, project_id=PID, run_id=case["run_id"],
+        target_commit_sha=case["head"], route_evidence={},
+        requested_snapshot_id=case["snapshot_id"],
+    )
+    assert original_state["status"] != "complete"
+    direct = store.current_full_reconcile_state(conn, PID, case["head"])
+    assert direct["db_verified"] is False
+    assert direct["active_snapshot_verified"] is False
+    _operation, stale = server._graph_stale_scope_operation(
+        PID, conn=conn,
+        status={"graph_snapshot_commit": case["head"], "active_snapshot_warnings": []},
+        pending_rows=[],
+    )
+    assert stale["comparison_status"] == "verified_linked_main_owner", stale
+    before = conn.total_changes
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=case["body"])
+    )
+    assert replay_status == 200, replay
+    assert replay["idempotent_replay"] is True
+    assert conn.total_changes == before
+    (case["owner"] / "late-dirty.txt").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=case["body"])
+        )
+    assert conn.total_changes == before
+    (case["owner"] / "late-dirty.txt").unlink()
+    conn.execute(
+        "UPDATE graph_ref_events SET actor='forged' WHERE project_id=? AND event_id=?",
+        (PID, recovered["operator_event_id"]),
+    )
+    conn.commit()
+    tampered = store.get_active_graph_snapshot(conn, PID)
+    assert store._current_full_snapshot_provenance_binding(
+        conn, PID, tampered,
+    )["recovery_verified"] is False
+
+
+def test_operator_current_full_recovery_provenance_failure_rolls_back_event(
+    conn, monkeypatch, tmp_path,
+):
+    case = _legacy_operator_current_full_recovery_world(conn, monkeypatch, tmp_path)
+    original_notes = conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (PID, case["snapshot_id"]),
+    ).fetchone()[0]
+    original_ref = dict(conn.execute(
+        "SELECT * FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+        (PID,),
+    ).fetchone())
+    def unavailable(*_args, **_kwargs):
+        raise ValueError("provenance sink unavailable")
+    monkeypatch.setattr(store, "record_current_full_reconcile_provenance", unavailable)
+    with pytest.raises(ValueError, match="provenance sink unavailable"):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=case["body"])
+        )
+    assert conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (PID, case["snapshot_id"]),
+    ).fetchone()[0] == original_notes
+    assert dict(conn.execute(
+        "SELECT * FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+        (PID,),
+    ).fetchone()) == original_ref
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id=? "
+        "AND operation_type='operator_provenance_recovery'", (PID,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance WHERE project_id=?",
+        (PID,),
+    ).fetchone()[0] == 0
+
+
+def test_operator_current_full_recovery_readback_rejects_forged_old_commit(
+    conn, monkeypatch, tmp_path,
+):
+    case = _legacy_operator_current_full_recovery_world(conn, monkeypatch, tmp_path)
+    status, recovery = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=case["body"])
+    )
+    assert status == 201, recovery
+    before = conn.total_changes
+    conn.execute(
+        "UPDATE graph_ref_events SET old_commit='forged' WHERE project_id=? AND event_id=?",
+        (PID, recovery["operator_event_id"]),
+    )
+    conn.commit()
+    tampered_changes = conn.total_changes
+    active = store.get_active_graph_snapshot(conn, PID)
+    assert store._current_full_snapshot_provenance_binding(
+        conn, PID, active,
+    )["recovery_verified"] is False
+    _operation, stale = server._graph_stale_scope_operation(
+        PID, conn=conn,
+        status={"graph_snapshot_commit": case["head"], "active_snapshot_warnings": []},
+        pending_rows=[],
+    )
+    assert stale["comparison_status"] == "unresolved", stale
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=case["body"])
+        )
+    assert conn.total_changes == tampered_changes
+    assert tampered_changes == before + 1
+
+
+@pytest.mark.parametrize("defect", [
+    "wrong_cas", "wrong_root", "wrong_head", "dirty_owner",
+    "fingerprint", "companion", "prior_metric", "prior_activation",
+    "prior_build_claim", "ambiguous_owner", "unauthorized",
+])
+def test_operator_current_full_recovery_rejects_untrusted_world_without_writes(
+    conn, monkeypatch, tmp_path, defect,
+):
+    case = _legacy_operator_current_full_recovery_world(conn, monkeypatch, tmp_path)
+    body = dict(case["body"])
+    if defect == "wrong_cas":
+        body["expected_old_snapshot_id"] = "foreign"
+    elif defect == "wrong_root":
+        body["project_root"] = str(case["registered"])
+    elif defect == "wrong_head":
+        body["target_commit_sha"] = "b" * 40
+    elif defect == "dirty_owner":
+        (case["owner"] / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+    elif defect == "fingerprint":
+        row = conn.execute(
+            "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+            (PID, case["snapshot_id"]),
+        ).fetchone()
+        notes = json.loads(row[0])
+        notes["graph_rule_fingerprint"]["fingerprint"] = "sha256:" + "0" * 64
+        conn.execute(
+            "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+            (json.dumps(notes), PID, case["snapshot_id"]),
+        )
+    elif defect == "companion":
+        companion = store.snapshot_companion_dir(PID, case["snapshot_id"]) / "graph.json"
+        companion.write_text("{}", encoding="utf-8")
+    elif defect == "prior_metric":
+        conn.execute(
+            "UPDATE reconcile_run_metrics SET status='failed' WHERE project_id=? AND run_id=?",
+            (PID, case["run_id"]),
+        )
+    elif defect == "prior_activation":
+        conn.execute(
+            "DELETE FROM graph_ref_events WHERE project_id=? AND event_id=?",
+            (PID, case["activation"]["graph_ref_event_id"]),
+        )
+    elif defect == "prior_build_claim":
+        conn.execute(
+            "UPDATE graph_current_full_build_claim_history SET terminal_status='failed' "
+            "WHERE project_id=? AND snapshot_id=?",
+            (PID, case["snapshot_id"]),
+        )
+    elif defect == "ambiguous_owner":
+        monkeypatch.setattr(
+            server, "_operator_supervised_direct_main_linked_main_owner",
+            lambda **_kwargs: (None, "main_worktree_owner_missing_or_ambiguous"),
+        )
+    conn.commit()
+    before = conn.total_changes
+    ctx = _ctx_with_role({"project_id": PID}, "coordinator", method="POST", body=body)
+    if defect == "unauthorized":
+        ctx._session["role"] = "worker"
+    with pytest.raises((GovernanceError, ValueError, PermissionError)):
+        server.handle_graph_governance_current_full_reconcile(ctx)
+    assert conn.total_changes == before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance WHERE project_id=?",
+        (PID,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id=? "
+        "AND operation_type='operator_provenance_recovery'",
+        (PID,),
+    ).fetchone()[0] == 0

@@ -13339,7 +13339,9 @@ def _require_current_full_reconcile_auth(
 ) -> dict:
     """Allow the normal operator gate or a scoped observer route-token proof."""
     if str(ctx.token or "").strip() or not _current_full_route_proof_requested(ctx):
-        return _require_graph_governance_operator(ctx, conn, action)
+        operator = dict(_require_graph_governance_operator(ctx, conn, action))
+        operator["role_source"] = "operator_capability"
+        return operator
 
     project_id = ctx.get_project_id()
     observer_session_id = _contract_runtime_ref_value(
@@ -92610,6 +92612,17 @@ def _graph_stale_scope_operation(
             "WHERE project_id=? AND ref_name='active'", (project_id,),
         ).fetchall()
         proof = store._current_full_snapshot_provenance_binding(conn, project_id, active)
+        operator_terminal_valid = False
+        if proof.get("operator_verified") is True:
+            proof_marker = proof.get("marker") or {}
+            proof_route = proof_marker.get("route_evidence") or {}
+            proof_run_id = str(proof_route.get("reconcile_run_id") or "")
+            if proof_run_id:
+                operator_terminal_valid = store.current_full_active_terminal_tuple(
+                    conn, project_id=project_id, run_id=proof_run_id,
+                    target_commit_sha=graph_commit, expected_scope={},
+                    snapshot_id=str(active.get("snapshot_id") or ""),
+                ).get("valid") is True
         try:
             companion = store.validate_snapshot_companion_integrity(active)
         except (OSError, ValueError, KeyError):
@@ -92628,7 +92641,11 @@ def _graph_stale_scope_operation(
             and str(refs[0]["snapshot_id"] or "") == str(active.get("snapshot_id") or "")
             and str(refs[0]["commit_sha"] or "").strip().lower() == graph_commit
             and companion.get("valid") is True
-            and proof.get("verified") is True
+            and (
+                proof.get("verified") is True
+                or operator_terminal_valid
+                or proof.get("recovery_verified") is True
+            )
             and str(proof.get("provenance_target_commit") or "").strip().lower() == graph_commit
             and materialization.get("execution_root_role") == "execution_root"
             and Path(execution_root).resolve() == owner
@@ -102078,6 +102095,59 @@ def _record_current_full_atomic_evidence(
                 "loaded_commit": str(route_evidence.get("loaded_commit") or ""),
             },
         )
+    elif not str((route_evidence.get("route_token_scope") or {}).get("backlog_id") or body.get("backlog_id") or "").strip():
+        # The ordinary operator API is allowed without a backlog.  It still
+        # needs a durable activation event; a contract reconcile PASS would
+        # falsely claim a task that was never selected.
+        if not (
+            route_evidence.get("authentication_source") == "operator_capability"
+            and str(route_evidence.get("principal_id") or "").strip()
+            and str(route_evidence.get("session_id") or "").strip()
+        ):
+            raise GovernanceError(
+                "current_full_operator_identity_required",
+                "no-backlog current-full activation requires an authenticated operator identity",
+                409, {"run_id": run_id, "snapshot_id": snapshot_id, "fail_closed": True},
+            )
+        activation = result.get("activation") or {}
+        activation_event_id = str(activation.get("graph_ref_event_id") or "")
+        activation_event_row = conn.execute(
+            "SELECT * FROM graph_ref_events WHERE project_id=? AND event_id=?",
+            (project_id, activation_event_id),
+        ).fetchone() if activation_event_id else None
+        activation_event = dict(activation_event_row) if activation_event_row else {}
+        if not (
+            activation_event.get("operation_type") == "activate"
+            and activation_event.get("ref_name") == "active"
+            and activation_event.get("new_snapshot_id") == snapshot_id
+            and activation_event.get("new_commit") == target_commit
+            and activation_event.get("old_snapshot_id")
+            == str(activation.get("previous_snapshot_id") or "")
+        ):
+            raise GovernanceError(
+                "current_full_operator_active_cas_audit_invalid",
+                "no-backlog current-full activation requires its exact native CAS audit",
+                409, {"run_id": run_id, "snapshot_id": snapshot_id, "fail_closed": True},
+            )
+        event = store.record_graph_ref_event(
+            conn, project_id, ref_name="active",
+            operation_type="operator_reconcile",
+            old_snapshot_id=str(activation.get("previous_snapshot_id") or ""),
+            old_commit=str(activation_event.get("old_commit") or ""),
+            new_snapshot_id=snapshot_id, new_commit=target_commit,
+            source_event_id=activation_event_id,
+            actor=str(route_evidence["principal_id"]), schema_ready=True,
+            evidence={
+                "schema_version": "graph.operator_current_full_reconcile.v1",
+                "target_commit_sha": target_commit,
+                "snapshot_id": snapshot_id,
+                "run_id": run_id,
+                "request_id": request_id,
+                "principal_id": str(route_evidence["principal_id"]),
+                "session_id": str(route_evidence["session_id"]),
+                "authentication_source": "operator_capability",
+            },
+        )
     else:
         event = _record_pending_scope_reconcile_contract_event(
             conn, project_id=project_id, body=body, result=result,
@@ -102086,7 +102156,7 @@ def _record_current_full_atomic_evidence(
             declared_actor_role=declared_actor_role, post_commit_hooks=False,
         )
     failure = {"run_id": run_id, "snapshot_id": snapshot_id, "fail_closed": True}
-    if route_bound and not event:
+    if not event:
         raise GovernanceError(
             "current_full_reconcile_atomic_timeline_required",
             "route-bound current-full activation requires durable reconcile evidence",
@@ -102094,12 +102164,19 @@ def _record_current_full_atomic_evidence(
         )
     provenance: dict[str, Any] = {}
     if event:
-        result["timeline_event_recorded"] = {
-            "id": event.get("id"), "ref": f"timeline:{event.get('id')}",
-            "event_kind": event.get("event_kind"), "phase": event.get("phase"),
-            "status": event.get("status"),
-            "requirement_id": "" if force_graph_only else "reconcile",
-        }
+        operator_event = bool(event.get("event_id"))
+        if operator_event:
+            result["operator_graph_event_recorded"] = {
+                "event_id": event["event_id"],
+                "operation_type": event["operation_type"],
+            }
+        else:
+            result["timeline_event_recorded"] = {
+                "id": event.get("id"), "ref": f"timeline:{event.get('id')}",
+                "event_kind": event.get("event_kind"), "phase": event.get("phase"),
+                "status": event.get("status"),
+                "requirement_id": "" if force_graph_only else "reconcile",
+            }
         provenance = store.record_current_full_reconcile_provenance(
             conn, project_id=project_id, snapshot_id=snapshot_id,
             target_commit_sha=target_commit, request_id=request_id,
@@ -102108,11 +102185,12 @@ def _record_current_full_atomic_evidence(
             runtime_context_scope=runtime_context_scope,
             reconcile_event_id=int(event.get("id") or 0),
             reconcile_event_created_at=str(event.get("created_at") or ""),
+            operator_event_id=str(event.get("event_id") or ""),
             marker_created_at=_utc_now(), schema_ready=True,
             dev_force_graph_only=force_graph_only,
         )
         result["current_full_reconcile_provenance"] = provenance
-    if route_bound and not provenance:
+    if not provenance:
         raise GovernanceError(
             "current_full_reconcile_atomic_provenance_required",
             "route-bound current-full activation requires durable provenance",
@@ -102131,10 +102209,363 @@ def _record_current_full_atomic_evidence(
             "request_id": request_id,
             "reconcile_event_id": int(event.get("id") or 0),
             "provenance_id": str(provenance.get("provenance_id") or ""),
+            **({"operator_event_id": str(event["event_id"])}
+               if event.get("event_id") else {}),
         },
         created_at=request_started_at, schema_ready=True,
     )
     return event, provenance
+
+
+def _recover_current_full_operator_provenance(
+    ctx: RequestContext, conn, store, *, project_id: str,
+    body: Mapping[str, Any], auth: Mapping[str, Any],
+    request_started_at: str,
+) -> tuple[int, dict[str, Any]]:
+    """Append a current operator attestation for one legacy active full run.
+
+    The original complete metric and activation receipt remain historical
+    facts.  This operation proves them and records only a new recovery event
+    and provenance marker; it never invokes the graph builder or activation.
+    """
+
+    from .checkout_provenance import describe_checkout
+    from .graph_rule_fingerprint import build_graph_rule_fingerprint
+    from .db import sqlite_write_lock
+
+    allowed = {
+        "project_id", "recover_operator_provenance", "snapshot_id", "run_id",
+        "recovery_run_id", "target_commit_sha", "expected_old_snapshot_id", "project_root",
+    }
+    snapshot_id = str(body.get("snapshot_id") or "").strip()
+    run_id = str(body.get("run_id") or "").strip()
+    recovery_run_id = str(body.get("recovery_run_id") or "").strip()
+    commit = str(body.get("target_commit_sha") or "").strip().lower()
+    if not (
+        body.get("recover_operator_provenance") is True
+        and not (set(body) - allowed)
+        and snapshot_id and run_id and recovery_run_id
+        and recovery_run_id != run_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
+        and str(body.get("expected_old_snapshot_id") or "").strip() == snapshot_id
+        and body.get("project_id", project_id) == project_id
+    ):
+        raise GovernanceError(
+            "current_full_operator_recovery_request_invalid",
+            "operator recovery requires an exact active snapshot, run, HEAD and CAS",
+            422, {"zero_write_rejection": True, "fail_closed": True},
+        )
+
+    def reject(reason: str) -> NoReturn:
+        raise GovernanceError(
+            "current_full_operator_recovery_" + reason,
+            "current-full operator provenance recovery proof failed: " + reason,
+            409, {"zero_write_rejection": True, "writes_performed": False,
+                  "mutation_performed": False, "fail_closed": True},
+        )
+
+    with sqlite_write_lock():
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            locked_auth = _require_current_full_reconcile_auth(
+                ctx, conn, "graph-governance.reconcile.current-full",
+                route_ref_renew_within_seconds=0,
+            )
+            if not (
+                locked_auth.get("role_source") == "operator_capability"
+                and str(locked_auth.get("principal_id") or "").strip()
+                and str(locked_auth.get("session_id") or "").strip()
+                and str(locked_auth.get("principal_id") or "")
+                == str(auth.get("principal_id") or "")
+                and str(locked_auth.get("session_id") or "")
+                == str(auth.get("session_id") or "")
+                and not _current_full_route_proof_requested(ctx)
+            ):
+                reject("authentication_invalid")
+            active_rows = conn.execute(
+                "SELECT * FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+                (project_id,),
+            ).fetchall()
+            snapshot_row = conn.execute(
+                "SELECT * FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+                (project_id, snapshot_id),
+            ).fetchone()
+            snapshot = dict(snapshot_row) if snapshot_row else {}
+            if not (
+                len(active_rows) == 1
+                and active_rows[0]["snapshot_id"] == snapshot_id
+                and active_rows[0]["commit_sha"] == commit
+                and snapshot.get("status") == "active"
+                and snapshot.get("snapshot_kind") == "full"
+                and snapshot.get("commit_sha") == commit
+            ):
+                reject("active_cas_mismatch")
+            active_ref = dict(active_rows[0])
+            notes = _json_loads(snapshot.get("notes"), {})
+            notes = dict(notes) if isinstance(notes, Mapping) else {}
+            marker = notes.get("current_full_reconcile")
+            if isinstance(marker, Mapping):
+                binding = store._current_full_snapshot_provenance_binding(
+                    conn, project_id, snapshot,
+                )
+                recovery = marker.get("recovery")
+                if (
+                    binding.get("recovery_verified") is True
+                    and isinstance(recovery, Mapping)
+                    and recovery.get("original_run_id") == run_id
+                    and recovery.get("recovery_run_id") == recovery_run_id
+                    and recovery.get("owner_head") == commit
+                    and recovery.get("active_ref_updated_at") == active_ref["updated_at"]
+                ):
+                    # Replay remains a present-tense owner claim.  The
+                    # sealed old evidence alone cannot excuse a dirty or
+                    # detached linked-main checkout.
+                    replay_owner = Path(str(recovery.get("owner_root") or ""))
+                    registered_root = Path(project_service.resolve_project_root(
+                        project_id, None, fallback_self=True,
+                    )).resolve(strict=True)
+                    owner, owner_error = _operator_supervised_direct_main_linked_main_owner(
+                        registered_root=registered_root,
+                        expected_root=replay_owner.resolve(strict=True),
+                        expected_head=commit,
+                    )
+                    if owner is None or _git_dirty_paths(owner) or _git_head_commit(owner).lower() != commit:
+                        reject(owner_error or "owner_head_or_cleanliness_changed")
+                    if body.get("project_root") and Path(str(body["project_root"])).resolve() != owner:
+                        reject("caller_root_mismatch")
+                    conn.rollback()
+                    return 200, {
+                        "ok": True, "project_id": project_id,
+                        "status": "recovered", "snapshot_id": snapshot_id,
+                        "original_run_id": run_id,
+                        "recovery_run_id": recovery_run_id,
+                        "recovery_provenance_id": binding["provenance_id"],
+                        "operator_event_id": str(marker.get("operator_event_id") or ""),
+                        "idempotent_replay": True, "writes_performed": False,
+                        "rebuild_started": False, "active_ref_mutated": False,
+                    }
+                reject("existing_provenance_conflict")
+            if conn.execute(
+                "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance "
+                "WHERE project_id=? AND snapshot_id=?",
+                (project_id, snapshot_id),
+            ).fetchone()[0]:
+                reject("existing_provenance_conflict")
+            if conn.execute(
+                "SELECT COUNT(*) FROM pending_scope_reconcile WHERE project_id=? "
+                "AND status IN ('queued','running','failed')", (project_id,),
+            ).fetchone()[0]:
+                reject("pending_scope_present")
+            if conn.execute(
+                "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+                (project_id, recovery_run_id),
+            ).fetchone()[0]:
+                reject("recovery_run_id_conflict")
+            owner_notes = notes.get("checkout_provenance")
+            owner_notes = owner_notes if isinstance(owner_notes, Mapping) else {}
+            expected_root = str(owner_notes.get("execution_root") or "").strip()
+            if not expected_root:
+                reject("owner_missing")
+            try:
+                registered_root = Path(project_service.resolve_project_root(
+                    project_id, None, fallback_self=True,
+                )).resolve(strict=True)
+                owner_root = Path(expected_root).resolve(strict=True)
+            except (OSError, ValueError):
+                reject("owner_missing")
+            owner, owner_error = _operator_supervised_direct_main_linked_main_owner(
+                registered_root=registered_root, expected_root=owner_root,
+                expected_head=commit,
+            )
+            if owner is None:
+                reject(owner_error or "owner_unverified")
+            if body.get("project_root") and Path(str(body["project_root"])).resolve() != owner:
+                reject("caller_root_mismatch")
+            if _git_head_commit(owner).lower() != commit or _git_dirty_paths(owner):
+                reject("owner_head_or_cleanliness_changed")
+            owner_checkout = describe_checkout(owner, project_id=project_id)
+            registered_checkout = describe_checkout(registered_root, project_id=project_id)
+            snapshot_git = owner_notes.get("git")
+            snapshot_git = snapshot_git if isinstance(snapshot_git, Mapping) else {}
+            owner_git = owner_checkout.get("git") or {}
+            registered_git = registered_checkout.get("git") or {}
+            common_dirs = [str(value.get("git_common_dir") or "") for value in (
+                snapshot_git, owner_git, registered_git,
+            )]
+            identity = owner_notes.get("canonical_project_identity")
+            identity = identity if isinstance(identity, Mapping) else {}
+            if not (
+                owner_notes.get("execution_root_role") == "execution_root"
+                and Path(expected_root) == owner
+                and snapshot_git.get("worktree_root") == str(owner)
+                and all(common_dirs)
+                and len({str(Path(value).resolve()) for value in common_dirs}) == 1
+                and identity.get("type") == "git"
+                and identity.get("project_id") == project_id
+                and identity.get("commit_sha") == commit
+                and owner_checkout.get("commit_sha") == commit
+            ):
+                reject("owner_identity_mismatch")
+            fingerprint = notes.get("graph_rule_fingerprint")
+            fingerprint = fingerprint if isinstance(fingerprint, Mapping) else {}
+            anchor = notes.get("full_reconcile_anchor")
+            anchor = anchor if isinstance(anchor, Mapping) else {}
+            # Source/governance hint projections can be scan-dependent.  The
+            # immutable full hash must match the original snapshot anchor;
+            # only rebuild inputs are compared with the current clean HEAD.
+            current_fingerprint = build_graph_rule_fingerprint(
+                owner, commit_sha=commit, include_source_hints=False,
+            )
+            if not (
+                fingerprint.get("commit_sha") == commit
+                and anchor.get("project_id") == project_id
+                and anchor.get("snapshot_id") == snapshot_id
+                and anchor.get("anchor_commit") == commit
+                and anchor.get("structure_rule_fingerprint")
+                == fingerprint.get("fingerprint")
+                and anchor.get("rebuild_input_fingerprint")
+                == fingerprint.get("rebuild_input_fingerprint")
+                and str(fingerprint.get("rebuild_input_fingerprint") or "")
+                == str(current_fingerprint.get("rebuild_input_fingerprint") or "")
+            ):
+                reject("rule_fingerprint_mismatch")
+            companion = store.validate_snapshot_companion_integrity(snapshot)
+            if not companion.get("valid"):
+                reject("companion_invalid")
+            origin_run_id = str(notes.get("run_id") or "").strip()
+            claim_rows = conn.execute(
+                "SELECT * FROM graph_current_full_build_claim_history "
+                "WHERE project_id=? AND snapshot_id=? AND run_id=?",
+                (project_id, snapshot_id, origin_run_id),
+            ).fetchall()
+            if not (
+                origin_run_id and len(claim_rows) == 1
+                and claim_rows[0]["commit_sha"] == commit
+                and claim_rows[0]["status"] == "released"
+                and claim_rows[0]["terminal_status"] == "candidate_ready"
+            ):
+                reject("prior_build_audit_invalid")
+            metric_rows = conn.execute(
+                "SELECT * FROM reconcile_run_metrics WHERE project_id=? AND run_id=? AND snapshot_id=?",
+                (project_id, run_id, snapshot_id),
+            ).fetchall()
+            metric = dict(metric_rows[0]) if len(metric_rows) == 1 else {}
+            evidence = _json_loads(metric.get("evidence_json"), {})
+            if not (
+                metric.get("status") == "complete"
+                and metric.get("strategy") == "current_full_reconcile"
+                and metric.get("snapshot_kind") == "full"
+                and metric.get("commit_sha") == commit
+                and metric.get("graph_delta_mode") == "full_rebuild"
+                and isinstance(evidence, Mapping)
+                and metric.get("evidence_json") == store._json(dict(evidence))
+                and set(evidence) == store._CURRENT_FULL_COMPLETE_EVIDENCE_KEYS
+                and evidence.get("phase") == "atomic_finalize_complete"
+                and evidence.get("activate_requested") is True
+                and str(evidence.get("request_id") or "").strip()
+                and not evidence.get("reconcile_event_id")
+                and not evidence.get("provenance_id")
+                and isinstance(evidence.get("idempotency_scope"), Mapping)
+                and not evidence["idempotency_scope"]
+            ):
+                reject("prior_run_audit_invalid")
+            prior_rows = conn.execute(
+                "SELECT * FROM graph_ref_events WHERE project_id=? AND ref_name='active' "
+                "AND operation_type='activate' AND new_snapshot_id=? AND new_commit=?",
+                (project_id, snapshot_id, commit),
+            ).fetchall()
+            prior_ref = dict(prior_rows[0]) if len(prior_rows) == 1 else {}
+            prior_evidence = _json_loads(prior_ref.get("evidence_json"), {})
+            if not (
+                prior_ref
+                and isinstance(prior_evidence, Mapping)
+                and prior_evidence.get("source") == "activate_graph_snapshot"
+            ):
+                reject("prior_activation_audit_invalid")
+            recovery_evidence = {
+                "schema_version": "graph.operator_current_full_provenance_recovery.v1",
+                "original_run_id": run_id,
+                "recovery_run_id": recovery_run_id,
+                "original_metric_hash": store._stable_sha256(metric),
+                "origin_run_id": origin_run_id,
+                "origin_claim_hash": store._stable_sha256(dict(claim_rows[0])),
+                "prior_graph_ref_event_id": prior_ref["event_id"],
+                "prior_graph_ref_event_hash": store._stable_sha256(prior_ref),
+                "prior_cas_snapshot_id": prior_ref["old_snapshot_id"],
+                "active_ref_updated_at": active_ref["updated_at"],
+                "owner_root": str(owner), "owner_head": commit,
+                "rule_fingerprint": fingerprint["fingerprint"],
+                "rebuild_input_fingerprint": fingerprint["rebuild_input_fingerprint"],
+                **{field: str(snapshot[field]) for field in (
+                    "graph_sha256", "inventory_sha256", "drift_sha256",
+                )},
+            }
+            route_evidence = _current_full_reconcile_route_evidence(
+                locked_auth, runtime_context_scope={},
+            )
+            route_evidence.update(
+                protected_action="graph_current_full_operator_provenance_recovery",
+                recovery_operation=True,
+                recovery_request_id=str(ctx.request_id),
+                original_run_id=run_id,
+                reconcile_run_id=recovery_run_id,
+                idempotency_scope={},
+            )
+            event = store.record_graph_ref_event(
+                conn, project_id, ref_name="active",
+                operation_type="operator_provenance_recovery",
+                old_snapshot_id=snapshot_id, new_snapshot_id=snapshot_id,
+                old_commit=commit, new_commit=commit,
+                source_event_id=str(prior_ref["event_id"]),
+                actor=str(locked_auth["principal_id"]), schema_ready=True,
+                evidence={
+                    "schema_version": "graph.operator_current_full_provenance_recovery.v1",
+                    "snapshot_id": snapshot_id,
+                    "target_commit_sha": commit,
+                    "original_run_id": run_id,
+                    "recovery_run_id": recovery_run_id,
+                    "recovery_evidence": recovery_evidence,
+                    "principal_id": str(locked_auth["principal_id"]),
+                    "session_id": str(locked_auth["session_id"]),
+                    "request_id": str(ctx.request_id),
+                    "historical_graph_reconciled": False,
+                    "contract_evidence": [],
+                },
+            )
+            provenance = store.record_current_full_reconcile_provenance(
+                conn, project_id=project_id, snapshot_id=snapshot_id,
+                target_commit_sha=commit, request_id=str(ctx.request_id),
+                request_started_at=request_started_at,
+                route_evidence=route_evidence,
+                reconcile_event_id=0,
+                reconcile_event_created_at=str(event["created_at"]),
+                operator_event_id=str(event["event_id"]),
+                marker_created_at=_utc_now(), schema_ready=True,
+                recovery_evidence=recovery_evidence,
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+                (project_id, snapshot_id),
+            ).fetchone()
+            binding = store._current_full_snapshot_provenance_binding(
+                conn, project_id, dict(refreshed),
+            )
+            if binding.get("recovery_verified") is not True:
+                reject("terminal_verification_failed")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return 201, {
+        "ok": True, "project_id": project_id, "status": "recovered",
+        "snapshot_id": snapshot_id, "original_run_id": run_id,
+        "recovery_run_id": recovery_run_id,
+        "recovery_provenance_id": provenance["provenance_id"],
+        "recovery_provenance_hash": provenance["provenance_hash"],
+        "operator_event_id": event["event_id"], "recovery_verified": True,
+        "writes_performed": True, "rebuild_started": False,
+        "active_ref_mutated": False, "original_metric_mutated": False,
+    }
 
 
 def _dev_direct_bind_current_full_provenance(
@@ -104160,6 +104591,11 @@ def _current_full_reconcile_bounded_http_response(
         if isinstance(source.get("current_full_reconcile_provenance"), Mapping)
         else {}
     )
+    operator_graph_event = (
+        source.get("operator_graph_event_recorded")
+        if isinstance(source.get("operator_graph_event_recorded"), Mapping)
+        else {}
+    )
     idempotent_replay = bool(source.get("idempotent_replay"))
     explicit_write = bool(
         source.get("writes_performed") is True
@@ -104275,6 +104711,7 @@ def _current_full_reconcile_bounded_http_response(
             "activation_write_proven": activation_write_proven,
             "timeline_write_proven": timeline_write_proven,
             "timeline_event_id": int(timeline_event.get("id") or 0),
+            "operator_event_id": str(operator_graph_event.get("event_id") or ""),
             "provenance_id": str(provenance.get("provenance_id") or ""),
             "idempotent_replay": idempotent_replay,
             "source": "governance_http_request_connection",
@@ -104326,6 +104763,7 @@ def _current_full_reconcile_bounded_http_response(
             "target_commit_sha",
             "request_id",
             "reconcile_event_id",
+            "operator_event_id",
             "route_bound",
             "status",
         ),
@@ -104359,6 +104797,7 @@ def _current_full_reconcile_bounded_http_response(
             "projection_id",
         ),
         "post_commit_activation_events": ("published", "error"),
+        "operator_graph_event_recorded": ("event_id", "operation_type"),
         "graph_stats": ("nodes", "edges", "files", "symbols"),
     }
     if timeline_event:
@@ -104528,6 +104967,11 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 ctx, conn, "graph-governance.reconcile.current-full",
             )
         )
+        if "recover_operator_provenance" in body:
+            return _recover_current_full_operator_provenance(
+                ctx, conn, store, project_id=project_id, body=body,
+                auth=current_full_auth, request_started_at=request_started_at,
+            )
         force_world: dict[str, Any] = {}
         if dev_force_graph:
             force_world = _operator_supervised_direct_main_dev_world_authority()
@@ -106058,7 +106502,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             conn.commit()
             raise
 
-        if timeline_event:
+        if timeline_event and timeline_event.get("id"):
             if not dev_force_graph:
                 _task_timeline.run_post_commit_hooks(conn, timeline_event)
                 conn.commit()

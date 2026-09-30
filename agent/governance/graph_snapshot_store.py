@@ -545,6 +545,8 @@ GRAPH_REF_OPERATION_TYPES = {
     "revert",
     "replay",
     "backfill_escape",
+    "operator_reconcile",
+    "operator_provenance_recovery",
 }
 
 
@@ -3660,6 +3662,8 @@ def record_current_full_reconcile_provenance(
     marker_created_at: str | None = None,
     schema_ready: bool = False,
     dev_force_graph_only: bool = False,
+    recovery_evidence: Mapping[str, Any] | None = None,
+    operator_event_id: str = "",
 ) -> dict[str, Any]:
     """Seal one protected current-full completion to its durable reconcile event."""
 
@@ -3686,10 +3690,17 @@ def record_current_full_reconcile_provenance(
         "reconcile_event_created_at": reconcile_event_created_at,
     }
     missing = [key for key, value in required.items() if not value]
-    if missing or reconcile_event_id <= 0:
+    operator_event_id = str(operator_event_id or "").strip()
+    if operator_event_id:
+        missing = [item for item in missing if item != "reconcile_event_created_at"]
+    if missing or (reconcile_event_id <= 0 and not operator_event_id) or (
+        reconcile_event_id > 0 and operator_event_id
+    ):
         missing_fields = [*missing]
-        if reconcile_event_id <= 0:
+        if reconcile_event_id <= 0 and not operator_event_id:
             missing_fields.append("reconcile_event_id")
+        if reconcile_event_id > 0 and operator_event_id:
+            missing_fields.append("event_mode_conflict")
         raise ValueError(
             "current-full reconcile provenance requires: "
             + ", ".join(missing_fields)
@@ -3711,7 +3722,10 @@ def record_current_full_reconcile_provenance(
             "current-full reconcile provenance requires the active target snapshot"
         )
 
-    protected_action = "graph_current_full_reconcile"
+    protected_action = (
+        "graph_current_full_operator_provenance_recovery"
+        if recovery_evidence is not None else "graph_current_full_reconcile"
+    )
     protected_entrypoint = (
         "POST /api/graph-governance/{project_id}/reconcile/current-full"
     )
@@ -3788,6 +3802,13 @@ def record_current_full_reconcile_provenance(
         "reconcile_event_created_at": reconcile_event_created_at,
         "route_evidence": safe_route_evidence,
     }
+    if operator_event_id:
+        marker_core["operator_event_id"] = operator_event_id
+        marker_core["operator_event_created_at"] = reconcile_event_created_at
+        marker_core["operator_no_backlog"] = recovery_evidence is None
+    if recovery_evidence is not None:
+        marker_core["recovery"] = dict(recovery_evidence)
+        marker_core["normal_update_path"] = False
     if safe_runtime_context_scope:
         marker_core["runtime_context_scope"] = {
             **safe_runtime_context_scope,
@@ -3844,6 +3865,7 @@ def record_current_full_reconcile_provenance(
         "marker_created_at": marker_created_at,
         "reconcile_event_id": reconcile_event_id,
         "reconcile_event_created_at": reconcile_event_created_at,
+        "operator_event_id": operator_event_id,
         "route_evidence": safe_route_evidence,
         "runtime_context_scope": safe_runtime_context_scope,
         "provenance_hash": provenance_hash,
@@ -3976,6 +3998,32 @@ def _current_full_snapshot_provenance_binding(
     except (TypeError, ValueError):
         marker_reconcile_event_id = 0
         provenance_reconcile_event_id = 0
+    operator_event_id = str(marker.get("operator_event_id") or "").strip()
+    operator_event_row = conn.execute(
+        "SELECT * FROM graph_ref_events WHERE project_id=? AND event_id=?",
+        (project_id, operator_event_id),
+    ).fetchone() if operator_event_id else None
+    operator_event = dict(operator_event_row) if operator_event_row else {}
+    operator_payload = _decode_json(operator_event.get("evidence_json"), {})
+    operator_event_verified = bool(
+        operator_event_id
+        and marker_reconcile_event_id == provenance_reconcile_event_id == 0
+        and operator_event.get("ref_name") == "active"
+        and operator_event.get("new_snapshot_id") == snapshot_id
+        and operator_event.get("new_commit") == snapshot_commit
+        and operator_event.get("created_at") == marker.get("operator_event_created_at")
+        and operator_event.get("created_at") == provenance.get("reconcile_event_created_at")
+        and operator_event.get("actor") == route_evidence.get("principal_id")
+        and isinstance(operator_payload, Mapping)
+        and operator_payload.get("snapshot_id") == snapshot_id
+        and operator_payload.get("target_commit_sha") == snapshot_commit
+        and operator_payload.get("request_id") == marker.get("request_id")
+        and operator_payload.get("principal_id") == route_evidence.get("principal_id")
+        and operator_payload.get("session_id") == route_evidence.get("session_id")
+        and route_evidence.get("authentication_source") == "operator_capability"
+        and not route_evidence.get("route_token_ref")
+        and not route_evidence.get("route_token_scope")
+    )
     common_verified = bool(
         project_id
         and snapshot_id
@@ -3997,7 +4045,10 @@ def _current_full_snapshot_provenance_binding(
         and str(marker.get("provenance_id") or "").strip()
         == str(provenance.get("provenance_id") or "").strip()
         and str(marker.get("protected_action") or "").strip()
-        == "graph_current_full_reconcile"
+        in {
+            "graph_current_full_reconcile",
+            "graph_current_full_operator_provenance_recovery",
+        }
         and str(marker.get("protected_entrypoint") or "").strip()
         == "POST /api/graph-governance/{project_id}/reconcile/current-full"
         and str(provenance.get("protected_action") or "").strip()
@@ -4013,8 +4064,9 @@ def _current_full_snapshot_provenance_binding(
         and str(provenance.get("marker_created_at") or "").strip()
         == str(marker.get("marker_created_at") or "").strip()
         and _timestamp_value(marker.get("marker_created_at")) is not None
-        and provenance_reconcile_event_id > 0
         and provenance_reconcile_event_id == marker_reconcile_event_id
+        and ((provenance_reconcile_event_id > 0 and not operator_event_id)
+             or operator_event_verified)
         and str(
             provenance.get("reconcile_event_created_at") or ""
         ).strip()
@@ -4035,14 +4087,134 @@ def _current_full_snapshot_provenance_binding(
         )
         and route_evidence.get("raw_route_token_persisted") is False
         and route_evidence.get("protected_action")
-        == "graph_current_full_reconcile"
+        == marker.get("protected_action")
         and runtime_context_scope_link_verified
     )
     verified = bool(
         common_verified
         and marker.get("normal_update_path") is True
         and marker.get("dev_force_graph_only") is not True
+        and marker.get("protected_action") == "graph_current_full_reconcile"
+        and "recovery" not in marker
+        and not operator_event_id
     )
+    operator_verified = bool(
+        common_verified
+        and marker.get("operator_no_backlog") is True
+        and marker.get("protected_action") == "graph_current_full_reconcile"
+        and operator_event.get("operation_type") == "operator_reconcile"
+        and str(operator_payload.get("run_id") or "")
+        == str(route_evidence.get("reconcile_run_id") or "")
+        and str(operator_event.get("source_event_id") or "")
+        and "recovery" not in marker
+    )
+    recovery_verified = False
+    recovery = marker.get("recovery")
+    if common_verified and isinstance(recovery, Mapping):
+        original_run_id = str(recovery.get("original_run_id") or "")
+        original_metric_row = conn.execute(
+            "SELECT * FROM reconcile_run_metrics WHERE project_id=? AND run_id=? AND snapshot_id=?",
+            (project_id, original_run_id, snapshot_id),
+        ).fetchone() if original_run_id else None
+        original_metric = dict(original_metric_row) if original_metric_row else {}
+        original_evidence = _decode_json(original_metric.get("evidence_json"), {})
+        prior_ref_id = str(recovery.get("prior_graph_ref_event_id") or "")
+        prior_ref_row = conn.execute(
+            "SELECT * FROM graph_ref_events WHERE project_id=? AND event_id=?",
+            (project_id, prior_ref_id),
+        ).fetchone() if prior_ref_id else None
+        prior_ref = dict(prior_ref_row) if prior_ref_row else {}
+        origin_run_id = str(recovery.get("origin_run_id") or "")
+        claim_rows = conn.execute(
+            "SELECT * FROM graph_current_full_build_claim_history "
+            "WHERE project_id=? AND snapshot_id=? AND run_id=?",
+            (project_id, snapshot_id, origin_run_id),
+        ).fetchall() if origin_run_id else []
+        claim = dict(claim_rows[0]) if len(claim_rows) == 1 else {}
+        recovery_event = operator_event
+        recovery_payload = operator_payload
+        notes = _snapshot_notes(snapshot)
+        checkout = notes.get("checkout_provenance")
+        checkout = checkout if isinstance(checkout, Mapping) else {}
+        fingerprint = notes.get("graph_rule_fingerprint")
+        ref_row = conn.execute(
+            "SELECT * FROM graph_snapshot_refs WHERE project_id=? AND ref_name='active'",
+            (project_id,),
+        ).fetchone()
+        active_ref = dict(ref_row) if ref_row else {}
+        try:
+            companion = validate_snapshot_companion_integrity(snapshot)
+        except (OSError, ValueError, KeyError):
+            companion = {"valid": False}
+        recovery_verified = bool(
+            marker.get("protected_action") == "graph_current_full_operator_provenance_recovery"
+            and marker.get("normal_update_path") is False
+            and marker.get("dev_force_graph_only") is False
+            and recovery.get("schema_version") == "graph.operator_current_full_provenance_recovery.v1"
+            and str(recovery.get("owner_root") or "")
+            == str(checkout.get("execution_root") or "")
+            and str(recovery.get("owner_head") or "") == snapshot_commit
+            and isinstance(fingerprint, Mapping)
+            and str(fingerprint.get("fingerprint") or "")
+            == str(recovery.get("rule_fingerprint") or "")
+            and str(fingerprint.get("rebuild_input_fingerprint") or "")
+            == str(recovery.get("rebuild_input_fingerprint") or "")
+            and all(str(snapshot.get(field) or "") == str(recovery.get(field) or "")
+                    for field in ("graph_sha256", "inventory_sha256", "drift_sha256"))
+            and companion.get("valid") is True
+            and active_ref.get("snapshot_id") == snapshot_id
+            and active_ref.get("commit_sha") == snapshot_commit
+            and active_ref.get("updated_at") == recovery.get("active_ref_updated_at")
+            and original_metric.get("status") == "complete"
+            and original_metric.get("strategy") == "current_full_reconcile"
+            and original_metric.get("snapshot_kind") == "full"
+            and original_metric.get("commit_sha") == snapshot_commit
+            and str(route_evidence.get("original_run_id") or "") == original_run_id
+            and str(route_evidence.get("reconcile_run_id") or "")
+            == str(recovery.get("recovery_run_id") or "")
+            and str(recovery.get("recovery_run_id") or "") != original_run_id
+            and isinstance(original_evidence, Mapping)
+            and original_metric.get("evidence_json") == _json(dict(original_evidence))
+            and set(original_evidence) == _CURRENT_FULL_COMPLETE_EVIDENCE_KEYS
+            and original_evidence.get("phase") == "atomic_finalize_complete"
+            and original_evidence.get("activate_requested") is True
+            and str(original_evidence.get("request_id") or "").strip()
+            and original_evidence.get("idempotency_scope") == {}
+            and not original_evidence.get("reconcile_event_id")
+            and not original_evidence.get("provenance_id")
+            and _stable_sha256(original_metric) == recovery.get("original_metric_hash")
+            and origin_run_id == str(notes.get("run_id") or "")
+            and claim.get("commit_sha") == snapshot_commit
+            and claim.get("status") == "released"
+            and claim.get("terminal_status") == "candidate_ready"
+            and _stable_sha256(claim) == recovery.get("origin_claim_hash")
+            and prior_ref.get("ref_name") == "active"
+            and prior_ref.get("operation_type") == "activate"
+            and prior_ref.get("new_snapshot_id") == snapshot_id
+            and prior_ref.get("new_commit") == snapshot_commit
+            and prior_ref.get("old_snapshot_id") == recovery.get("prior_cas_snapshot_id")
+            and isinstance(_decode_json(prior_ref.get("evidence_json"), {}), Mapping)
+            and _decode_json(prior_ref.get("evidence_json"), {}).get("source") == "activate_graph_snapshot"
+            and _stable_sha256(prior_ref) == recovery.get("prior_graph_ref_event_hash")
+            and recovery_event.get("operation_type") == "operator_provenance_recovery"
+            and recovery_event.get("source_event_id") == prior_ref_id
+            and recovery_event.get("old_snapshot_id") == snapshot_id
+            and recovery_event.get("old_commit") == snapshot_commit
+            and recovery_event.get("new_snapshot_id") == snapshot_id
+            and recovery_event.get("new_commit") == snapshot_commit
+            and isinstance(recovery_payload, Mapping)
+            and recovery_payload.get("snapshot_id") == snapshot_id
+            and recovery_payload.get("original_run_id") == original_run_id
+            and recovery_payload.get("recovery_run_id") == recovery.get("recovery_run_id")
+            and recovery_payload.get("recovery_evidence") == dict(recovery)
+            and recovery_payload.get("principal_id") == route_evidence.get("principal_id")
+            and recovery_payload.get("session_id") == route_evidence.get("session_id")
+            and route_evidence.get("authentication_source") == "operator_capability"
+            and str(route_evidence.get("principal_id") or "").strip()
+            and str(route_evidence.get("session_id") or "").strip()
+            and not route_evidence.get("route_token_ref")
+            and not route_evidence.get("route_token_scope")
+        )
     force_verified = bool(
         common_verified
         and marker.get("normal_update_path") is False
@@ -4056,7 +4228,9 @@ def _current_full_snapshot_provenance_binding(
     )
     return {
         "verified": verified,
+        "operator_verified": operator_verified,
         "force_verified": force_verified,
+        "recovery_verified": recovery_verified,
         "snapshot_id": snapshot_id,
         "snapshot_commit": snapshot_commit,
         "snapshot_status": snapshot_status,
@@ -4367,6 +4541,8 @@ def current_full_active_terminal_tuple(
     except (TypeError, ValueError):
         reconcile_event_id = 0
     provenance_id = str(evidence.get("provenance_id") or "").strip()
+    operator_event_id = str(evidence.get("operator_event_id") or "").strip()
+    operator_mode = not route_bound and not dev_force_graph_only
     request_id = str(evidence.get("request_id") or "").strip()
     stored_scope = (
         dict(evidence.get("idempotency_scope"))
@@ -4475,7 +4651,10 @@ def current_full_active_terminal_tuple(
     if not isinstance(evidence_value, Mapping):
         errors.append("terminal_metric_evidence_malformed")
     else:
-        if set(evidence) != _CURRENT_FULL_COMPLETE_EVIDENCE_KEYS:
+        expected_evidence_keys = _CURRENT_FULL_COMPLETE_EVIDENCE_KEYS | (
+            {"operator_event_id"} if operator_mode else set()
+        )
+        if set(evidence) != expected_evidence_keys:
             errors.append("terminal_metric_evidence_schema_mismatch")
         if not evidence_canonical:
             errors.append("terminal_metric_evidence_not_canonical")
@@ -4487,12 +4666,64 @@ def current_full_active_terminal_tuple(
             errors.append("terminal_metric_scope_mismatch")
         if not request_id:
             errors.append("terminal_metric_request_id_missing")
-        if route_bound != (reconcile_event_id > 0):
+        if (reconcile_event_id != 0 if operator_mode else reconcile_event_id <= 0):
             errors.append("terminal_metric_event_route_mode_mismatch")
-        if route_bound != bool(provenance_id):
+        if operator_mode and not operator_event_id:
+            errors.append("terminal_metric_operator_event_missing")
+        if not provenance_id:
             errors.append("terminal_metric_provenance_route_mode_mismatch")
 
-    if route_bound:
+    if operator_mode:
+        if not provenance:
+            errors.append("terminal_provenance_missing")
+        else:
+            if provenance_binding.get("operator_verified") is not True:
+                errors.append("terminal_operator_provenance_binding_invalid")
+            if str(provenance_binding.get("provenance_id") or "") != provenance_id:
+                errors.append("terminal_provenance_id_mismatch")
+            if str(provenance.get("request_id") or "") != request_id:
+                errors.append("terminal_provenance_request_mismatch")
+            if int(provenance.get("reconcile_event_id") or 0) != 0:
+                errors.append("terminal_operator_provenance_timeline_event_invalid")
+            if str(provenance_route_evidence.get("reconcile_run_id") or "") != run_id:
+                errors.append("terminal_provenance_run_mismatch")
+            if _current_full_idempotency_scope(provenance_route_evidence) != expected_scope:
+                errors.append("terminal_provenance_scope_mismatch")
+            marker = provenance_binding.get("marker") or {}
+            if str(marker.get("operator_event_id") or "") != operator_event_id:
+                errors.append("terminal_operator_event_id_mismatch")
+        event_row = conn.execute(
+            "SELECT * FROM graph_ref_events WHERE project_id=? AND event_id=?",
+            (project_id, operator_event_id),
+        ).fetchone() if operator_event_id else None
+        operator_event = dict(event_row) if event_row else {}
+        payload = _decode_json(operator_event.get("evidence_json"), {})
+        activation_id = str(operator_event.get("source_event_id") or "")
+        activation_row = conn.execute(
+            "SELECT * FROM graph_ref_events WHERE project_id=? AND event_id=?",
+            (project_id, activation_id),
+        ).fetchone() if activation_id else None
+        activation = dict(activation_row) if activation_row else {}
+        if not (
+            operator_event.get("operation_type") == "operator_reconcile"
+            and operator_event.get("ref_name") == "active"
+            and operator_event.get("new_snapshot_id") == snapshot_id
+            and operator_event.get("new_commit") == target_commit_sha
+            and operator_event.get("actor") == provenance_route_evidence.get("principal_id")
+            and isinstance(payload, Mapping)
+            and payload.get("run_id") == run_id
+            and payload.get("request_id") == request_id
+            and payload.get("principal_id") == provenance_route_evidence.get("principal_id")
+            and payload.get("session_id") == provenance_route_evidence.get("session_id")
+            and activation.get("operation_type") == "activate"
+            and activation.get("ref_name") == "active"
+            and activation.get("new_snapshot_id") == snapshot_id
+            and activation.get("new_commit") == target_commit_sha
+            and activation.get("old_snapshot_id") == operator_event.get("old_snapshot_id")
+            and activation.get("old_commit") == operator_event.get("old_commit")
+        ):
+            errors.append("terminal_operator_event_invalid")
+    else:
         if not provenance:
             errors.append("terminal_provenance_missing")
         else:
@@ -4510,21 +4741,35 @@ def current_full_active_terminal_tuple(
                 errors.append("terminal_provenance_run_mismatch")
             if _current_full_idempotency_scope(provenance_route_evidence) != expected_scope:
                 errors.append("terminal_provenance_scope_mismatch")
+            if not expected_scope.get("backlog_id") and not dev_force_graph_only and not (
+                provenance_route_evidence.get("authentication_source") == "operator_capability"
+                and str(provenance_route_evidence.get("principal_id") or "").strip()
+                and str(provenance_route_evidence.get("session_id") or "").strip()
+                and not provenance_route_evidence.get("route_token_ref")
+                and not provenance_route_evidence.get("route_token_scope")
+            ):
+                errors.append("terminal_operator_authentication_invalid")
         if not timeline_event:
             errors.append("terminal_timeline_missing")
         else:
+            operator_no_backlog = not expected_scope.get("backlog_id")
             if (
                 str(timeline_event.get("event_type") or "")
                 != (
                     "graph.dev_force_graph_reconcile"
-                    if dev_force_graph_only else "graph.reconcile"
+                    if dev_force_graph_only else (
+                        "graph.operator_current_full_reconcile"
+                        if operator_no_backlog else "graph.reconcile"
+                    )
                 )
                 or str(timeline_event.get("event_kind") or "")
-                != ("graph_only" if dev_force_graph_only else "reconcile")
+                != ("graph_only" if dev_force_graph_only else (
+                    "operator_reconcile" if operator_no_backlog else "reconcile"
+                ))
                 or str(timeline_event.get("phase") or "")
-                != ("graph" if dev_force_graph_only else "reconcile")
+                != ("graph" if dev_force_graph_only or operator_no_backlog else "reconcile")
                 or str(timeline_event.get("status") or "")
-                != ("recorded" if dev_force_graph_only else "passed")
+                != ("recorded" if dev_force_graph_only or operator_no_backlog else "passed")
                 or str(timeline_event.get("backlog_id") or "")
                 != expected_scope.get("backlog_id")
                 or str(timeline_event.get("task_id") or "")
@@ -4548,19 +4793,47 @@ def current_full_active_terminal_tuple(
                     )
                     if dev_force_graph_only
                     else (
+                        (
+                            str(timeline_payload.get("run_id") or "") != run_id
+                            or str(timeline_payload.get("request_id") or "") != request_id
+                            or str(timeline_payload.get("principal_id") or "")
+                            != str(provenance_route_evidence.get("principal_id") or "")
+                            or str(timeline_payload.get("session_id") or "")
+                            != str(provenance_route_evidence.get("session_id") or "")
+                            or str(timeline_payload.get("graph_ref_event_id") or "") == ""
+                            or timeline_payload.get("graph_reconciled") is not True
+                            or bool(timeline_payload.get("contract_evidence"))
+                        ) if operator_no_backlog else (
                         timeline_payload.get("current_full_reconcile") is not True
                         or timeline_payload.get("graph_reconciled") is not True
                         or str(event_trace.get("run_id") or "") != run_id
+                        )
                     )
                 )
             ):
                 errors.append("terminal_timeline_payload_mismatch")
             if (
-                not dev_force_graph_only
+                not dev_force_graph_only and not operator_no_backlog
                 and str(event_result.get("graph_delta_mode") or "")
                 != str(metric.get("graph_delta_mode") or "")
             ):
                 errors.append("terminal_timeline_metric_mode_mismatch")
+            if operator_no_backlog and not dev_force_graph_only:
+                ref_event_id = str(timeline_payload.get("graph_ref_event_id") or "")
+                ref_event_row = conn.execute(
+                    "SELECT * FROM graph_ref_events WHERE project_id=? AND event_id=?",
+                    (project_id, ref_event_id),
+                ).fetchone() if ref_event_id else None
+                ref_event = dict(ref_event_row) if ref_event_row else {}
+                if not (
+                    ref_event.get("ref_name") == "active"
+                    and ref_event.get("operation_type") == "activate"
+                    and ref_event.get("new_snapshot_id") == snapshot_id
+                    and ref_event.get("new_commit") == target_commit_sha
+                    and ref_event.get("old_snapshot_id")
+                    == str(timeline_payload.get("active_cas_previous_snapshot_id") or "")
+                ):
+                    errors.append("terminal_operator_active_cas_mismatch")
             metric_mode = str(metric.get("graph_delta_mode") or "")
             activation_verification = (
                 event_result.get("activation_verification")
@@ -4632,6 +4905,7 @@ def current_full_active_terminal_tuple(
         "timeline_scope_mismatch_fields": timeline_scope_mismatch_fields,
         "request_id": request_id,
         "reconcile_event_id": reconcile_event_id,
+        "operator_event_id": operator_event_id,
         "provenance_id": provenance_id,
         "companion_integrity": companion_integrity,
         "snapshot": snapshot,
