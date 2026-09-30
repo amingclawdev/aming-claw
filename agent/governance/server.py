@@ -65696,6 +65696,53 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
         and any(version != dispatch_schema_version for version in explicit_dispatch_versions)
     ):
         return {}
+    if dispatch_schema_version in {
+        "mf_parallel.dispatch_bounded_worker.v1",
+        "mf_parallel.dispatch_bounded_worker.v2",
+    } and not (
+        isinstance(bounded_workers, list)
+        and len(bounded_workers) == 1
+        and isinstance(bounded_workers[0], Mapping)
+        and dispatch_payload.get("worker_count") == 1
+        and dispatch_payload.get("required_worker_count") == 1
+        and dispatch_payload.get("atomic_dispatch") is False
+    ):
+        return {}
+    if dispatch_schema_version == "mf_parallel.atomic_two_worker_dispatch.v1":
+        ticket = dispatch_payload.get("dispatch_ticket_authority")
+        if not (
+            isinstance(bounded_workers, list)
+            and len(bounded_workers) == 2
+            and all(isinstance(worker, Mapping) for worker in bounded_workers)
+            and all(
+                str(worker.get("runtime_context_id") or "").strip()
+                and str(worker.get("task_id") or "").strip()
+                for worker in bounded_workers
+            )
+            and len({
+                str(worker.get("runtime_context_id") or "").strip()
+                for worker in bounded_workers
+            }) == 2
+            and len({
+                str(worker.get("task_id") or "").strip()
+                for worker in bounded_workers
+            }) == 2
+            and all(
+                str(worker.get("worker_role") or "").strip() == "mf_sub"
+                for worker in bounded_workers
+            )
+            and dispatch_payload.get("worker_count") == 2
+            and dispatch_payload.get("required_worker_count") == 2
+            and dispatch_payload.get("atomic_dispatch") is True
+            and dispatch_payload.get("all_or_nothing") is True
+            and isinstance(ticket, Mapping)
+            and ticket.get("schema_version")
+            == "mf_parallel.atomic_dispatch_ticket_authority.v1"
+            and ticket.get("required_worker_count") == 2
+            and ticket.get("all_workers_bound") is True
+            and ticket.get("atomic_dispatch") is True
+        ):
+            return {}
     if not dispatch_schema_version:
         # The accepted single-worker rev3 projection omitted all dispatch
         # versions.  Read only that exact sealed, ticket-bound shape; never

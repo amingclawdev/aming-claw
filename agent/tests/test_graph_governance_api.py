@@ -82201,6 +82201,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
     initial_join_omit_identity_field: str = "",
     pre_initial_join_dispatch_drift_field: str = "",
     pre_initial_join_dispatch_schema: str = "",
+    pre_initial_join_dispatch_cardinality: int = 1,
     dispatch_status: str = "",
     context_owned_files: tuple[str, ...] = ("agent/governance/server.py",),
     dispatch_owned_files: tuple[str, ...] | None = None,
@@ -82346,6 +82347,13 @@ def _setup_pre_lineage_rejoin_recovery_case(
                     "" if pre_initial_join_dispatch_schema == "empty"
                     else pre_initial_join_dispatch_schema
                 )
+        if pre_initial_join_dispatch_cardinality == 2:
+            dispatch_payload["bounded_workers"].append(
+                copy.deepcopy(dispatch_payload["bounded_workers"][0])
+            )
+            dispatch_payload["worker_count"] = 2
+            dispatch_payload["required_worker_count"] = 2
+            dispatch_payload["atomic_dispatch"] = True
         dispatch["payload"] = dispatch_payload
         record["completed_lines"] = lines
         runtime_guide = copy.deepcopy(record.get("runtime_guide") or {})
@@ -88305,6 +88313,53 @@ def test_frozen_single_worker_dispatch_rejects_explicit_bad_schema_before_join(
         )
     assert rejected.value.code == "runtime_context_initial_join_dispatch_identity_mismatch"
     assert rejected.value.details["mutation_performed"] is False
+
+
+def test_atomic_two_worker_schema_on_single_worker_is_zero_write_rejection(
+    conn, monkeypatch, tmp_path,
+):
+    before_join = {}
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix="single-worker-atomic-schema",
+            source_backed_contract_runtime=True,
+            pre_initial_join_dispatch_schema=(
+                "mf_parallel.atomic_two_worker_dispatch.v1"
+            ),
+            pre_initial_join_snapshot=before_join,
+        )
+    assert rejected.value.code == "runtime_context_initial_join_dispatch_identity_mismatch"
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["timeline_event_persisted"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    assert conn.total_changes == before_join["total_changes"]
+    assert "\n".join(conn.iterdump()) == before_join["database_dump"]
+
+
+def test_single_worker_schema_on_two_workers_is_zero_write_rejection(
+    conn, monkeypatch, tmp_path,
+):
+    before_join = {}
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix="two-workers-single-schema",
+            source_backed_contract_runtime=True,
+            pre_initial_join_dispatch_schema="mf_parallel.dispatch_bounded_worker.v2",
+            pre_initial_join_dispatch_cardinality=2,
+            pre_initial_join_snapshot=before_join,
+        )
+    assert rejected.value.code == "runtime_context_initial_join_dispatch_identity_mismatch"
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["timeline_event_persisted"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    assert conn.total_changes == before_join["total_changes"]
+    assert "\n".join(conn.iterdump()) == before_join["database_dump"]
 
 
 @pytest.mark.parametrize("drift", ["branch_ref", "owned_files"])
