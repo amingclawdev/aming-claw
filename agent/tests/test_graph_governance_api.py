@@ -82200,6 +82200,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
     initial_join_context_factory=None,
     initial_join_omit_identity_field: str = "",
     pre_initial_join_dispatch_drift_field: str = "",
+    pre_initial_join_dispatch_schema: str = "",
     dispatch_status: str = "",
     context_owned_files: tuple[str, ...] = ("agent/governance/server.py",),
     dispatch_owned_files: tuple[str, ...] | None = None,
@@ -82323,6 +82324,28 @@ def _setup_pre_lineage_rejoin_recovery_case(
                 ),
             }
         ]
+        if pre_initial_join_dispatch_schema:
+            for source in (dispatch, dispatch_payload, dispatch_payload["bounded_workers"][0]):
+                source.pop("schema_version", None)
+                if pre_initial_join_dispatch_schema == "missing":
+                    source.pop("agent_id", None)
+            if pre_initial_join_dispatch_schema == "missing":
+                dispatch_payload["worker_count"] = 1
+                dispatch_payload["required_worker_count"] = 1
+                dispatch_payload["atomic_dispatch"] = False
+                dispatch_payload["observer_impersonation"] = False
+                dispatch_payload["dispatch_ticket_authority"] = {
+                    "schema_version": "mf_parallel.dispatch_ticket_authority.v1",
+                    "source": "observer_route_token_refs",
+                    "server_resolved_child_route_identity": True,
+                    "runtime_context_bound": True,
+                    "observer_impersonation_explicit": True,
+                }
+            if pre_initial_join_dispatch_schema != "missing":
+                dispatch_payload["schema_version"] = (
+                    "" if pre_initial_join_dispatch_schema == "empty"
+                    else pre_initial_join_dispatch_schema
+                )
         dispatch["payload"] = dispatch_payload
         record["completed_lines"] = lines
         runtime_guide = copy.deepcopy(record.get("runtime_guide") or {})
@@ -82341,6 +82364,17 @@ def _setup_pre_lineage_rejoin_recovery_case(
         guide_payload["bounded_workers"] = copy.deepcopy(
             dispatch_payload["bounded_workers"]
         )
+        if pre_initial_join_dispatch_schema:
+            guide_dispatch.pop("schema_version", None)
+            guide_payload.pop("schema_version", None)
+            if pre_initial_join_dispatch_schema == "missing":
+                guide_dispatch.pop("agent_id", None)
+                guide_payload.pop("agent_id", None)
+            if pre_initial_join_dispatch_schema != "missing":
+                guide_payload["schema_version"] = (
+                    "" if pre_initial_join_dispatch_schema == "empty"
+                    else pre_initial_join_dispatch_schema
+                )
         guide_dispatch["payload"] = guide_payload
         runtime_guide["completed_lines"] = guide_lines
         record["runtime_guide"] = runtime_guide
@@ -88228,6 +88262,74 @@ def test_fresh_join_worker_identity_is_anchored_to_contract_dispatch_not_context
             ),
         }
     ]
+
+
+def test_frozen_schema_less_single_worker_dispatch_rejoins_exact_custody(
+    conn, monkeypatch, tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="frozen-schema-less-dispatch",
+        source_backed_contract_runtime=True,
+        pre_initial_join_dispatch_schema="missing",
+    )
+    anchor = server._runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+        conn,
+        project_id=PID,
+        context=case["context"],
+        runtime_context_id=case["context"].runtime_context_id,
+        contract_execution_id=case["parent_task_id"],
+    )
+    assert anchor["dispatch_schema_version"] == (
+        "mf_parallel.legacy_schema_less_single_worker_dispatch"
+    )
+    assert case["initial_join"]["ok"] is True
+    assert anchor["route_identity"] == case["route_identity"]
+
+
+@pytest.mark.parametrize("schema", ["empty", "mf_parallel.dispatch_bounded_worker.v99"])
+def test_frozen_single_worker_dispatch_rejects_explicit_bad_schema_before_join(
+    conn, monkeypatch, tmp_path, schema,
+):
+    suffix = "bad-dispatch-schema-" + ("empty" if schema == "empty" else "unknown")
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=suffix,
+            source_backed_contract_runtime=True,
+            pre_initial_join_dispatch_schema=schema,
+        )
+    assert rejected.value.code == "runtime_context_initial_join_dispatch_identity_mismatch"
+    assert rejected.value.details["mutation_performed"] is False
+
+
+@pytest.mark.parametrize("drift", ["branch_ref", "owned_files"])
+def test_frozen_schema_less_dispatch_rejects_context_or_custody_drift(
+    conn, monkeypatch, tmp_path, drift,
+):
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix=f"frozen-schema-less-{drift}",
+            source_backed_contract_runtime=True,
+            pre_initial_join_dispatch_schema="missing",
+            pre_initial_join_dispatch_drift_field=(
+                "branch_ref" if drift == "branch_ref" else ""
+            ),
+            dispatch_owned_files=(
+                ("agent/tests/test_graph_governance_api.py",)
+                if drift == "owned_files" else None
+            ),
+        )
+    assert rejected.value.code == "runtime_context_initial_join_dispatch_identity_mismatch"
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["credential_rotated"] is False
 
 
 @pytest.mark.parametrize(
@@ -190666,6 +190768,24 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
         "branch_ref" in error
         for error in forged_precheck["decision"]["errors"]
     )
+    unknown_schema_body = copy.deepcopy(copy_safe_dispatch_body)
+    unknown_schema_body["payload"]["schema_version"] = (
+        "mf_parallel.dispatch_bounded_worker.v99"
+    )
+    before_unknown_schema = conn.total_changes
+    unknown_schema = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": child_execution_id},
+            "observer",
+            method="POST",
+            body=unknown_schema_body,
+        )
+    )
+    assert unknown_schema["ok"] is False
+    assert "dispatch schema_version is unknown or conflicting" in (
+        unknown_schema["decision"]["errors"]
+    )
+    assert conn.total_changes == before_unknown_schema
     accepted_dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {
@@ -190848,6 +190968,44 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
         runtime_context_id_for_branch_context(batch_context)
     )
     assert "contract_merge_authority" not in batch_scope
+
+    # This child went through the real batch entry, one-lane allocation,
+    # Guide prefill, and accepted dispatch above.  The first worker host join
+    # must consume that sealed dispatch without any fixture repair.
+    assert bound_dispatch["payload"]["schema_version"] == (
+        "mf_parallel.dispatch_bounded_worker.v2"
+    )
+    worker_session_id = f"session-{child_worker_context.task_id}"
+    joined = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": child_worker_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": child_worker_context.task_id,
+                "parent_task_id": child_execution_id,
+                "contract_execution_id": child_execution_id,
+                "target_project_root": child_worker_context.target_project_root,
+                "worker_id": child_worker_context.worker_id,
+                "worker_slot_id": child_worker_context.worker_slot_id,
+                "agent_id": child_worker_context.worker_id,
+                "actual_host_worker_id": child_worker_context.worker_id,
+                "worker_session_id": worker_session_id,
+                "host_session_id": worker_session_id,
+                "host_startup_id": f"startup-{child_worker_context.task_id}",
+                **child_allocation_body["route_identity"],
+                "ttl_seconds": 3600,
+                "reason": "Verify the accepted one-worker batch dispatch custody.",
+            },
+        )
+    )
+    assert joined["ok"] is True
+    assert joined["canonical_identity_binding"]["contract_dispatch_identity_anchor"][
+        "dispatch_schema_version"
+    ] == "mf_parallel.dispatch_bounded_worker.v2"
 
 
 def test_mf_batch_guide_entry_replay_survives_timeline_window_and_active_epoch(

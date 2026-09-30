@@ -65663,6 +65663,129 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
         or dispatch_line.get("schema_version")
         or ""
     ).strip()
+    explicit_dispatch_versions = [
+        str(source.get("schema_version") or "").strip()
+        for source in (dispatch_line, dispatch_payload)
+        if "schema_version" in source
+    ]
+    bounded_workers = dispatch_payload.get("bounded_workers")
+    if isinstance(bounded_workers, list):
+        explicit_dispatch_versions.extend(
+            str(worker.get("schema_version") or "").strip()
+            for worker in bounded_workers
+            if isinstance(worker, Mapping) and "schema_version" in worker
+        )
+    known_dispatch_versions = {
+        "mf_parallel.dispatch_bounded_worker.v1",
+        "mf_parallel.dispatch_bounded_worker.v2",
+        "mf_parallel.atomic_two_worker_dispatch.v1",
+    }
+    if any(version not in known_dispatch_versions for version in explicit_dispatch_versions):
+        return {}
+    if (
+        dispatch_line.get("schema_version")
+        and dispatch_payload.get("schema_version")
+        and dispatch_line.get("schema_version") != dispatch_payload.get("schema_version")
+    ):
+        return {}
+    if (
+        dispatch_schema_version in {
+            "mf_parallel.dispatch_bounded_worker.v1",
+            "mf_parallel.dispatch_bounded_worker.v2",
+        }
+        and any(version != dispatch_schema_version for version in explicit_dispatch_versions)
+    ):
+        return {}
+    if not dispatch_schema_version:
+        # The accepted single-worker rev3 projection omitted all dispatch
+        # versions.  Read only that exact sealed, ticket-bound shape; never
+        # infer a version from the unrelated dispatch-ticket schema.
+        selected = _contract_runtime_current_dispatch_authority_line(record)
+        completed_lines = record.get("completed_lines")
+        sealed_line = (
+            completed_lines[line_index]
+            if isinstance(completed_lines, list)
+            and isinstance(line_index, int)
+            and 0 <= line_index < len(completed_lines)
+            else None
+        )
+        ticket = dispatch_payload.get("dispatch_ticket_authority")
+        if not (
+            str(record.get("contract_id") or "").strip() == "mf_parallel.v2"
+            and selected.get("status") == "selected"
+            and selected.get("completed_line_index") == line_index
+            and isinstance(sealed_line, Mapping)
+            and dict(sealed_line) == dict(dispatch_line)
+            and str(dispatch_line.get("line_instance_id") or "").strip()
+            == f"runtime_context:{runtime_id}"
+            and not explicit_dispatch_versions
+            and isinstance(bounded_workers, list)
+            and len(bounded_workers) == 1
+            and isinstance(bounded_workers[0], Mapping)
+            and dispatch_payload.get("worker_count") == 1
+            and dispatch_payload.get("required_worker_count") == 1
+            and dispatch_payload.get("atomic_dispatch") is False
+            and dispatch_payload.get("observer_impersonation") is False
+            and isinstance(ticket, Mapping)
+            and dict(ticket) == {
+                "schema_version": "mf_parallel.dispatch_ticket_authority.v1",
+                "source": "observer_route_token_refs",
+                "server_resolved_child_route_identity": True,
+                "runtime_context_bound": True,
+                "observer_impersonation_explicit": True,
+            }
+        ):
+            return {}
+        worker = bounded_workers[0]
+        expected_legacy_fields = {
+            "runtime_context_id": runtime_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "target_project_root": _runtime_context_effective_target_project_root(context),
+            "worktree_path": str(getattr(context, "worktree_path", "") or "").strip(),
+            "branch_ref": str(getattr(context, "branch_ref", "") or "").strip(),
+            "base_commit": str(getattr(context, "base_commit", "") or "").strip(),
+            "target_head_commit": str(getattr(context, "target_head_commit", "") or "").strip(),
+            "merge_queue_id": str(getattr(context, "merge_queue_id", "") or "").strip(),
+        }
+        if any(
+            not expected or any(
+                str(source.get(field) or "").strip() != expected
+                for source in (dispatch_payload, worker)
+            )
+            for field, expected in expected_legacy_fields.items()
+        ):
+            return {}
+        expected_files = _runtime_context_closed_canonical_owned_file_set(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+        expected_agent = str(
+            getattr(context, "agent_id", "")
+            or getattr(context, "allocation_owner", "")
+            or ""
+        ).strip()
+        if (
+            not expected_files
+            or any(
+                _runtime_context_closed_canonical_owned_file_set(
+                    source.get("owned_files") or ()
+                ) != expected_files
+                or (
+                    str(source.get("agent_id") or "").strip()
+                    and str(source.get("agent_id") or "").strip() != expected_agent
+                )
+                for source in (dispatch_payload, worker)
+            )
+            or not isinstance(dispatch_payload.get("route_identity"), Mapping)
+            or not isinstance(worker.get("route_identity"), Mapping)
+            or dispatch_payload["route_identity"] != worker["route_identity"]
+        ):
+            return {}
+        dispatch_schema_version = "mf_parallel.legacy_schema_less_single_worker_dispatch"
     if (
         not isinstance(line_index, int)
         or str(dispatch_line.get("stage_id") or "").strip() != "dispatch"
@@ -151662,6 +151785,34 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
         return effective, list(dict.fromkeys(errors))
 
     assert context is not None
+    dispatch_schema_version = (
+        "contract_update.dispatch_bounded_worker.v1"
+        if contract_update_authority
+        else "mf_parallel.dispatch_bounded_worker.v2"
+    )
+    allowed_dispatch_versions = (
+        {dispatch_schema_version}
+        if contract_update_authority
+        else {
+            "mf_parallel.dispatch_bounded_worker.v1",
+            dispatch_schema_version,
+        }
+    )
+    supplied_versions = {
+        str(source.get("schema_version") or "").strip()
+        for source in (payload, bounded_worker)
+        if "schema_version" in source
+    }
+    if (
+        any(version not in allowed_dispatch_versions for version in supplied_versions)
+        or len(supplied_versions) > 1
+    ):
+        return effective, ["dispatch schema_version is unknown or conflicting"]
+    payload["schema_version"] = (
+        next(iter(supplied_versions))
+        if supplied_versions
+        else dispatch_schema_version
+    )
     canonical_values = {
         "runtime_context_id": str(context.runtime_context_id),
         "task_id": str(context.task_id),
