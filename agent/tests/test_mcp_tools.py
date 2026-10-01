@@ -2038,6 +2038,36 @@ def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
     )
 
 
+def test_parallel_branch_merge_queue_apply_preserves_distinct_route_refs():
+    properties = _tool_properties("parallel_branch_merge_queue_apply")
+    assert properties["observer_route_token_ref"]["type"] == "string"
+    assert properties["route_token_ref"]["type"] == "string"
+
+    expected = {
+        "merge_queue_id": "mq-route-refs",
+        "task_id": "task-route-refs",
+        "observer_route_token_ref": "fixture-opaque-parent-ref",
+        "route_token_ref": "fixture-opaque-child-ref",
+        "dry_run": False,
+    }
+    args = {**expected, "unsupported_route_probe": "must-not-forward"}
+    assert mcp_tools._parallel_branch_merge_queue_apply_body(args) == expected
+
+    recorder = _Recorder()
+    result = _dispatcher(recorder).dispatch(
+        "parallel_branch_merge_queue_apply",
+        {"project_id": "aming-claw", **args},
+    )
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/parallel-branches/merge-execute",
+            expected,
+        )
+    ]
+    assert result["data"] == expected
+
+
 def test_parallel_branch_merge_queue_apply_forwards_explicit_flow():
     properties = _tool_properties("parallel_branch_merge_queue_apply")
     assert set(properties["flow"]["enum"]) == {

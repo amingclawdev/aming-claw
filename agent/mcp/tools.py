@@ -4035,6 +4035,10 @@ def _parallel_branch_merge_queue_apply_schema_properties() -> dict[str, Any]:
             "type": "string",
             "description": "Opaque server-registered route token reference.",
         },
+        "observer_route_token_ref": {
+            "type": "string",
+            "description": "Opaque parent observer route reference, separate from the child route_token_ref.",
+        },
         "route_waiver": {"type": "object"},
         "route_token_waiver": {"type": "object"},
         "timeout_seconds": {"type": "integer"},
@@ -4186,6 +4190,7 @@ def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
         "parent_task_id",
         "route_token",
         "route_token_ref",
+        "observer_route_token_ref",
         "route_waiver",
         "route_token_waiver",
         "timeout_seconds",
