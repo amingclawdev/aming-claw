@@ -5066,6 +5066,10 @@ def _typed_reference_setup(connection, count=70):
 
 def test_typed_census_measured_shape_preserves_current_and_durable_large_audits(conn):
     _typed_reference_setup(conn, count=109)
+    # Real owner count/physical-identity scalars are supported metadata, while
+    # unknown ordinary binary payloads must never prove negative authority.
+    conn.execute("INSERT INTO reconcile_run_metrics(project_id,run_id,snapshot_id,status,created_at) "
+                 "VALUES (?, 'typed-owned-metadata', 'scope-current', 'completed', '2020')", (PID,))
     # Reproduce inventory/owner proportions without claiming 114 eligible items.
     conn.executemany("INSERT INTO graph_snapshots(project_id,snapshot_id,commit_sha,snapshot_kind,status,created_at) "
                      "VALUES (?,?,?,'scope','superseded','2020')",
@@ -5105,6 +5109,27 @@ def test_typed_census_measured_shape_preserves_current_and_durable_large_audits(
     assert len(conn.execute("SELECT snapshot_id FROM graph_snapshots").fetchall()) == 114
     assert any('_rowid_>64' in q for q in statements) and body_fetches == []
     assert changes == conn.total_changes and image == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+def test_typed_rework_owned_integer_field_rejects_actual_blob_storage(conn):
+    _typed_reference_setup(conn, count=1)
+    conn.execute("INSERT INTO reconcile_run_metrics(project_id,run_id,snapshot_id,status,created_at,node_count) "
+                 "VALUES (?, 'typed-opaque-count', 'scope-current', 'completed', '2020', ?)",
+                 (PID, sqlite3.Binary(b'{"snapshot_id":"scope-durable"}')))
+    conn.commit()
+    image = hashlib.sha256(conn.serialize()).hexdigest()
+    fetched = []
+    def row_factory(cursor, row):
+        fetched.extend(v for v in row if isinstance(v, bytes))
+        return sqlite3.Row(cursor, row)
+    conn.row_factory = row_factory
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state["complete"] and "reconcile_run_metrics_payload_unreadable" in state["refusal_reasons"]
+    assert state["refusal_metadata"][0] == {
+        "table": "reconcile_run_metrics", "field": "node_count", "sqlite_storage_type": "blob",
+        "storage_byte_length": 31, "utf8_byte_length": None,
+        "cause": "unsupported_payload_storage", "complete": False, "body_fetched": False}
+    assert not fetched and image == hashlib.sha256(conn.serialize()).hexdigest()
 
 
 @pytest.mark.parametrize("payload,cause", [

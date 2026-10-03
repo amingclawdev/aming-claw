@@ -2074,6 +2074,26 @@ def _snapshot_retention_reference_state(
         "graph_c_family_occurrences", "graph_c_family_relations",
         "graph_c_family_diagnostics",
     }
+    # These scalar fields are owned by this module's schemas: counts, source
+    # coordinates and physical/process/event identities, never audit payloads.
+    # Declared affinity alone does not establish that an unknown field is one
+    # of them; SQLite can store opaque bytes in an INTEGER or TEXT column too.
+    integer_metadata = {
+        "graph_current_full_reconcile_provenance": {"reconcile_event_id"},
+        "graph_c_family_symbols": {"line", "is_definition"},
+        "graph_c_family_occurrences": {"line", "column_no"},
+        "graph_c_family_diagnostics": {"line"},
+        "pending_scope_reconcile": {"retry_count"},
+        "reconcile_run_metrics": {"changed_file_count", "impacted_file_count", "event_count",
+                                  "node_count", "edge_count", "elapsed_ms"},
+        "graph_current_full_build_claim_history": {"manager_pid"},
+        "graph_reconcile_manager_generations": {"sequence", "manager_pid",
+                                                "predecessor_sequence", "prior_manager_pid"},
+        "graph_reconcile_metric_physical_identities": {"identity_sequence", "metric_rowid"},
+        "graph_reconcile_run_terminalizations": {"source_metric_identity_sequence",
+                                                "replacement_metric_identity_sequence", "timeline_event_id"},
+        "sqlite_sequence": {"seq"},
+    }
 
     try:
         known_ids = {str(row["snapshot_id"]) for row in conn.execute(
@@ -2114,8 +2134,22 @@ def _snapshot_retention_reference_state(
         tables = [str(row["name"]) for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()]
+        # FTS5's binary shadows encode the logical virtual table. Scan that
+        # table's TEXT values below; do not mistake SQLite's verified internal
+        # index representation for an independent opaque audit owner. A name
+        # resembling an FTS shadow is insufficient without SQLite's type and
+        # the actual FTS5 parent definition.
+        fts5_owners = {str(row[0]) for row in conn.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='table'")
+            if re.search(r"\busing\s+fts5\s*\(", str(row[1]), re.IGNORECASE)
+            # Contentless FTS returns NULL instead of its indexed text. Its
+            # binary storage remains unsupported, never a negative proof.
+            and not re.search(r"\bcontent\s*=\s*(['\"])\s*\1", str(row[1]), re.IGNORECASE)}
+        fts5_shadows = {str(row[1]) for row in conn.execute("PRAGMA table_list")
+            if row[2] == "shadow" and any(str(row[1]) == owner + "_" + suffix
+                for owner in fts5_owners for suffix in ("data", "idx", "content", "docsize", "config"))}
         for table in tables:
-            if table in intrinsic:
+            if table in intrinsic or table in fts5_shadows:
                 continue
             if table == "contract_runtime_executions":
                 try:
@@ -2154,22 +2188,19 @@ def _snapshot_retention_reference_state(
                                              and col == "snapshot_id")))
             if identity:
                 collect(table, identity, f"durable_{table}_reference")
-            text_columns = sorted(str(row["name"]) for row in schema_rows
-                                  if "TEXT" in str(row["type"] or "").upper()
-                                  and not (table in self_identity_tables
-                                           and str(row["name"]) == "snapshot_id"))
-            if any(col.endswith("_json") and col not in text_columns for col in columns):
-                refusals.append(f"{table}_payload_type_unknown")
-            if not text_columns:
-                continue
+            # SQLite affinity is not a storage proof. Project bounded actual
+            # TEXT for every non-intrinsic field, plus storage metadata for all
+            # other values. FTS5 logical TEXT columns have no declared affinity.
+            text_columns = sorted(columns - (
+                {"snapshot_id"} if table in self_identity_tables else set()))
             quoted_columns = ['"' + col.replace('"', '""') + '"' for col in text_columns]
-            selected = ",".join(f"CASE WHEN typeof({col})='text' AND "
+            projection = [f"CASE WHEN typeof({col})='text' AND "
                 f"length(CAST({col} AS BLOB))<={_REFERENCE_MAX_BYTES} THEN {col} ELSE NULL END"
-                for col in quoted_columns)
-            selected += "," + ",".join(f"typeof({col}),length(CAST({col} AS BLOB))"
-                                       for col in quoted_columns)
-            where = " WHERE project_id=?" if "project_id" in columns else ""
-            rows = _reference_pages(conn, table, selected,
+                for col in quoted_columns]
+            projection += [f"typeof({col}),length(CAST({col} AS BLOB))" for col in quoted_columns]
+            if not projection:
+                continue
+            rows = _reference_pages(conn, table, ",".join(projection),
                 "project_id=?" if "project_id" in columns else "",
                 (project_id,) if "project_id" in columns else ())
             for source_row in rows:
@@ -2181,8 +2212,15 @@ def _snapshot_retention_reference_state(
                 for index, col in enumerate(text_columns):
                     raw = row[col]
                     storage_type, byte_length = source_row[1+len(text_columns)+index*2:3+len(text_columns)+index*2]
+                    if col in integer_metadata.get(table, set()) and storage_type == "integer":
+                        continue
                     if storage_type != "null" and (storage_type != "text" or byte_length > _REFERENCE_MAX_BYTES):
                         refusals.append(f"{table}_payload_unreadable")
+                        if not refusal_metadata:
+                            refusal_metadata.append({"table": table, "field": col,
+                                "sqlite_storage_type": storage_type, "storage_byte_length": byte_length,
+                                "utf8_byte_length": byte_length if storage_type == "text" else None,
+                                "cause": "unsupported_payload_storage", "complete": False, "body_fetched": False})
                         continue
                     if raw is None or raw == "":
                         continue

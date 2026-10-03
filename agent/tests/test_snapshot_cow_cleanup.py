@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import ctypes
+import hashlib
 import os
 import plistlib
 import shutil
@@ -85,6 +86,112 @@ def preview(fixture):
     conn, root, *_ = fixture
     return cleanup.build_stale_artifact_cleanup_projection(conn, "proj", repo_root_path=root,
                                                           dimension=cow.DIMENSION)
+
+
+@pytest.mark.parametrize("declared_type,payload", [
+    ("BLOB", sqlite3.Binary(b'{"snapshot_id":"scope-opaque-reference"}')),
+    ("BLOB", sqlite3.Binary(b'\x00\xffopaque-owner')),
+    ("TEXT", sqlite3.Binary(b'{"snapshot_id":"scope-opaque-reference"}')),
+    ("INTEGER", 7),
+])
+def test_typed_rework_unprojected_owner_storage_protects_selector_and_public(
+        cow_fixture, declared_type, payload):
+    conn, root, base, *_ = cow_fixture
+    sid = "scope-opaque-reference"
+    conn.execute("INSERT INTO graph_snapshots(project_id,snapshot_id,commit_sha,snapshot_kind,status,created_at) "
+                 "VALUES ('proj',?,'fixture','scope','superseded','2020')", (sid,))
+    path = snapshots._snapshot_root("proj", sid)
+    path.mkdir(parents=True)
+    (path / "graph.json").write_text('{}')
+    conn.execute(f"CREATE TABLE ordinary_audit(payload {declared_type})")
+    conn.execute("INSERT INTO ordinary_audit VALUES (?)", (payload,))
+    conn.commit()
+    before = hashlib.sha256(conn.serialize()).hexdigest()
+    changes = conn.total_changes
+    files = {str(p): p.read_bytes() for p in base.parent.rglob('*') if p.is_file()}
+    fetched = []
+
+    def row_factory(cursor, row):
+        fetched.extend(value for col, value in zip(cursor.description, row)
+                       if col[0] == "payload" or isinstance(value, bytes))
+        return sqlite3.Row(cursor, row)
+
+    conn.row_factory = row_factory
+    state = snapshots.snapshot_retention_reference_state(conn, "proj")
+    assert not state["complete"]
+    assert any(reason.startswith("ordinary_audit_payload_") for reason in state["refusal_reasons"])
+    metadata = state["refusal_metadata"][0]
+    assert metadata["table"] == "ordinary_audit" and metadata["field"] == "payload"
+    assert metadata["body_fetched"] is False and metadata["complete"] is False
+    assert metadata["sqlite_storage_type"] == ("blob" if isinstance(payload, (bytes, memoryview))
+                                                else "integer" if isinstance(payload, int) else "text")
+    selected = snapshots.select_snapshot_retention_candidates(
+        conn, "proj", keep_last_n=0, extra_bundle_snapshot_ids=set())
+    assert not selected["reference_authority_complete"] and selected["candidates"] == []
+    assert "reference_authority_incomplete" in next(
+        r["reasons"] for r in selected["protected"] if r["snapshot_id"] == sid)
+    public = cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=root, dimension="graph_snapshots")
+    assert public["summary"]["safe_apply_count"] == 0
+    assert any(reason.startswith("ordinary_audit_payload_") for reason in public["global_refusal_reasons"])
+    own_rows = [r for r in public["candidates"] if r["snapshot_id"] == sid]
+    assert own_rows and all(r["safe_to_apply"] is False for r in own_rows)
+    assert fetched == [] and conn.total_changes == changes
+    assert before == hashlib.sha256(conn.serialize()).hexdigest()
+    assert files == {str(p): p.read_bytes() for p in base.parent.rglob('*') if p.is_file()}
+    assert not cow._state_root("proj").exists()
+
+
+@pytest.mark.parametrize("declared_type", ["TEXT", "", "BLOB"])
+def test_typed_rework_supported_actual_text_owner_is_censusable(cow_fixture, declared_type):
+    conn, root, *_ = cow_fixture
+    conn.execute(f"CREATE TABLE ordinary_audit(payload {declared_type}, optional_note TEXT)")
+    conn.execute("INSERT INTO ordinary_audit VALUES (?, NULL)",
+                 (json.dumps({"nested": {"snapshot_id": "full-old"}}),))
+    conn.commit()
+    before = hashlib.sha256(conn.serialize()).hexdigest()
+    state = snapshots.snapshot_retention_reference_state(conn, "proj")
+    assert state["complete"] and state["refusal_reasons"] == []
+    assert "full-old" in state["current_use"] and "full-old" in state["durable_references"]
+    public = cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=root, dimension="graph_snapshots")
+    assert public["global_refusal_reasons"] == []
+    own_rows = [r for r in public["candidates"] if r["snapshot_id"] == "full-old"]
+    assert own_rows and all(not r["safe_to_apply"] for r in own_rows)
+    assert before == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+def test_typed_rework_fts_logical_owner_carries_pin_but_shadow_name_is_not_authority(cow_fixture):
+    conn, *_ = cow_fixture
+    conn.execute("CREATE VIRTUAL TABLE ordinary_audit_fts USING fts5 (payload)")
+    conn.execute("INSERT INTO ordinary_audit_fts VALUES (?)", ('{"snapshot_id":"full-old"}',))
+    conn.commit()
+    before = hashlib.sha256(conn.serialize()).hexdigest()
+    state = snapshots.snapshot_retention_reference_state(conn, "proj")
+    assert state["complete"] and "full-old" in state["protected"]
+    assert before == hashlib.sha256(conn.serialize()).hexdigest()
+    # This is an ordinary table, not a SQLite-confirmed FTS5 shadow.
+    conn.execute("CREATE TABLE fabricated_fts_data(payload BLOB)")
+    conn.execute("INSERT INTO fabricated_fts_data VALUES (?)", (sqlite3.Binary(b'opaque-owner'),))
+    conn.commit()
+    state = snapshots.snapshot_retention_reference_state(conn, "proj")
+    assert not state["complete"] and "fabricated_fts_data_payload_unreadable" in state["refusal_reasons"]
+
+
+def test_typed_rework_contentless_fts_never_proves_absence(cow_fixture):
+    conn, root, *_ = cow_fixture
+    conn.execute("CREATE VIRTUAL TABLE opaque_audit_fts USING fts5(payload, content='')")
+    conn.execute("INSERT INTO opaque_audit_fts VALUES (?)", ('{"snapshot_id":"full-old"}',))
+    conn.commit()
+    assert conn.execute("SELECT payload FROM opaque_audit_fts").fetchone()[0] is None
+    state = snapshots.snapshot_retention_reference_state(conn, "proj")
+    assert not state["complete"] and state["refusal_reasons"]
+    selected = snapshots.select_snapshot_retention_candidates(
+        conn, "proj", keep_last_n=0, extra_bundle_snapshot_ids=set())
+    assert not selected["reference_authority_complete"] and not selected["candidates"]
+    public = cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=root, dimension="graph_snapshots")
+    assert public["global_refusal_reasons"] and public["summary"]["safe_apply_count"] == 0
 
 
 def apply(fixture, plan):
