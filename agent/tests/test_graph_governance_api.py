@@ -242485,3 +242485,55 @@ def test_worker_action_redacts_complete_nested_credentials_before_fragmentation(
     assert decoded["copy_safe_body"]["worker_host_envelope_handoff"]["raw_worker_env_required"] is False
     assert server._stable_public_hash(decoded) == manifest["action_hash"]
     assert decoded["copy_safe_body"]["implementation_diff_submission_guidance"] == action["copy_safe_body"]["implementation_diff_submission_guidance"]
+
+
+@pytest.mark.parametrize("tool", [
+    "runtime_context_implementation_evidence",
+    "runtime_context_finish_time_worker_attestation",
+])
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_canonical_worker_action_sanitizes_original_inputs_before_placeholders(tool, fragmented):
+    from copy import deepcopy
+    from agent.tests.test_mcp_tools import _worker_action_transport_fixture
+    identity, fixture_action, _, _ = _worker_action_transport_fixture(tool)
+    body = deepcopy(fixture_action["copy_safe_body"])
+    marker = "NOT_A_SECRET_TEST_VALUE"
+    body.pop("implementation_diff_submission_guidance")
+    body["session_token"] = marker
+    body["payload"].update({
+        "credentials": {"nested": [{"fence_token": marker}]},
+        "public_note": "before " + marker + " after",
+        "nested_notes": [{"note": marker}],
+        "ordinary_guidance": "retain this guidance " * (2000 if fragmented else 1),
+    })
+    body["worker_host_envelope_handoff"]["raw_worker_env_required"] = ["AMING_WORKER_SESSION_TOKEN"]
+    action = server._guide_canonical_executable_action(
+        project_id=identity["project_id"], action=fixture_action["action"],
+        body=body, mcp_tool=tool, stage_id=fixture_action["stage_id"],
+        line_id=fixture_action["line_id"],
+        host_realization={"public_note": marker, "raw_auth_persisted": True},
+    )
+    assert marker not in json.dumps(action)
+    assert action["copy_safe_body"]["session_token"] == "<host-realized session_token>"
+    assert "copy_safe_body.session_token" in action["host_realization"]["required_replacement_paths"]
+    assert action["copy_safe_body"]["payload"]["public_note"] == "before <private worker credential> after"
+    assert action["copy_safe_body"]["payload"]["nested_notes"] == [{"note": "<private worker credential>"}]
+    assert "credentials" not in action["copy_safe_body"]["payload"]
+    assert action["host_realization"]["public_note"] == "<private worker credential>"
+    assert action["host_realization"]["raw_auth_persisted"] is False
+    assert action["copy_safe_body"]["worker_host_envelope_handoff"]["raw_worker_env_required"] is False
+    assert action["copy_safe_body"]["session_token_ref"] == identity["session_token_ref"]
+    assert action["copy_safe_body"]["payload"]["ordinary_guidance"] == body["payload"]["ordinary_guidance"]
+    source = {**identity, "canonical_executable_action": action}
+    header = server._runtime_context_worker_guide_action_continuation(source)
+    if not fragmented:
+        assert header is None
+        return
+    manifest = header["action_continuation"]
+    pages = [server._runtime_context_worker_guide_action_continuation(
+        source, detail_ref=manifest["detail_ref"], detail_cursor=f"action:{index}",
+    ) for index in range(manifest["page_count"])]
+    decoded = json.loads("".join(page["fragment"] for page in pages))
+    assert decoded == action
+    assert marker not in json.dumps(decoded)
+    assert server._stable_public_hash(decoded) == manifest["action_hash"]

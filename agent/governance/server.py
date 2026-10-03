@@ -177462,7 +177462,17 @@ def _guide_canonical_executable_action(
     normalized_action = str(action or facade or mcp_tool or "").strip()
     normalized_facade = str(facade or mcp_tool or normalized_action).strip()
     normalized_tool = str(mcp_tool or normalized_facade).strip()
-    copy_safe_body, replacement_paths = _guide_executable_action_safe_body(body)
+    # Collect private values from the original inputs before replacing named
+    # fields with placeholders; otherwise repeated public aliases lose their
+    # association with the private field before complete-action sanitization.
+    public_inputs = _runtime_context_worker_guide_public_action({
+        "copy_safe_body": body,
+        "host_realization": host_realization or {},
+    })
+    copy_safe_body = public_inputs["copy_safe_body"]
+    replacement_paths = public_inputs["host_realization"]["required_replacement_paths"]
+    if isinstance(host_realization, Mapping):
+        host_realization = public_inputs["host_realization"]
     if project_id:
         copy_safe_body.setdefault("project_id", project_id)
 
@@ -177581,7 +177591,7 @@ def _guide_canonical_executable_action(
             )
         )
         projected_host_realization["authority_inference_allowed"] = False
-    return {
+    return _runtime_context_worker_guide_public_action({
         "schema_version": "guide.canonical_executable_action.v1",
         "action": normalized_action,
         "facade": normalized_facade,
@@ -177606,7 +177616,7 @@ def _guide_canonical_executable_action(
             "unrealized_placeholder": "reject_zero_write",
             "raw_secret_exposed": False,
         },
-    }
+    })
 
 
 def _onboard_guide_capsule_blocker_ids(
