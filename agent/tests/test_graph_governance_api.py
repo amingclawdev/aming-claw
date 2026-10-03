@@ -204160,9 +204160,12 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
     ).fetchone()[0] == before_same_lane_timeline
 
 
+@pytest.mark.parametrize("via_action_continuation", [False, True], ids=["direct", "paged-action"])
 def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_inactive_lane(
     conn,
     tmp_path,
+    monkeypatch,
+    via_action_continuation,
 ):
     backlog_id = "AC-IMPLEMENTATION-WRITER-HASH-LANE-R2"
     parent_task_id = "implementation-writer-hash-lane-r2-parent"
@@ -204671,18 +204674,149 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
         Path(inactive_context.target_project_root) / inactive_context.owned_files[0]
     )
     implementation_path.write_text("implementation\n", encoding="utf-8")
-    implementation = (
-        server.handle_graph_governance_runtime_context_implementation_evidence(
-            _ctx(
-                {
-                    "project_id": PID,
-                    "runtime_context_id": inactive_context.runtime_context_id,
-                },
-                method="POST",
-                body=implementation_body,
+    if via_action_continuation:
+        from agent.mcp.tools import ToolDispatcher
+        original_builder = server._guide_canonical_executable_action
+        def oversized_builder(**kwargs):
+            if kwargs.get("mcp_tool") == "runtime_context_implementation_evidence":
+                kwargs["body"] = copy.deepcopy(kwargs["body"])
+                kwargs["body"]["implementation_diff_submission_guidance"]["transport_diagnostics"] = "escaped\\\"雪" * 7000
+            return original_builder(**kwargs)
+        monkeypatch.setattr(server, "_guide_canonical_executable_action", oversized_builder)
+        dispatcher = ToolDispatcher(api_fn=lambda *_args: None, worker_pool=None)
+        identity = {
+            "project_id": PID, "runtime_context_id": inactive_context.runtime_context_id,
+            "task_id": inactive_context.task_id, "parent_task_id": execution_id,
+            "contract_execution_id": execution_id, "target_project_root": inactive_context.target_project_root,
+            "session_token_ref": session_ref, "worker_id": inactive_context.worker_id,
+            "worker_slot_id": inactive_context.worker_slot_id, **route_identity,
+        }
+        calls = []
+        def isolated_api(method, path, body=None, **_kwargs):
+            from urllib.parse import parse_qs, urlparse
+            parsed = urlparse(path)
+            if parsed.path.endswith("/session-token/rejoin"):
+                # Controlled issuance response for this test's actual DB lane;
+                # no Models/native auth, no alternate protected write facade.
+                return {"ok": True, "status": "session_token_rejoined", "delivery": "worker_host_envelope",
+                        **identity, "session_token": inactive_token, "fence_token": inactive_fence,
+                        "host_envelope": {**identity, "env": {"AMING_WORKER_SESSION_TOKEN": inactive_token, "AMING_WORKER_FENCE_TOKEN": inactive_fence}}}
+            calls.append((method, parsed.path))
+            if method == "GET":
+                query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+                return server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+                    _ctx_with_role({"project_id": PID, "runtime_context_id": inactive_context.runtime_context_id}, "mf_sub", query=query)
+                )
+            assert parsed.path.endswith("/implementation-evidence")
+            assert "action_continuation_ref" not in body
+            return server.handle_graph_governance_runtime_context_implementation_evidence(
+                _ctx({"project_id": PID, "runtime_context_id": inactive_context.runtime_context_id}, method="POST", body=body)
+            )
+        monkeypatch.setattr(dispatcher, "_governance_api_with_timeout", isolated_api)
+        monkeypatch.setattr(dispatcher, "_api", isolated_api)
+        issued = dispatcher.dispatch("runtime_context_session_token_rejoin", identity)
+        assert issued["auth_loaded"] is True
+        header = dispatcher.dispatch("runtime_context_worker_guide", identity)
+        manifest = header["action_continuation"]
+        assert manifest["action_bytes"] >= 36692
+        assert header["materialization_performed_write"] is False
+        for index in range(manifest["page_count"]):
+            page = dispatcher.dispatch("runtime_context_worker_guide", {
+                **identity, "detail_ref": manifest["detail_ref"], "detail_cursor": f"action:{index}",
+            })
+            assert page["ok"] is True
+            assert server._runtime_context_worker_guide_serialized_bytes(page) <= 32768
+        assert page["managed_action_materialized"] is True
+        assert runtime.store.get(execution_id) == baseline_record
+        assert conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0] == baseline_timeline_count
+        assert dispatcher._host_envelope_continuity.pending_count() == 1
+        # Another process materializes the same legitimate action before the
+        # first write. After that write advances THIS lane to commit, the
+        # existing server gate (not either host lock) rejects its stale action.
+        from agent.mcp.host_envelope_continuity import ManagedHostEnvelopeContinuity
+        racing_host = ManagedHostEnvelopeContinuity()
+        racing_host.dispatch("runtime_context_session_token_rejoin", identity,
+                             lambda _args: isolated_api("POST", "/session-token/rejoin"))
+        racing_host.dispatch("runtime_context_worker_guide", identity, lambda _args: copy.deepcopy(header))
+        # Fresh source reads here still select the same state; all pages must
+        # be complete before the remote writer advances it.
+        for index in range(manifest["page_count"]):
+            racing_request = {**identity, "detail_ref": manifest["detail_ref"], "detail_cursor": f"action:{index}"}
+            racing_page = racing_host.dispatch("runtime_context_worker_guide", racing_request,
+                                lambda body: isolated_api("GET", "/worker-guide?" + __import__("urllib.parse", fromlist=["urlencode"]).urlencode({**body, "view": "compact"})))
+        assert racing_page.get("managed_action_materialized") is True, racing_page
+        # Wrong selected attestation action reaches the real registered domain
+        # entry but fails under its own transaction before transcript or DB
+        # effects. The actual Models attestation body remains unavailable.
+        wrong_attestation_precondition = {
+            "mcp_tool": "runtime_context_finish_time_worker_attestation", "identity": identity,
+            "execution_state_revision": manifest["source_state"]["execution_state_revision"],
+            "selected_line_id": "worker_finish_time_attestation", "action_hash": manifest["action_hash"],
+        }
+        before_attestation_effects = conn.total_changes
+        with pytest.raises(GovernanceError) as wrong_attestation:
+            server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+                _ctx({"project_id": PID, "runtime_context_id": inactive_context.runtime_context_id}, method="POST", body={
+                    **identity, "session_token": inactive_token, "fence_token": inactive_fence,
+                    "harness_type": "codex", "worker_guide_action_precondition": wrong_attestation_precondition,
+                })
+            )
+        assert wrong_attestation.value.code == "runtime_context_materialized_action_stale"
+        assert conn.total_changes == before_attestation_effects
+        args = {**identity, "action_continuation_ref": manifest["detail_ref"],
+                "changed_files": implementation_body["changed_files"],
+                "tests": implementation_body["tests"], "test_results": implementation_body["test_results"]}
+        # A genuinely unrelated dispatched sibling advances after BOTH hosts
+        # finished their immutable pages. Its ordinary typed read writer must
+        # preserve the existing narrow historical rebase for this lane.
+        sibling_fence, sibling_token = secrets_by_context[active_context.runtime_context_id]
+        active_context = upsert_branch_context(conn, replace(
+            active_context, agent_id=active_context.worker_slot_id,
+            allocation_owner=active_context.worker_slot_id,
+        ))
+        conn.commit()
+        sibling_read = server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx({"project_id": PID, "runtime_context_id": active_context.runtime_context_id}, method="POST", body={
+                "contract_execution_id": execution_id, "parent_task_id": execution_id,
+                "fence_token": sibling_fence, "session_token": sibling_token,
+                "session_token_ref": runtime_context_session_token_ref(active_context),
+                "target_project_root": active_context.target_project_root,
+                "actor": active_context.worker_slot_id,
+                "read_receipt_hash": _fake_sha("continuation-sibling-read"),
+                "launch_text_hash": _fake_sha("continuation-sibling-launch"),
+            })
+        )
+        assert sibling_read["ok"] is True
+        assert runtime.store.get(execution_id)["execution_state_revision"] > manifest["source_state"]["execution_state_revision"]
+        implementation = dispatcher.dispatch("runtime_context_implementation_evidence", args)
+        assert implementation["ok"] is True
+        replay = dispatcher.dispatch("runtime_context_implementation_evidence", args)
+        assert replay["writes_performed"] is False
+        assert sum(method == "POST" for method, _ in calls) == 1
+        assert dispatcher._host_envelope_continuity.pending_count() == 1
+        after_accepted_record = copy.deepcopy(runtime.store.get(execution_id))
+        after_accepted_timeline = conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0]
+        after_accepted_total_changes = conn.total_changes
+        with pytest.raises(GovernanceError) as stale_race:
+            racing_host.dispatch("runtime_context_implementation_evidence", args,
+                                 lambda body: isolated_api("POST", "/implementation-evidence", body))
+        assert stale_race.value.code == "runtime_context_materialized_action_stale"
+        assert conn.total_changes == after_accepted_total_changes, "remote stale action performed DB effects"
+        assert runtime.store.get(execution_id) == after_accepted_record, "remote stale action changed canonical state"
+        assert conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0] == after_accepted_timeline, "remote stale action appended timeline evidence"
+    else:
+        implementation = (
+            server.handle_graph_governance_runtime_context_implementation_evidence(
+                _ctx(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": inactive_context.runtime_context_id,
+                    },
+                    method="POST",
+                    body=implementation_body,
+                )
             )
         )
-    )
     assert implementation["ok"] is True
     implementation_record = runtime.store.get(execution_id)
     implementation_line = implementation_record["completed_lines"][-1]
@@ -204704,9 +204838,18 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
         for item in implementation_record["execution_state"]["completed_lines"]
     )
     for field in writer_binding_fields:
+        if via_action_continuation and field in {"execution_state_revision", "runtime_guide_hash"}:
+            continue  # Rebased by the existing proven sibling-only server rule.
         assert implementation_line["payload"][field] == implementation_body[field]
         if field in implementation_line:
             assert implementation_line[field] == implementation_body[field]
+    if via_action_continuation:
+        rebase = implementation_line["payload"]["concurrent_sibling_revision_rebase"]
+        assert rebase["applied"] is True
+        assert rebase["same_lane_intervening_line"] is False
+        assert rebase["from_execution_state_revision"] == manifest["source_state"]["execution_state_revision"]
+        assert rebase["to_execution_state_revision"] > rebase["from_execution_state_revision"]
+        return  # Transport acceptance ends at the actual canonical implementation write.
     post_implementation_guide = (
         server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
             _ctx_with_role(
@@ -214708,7 +214851,7 @@ def test_worker_guide_compact_projection_fails_closed_instead_of_truncating():
     assert exc_info.value.details["writes_performed"] is False
 
 
-def test_worker_guide_compact_omits_declared_implementation_guidance_losslessly():
+def test_worker_guide_compact_continues_complete_implementation_action_losslessly():
     full = _representative_oversized_worker_guide()
     repeated_guidance = {
         "implementation_diff_submission_guidance": {
@@ -214761,34 +214904,37 @@ def test_worker_guide_compact_omits_declared_implementation_guidance_losslessly(
 
     compact = server._runtime_context_worker_guide_compact_response(full)
 
-    projected = compact["canonical_executable_action"]
-    projected_body = projected["copy_safe_body"]
-    assert compact["serialized_bytes"] <= compact["max_serialized_bytes"]
-    assert projected["mcp_tool"] == "runtime_context_implementation_evidence"
-    assert projected["source_copy_safe_body_hash"] == server._stable_public_hash(
-        action["copy_safe_body"]
-    )
-    assert projected["omitted_optional_body_metadata"][
-        "execution_semantics_changed"
-    ] is False
-    assert projected["omitted_optional_body_metadata"][
-        "semantic_truncation_performed"
-    ] is False
-    omitted_paths = set(
-        projected["omitted_optional_body_metadata"]["fields"]
-    )
-    for field in repeated_guidance:
-        assert field not in projected_body
-        assert field not in projected_body["payload"]
-        assert f"copy_safe_body.{field}" in omitted_paths
-        assert f"copy_safe_body.payload.{field}" in omitted_paths
-    assert projected_body["changed_files"] == ["src/app.py"]
-    assert projected_body["tests"] == [
-        {"command": "pytest -q", "status": "passed"}
-    ]
-    assert projected_body["graph_trace_ids"] == [
-        "gqt-compact-implementation"
-    ]
+    assert compact["response_view"] == "compact_action"
+    assert compact["serialized_bytes"] == server._runtime_context_worker_guide_serialized_bytes(compact)
+    manifest = compact["action_continuation"]
+    fragments = []
+    for index in range(manifest["page_count"]):
+        page = server._runtime_context_worker_guide_action_continuation(
+            full, detail_ref=manifest["detail_ref"], detail_cursor=f"action:{index}",
+        )
+        assert page["serialized_bytes"] == server._runtime_context_worker_guide_serialized_bytes(page)
+        assert page["serialized_bytes"] <= 32768
+        fragments.append(page["fragment"])
+    rebuilt = json.loads("".join(fragments))
+    assert rebuilt == action
+    assert server._stable_public_hash(rebuilt) == manifest["action_hash"]
+    assert rebuilt["copy_safe_body"]["payload"] == action["copy_safe_body"]["payload"]
+    assert "omitted_optional_body_metadata" not in rebuilt
+    # Outer lease/read timing may change without changing the selected action.
+    full["session_token_lease"] = {"ttl_seconds_remaining": 19, "now": "later"}
+    assert server._runtime_context_worker_guide_action_continuation(full)["action_continuation"] == manifest
+    changed = copy.deepcopy(full)
+    changed["contract_runtime_current_state"]["execution_state_revision"] = 999
+    with pytest.raises(GovernanceError):
+        server._runtime_context_worker_guide_action_continuation(
+            changed, detail_ref=manifest["detail_ref"], detail_cursor="action:1",
+        )
+    changed = copy.deepcopy(full)
+    changed["canonical_executable_actions"]["implementation"]["copy_safe_body"]["changed_files"].append("wrong.py")
+    with pytest.raises(GovernanceError):
+        server._runtime_context_worker_guide_action_continuation(
+            changed, detail_ref=manifest["detail_ref"], detail_cursor="action:1",
+        )
 
 
 def test_worker_guide_compact_has_one_full_current_action_in_post_auth_world():
@@ -242310,3 +242456,32 @@ def test_operator_current_full_recovery_rejects_untrusted_world_without_writes(
         "AND operation_type='operator_provenance_recovery'",
         (PID,),
     ).fetchone()[0] == 0
+
+
+def test_worker_action_redacts_complete_nested_credentials_before_fragmentation():
+    from agent.tests.test_mcp_tools import _worker_action_transport_fixture
+    identity, action, _, _ = _worker_action_transport_fixture()
+    # Deliberately spans several fragment boundaries and is repeated under a
+    # benign alias: decoded aggregate, not just individual frames, must be safe.
+    secret = "nested-private-credential-" + "q" * 20_000
+    action["copy_safe_body"]["payload"]["credentials"] = {
+        "same_owner_worker_session": {"session_token": secret},
+        "env": {"AMING_WORKER_FENCE_TOKEN": "private-nested-fence"},
+    }
+    action["copy_safe_body"]["payload"]["benign_alias"] = "prefix-" + secret + "-suffix"
+    action["copy_safe_body"]["worker_host_envelope_handoff"]["raw_worker_env_required"] = ["AMING_WORKER_SESSION_TOKEN"]
+    source = {**identity, "canonical_executable_action": action}
+    header = server._runtime_context_worker_guide_action_continuation(source)
+    manifest = header["action_continuation"]
+    pages = [server._runtime_context_worker_guide_action_continuation(
+        source, detail_ref=manifest["detail_ref"], detail_cursor=f"action:{index}",
+    ) for index in range(manifest["page_count"])]
+    decoded = json.loads("".join(page["fragment"] for page in pages))
+    serialized = json.dumps(decoded)
+    assert secret not in serialized
+    assert "private-nested-fence" not in serialized
+    assert "credentials" not in decoded["copy_safe_body"]["payload"]
+    assert decoded["copy_safe_body"]["payload"]["benign_alias"] == "prefix-<private worker credential>-suffix"
+    assert decoded["copy_safe_body"]["worker_host_envelope_handoff"]["raw_worker_env_required"] is False
+    assert server._stable_public_hash(decoded) == manifest["action_hash"]
+    assert decoded["copy_safe_body"]["implementation_diff_submission_guidance"] == action["copy_safe_body"]["implementation_diff_submission_guidance"]
