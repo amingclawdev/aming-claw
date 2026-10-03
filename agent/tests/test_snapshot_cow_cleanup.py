@@ -170,33 +170,27 @@ def _observe_census_record_fetches(conn):
 
 
 @pytest.mark.parametrize("entrypoint", ["preview", "apply"])
-def test_census_oversized_multibyte_payload_refuses_before_fetch(cow_fixture, entrypoint):
+def test_census_oversized_multibyte_late_pin_without_fetch(cow_fixture, entrypoint):
     if entrypoint == "apply" and sys.platform != "darwin":
         pytest.skip("native apply preflight requires macOS")
     conn, _, base, _, _ = cow_fixture
     approved = preview(cow_fixture)
     before = {p: p.read_bytes() for p in base.rglob("*.json")}
-    payload = json.dumps({"runtime_guide": {"next_legal_action": {"snapshot_id": "full-old"}},
-                          "private_payload": "雪" * 350_000}, ensure_ascii=False)
+    payload = json.dumps({"runtime_guide": {"next_legal_action": 0},
+                          "private_payload": "雪" * 350_000,
+                          "late_pin": {"snapshot_id": "full-old"}}, ensure_ascii=False)
     assert len(payload) < cow.MAX_JSON_BYTES < len(payload.encode("utf-8"))
     _insert_census_contract(conn, payload)
     fetched_lengths = _observe_census_record_fetches(conn)
-    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
-        preview(cow_fixture) if entrypoint == "preview" else apply(cow_fixture, approved)
-    assert fetched_lengths == []  # Includes the shared schema/readability probe.
-    details = caught.value.payload
-    assert details["refusal_reason"] == "cow_live_payload_unbounded:contract_runtime_executions"
-    assert details["writes_performed"] is False
-    assert details.get("apply_plan_available", False) is False
-    facts = details["refusal_metadata"]
-    assert facts["table"] == "contract_runtime_executions"
-    assert facts["field"] == "record_json"
-    assert facts["sqlite_storage_type"] == "text"
-    assert facts["utf8_byte_length"] == facts["storage_byte_length"] == len(payload.encode("utf-8"))
-    assert facts["cause"] == "oversized_text" and facts["body_fetched"] is False
-    assert facts["execution_identity_hash"].startswith("sha256:")
-    assert len(facts["execution_identity_hash"]) == 71
-    assert "private-census-cex" not in json.dumps(details) and "雪" not in json.dumps(details, ensure_ascii=False)
+    plan = preview(cow_fixture)
+    assert plan["candidates"] == [] and plan["writes_performed"] is False
+    assert any(r["reason"] == "cow_snapshot_live_or_retained" for r in plan["refusals"])
+    if entrypoint == "apply":
+        with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+            apply(cow_fixture, approved)
+        assert caught.value.payload["writes_performed"] is False
+    assert fetched_lengths == []
+    assert "private-census-cex" not in json.dumps(plan) and "雪" not in json.dumps(plan, ensure_ascii=False)
     assert not cow._state_root("proj").exists()
     assert {p: p.read_bytes() for p in before} == before
 
@@ -234,11 +228,8 @@ def test_census_large_duplicate_keys_match_python_last_member(cow_fixture, dupli
     if last_completed:
         assert len(preview(cow_fixture)["candidates"]) == 2
     else:
-        with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
-            preview(cow_fixture)
-        assert caught.value.payload["refusal_reason"] == "cow_live_payload_unbounded:contract_runtime_executions"
-        assert caught.value.payload["refusal_metadata"]["cause"] == "oversized_text"
-        assert caught.value.payload["writes_performed"] is False
+        plan = preview(cow_fixture)
+        assert plan["candidates"] == [] and plan["writes_performed"] is False
     assert fetched_lengths == []
     assert not cow._state_root("proj").exists()
 
@@ -250,10 +241,7 @@ def test_census_large_nonnull_scalar_action_remains_live(cow_fixture, action):
                           "history": "雪" * 350_000}, ensure_ascii=False)
     _insert_census_contract(conn, payload)
     fetched_lengths = _observe_census_record_fetches(conn)
-    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
-        preview(cow_fixture)
-    assert caught.value.payload["refusal_reason"] == "cow_live_payload_unbounded:contract_runtime_executions"
-    assert caught.value.payload["refusal_metadata"]["cause"] == "oversized_text"
+    assert len(preview(cow_fixture)["candidates"]) == 2
     assert fetched_lengths == []
 
 
@@ -296,6 +284,121 @@ def test_census_null_required_contract_payload_is_not_optional_absence(cow_fixtu
     assert facts["cause"] == "null" and facts["sqlite_storage_type"] == "null"
     assert facts["utf8_byte_length"] is None and facts["storage_byte_length"] is None
     assert details["apply_plan_available"] is False
+
+
+@pytest.mark.parametrize("reference_kind", ["escaped_snapshot", "serialized_audit", "path", "run"])
+def test_typed_census_late_page_and_decoded_late_pin(cow_fixture, reference_kind):
+    conn, _, base, _, _ = cow_fixture
+    if reference_kind == "run":
+        _insert_claim(conn, run_id="unique-current-run")
+    if reference_kind == "escaped_snapshot":
+        late = '{"snapshot_id":"full\\u002dold"}'
+    elif reference_kind == "serialized_audit":
+        late = json.dumps('{"snapshot_id":"full\\u002dold"}')
+    elif reference_kind == "path":
+        late = json.dumps(str(base / "graph.json"))
+    else:
+        late = json.dumps("unique-current-run")
+    # More than one internal page; late identity follows >1MiB of multibyte data.
+    for index in range(70):
+        payload = '{"runtime_guide":{"next_legal_action":0},"history":' + json.dumps(
+            "雪" * 350_000 if index == 69 else "audit", ensure_ascii=False) + ',"late":' + (
+            late if index == 69 else 'null') + '}'
+        conn.execute("INSERT INTO contract_runtime_executions "
+            "(contract_execution_id,project_id,backlog_id,contract_id,version,revision,execution_state_revision,record_json,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", (f"cex-{index:03d}", "proj", "backlog", "contract", "1", "1", 1, payload, "now", "now"))
+    conn.commit()
+    fetched = _observe_census_record_fetches(conn)
+    statements = []
+    conn.set_trace_callback(statements.append)
+    plan = preview(cow_fixture)
+    conn.set_trace_callback(None)
+    assert plan["candidates"] == [] and plan["writes_performed"] is False
+    assert fetched == []
+    pages = [q for q in statements if 'FROM "contract_runtime_executions"' in q and 'ORDER BY _rowid_' in q]
+    assert len(pages) >= 3 and any('_rowid_>64' in q for q in pages)
+
+
+def test_typed_census_native_complex_shape_over_20k_nodes_still_projects_late_pin(cow_fixture):
+    conn = cow_fixture[0]
+    # Actual measured native shape exceeds 20,001 tree nodes and has four
+    # valid serialized JSON strings. Traversal is complete inside SQLite.
+    payload = json.dumps({"runtime_guide": {"next_legal_action": 0},
+        "history": [{"step": index, "notes": "雪" * 48, "details": ["audit", index]} for index in range(6000)],
+        "serialized": [json.dumps({"audit": ["record", {"late_snapshot_id": "full-old"}]}) for _ in range(4)],
+        "late_snapshot_id": "full-old"}, ensure_ascii=False)
+    assert len(payload.encode()) > cow.MAX_JSON_BYTES
+    assert conn.execute("SELECT count(*) FROM json_tree(?)", (payload,)).fetchone()[0] > 20_001
+    _insert_census_contract(conn, payload)
+    fetched = _observe_census_record_fetches(conn)
+    plan = preview(cow_fixture)
+    assert plan["reference_census"]["complete"] and plan["candidates"] == []
+    assert fetched == [] and plan["writes_performed"] is False
+
+
+def test_typed_census_unfinished_projection_keeps_causal_metadata(cow_fixture):
+    conn = cow_fixture[0]
+    nested = '{"snapshot_id":"full-old"}'
+    for _ in range(10):
+        nested = json.dumps({"serialized_audit": nested})
+    payload = json.dumps({"runtime_guide": {"next_legal_action": 0}, "history": "雪" * 350_000,
+                          "nested": nested}, ensure_ascii=False)
+    _insert_census_contract(conn, payload)
+    fetched = _observe_census_record_fetches(conn)
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        preview(cow_fixture)
+    facts = caught.value.payload["refusal_metadata"]
+    assert facts["cause"] == "typed_projection_incomplete" and facts["complete"] is False
+    assert facts["sqlite_storage_type"] == "text" and facts["utf8_byte_length"] == len(payload.encode())
+    assert facts["body_fetched"] is False and facts["execution_identity_hash"].startswith("sha256:")
+    assert caught.value.payload["writes_performed"] is False and fetched == []
+    assert not cow._state_root("proj").exists()
+
+
+@pytest.mark.parametrize("payload,cause", [
+    ('{"runtime_guide":{"next_legal_action":null}}' + chr(0) + '{"late":"full-old"}', "malformed_json"),
+    ('{"runtime_guide":{"next_legal_action":0},"late":"prefix\\u0000full-old"}', "typed_projection_incomplete"),
+    ('{"runtime_guide\\u0000suffix":{"next_legal_action":null},"late":"full-old"}', "missing_runtime_guide"),
+])
+def test_typed_census_nul_or_nul_key_never_proves_pin_absence(cow_fixture, payload, cause):
+    conn = cow_fixture[0]
+    _insert_census_contract(conn, payload)
+    fetched = _observe_census_record_fetches(conn)
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        preview(cow_fixture)
+    assert caught.value.payload["refusal_metadata"]["cause"] == cause
+    assert caught.value.payload["refusal_metadata"]["utf8_byte_length"] == len(payload.encode())
+    assert caught.value.payload["writes_performed"] is False and fetched == []
+
+
+def test_typed_census_unknown_owner_and_column_stay_protective(cow_fixture):
+    conn = cow_fixture[0]
+    conn.execute("CREATE TABLE future_qa_session (project_id TEXT, payload_json TEXT)")
+    conn.execute("INSERT INTO future_qa_session VALUES ('proj','{}')")
+    conn.commit()
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as unknown:
+        preview(cow_fixture)
+    assert unknown.value.payload["refusal_metadata"]["cause"] == "owner_schema_unknown"
+    assert unknown.value.payload["refusal_metadata"]["body_fetched"] is False
+    conn.execute("ALTER TABLE contract_runtime_executions ADD COLUMN future_pins TEXT")
+    conn.commit()
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        preview(cow_fixture)
+    assert caught.value.payload["refusal_metadata"]["cause"] == "contract_runtime_executions_owner_schema_unknown"
+    assert caught.value.payload["writes_performed"] is False
+
+
+def test_typed_census_live_pin_arriving_after_approval_refuses_apply(cow_fixture):
+    if sys.platform != "darwin":
+        pytest.skip("native apply preflight requires macOS")
+    conn = cow_fixture[0]
+    approved = preview(cow_fixture)
+    _insert_census_contract(conn, json.dumps({"runtime_guide": {"next_legal_action": 0},
+                                            "late_snapshot_id": "full-old"}))
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        apply(cow_fixture, approved)
+    assert caught.value.payload["writes_performed"] is False
+    assert not cow._state_root("proj").exists()
 
 
 # Read-only native row from reviewer-candidate-claim-readonly.json,

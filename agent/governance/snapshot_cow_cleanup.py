@@ -323,6 +323,20 @@ def _custody(conn: sqlite3.Connection, project_id: str, root: Path) -> dict[str,
 
 
 def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
+    try:
+        with snapshots._reference_read_snapshot(conn):
+            return _live_pins_in_snapshot(conn, project_id)
+    except (ValueError, sqlite3.Error) as exc:
+        if isinstance(exc, CowRefusal):
+            raise
+        if str(exc).startswith("reference_census_window_unbounded:"):
+            raise CowRefusal(str(exc).replace("reference_census_window_unbounded:",
+                                             "cow_live_window_unbounded:", 1)) from exc
+        raise CowRefusal("cow_reference_census_refused", {"cause": str(exc)[:160],
+                         "complete": False, "body_fetched": False}) from exc
+
+
+def _live_pins_in_snapshot(conn: sqlite3.Connection, project_id: str) -> set[str]:
     """Dedicated typed bounded live census; completed audits do not delete bytes.
 
     Required schema validation is shared with cleanup, including the jointly
@@ -389,6 +403,9 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
     stores = (set(cleanup._ARCHIVE_REFERENCE_COLUMNS) | set(required)) - history - {
         "graph_snapshots", "graph_snapshot_refs"}
     stores.update(n for n in names if any(part in n for part in ("qa_session", "semantic_use", "lease")))
+    known_ids = {str(r[0]) for r in conn.execute(
+        "SELECT snapshot_id FROM graph_snapshots WHERE project_id=?", (project_id,))}
+    reference_tokens = snapshots._snapshot_reference_tokens(conn, project_id, known_ids)
     if "graph_semantic_projections" in names:
         if not {"project_id", "snapshot_id", "status", "projection_json"} <= cleanup._table_columns(conn, "graph_semantic_projections"):
             raise CowRefusal("cow_semantic_projection_schema_incomplete")
@@ -399,7 +416,39 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
     scanned = 0
     for table in sorted(stores & names):
         columns = cleanup._table_columns(conn, table)
+        if table == "contract_runtime_executions":
+            for reference in snapshots._contract_reference_rows(conn, project_id, known_ids):
+                scanned += 1
+                state, metadata = reference["state"], reference["metadata"]
+                if state not in {"completed", "live"}:
+                    cause = "null" if metadata["sqlite_storage_type"] == "null" else state
+                    reason = ("cow_live_payload_unbounded:" + table if cause == "nontext" else
+                              "cow_live_payload_malformed:" + table if cause == "malformed_json" else
+                              "cow_contract_live_state_unknown")
+                    raise CowRefusal(reason, {**metadata, "cause": cause})
+                if state == "completed":
+                    continue  # Current-use skip only; ordinary durable audit remains protected.
+                if not reference["complete"]:
+                    raise CowRefusal("cow_live_payload_unbounded:" + table,
+                        {**metadata, "cause": "typed_projection_incomplete", "complete": False})
+                pins.update(reference["pins"])
+                if scanned > 20000 or len(pins) > snapshots._REFERENCE_MAX_ROWS or sum(
+                        len(pin.encode('utf-8')) for pin in pins) > MAX_JSON_BYTES:
+                    raise CowRefusal("cow_live_census_unbounded")
+            continue
         quoted = '"' + table.replace('"', '""') + '"'
+        unknown_owner = table not in (set(cleanup._ARCHIVE_REFERENCE_COLUMNS) | set(required) |
+                                      {"graph_semantic_projections"})
+        if unknown_owner:
+            # No payload transfer from an owner whose field/disposition contract
+            # is unknown. An empty store is proved empty in this read snapshot.
+            if conn.execute(f"SELECT 1 FROM {quoted} LIMIT 1").fetchone():
+                if not {"snapshot_id", "status"} <= columns:
+                    raise CowRefusal("cow_live_owner_schema_unknown:" + table,
+                        {"table": table, "cause": "owner_schema_unknown", "complete": False,
+                         "body_fetched": False})
+                pins.update(known_ids)  # Unverified terminal labels never remove a use pin.
+            continue
         where, args = [], []
         if "project_id" in columns:
             where.append("project_id=?")
@@ -461,32 +510,13 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
         for key in json_fields:
             column = '"' + key.replace('"', '""') + '"'
             projection.extend((f"typeof({column})", f"length(CAST({column} AS BLOB))"))
-        if table == "contract_runtime_executions":
-            # Native completed semantics precede the payload cap. Inspect only
-            # JSON types in SQLite: never transfer an oversized record body.
-            # json_each preserves duplicate members; selecting the last at each
-            # level matches json.loads rather than json_extract's first match.
-            # An absent key is never explicit next_legal_action=null.
-            projection.append("CASE WHEN typeof(record_json)!='text' THEN 'nontext' "
-                "WHEN NOT json_valid(record_json) THEN 'malformed_json' "
-                "ELSE coalesce((SELECT CASE WHEN guide.type!='object' "
-                "THEN 'missing_runtime_guide' ELSE coalesce((SELECT "
-                "CASE WHEN action.type='null' THEN 'completed' ELSE 'live' END "
-                "FROM json_each(guide.value) AS action "
-                "WHERE action.key='next_legal_action' ORDER BY action.id DESC LIMIT 1), "
-                "'missing_next_legal_action') END FROM json_each(record_json) AS guide "
-                "WHERE guide.key='runtime_guide' ORDER BY guide.id DESC LIMIT 1), "
-                "'missing_runtime_guide') END")
-        query = f"SELECT {','.join(projection)} FROM {quoted}" + (
-            " WHERE " + " AND ".join(where) if where else "") + " LIMIT ?"
-        cursor = conn.execute(query, (*args, MAX_LIVE_ROWS + 1))
-        records = cursor.fetchall()
-        if len(records) > MAX_LIVE_ROWS:
-            raise CowRefusal("cow_live_window_unbounded:" + table)
-        scanned += len(records)
-        if scanned > 20000:
-            raise CowRefusal("cow_live_census_unbounded")
-        for record in records:
+        records = snapshots._reference_pages(conn, table, ','.join(projection),
+                                             " AND ".join(where), tuple(args), max_rows=MAX_LIVE_ROWS)
+        for source_record in records:
+            record = source_record[1:]
+            scanned += 1
+            if scanned > 20000:
+                raise CowRefusal("cow_live_census_unbounded")
             value = dict(zip(fields, record[:len(fields)]))
             payload_metadata = {}
             for index, key in enumerate(json_fields):
@@ -514,17 +544,6 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
                     raise CowRefusal("cow_session_task_unknown")
                 if str(task[0]).lower() in TERMINAL:
                     continue
-            if table == "contract_runtime_executions":
-                state = record[-1]
-                if state == "completed":
-                    continue
-                if state != "live":
-                    metadata = payload_metadata["record_json"]
-                    cause = "null" if metadata["sqlite_storage_type"] == "null" else state
-                    reason = ("cow_live_payload_unbounded:" + table if cause == "nontext" else
-                              "cow_live_payload_malformed:" + table if cause == "malformed_json" else
-                              "cow_contract_live_state_unknown")
-                    raise CowRefusal(reason, {**metadata, "cause": cause})
             for key, raw in value.items():
                 if key in payload_metadata:
                     metadata = payload_metadata[key]
@@ -535,12 +554,20 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
                         cause = "nontext" if metadata["sqlite_storage_type"] != "text" else "oversized_text"
                         raise CowRefusal("cow_live_payload_unbounded:" + table, {**metadata, "cause": cause})
                     try:
-                        json.loads(raw)  # Corruption is never an empty inventory.
+                        payload = json.loads(raw)  # Corruption is never an empty inventory.
                     except (ValueError, TypeError, UnicodeError) as exc:
                         raise CowRefusal("cow_live_payload_malformed:" + table,
                                          {**metadata, "cause": "malformed_json"}) from exc
+                    try:
+                        pins.update(snapshots._bounded_decoded_reference_pins(payload, reference_tokens))
+                    except (ValueError, RecursionError) as exc:
+                        raise CowRefusal("cow_live_payload_unbounded:" + table,
+                            {**metadata, "cause": "typed_projection_incomplete", "complete": False}) from exc
             # Keep exact IDs/paths in a bounded typed inventory for per-item matching.
             pins.add(json.dumps(value, sort_keys=True, default=str))
+            if len(pins) > snapshots._REFERENCE_MAX_ROWS or sum(
+                    len(pin.encode('utf-8')) for pin in pins) > MAX_JSON_BYTES:
+                raise CowRefusal("cow_live_census_unbounded")
     return pins
 
 
@@ -664,6 +691,9 @@ def preview(conn: sqlite3.Connection, project_id: str, root: Path, *,
               for p in (row["source_metadata"], row["target_metadata"])}
     return {"ok": True, "mode": "dry_run", "dimension": DIMENSION,
             "project_id": project_id, "plan_revision": REVISION, "plan_hash": plan_hash,
+            "reference_census": {"complete": True, "read_snapshot": "same_connection",
+                                 "page_rows": snapshots._REFERENCE_PAGE_ROWS,
+                                 "max_rows_per_store": MAX_LIVE_ROWS},
             "operation_id": operation_id, "custody": custody, "budgets": budgets,
             "config_hash": _digest(config), "candidates": rows, "refusals": rejected,
             "apply_plan_available": not incomplete, "writes_performed": False,

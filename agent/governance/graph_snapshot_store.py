@@ -14,6 +14,7 @@ import re
 import sqlite3
 import stat
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -1785,11 +1786,216 @@ def _bundle_referenced_snapshot_ids() -> set[str]:
     return referenced
 
 
+_REFERENCE_PAGE_ROWS = 64
+_REFERENCE_MAX_ROWS = 2000
+_REFERENCE_MAX_BYTES = 65536
+
+
+@contextmanager
+def _reference_read_snapshot(conn: sqlite3.Connection):
+    """One reader view; never silently accept caller writes or changed input."""
+    owns = not conn.in_transaction
+    before = (conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0],
+              conn.execute("PRAGMA schema_version").fetchone()[0])
+    if owns:
+        conn.execute("BEGIN")
+    try:
+        # Establish the read snapshot before any cursor/count/schema query.
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        yield
+        if conn.total_changes != before[0] or conn.execute("PRAGMA schema_version").fetchone()[0] != before[2]:
+            raise ValueError("reference_census_input_changed")
+    finally:
+        if owns:
+            conn.rollback()  # Read transaction only; no database bytes written.
+    if conn.execute("PRAGMA data_version").fetchone()[0] != before[1]:
+        raise ValueError("reference_census_input_changed")
+
+
+def _reference_pages(conn: sqlite3.Connection, table: str, projection: str,
+                     where: str = "", args: tuple = (), *, max_rows: int = _REFERENCE_MAX_ROWS):
+    """Bounded keyset pages, with an exact count and terminal continuation proof."""
+    quoted = '"' + table.replace('"', '""') + '"'
+    columns = {r[1] for r in conn.execute(f"PRAGMA table_info({quoted})")}
+    cursor_key = next((key for key in ("_rowid_", "rowid", "oid") if key not in columns), None)
+    schema = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    if not cursor_key or not schema or "WITHOUT ROWID" in str(schema[0]).upper():
+        raise ValueError("reference_census_cursor_unsupported:" + table)
+    scope = " WHERE " + where if where else ""
+    expected = conn.execute(f"SELECT count(*) FROM {quoted}{scope}", args).fetchone()[0]
+    if expected > max_rows:
+        raise ValueError("reference_census_window_unbounded:" + table)
+    last, seen = None, 0
+    while True:
+        predicate = where
+        page_args = args
+        if last is not None:
+            predicate = (predicate + " AND " if predicate else "") + f"{cursor_key}>?"
+            page_args += (last,)
+        page = conn.execute(f"SELECT {cursor_key},{projection} FROM {quoted}" +
+            (" WHERE " + predicate if predicate else "") +
+            f" ORDER BY {cursor_key} LIMIT ?", (*page_args, _REFERENCE_PAGE_ROWS)).fetchall()
+        if not page:
+            break
+        if sum(len(str(cell).encode('utf-8')) for row in page for cell in row) > 1024 * 1024:
+            raise ValueError("reference_census_page_unbounded:" + table)
+        for row in page:
+            if type(row[0]) is not int or (last is not None and row[0] <= last):
+                raise ValueError("reference_census_continuation_gap:" + table)
+            seen += 1
+            if seen > expected:
+                raise ValueError("reference_census_input_changed:" + table)
+            last = row[0]
+            yield row
+    if seen != expected:
+        raise ValueError("reference_census_continuation_gap:" + table)
+
+
+def _snapshot_reference_tokens(conn: sqlite3.Connection, project_id: str,
+                               known_ids: set[str]) -> list[tuple[str, str]]:
+    if len(known_ids) > _REFERENCE_MAX_ROWS or any(not isinstance(sid, str) or not sid or
+            len(sid.encode('utf-8')) > 1024 for sid in known_ids):
+        raise ValueError("reference_identity_inventory_unbounded")
+    tokens = {(sid, token) for sid in known_ids for token in
+              (sid, str(_snapshot_root(project_id, sid)))}
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for table in ("reconcile_run_metrics", "graph_current_full_build_claim_history"):
+        if table not in names:
+            continue
+        columns = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+        if not {"project_id", "snapshot_id", "run_id"} <= columns:
+            raise ValueError("reference_run_identity_schema_incomplete:" + table)
+        for row in _reference_pages(conn, table, "snapshot_id,run_id", "project_id=?", (project_id,)):
+            sid, run = row[1:]
+            if sid in known_ids and run:
+                if not isinstance(run, str) or len(run.encode('utf-8')) > 1024:
+                    # This owner cannot establish a negative dependency. Its
+                    # typed snapshot identity is itself a conservative pin.
+                    tokens.add((sid, ""))
+                    continue
+                tokens.add((sid, run))
+    if len(tokens) > _REFERENCE_MAX_ROWS * 4:
+        raise ValueError("reference_pin_inventory_unbounded")
+    return sorted(tokens)
+
+
+def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
+    """SQL-only decoded pins; bodies and nested serialized audits stay SQLite-side.
+
+    Literal and decoded substring matches deliberately overprotect. Nested JSON
+    strings are decoded too; unfinished serialized nesting refuses completeness.
+    Tokens are bounded identities obtained from the same read snapshot, never SQL.
+    """
+    def literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+    values = ",".join(f"({literal(sid)},{literal(token)})" for sid, token in tokens)
+    token_cte = "VALUES " + values if values else "SELECT '' AS column1,'' AS column2 WHERE 0"
+    decoded = ("WITH RECURSIVE docs(doc,depth) AS (SELECT record_json,0 UNION "
+        "SELECT j.atom,d.depth+1 FROM docs d,json_tree(d.doc) j "
+        "WHERE j.type='text' AND substr(ltrim(j.atom),1,1) IN ('{','[') "
+        "AND json_valid(j.atom) AND d.depth<8), "
+        "atoms AS (SELECT d.depth,j.key,j.atom,j.type FROM docs d,json_tree(d.doc) j) ")
+    complete = ("(SELECT CASE WHEN coalesce(max(CASE "
+        "WHEN depth=8 AND type='text' AND substr(ltrim(atom),1,1) IN ('{','[') "
+        "AND json_valid(atom) THEN 1 "
+        "WHEN type='text' AND instr(atom,char(0))>0 THEN 1 "
+        "WHEN type='text' AND NOT json_valid(atom) AND "
+        "instr(atom,char(92)||'u')>0 "
+        "THEN 1 ELSE 0 END),0)=1 THEN 0 ELSE 1 END FROM atoms)")
+    pins = (f"(SELECT json_group_array(sid) FROM (SELECT DISTINCT sid FROM ({token_cte}) "
+        "AS tokens WHERE EXISTS(SELECT 1 FROM atoms WHERE "
+        "(type='text' AND instr(atom,tokens.column2)>0) OR "
+        "(typeof(key)='text' AND instr(key,tokens.column2)>0))))")
+    # VALUES names are column1/column2; preserve sid label for bounded output.
+    pins = pins.replace("SELECT DISTINCT sid FROM", "SELECT DISTINCT column1 AS sid FROM")
+    state = ("CASE WHEN typeof(record_json)!='text' THEN 'nontext' "
+        "WHEN instr(record_json,char(0))>0 OR NOT json_valid(record_json) THEN 'malformed_json' ELSE coalesce((SELECT "
+        "CASE WHEN guide.type!='object' THEN 'missing_runtime_guide' ELSE coalesce((SELECT "
+        "CASE WHEN action.type='null' THEN 'completed' ELSE 'live' END "
+        "FROM json_each(guide.value) action WHERE action.key='next_legal_action' "
+        "ORDER BY action.id DESC LIMIT 1),'missing_next_legal_action') END "
+        "FROM json_each(record_json) guide WHERE guide.key='runtime_guide' "
+        "ORDER BY guide.id DESC LIMIT 1),'missing_runtime_guide') END")
+    guarded = "typeof(record_json)='text' AND instr(record_json,char(0))=0 AND json_valid(record_json)"
+    pin_projection = f"CASE WHEN {guarded} THEN ({decoded} SELECT CASE WHEN length({pins})<={_REFERENCE_MAX_BYTES} THEN {pins} ELSE NULL END) ELSE NULL END"
+    complete_projection = f"CASE WHEN {guarded} THEN ({decoded} SELECT {complete}) ELSE 0 END"
+    return (f"CASE WHEN typeof(contract_execution_id)='text' AND length(CAST(contract_execution_id AS BLOB))<={_REFERENCE_MAX_BYTES} THEN contract_execution_id ELSE NULL END,typeof(record_json),length(CAST(record_json AS BLOB))," +
+            state + "," + pin_projection + "," + complete_projection)
+
+
+def _contract_reference_rows(conn: sqlite3.Connection, project_id: str,
+                             known_ids: set[str]):
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(contract_runtime_executions)")}
+    required = {"contract_execution_id", "project_id", "backlog_id", "record_json"}
+    owned = required | {"contract_id", "version", "revision", "execution_state_revision",
+                        "created_at", "updated_at", "parent_contract_execution_id",
+                        "root_contract_execution_id", "contract_chain_id"}
+    if not required <= columns or columns - owned:
+        raise ValueError("contract_runtime_executions_owner_schema_unknown")
+    tokens = _snapshot_reference_tokens(conn, project_id, known_ids)
+    for row in _reference_pages(conn, "contract_runtime_executions",
+            _contract_reference_projection(tokens), "project_id=?", (project_id,)):
+        _, identity, storage_type, byte_length, state, raw_pins, complete = row
+        if identity is None:
+            raise ValueError("contract_runtime_executions_identity_unreadable")
+        metadata = {"table": "contract_runtime_executions", "field": "record_json",
+            "sqlite_storage_type": storage_type, "storage_byte_length": byte_length,
+            "utf8_byte_length": byte_length if storage_type == "text" else None,
+            "execution_identity_hash": "sha256:" + hashlib.sha256(json.dumps(
+                ["contract_runtime_executions", identity], sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False).encode('utf-8')).hexdigest(), "body_fetched": False}
+        yield {"state": state, "pins": json.loads(raw_pins) if raw_pins is not None else None,
+               "complete": bool(complete) and raw_pins is not None, "metadata": metadata}
+
+
+def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]]) -> set[str]:
+    """Legacy capped-body fallback, including nested serialized audit strings."""
+    pins, visited = set(), 0
+    def visit(child: Any, depth: int) -> None:
+        nonlocal visited
+        visited += 1
+        if depth > 8 or visited > 20000:
+            raise ValueError("reference_decoding_incomplete")
+        if isinstance(child, dict):
+            for key, item in child.items():
+                visit(str(key), depth + 1)
+                visit(item, depth + 1)
+        elif isinstance(child, list):
+            for item in child:
+                visit(item, depth + 1)
+        elif isinstance(child, str):
+            pins.update(sid for sid, token in tokens if token in child)
+            if child.lstrip().startswith(("{", "[")):
+                visit(json.loads(child), depth + 1)
+            elif "\\u" in child:
+                # No positive decoding proof for an escaped non-JSON fragment.
+                raise ValueError("reference_decoding_unknown")
+    visit(value, 0)
+    if len(pins) > _REFERENCE_MAX_ROWS:
+        raise ValueError("reference_pin_inventory_unbounded")
+    return pins
+
+
 def snapshot_retention_reference_state(
+    conn: sqlite3.Connection, project_id: str,
+) -> dict[str, Any]:
+    try:
+        with _reference_read_snapshot(conn):
+            return _snapshot_retention_reference_state(conn, project_id)
+    except (ValueError, sqlite3.Error) as exc:
+        return {"protected": {}, "current_use": {}, "durable_references": {},
+                "complete": False, "refusal_reasons": [str(exc)],
+                "census": {"complete": False, "read_snapshot": "same_connection"}}
+
+
+def _snapshot_retention_reference_state(
     conn: sqlite3.Connection, project_id: str,
 ) -> dict[str, Any]:
     """Collect bounded durable identities used by every retention entrypoint."""
     protected: dict[str, set[str]] = {}
+    current_use: dict[str, set[str]] = {}
+    contract_rows = {"current": 0, "completed": 0}
+    refusal_metadata = []
     refusals: list[str] = []
 
     def collect(table: str, columns: tuple[str, ...], reason: str,
@@ -1829,7 +2035,11 @@ def snapshot_retention_reference_state(
                 refusals.append(f"{table}_reference_window_unbounded")
                 return
             for row in rows:
-                sid = str(row["snapshot_id"] or "")
+                sid = row["snapshot_id"]
+                if sid is not None and (not isinstance(sid, str) or len(sid.encode('utf-8')) > 1024):
+                    refusals.append(f"{table}_reference_type_unknown")
+                    continue
+                sid = sid or ""
                 if sid:
                     protected.setdefault(sid, set()).add(reason)
         except (sqlite3.Error, TypeError, ValueError):
@@ -1881,16 +2091,24 @@ def snapshot_retention_reference_state(
             for key, child in value.items():
                 if str(key).endswith("snapshot_id") and isinstance(child, str) and child:
                     protected.setdefault(child, set()).add(reason)
+                    if current_row:
+                        current_use.setdefault(child, set()).add("unclassified_owner_use_reference")
                 if str(key).endswith("snapshot_ids") and isinstance(child, list):
                     for sid in child:
                         if isinstance(sid, str) and sid:
                             protected.setdefault(sid, set()).add(reason)
+                            if current_row:
+                                current_use.setdefault(sid, set()).add("unclassified_owner_use_reference")
                 walk(child, reason)
         elif isinstance(value, list):
             for child in value:
                 walk(child, reason)
         elif isinstance(value, str) and value in known_ids:
             protected.setdefault(value, set()).add(reason)
+            if current_row:
+                current_use.setdefault(value, set()).add("unclassified_owner_use_reference")
+
+    tokens = _snapshot_reference_tokens(conn, project_id, known_ids)
 
     try:
         tables = [str(row["name"]) for row in conn.execute(
@@ -1899,11 +2117,37 @@ def snapshot_retention_reference_state(
         for table in tables:
             if table in intrinsic:
                 continue
+            if table == "contract_runtime_executions":
+                try:
+                    for reference in _contract_reference_rows(conn, project_id, known_ids):
+                        if reference["state"] not in {"completed", "live"}:
+                            refusals.append("contract_runtime_executions_owner_" + reference["state"])
+                        if not reference["complete"]:
+                            refusals.append("contract_runtime_executions_projection_incomplete")
+                        if (reference["state"] not in {"completed", "live"} or not reference["complete"]) and not refusal_metadata:
+                            refusal_metadata.append({**reference["metadata"], "cause": reference["state"]
+                                if reference["state"] not in {"completed", "live"} else "typed_projection_incomplete"})
+                        if reference["pins"] is not None:
+                            for sid in reference["pins"]:
+                                protected.setdefault(sid, set()).add("durable_contract_runtime_executions_payload_reference")
+                                if reference["state"] == "live":
+                                    current_use.setdefault(sid, set()).add("current_contract_runtime_execution_reference")
+                        contract_rows["completed" if reference["state"] == "completed" else "current"] += 1
+                except (ValueError, sqlite3.Error) as exc:
+                    refusals.append("contract_runtime_executions_projection_unreadable:" + str(exc)[:160])
+                continue
             quoted = '"' + table.replace('"', '""') + '"'
             schema_rows = conn.execute(
                 f"PRAGMA table_info({quoted})"
             ).fetchall()
             columns = {str(row["name"]) for row in schema_rows}
+            sensitive_owner = ("qa_session" in table or "semantic_use" in table or
+                               bool({"lease", "leases"} & set(table.split("_"))))
+            if sensitive_owner and not {
+                    "project_id", "snapshot_id", "status"} <= columns:
+                occupied = conn.execute(f"SELECT 1 FROM {quoted} LIMIT 1").fetchone()
+                if occupied:
+                    refusals.append(f"{table}_owner_schema_unknown")
             identity = tuple(sorted(col for col in columns
                                     if col.endswith("snapshot_id")
                                     and not (table in self_identity_tables
@@ -1914,21 +2158,32 @@ def snapshot_retention_reference_state(
                                   if "TEXT" in str(row["type"] or "").upper()
                                   and not (table in self_identity_tables
                                            and str(row["name"]) == "snapshot_id"))
+            if any(col.endswith("_json") and col not in text_columns for col in columns):
+                refusals.append(f"{table}_payload_type_unknown")
             if not text_columns:
                 continue
-            selected = ",".join('"' + col.replace('"', '""') + '"'
-                                for col in text_columns)
+            quoted_columns = ['"' + col.replace('"', '""') + '"' for col in text_columns]
+            selected = ",".join(f"CASE WHEN typeof({col})='text' AND "
+                f"length(CAST({col} AS BLOB))<={_REFERENCE_MAX_BYTES} THEN {col} ELSE NULL END"
+                for col in quoted_columns)
+            selected += "," + ",".join(f"typeof({col}),length(CAST({col} AS BLOB))"
+                                       for col in quoted_columns)
             where = " WHERE project_id=?" if "project_id" in columns else ""
-            rows = conn.execute(
-                f"SELECT {selected} FROM {quoted}{where} LIMIT 2001",
-                (project_id,) if where else (),
-            ).fetchall()
-            if len(rows) > 2000:
-                refusals.append(f"{table}_payload_window_unbounded")
-                continue
-            for row in rows:
-                for col in text_columns:
+            rows = _reference_pages(conn, table, selected,
+                "project_id=?" if "project_id" in columns else "",
+                (project_id,) if "project_id" in columns else ())
+            for source_row in rows:
+                row = dict(zip(text_columns, source_row[1:len(text_columns)+1]))
+                # Unknown owner disposition stays a conservative current-use
+                # reference too. Only positive completed contract semantics above
+                # remove current use; every audit still remains durable.
+                current_row = True
+                for index, col in enumerate(text_columns):
                     raw = row[col]
+                    storage_type, byte_length = source_row[1+len(text_columns)+index*2:3+len(text_columns)+index*2]
+                    if storage_type != "null" and (storage_type != "text" or byte_length > _REFERENCE_MAX_BYTES):
+                        refusals.append(f"{table}_payload_unreadable")
+                        continue
                     if raw is None or raw == "":
                         continue
                     if not isinstance(raw, str) or len(raw) > 65536:
@@ -1939,16 +2194,36 @@ def snapshot_retention_reference_state(
                             protected.setdefault(sid, set()).add(
                                 f"durable_{table}_text_reference"
                             )
+                            current_use.setdefault(sid, set()).add("unclassified_owner_use_reference")
                     if not raw.lstrip().startswith(("{", "[")):
                         continue
                     try:
-                        walk(json.loads(raw), f"durable_{table}_payload_reference")
+                        payload = json.loads(raw)
+                        walk(payload, f"durable_{table}_payload_reference")
+                        for sid in _bounded_decoded_reference_pins(payload, tokens):
+                            protected.setdefault(sid, set()).add(f"durable_{table}_payload_reference")
+                            current_use.setdefault(sid, set()).add("unclassified_owner_use_reference")
                     except (ValueError, TypeError, RecursionError):
                         refusals.append(f"{table}_payload_unreadable")
-    except (sqlite3.Error, TypeError, ValueError):
-        refusals.append("durable_reference_census_unavailable")
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        refusals.append("durable_reference_census_unavailable:" + str(exc)[:160])
+    aggregate_bounded = len(protected) <= _REFERENCE_MAX_ROWS and sum(
+        len(sid.encode('utf-8')) + sum(len(reason.encode('utf-8')) for reason in reasons)
+        for sid, reasons in protected.items()) <= 1024 * 1024
+    if not aggregate_bounded:
+        refusals.append("durable_reference_pin_inventory_unbounded")
+        # Incomplete authority globally protects every candidate. Never return a
+        # truncated pin map that could be mistaken for an absence proof.
+        protected, current_use = {}, {}
     return {"protected": {sid: sorted(reasons) for sid, reasons in protected.items()},
-            "complete": not refusals, "refusal_reasons": sorted(set(refusals))}
+            "current_use": {sid: sorted(reasons) for sid, reasons in current_use.items()},
+            "durable_references": {sid: sorted(reasons) for sid, reasons in protected.items()},
+            "complete": not refusals, "refusal_reasons": sorted(set(refusals)),
+            "refusal_metadata": refusal_metadata,
+            "census": {"complete": not refusals, "read_snapshot": "same_connection",
+                       "page_rows": _REFERENCE_PAGE_ROWS, "max_rows_per_store": _REFERENCE_MAX_ROWS,
+                       "aggregate_bounded": aggregate_bounded,
+                       "contract_rows": contract_rows}}
 
 
 def select_snapshot_retention_candidates(

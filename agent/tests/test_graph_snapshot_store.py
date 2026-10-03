@@ -5047,6 +5047,160 @@ def test_retention_census_reads_unscoped_qa_payload_arrays_and_fails_on_malforme
     assert "qa_custody_without_project_payload_unreadable" in unavailable["global_refusal_reasons"]
 
 
+def _typed_reference_setup(connection, count=70):
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
+    from agent.governance.contracts.runtime import SQLiteContractExecutionStore
+    connection.executescript(SQLiteContractExecutionStore.SCHEMA_SQL)
+    for sid in ("scope-current", "scope-durable"):
+        connection.execute("INSERT INTO graph_snapshots(project_id,snapshot_id,commit_sha,snapshot_kind,status,created_at) "
+                           "VALUES (?,?,?,'scope','superseded','2020')", (PID, sid, "fixture"))
+    for index in range(count):
+        payload = json.dumps({"runtime_guide": {"next_legal_action": 0}, "history": "audit"})
+        connection.execute("INSERT INTO contract_runtime_executions "
+            "(contract_execution_id,project_id,backlog_id,contract_id,version,revision,execution_state_revision,record_json,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", (f"cex-{index:03d}", PID, "backlog", "contract", "1", "1", 1, payload, "now", "now"))
+    connection.commit()
+
+
+def test_typed_census_measured_shape_preserves_current_and_durable_large_audits(conn):
+    _typed_reference_setup(conn, count=109)
+    # Reproduce inventory/owner proportions without claiming 114 eligible items.
+    conn.executemany("INSERT INTO graph_snapshots(project_id,snapshot_id,commit_sha,snapshot_kind,status,created_at) "
+                     "VALUES (?,?,?,'scope','superseded','2020')",
+                     [(PID, f"inventory-{i:03d}", "fixture") for i in range(112)])
+    for index in range(109):
+        completed = index < 90
+        history = "雪" * (380_000 if index in (0, 93, 100, 108) else 70_000 if index < 30 or not completed else 2)
+        if index in (0, 93, 100, 108):
+            payload = json.dumps({"runtime_guide": {"next_legal_action": None if completed else False},
+                "history": [{"step": item, "notes": "雪" * 48, "details": ["audit", item]} for item in range(6000)],
+                "serialized": [json.dumps({"audit": {"late_snapshot_id": "scope-durable" if completed else "scope-current"}}) for _ in range(4 if index != 108 else 0)],
+                "late_snapshot_id": "scope-durable" if completed else "scope-current"}, ensure_ascii=False)
+            assert len(payload.encode()) > 1024 * 1024
+            assert conn.execute("SELECT count(*) FROM json_tree(?)", (payload,)).fetchone()[0] > 20_001
+        else:
+            payload = ('{"runtime_guide":{"next_legal_action":' + ('null' if completed else 'false') +
+                       '},"history":' + json.dumps(history, ensure_ascii=False) + ',"late":' +
+                       ('"scope-durable"' if completed else '{"snapshot_id":"scope\\u002dcurrent"}') + '}')
+        conn.execute("UPDATE contract_runtime_executions SET record_json=? WHERE contract_execution_id=?",
+                     (payload, f"cex-{index:03d}"))
+    conn.commit()
+    changes = conn.total_changes
+    image = hashlib.sha256(conn.serialize()).hexdigest()
+    body_fetches, statements = [], []
+    def row_factory(cursor, row):
+        body_fetches.extend(v for col, v in zip(cursor.description, row) if col[0] == "record_json" and v is not None)
+        return sqlite3.Row(cursor, row)
+    conn.row_factory = row_factory
+    conn.set_trace_callback(statements.append)
+    state = store.snapshot_retention_reference_state(conn, PID)
+    conn.set_trace_callback(None)
+    assert state["complete"] is True and state["refusal_reasons"] == []
+    assert state["census"]["contract_rows"] == {"current": 19, "completed": 90}
+    assert "scope-current" in state["current_use"] and "scope-durable" not in state["current_use"]
+    assert {"scope-current", "scope-durable"} <= state["durable_references"].keys()
+    assert {"scope-current", "scope-durable"} <= state["protected"].keys()
+    assert len(conn.execute("SELECT snapshot_id FROM graph_snapshots").fetchall()) == 114
+    assert any('_rowid_>64' in q for q in statements) and body_fetches == []
+    assert changes == conn.total_changes and image == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+@pytest.mark.parametrize("payload,cause", [
+    (sqlite3.Binary(b'{"runtime_guide":{"next_legal_action":null}}'), "nontext"),
+    ('{bad', "malformed_json"), ('{}', "missing_runtime_guide"),
+    ('{"runtime_guide":{}}', "missing_next_legal_action"),
+])
+def test_typed_census_unknown_owner_payload_protects_all_retention(conn, payload, cause):
+    _typed_reference_setup(conn, count=1)
+    conn.execute("UPDATE contract_runtime_executions SET record_json=?", (payload,))
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state["complete"] is False
+    assert "contract_runtime_executions_owner_" + cause in state["refusal_reasons"]
+    assert state["refusal_metadata"][0]["body_fetched"] is False
+    selected = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0, extra_bundle_snapshot_ids=set())
+    assert not selected["reference_authority_complete"] and selected["candidates"] == []
+
+
+@pytest.mark.parametrize("fault", ["gap", "mutation"])
+def test_typed_census_page_gap_or_same_connection_mutation_refuses(fault):
+    class FaultConnection(sqlite3.Connection):
+        armed = False
+        fired = False
+        def execute(self, sql, args=()):
+            cursor = super().execute(sql, args)
+            if self.armed and not self.fired and 'FROM "contract_runtime_executions"' in sql and 'ORDER BY _rowid_' in sql:
+                self.fired = True
+                if fault == "mutation":
+                    super().execute("UPDATE contract_runtime_executions SET updated_at='changed' WHERE contract_execution_id='cex-000'")
+                else:
+                    class GapCursor:
+                        def fetchall(inner):
+                            return cursor.fetchall()[1:]
+                    return GapCursor()
+            return cursor
+    connection = sqlite3.connect(":memory:", factory=FaultConnection)
+    connection.row_factory = sqlite3.Row
+    _typed_reference_setup(connection)
+    connection.armed = True
+    state = store.snapshot_retention_reference_state(connection, PID)
+    assert state["complete"] is False and connection.fired
+    assert any("continuation_gap" in r if fault == "gap" else "input_changed" in r for r in state["refusal_reasons"])
+    assert connection.execute("SELECT updated_at FROM contract_runtime_executions WHERE contract_execution_id='cex-000'").fetchone()[0] == "now"
+    connection.close()
+
+
+def test_typed_census_external_committed_change_refuses_after_read_snapshot(tmp_path):
+    path = tmp_path / "isolated-census.db"
+    class Reader(sqlite3.Connection):
+        armed = False
+        def execute(self, sql, args=()):
+            cursor = super().execute(sql, args)
+            if self.armed and 'FROM "contract_runtime_executions"' in sql and 'ORDER BY _rowid_' in sql:
+                self.armed = False
+                with sqlite3.connect(path) as writer:
+                    writer.execute("UPDATE contract_runtime_executions SET updated_at='new-watermark'")
+            return cursor
+    reader = sqlite3.connect(path, factory=Reader)
+    reader.row_factory = sqlite3.Row
+    reader.execute("PRAGMA journal_mode=WAL")
+    _typed_reference_setup(reader)
+    reader.armed = True
+    state = store.snapshot_retention_reference_state(reader, PID)
+    assert not state["complete"] and any("input_changed" in r for r in state["refusal_reasons"])
+    reader.close()
+
+
+def test_typed_census_aggregate_unknown_id_overflow_never_becomes_negative_pins(conn):
+    _typed_reference_setup(conn, count=1)
+    conn.execute("CREATE TABLE unknown_audit (payload_json TEXT)")
+    payload = json.dumps({"snapshot_ids": [f"outside-{i}" for i in range(2001)]})
+    assert len(payload.encode()) < 65536
+    conn.execute("INSERT INTO unknown_audit VALUES (?)", (payload,))
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state["complete"] and not state["census"]["aggregate_bounded"]
+    assert "durable_reference_pin_inventory_unbounded" in state["refusal_reasons"]
+    assert state["protected"] == state["current_use"] == state["durable_references"] == {}
+    selection = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0, extra_bundle_snapshot_ids=set())
+    assert not selection["reference_authority_complete"] and selection["candidates"] == []
+
+
+def test_typed_census_unknown_store_and_plain_oversized_text_remain_protective(conn):
+    _typed_reference_setup(conn, count=1)
+    conn.execute("CREATE TABLE future_qa_session (payload INTEGER)")
+    conn.execute("INSERT INTO future_qa_session VALUES (7)")
+    conn.execute("CREATE TABLE ordinary_audit (notes TEXT)")
+    conn.execute("INSERT INTO ordinary_audit VALUES (?)", ("plain text " * 10_000,))
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state["complete"]
+    assert "future_qa_session_owner_schema_unknown" in state["refusal_reasons"]
+    assert "ordinary_audit_payload_unreadable" in state["refusal_reasons"]
+
+
 def test_write_companion_files_enospc_raises_actionable_error(conn, tmp_path, monkeypatch):
     """ENOSPC during write_companion_files must raise an actionable OSError."""
     import errno as _errno
