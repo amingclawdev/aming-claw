@@ -2807,6 +2807,59 @@ def test_129_protected_graph_rows_compact_only_optional_diagnostics(
         assert not safe_directory.exists()
 
 
+@pytest.mark.parametrize("candidate_count", [2, 129])
+def test_all_protected_snapshot_preview_keeps_global_census_refusal(
+    tmp_path, monkeypatch, candidate_count,
+):
+    conn = _conn()
+    repo = _git_repo(tmp_path)
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    protected = []
+    for number in range(candidate_count):
+        sid = f"full-{number:03d}-" + "s" * 34
+        directory = snapshot_root / sid
+        directory.mkdir()
+        (directory / "graph.json").write_bytes(b"{}")
+        protected.append({
+            "snapshot_id": sid, "snapshot_kind": "full", "status": "active",
+            "created_at": "2026-09-27T00:00:00Z", "dir_exists": True,
+            "reasons": [f"reference:{number:03d}:{part:02d}:" + "r" * 100 + "雪\\\"\n"
+                        for part in range(8)],
+        })
+    global_reasons = ["reference_inventory_corrupt:contract_runtime_executions.record_json"]
+    monkeypatch.setattr(graph_snapshot_store, "select_snapshot_retention_candidates",
+                        lambda *_a, **_kw: {"candidates": [], "protected": protected,
+                            "reference_authority_complete": False,
+                            "global_refusal_reasons": global_reasons})
+    monkeypatch.setattr(graph_snapshot_store, "_snapshot_root", lambda _pid, sid: snapshot_root / sid)
+    monkeypatch.setattr(governance_server, "_graph_release_build_fence_state", lambda *_a: {"clear": True})
+    raw = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots", response_budget=False,
+    )
+    bounded = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+        conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+    )
+    assert raw["global_refusal_reasons"] == bounded["global_refusal_reasons"] == global_reasons
+    assert bounded["candidates"][0]["evidence"]["global_refusal_reasons"] == global_reasons
+    assert bounded["summary"]["safe_apply_count"] == 0
+    assert len(bounded["candidates"]) == candidate_count
+    assert all(not c["safe_to_apply"] for c in bounded["candidates"])
+    assert bounded["plan_hash"] == raw["plan_hash"]
+    if candidate_count == 129:
+        assert bounded["candidate_diagnostics"]["graph_unsafe_rows_compacted"] == candidate_count
+    assert all(n <= 224 * 1024 for n in stale_artifact_cleanup.cleanup_response_wire_bytes(bounded).values())
+    with pytest.raises(stale_artifact_cleanup.StaleArtifactCleanupError):
+        stale_artifact_cleanup.apply_stale_artifact_cleanup(
+            conn, "proj", repo_root_path=repo, dimension="graph_snapshots",
+            candidate_ids=[c["candidate_id"] for c in bounded["candidates"]],
+            plan_hash=bounded["plan_hash"], plan_revision=bounded["plan_revision"],
+        )
+    assert all((snapshot_root / row["snapshot_id"] / "graph.json").read_bytes() == b"{}"
+               for row in protected)
+    conn.close()
+
+
 def test_cleanup_apply_refuses_unrepresentable_ids_before_any_removal(
     tmp_path, monkeypatch,
 ):

@@ -47,7 +47,9 @@ CLONE_NOFOLLOW_ANY = 0x8
 
 
 class CowRefusal(ValueError):
-    pass
+    def __init__(self, reason: str, metadata: dict[str, Any] | None = None):
+        super().__init__(reason)
+        self.metadata = metadata or {}
 
 
 class CowPrejournalRefusal(CowRefusal):
@@ -443,7 +445,40 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
                 predicate = "(" + predicate + " OR coalesce(lease_expires_at,'')>?)"
                 args.append(datetime.now(timezone.utc).isoformat())
             where.append(predicate)
-        query = f"SELECT * FROM {quoted}" + (" WHERE " + " AND ".join(where) if where else "") + " LIMIT ?"
+        # Project byte/type facts before transferring JSON bodies to Python.
+        # SQLite TEXT length counts characters (and stops at NUL); its BLOB
+        # representation measures actual UTF-8 bytes. BLOB is never called TEXT.
+        fields = sorted(columns)
+        json_fields = [key for key in fields if key.endswith("_json")]
+        projection = []
+        for key in fields:
+            column = '"' + key.replace('"', '""') + '"'
+            projection.append(
+                f"CASE WHEN typeof({column})='text' "
+                f"AND length(CAST({column} AS BLOB))<={MAX_JSON_BYTES} "
+                f"THEN {column} ELSE NULL END AS {column}"
+                if key in json_fields else column)
+        for key in json_fields:
+            column = '"' + key.replace('"', '""') + '"'
+            projection.extend((f"typeof({column})", f"length(CAST({column} AS BLOB))"))
+        if table == "contract_runtime_executions":
+            # Native completed semantics precede the payload cap. Inspect only
+            # JSON types in SQLite: never transfer an oversized record body.
+            # json_each preserves duplicate members; selecting the last at each
+            # level matches json.loads rather than json_extract's first match.
+            # An absent key is never explicit next_legal_action=null.
+            projection.append("CASE WHEN typeof(record_json)!='text' THEN 'nontext' "
+                "WHEN NOT json_valid(record_json) THEN 'malformed_json' "
+                "ELSE coalesce((SELECT CASE WHEN guide.type!='object' "
+                "THEN 'missing_runtime_guide' ELSE coalesce((SELECT "
+                "CASE WHEN action.type='null' THEN 'completed' ELSE 'live' END "
+                "FROM json_each(guide.value) AS action "
+                "WHERE action.key='next_legal_action' ORDER BY action.id DESC LIMIT 1), "
+                "'missing_next_legal_action') END FROM json_each(record_json) AS guide "
+                "WHERE guide.key='runtime_guide' ORDER BY guide.id DESC LIMIT 1), "
+                "'missing_runtime_guide') END")
+        query = f"SELECT {','.join(projection)} FROM {quoted}" + (
+            " WHERE " + " AND ".join(where) if where else "") + " LIMIT ?"
         cursor = conn.execute(query, (*args, MAX_LIVE_ROWS + 1))
         records = cursor.fetchall()
         if len(records) > MAX_LIVE_ROWS:
@@ -451,9 +486,20 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
         scanned += len(records)
         if scanned > 20000:
             raise CowRefusal("cow_live_census_unbounded")
-        fields = [c[0] for c in cursor.description]
         for record in records:
-            value = dict(zip(fields, record))
+            value = dict(zip(fields, record[:len(fields)]))
+            payload_metadata = {}
+            for index, key in enumerate(json_fields):
+                storage_type, byte_length = record[len(fields) + index * 2:len(fields) + index * 2 + 2]
+                payload_metadata[key] = {
+                    "table": table, "field": key, "sqlite_storage_type": storage_type,
+                    "storage_byte_length": byte_length,
+                    "utf8_byte_length": byte_length if storage_type == "text" else None,
+                    "execution_identity_hash": ("sha256:" + _digest(
+                        [table, str(value["contract_execution_id"])]))
+                        if table == "contract_runtime_executions" else None,
+                    "body_fetched": storage_type == "text" and byte_length <= MAX_JSON_BYTES,
+                }
             lease = value.get("lease_expires_at")
             if lease:
                 try:
@@ -469,17 +515,30 @@ def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
                 if str(task[0]).lower() in TERMINAL:
                     continue
             if table == "contract_runtime_executions":
-                contract = json.loads(value["record_json"])
-                guide = contract.get("runtime_guide")
-                if not isinstance(guide, dict) or "next_legal_action" not in guide:
-                    raise CowRefusal("cow_contract_live_state_unknown")
-                if guide["next_legal_action"] is None:
+                state = record[-1]
+                if state == "completed":
                     continue
+                if state != "live":
+                    metadata = payload_metadata["record_json"]
+                    cause = "null" if metadata["sqlite_storage_type"] == "null" else state
+                    reason = ("cow_live_payload_unbounded:" + table if cause == "nontext" else
+                              "cow_live_payload_malformed:" + table if cause == "malformed_json" else
+                              "cow_contract_live_state_unknown")
+                    raise CowRefusal(reason, {**metadata, "cause": cause})
             for key, raw in value.items():
-                if key.endswith("_json") and raw not in (None, ""):
-                    if not isinstance(raw, str) or len(raw.encode()) > MAX_JSON_BYTES:
-                        raise CowRefusal("cow_live_payload_unbounded:" + table)
-                    json.loads(raw)  # A corrupt required live payload is never an empty inventory.
+                if key in payload_metadata:
+                    metadata = payload_metadata[key]
+                    if metadata["sqlite_storage_type"] == "null" or (
+                            metadata["sqlite_storage_type"] == "text" and metadata["storage_byte_length"] == 0):
+                        continue  # Existing optional empty/null payload semantics.
+                    if metadata["sqlite_storage_type"] != "text" or metadata["storage_byte_length"] > MAX_JSON_BYTES:
+                        cause = "nontext" if metadata["sqlite_storage_type"] != "text" else "oversized_text"
+                        raise CowRefusal("cow_live_payload_unbounded:" + table, {**metadata, "cause": cause})
+                    try:
+                        json.loads(raw)  # Corruption is never an empty inventory.
+                    except (ValueError, TypeError, UnicodeError) as exc:
+                        raise CowRefusal("cow_live_payload_malformed:" + table,
+                                         {**metadata, "cause": "malformed_json"}) from exc
             # Keep exact IDs/paths in a bounded typed inventory for per-item matching.
             pins.add(json.dumps(value, sort_keys=True, default=str))
     return pins
@@ -973,7 +1032,7 @@ def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_id
             _archive(project_id, snapshots._snapshot_root(project_id, row["snapshot_id"]),
                      row["target_metadata"]["size"] * 2 + 1024 * 1024)
     except CowRefusal as exc:
-        raise CowPrejournalRefusal(str(exc)) from exc
+        raise CowPrejournalRefusal(str(exc), exc.metadata) from exc
     _state_root(project_id, create=True)
     before = shutil.disk_usage(snapshots._snapshot_root(project_id, rows[0]["snapshot_id"])).free
     record = {"schema": "snapshot_cow_operation.v1", "operation_id": operation_id,

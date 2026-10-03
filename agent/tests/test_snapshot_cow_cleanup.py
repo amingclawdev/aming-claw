@@ -146,6 +146,158 @@ def test_completed_audit_reference_is_history_but_live_ref_protects(cow_fixture)
     assert preview(cow_fixture)["candidates"] == []
 
 
+def _insert_census_contract(conn, payload):
+    conn.execute(
+        "INSERT INTO contract_runtime_executions "
+        "(contract_execution_id,project_id,backlog_id,contract_id,version,"
+        "revision,execution_state_revision,record_json,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("private-census-cex", "proj", "backlog", "contract", "1", "1", 1,
+         payload, "now", "now"),
+    )
+    conn.commit()
+
+
+def _observe_census_record_fetches(conn):
+    fetched_lengths = []
+    def row_factory(cursor, row):
+        for column, value in zip(cursor.description, row):
+            if column[0] == "record_json" and value is not None:
+                fetched_lengths.append(len(value))
+        return sqlite3.Row(cursor, row)
+    conn.row_factory = row_factory
+    return fetched_lengths
+
+
+@pytest.mark.parametrize("entrypoint", ["preview", "apply"])
+def test_census_oversized_multibyte_payload_refuses_before_fetch(cow_fixture, entrypoint):
+    if entrypoint == "apply" and sys.platform != "darwin":
+        pytest.skip("native apply preflight requires macOS")
+    conn, _, base, _, _ = cow_fixture
+    approved = preview(cow_fixture)
+    before = {p: p.read_bytes() for p in base.rglob("*.json")}
+    payload = json.dumps({"runtime_guide": {"next_legal_action": {"snapshot_id": "full-old"}},
+                          "private_payload": "雪" * 350_000}, ensure_ascii=False)
+    assert len(payload) < cow.MAX_JSON_BYTES < len(payload.encode("utf-8"))
+    _insert_census_contract(conn, payload)
+    fetched_lengths = _observe_census_record_fetches(conn)
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        preview(cow_fixture) if entrypoint == "preview" else apply(cow_fixture, approved)
+    assert fetched_lengths == []  # Includes the shared schema/readability probe.
+    details = caught.value.payload
+    assert details["refusal_reason"] == "cow_live_payload_unbounded:contract_runtime_executions"
+    assert details["writes_performed"] is False
+    assert details.get("apply_plan_available", False) is False
+    facts = details["refusal_metadata"]
+    assert facts["table"] == "contract_runtime_executions"
+    assert facts["field"] == "record_json"
+    assert facts["sqlite_storage_type"] == "text"
+    assert facts["utf8_byte_length"] == facts["storage_byte_length"] == len(payload.encode("utf-8"))
+    assert facts["cause"] == "oversized_text" and facts["body_fetched"] is False
+    assert facts["execution_identity_hash"].startswith("sha256:")
+    assert len(facts["execution_identity_hash"]) == 71
+    assert "private-census-cex" not in json.dumps(details) and "雪" not in json.dumps(details, ensure_ascii=False)
+    assert not cow._state_root("proj").exists()
+    assert {p: p.read_bytes() for p in before} == before
+
+
+def test_census_large_completed_contract_is_skipped_without_body_fetch(cow_fixture):
+    conn = cow_fixture[0]
+    payload = json.dumps({"runtime_guide": {"next_legal_action": None},
+                          "snapshot_id": "full-old", "history": "雪" * 350_000}, ensure_ascii=False)
+    assert len(payload.encode("utf-8")) > cow.MAX_JSON_BYTES
+    _insert_census_contract(conn, payload)
+    fetched_lengths = _observe_census_record_fetches(conn)
+    plan = preview(cow_fixture)
+    assert len(plan["candidates"]) == 2
+    assert plan["writes_performed"] is False
+    assert fetched_lengths == []
+
+
+@pytest.mark.parametrize("duplicate_level", ["runtime_guide", "next_legal_action"])
+@pytest.mark.parametrize("last_completed", [False, True])
+def test_census_large_duplicate_keys_match_python_last_member(cow_fixture, duplicate_level, last_completed):
+    conn = cow_fixture[0]
+    first, last = ('{"snapshot_id":"full-old"}', 'null') if last_completed else (
+        'null', '{"snapshot_id":"full-old"}')
+    if duplicate_level == "runtime_guide":
+        members = ('"runtime_guide":{"next_legal_action":' + first + '},'
+                   '"runtime_guide":{"next_legal_action":' + last + '}')
+    else:
+        members = ('"runtime_guide":{"next_legal_action":' + first + ','
+                   '"next_legal_action":' + last + '}')
+    payload = '{' + members + ',"history":' + json.dumps("雪" * 350_000, ensure_ascii=False) + '}'
+    assert (json.loads(payload)["runtime_guide"]["next_legal_action"] is None) == last_completed
+    assert len(payload.encode("utf-8")) > cow.MAX_JSON_BYTES
+    _insert_census_contract(conn, payload)
+    fetched_lengths = _observe_census_record_fetches(conn)
+    if last_completed:
+        assert len(preview(cow_fixture)["candidates"]) == 2
+    else:
+        with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+            preview(cow_fixture)
+        assert caught.value.payload["refusal_reason"] == "cow_live_payload_unbounded:contract_runtime_executions"
+        assert caught.value.payload["refusal_metadata"]["cause"] == "oversized_text"
+        assert caught.value.payload["writes_performed"] is False
+    assert fetched_lengths == []
+    assert not cow._state_root("proj").exists()
+
+
+@pytest.mark.parametrize("action", [0, True, False, ""])
+def test_census_large_nonnull_scalar_action_remains_live(cow_fixture, action):
+    conn = cow_fixture[0]
+    payload = json.dumps({"runtime_guide": {"next_legal_action": action},
+                          "history": "雪" * 350_000}, ensure_ascii=False)
+    _insert_census_contract(conn, payload)
+    fetched_lengths = _observe_census_record_fetches(conn)
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        preview(cow_fixture)
+    assert caught.value.payload["refusal_reason"] == "cow_live_payload_unbounded:contract_runtime_executions"
+    assert caught.value.payload["refusal_metadata"]["cause"] == "oversized_text"
+    assert fetched_lengths == []
+
+
+@pytest.mark.parametrize("payload,cause,storage_type", [
+    (sqlite3.Binary(b'{"runtime_guide":{"next_legal_action":null}}'), "nontext", "blob"),
+    ('{"runtime_guide":', "malformed_json", "text"),
+    ('{}', "missing_runtime_guide", "text"),
+    ('{"runtime_guide":null}', "missing_runtime_guide", "text"),
+    ('{"runtime_guide":{}}', "missing_next_legal_action", "text"),
+    ('[]', "missing_runtime_guide", "text"),
+])
+def test_census_contract_storage_and_guide_states_are_distinct(cow_fixture, payload, cause, storage_type):
+    conn = cow_fixture[0]
+    _insert_census_contract(conn, payload)
+    assert conn.execute("SELECT typeof(record_json) FROM contract_runtime_executions").fetchone()[0] == storage_type
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        preview(cow_fixture)
+    details = caught.value.payload
+    facts = details["refusal_metadata"]
+    assert facts["cause"] == cause and facts["sqlite_storage_type"] == storage_type
+    assert facts["storage_byte_length"] == len(payload.encode("utf-8") if isinstance(payload, str) else payload)
+    assert facts["utf8_byte_length"] == (len(payload.encode("utf-8")) if storage_type == "text" else None)
+    assert details["apply_plan_available"] is False and details["writes_performed"] is False
+    assert not cow._state_root("proj").exists()
+
+
+def test_census_null_required_contract_payload_is_not_optional_absence(cow_fixture):
+    conn = cow_fixture[0]
+    # TEXT affinity is a schema name/type check, not a NOT NULL guarantee.
+    conn.execute("DROP TABLE contract_runtime_executions")
+    conn.execute("CREATE TABLE contract_runtime_executions "
+                 "(contract_execution_id TEXT PRIMARY KEY, project_id TEXT, backlog_id TEXT, record_json TEXT)")
+    conn.execute("INSERT INTO contract_runtime_executions VALUES('private-census-cex','proj','backlog',NULL)")
+    conn.commit()
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        preview(cow_fixture)
+    details = caught.value.payload
+    facts = details["refusal_metadata"]
+    assert details["refusal_reason"] == "cow_contract_live_state_unknown"
+    assert facts["cause"] == "null" and facts["sqlite_storage_type"] == "null"
+    assert facts["utf8_byte_length"] is None and facts["storage_byte_length"] is None
+    assert details["apply_plan_available"] is False
+
+
 # Read-only native row from reviewer-candidate-claim-readonly.json,
 # SHA256 faa9d07fe4ce1311601dab31739a49e0f2ed4a2bce1a032d8ff0b957add56bf3.
 # Only the project is remapped into the isolated fixture; no live DB is opened.

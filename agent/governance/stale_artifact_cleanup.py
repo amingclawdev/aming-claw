@@ -266,7 +266,7 @@ def _bounded_cleanup_projection(result: dict[str, Any]) -> dict[str, Any]:
                 key: evidence[key] for key in (
                     "snapshot_kind", "status", "created_at", "age_days",
                     "size_bytes", "size_bytes_status", "run_id",
-                    "snapshot_id", "commit_sha",
+                    "snapshot_id", "commit_sha", "global_refusal_reasons",
                 ) if key in evidence
             }
             visible_candidates.append({
@@ -1078,6 +1078,8 @@ def _build_graph_snapshot_candidates(
                 "exists": exists,
                 "path_identity": identity,
                 "append_only_evidence_retained": True,
+                **({"global_refusal_reasons": selection["global_refusal_reasons"]}
+                   if selection.get("global_refusal_reasons") and not candidates else {}),
             },
         })
     # Also surface protected as refusals (informational). Read-only estimates
@@ -1113,6 +1115,8 @@ def _build_graph_snapshot_candidates(
                 "exists": bool(item.get("dir_exists")),
                 "path_identity": _path_identity(actual_path),
                 "append_only_evidence_retained": True,
+                **({"global_refusal_reasons": selection["global_refusal_reasons"]}
+                   if selection.get("global_refusal_reasons") and not candidates else {}),
             },
         })
     return candidates
@@ -1158,6 +1162,7 @@ def build_stale_artifact_cleanup_projection(
                 "ok": False, "error": "snapshot_cow_preview_refused",
                 "refusal_reason": str(exc)[:160], "writes_performed": False,
                 "write_disposition": "not_written", "apply_plan_available": False,
+                "refusal_metadata": exc.metadata if isinstance(exc, cow.CowRefusal) else {},
             }) from exc
         if not _cleanup_response_fits(result):
             raise StaleArtifactCleanupError("cleanup_response_frame_refused", {
@@ -1222,6 +1227,8 @@ def build_stale_artifact_cleanup_projection(
                                              "refused_count": total - safe,
                                              "truncated": total > PREVIEW_LIMIT}}},
             "candidates": visible,
+            "global_refusal_reasons": sorted({reason for item in graph_items
+                for reason in (item.get("evidence") or {}).get("global_refusal_reasons", [])}),
             "append_only_retained": {"policy": "retain_append_only_evidence", "deleted": False},
             "cleanup": cleanup_recommendation(project_id),
         }
@@ -2016,6 +2023,7 @@ def _cow_locked(conn: sqlite3.Connection, project_id: str, root: str | Path,
             "operation_id": arguments.get("operation_id"),
             "native_prejournal_refusal": isinstance(exc, cow.CowPrejournalRefusal),
             "writes_performed": False, "write_disposition": "not_written", "safe_retry": False,
+            "refusal_metadata": exc.metadata if isinstance(exc, cow.CowRefusal) else {},
         }) from exc
     finally:
         if owns_transaction and conn.in_transaction:
@@ -2103,7 +2111,9 @@ def _archive_reference_inventory_reasons(
                 return ["reference_inventory_schema_incomplete:" + name]
             quoted = '"' + name.replace('"', '""') + '"'
             try:
-                conn.execute(f"SELECT * FROM {quoted} LIMIT 1").fetchone()
+                # Schema/readability probe must not transfer an oversized first
+                # runtime payload before the live census can classify it.
+                conn.execute(f"SELECT 1 FROM {quoted} LIMIT 1").fetchone()
             except sqlite3.Error:
                 return ["reference_inventory_unreadable:" + name]
         if project_id != "aming-claw" and _STABLE_QUEUE_REFERENCE_TABLES <= names:
