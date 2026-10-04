@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -4724,7 +4725,7 @@ def test_finalize_graph_snapshot_rejects_commit_mismatch_and_stale_active(conn):
 # ---------------------------------------------------------------------------
 
 
-def test_retention_selection_protects_active_snapshot(conn, tmp_path):
+def test_retention_selection_protects_active_snapshot(conn, tmp_path, bundle_namespace):
     """Active snapshot must never appear as a GC candidate."""
     _ensure_schema(conn)
     active = store.create_graph_snapshot(
@@ -4745,7 +4746,7 @@ def test_retention_selection_protects_active_snapshot(conn, tmp_path):
     assert active["snapshot_id"] not in candidate_ids, "active snapshot must not be a candidate"
 
 
-def test_retention_selection_protects_keep_last_n(conn, tmp_path):
+def test_retention_selection_protects_keep_last_n(conn, tmp_path, bundle_namespace):
     """The most recent N snapshots must be protected."""
     _ensure_schema(conn)
     snap_ids = []
@@ -4767,7 +4768,7 @@ def test_retention_selection_protects_keep_last_n(conn, tmp_path):
     assert (set(protected_ids) & set(candidate_ids)) == set()
 
 
-def test_retention_selection_protects_full_baseline(conn, tmp_path):
+def test_retention_selection_protects_full_baseline(conn, tmp_path, bundle_namespace):
     """The most recent 'full' snapshot must always be protected."""
     _ensure_schema(conn)
     full = store.create_graph_snapshot(
@@ -4785,7 +4786,7 @@ def test_retention_selection_protects_full_baseline(conn, tmp_path):
     assert full["snapshot_id"] in protected_ids, "most recent full baseline must be protected"
 
 
-def test_retention_selection_protects_reconcile_in_progress(conn, tmp_path):
+def test_retention_selection_protects_reconcile_in_progress(conn, tmp_path, bundle_namespace):
     """Snapshots referenced by running reconcile rows must be protected."""
     _ensure_schema(conn)
     active = store.create_graph_snapshot(
@@ -4892,7 +4893,7 @@ def test_retention_gc_is_idempotent(conn, tmp_path):
     assert r2["errors"] == [], "second GC run must not produce errors"
 
 
-def test_retention_selector_protects_both_trace_columns_and_candidate_status(conn):
+def test_retention_selector_protects_both_trace_columns_and_candidate_status(conn, bundle_namespace):
     _ensure_schema(conn)
     conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
     first = store.create_graph_snapshot(
@@ -4951,7 +4952,7 @@ def test_retention_selector_scan_error_does_not_claim_known_zero(conn, monkeypat
     assert selected["size_bytes"] is None
 
 
-def test_retention_reference_overflow_fails_closed(conn, tmp_path):
+def test_retention_reference_overflow_fails_closed(conn, tmp_path, bundle_namespace):
     _ensure_schema(conn)
     conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
     snapshot = store.create_graph_snapshot(
@@ -4974,7 +4975,7 @@ def test_retention_reference_overflow_fails_closed(conn, tmp_path):
     assert (tmp_path / PID / "graph-snapshots" / snapshot["snapshot_id"]).exists()
 
 
-def test_retention_explicit_fixture_authority_can_remove_unreferenced_superseded_dir(conn, tmp_path):
+def test_retention_explicit_fixture_authority_can_remove_unreferenced_superseded_dir(conn, tmp_path, bundle_namespace):
     _ensure_schema(conn)
     conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
     old = store.create_graph_snapshot(
@@ -5026,7 +5027,7 @@ def test_retention_rechecks_each_item_and_reports_partial_refusal(conn, tmp_path
     assert (tmp_path / PID / "graph-snapshots" / "scope-b-recheck").exists()
 
 
-def test_retention_census_reads_unscoped_qa_payload_arrays_and_fails_on_malformed(conn):
+def test_retention_census_reads_unscoped_qa_payload_arrays_and_fails_on_malformed(conn, bundle_namespace):
     _ensure_schema(conn)
     conn.execute("CREATE TABLE graph_query_traces (project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
     snapshot = store.create_graph_snapshot(
@@ -5252,8 +5253,8 @@ def test_write_companion_files_enospc_raises_actionable_error(conn, tmp_path, mo
     assert exc_info.value.errno == _errno.ENOSPC
 
 
-def test_bundle_referenced_snapshot_ids_returns_set(tmp_path):
-    """Bundle-referenced snapshot ids must be a set (may be empty in test env)."""
+def test_bundle_referenced_snapshot_ids_returns_set(bundle_namespace):
+    """The success API remains a set in an entirely isolated namespace."""
     result = store._bundle_referenced_snapshot_ids()
     assert isinstance(result, set)
 
@@ -6338,3 +6339,384 @@ def test_owner_projection_degraded_flags_object_and_unknown_large_text(conn):
     conn.execute("INSERT INTO unknown_owner VALUES (?)", ('x'*100_406,)); conn.commit()
     state = store.snapshot_retention_reference_state(conn, PID)
     assert not state["complete"] and "unknown_owner_payload_unreadable" in state["refusal_reasons"]
+
+
+@pytest.fixture()
+def bundle_namespace(tmp_path, monkeypatch):
+    """Never read the real installed default or governance namespace."""
+    from agent.governance import self_graph_bundle_check
+    default = tmp_path / "installed-default.json"
+    default.write_text(json.dumps({"snapshot_id": "sealed-default"}), encoding="utf-8")
+    monkeypatch.setattr(self_graph_bundle_check, "SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH", default)
+    monkeypatch.setattr(db, "_governance_root", lambda: tmp_path)
+    monkeypatch.setattr(store.time, "monotonic", lambda: 0.0)
+    return tmp_path, default
+
+
+def _bundle_manifest(root, directory, sid="sealed-historic", body=None):
+    path = root / directory / "self-graph-bundle-manifest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body if body is not None else json.dumps({"snapshot_id": sid}).encode())
+    return path
+
+
+def _bundle_selection(conn, monkeypatch):
+    _ensure_schema(conn)
+    store.ensure_schema(conn)
+    for sid in ("sealed-default", "sealed-historic", "explicit-extra", "unreferenced"):
+        store.create_graph_snapshot(conn, PID, snapshot_id=sid, commit_sha=sid,
+                                    snapshot_kind="scope")
+    conn.execute("UPDATE graph_snapshots SET status='superseded' WHERE project_id=?", (PID,))
+    monkeypatch.setattr(store, "snapshot_retention_reference_state", lambda *_: {
+        "protected": {}, "complete": True, "refusal_reasons": []})
+    return lambda: store.select_snapshot_retention_candidates(
+        conn, PID, keep_last_n=0, extra_bundle_snapshot_ids={"explicit-extra"},
+        measure_sizes=False)
+
+
+def _assert_bundle_incomplete(selection, positives=("sealed-default",)):
+    assert selection["reference_authority_complete"] is False
+    assert selection["candidates"] == []
+    assert "bundle_manifest_reference_unreadable" in selection["global_refusal_reasons"]
+    protected = {row["snapshot_id"]: row["reasons"] for row in selection["protected"]}
+    assert all("reference_authority_incomplete" in reasons for reasons in protected.values())
+    for sid in (*positives, "explicit-extra"):
+        assert "bundle_manifest_reference" in protected[sid]
+
+
+def _bundle_long_stream(monkeypatch, root, late, clock=None):
+    actual = os.scandir
+    root_ino = root.stat().st_ino
+    info = late.stat()
+
+    class Unrelated:
+        name = "unrelated.json"
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            return info
+
+    class Stream:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def __iter__(self):
+            return self
+        def __next__(self):
+            return next(self.items)
+        def __init__(self):
+            def items():
+                for _ in range(100001):
+                    yield Unrelated()
+                if clock is not None:
+                    clock[0] = 11.0
+                with actual(root) as iterator:
+                    for entry in iterator:
+                        if entry.name == late.name:
+                            yield entry
+            self.items = items()
+
+    monkeypatch.setattr(store.os, "scandir", lambda fd:
+                        Stream() if isinstance(fd, int) and os.fstat(fd).st_ino == root_ino else actual(fd))
+
+
+def test_bundle_streaming_large_unrelated_namespace_late_historical_pin(
+        conn, bundle_namespace, monkeypatch):
+    root, _ = bundle_namespace
+    selection = _bundle_selection(conn, monkeypatch)
+    # Arbitrary CL feature paths must remain within Rule4 discovery.
+    late = _bundle_manifest(root, "charting-loop/trace/feature-inputs/portable-export")
+    # Real recursive CL discovery is checked before controlled wide enumeration.
+    assert store._bundle_referenced_snapshot_ids() == {"sealed-default", "sealed-historic"}
+    root_late = _bundle_manifest(root, "", "sealed-historic")
+    _bundle_long_stream(monkeypatch, root, root_late)
+    assert store._bundle_referenced_snapshot_ids() == {"sealed-default", "sealed-historic"}
+    result = selection()
+    assert result["reference_authority_complete"] is True
+    protected = {row["snapshot_id"]: row["reasons"] for row in result["protected"]}
+    for sid in ("sealed-default", "sealed-historic", "explicit-extra"):
+        assert protected[sid] == ["bundle_manifest_reference"]
+    assert [row["snapshot_id"] for row in result["candidates"]] == ["unreferenced"]
+    assert late.exists()  # Discovery never changes portable historical exports.
+
+
+def test_bundle_streaming_deadline_preserves_default_and_extra(
+        conn, bundle_namespace, monkeypatch):
+    root, _ = bundle_namespace
+    selection = _bundle_selection(conn, monkeypatch)
+    late = _bundle_manifest(root, "")
+    clock = [0.0]
+    monkeypatch.setattr(store.time, "monotonic", lambda: clock[0])
+    _bundle_long_stream(monkeypatch, root, late, clock)
+    with pytest.raises(store._BundleInventoryIncomplete) as error:
+        store._bundle_referenced_snapshot_ids()
+    assert error.value.cause == "deadline_exceeded"
+    assert error.value.entries_seen == 100001
+    assert error.value.referenced_snapshot_ids == {"sealed-default"}
+    clock[0] = 0.0
+    _assert_bundle_incomplete(selection())
+
+
+@pytest.mark.parametrize("failure", ["missing", "malformed", "utf8", "nonobject",
+                                    "recursion", "symlink", "nonregular", "unreadable"])
+def test_bundle_streaming_default_failures_refuse_all(
+        conn, bundle_namespace, monkeypatch, failure):
+    root, default = bundle_namespace
+    selection = _bundle_selection(conn, monkeypatch)
+    if failure == "missing":
+        default.unlink()
+    elif failure == "malformed":
+        default.write_bytes(b"{")
+    elif failure == "utf8":
+        default.write_bytes(b"\xff")
+    elif failure == "nonobject":
+        default.write_bytes(b"[]")
+    elif failure == "recursion":
+        # Parser recursion limits differ across Python implementations. Exercise
+        # the recognized parser failure deterministically without changing limits.
+        original_loads = store.json.loads
+        def recursive_parser(value, *args, **kwargs):
+            if value == default.read_text():
+                raise RecursionError("isolated parser recursion")
+            return original_loads(value, *args, **kwargs)
+        monkeypatch.setattr(store.json, "loads", recursive_parser)
+    elif failure == "symlink":
+        target = root / "target.json"
+        default.rename(target)
+        default.symlink_to(target)
+    elif failure == "nonregular":
+        default.unlink()
+        default.mkdir()
+    else:
+        original = os.open
+        def denied(name, *args, **kwargs):
+            if name == default.name:
+                raise PermissionError("isolated denied read")
+            return original(name, *args, **kwargs)
+        monkeypatch.setattr(store.os, "open", denied)
+    _assert_bundle_incomplete(selection(), positives=())
+
+
+@pytest.mark.parametrize("failure", ["malformed", "utf8", "file_symlink", "dir_symlink",
+                                    "unreadable", "disappeared", "replaced", "growth",
+                                    "namespace_changed", "dir_replaced"])
+def test_bundle_streaming_historical_failure_carries_prior_pins(
+        conn, bundle_namespace, monkeypatch, failure):
+    root, _ = bundle_namespace
+    selection = _bundle_selection(conn, monkeypatch)
+    late = _bundle_manifest(root, "broken")
+    if failure in {"malformed", "utf8"}:
+        late.write_bytes(b"{" if failure == "malformed" else b"\xff")
+    elif failure == "file_symlink":
+        late.unlink()
+        late.symlink_to(root / "installed-default.json")
+    elif failure == "dir_symlink":
+        (root / "linked-dir").symlink_to(late.parent, target_is_directory=True)
+    elif failure in {"unreadable", "dir_replaced"}:
+        original = os.open
+        def denied(name, *args, **kwargs):
+            if failure == "unreadable" and name == late.name:
+                raise PermissionError("isolated denied read")
+            if failure == "dir_replaced" and name == late.parent.name:
+                late.parent.rename(root / "old-directory")
+                late.parent.mkdir()
+            return original(name, *args, **kwargs)
+        monkeypatch.setattr(store.os, "open", denied)
+    elif failure in {"replaced", "growth"}:
+        original = os.read
+        inode = late.stat().st_ino
+        changed = [False]
+        def raced(fd, size):
+            data = original(fd, size)
+            if os.fstat(fd).st_ino == inode and not changed[0]:
+                changed[0] = True
+                if failure == "growth":
+                    with late.open("ab") as writer:
+                        writer.write(b" ")
+                else:
+                    replacement = late.with_suffix(".replacement")
+                    replacement.write_bytes(late.read_bytes())
+                    replacement.replace(late)
+            return data
+        monkeypatch.setattr(store.os, "read", raced)
+    else:
+        original = os.scandir
+        inode = late.parent.stat().st_ino
+        class Mutating:
+            def __enter__(self):
+                self.iterator = original(late.parent)
+                return self
+            def __exit__(self, *_):
+                self.iterator.close()
+            def __iter__(self):
+                return self
+            def __next__(self):
+                child = next(self.iterator, None)
+                if child is None:
+                    (late.parent / "new-entry").write_bytes(b"unrelated")
+                    raise StopIteration
+                if failure == "disappeared" and child.name == late.name:
+                    # Cache the observed entry, then remove before the anchored read.
+                    child.stat(follow_symlinks=False)
+                    late.unlink()
+                return child
+        monkeypatch.setattr(store.os, "scandir", lambda fd:
+                            Mutating() if isinstance(fd, int) and os.fstat(fd).st_ino == inode else original(fd))
+    _assert_bundle_incomplete(selection())
+
+
+@pytest.mark.parametrize("budget,cause", [
+    ("count", "manifest_count_exceeded"),
+    ("file", "manifest_file_bytes_exceeded"),
+    ("total", "manifest_total_bytes_exceeded"),
+    ("pin", "pin_bytes_exceeded"),
+    ("depth", "directory_resources_exceeded"),
+    ("handles", "directory_resources_exceeded"),
+])
+def test_bundle_streaming_resource_boundaries_are_not_truncation(
+        conn, bundle_namespace, monkeypatch, budget, cause):
+    root, default = bundle_namespace
+    if budget == "count":
+        monkeypatch.setattr(store, "_BUNDLE_MANIFEST_COUNT", 2)
+        _bundle_manifest(root, "a")
+    elif budget == "file":
+        size = default.stat().st_size
+        monkeypatch.setattr(store, "_BUNDLE_FILE_BYTES", size)
+    elif budget == "total":
+        _bundle_manifest(root, "a")
+        monkeypatch.setattr(store, "_BUNDLE_TOTAL_BYTES", default.stat().st_size +
+                            (root / "a/self-graph-bundle-manifest.json").stat().st_size)
+    elif budget == "pin":
+        monkeypatch.setattr(store, "_BUNDLE_PIN_BYTES", len("sealed-default"))
+    elif budget == "depth":
+        monkeypatch.setattr(store, "_BUNDLE_DIRECTORY_DEPTH", 2)
+        (root / "a").mkdir()
+    else:
+        monkeypatch.setattr(store, "_BUNDLE_DIRECTORY_HANDLES", 4)
+        (root / "a").mkdir()
+    assert "sealed-default" in store._bundle_referenced_snapshot_ids()
+    if budget in {"count", "total"}:
+        _bundle_manifest(root, "b", "another-sealed")
+    elif budget == "file":
+        _bundle_manifest(root, "a", body=default.read_bytes() + b" ")
+    elif budget == "pin":
+        _bundle_manifest(root, "a", "x" * (len("sealed-default") + 1))
+    else:
+        (root / "a/b").mkdir()
+    with pytest.raises(store._BundleInventoryIncomplete) as error:
+        store._bundle_referenced_snapshot_ids()
+    assert error.value.cause == cause
+    assert "sealed-default" in error.value.referenced_snapshot_ids
+    assert len(str(error.value)) < 200
+    selection = _bundle_selection(conn, monkeypatch)
+    _assert_bundle_incomplete(selection())
+
+
+def test_bundle_streaming_exact_manifest_count_and_utf8_pin_boundary(bundle_namespace):
+    root, default = bundle_namespace
+    for index in range(127):
+        _bundle_manifest(root, str(index), str(index))
+    result = store._bundle_referenced_snapshot_ids()
+    assert len(result) == 128
+    _bundle_manifest(root, "overflow")
+    with pytest.raises(store._BundleInventoryIncomplete) as error:
+        store._bundle_referenced_snapshot_ids()
+    assert error.value.cause == "manifest_count_exceeded"
+    assert len(error.value.referenced_snapshot_ids) == 128
+    # Exact UTF8 byte boundary, not character count or project-owner filtering.
+    for path in root.glob("*/self-graph-bundle-manifest.json"):
+        path.unlink()
+    default.write_text(json.dumps({"snapshot_id": "é" * 2048}), encoding="utf-8")
+    assert store._bundle_referenced_snapshot_ids() == {"é" * 2048}
+    default.write_text(json.dumps({"snapshot_id": "é" * 2049}), encoding="utf-8")
+    with pytest.raises(store._BundleInventoryIncomplete, match="pin_bytes_exceeded"):
+        store._bundle_referenced_snapshot_ids()
+
+
+@pytest.mark.parametrize("value,expected", [(42, {"42"}), ("  historical  ", {"historical"}),
+                                           (False, set()), (None, set())])
+def test_bundle_streaming_original_snapshot_id_conversion(bundle_namespace, value, expected):
+    _, default = bundle_namespace
+    default.write_text(json.dumps({"snapshot_id": value}))
+    assert store._bundle_referenced_snapshot_ids() == expected
+
+
+def test_bundle_streaming_partial_historical_positive_survives_later_bad_manifest(
+        conn, bundle_namespace, monkeypatch):
+    root, _ = bundle_namespace
+    selection = _bundle_selection(conn, monkeypatch)
+    _bundle_manifest(root, "", "sealed-historic")
+    _bundle_manifest(root, "broken", body=b"{")
+    original = os.scandir
+    root_ino = root.stat().st_ino
+    class Ordered:
+        def __enter__(self):
+            with original(root) as iterator:
+                children = sorted(iterator, key=lambda child: child.name !=
+                                  "self-graph-bundle-manifest.json")
+            self.iterator = iter(children)
+            return self
+        def __exit__(self, *_):
+            pass
+        def __iter__(self):
+            return self
+        def __next__(self):
+            return next(self.iterator)
+    monkeypatch.setattr(store.os, "scandir", lambda fd:
+                        Ordered() if isinstance(fd, int) and os.fstat(fd).st_ino == root_ino
+                        else original(fd))
+    _assert_bundle_incomplete(selection(), positives=("sealed-default", "sealed-historic"))
+
+
+def test_bundle_streaming_exact_file_and_total_byte_boundaries(bundle_namespace):
+    root, default = bundle_namespace
+    prefix = b'{"snapshot_id":"sealed-default","padding":"'
+    suffix = b'"}'
+    content = prefix + b"x" * (1048576 - len(prefix) - len(suffix)) + suffix
+    default.write_bytes(content)
+    # One MiB per file and sixteen MiB in aggregate, including default.
+    for index in range(15):
+        _bundle_manifest(root, str(index), body=content)
+    assert store._bundle_referenced_snapshot_ids() == {"sealed-default"}
+    _bundle_manifest(root, "total-overflow", body=b"{}")
+    with pytest.raises(store._BundleInventoryIncomplete, match="manifest_total_bytes_exceeded"):
+        store._bundle_referenced_snapshot_ids()
+    # Isolate the per-file ceiling from aggregate accounting.
+    for path in root.glob("*/self-graph-bundle-manifest.json"):
+        path.unlink()
+    default.write_bytes(content + b" ")
+    with pytest.raises(store._BundleInventoryIncomplete, match="manifest_file_bytes_exceeded"):
+        store._bundle_referenced_snapshot_ids()
+
+
+def test_bundle_streaming_optional_absent_namespace_preserves_default(
+        bundle_namespace, monkeypatch):
+    root, _ = bundle_namespace
+    monkeypatch.setattr(db, "_governance_root", lambda: root / "absent")
+    assert store._bundle_referenced_snapshot_ids() == {"sealed-default"}
+
+
+@pytest.mark.parametrize("failure", ["symlink", "replacement"])
+def test_bundle_streaming_default_parent_is_anchored_no_follow(
+        conn, bundle_namespace, monkeypatch, failure):
+    from agent.governance import self_graph_bundle_check
+    root, _ = bundle_namespace
+    selection = _bundle_selection(conn, monkeypatch)
+    parent = root / "package-resources"
+    parent.mkdir()
+    default = parent / "default.json"
+    default.write_text(json.dumps({"snapshot_id": "sealed-default"}))
+    monkeypatch.setattr(self_graph_bundle_check, "SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH", default)
+    if failure == "symlink":
+        parent.rename(root / "real-resources")
+        parent.symlink_to(root / "real-resources", target_is_directory=True)
+    else:
+        original = os.open
+        def replace_parent(name, *args, **kwargs):
+            if name == parent:
+                parent.rename(root / "old-resources")
+                parent.mkdir()
+                (parent / default.name).write_text(json.dumps({"snapshot_id": "replacement"}))
+            return original(name, *args, **kwargs)
+        monkeypatch.setattr(store.os, "open", replace_parent)
+    _assert_bundle_incomplete(selection(), positives=())

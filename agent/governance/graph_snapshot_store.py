@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import stat
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -1742,47 +1743,200 @@ def get_snapshot_retention_config(
     }
 
 
-def _bundle_referenced_snapshot_ids() -> set[str]:
-    """Return snapshot_ids that are referenced by plugin bundle manifests.
+_BUNDLE_INVENTORY_SECONDS = 10
+_BUNDLE_MANIFEST_COUNT = 128  # Includes the mandatory installed default.
+_BUNDLE_FILE_BYTES = 1048576
+_BUNDLE_TOTAL_BYTES = 16777216
+_BUNDLE_PIN_BYTES = 4096
+_BUNDLE_DIRECTORY_DEPTH = 128
+_BUNDLE_DIRECTORY_HANDLES = 128
 
-    These are treated as sealed full baselines and must never be deleted.
+
+class _BundleInventoryIncomplete(ValueError):
+    """Private bounded refusal that preserves already verified positive pins."""
+
+    def __init__(self, cause: str, referenced: set[str], entries: int):
+        self.cause = cause[:128]
+        self.referenced_snapshot_ids = frozenset(referenced)
+        self.entries_seen = entries
+        # One static cause; no unbounded paths, bodies, or diagnostic examples.
+        super().__init__("bundle_manifest_reference_unreadable:" + self.cause)
+
+
+def _bundle_referenced_snapshot_ids() -> set[str]:
+    """Stream the original bundle namespace, preserving all sealed baselines.
+
+    The deadline is cooperative, not cancellation of a blocked OS syscall.
+    Per-directory guards detect observed drift, not an atomic filesystem view.
     """
     from .self_graph_bundle_check import SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH
-    referenced: set[str] = set()
-    # Walk the installed package tree to locate bundle manifests
-    pkg_root = Path(__file__).resolve().parents[2]
-    candidates: list[Path] = [pkg_root / SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH]
-    # Also search shared-volume for other project bundle manifests if accessible
     from .db import _governance_root
-    groot = _governance_root()
-    if groot.exists():
-        if groot.is_symlink() or not groot.is_dir():
-            raise ValueError("bundle_manifest_inventory_unreadable")
-        def unreadable(exc: OSError) -> None:
-            raise ValueError("bundle_manifest_inventory_unreadable") from exc
-        seen = 0
-        for directory, subdirs, files in os.walk(groot, onerror=unreadable):
-            seen += len(subdirs) + len(files)
-            if seen > 100000 or any((Path(directory) / name).is_symlink() for name in subdirs):
-                raise ValueError("bundle_manifest_inventory_unbounded")
-            if "self-graph-bundle-manifest.json" in files:
-                candidates.append(Path(directory) / "self-graph-bundle-manifest.json")
-    for manifest_path in candidates:
-        if manifest_path.is_symlink():
-            raise ValueError("bundle_manifest_reference_unreadable")
-        if not manifest_path.exists():
-            if manifest_path == candidates[0]:
-                raise ValueError("bundle_manifest_reference_unavailable")
-            continue
+
+    referenced: set[str] = set()
+    entries = manifests = total_bytes = 0
+    deadline = time.monotonic() + _BUNDLE_INVENTORY_SECONDS
+
+    def refuse(cause: str) -> None:
+        raise _BundleInventoryIncomplete(cause, referenced, entries)
+
+    def checkpoint() -> None:
+        if time.monotonic() >= deadline:
+            refuse("deadline_exceeded")
+
+    def identity(info: os.stat_result) -> tuple[int, ...]:
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    def read_manifest(name: str | Path, parent_fd: int | None = None,
+                      expected: os.stat_result | None = None) -> None:
+        nonlocal manifests, total_bytes
+        checkpoint()
+        if manifests >= _BUNDLE_MANIFEST_COUNT:
+            refuse("manifest_count_exceeded")
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if expected is not None and identity(before) != identity(expected):
+            refuse("manifest_replaced")
+        if not stat.S_ISREG(before.st_mode):
+            refuse("manifest_not_regular")
+        if before.st_size > _BUNDLE_FILE_BYTES:
+            refuse("manifest_file_bytes_exceeded")
+        if total_bytes + before.st_size > _BUNDLE_TOTAL_BYTES:
+            refuse("manifest_total_bytes_exceeded")
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=parent_fd)
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(manifest, dict):
-                raise ValueError("bundle manifest is not an object")
-            sid = str(manifest.get("snapshot_id") or "").strip()
-            if sid:
-                referenced.add(sid)
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise ValueError("bundle_manifest_reference_unreadable") from exc
+            if identity(os.fstat(fd)) != identity(before):
+                refuse("manifest_replaced")
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                checkpoint()
+                chunk = os.read(fd, min(65536, _BUNDLE_FILE_BYTES + 1 - size))
+                checkpoint()
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > _BUNDLE_FILE_BYTES:
+                    refuse("manifest_file_bytes_exceeded")
+                if total_bytes + size > _BUNDLE_TOTAL_BYTES:
+                    refuse("manifest_total_bytes_exceeded")
+                chunks.append(chunk)
+            if (size != before.st_size or identity(os.fstat(fd)) != identity(before)
+                    or identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+                    != identity(before)):
+                refuse("manifest_changed")
+        finally:
+            os.close(fd)
+        checkpoint()
+        manifest = json.loads(b"".join(chunks).decode("utf-8"))
+        if not isinstance(manifest, dict):
+            refuse("manifest_not_object")
+        sid = str(manifest.get("snapshot_id") or "").strip()
+        if len(sid.encode("utf-8")) > _BUNDLE_PIN_BYTES:
+            refuse("pin_bytes_exceeded")
+        if sid:
+            referenced.add(sid)
+        manifests += 1
+        total_bytes += size
+        checkpoint()
+
+    def walk(name: str | Path, parent_fd: int | None, depth: int,
+             expected: os.stat_result | None = None) -> None:
+        nonlocal entries
+        checkpoint()
+        # scandir(fd) owns a duplicate fd while the anchor remains open.
+        if depth > _BUNDLE_DIRECTORY_DEPTH or 2 * depth > _BUNDLE_DIRECTORY_HANDLES:
+            refuse("directory_resources_exceeded")
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if expected is not None and identity(before) != identity(expected):
+            refuse("directory_replaced")
+        if not stat.S_ISDIR(before.st_mode):
+            refuse("directory_not_regular")
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                     dir_fd=parent_fd)
+        try:
+            if identity(os.fstat(fd)) != identity(before):
+                refuse("directory_replaced")
+            with os.scandir(fd) as children:
+                while True:
+                    checkpoint()
+                    child = next(children, None)
+                    checkpoint()
+                    if child is None:
+                        break
+                    entries += 1  # Diagnostic only; unrelated entry count is unlimited.
+                    info = child.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(info.st_mode):
+                        refuse("namespace_symlink")
+                    if child.name == "self-graph-bundle-manifest.json":
+                        read_manifest(child.name, fd, info)
+                    elif stat.S_ISDIR(info.st_mode):
+                        walk(child.name, fd, depth + 1, info)
+            checkpoint()
+            if (identity(os.fstat(fd)) != identity(before)
+                    or identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+                    != identity(before)):
+                refuse("directory_changed")
+        finally:
+            os.close(fd)
+        checkpoint()
+
+    def read_default() -> None:
+        # The package root is resolved; open each relative directory component
+        # without following links, retaining anchors until the default read ends.
+        pkg_root = Path(__file__).resolve().parents[2]
+        relative = Path(SELF_GRAPH_BUNDLE_MANIFEST_REL_PATH)
+        anchor = relative.parent if relative.is_absolute() else pkg_root
+        parts = (relative.name,) if relative.is_absolute() else relative.parts
+        opened: list[int] = []
+        guards: list[tuple[int | None, str | Path, os.stat_result, int]] = []
+        parent_fd = None
+        try:
+            for component in (anchor, *parts[:-1]):
+                checkpoint()
+                if len(opened) >= min(_BUNDLE_DIRECTORY_DEPTH, _BUNDLE_DIRECTORY_HANDLES):
+                    refuse("directory_resources_exceeded")
+                before = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(before.st_mode):
+                    refuse("directory_not_regular")
+                fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                             dir_fd=parent_fd)
+                opened.append(fd)
+                if identity(os.fstat(fd)) != identity(before):
+                    refuse("directory_replaced")
+                guards.append((parent_fd, component, before, fd))
+                parent_fd = fd
+                checkpoint()
+            read_manifest(parts[-1], parent_fd)
+            for parent, component, before, fd in reversed(guards):
+                checkpoint()
+                if (identity(os.fstat(fd)) != identity(before)
+                        or identity(os.stat(component, dir_fd=parent, follow_symlinks=False))
+                        != identity(before)):
+                    refuse("directory_changed")
+        finally:
+            for fd in reversed(opened):
+                os.close(fd)
+
+    try:
+        # Read this mandatory positive before encountering unrelated namespace work.
+        read_default()
+        groot = _governance_root()
+        checkpoint()
+        try:
+            root_before = os.stat(groot, follow_symlinks=False)
+        except FileNotFoundError:
+            # The old optional shared namespace may be absent; default is mandatory.
+            checkpoint()
+            return referenced
+        walk(groot, None, 1, root_before)
+        checkpoint()
+    except _BundleInventoryIncomplete:
+        raise
+    except (OSError, UnicodeError, ValueError, RecursionError, MemoryError) as exc:
+        cause = ("filesystem_unreadable" if isinstance(exc, OSError)
+                 else "manifest_decode_unreadable")
+        raise _BundleInventoryIncomplete(cause, referenced, entries) from exc
     return referenced
 
 
@@ -2463,8 +2617,9 @@ def select_snapshot_retention_candidates(
     # Rule 4: bundle-referenced snapshot ids
     try:
         bundle_refs = _bundle_referenced_snapshot_ids()
-    except (OSError, ValueError):
-        bundle_refs = set()
+    except (OSError, ValueError) as exc:
+        bundle_refs = (set(exc.referenced_snapshot_ids)
+                       if isinstance(exc, _BundleInventoryIncomplete) else set())
         reference_state["complete"] = False
         reference_state["refusal_reasons"].append("bundle_manifest_reference_unreadable")
     if extra_bundle_snapshot_ids:
