@@ -242763,3 +242763,173 @@ def test_coordinator_current_actual_http_bound_covers_unicode_and_late_additions
     assert json.loads(_coordinator_current_http_bytes(late))["error"] == (
         "coordinator_current_wire_unbounded"
     )
+
+
+@pytest.mark.parametrize("adapter", ["runtime", "governance"])
+@pytest.mark.parametrize("shape, command_count", [("inline", 8), ("large_action", 160), ("total_overflow", 120)])
+def test_authenticated_attestation_guide_materializes_governed_worker_identity(
+    conn, tmp_path, monkeypatch, adapter, shape, command_count,
+):
+    """Actual persisted Guide producer through the unchanged managed host.
+
+    All governance facts live in the isolated API fixture. The final canonical
+    POST is mocked; this is ordinary source integration, not native evidence.
+    """
+    from urllib.parse import parse_qs, urlsplit
+    from agent.governance import mcp_server as governance_mcp_server
+    from agent.mcp.host_envelope_continuity import ManagedHostEnvelopeContinuity
+    from agent.mcp.tools import ToolDispatcher
+
+    task = "attestation-identity-worker"
+    backlog = "AC-ATTESTATION-IDENTITY-FIXTURE"
+    token, fence = "fixture-attestation-token", "fixture-attestation-fence"
+    root = tmp_path / task
+    owned_file = "agent/governance/server.py"
+    base, head = _source_backed_worker_git_fixture(root, owned_file)
+    test_results = {"status": "passed", "passed": True, "commands": [
+        {"command": f"python -m pytest agent/tests/test_attestation_identity.py::test_current_guide_{index}",
+         "status": "passed"} for index in range(command_count)
+    ]}
+    # This existing authority helper accepts its optional prepared receipt via
+    # the test module; no live prepare or external governance state is used.
+    monkeypatch.setattr(sys.modules[__name__], "prepared", {}, raising=False)
+    execution, context, runtime, _session = _record_source_backed_worker_authority(
+        server, conn, backlog_id=backlog, worker_task_id=task,
+        worker_token=token, worker_fence=fence,
+        graph_trace_id="gqt-attestation-identity", owned_file=owned_file,
+        worker_root=root, base_commit=base, worker_commit=head, test_results=test_results,
+    )
+    context = upsert_branch_context(conn, replace(
+        context, agent_id=context.worker_id, allocation_owner=context.worker_id,
+        actual_host_worker_id=context.worker_id,
+        host_startup_id=f"startup-{task}", host_session_id=f"session-{task}",
+        lease_id=f"lease-{task}", lease_expires_at="2999-01-01T00:00:00Z",
+    ))
+    conn.commit()
+    route = {
+        "route_id": f"route-{task}", "route_context_hash": f"sha256:route-{task}",
+        "prompt_contract_id": f"rprompt-{task}", "prompt_contract_hash": f"sha256:prompt-{task}",
+        "route_token_ref": f"rtok-{task}", "visible_injection_manifest_hash": f"sha256:visible-{task}",
+    }
+    append_branch_contract_revision(
+        conn, context, contract_version="mf_parallel.v2",
+        payload={"schema_version": "parallel_branch_allocate_contract_revision.v1",
+                 "source": "parallel_branch_allocate", "source_of_truth": "Contract/Revision/Event",
+                 "contract_execution_id": execution, "successor_contract_execution_id": execution,
+                 "runtime_context_id": context.runtime_context_id, "route_identity": route},
+        route_gate={"schema_version": "parallel_branch_allocate_route_gate.v1",
+                    "allowed_action": "parallel_branch_allocate", "caller_role": "observer",
+                    "decision": "allocated", "source": "parallel_branch_allocate", **route},
+        route_identity=route, route_evidence_type="parallel_branch_allocate",
+        actor="parallel_branch_allocate", now_iso="2099-01-01T00:00:00Z",
+    )
+    conn.commit()
+    identity = {
+        "project_id": PID, "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id, "parent_task_id": context.parent_task_id,
+        "contract_execution_id": execution,
+        "target_project_root": context.target_project_root,
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id or context.worker_id, **route,
+    }
+    original_bounded = server._runtime_context_server_bounded_worker_guide_response
+    def measured_bounded(source, **kwargs):
+        try:
+            return original_bounded(source, **kwargs)
+        except GovernanceError as exc:
+            print("PRODUCER_TOTAL_REFUSAL", exc.code, json.dumps(exc.details, sort_keys=True))
+            raise
+    monkeypatch.setattr(server, "_runtime_context_server_bounded_worker_guide_response", measured_bounded)
+    original_continuation = server._runtime_context_worker_guide_action_continuation
+    def measured_continuation(source, **kwargs):
+        stage = server._runtime_context_worker_guide_current_stage(source)
+        action = source.get("canonical_executable_action") or (source.get("canonical_executable_actions") or {}).get(stage) or {}
+        print("PRODUCER", stage, len(json.dumps(action, sort_keys=True, separators=(",", ":"), default=str).encode()),
+              "worker", source.get("worker_id"), source.get("worker_slot_id"))
+        return original_continuation(source, **kwargs)
+    monkeypatch.setattr(server, "_runtime_context_worker_guide_action_continuation", measured_continuation)
+    calls, pages = [], []
+    def api(method, path, body=None, **_kwargs):
+        calls.append((method, path, copy.deepcopy(body)))
+        if method == "GET":
+            query = {key: values[0] for key, values in parse_qs(urlsplit(path).query).items()}
+            # The adapters do not forward caller allocation IDs. The producer
+            # must recover them from the authenticated persisted context.
+            assert "worker_id" not in query and "worker_slot_id" not in query
+            result = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+                _ctx_with_role({"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                               "mf_sub", query=query)
+            )
+            pages.append(copy.deepcopy(result))
+            return result
+        assert path.endswith("/finish-time-worker-attestation")
+        assert body["session_token"] == token and body["fence_token"] == fence
+        action = json.loads("".join(page["fragment"] for page in pages[1:]))
+        expected = copy.deepcopy(action["copy_safe_body"])
+        expected.update({"session_token": token, "fence_token": fence})
+        # Both existing HTTP adapters encode project identity in the URL.
+        assert path.startswith(f"/api/graph-governance/{expected.pop('project_id')}/")
+        expected["worker_guide_action_precondition"] = body["worker_guide_action_precondition"]
+        assert body == expected
+        precondition = body["worker_guide_action_precondition"]
+        assert precondition["identity"]["worker_id"] == context.worker_id
+        assert precondition["selected_line_id"] == "worker_finish_time_attestation"
+        before = conn.total_changes
+        server._runtime_context_require_materialized_action_current(
+            conn, project_id=PID, context=context, precondition=precondition,
+            mcp_tool="runtime_context_finish_time_worker_attestation",
+        )
+        assert conn.total_changes == before
+        return {"ok": True, "status": "accepted_fixture_mock"}
+
+    if adapter == "runtime":
+        dispatcher = ToolDispatcher(api_fn=lambda *_args: None, worker_pool=None)
+        monkeypatch.setattr(dispatcher, "_governance_api_with_timeout", api)
+        monkeypatch.setattr(dispatcher, "_api", api)
+        continuity, dispatch = dispatcher._host_envelope_continuity, dispatcher.dispatch
+    else:
+        continuity = ManagedHostEnvelopeContinuity()
+        monkeypatch.setattr(governance_mcp_server, "_HOST_ENVELOPE_CONTINUITY", continuity)
+        monkeypatch.setattr(governance_mcp_server, "_http", api)
+        dispatch = governance_mcp_server._dispatch_tool
+    issuance = continuity.dispatch("runtime_context_session_token_rejoin", identity, lambda _args: {
+        "ok": True, "status": "session_token_rejoined", "delivery": "worker_host_envelope",
+        **identity, "session_token": token, "fence_token": fence,
+        "host_envelope": {**identity, "env": {
+            "AMING_WORKER_SESSION_TOKEN": token, "AMING_WORKER_FENCE_TOKEN": fence}},
+    })
+    assert issuance.get("auth_loaded") is True, issuance
+    header = dispatch("runtime_context_worker_guide", identity)
+    assert header["ok"] is True, header
+    print("GUIDE_TOTAL", header.get("serialized_bytes"), header.get("response_view"))
+    if shape == "inline":
+        assert "action_continuation" not in header
+        assert header["canonical_executable_action"]["mcp_tool"] == "runtime_context_finish_time_worker_attestation"
+        assert header["serialized_bytes"] <= 32768
+        assert len(calls) == 1 and calls[0][0] == "GET"
+        return
+    assert "action_continuation" in header, header
+    manifest = header["action_continuation"]
+    assert manifest["identity"]["worker_id"] == context.worker_id
+    assert manifest["identity"]["worker_slot_id"] == context.worker_slot_id
+    print("MANIFEST", manifest["action_bytes"], manifest["page_count"], manifest["action_hash"])
+    assert manifest["stage_id"] == "attestation"
+    assert manifest["page_count"] == (4 if shape == "large_action" else 3), manifest
+    ref = manifest["detail_ref"]
+    public = [header]
+    for index in range(manifest["page_count"]):
+        public.append(dispatch("runtime_context_worker_guide", {
+            **identity, "detail_ref": ref, "detail_cursor": f"action:{index}"}))
+        assert public[-1]["ok"] is True, public[-1]
+        assert public[-1]["serialized_bytes"] <= 32768
+    assert public[-1]["managed_action_materialized"] is True
+    assert len(calls) == manifest["page_count"] + 1 and all(call[0] == "GET" for call in calls)
+    decoded = json.loads("".join(page["fragment"] for page in pages[1:]))
+    canonical_identity = {key: value for key, value in identity.items()
+                          if key in decoded["copy_safe_body"]}
+    public.append(dispatch("runtime_context_finish_time_worker_attestation", {
+        **canonical_identity, "action_continuation_ref": ref}))
+    assert public[-1] == {"ok": True, "status": "accepted_fixture_mock"}, json.dumps(public[-1], sort_keys=True)
+    assert sum(call[0] == "POST" for call in calls) == 1
+    assert token not in json.dumps(public) and fence not in json.dumps(public)

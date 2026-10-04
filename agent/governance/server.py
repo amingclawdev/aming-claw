@@ -42515,6 +42515,7 @@ def _runtime_context_require_materialized_action_current(
 
 def _runtime_context_worker_guide_action_continuation(
     source: Mapping[str, Any], *, detail_ref: str = "", detail_cursor: str = "",
+    force_paging: bool = False,
 ) -> dict[str, Any] | None:
     """Page the complete source-owned action before any compact-body omission.
 
@@ -42531,7 +42532,7 @@ def _runtime_context_worker_guide_action_continuation(
         return None
     action = _runtime_context_worker_guide_public_action(action)
     encoded = json.dumps(action, sort_keys=True, separators=(",", ":"), default=str)
-    if len(encoded.encode("utf-8")) <= _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES:
+    if not force_paging and len(encoded.encode("utf-8")) <= _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES:
         return None
     # Bounded host storage; do not raise the managed response limit.
     if len(encoded) > 1_048_576:
@@ -42548,6 +42549,7 @@ def _runtime_context_worker_guide_action_continuation(
     # Full action hash already binds all semantic fields. These source pins
     # distinguish identical actions selected from different canonical states.
     state = source.get("contract_runtime_current_state") or {}
+    next_action = source.get("contract_runtime_next_legal_action") or {}
     source_refs = source.get("source_refs") or {}
     pins = {
         "contract_revision_id": source_refs.get("contract_revision_id") or "",
@@ -42560,7 +42562,7 @@ def _runtime_context_worker_guide_action_continuation(
         "schema_version": "runtime_context.worker_action_continuation.v1",
         "identity": identity, "source_state": pins,
         "mcp_tool": action["mcp_tool"], "stage_id": stage,
-        "selected_line_id": action.get("line_id") or body.get("line_id") or "",
+        "selected_line_id": action.get("line_id") or body.get("line_id") or next_action.get("line_id") or "",
         "action_hash": _stable_public_hash(action),
         "action_bytes": len(encoded.encode("utf-8")),
         "fragment_chars": 8192, "page_count": len(fragments),
@@ -43772,6 +43774,8 @@ def _runtime_context_worker_guide_early_compact_response(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
         "contract_execution_id": contract_execution_id,
         "target_project_root": target_project_root,
         "project_root": target_project_root,
@@ -43869,26 +43873,45 @@ def _runtime_context_worker_guide_early_compact_response(
     )
     if transport is not None:
         return transport
-    compact = _runtime_context_worker_guide_compact_response(bounded_source)
-    compact["builder"] = "bounded_current_authority"
-    compact["full_worker_guide_builder_called"] = False
-    compact["full_runtime_projection_called"] = False
-    compact["position_bounded"] = position_bounded
-    compact["position_stage"] = contract_stage
-    compact["recovery_forest_called"] = not position_bounded
-    compact["role_scope"] = role
-    compact["serialized_bytes"] = (
-        _runtime_context_worker_guide_serialized_bytes(compact)
-    )
-    if (
-        compact["serialized_bytes"]
-        > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
-    ):
-        return _runtime_context_server_bounded_worker_guide_response(
-            compact,
-            requested_view="compact",
+    try:
+        compact = _runtime_context_worker_guide_compact_response(bounded_source)
+        compact["builder"] = "bounded_current_authority"
+        compact["full_worker_guide_builder_called"] = False
+        compact["full_runtime_projection_called"] = False
+        compact["position_bounded"] = position_bounded
+        compact["position_stage"] = contract_stage
+        compact["recovery_forest_called"] = not position_bounded
+        compact["role_scope"] = role
+        compact["serialized_bytes"] = (
+            _runtime_context_worker_guide_serialized_bytes(compact)
         )
-    return compact
+        if (
+            compact["serialized_bytes"]
+            > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+        ):
+            return _runtime_context_server_bounded_worker_guide_response(
+                compact,
+                requested_view="compact",
+            )
+        return compact
+    except GovernanceError as exc:
+        # A small action can still overflow the final authority package.
+        # Page the original action, before any compact-body projection, only
+        # after the ordinary final-total bound has actually refused it.
+        if (
+            exc.code == "runtime_context_worker_guide_compact_response_too_large"
+            and exc.details.get("serialized_bytes", 0)
+            > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+            and "current_action_serialized_bytes" not in exc.details
+        ):
+            transport = _runtime_context_worker_guide_action_continuation(
+                bounded_source, force_paging=True,
+                detail_ref=str(ctx.query.get("detail_ref") or ""),
+                detail_cursor=str(ctx.query.get("detail_cursor") or ""),
+            )
+            if transport is not None:
+                return transport
+        raise
 
 
 def _runtime_context_position_bounded_current_state_response(
