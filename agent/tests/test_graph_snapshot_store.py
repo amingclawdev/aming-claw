@@ -6828,3 +6828,84 @@ def test_owner_census_known_empty_and_nonempty_inventory(conn, json_owner, known
     assert set(state["protected"]) == set(state["current_use"]) == set(state["durable_references"]) == expected
     assert changes == conn.total_changes
     assert image == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+@pytest.mark.parametrize("body,pins,complete", [
+    ("ordinary Markdown z-pin a-pin", ["a-pin", "z-pin"], 1),
+    ("ordinary Markdown without any reference", [], 1),
+    ("plain \\u0073napshot a-pin", ["a-pin"], 0),
+    ('{"snapshot_ids":["external"],"serialized":"{\\"snapshot_id\\":\\"a-pin\\"}"}',
+     ["a-pin", "external"], 1),
+    ('"a-pin"', ["a-pin"], 1),
+    ('{bad a-pin', None, 0),
+    (sqlite3.Binary(b"ordinary a-pin"), None, 0),
+    ("ordinary\x00a-pin", None, 0),
+])
+def test_markdown_reference_projection_preserves_plain_and_structured_outputs(conn, body, pins, complete):
+    conn.execute("CREATE TABLE markdown_projection(body)")
+    conn.execute("INSERT INTO markdown_projection VALUES (?)", (body,))
+    # Deliberately unsorted aliases verify stable DISTINCT pin ordering.
+    tokens = [("z-pin", "z-pin"), ("a-pin", "a-pin"), ("a-pin", "alias")]
+    projection = ",".join(store._owner_reference_projection("body", tokens, json_owner=False))
+    result = conn.execute("SELECT " + projection + " FROM markdown_projection").fetchone()
+    assert (json.loads(result[0]) if result[0] is not None else None) == pins
+    assert result[1] == complete
+
+
+@pytest.mark.parametrize("tokens", [[], [("a-pin", "a-pin")]])
+def test_markdown_reference_projection_empty_and_whitespace_are_complete(conn, tokens):
+    conn.execute("CREATE TABLE markdown_projection(body TEXT)")
+    conn.executemany("INSERT INTO markdown_projection VALUES (?)", [("",), ("  \n ",)])
+    projection = ",".join(store._owner_reference_projection("body", tokens, json_owner=False))
+    assert [tuple(row) for row in conn.execute("SELECT " + projection + " FROM markdown_projection")] == [
+        ("[]", 1), ("[]", 1)]
+
+
+def test_markdown_reference_projection_materializes_one_bounded_token_pass(conn):
+    tokens = [(f"snapshot-{i:03}", f"snapshot-{i:03}") for i in range(200)]
+    body = "Ordinary owner paragraph. " * 1200 + "snapshot-099"
+    conn.execute("CREATE TABLE markdown_projection(body TEXT)")
+    conn.executemany("INSERT INTO markdown_projection VALUES (?)", [(body,)] * 96)
+    projection = ",".join(store._owner_reference_projection("body", tokens, json_owner=False))
+    steps = 0
+    started = time.monotonic()
+    def budget():
+        nonlocal steps
+        steps += 1000
+        return int(steps >= 250_000 or time.monotonic() - started >= 5)
+    conn.set_progress_handler(budget, 1000)
+    try:
+        rows = conn.execute("SELECT " + projection + " FROM markdown_projection").fetchall()
+    finally:
+        conn.set_progress_handler(None, 0)
+    assert steps < 250_000
+    assert [tuple(row) for row in rows] == [('["snapshot-099"]', 1)] * 96
+
+
+def test_markdown_retention_selection_keeps_typed_current_durable_and_bundle_pins(conn, bundle_namespace):
+    _typed_reference_setup(conn, count=2)
+    conn.execute("UPDATE contract_runtime_executions SET record_json=? WHERE contract_execution_id='cex-000'",
+                 (json.dumps({"runtime_guide": {"next_legal_action": None}, "snapshot_id": "scope-durable"}),))
+    conn.execute("UPDATE contract_runtime_executions SET record_json=? WHERE contract_execution_id='cex-001'",
+                 (json.dumps({"runtime_guide": {"next_legal_action": False}, "snapshot_id": "scope-current"}),))
+    conn.executemany("INSERT INTO backlog_bugs(bug_id,details_md,created_at,updated_at) "
+                     "VALUES (?,?,'now','now')", [
+        ("markdown-owner", "Ordinary Markdown " * 1200 + "scope-durable"),
+        ("serialized-owner", json.dumps({"serialized": json.dumps({"snapshot_ids": ["scope-current"]})})),
+    ])
+    conn.executemany("INSERT INTO graph_query_traces VALUES (?,?,?)", [(PID, "scope-current", "scope-durable")] * 70)
+    conn.commit()
+    image = hashlib.sha256(conn.serialize()).hexdigest()
+    changes = conn.total_changes
+    state = store.snapshot_retention_reference_state(conn, PID)
+    selection = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0, measure_sizes=False)
+    assert state["complete"] is True and selection["reference_authority_complete"] is True
+    assert state["census"]["contract_rows"] == {"current": 1, "completed": 1}
+    assert {"scope-current", "scope-durable"} <= state["current_use"].keys()
+    assert {"scope-current", "scope-durable"} <= state["durable_references"].keys()
+    selected = {row["snapshot_id"]: row["reasons"] for row in selection["protected"]}
+    assert "bundle_manifest_reference" in selected["sealed-default"]
+    assert {"scope-current", "scope-durable"} <= selected.keys()
+    assert "durable_backlog_bugs_payload_reference" in selected["scope-durable"]
+    assert selection["candidates"] == [] and selection["global_refusal_reasons"] == []
+    assert changes == conn.total_changes and image == hashlib.sha256(conn.serialize()).hexdigest()

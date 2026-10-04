@@ -2152,6 +2152,21 @@ def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
         "AND (NOT json_valid(atom) OR depth=8) THEN 1 "
         "WHEN type='text' AND NOT json_valid(atom) AND instr(atom,char(92)||'u')>0 "
         "THEN 1 ELSE 0 END),0)=1 THEN 0 ELSE 1 END FROM parented) ELSE 0 END")
+    if not json_owner:
+        # Non-JSON Markdown becomes one root text atom after json_quote. Its
+        # raw and decoded token matches are identical, with no keys, array
+        # children or serialized documents to traverse. Materialize the pins
+        # once so the byte guard does not repeat every substring scan.
+        plain = f"{valid} AND NOT json_valid({column})"
+        direct = ("(SELECT json_group_array(sid) FROM (SELECT DISTINCT column1 AS sid "
+            f"FROM ({token_cte}) tokens WHERE instr({column},tokens.column2)>0 "
+            "AND column1!='' ORDER BY sid))")
+        projection = (f"CASE WHEN {plain} THEN (WITH projected AS MATERIALIZED "
+            f"(SELECT {direct} AS pin_json) SELECT CASE WHEN "
+            f"length(CAST(pin_json AS BLOB))<={_REFERENCE_MAX_BYTES} THEN pin_json "
+            f"ELSE NULL END FROM projected) ELSE {projection} END")
+        complete = (f"CASE WHEN {plain} THEN CASE WHEN "
+            f"instr({column},char(92)||'u')>0 THEN 0 ELSE 1 END ELSE {complete} END")
     return projection, complete
 
 
