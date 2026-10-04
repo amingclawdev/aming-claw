@@ -6923,7 +6923,7 @@ def test_owner_census_known_empty_and_nonempty_inventory(conn, json_owner, known
     ('{"snapshot_ids":["external"],"serialized":"{\\"snapshot_id\\":\\"a-pin\\"}"}',
      ["a-pin", "external"], 1),
     ('"a-pin"', ["a-pin"], 1),
-    ('{bad a-pin', None, 0),
+    ('{bad a-pin', ["a-pin"], 1),
     (sqlite3.Binary(b"ordinary a-pin"), None, 0),
     ("ordinary\x00a-pin", None, 0),
 ])
@@ -7100,7 +7100,8 @@ def test_owned_census_small_legacy_outputs_and_borrowed_callback(conn, bundle_na
 
 
 @pytest.mark.parametrize('mode', ['sql', 'python'])
-def test_owned_census_budget_keeps_prefix_pins_and_restores(mode, monkeypatch, bundle_namespace):
+def test_owned_census_budget_keeps_prefix_pins_and_restores(mode, monkeypatch, bundle_namespace, caplog):
+    caplog.set_level('INFO', logger=store.__name__)
     clock = [0.0]
     monkeypatch.setattr(store.time, 'monotonic', lambda: clock[0])
     sql_interrupts = []
@@ -7146,6 +7147,11 @@ def test_owned_census_budget_keeps_prefix_pins_and_restores(mode, monkeypatch, b
         assert {'scope-current', 'scope-durable'} <= state['protected'].keys()
         assert connection.execute('PRAGMA busy_timeout').fetchone()[0] == 9000
         assert not provider.active and not connection.in_transaction
+        diagnostics = [json.loads(r.message.split("reference_census_diagnostic ", 1)[1])
+                       for r in caplog.records if "reference_census_diagnostic " in r.message]
+        assert len(diagnostics) == 1 and diagnostics[0]["cause"] == "budget_exhausted"
+        assert diagnostics[0]["mode"] == mode
+        assert diagnostics[0]["phase"] == ("page" if mode == "sql" else "field")
         deadline = provider.deadline
         selected = store.select_snapshot_retention_candidates(connection, PID, measure_sizes=False)
         assert selected['candidates'] == [] and not selected['reference_authority_complete']
@@ -7263,3 +7269,172 @@ def test_owned_census_unsupported_cursor_and_concurrent_commit_are_incomplete(tm
         state = store.snapshot_retention_reference_state(connection, PID)
         assert not state['complete'] and any('cursor_unsupported:unsupported_owner' in r for r in state['refusal_reasons'])
         assert {'scope-current', 'scope-durable'} <= state['protected'].keys()
+
+
+def test_census_literal_bracket_title_and_nested_audit_text_keep_late_pins(conn, bundle_namespace):
+    _typed_reference_setup(conn, count=1)
+    evidence = '{ordinary audit scope-current; not serialized JSON}'
+    audit = {'audit_archive': {'audit_close_gate': {'evidence': [evidence]},
+                              'evidence': {'audit_close_gate': {'evidence': [evidence]}}},
+             'late_snapshot_id': 'outside-late-pin',
+             'serialized': json.dumps({'note': 'scope-durable'}).replace('scope-', 'scope\\u002d')}
+    conn.execute('INSERT INTO backlog_bugs(bug_id,title,takeover_json,details_md,created_at,updated_at) VALUES (?,?,?,?,?,?)',
+                 ('literal', '[ordinary title] scope-current', json.dumps(audit), '{ordinary Markdown scope-durable', 'now', 'now'))
+    conn.commit()
+    before = hashlib.sha256(conn.serialize()).hexdigest()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state['complete'], state['refusal_reasons']
+    assert {'scope-current', 'scope-durable', 'outside-late-pin'} <= state['protected'].keys()
+    assert {'scope-current', 'scope-durable', 'outside-late-pin'} <= state['current_use'].keys()
+    assert state['protected'] == state['durable_references']
+    assert before == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+@pytest.mark.parametrize('payload', ['{declared broken scope-current', 'not-json scope-current',
+    json.dumps({'serialized': '{declared broken scope-current'}),
+    json.dumps({'note': '{opaque \\u0073cope-current'}),
+    json.dumps({'note': 'scope-current\x00unknown'}), sqlite3.Binary(b'{scope-current}')])
+def test_census_declared_json_and_unknown_text_remain_incomplete(payload, conn, bundle_namespace):
+    _typed_reference_setup(conn, count=0)
+    conn.execute("INSERT INTO backlog_bugs(bug_id,takeover_json,created_at,updated_at) VALUES (?, ?,'now','now')", ('fixture', payload)); conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state['complete'] and 'backlog_bugs_payload_unreadable' in state['refusal_reasons']
+    if isinstance(payload, str) and 'scope-current' in payload:
+        assert 'scope-current' in state['protected']
+
+
+def test_reference_page_exact_body_memo_preserves_physical_rows_and_storage(conn, monkeypatch):
+    # An unknown owner may use internal-looking names; no alias may shadow it.
+    conn.execute('CREATE TABLE memo_fixture(project_id TEXT,body TEXT COLLATE NOCASE,storage TEXT,'
+                 'exact_body TEXT,v0 TEXT,census_cursor TEXT,__ac_reference_cursor TEXT)')
+    rowids = [-9, 0] + list(range(3, 78))
+    values = ['{"snapshot_id":"upper"}', '{"snapshot_id":"UPPER"}',
+              '{"snapshot_ids":["extra"],"note":"known"}', None, sqlite3.Binary(b'known')]
+    conn.executemany('INSERT INTO memo_fixture(rowid,project_id,body,storage,exact_body,v0,census_cursor,__ac_reference_cursor) '
+                    'VALUES (?,?,?,\'literal\',\'bytes\',\'v\',\'cursor\',\'shadow\')',
+                    [(rid, PID, values[i % len(values)]) for i, rid in enumerate(rowids)])
+    conn.execute("INSERT INTO memo_fixture(rowid,project_id,body) VALUES (1,'foreign','foreign')");conn.commit()
+    image = hashlib.sha256(conn.serialize()).hexdigest()
+    with store._owned_reference_connection(lambda: conn):
+        with store._reference_budget(conn).census(), store._reference_read_snapshot(conn):
+            for tokens in [[], [('known', 'known')]]:
+                for mode in [True, False]:
+                    expressions = store._owner_reference_projection('body', tokens, json_owner=mode)
+                    projection = 'storage,exact_body,v0,census_cursor,__ac_reference_cursor,typeof(body),length(CAST(body AS BLOB)),__reference_memo_0_0__,__reference_memo_0_1__'
+                    memo = list(store._reference_pages(conn, 'memo_fixture', projection, 'project_id=?', (PID,), reusable={'body': expressions}))
+                    with monkeypatch.context() as m:
+                        m.setattr(store, '_reference_memo_page', lambda *args: None)
+                        ordinary = list(store._reference_pages(conn, 'memo_fixture', projection, 'project_id=?', (PID,), reusable={'body': expressions}))
+                    assert [tuple(r) for r in memo] == [tuple(r) for r in ordinary]
+                    assert [r[0] for r in memo] == rowids
+                    assert json.loads(memo[0][-2]) == ['upper'] and json.loads(memo[1][-2]) == ['UPPER']
+        assert image == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+def test_reference_page_memo_memory_fallback_is_lossless(conn, monkeypatch):
+    conn.execute('CREATE TABLE memo_fixture(body TEXT)')
+    conn.executemany('INSERT INTO memo_fixture VALUES (?)', [('same known',)] * 65)
+    conn.commit()
+    expressions = store._owner_reference_projection('body', [('known', 'known')], json_owner=False)
+    projection = '__reference_memo_0_0__,__reference_memo_0_1__'
+    cached = [tuple(r) for r in store._reference_pages(conn, 'memo_fixture', projection, reusable={'body': expressions})]
+    monkeypatch.setattr(store, '_REFERENCE_MEMO_BYTES', 1)
+    ordinary = [tuple(r) for r in store._reference_pages(conn, 'memo_fixture', projection, reusable={'body': expressions})]
+    assert ordinary == cached and len(ordinary) == 65
+
+
+def test_census_diagnostics_bounded_private_and_plan_stable(conn, bundle_namespace, caplog, monkeypatch):
+    from agent.governance import stale_artifact_cleanup
+    _typed_reference_setup(conn, count=0)
+    conn.executemany("INSERT INTO backlog_bugs(bug_id,takeover_json,created_at,updated_at) VALUES (?, ?, 'now','now')",
+                     [(str(i), '{private secret-body /private/path authorization-token') for i in range(12)])
+    conn.commit()
+    image = hashlib.sha256(conn.serialize()).hexdigest()
+    first = store.snapshot_retention_reference_state(conn, PID)
+    caplog.set_level('INFO', logger=store.__name__)
+    with store._owned_reference_connection(lambda: conn, diagnostic_request_id='req-private-diagnostic'):
+        second = store.snapshot_retention_reference_state(conn, PID)
+        assert first['protected'] == second['protected'] and first['refusal_reasons'] == second['refusal_reasons']
+        assert len(caplog.records) == store._REFERENCE_DIAGNOSTICS - 1
+        logs = '\n'.join(r.message for r in caplog.records)
+        assert 'req-private-diagnostic' in logs and 'bounded_decoder_incomplete' in logs
+        assert all(value not in logs for value in ['secret-body', '/private/path', 'authorization-token', 'SELECT '])
+        assert image == hashlib.sha256(conn.serialize()).hexdigest()
+        # Logging never adds a volatile field to the selection or apply hash.
+        caplog.clear()
+        with monkeypatch.context() as m:
+            m.setattr(store, '_reference_diagnostic', lambda *args, **kwargs: None)
+            selection = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0, measure_sizes=False)
+        repeat = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0, measure_sizes=False)
+        assert selection == repeat
+        assert stale_artifact_cleanup._plan_hash(PID, 'graph_snapshot', selection['candidates']) == stale_artifact_cleanup._plan_hash(PID, 'graph_snapshot', repeat['candidates'])
+
+
+def test_census_bundle_diagnostic_preserves_positive_refusal_and_no_paths(conn, bundle_namespace, monkeypatch, caplog):
+    _typed_reference_setup(conn, count=0)
+    caplog.set_level('INFO', logger=store.__name__)
+    def unavailable():
+        raise store._BundleInventoryIncomplete('directory_changed', {'scope-durable'}, 118669)
+    monkeypatch.setattr(store, '_bundle_referenced_snapshot_ids', unavailable)
+    with store._owned_reference_connection(lambda: conn, diagnostic_request_id='/private/request/token'):
+        result = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0, measure_sizes=False)
+        assert not result['reference_authority_complete'] and result['candidates'] == []
+        assert any(r['snapshot_id'] == 'scope-durable' and 'bundle_manifest_reference' in r['reasons'] for r in result['protected'])
+        assert result['global_refusal_reasons'] == ['bundle_manifest_reference_unreadable']
+        record = json.loads(caplog.records[-1].message.split('reference_census_diagnostic ', 1)[1])
+        assert record == {'cause': 'directory_changed', 'phase': 'bundle', 'entries': 118669,
+            'request_id': 'sha256:' + hashlib.sha256(b'/private/request/token').hexdigest()}
+        assert '/private/' not in caplog.text
+
+
+def test_nested_serialized_depth_still_refuses_sql_and_python(conn):
+    nested = json.dumps({'snapshot_id': 'scope-current'})
+    for _ in range(10):
+        nested = json.dumps({'serialized': nested})
+    conn.execute('CREATE TABLE nested_fixture(contract_execution_id TEXT,record_json TEXT)')
+    conn.execute('INSERT INTO nested_fixture VALUES (?,?)', ('fixture',
+        json.dumps({'runtime_guide': {'next_legal_action': False}, 'serialized': nested})))
+    contract = conn.execute('SELECT ' + store._contract_reference_projection([('scope-current', 'scope-current')]) + ' FROM nested_fixture').fetchone()
+    pins, complete = conn.execute('SELECT ' + ','.join(store._owner_reference_projection(
+        'record_json', [('scope-current', 'scope-current')], json_owner=True)) + ' FROM nested_fixture').fetchone()
+    assert contract[-1] == complete == 0
+    assert json.loads(contract[-2]) == json.loads(pins) == ['scope-current']
+    with pytest.raises(ValueError, match='reference_decoding_incomplete'):
+        store._bounded_decoded_reference_pins(json.loads(nested), [('scope-current', 'scope-current')])
+
+
+def test_memoized_contract_page_budget_retains_completed_prefix(monkeypatch, bundle_namespace):
+    clock = [0.0]
+    monkeypatch.setattr(store.time, 'monotonic', lambda: clock[0])
+    class Timed(sqlite3.Connection):
+        def execute(self, query, args=()):
+            if query.startswith('WITH page_source') and 'contract_runtime_executions' in query and '_rowid_>?' in query:
+                clock[0] = 26.0
+            return super().execute(query, args)
+    connection = _complete_owner_fixture(factory=Timed)
+    for i in range(70):
+        payload = json.dumps({'runtime_guide': {'next_legal_action': None}, 'note': 'scope-durable'})
+        connection.execute('INSERT INTO contract_runtime_executions '
+            '(contract_execution_id,project_id,backlog_id,contract_id,version,revision,execution_state_revision,record_json,created_at,updated_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?)', (f'execution-{i}', PID, 'backlog', 'contract', '1', '1', 1, payload, 'now', 'now'))
+    connection.commit()
+    with store._owned_reference_connection(lambda: connection):
+        result = store.snapshot_retention_reference_state(connection, PID)
+        assert not result['complete'] and store._reference_budget(connection).exhausted
+        assert result['census']['contract_rows'] == {'completed': 64, 'current': 0}
+        assert 'scope-durable' in result['durable_references']
+        assert 'scope-durable' not in result['current_use']
+        assert 'reference_census_budget_exhausted' in result['refusal_reasons']
+        assert not connection.in_transaction and not store._reference_budget(connection).active
+
+
+@pytest.mark.parametrize('cap', [1, 8 * 1024 * 1024])
+def test_reference_memo_template_preserves_marker_like_tokens_and_columns(conn, monkeypatch, cap):
+    conn.execute('CREATE TABLE memo_fixture(body TEXT,"__reference_memo_0_0__" TEXT)')
+    conn.execute('INSERT INTO memo_fixture VALUES (?,?)', ('literal __reference_memo_0_1__', 'literal-column'))
+    conn.commit()
+    monkeypatch.setattr(store, '_REFERENCE_MEMO_BYTES', cap)
+    expressions = store._owner_reference_projection('body', [('pin', '__reference_memo_0_1__')], json_owner=False)
+    projection = '"__reference_memo_0_0__",__reference_memo_0_0__,__reference_memo_0_1__'
+    rows = list(store._reference_pages(conn, 'memo_fixture', projection, reusable={'body': expressions}))
+    assert [tuple(r) for r in rows] == [(1, 'literal-column', '["pin"]', 1)]

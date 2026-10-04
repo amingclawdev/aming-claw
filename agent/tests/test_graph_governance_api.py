@@ -243196,6 +243196,7 @@ def test_cleanup_native_fresh_connection_owns_census_only(apply, monkeypatch, tm
     def auth(_ctx, connection, _action):
         assert store._reference_budget(connection) is not None
         assert store._reference_budget(connection).deadline is None
+        assert store._reference_budget(connection).request_id == 'req-census-diagnostic'
     monkeypatch.setattr(server, '_require_graph_governance_operator', auth)
     def projection(connection, project_id, **_kwargs):
         state = store.snapshot_retention_reference_state(connection, project_id)
@@ -243205,7 +243206,7 @@ def test_cleanup_native_fresh_connection_owns_census_only(apply, monkeypatch, tm
     monkeypatch.setattr(stale_artifact_cleanup,
         'apply_stale_artifact_cleanup' if apply else 'build_stale_artifact_cleanup_projection', projection)
     context = SimpleNamespace(get_project_id=lambda: PID, handler=SimpleNamespace(),
-        token='', query={}, body={})
+        token='', query={}, body={}, request_id='req-census-diagnostic')
     result = (server.handle_graph_governance_stale_artifact_cleanup_apply if apply else
               server.handle_graph_governance_stale_artifact_cleanup)(context)
     assert result == {'ok': True, 'writes_performed': False}

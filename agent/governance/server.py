@@ -91148,7 +91148,8 @@ def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
     with phase("project_root"):
         root = _graph_governance_project_root(project_id, ctx.query)
     with phase("db_connect"):
-        conn_owner = graph_snapshot_store._owned_reference_connection(lambda: get_connection(project_id))
+        conn_owner = graph_snapshot_store._owned_reference_connection(
+        lambda: get_connection(project_id), diagnostic_request_id=str(getattr(ctx, "request_id", "")))
         conn = conn_owner.__enter__()
     try:
         with phase("operator"):
@@ -91200,7 +91201,8 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
         return 401, {"ok": False, "error": "snapshot_cow_auth_required", "writes_performed": False}
 
     root = _graph_governance_project_root(project_id, ctx.body)
-    conn_owner = graph_snapshot_store._owned_reference_connection(lambda: get_connection(project_id))
+    conn_owner = graph_snapshot_store._owned_reference_connection(
+        lambda: get_connection(project_id), diagnostic_request_id=str(getattr(ctx, "request_id", "")))
     conn = conn_owner.__enter__()
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.apply")
@@ -105518,7 +105520,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         from . import graph_snapshot_store as terminalization_store
 
         terminalization_owner = terminalization_store._owned_reference_connection(
-            lambda: get_connection(project_id))
+            lambda: get_connection(project_id), diagnostic_request_id=str(getattr(ctx, "request_id", "")))
         terminalization_conn = terminalization_owner.__enter__()
         try:
             terminalization_auth = _require_reconcile_terminalization_auth(
@@ -105647,7 +105649,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
 
     request_started_at = _utc_now()
     request_started_monotonic = time.monotonic()
-    conn_owner = store._owned_reference_connection(lambda: get_connection(project_id))
+    conn_owner = store._owned_reference_connection(
+        lambda: get_connection(project_id), diagnostic_request_id=str(getattr(ctx, "request_id", "")))
     conn = conn_owner.__enter__()
     request_total_changes_before = int(conn.total_changes)
     process_build_key: tuple[str, str] | None = None

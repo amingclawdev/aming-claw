@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -1950,6 +1951,39 @@ _REFERENCE_MAX_BYTES = 65536
 # Borrowed connections never install/clear a callback or acquire unlimited SQL.
 _REFERENCE_CENSUS_SECONDS = 25.0
 _REFERENCE_CONNECTIONS = threading.local()
+_REFERENCE_MEMO_BYTES = 8 * 1024 * 1024  # Per page, SQLite-side bodies only.
+_REFERENCE_DIAGNOSTICS = 8
+_REFERENCE_LOG = logging.getLogger(__name__)
+
+
+def _reference_label(value):
+    value = str(value)
+    return value if re.fullmatch(r"[a-zA-Z0-9_.-]{1,96}", value) else (
+        "sha256:" + hashlib.sha256(value.encode('utf-8', errors='replace')).hexdigest())
+
+
+def _reference_location(conn, phase, **location):
+    budget = _reference_budget(conn)
+    if budget:
+        budget.location = {"phase": phase, **location}
+
+
+def _reference_diagnostic(conn, cause, **location):
+    budget = _reference_budget(conn)
+    # Reserve the final slot for the budget's actual SQL/Python location.
+    limit = _REFERENCE_DIAGNOSTICS if cause == "budget_exhausted" else _REFERENCE_DIAGNOSTICS - 1
+    if budget is None or budget.diagnostics >= limit:
+        return
+    budget.diagnostics += 1
+    # Only bounded static labels/scalars; no SQL, payloads or filesystem paths.
+    record = {"cause": _reference_label(cause), "request_id": budget.request_id}
+    for key, value in {**budget.location, **location}.items():
+        if key in {"rowid", "page_after_rowid", "bytes", "entries"}:
+            if value is None or type(value) is int:
+                record[key] = value
+        elif key in {"phase", "table", "field", "mode", "storage"}:
+            record[key] = _reference_label(value)
+    _REFERENCE_LOG.info("reference_census_diagnostic %s", json.dumps(record, sort_keys=True))
 
 
 class _ReferenceBudgetExceeded(ValueError):
@@ -1961,20 +1995,25 @@ class _ReferenceInventoryExceeded(ValueError):
 
 
 class _ReferenceBudget:
-    def __init__(self, conn):
+    def __init__(self, conn, request_id=""):
         self.conn = conn
+        self.request_id = _reference_label(request_id) if request_id else ""
+        self.location = {"phase": "snapshot"}
+        self.diagnostics = 0
         self.deadline = None
         self.active = False
         self.exhausted = False
 
-    def checkpoint(self):
+    def checkpoint(self, mode="python"):
         if self.active and (self.exhausted or time.monotonic() >= self.deadline):
+            if not self.exhausted:
+                _reference_diagnostic(self.conn, "budget_exhausted", mode=mode)
             self.exhausted = True
             raise _ReferenceBudgetExceeded("reference_census_budget_exhausted")
 
     def progress(self):
         try:
-            self.checkpoint()
+            self.checkpoint("sql")
         except _ReferenceBudgetExceeded:
             return 1
         return 0
@@ -2013,7 +2052,7 @@ def _reference_checkpoint(conn):
 
 
 @contextmanager
-def _owned_reference_connection(factory):
+def _owned_reference_connection(factory, *, diagnostic_request_id=""):
     """Own one source-created fresh connection and its known-absent callback.
 
     The absolute cooperative census deadline survives subsequent rechecks.
@@ -2024,7 +2063,7 @@ def _owned_reference_connection(factory):
     providers = getattr(_REFERENCE_CONNECTIONS, "providers", None)
     if providers is None:
         providers = _REFERENCE_CONNECTIONS.providers = {}
-    budget = _ReferenceBudget(conn)
+    budget = _ReferenceBudget(conn, diagnostic_request_id)
     try:
         conn.set_progress_handler(budget.progress, 1000)
         providers[conn] = budget
@@ -2068,15 +2107,18 @@ def _reference_read_snapshot(conn: sqlite3.Connection):
 
 
 def _reference_pages(conn: sqlite3.Connection, table: str, projection: str,
-                     where: str = "", args: tuple = (), *, max_rows: int = _REFERENCE_MAX_ROWS):
+                     where: str = "", args: tuple = (), *, max_rows: int = _REFERENCE_MAX_ROWS,
+                     reusable: dict | None = None):
     """Bounded keyset pages, with an exact count and terminal continuation proof."""
     quoted = '"' + table.replace('"', '""') + '"'
+    _reference_location(conn, "schema", table=table)
     columns = {r[1] for r in conn.execute(f"PRAGMA table_info({quoted})")}
     cursor_key = next((key for key in ("_rowid_", "rowid", "oid") if key not in columns), None)
     schema = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
     if not cursor_key or not schema or "WITHOUT ROWID" in str(schema[0]).upper():
         raise ValueError("reference_census_cursor_unsupported:" + table)
     scope = " WHERE " + where if where else ""
+    _reference_location(conn, "count", table=table)
     expected = conn.execute(f"SELECT count(*) FROM {quoted}{scope}", args).fetchone()[0]
     budget = _reference_budget(conn)
     if budget is None and expected > max_rows:
@@ -2091,10 +2133,22 @@ def _reference_pages(conn: sqlite3.Connection, table: str, projection: str,
         _reference_checkpoint(conn)
         if budget:
             budget.before_sql()
-        page = conn.execute(f"SELECT {cursor_key},{projection} FROM {quoted}" +
-            (" NOT INDEXED" if budget else "") +
-            (" WHERE " + predicate if predicate else "") +
-            f" ORDER BY {cursor_key} LIMIT ?", (*page_args, _REFERENCE_PAGE_ROWS)).fetchall()
+        _reference_location(conn, "page", table=table, page_after_rowid=last)
+        source = (f" FROM {quoted}" + (" NOT INDEXED" if budget else "") +
+                  (" WHERE " + predicate if predicate else "") +
+                  f" ORDER BY {cursor_key} LIMIT ?")
+        page_parameters = (*page_args, _REFERENCE_PAGE_ROWS)
+        query = f"SELECT {cursor_key},{projection}" + source
+        if reusable:
+            query = _reference_memo_page(conn, source, page_parameters,
+                                         cursor_key, projection, reusable, columns) or query
+        if reusable:
+            replacements = {f"__reference_memo_{ordinal}_{i}__": expression
+                for ordinal, expressions in enumerate(reusable.values())
+                for i, expression in enumerate(expressions)}
+            query = _reference_expand_projection(query, replacements)
+        page = conn.execute(query, page_parameters).fetchall()
+        _reference_location(conn, "rows", table=table, page_after_rowid=last)
         _reference_checkpoint(conn)
         if not page:
             break
@@ -2111,6 +2165,55 @@ def _reference_pages(conn: sqlite3.Connection, table: str, projection: str,
             yield row
     if seen != expected:
         raise ValueError("reference_census_continuation_gap:" + table)
+
+
+def _reference_expand_projection(projection, replacements):
+    # One expansion pass, skipping SQL literals/quoted owner column names.
+    # Valid identities may themselves contain a placeholder-looking token.
+    pattern = r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|__reference_memo_[0-9]+_[0-9]+__"
+    return re.sub(pattern, lambda match: replacements.get(match[0], match[0])
+                  if not match[0].startswith(("'", '"')) else match[0], projection)
+
+
+def _reference_memo_page(conn, source, args, cursor_key, projection, reusable, columns):
+    """Exact bytes+storage equality, scoped to this page/snapshot/token SQL.
+
+    Never fetch/cache raw bodies in Python, or substitute hashes for equality.
+    Large pages use unchanged uncached expressions; this is not an owner cap.
+    """
+    def quote(name):
+        return '"' + name.replace('"', '""') + '"'
+    sizes = "+".join(f"coalesce(length(CAST({quote(col)} AS BLOB)),0)" for col in sorted(columns))
+    size = conn.execute(f"SELECT sum({sizes}) FROM (SELECT *" + source + ")", args).fetchone()[0]
+    _reference_checkpoint(conn)
+    if size is not None and size > _REFERENCE_MEMO_BYTES:
+        return None
+    prefix = "__ac_reference_"
+    while any(col.startswith(prefix) for col in columns):
+        prefix += "_"
+    cursor = prefix + "cursor"
+    ctes = [f"page_source AS MATERIALIZED (SELECT {cursor_key} AS {cursor},*" + source + ")"]
+    joins, replacements = [], {}
+    for ordinal, (column, expressions) in enumerate(reusable.items()):
+        col = quote(column)
+        # Actual TEXT bytes collate BINARY; class remains part of the exact key.
+        storage, body = f"{prefix}storage_{ordinal}", f"{prefix}body_{ordinal}"
+        ctes.append(f"body_{ordinal} AS MATERIALIZED (SELECT DISTINCT typeof({col}) AS {storage},"
+                    f"CAST({col} AS BLOB) AS {body} FROM page_source)")
+        value = f"CASE WHEN {storage}='text' THEN CAST({body} AS TEXT) ELSE NULL END"
+        values = f"SELECT {storage},{body},{value} AS {col} FROM body_{ordinal}"
+        projected = ",".join(f"{expression} AS {prefix}v{ordinal}_{i}" for i, expression in enumerate(expressions))
+        ctes.append(f"memo_{ordinal} AS MATERIALIZED (SELECT {storage},{body},{projected} "
+                    f"FROM ({values}))")
+        joins.append(f"JOIN memo_{ordinal} ON memo_{ordinal}.{storage}=typeof(page_source.{col}) "
+                     f"AND memo_{ordinal}.{body} IS CAST(page_source.{col} AS BLOB)")
+        for i, expression in enumerate(expressions):
+            replacements[f"__reference_memo_{ordinal}_{i}__"] = f"memo_{ordinal}.{prefix}v{ordinal}_{i}"
+    projection = _reference_expand_projection(projection, replacements)
+    # Non-TEXT bodies retain the original NULL/false projection outcome. All
+    # physical rows still appear in order, with original storage/size metadata.
+    return ("WITH " + ",".join(ctes) + f" SELECT {cursor},{projection} FROM page_source " +
+            " ".join(joins) + f" ORDER BY {cursor}")
 
 
 def _snapshot_reference_tokens(conn: sqlite3.Connection, project_id: str,
@@ -2161,7 +2264,7 @@ def _decoded_reference_matches(token_cte: str, *, ordered: bool = False) -> str:
         "(typeof(atoms.key)='text' AND instr(atoms.key,json_extract(tokens.value,'$[1]'))>0)), ")
 
 
-def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
+def _contract_reference_projection(tokens: list[tuple[str, str]], *, reusable=None) -> str:
     """SQL-only decoded pins; bodies and nested serialized audits stay SQLite-side.
 
     Literal and decoded substring matches deliberately overprotect. Nested JSON
@@ -2210,6 +2313,10 @@ def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
         f"SELECT CASE WHEN length(pin_json)<={_REFERENCE_MAX_BYTES} THEN pin_json "
         "ELSE NULL END FROM projected) ELSE NULL END")
     complete_projection = f"CASE WHEN {guarded} THEN ({decoded} SELECT {complete}) ELSE 0 END"
+    if reusable is not None:
+        reusable["record_json"] = (state, pin_projection, complete_projection)
+        state, pin_projection, complete_projection = (
+            f"__reference_memo_0_{i}__" for i in range(3))
     return (f"CASE WHEN typeof(contract_execution_id)='text' AND length(CAST(contract_execution_id AS BLOB))<={_REFERENCE_MAX_BYTES} THEN contract_execution_id ELSE NULL END,typeof(record_json),length(CAST(record_json AS BLOB))," +
             state + "," + pin_projection + "," + complete_projection)
 
@@ -2229,10 +2336,6 @@ def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
     valid = f"typeof({column})='text' AND instr({column},char(0))=0"
     if json_owner:
         valid += f" AND json_valid({column}) AND json_type({column})='object'"
-    else:
-        # Markdown is TEXT; a JSON-looking malformed body cannot prove absence.
-        valid += (f" AND (substr(ltrim({column}),1,1) NOT IN ('{{','[') "
-                  f"OR json_valid({column}))")
     # Annotate direct children by (document, parent) in one window pass. A
     # marker row belongs to the array's own id; its children use their parent
     # id. Filtering markers afterward preserves duplicate keys and every atom,
@@ -2273,7 +2376,9 @@ def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
         "WHEN type!='text' AND parent_pin=1 THEN 1 "
         "WHEN type='text' AND instr(atom,char(0))>0 THEN 1 "
         "WHEN type='text' AND substr(ltrim(atom),1,1) IN ('{','[') "
-        "AND (NOT json_valid(atom) OR depth=8) THEN 1 "
+        "AND json_valid(atom) AND depth=8 THEN 1 "
+        "WHEN type='text' AND key='serialized' AND substr(ltrim(atom),1,1) IN ('{','[') "
+        "AND NOT json_valid(atom) THEN 1 "
         "WHEN type='text' AND NOT json_valid(atom) AND instr(atom,char(92)||'u')>0 "
         "THEN 1 ELSE 0 END),0)=1 THEN 0 ELSE 1 END FROM parented) ELSE 0 END")
     if not json_owner:
@@ -2304,8 +2409,10 @@ def _contract_reference_rows(conn: sqlite3.Connection, project_id: str,
     if not required <= columns or columns - owned:
         raise ValueError("contract_runtime_executions_owner_schema_unknown")
     tokens = _snapshot_reference_tokens(conn, project_id, known_ids)
+    reusable = {}
+    projection = _contract_reference_projection(tokens, reusable=reusable)
     for row in _reference_pages(conn, "contract_runtime_executions",
-            _contract_reference_projection(tokens), "project_id=?", (project_id,)):
+            projection, "project_id=?", (project_id,), reusable=reusable):
         _, identity, storage_type, byte_length, state, raw_pins, complete = row
         if identity is None:
             raise ValueError("contract_runtime_executions_identity_unreadable")
@@ -2323,7 +2430,7 @@ def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]],
                                     checkpoint=lambda: None) -> set[str]:
     """Legacy capped-body fallback, including nested serialized audit strings."""
     pins, visited = set(), 0
-    def visit(child: Any, depth: int) -> None:
+    def visit(child: Any, depth: int, declared_json=False) -> None:
         nonlocal visited
         checkpoint()
         visited += 1
@@ -2332,7 +2439,7 @@ def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]],
         if isinstance(child, dict):
             for key, item in child.items():
                 visit(str(key), depth + 1)
-                visit(item, depth + 1)
+                visit(item, depth + 1, declared_json=(key == "serialized"))
         elif isinstance(child, list):
             for item in child:
                 visit(item, depth + 1)
@@ -2341,8 +2448,19 @@ def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]],
                 checkpoint()
                 if token in child:
                     pins.add(sid)
+            if "\x00" in child:
+                raise ValueError("reference_decoding_unknown")
             if child.lstrip().startswith(("{", "[")):
-                visit(json.loads(child), depth + 1)
+                try:
+                    nested = json.loads(child)
+                except json.JSONDecodeError:
+                    # This is a TEXT atom in a valid enclosing document, not
+                    # a declared JSON owner. Preserve raw tokens; opaque
+                    # escapes still cannot establish a negative proof.
+                    if declared_json or "\\u" in child:
+                        raise ValueError("reference_decoding_unknown")
+                else:
+                    visit(nested, depth + 1)
             elif "\\u" in child:
                 # No positive decoding proof for an escaped non-JSON fragment.
                 raise ValueError("reference_decoding_unknown")
@@ -2645,12 +2763,14 @@ def _snapshot_retention_reference_state(
             quoted_columns = ['"' + col.replace('"', '""') + '"' for col in text_columns]
             owner_fields = projected_owner_fields.get(table, {})
             owner_scalars = scalar_domains.get(table, {})
-            projection, completions = [], []
+            projection, completions, reusable = [], [], {}
             for name, col in zip(text_columns, quoted_columns):
                 if name in owner_fields:
                     pins, complete = _owner_reference_projection(col, tokens, json_owner=owner_fields[name])
-                    projection.append(pins)
-                    completions.append(complete)
+                    ordinal = len(reusable)
+                    reusable[name] = (pins, complete)
+                    projection.append(f"__reference_memo_{ordinal}_0__")
+                    completions.append(f"__reference_memo_{ordinal}_1__")
                 elif name in owner_scalars:
                     projection.append(f"CASE WHEN typeof({col})='integer' AND " +
                         owner_scalars[name].format(col=col) + " THEN 1 ELSE 0 END")
@@ -2665,7 +2785,7 @@ def _snapshot_retention_reference_state(
                 continue
             rows = _reference_pages(conn, table, ",".join(projection),
                 "project_id=?" if "project_id" in columns else "",
-                (project_id,) if "project_id" in columns else ())
+                (project_id,) if "project_id" in columns else (), reusable=reusable)
             for source_row in rows:
                 row = dict(zip(text_columns, source_row[1:len(text_columns)+1]))
                 # Unknown owner disposition stays a conservative current-use
@@ -2675,6 +2795,7 @@ def _snapshot_retention_reference_state(
                 for index, col in enumerate(text_columns):
                     _reference_checkpoint(conn)
                     raw = row[col]
+                    _reference_location(conn, "field", table=table, field=col, rowid=source_row[0])
                     storage_type, byte_length = source_row[1+len(text_columns)+index*2:3+len(text_columns)+index*2]
                     if col in owner_fields or col in owner_scalars:
                         complete = source_row[1+3*len(text_columns)+index]
@@ -2682,6 +2803,8 @@ def _snapshot_retention_reference_state(
                                  else storage_type == "text" and complete == 1 and raw is not None)
                         if not valid:
                             refusals.append(f"{table}_payload_unreadable")
+                            _reference_diagnostic(conn, "owner_projection_incomplete", storage=storage_type,
+                                                  bytes=byte_length)
                             if not refusal_metadata:
                                 refusal_metadata.append({"table": table, "field": col,
                                     "sqlite_storage_type": storage_type, "storage_byte_length": byte_length,
@@ -2698,6 +2821,8 @@ def _snapshot_retention_reference_state(
                         continue
                     if storage_type != "null" and (storage_type != "text" or byte_length > _REFERENCE_MAX_BYTES):
                         refusals.append(f"{table}_payload_unreadable")
+                        _reference_diagnostic(conn, "unsupported_payload_storage", storage=storage_type,
+                                              bytes=byte_length)
                         if not refusal_metadata:
                             refusal_metadata.append({"table": table, "field": col,
                                 "sqlite_storage_type": storage_type, "storage_byte_length": byte_length,
@@ -2714,10 +2839,26 @@ def _snapshot_retention_reference_state(
                         if sid and sid in raw:
                             add_pin(protected, sid, f"durable_{table}_text_reference")
                             add_pin(current_use, sid, "unclassified_owner_use_reference")
+                    if "\x00" in raw or ("\\u" in raw and not raw.lstrip().startswith(("{", "["))):
+                        refusals.append(f"{table}_payload_unreadable")
+                        _reference_diagnostic(conn, "opaque_text_escape", storage=storage_type, bytes=byte_length)
+                        continue
                     if not raw.lstrip().startswith(("{", "[")):
+                        if table == "backlog_bugs" and col.endswith("_json") and raw not in {"", "null"}:
+                            try:
+                                json.loads(raw)
+                            except json.JSONDecodeError:
+                                refusals.append(f"{table}_payload_unreadable")
+                                _reference_diagnostic(conn, "declared_json_invalid", storage=storage_type,
+                                                      bytes=byte_length)
                         continue
                     try:
-                        payload = json.loads(raw)
+                        try:
+                            payload = json.loads(raw)
+                        except json.JSONDecodeError:
+                            if table == "backlog_bugs" and col == "title" and "\\u" not in raw and "\x00" not in raw:
+                                continue
+                            raise
                         walk(payload, f"durable_{table}_payload_reference")
                         for sid in _bounded_decoded_reference_pins(payload, tokens,
                                 lambda: _reference_checkpoint(conn)):
@@ -2728,6 +2869,8 @@ def _snapshot_retention_reference_state(
                     except (ValueError, TypeError, RecursionError):
                         _reference_checkpoint(conn)
                         refusals.append(f"{table}_payload_unreadable")
+                        _reference_diagnostic(conn, "bounded_decoder_incomplete", storage=storage_type,
+                                              bytes=byte_length)
     except _ReferenceInventoryExceeded:
         raise
     except (sqlite3.Error, TypeError, ValueError) as exc:
@@ -2835,6 +2978,7 @@ def select_snapshot_retention_candidates(
         _protect(str(most_recent_full["snapshot_id"]), "most_recent_full_baseline")
 
     # Rule 4: bundle-referenced snapshot ids
+    _reference_location(conn, "bundle")
     try:
         bundle_refs = _bundle_referenced_snapshot_ids()
     except (OSError, ValueError) as exc:
@@ -2842,6 +2986,9 @@ def select_snapshot_retention_candidates(
                        if isinstance(exc, _BundleInventoryIncomplete) else set())
         reference_state["complete"] = False
         reference_state["refusal_reasons"].append("bundle_manifest_reference_unreadable")
+        _reference_diagnostic(conn, exc.cause if isinstance(exc, _BundleInventoryIncomplete)
+                              else "bundle_unreadable", phase="bundle", entries=(
+            exc.entries_seen if isinstance(exc, _BundleInventoryIncomplete) else None))
     if extra_bundle_snapshot_ids:
         bundle_refs = bundle_refs | set(extra_bundle_snapshot_ids)
     for sid in bundle_refs:
