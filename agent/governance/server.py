@@ -32327,7 +32327,9 @@ def _runtime_context_finish_attestation_rejoin_trace_evidence(
         or text(commit_payload, "contract_execution_id") != contract_execution_id
         or requested != set(source.get("graph_trace_ids") or [])
         or requested != set(commit_payload.get("graph_trace_ids") or [])
-        or source.get("test_results") != dict(test_results)
+        or _runtime_context_finish_attestation_test_results_payload(
+            source.get("test_results") or {}
+        ) != dict(test_results)
         or text(commit_payload, "implementation_lineage_ref")
         != text(lineage, "implementation_lineage_ref")
         or set(commit_payload.get("changed_files") or [])

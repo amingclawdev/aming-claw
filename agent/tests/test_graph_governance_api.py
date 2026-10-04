@@ -243046,9 +243046,9 @@ def test_cleanup_request_phase_timing_reserves_bounded_final_record(caplog):
     assert sum(r["event"] == "final" for r in records) == 1
 
 
-@pytest.mark.parametrize("trace_count, renewals", [(1, 1), (2, 1), (2, 2), (1, 0)])
-def test_postcommit_same_owner_renewal_attests_original_source_traces(
+def _assert_postcommit_same_owner_renewal_attestation(
     release_conn, tmp_path, monkeypatch, trace_count, renewals,
+    *, test_results=None, alter_ledger=None,
 ):
     """Real local producers and final handler; no manufactured audit or verifier."""
     from datetime import datetime, timedelta, timezone
@@ -243056,7 +243056,7 @@ def test_postcommit_same_owner_renewal_attests_original_source_traces(
     task = f"postcommit-renewal-{trace_count}-{renewals}"
     token, fence = "ordinary-fixture-token", "ordinary-fixture-fence"
     root = tmp_path / task
-    results = {"status": "passed", "passed": True, "commands": [
+    results = test_results or {"status": "passed", "passed": True, "commands": [
         {"command": "python -m pytest focused.py -q", "status": "passed"}]}
     successor, context, head, events, startup = _normal_mf_parallel_finish_precursor(
         conn, tmp_path, backlog_id=f"AC-{task.upper()}", worker_task_id=task,
@@ -243064,6 +243064,8 @@ def test_postcommit_same_owner_renewal_attests_original_source_traces(
         graph_trace_id="fixture-request-trace", test_results=results,
         graph_query_count=trace_count, verifier_backed=True,
     )
+    if callable(test_results):
+        test_results = test_results(context)
     execution = successor["contract_execution_id"]
     before = copy.deepcopy(server._contract_runtime_store(conn).get(execution)["completed_lines"])
     trace_ids = startup["graph_trace_ids"]
@@ -243138,7 +243140,29 @@ def test_postcommit_same_owner_renewal_attests_original_source_traces(
     assert body["graph_trace_ids"] == trace_ids
     assert body["head_commit"] == head
     assert body["test_results"] == original_body["test_results"]
+    if test_results is not None:
+        canonical_implementation = next(
+            line for line in before if line["line_id"] == "worker_implementation"
+        )
+        assert canonical_implementation["payload"]["test_results"] == test_results
+        assert body["test_results"] == server._runtime_context_finish_attestation_test_results_payload(
+            test_results
+        )
+        assert body["test_results"]["no_pass"] is True
+        assert body["test_results"]["overall_release_pass"] is False
     body.update(session_token=token, fence_token=fence)
+    if alter_ledger:
+        alter_ledger(body["test_results"])
+        with pytest.raises(ValidationError) as rejected:
+            server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+                _ctx_with_role(path, "mf_sub", method="POST", body=body))
+        assert "requires accepted test_results" in str(rejected.value) or (
+            "requires verified mf_sub graph trace ids" in str(rejected.value)
+        )
+        assert server._contract_runtime_store(conn).get(execution)["completed_lines"] == before
+        assert original_rows == [tuple(row) for row in conn.execute(
+            "SELECT * FROM graph_query_traces WHERE project_id=? ORDER BY trace_id", (PID,))]
+        return
     accepted = server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
         _ctx_with_role(path, "mf_sub", method="POST", body=body))
     assert accepted["ok"] is True
@@ -243150,7 +243174,10 @@ def test_postcommit_same_owner_renewal_attests_original_source_traces(
         "SELECT * FROM graph_query_traces WHERE project_id=? ORDER BY trace_id", (PID,)).fetchall()]
     assert set(after[-1]["payload"]["graph_trace_ids"]) == set(trace_ids)
     assert bool(accepted.get("postcommit_rejoin_trace_continuity")) == bool(renewals)
-
+    if test_results is not None:
+        assert after[-1]["payload"]["test_results"]["no_pass"] is True
+        assert after[-1]["payload"]["test_results"]["overall_release_pass"] is False
+        assert after[-1]["payload"]["test_results"]["passed"] is False
 
 @pytest.mark.parametrize('apply', [False, True])
 def test_cleanup_native_fresh_connection_owns_census_only(apply, monkeypatch, tmp_path):
@@ -243224,3 +243251,80 @@ def test_current_full_native_connection_census_lifetime(terminal, monkeypatch, t
     assert len(opened) == 1 and store._reference_budget(opened[0]) is None
     with pytest.raises(sqlite3.ProgrammingError):
         opened[0].execute('SELECT 1')
+
+
+
+@pytest.mark.parametrize("trace_count, renewals", [(1, 1), (2, 1), (2, 2), (1, 0)])
+def test_postcommit_same_owner_renewal_attests_original_source_traces(
+    release_conn, tmp_path, monkeypatch, trace_count, renewals,
+):
+    _assert_postcommit_same_owner_renewal_attestation(
+        release_conn, tmp_path, monkeypatch, trace_count, renewals,
+    )
+
+
+@pytest.mark.parametrize("representation", ["missing_release_flag", "already_normalized"])
+def test_postcommit_renewal_attests_source_projected_unrelated_block_ledger(
+    release_conn, tmp_path, monkeypatch, representation,
+):
+    results = _postcommit_unrelated_block_ledger()
+    if representation == "already_normalized":
+        results["overall_release_pass"] = False
+    _assert_postcommit_same_owner_renewal_attestation(
+        release_conn, tmp_path, monkeypatch, 2, 1, test_results=results,
+    )
+    assert results["no_pass"] is True and results["passed"] is False
+    assert results["overall_release_pass_claimed"] is False
+    assert ("overall_release_pass" in results) == (representation == "already_normalized")
+
+
+def _postcommit_unrelated_block_ledger():
+    # Local producer evidence for an owned lane with an unrelated diagnostic;
+    # the accepted canonical ledger intentionally omits only the release flag.
+    return {
+        "status": "passed_with_unrelated_system_block_recorded",
+        "required_passed": 1, "unrelated_system_blocks": 1,
+        "no_pass": True, "passed": False, "overall_release_pass_claimed": False,
+        "tests": [
+            {"name": "focused", "command": "pytest -q focused", "status": "passed"},
+            {"name": "sibling diagnostic", "command": "pytest -q",
+             "status": "blocked_unrelated", "detail": "unchanged sibling stub"},
+        ],
+    }
+
+
+def test_postcommit_renewal_preserves_already_equal_known_baseline_ledger(
+    release_conn, tmp_path, monkeypatch,
+):
+    def results(context):
+        return _complete_known_baseline_test_results({
+            "status": "accepted_with_known_baseline_failure",
+            "no_pass": True, "passed": False,
+            "candidate_new_failures": 0,
+            "full_failed": 8, "inherited_failed": 8, "baseline_failed": 8,
+            "focused_passed": 90, "full_passed": 226, "baseline_passed": 215,
+            "overall_release_pass_claimed": False, "overall_release_pass": False,
+        }, runtime_context=context, tmp_path=tmp_path)
+    _assert_postcommit_same_owner_renewal_attestation(
+        release_conn, tmp_path, monkeypatch, 2, 1, test_results=results,
+    )
+
+
+@pytest.mark.parametrize("change", ["command", "count", "release_claim"])
+def test_postcommit_renewal_refuses_changed_unrelated_block_ledger(
+    release_conn, tmp_path, monkeypatch, change,
+):
+    def alter_ledger(results):
+        if change == "command":
+            results["tests"][0]["command"] = "pytest -q different"
+        elif change == "count":
+            results["required_passed"] = 2
+            results["tests"].append({
+                "name": "extra claim", "command": "pytest -q extra", "status": "passed",
+            })
+        else:
+            results["overall_release_pass"] = True
+    _assert_postcommit_same_owner_renewal_attestation(
+        release_conn, tmp_path, monkeypatch, 2, 1,
+        test_results=_postcommit_unrelated_block_ledger(), alter_ledger=alter_ledger,
+    )
