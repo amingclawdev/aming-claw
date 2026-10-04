@@ -6720,3 +6720,67 @@ def test_bundle_streaming_default_parent_is_anchored_no_follow(
             return original(name, *args, **kwargs)
         monkeypatch.setattr(store.os, "open", replace_parent)
     _assert_bundle_incomplete(selection(), positives=())
+
+
+@pytest.mark.parametrize("owner", ["contract", "audit"])
+def test_reference_projection_large_valid_token_inventory_completes_bounded_vm(conn, owner):
+    ids = [f"snapshot-{i:03}" for i in range(100)]
+    tokens = [(sid, token) for sid in ids for token in
+              (sid, f"run-{sid}", f"/private/graph/{sid}")]
+    nested = json.dumps({"snapshot_ids": [ids[-1]], "late_snapshot_id": "external-pin"})
+    nested = nested.replace(ids[-1], ids[-1].replace("-", "\\u002d"))
+    body = json.dumps({"history": [{"n": i, "note": "ordinary owner text", "flag": True}
+                        for i in range(6000)], "serialized": nested,
+                       "raw_path": "/private/graph/snapshot-098",
+                       "runtime_guide": {"next_legal_action": None}})
+    assert conn.execute("SELECT count(*) FROM json_tree(?)", (body,)).fetchone()[0] > 20_000
+    conn.execute("CREATE TABLE projection_fixture(contract_execution_id TEXT,record_json TEXT)")
+    conn.execute("INSERT INTO projection_fixture VALUES ('execution',?)", (body,))
+    if owner == "contract":
+        projection = store._contract_reference_projection(tokens)
+    else:
+        projection = ",".join(store._owner_reference_projection("record_json", tokens, json_owner=True))
+    steps = 0
+    started = store.time.monotonic()
+    def budget():
+        nonlocal steps
+        steps += 1000
+        return int(steps >= 30_000_000 or store.time.monotonic() - started >= 5)
+    conn.set_progress_handler(budget, 1000)
+    try:
+        row = conn.execute("SELECT " + projection + " FROM projection_fixture").fetchone()
+    finally:
+        conn.set_progress_handler(None, 0)
+    assert steps < 30_000_000
+    if owner == "contract":
+        assert tuple(row[:4]) == ("execution", "text", len(body.encode()), "completed")
+        pins, complete = row[4:]
+        assert json.loads(pins) == ids[-2:]
+    else:
+        pins, complete = row
+        assert set(json.loads(pins)) == {ids[-2], ids[-1], "external-pin"}
+    assert complete == 1
+    assert len(pins.encode()) < 1024
+
+
+def test_owner_projection_parent_identity_stays_with_its_serialized_document(conn):
+    first = json.dumps({"snapshot_ids": ["external-one", 7]})
+    second = json.dumps({"ordinary_ids": ["ordinary-not-a-pin", False]})
+    body = ('{"first":' + json.dumps(first) + ',"second":' + json.dumps(second) +
+            ',"snapshot_id":"external-root","snapshot_id":"external-last"}')
+    conn.execute("CREATE TABLE projection_fixture(body TEXT)")
+    conn.execute("INSERT INTO projection_fixture VALUES (?)", (body,))
+    projection = ",".join(store._owner_reference_projection(
+        "body", [("known-absent", "known-absent")], json_owner=True))
+    row = conn.execute("SELECT " + projection + " FROM projection_fixture").fetchone()
+    assert set(json.loads(row[0])) == {"external-one", "external-root", "external-last"}
+    assert row[1] == 0  # A nontext direct child refuses completeness.
+
+
+def test_contract_reference_projection_empty_inventory_preserves_completion(conn):
+    body = json.dumps({"runtime_guide": {"next_legal_action": None}})
+    conn.execute("CREATE TABLE projection_fixture(contract_execution_id TEXT,record_json TEXT)")
+    conn.execute("INSERT INTO projection_fixture VALUES ('execution',?)", (body,))
+    row = conn.execute("SELECT " + store._contract_reference_projection([]) +
+                       " FROM projection_fixture").fetchone()
+    assert tuple(row) == ("execution", "text", len(body.encode()), "completed", "[]", 1)

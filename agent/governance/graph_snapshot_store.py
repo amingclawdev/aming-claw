@@ -2042,13 +2042,14 @@ def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
     """
     def literal(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
-    values = ",".join(f"({literal(sid)},{literal(token)})" for sid, token in tokens)
-    token_cte = "VALUES " + values if values else "SELECT '' AS column1,'' AS column2 WHERE 0"
-    decoded = ("WITH RECURSIVE docs(doc,depth) AS (SELECT record_json,0 UNION "
+    decoded = ("WITH RECURSIVE docs(doc,depth) AS MATERIALIZED (SELECT record_json,0 UNION "
         "SELECT j.atom,d.depth+1 FROM docs d,json_tree(d.doc) j "
         "WHERE j.type='text' AND substr(ltrim(j.atom),1,1) IN ('{','[') "
         "AND json_valid(j.atom) AND d.depth<8), "
-        "atoms AS (SELECT d.depth,j.key,j.atom,j.type FROM docs d,json_tree(d.doc) j) ")
+        "atoms AS MATERIALIZED (SELECT d.depth,j.key,j.atom,j.type FROM docs d,json_tree(d.doc) j), "
+        "search AS MATERIALIZED (SELECT coalesce(group_concat(CASE WHEN type='text' "
+        "THEN atom END,char(0)),'')||char(0)||coalesce(group_concat(CASE "
+        "WHEN typeof(key)='text' THEN key END,char(0)),'') AS body FROM atoms) ")
     complete = ("(SELECT CASE WHEN coalesce(max(CASE "
         "WHEN depth=8 AND type='text' AND substr(ltrim(atom),1,1) IN ('{','[') "
         "AND json_valid(atom) THEN 1 "
@@ -2056,12 +2057,19 @@ def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
         "WHEN type='text' AND NOT json_valid(atom) AND "
         "instr(atom,char(92)||'u')>0 "
         "THEN 1 ELSE 0 END),0)=1 THEN 0 ELSE 1 END FROM atoms)")
-    pins = (f"(SELECT json_group_array(sid) FROM (SELECT DISTINCT sid FROM ({token_cte}) "
-        "AS tokens WHERE EXISTS(SELECT 1 FROM atoms WHERE "
+    # Search concatenation is only a necessary-condition prefilter. Confirm
+    # each hit against its original atom/key, including tokens spanning the NUL
+    # separators. Raw bodies and the search string never leave SQLite. The
+    # ordinal preserves the original token-order projection.
+    ordered_tokens = ",".join(f"({literal(sid)},{literal(token)},{i})"
+                              for i, (sid, token) in enumerate(tokens))
+    token_cte = "VALUES " + ordered_tokens if ordered_tokens else "SELECT '' AS column1, '' AS column2, 0 AS column3 WHERE 0"
+    pins = (f"(SELECT json_group_array(sid) FROM (SELECT column1 AS sid "
+        f"FROM search CROSS JOIN ({token_cte}) AS tokens WHERE instr(search.body,tokens.column2)>0 "
+        "AND EXISTS(SELECT 1 FROM atoms WHERE "
         "(type='text' AND instr(atom,tokens.column2)>0) OR "
-        "(typeof(key)='text' AND instr(key,tokens.column2)>0))))")
-    # VALUES names are column1/column2; preserve sid label for bounded output.
-    pins = pins.replace("SELECT DISTINCT sid FROM", "SELECT DISTINCT column1 AS sid FROM")
+        "(typeof(key)='text' AND instr(key,tokens.column2)>0)) "
+        "GROUP BY column1 ORDER BY min(column3)))")
     state = ("CASE WHEN typeof(record_json)!='text' THEN 'nontext' "
         "WHEN instr(record_json,char(0))>0 OR NOT json_valid(record_json) THEN 'malformed_json' ELSE coalesce((SELECT "
         "CASE WHEN guide.type!='object' THEN 'missing_runtime_guide' ELSE coalesce((SELECT "
@@ -2071,7 +2079,10 @@ def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
         "FROM json_each(record_json) guide WHERE guide.key='runtime_guide' "
         "ORDER BY guide.id DESC LIMIT 1),'missing_runtime_guide') END")
     guarded = "typeof(record_json)='text' AND instr(record_json,char(0))=0 AND json_valid(record_json)"
-    pin_projection = f"CASE WHEN {guarded} THEN ({decoded} SELECT CASE WHEN length({pins})<={_REFERENCE_MAX_BYTES} THEN {pins} ELSE NULL END) ELSE NULL END"
+    pin_projection = (f"CASE WHEN {guarded} THEN ({decoded}, "
+        f"projected AS MATERIALIZED (SELECT {pins} AS pin_json) "
+        f"SELECT CASE WHEN length(pin_json)<={_REFERENCE_MAX_BYTES} THEN pin_json "
+        "ELSE NULL END FROM projected) ELSE NULL END")
     complete_projection = f"CASE WHEN {guarded} THEN ({decoded} SELECT {complete}) ELSE 0 END"
     return (f"CASE WHEN typeof(contract_execution_id)='text' AND length(CAST(contract_execution_id AS BLOB))<={_REFERENCE_MAX_BYTES} THEN contract_execution_id ELSE NULL END,typeof(record_json),length(CAST(record_json AS BLOB))," +
             state + "," + pin_projection + "," + complete_projection)
@@ -2096,36 +2107,51 @@ def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
         # Markdown is TEXT; a JSON-looking malformed body cannot prove absence.
         valid += (f" AND (substr(ltrim({column}),1,1) NOT IN ('{{','[') "
                   f"OR json_valid({column}))")
-    docs = (f"WITH RECURSIVE docs(doc,depth) AS (SELECT CASE WHEN json_valid({column}) "
+    # Annotate direct children by (document, parent) in one window pass. A
+    # marker row belongs to the array's own id; its children use their parent
+    # id. Filtering markers afterward preserves duplicate keys and every atom,
+    # without a correlated parent traversal per atom. Separate doc ids prevent
+    # serialized documents with matching local json_tree ids from sharing pins.
+    docs = (f"WITH RECURSIVE docs(doc,depth) AS MATERIALIZED (SELECT CASE WHEN json_valid({column}) "
         f"THEN {column} ELSE json_quote({column}) END,0 UNION "
         "SELECT j.atom,d.depth+1 FROM docs d,json_tree(d.doc) j "
         "WHERE j.type='text' AND substr(ltrim(j.atom),1,1) IN ('{','[') "
         "AND json_valid(j.atom) AND d.depth<8), "
-        "numbered AS (SELECT row_number() OVER () AS doc_id,doc,depth FROM docs), "
-        "atoms AS (SELECT d.doc_id,j.id,j.parent,j.key,j.atom,j.type,d.depth "
-        "FROM numbered d,json_tree(d.doc) j) ")
-    candidates = (f"pins(sid) AS (SELECT column1 FROM ({token_cte}) tokens "
-        f"WHERE instr({column},tokens.column2)>0 OR EXISTS(SELECT 1 FROM atoms "
-        "WHERE (type='text' AND instr(atom,tokens.column2)>0) OR "
+        "numbered AS MATERIALIZED (SELECT row_number() OVER () AS doc_id,doc,depth FROM docs), "
+        "atoms AS MATERIALIZED (SELECT d.doc_id,j.id,j.parent,j.key,j.atom,j.type,d.depth "
+        "FROM numbered d,json_tree(d.doc) j), "
+        "families AS MATERIALIZED (SELECT *,max(parent_marker) OVER "
+        "(PARTITION BY doc_id,family) AS parent_pin FROM "
+        "(SELECT *,parent AS family,0 AS parent_marker,0 AS marker_row FROM atoms "
+        "UNION ALL SELECT *,id AS family,1 AS parent_marker,1 AS marker_row "
+        "FROM atoms WHERE type='array' AND "
+        "substr(CAST(key AS TEXT),-12)='snapshot_ids')), "
+        "parented AS MATERIALIZED (SELECT * FROM families WHERE marker_row=0), "
+        "search AS MATERIALIZED (SELECT coalesce(group_concat(CASE WHEN type='text' "
+        "THEN atom END,char(0)),'')||char(0)||coalesce(group_concat(CASE "
+        "WHEN typeof(key)='text' THEN key END,char(0)),'') AS body FROM atoms) ")
+    candidates = (f"pins(sid) AS MATERIALIZED (SELECT column1 FROM ({token_cte}) tokens "
+        f"WHERE instr({column},tokens.column2)>0 UNION "
+        f"SELECT column1 FROM search CROSS JOIN ({token_cte}) tokens "
+        "WHERE instr(search.body,tokens.column2)>0 AND EXISTS(SELECT 1 FROM atoms WHERE "
+        "(type='text' AND instr(atom,tokens.column2)>0) OR "
         "(typeof(key)='text' AND instr(key,tokens.column2)>0)) UNION "
-        "SELECT atom FROM atoms a WHERE type='text' AND ("
-        "substr(CAST(key AS TEXT),-11)='snapshot_id' OR EXISTS(SELECT 1 FROM atoms p "
-        "WHERE p.doc_id=a.doc_id AND p.id=a.parent AND p.type='array' "
-        "AND substr(CAST(p.key AS TEXT),-12)='snapshot_ids'))) ")
+        "SELECT atom FROM parented WHERE type='text' AND "
+        "(substr(CAST(key AS TEXT),-11)='snapshot_id' OR parent_pin=1)) ")
     pins = "(SELECT json_group_array(sid) FROM (SELECT DISTINCT sid FROM pins WHERE sid!=''))"
-    projection = (f"CASE WHEN {valid} THEN ({docs}, {candidates} SELECT CASE "
-        f"WHEN length(CAST({pins} AS BLOB))<={_REFERENCE_MAX_BYTES} THEN {pins} "
-        "ELSE NULL END) ELSE NULL END")
+    projection = (f"CASE WHEN {valid} THEN ({docs}, {candidates}, "
+        f"projected AS MATERIALIZED (SELECT {pins} AS pin_json) SELECT CASE "
+        f"WHEN length(CAST(pin_json AS BLOB))<={_REFERENCE_MAX_BYTES} THEN pin_json "
+        "ELSE NULL END FROM projected) ELSE NULL END")
     complete = (f"CASE WHEN {valid} THEN ({docs} SELECT CASE WHEN coalesce(max(CASE "
         "WHEN typeof(key)='text' AND substr(key,-11)='snapshot_id' AND type!='text' THEN 1 "
         "WHEN typeof(key)='text' AND substr(key,-12)='snapshot_ids' AND type!='array' THEN 1 "
-        "WHEN type!='text' AND EXISTS(SELECT 1 FROM atoms p WHERE p.doc_id=atoms.doc_id "
-        "AND p.id=atoms.parent AND p.type='array' AND substr(CAST(p.key AS TEXT),-12)='snapshot_ids') THEN 1 "
+        "WHEN type!='text' AND parent_pin=1 THEN 1 "
         "WHEN type='text' AND instr(atom,char(0))>0 THEN 1 "
         "WHEN type='text' AND substr(ltrim(atom),1,1) IN ('{','[') "
         "AND (NOT json_valid(atom) OR depth=8) THEN 1 "
         "WHEN type='text' AND NOT json_valid(atom) AND instr(atom,char(92)||'u')>0 "
-        "THEN 1 ELSE 0 END),0)=1 THEN 0 ELSE 1 END FROM atoms) ELSE 0 END")
+        "THEN 1 ELSE 0 END),0)=1 THEN 0 ELSE 1 END FROM parented) ELSE 0 END")
     return projection, complete
 
 
