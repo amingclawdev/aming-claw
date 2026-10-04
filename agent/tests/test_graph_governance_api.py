@@ -242933,3 +242933,97 @@ def test_authenticated_attestation_guide_materializes_governed_worker_identity(
     assert public[-1] == {"ok": True, "status": "accepted_fixture_mock"}, json.dumps(public[-1], sort_keys=True)
     assert sum(call[0] == "POST" for call in calls) == 1
     assert token not in json.dumps(public) and fence not in json.dumps(public)
+
+
+@pytest.mark.parametrize("case", ["ok", "projection_error", "disconnect", "encoding_error"])
+def test_cleanup_request_phase_timing_http_final_follows_response(case, monkeypatch, caplog, tmp_path):
+    import logging
+    import time
+
+    caplog.set_level(logging.INFO, logger=server.__name__)
+    handler = _bare_handler()
+    handler.path = "/api/graph-governance/proj/stale-artifact-cleanup?dimension=graph_snapshots"
+    handler._find_handler = lambda _method: (server.handle_graph_governance_stale_artifact_cleanup,
+                                             {"project_id": "proj"}, "")
+    monkeypatch.setattr(server, "_guard_runtime_world_request", lambda **_kw: None)
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_a: tmp_path)
+    connection = sqlite3.connect(":memory:")
+    monkeypatch.setattr(server, "get_connection", lambda _pid: _NoCloseConn(connection))
+    monkeypatch.setattr(server, "_require_graph_governance_operator", lambda *_a: None)
+    payload = {"ok": True, "mode": "dry_run", "candidates": [], "private_fixture": "payload-not-in-logs"}
+
+    def project(*_args, **kwargs):
+        with kwargs["_phase_timing"]("selection"):
+            time.sleep(0.002)
+        if case == "projection_error":
+            raise RuntimeError("private-path-and-token-not-in-logs")
+        return dict(payload)
+
+    monkeypatch.setattr(stale_artifact_cleanup, "build_stale_artifact_cleanup_projection", project)
+    if case == "encoding_error":
+        monkeypatch.setattr(stale_artifact_cleanup, "cleanup_response_wire_bytes", lambda _body: {"http": 1})
+        payload["private_fixture"] = object()
+    actual_write = handler.wfile.write
+    writes = []
+
+    def write(data):
+        # No completion record before the actual transport write returns/fails.
+        assert not any('"event":"final"' in r.getMessage() for r in caplog.records)
+        writes.append(data)
+        if case == "disconnect":
+            raise BrokenPipeError("private-disconnect-detail-not-in-logs")
+        return actual_write(data)
+
+    handler.wfile.write = write
+    try:
+        handler._handle("GET")
+        records = [json.loads(r.getMessage().split(" ", 1)[1]) for r in caplog.records
+                   if r.getMessage().startswith("cleanup_request_phase ")]
+        assert records[0]["event"] == "begin" and records[-1]["event"] == "final"
+        assert sum(r["event"] == "final" for r in records) == 1
+        assert len(records) <= server._CleanupRequestTiming.MAX_RECORDS
+        assert len({r["request_id"] for r in records}) == 1
+        request_id = records[0]["request_id"]
+        assert request_id.startswith("req-") and all(r["project_id"] == "proj" for r in records)
+        begins = [r["phase"] for r in records if r["event"] == "begin"]
+        assert begins[:6] == ["request", "project_root", "db_connect", "operator", "projection", "selection"]
+        assert begins[-2:] == ["encoding", "response"]
+        selection = next(r for r in records if r["phase"] == "selection" and r["event"] == "end")
+        assert selection["phase_elapsed_ms"] >= 1
+        assert all(r["elapsed_ms"] >= 0 and r.get("thread_ms", 0) >= 0 for r in records)
+        assert [r["elapsed_ms"] for r in records] == sorted(r["elapsed_ms"] for r in records)
+        assert records[-1]["outcome"] == ("disconnect" if case == "disconnect" else
+                                         "ok" if case == "ok" else "error")
+        rendered = json.dumps(records)
+        assert "payload-not-in-logs" not in rendered
+        assert "private-path-and-token" not in rendered and "private-disconnect-detail" not in rendered
+        assert str(tmp_path) not in rendered
+        assert handler._cleanup_timing is None and writes
+        if case == "ok":
+            expected = {**payload, "request_id": request_id}
+            assert writes == [json.dumps(expected, ensure_ascii=False).encode("utf-8")]
+            assert handler.sent_statuses == [200]
+        elif case in {"projection_error", "encoding_error"}:
+            assert handler.sent_statuses == [500]
+        else:
+            assert handler.sent_statuses == [200] and handler.wfile.getvalue() == b""
+        assert connection.total_changes == 0
+    finally:
+        connection.close()
+
+
+def test_cleanup_request_phase_timing_reserves_bounded_final_record(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=server.__name__)
+    timing = server._CleanupRequestTiming("req-0123456789ab", "proj")
+    for _ in range(200):
+        with timing.phase("selection"):
+            pass
+    timing.finish("ok")
+    timing.finish("error")
+    records = [json.loads(r.getMessage().split(" ", 1)[1]) for r in caplog.records
+               if r.getMessage().startswith("cleanup_request_phase ")]
+    assert len(records) == timing.MAX_RECORDS
+    assert records[-1]["event"] == "final" and records[-1]["outcome"] == "ok"
+    assert sum(r["event"] == "final" for r in records) == 1

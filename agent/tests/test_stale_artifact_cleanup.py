@@ -2983,3 +2983,46 @@ def test_http_cannot_inject_internal_timer_selection(cow_http):
     result = cow_http('GET', '/api/graph-governance/proj/stale-artifact-cleanup?'
                      'dimension=graph_snapshot_duplicates&_run_selection=anything')
     assert result['ok'] and len(result['candidates']) == 2
+
+
+@pytest.mark.parametrize("count", [1, 40])
+def test_cleanup_phase_timing_graph_hooks_are_aggregate_and_preserve_projection(tmp_path, monkeypatch, count):
+    from contextlib import contextmanager
+
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    rows = []
+    for i in range(count):
+        sid = f"scope-{i:03d}"
+        path = root / sid
+        path.mkdir()
+        (path / "fixture.txt").write_text("ordinary fixture")
+        rows.append({"snapshot_id": sid, "dir_exists": True, "in_db": True,
+                     "status": "superseded", "snapshot_kind": "scope", "created_at": "2020"})
+    selection = {"candidates": rows, "protected": [], "reference_authority_complete": True}
+    monkeypatch.setattr(graph_snapshot_store, "select_snapshot_retention_candidates", lambda *_a, **_kw: selection)
+    monkeypatch.setattr(graph_snapshot_store, "_snapshot_root", lambda _pid, sid: root / sid)
+    monkeypatch.setattr(governance_server, "_graph_release_build_fence_state", lambda *_a: {"clear": True})
+    connection = sqlite3.connect(":memory:")
+    events = []
+
+    @contextmanager
+    def phase(name):
+        events.append((name, "begin"))
+        try:
+            yield
+        finally:
+            events.append((name, "end"))
+
+    try:
+        original = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+            connection, "proj", repo_root_path=tmp_path, dimension="graph_snapshots")
+        timed = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+            connection, "proj", repo_root_path=tmp_path, dimension="graph_snapshots", _phase_timing=phase)
+        assert timed == original
+        assert len(timed["candidates"]) == count
+        assert events == [(name, event) for name in ("selection", "build_fence", "sizing")
+                          for event in ("begin", "end")]
+        assert connection.total_changes == 0
+    finally:
+        connection.close()

@@ -1003,17 +1003,21 @@ def _count_related_timeline_events(
 def _build_graph_snapshot_candidates(
     conn: sqlite3.Connection,
     project_id: str,
+    _phase_timing: Any = None,
 ) -> list[dict[str, Any]]:
     """Return graph-snapshot dimension candidates in the same conservative model as worktrees."""
     from .graph_snapshot_store import select_snapshot_retention_candidates
     from .server import _graph_release_build_fence_state
+    phase = _phase_timing or (lambda _name: nullcontext())
     try:
         # The selector's legacy size walk is unbounded and can follow child
         # symlinks. This preview measures every selected row itself below.
-        selection = select_snapshot_retention_candidates(
-            conn, project_id, measure_sizes=False,
-        )
-        fence = _graph_release_build_fence_state(conn, project_id)
+        with phase("selection"):
+            selection = select_snapshot_retention_candidates(
+                conn, project_id, measure_sizes=False,
+            )
+        with phase("build_fence"):
+            fence = _graph_release_build_fence_state(conn, project_id)
     except Exception:  # noqa: BLE001 - preview fails closed without leaking source paths
         return [{
             "candidate_id": _candidate_id("graph_snapshots_error", project_id),
@@ -1027,98 +1031,99 @@ def _build_graph_snapshot_candidates(
         }]
     candidates: list[dict[str, Any]] = []
     # One deterministic read budget covers both eligible and protected rows.
-    remaining_size_entries = [_SNAPSHOT_SIZE_MAX_ENTRIES_PER_PREVIEW]
-    for item in selection.get("candidates", []):
-        sid = str(item.get("snapshot_id") or "")
-        from .graph_snapshot_store import _snapshot_root, _snapshot_id_is_component
-        valid_id = _snapshot_id_is_component(sid)
-        actual_path = str(_snapshot_root(project_id, sid)) if valid_id else ""
-        exists = bool(item.get("dir_exists"))
-        status = str(item.get("status") or "")
-        identity = _path_identity(actual_path)
-        size_bytes, size_status = _snapshot_directory_size(
-            actual_path, remaining_entries=remaining_size_entries,
-        ) if valid_id else (None, "snapshot_id_path_invalid")
-        safe = bool(exists and valid_id and item.get("in_db")
-                    and status == "superseded"
-                    and selection.get("reference_authority_complete") is True
-                    and fence.get("clear") is True
-                    and identity is not None)
-        refusal_reasons: list[str] = []
-        if not exists:
-            refusal_reasons.append("snapshot_dir_missing")
-        if not sid:
-            refusal_reasons.append("snapshot_id_empty")
-        elif not valid_id:
-            refusal_reasons.append("snapshot_id_path_invalid")
-        if not item.get("in_db") or status != "superseded":
-            refusal_reasons.append("snapshot_ownership_or_status_unverified")
-        if selection.get("reference_authority_complete") is not True:
-            refusal_reasons.extend(selection.get("global_refusal_reasons") or ["reference_authority_incomplete"])
-        if fence.get("clear") is not True:
-            refusal_reasons.append("global_current_full_build_fence_active")
-        if exists and identity is None:
-            refusal_reasons.append("snapshot_path_identity_unverified")
-        candidates.append({
-            "candidate_id": _candidate_id("graph_snapshot", sid or actual_path),
-            "artifact_type": "graph_snapshot_dir",
-            "action": ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
-            "snapshot_id": sid,
-            "path": actual_path,
-            "safe_to_apply": safe,
-            "refusal_reasons": refusal_reasons,
-            "evidence": {
-                "snapshot_kind": str(item.get("snapshot_kind") or ""),
-                "status": str(item.get("status") or ""),
-                "created_at": str(item.get("created_at") or ""),
-                "age_days": item.get("age_days"),
-                "size_bytes": size_bytes,
-                "size_bytes_status": size_status,
-                "in_db": bool(item.get("in_db")),
-                "exists": exists,
-                "path_identity": identity,
-                "append_only_evidence_retained": True,
-                **({"global_refusal_reasons": selection["global_refusal_reasons"]}
-                   if selection.get("global_refusal_reasons") and not candidates else {}),
-            },
-        })
-    # Also surface protected as refusals (informational). Read-only estimates
-    # use one deterministic entry budget for the complete graph preview.
-    for item in sorted(selection.get("protected", []),
-                       key=lambda row: str(row.get("snapshot_id") or "")):
-        sid = str(item.get("snapshot_id") or "")
-        from .graph_snapshot_store import _snapshot_root, _snapshot_id_is_component
-        valid_id = _snapshot_id_is_component(sid)
-        actual_path = str(_snapshot_root(project_id, sid)) if valid_id else ""
-        size_bytes, size_status = _snapshot_directory_size(
-            actual_path, remaining_entries=remaining_size_entries,
-        ) if valid_id else (None, "snapshot_id_path_invalid")
-        protection_reasons = [f"protected:{r}" for r in
-                              (item.get("reasons") or ["protected"])]
-        if not valid_id:
-            protection_reasons.append("snapshot_id_path_invalid")
-        candidates.append({
-            "candidate_id": _candidate_id("graph_snapshot_protected", sid),
-            "artifact_type": "graph_snapshot_dir",
-            "action": ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
-            "snapshot_id": sid,
-            "path": actual_path,
-            "safe_to_apply": False,
-            "refusal_reasons": protection_reasons,
-            "evidence": {
-                "snapshot_kind": str(item.get("snapshot_kind") or ""),
-                "status": str(item.get("status") or ""),
-                "created_at": str(item.get("created_at") or ""),
-                "size_bytes": size_bytes,
-                "size_bytes_status": size_status,
-                "protected": True,
-                "exists": bool(item.get("dir_exists")),
-                "path_identity": _path_identity(actual_path),
-                "append_only_evidence_retained": True,
-                **({"global_refusal_reasons": selection["global_refusal_reasons"]}
-                   if selection.get("global_refusal_reasons") and not candidates else {}),
-            },
-        })
+    with phase("sizing"):
+        remaining_size_entries = [_SNAPSHOT_SIZE_MAX_ENTRIES_PER_PREVIEW]
+        for item in selection.get("candidates", []):
+            sid = str(item.get("snapshot_id") or "")
+            from .graph_snapshot_store import _snapshot_root, _snapshot_id_is_component
+            valid_id = _snapshot_id_is_component(sid)
+            actual_path = str(_snapshot_root(project_id, sid)) if valid_id else ""
+            exists = bool(item.get("dir_exists"))
+            status = str(item.get("status") or "")
+            identity = _path_identity(actual_path)
+            size_bytes, size_status = _snapshot_directory_size(
+                actual_path, remaining_entries=remaining_size_entries,
+            ) if valid_id else (None, "snapshot_id_path_invalid")
+            safe = bool(exists and valid_id and item.get("in_db")
+                        and status == "superseded"
+                        and selection.get("reference_authority_complete") is True
+                        and fence.get("clear") is True
+                        and identity is not None)
+            refusal_reasons: list[str] = []
+            if not exists:
+                refusal_reasons.append("snapshot_dir_missing")
+            if not sid:
+                refusal_reasons.append("snapshot_id_empty")
+            elif not valid_id:
+                refusal_reasons.append("snapshot_id_path_invalid")
+            if not item.get("in_db") or status != "superseded":
+                refusal_reasons.append("snapshot_ownership_or_status_unverified")
+            if selection.get("reference_authority_complete") is not True:
+                refusal_reasons.extend(selection.get("global_refusal_reasons") or ["reference_authority_incomplete"])
+            if fence.get("clear") is not True:
+                refusal_reasons.append("global_current_full_build_fence_active")
+            if exists and identity is None:
+                refusal_reasons.append("snapshot_path_identity_unverified")
+            candidates.append({
+                "candidate_id": _candidate_id("graph_snapshot", sid or actual_path),
+                "artifact_type": "graph_snapshot_dir",
+                "action": ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
+                "snapshot_id": sid,
+                "path": actual_path,
+                "safe_to_apply": safe,
+                "refusal_reasons": refusal_reasons,
+                "evidence": {
+                    "snapshot_kind": str(item.get("snapshot_kind") or ""),
+                    "status": str(item.get("status") or ""),
+                    "created_at": str(item.get("created_at") or ""),
+                    "age_days": item.get("age_days"),
+                    "size_bytes": size_bytes,
+                    "size_bytes_status": size_status,
+                    "in_db": bool(item.get("in_db")),
+                    "exists": exists,
+                    "path_identity": identity,
+                    "append_only_evidence_retained": True,
+                    **({"global_refusal_reasons": selection["global_refusal_reasons"]}
+                       if selection.get("global_refusal_reasons") and not candidates else {}),
+                },
+            })
+        # Also surface protected as refusals (informational). Read-only estimates
+        # use one deterministic entry budget for the complete graph preview.
+        for item in sorted(selection.get("protected", []),
+                           key=lambda row: str(row.get("snapshot_id") or "")):
+            sid = str(item.get("snapshot_id") or "")
+            from .graph_snapshot_store import _snapshot_root, _snapshot_id_is_component
+            valid_id = _snapshot_id_is_component(sid)
+            actual_path = str(_snapshot_root(project_id, sid)) if valid_id else ""
+            size_bytes, size_status = _snapshot_directory_size(
+                actual_path, remaining_entries=remaining_size_entries,
+            ) if valid_id else (None, "snapshot_id_path_invalid")
+            protection_reasons = [f"protected:{r}" for r in
+                                  (item.get("reasons") or ["protected"])]
+            if not valid_id:
+                protection_reasons.append("snapshot_id_path_invalid")
+            candidates.append({
+                "candidate_id": _candidate_id("graph_snapshot_protected", sid),
+                "artifact_type": "graph_snapshot_dir",
+                "action": ACTION_REMOVE_STALE_GRAPH_SNAPSHOT,
+                "snapshot_id": sid,
+                "path": actual_path,
+                "safe_to_apply": False,
+                "refusal_reasons": protection_reasons,
+                "evidence": {
+                    "snapshot_kind": str(item.get("snapshot_kind") or ""),
+                    "status": str(item.get("status") or ""),
+                    "created_at": str(item.get("created_at") or ""),
+                    "size_bytes": size_bytes,
+                    "size_bytes_status": size_status,
+                    "protected": True,
+                    "exists": bool(item.get("dir_exists")),
+                    "path_identity": _path_identity(actual_path),
+                    "append_only_evidence_retained": True,
+                    **({"global_refusal_reasons": selection["global_refusal_reasons"]}
+                       if selection.get("global_refusal_reasons") and not candidates else {}),
+                },
+            })
     return candidates
 
 
@@ -1144,6 +1149,7 @@ def build_stale_artifact_cleanup_projection(
     response_budget: bool = True,
     archive_enrichment: bool = True,
     _run_selection: Any = None,
+    _phase_timing: Any = None,
 ) -> dict[str, Any]:
     """Return a dry-run projection; no artifacts or append-only evidence are deleted.
 
@@ -1197,7 +1203,8 @@ def build_stale_artifact_cleanup_projection(
         }
         return _bounded_cleanup_projection(result) if response_budget else result
     if dim == DIMENSION_GRAPH_SNAPSHOTS:
-        graph_items = _build_graph_snapshot_candidates(conn, project_id)
+        graph_items = (_build_graph_snapshot_candidates(conn, project_id, _phase_timing)
+                       if _phase_timing else _build_graph_snapshot_candidates(conn, project_id))
         total = len(graph_items)
         visible = graph_items[:PREVIEW_LIMIT]
         safe = sum(item.get("safe_to_apply") is True for item in graph_items)
@@ -1427,7 +1434,8 @@ def build_stale_artifact_cleanup_projection(
     # Add graph-snapshot dimension candidates unless scoped to worktrees only
     snapshot_candidates: list[dict[str, Any]] = []
     if dim != DIMENSION_WORKTREES:
-        snapshot_candidates = _build_graph_snapshot_candidates(conn, project_id)
+        snapshot_candidates = (_build_graph_snapshot_candidates(conn, project_id, _phase_timing)
+                       if _phase_timing else _build_graph_snapshot_candidates(conn, project_id))
 
     # Filter worktree candidates if scoped to snapshots only
     if dim == DIMENSION_GRAPH_SNAPSHOTS:

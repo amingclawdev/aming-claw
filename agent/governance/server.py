@@ -5730,6 +5730,72 @@ def _dashboard_read_profiled_request(function):
     return wrapped
 
 
+class _CleanupRequestTiming:
+    """Bounded, payload-free attribution for one cleanup HTTP request."""
+
+    MAX_RECORDS = 32
+    PHASES = frozenset({"request", "project_root", "db_connect", "operator",
+                        "projection", "selection", "build_fence", "sizing",
+                        "wire_budget", "encoding", "response"})
+
+    def __init__(self, request_id: str, project_id: str):
+        def safe(value):
+            value = str(value or "")
+            return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) else "unavailable"
+        self.request_id = safe(request_id)
+        self.project_id = safe(project_id)
+        self.started = time.monotonic()
+        self.thread_clock = getattr(time, "thread_time", None)
+        self.thread_started = self.thread_clock() if self.thread_clock else None
+        self.records = 0
+        self.finished = False
+        self._record("request", "begin", "pending")
+
+    def _record(self, phase, event, outcome, started=None, thread_started=None):
+        if self.records >= self.MAX_RECORDS - (event != "final"):
+            return
+        self.records += 1
+        now = time.monotonic()
+        record = {"request_id": self.request_id, "project_id": self.project_id,
+                  "mode": "dry_run", "phase": phase, "event": event,
+                  "outcome": outcome, "elapsed_ms": round((now - self.started) * 1000, 3)}
+        if started is not None:
+            record["phase_elapsed_ms"] = round((now - started) * 1000, 3)
+        if self.thread_clock:
+            cpu = self.thread_clock()
+            record["thread_ms"] = round((cpu - self.thread_started) * 1000, 3)
+            if thread_started is not None:
+                record["phase_thread_ms"] = round((cpu - thread_started) * 1000, 3)
+        try:
+            log.info("cleanup_request_phase %s", json.dumps(record, sort_keys=True, separators=(",", ":")))
+        except Exception:
+            # Observability must not change response or connection semantics.
+            pass
+
+    @contextmanager
+    def phase(self, name):
+        if name not in self.PHASES or self.finished:
+            yield
+            return
+        started = time.monotonic()
+        cpu = self.thread_clock() if self.thread_clock else None
+        self._record(name, "begin", "pending")
+        outcome = "ok"
+        try:
+            yield
+        except BaseException as exc:
+            outcome = ("disconnect" if isinstance(exc, (ConnectionAbortedError,
+                       ConnectionResetError, BrokenPipeError)) else "error")
+            raise
+        finally:
+            self._record(name, "end", outcome, started, cpu)
+
+    def finish(self, outcome):
+        if not self.finished:
+            self.finished = True
+            self._record("request", "final", outcome)
+
+
 class GovernanceHandler(BaseHTTPRequestHandler):
     """HTTP request handler with routing and middleware."""
 
@@ -5793,24 +5859,29 @@ class GovernanceHandler(BaseHTTPRequestHandler):
     def _respond(self, code: int, body: dict, extra_headers: dict | None = None):
         if body.get("response_view") == "coordinator_current":
             body = _contract_runtime_coordinator_current_wire_response(body)
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        timing = getattr(self, "_cleanup_timing", None)
+        with timing.phase("encoding") if timing else nullcontext():
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         try:
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            headers = dict(self.CORS_HEADERS)
-            if extra_headers:
-                headers.update(extra_headers)
-            for k, v in headers.items():
-                self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(payload)
+            with timing.phase("response") if timing else nullcontext():
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                headers = dict(self.CORS_HEADERS)
+                if extra_headers:
+                    headers.update(extra_headers)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(payload)
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError) as e:
-            # observer-hotfix 2026-04-25: Windows clients drop connections
-            # mid-write (gateway timeouts, executor restarts). Don't let
-            # the connection death propagate up the request thread and
-            # crash the gov server. Just log and move on.
+            if timing:
+                timing.finish("disconnect")
+            # Preserve the existing connection-drop behavior.
             log.debug("client connection dropped during _respond: %s", e)
+        else:
+            if timing:
+                timing.finish("ok" if code < 400 else "error")
 
     def _respond_bytes(
         self,
@@ -5871,6 +5942,10 @@ class GovernanceHandler(BaseHTTPRequestHandler):
                 return
             self._respond(404, {"error": "not_found", "message": "Endpoint not found"})
             return
+        timing = (_CleanupRequestTiming(request_id, path_params.get("project_id", ""))
+                  if method == "GET" and handler is handle_graph_governance_stale_artifact_cleanup
+                  else None)
+        self._cleanup_timing = timing
         try:
             request_body = self._read_body() if method in ("POST", "PUT") else {}
             request_query = self._query_params()
@@ -5968,6 +6043,13 @@ class GovernanceHandler(BaseHTTPRequestHandler):
                 "message": str(e),
                 "request_id": request_id,
             })
+
+        finally:
+            if timing:
+                # Covers handler/encoding/unexpected response failures; _respond
+                # owns successful writes and observed disconnect finalization.
+                timing.finish("error")
+            self._cleanup_timing = None
 
     def do_GET(self):
         self._handle("GET")
@@ -90771,26 +90853,34 @@ def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
     if cow_requested and not ctx.token:
         return 401, {"ok": False, "error": "snapshot_cow_auth_required", "writes_performed": False}
 
-    root = _graph_governance_project_root(project_id, ctx.query)
-    conn = get_connection(project_id)
+    timing = getattr(ctx.handler, "_cleanup_timing", None)
+    phase = timing.phase if timing else lambda _name: nullcontext()
+    with phase("project_root"):
+        root = _graph_governance_project_root(project_id, ctx.query)
+    with phase("db_connect"):
+        conn = get_connection(project_id)
     try:
-        _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.dry-run")
+        with phase("operator"):
+            _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.dry-run")
         if cow_requested and ctx.require_auth(conn).get("project_id") != project_id:
             return 403, {"ok": False, "error": "snapshot_cow_auth_project_mismatch", "writes_performed": False}
         try:
-            result = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
-                conn,
-                project_id,
-                repo_root_path=root,
-                include_unowned=_query_bool(ctx.query, "include_unowned", True),
-                dimension=str(ctx.query.get("dimension") or ""),
-            )
-            if (stale_artifact_cleanup.cleanup_response_wire_bytes(result)["http"]
-                    > stale_artifact_cleanup._CLEANUP_HTTP_MAX_BYTES):
-                return 400, {
-                    "ok": False, "error": "cleanup_response_encoding_refused",
-                    "apply_plan_available": False, "writes_performed": False,
-                }
+            with phase("projection"):
+                result = stale_artifact_cleanup.build_stale_artifact_cleanup_projection(
+                    conn,
+                    project_id,
+                    repo_root_path=root,
+                    include_unowned=_query_bool(ctx.query, "include_unowned", True),
+                    dimension=str(ctx.query.get("dimension") or ""),
+                    **({"_phase_timing": phase} if timing else {}),
+                )
+            with phase("wire_budget"):
+                if (stale_artifact_cleanup.cleanup_response_wire_bytes(result)["http"]
+                        > stale_artifact_cleanup._CLEANUP_HTTP_MAX_BYTES):
+                    return 400, {
+                        "ok": False, "error": "cleanup_response_encoding_refused",
+                        "apply_plan_available": False, "writes_performed": False,
+                    }
             return result
         except stale_artifact_cleanup.StaleArtifactCleanupError as exc:
             return 400, stale_artifact_cleanup.bounded_cleanup_error_payload(
