@@ -242537,3 +242537,229 @@ def test_canonical_worker_action_sanitizes_original_inputs_before_placeholders(t
     assert decoded == action
     assert marker not in json.dumps(decoded)
     assert server._stable_public_hash(decoded) == manifest["action_hash"]
+
+
+# Ordinary disposable CEX observations. These fixtures never use a live world,
+# host envelope, production database, native R3 action or contract evidence write.
+def _coordinator_current_fixture_record(conn, *, terminal=False, large=False):
+    runtime = server._contract_runtime(conn)
+    contract_id = "operator_supervised_direct_main" if terminal else "mf_parallel.v2"
+    parent = None
+    if not terminal:
+        backlog = "AC-COORDINATOR-OBSERVATION-FIXTURE"
+        _insert_source_backed_onboarding_backlog(conn, backlog)
+        parent = runtime.start_execution(
+            "onboard_contract", project_id=PID, backlog_id=backlog,
+            actor_role="observer", contract_execution_id="cex-coordinator-fixture-parent",
+        )
+        _complete_source_backed_onboarding(conn, parent["contract_execution_id"])
+    record = runtime.start_execution(
+        contract_id, version="v1" if terminal else "v2",
+        revision="rev2" if terminal else "rev3", project_id=PID,
+        backlog_id="AC-COORDINATOR-OBSERVATION-FIXTURE",
+        actor_role="observer", contract_execution_id="cex-coordinator-observation",
+        route_token_ref="rtok-disposable-observation",
+        parent_contract_execution_id=parent["contract_execution_id"] if parent else "",
+        root_contract_execution_id=parent["root_contract_execution_id"] if parent else "",
+        contract_chain_id=parent["contract_chain_id"] if parent else "",
+    )
+    if terminal:
+        stored = runtime.store.get(record["contract_execution_id"])
+        stored["completed_lines"] = [{
+            "stage_id": "qa", "line_id": "qa_independent_verification",
+            "actor_role": "qa", "evidence_kind": "independent_verification",
+            "status": "failed", "payload": {"fixture": "ordinary failed QA"},
+        }]
+        stored["execution_state_revision"] = 2
+        runtime.store.update(record["contract_execution_id"], stored)
+    record = runtime.current_record(record["contract_execution_id"], actor_role="observer")
+    if large:
+        # Persist the ordinary large continuation dimensions in this disposable
+        # fixture, then read that exact source record back; no production import.
+        copy_payload = record["runtime_guide"]["writer_role_safe_copy_payload"]["copy_payload"]
+        copy_payload["payload"] = {"bounded_workers": [
+            {"worker_id": "fixture-worker", "notes": "汉字é\\\"" * 20_000},
+        ], "mf_sub_host_bridge_guidance": {
+            "copy_safe_bridge_payload": {"fixture": "continuation" * 10_000},
+        }}
+        runtime.store.update(record["contract_execution_id"], record)
+        record = runtime.store.get(record["contract_execution_id"])
+    conn.commit()
+    return record
+
+
+def _coordinator_current_observe_record(record, native=None, **overrides):
+    native = native or server._contract_runtime_response(record, actor_role="observer")
+    inputs = {
+        "project_id": record["project_id"],
+        "contract_execution_id": record["contract_execution_id"],
+        "actor_role": "observer", "request_id": "req-coordinator-fixture",
+        **overrides,
+    }
+    return server._contract_runtime_coordinator_current_response(record, native, **inputs)
+
+
+def test_coordinator_current_large_source_action_exact_identity_without_body(conn):
+    record = _coordinator_current_fixture_record(conn, large=True)
+    before = server.stable_sha256(record)
+    native = server._contract_runtime_response(record, actor_role="observer")
+    action = native["next_legal_action"]
+    assert len(json.dumps(action, ensure_ascii=False).encode("utf-8")) > 96_397
+    observed = _coordinator_current_observe_record(record, native)
+    assert observed["ok"] is True, observed
+    assert observed["schema_version"] == "contract_runtime.coordinator_current.v1"
+    assert observed["contract_id"] == "mf_parallel.v2"
+    for field in (
+        "project_id", "backlog_id", "contract_execution_id", "contract_id",
+        "contract_revision_id", "contract_hash", "execution_state_revision",
+        "execution_state_hash", "runtime_guide_hash",
+    ):
+        assert observed[field] == native[field]
+        assert observed["next_legal_action"]["source_binding"][field] == native[field]
+    selected = observed["next_legal_action"]
+    assert selected["action_hash"] == server.stable_sha256(action)
+    assert selected["source_path"] == "ContractRuntime.selected_next_legal_action"
+    for field in ("action", "line_id", "stage_id", "owner_role"):
+        assert selected[field] == action[field]
+    wire = json.dumps(observed, ensure_ascii=False).encode("utf-8")
+    assert len(wire) < 4096
+    assert b"copy_payload" not in wire
+    assert b"rtok-disposable-observation" not in wire
+    assert b"mf_sub_host_bridge_guidance" not in wire
+    assert observed["observation_only"] is True
+    assert observed["terminal"] is None
+    assert observed["eligibility"]["current_eligible"] is None
+    assert server.stable_sha256(record) == before
+    assert server._contract_runtime_store(conn).get(record["contract_execution_id"]) == record
+
+
+def test_coordinator_current_native_gate_and_project_scope_are_shared(conn, monkeypatch):
+    backlog_id = "AC-COORDINATOR-NATIVE-CURRENT"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    started = server._contract_runtime(conn).start_execution(
+        "onboard_contract", project_id=PID, backlog_id=backlog_id,
+        actor_role="observer", contract_execution_id="cex-coordinator-native-current",
+    )
+    ctx = _ctx_with_role(
+        {"project_id": PID, "contract_execution_id": started["contract_execution_id"]},
+        "observer", query={"response_view": "coordinator_current"},
+    )
+    observed = server.handle_project_contract_runtime_current_state(ctx)
+    record = server._contract_runtime_read(
+        conn, contract_execution_id=started["contract_execution_id"], actor_role="observer",
+    )
+    assert observed["ok"] is True, observed
+    assert observed == _coordinator_current_observe_record(record, request_id=ctx.request_id)
+    assert _coordinator_current_observe_record(record, project_id="foreign-project")["error"] == (
+        "coordinator_current_scope_mismatch"
+    )
+    assert _coordinator_current_observe_record(record, contract_execution_id="foreign-cex")["error"] == (
+        "coordinator_current_scope_mismatch"
+    )
+    def denied(*_args, **_kwargs):
+        raise server.PermissionDeniedError("worker", "contract_runtime_current", {})
+    monkeypatch.setattr(server, "_contract_runtime_effective_actor_role", denied)
+    with pytest.raises(server.PermissionDeniedError):
+        server.handle_project_contract_runtime_current_state(ctx)
+
+
+def test_coordinator_current_terminal_no_pass_preserves_native_disposition(conn):
+    record = _coordinator_current_fixture_record(conn, terminal=True)
+    native = server._contract_runtime_response(record, actor_role="observer")
+    observed = _coordinator_current_observe_record(record, native)
+    assert observed["ok"] is True, observed
+    assert observed["terminal"] is True
+    assert observed["readiness_state"] == "terminal_no_pass"
+    assert observed["no_pass_claim"] is True
+    assert observed["write_eligible"] is False
+    assert observed["eligibility"]["write_eligible"] is False
+    source = record["runtime_guide"]["terminal_disposition"]
+    for field, value in source.items():
+        if field in observed["terminal_disposition"]:
+            assert observed["terminal_disposition"][field] == value
+    assert observed["terminal_disposition"]["source_hash"] == server.stable_sha256(source)
+    assert observed["terminal_disposition"]["no_pass_claim"] is True
+    assert observed["terminal_disposition"]["write_eligible"] is False
+    assert observed["next_legal_action"] is None
+    assert observed["execution_state_hash"] == native["execution_state_hash"]
+
+
+def test_coordinator_current_missing_action_does_not_invent_terminal(conn):
+    record = _coordinator_current_fixture_record(conn)
+    record["runtime_guide"]["next_legal_action"] = None
+    observed = _coordinator_current_observe_record(record)
+    assert observed["ok"] is True
+    assert observed["terminal"] is None
+    assert observed["next_legal_action"] is None
+    assert observed["no_pass_claim"] is None
+    assert observed["write_eligible"] is None
+
+
+def test_coordinator_current_refuses_foreign_selected_action_and_source_binding(conn):
+    record = _coordinator_current_fixture_record(conn)
+    native = server._contract_runtime_response(record, actor_role="observer")
+    epoch_native = copy.deepcopy(native)
+    epoch_native["next_legal_action"]["contract_execution_id"] = "cex-other-epoch"
+    refused = _coordinator_current_observe_record(record, epoch_native)
+    assert refused["error"] == "coordinator_current_action_source_mismatch"
+    assert refused["ok"] is False
+    # Ordinary inconsistent guide execution cannot borrow the record's state.
+    record["runtime_guide"]["execution"]["execution_state_hash"] = "sha256:" + "0" * 64
+    refused = _coordinator_current_observe_record(record)
+    assert refused["error"] == "coordinator_current_action_source_mismatch"
+    assert len(json.dumps(refused).encode("utf-8")) < 512
+    assert refused["next_legal_action"] is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("backlog_id", "界" * 342),
+    ("contract_id", "x" * 1025),
+    ("execution_state_revision", 0),
+    ("definition_hash", "a" * 64),
+], ids=["unicode-backlog", "long-contract", "zero-revision", "bare-hash"])
+def test_coordinator_current_authoritative_identity_refused_without_truncation(conn, field, value):
+    record = _coordinator_current_fixture_record(conn)
+    record[field] = value
+    observed = _coordinator_current_observe_record(record)
+    assert observed["ok"] is False
+    assert observed["error"] in {
+        "coordinator_current_identity_unbounded", "coordinator_current_identity_invalid",
+    }
+    assert "backlog_id" not in observed
+    assert "contract_id" not in observed
+    assert len(json.dumps(observed).encode("utf-8")) < 512
+
+
+def _coordinator_current_http_bytes(body):
+    # The real final serializer/Content-Length path, with an in-memory socket.
+    handler = object.__new__(server.GovernanceHandler)
+    handler.wfile = io.BytesIO()
+    handler.send_response = lambda _code: None
+    headers = {}
+    handler.send_header = lambda key, value: headers.__setitem__(key, value)
+    handler.end_headers = lambda: None
+    handler._respond(200, body)
+    wire = handler.wfile.getvalue()
+    assert int(headers["Content-Length"]) == len(wire)
+    return wire
+
+
+def test_coordinator_current_actual_http_bound_covers_unicode_and_late_additions(conn):
+    observed = _coordinator_current_observe_record(_coordinator_current_fixture_record(conn))
+    assert observed["ok"] is True
+    baseline = len(json.dumps({**observed, "late_projection": ""}, ensure_ascii=False).encode("utf-8"))
+    exact = {**observed, "late_projection": "界" + "x" * (16_384 - baseline - 3)}
+    assert len(_coordinator_current_http_bytes(exact)) == 16_384
+    oversized = {**exact, "late_projection": exact["late_projection"] + "é"}
+    assert len(json.dumps(oversized, ensure_ascii=False).encode("utf-8")) == 16_386
+    refused_wire = _coordinator_current_http_bytes(oversized)
+    assert len(refused_wire) < 512
+    refused = json.loads(refused_wire)
+    assert refused["ok"] is False
+    assert refused["error"] == "coordinator_current_wire_unbounded"
+    assert refused["next_legal_action"] is None
+    # A late runtime/epoch body cannot escape the bound, or become authority.
+    late = {**observed, "runtime_context": {"notes": "界" * 10_000}}
+    assert json.loads(_coordinator_current_http_bytes(late))["error"] == (
+        "coordinator_current_wire_unbounded"
+    )

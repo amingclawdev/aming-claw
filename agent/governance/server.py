@@ -5791,6 +5791,8 @@ class GovernanceHandler(BaseHTTPRequestHandler):
 
     @dashboard_read_timed("server.respond_json_headers_body")
     def _respond(self, code: int, body: dict, extra_headers: dict | None = None):
+        if body.get("response_view") == "coordinator_current":
+            body = _contract_runtime_coordinator_current_wire_response(body)
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         try:
             self.send_response(code)
@@ -126785,6 +126787,239 @@ def _contract_runtime_response(
     return response
 
 
+_CONTRACT_RUNTIME_COORDINATOR_CURRENT_MAX_BYTES = 16_384
+_CONTRACT_RUNTIME_COORDINATOR_CURRENT_SCHEMA = "contract_runtime.coordinator_current.v1"
+
+
+def _contract_runtime_coordinator_current_refusal(reason: str) -> dict[str, Any]:
+    # Never echo an unbounded identity or an executable action in a refusal.
+    return {
+        "schema_version": _CONTRACT_RUNTIME_COORDINATOR_CURRENT_SCHEMA,
+        "response_view": "coordinator_current",
+        "ok": False,
+        "error": reason,
+        "observation_only": True,
+        "source_of_authority": "ContractRuntime",
+        "terminal": None,
+        "next_legal_action": None,
+        "zero_write": True,
+    }
+
+
+def _contract_runtime_coordinator_current_wire_response(
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    # Use exactly the HTTP serializer, including spaces and UTF-8 encoding.
+    # This is also called by _respond after all endpoint/handler additions.
+    if len(json.dumps(response, ensure_ascii=False).encode("utf-8")) <= (
+        _CONTRACT_RUNTIME_COORDINATOR_CURRENT_MAX_BYTES
+    ):
+        return response
+    return _contract_runtime_coordinator_current_refusal(
+        "coordinator_current_wire_unbounded"
+    )
+
+
+def _contract_runtime_coordinator_current_response(
+    record: Mapping[str, Any],
+    native_response: Mapping[str, Any],
+    *,
+    project_id: str,
+    contract_execution_id: str,
+    actor_role: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Observe one native CEX selection without exporting its executable body."""
+    refuse = _contract_runtime_coordinator_current_refusal
+    if (
+        record.get("project_id") != project_id
+        or record.get("contract_execution_id") != contract_execution_id
+    ):
+        return refuse("coordinator_current_scope_mismatch")
+    state = _runtime_current_state_from_record(record)
+    guide = _contract_runtime_guide_for_response(record, actor_role=actor_role)
+    canonical_action = _runtime_next_action_from_guide(guide)
+    current_action = state.get("next_legal_action") or {}
+    if current_action.get("fresh_authority_required") is True:
+        canonical_action = dict(current_action)
+    selected_action = native_response.get("next_legal_action") or {}
+    if not isinstance(selected_action, Mapping) or (
+        stable_sha256(selected_action) != stable_sha256(canonical_action)
+    ):
+        return refuse("coordinator_current_action_source_mismatch")
+
+    identity = {
+        "project_id": record.get("project_id"),
+        "backlog_id": record.get("backlog_id"),
+        "contract_execution_id": record.get("contract_execution_id"),
+        "contract_id": record.get("contract_id"),
+        "contract_revision_id": record.get("revision"),
+        "contract_hash": record.get("definition_hash"),
+        "execution_state_revision": record.get("execution_state_revision"),
+        "execution_state_hash": state["execution_state_hash"],
+        "runtime_guide_hash": state["runtime_guide_hash"],
+    }
+    for field, value in identity.items():
+        if field == "execution_state_revision":
+            if type(value) is not int or not 1 <= value <= 2**63 - 1:
+                return refuse("coordinator_current_identity_invalid")
+        elif not isinstance(value, str) or not value:
+            return refuse("coordinator_current_identity_invalid")
+        elif len(value.encode("utf-8")) > 1024:
+            return refuse("coordinator_current_identity_unbounded")
+    for field in ("contract_hash", "execution_state_hash", "runtime_guide_hash"):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", identity[field]):
+            return refuse("coordinator_current_identity_invalid")
+    source_execution = guide.get("execution") or {}
+    source_contract = guide.get("contract") or {}
+    if not isinstance(source_execution, Mapping) or not isinstance(source_contract, Mapping):
+        return refuse("coordinator_current_action_source_mismatch")
+    if any(
+        source_execution.get(field) != identity[field]
+        for field in (
+            "project_id", "backlog_id", "contract_execution_id",
+            "execution_state_revision",
+        )
+    ) or any(
+        source_contract.get(source_field) != identity[identity_field]
+        for source_field, identity_field in (
+            ("contract_id", "contract_id"), ("revision", "contract_revision_id"),
+            ("definition_hash", "contract_hash"),
+        )
+    ):
+        return refuse("coordinator_current_action_source_mismatch")
+    for value in (actor_role, request_id):
+        if not isinstance(value, str) or not value:
+            return refuse("coordinator_current_identity_invalid")
+        if len(value.encode("utf-8")) > 128:
+            return refuse("coordinator_current_identity_unbounded")
+
+    execution_state = record.get("execution_state") or {}
+    terminal_source = state.get("terminal", execution_state.get("terminal"))
+    if terminal_source is not None and type(terminal_source) is not bool:
+        return refuse("coordinator_current_terminal_identity_invalid")
+    terminal = terminal_source
+    terminal_source_fields = state.get("terminal_disposition") or {}
+    if not isinstance(terminal_source_fields, Mapping):
+        return refuse("coordinator_current_terminal_identity_invalid")
+    terminal_disposition = None
+    if terminal_source_fields:
+        terminal_disposition = {}
+        for field in (
+            "schema_version", "status", "readiness_state", "disposition", "terminal",
+            "scheduler_eligible", "schedulable", "current_eligible", "close_eligible",
+            "closeable", "resume_eligible", "resumable", "retry_eligible",
+            "write_eligible", "no_pass_claim", "authoritative_pass_synthesized",
+            "history_rewrite_allowed", "repair_requires_separate_backlog_row",
+            "source_completed_line_index", "source_stage_id", "source_line_id",
+            "source_status", "source_line_hash", "policy_field", "policy_value",
+            "source_of_authority", "disposition_hash",
+        ):
+            if field not in terminal_source_fields:
+                continue
+            value = terminal_source_fields[field]
+            if isinstance(value, str):
+                if len(value.encode("utf-8")) > 1024:
+                    return refuse("coordinator_current_identity_unbounded")
+            elif type(value) is bool:
+                pass
+            elif field == "source_completed_line_index" and type(value) is int:
+                if not 0 <= value <= 2**63 - 1:
+                    return refuse("coordinator_current_terminal_identity_invalid")
+            else:
+                return refuse("coordinator_current_terminal_identity_invalid")
+            terminal_disposition[field] = value
+        terminal_disposition.update({
+            "source_path": "ContractRuntime.runtime_guide.terminal_disposition",
+            "source_hash": stable_sha256(terminal_source_fields),
+        })
+    action_identity = None
+    if selected_action:
+        # The action's source fields originate in this same native record.
+        # An epoch/facade action from another CEX or revision cannot borrow it.
+        if any(
+            selected_action.get(field) != identity[field]
+            for field in (
+                "contract_execution_id", "execution_state_revision",
+                "execution_state_hash", "runtime_guide_hash",
+            )
+        ):
+            return refuse("coordinator_current_action_source_mismatch")
+        for field in ("project_id", "backlog_id", "contract_id", "contract_hash"):
+            if field in selected_action and selected_action[field] != identity[field]:
+                return refuse("coordinator_current_action_source_mismatch")
+        labels = {
+            field: selected_action.get(field, "")
+            for field in ("action", "line_id", "stage_id", "owner_role")
+        }
+        if any(
+            not isinstance(value, str) or len(value.encode("utf-8")) > 256
+            for value in labels.values()
+        ) or not labels["action"] or not labels["line_id"]:
+            return refuse("coordinator_current_action_identity_invalid")
+        action_identity = {
+            **labels,
+            "source_binding": dict(identity),
+            "source_path": "ContractRuntime.selected_next_legal_action",
+            "action_hash": stable_sha256(selected_action),
+        }
+        for field in ("actionable", "fresh_authority_required"):
+            value = selected_action.get(field)
+            if value is not None and type(value) is not bool:
+                return refuse("coordinator_current_action_identity_invalid")
+            action_identity[field] = value
+        if terminal is True:
+            # A terminal native action is not executable, but preserve its hash
+            # only by refusing contradictory source rather than inventing state.
+            if selected_action.get("actionable") is not False:
+                return refuse("coordinator_current_action_source_mismatch")
+            action_identity = None
+
+    response = {
+        "schema_version": _CONTRACT_RUNTIME_COORDINATOR_CURRENT_SCHEMA,
+        "response_view": "coordinator_current",
+        "ok": True,
+        "source_of_authority": "ContractRuntime",
+        "observation_only": True,
+        "actor_role": actor_role,
+        "request_id": request_id,
+        **identity,
+        "terminal": terminal,
+        "readiness_state": state.get("readiness_state", ""),
+        "row_status": state.get("row_status"),
+        "source_row_status": state.get("source_row_status"),
+        "disposition": state.get("disposition"),
+        "eligibility": {},
+        "no_pass_claim": None,
+        "write_eligible": None,
+        "terminal_disposition": terminal_disposition,
+        "next_legal_action": action_identity,
+    }
+    for field in ("readiness_state", "row_status", "source_row_status", "disposition"):
+        value = response[field]
+        if value is not None and (
+            not isinstance(value, str) or len(value.encode("utf-8")) > 256
+        ):
+            return refuse("coordinator_current_identity_unbounded")
+    for field in (
+        "scheduler_eligible", "schedulable", "current_eligible", "close_eligible",
+        "closeable", "resume_eligible", "resumable", "retry_eligible",
+        "write_eligible", "historical_pinned_read_only",
+    ):
+        value = state.get(field, execution_state.get(field, terminal_source_fields.get(field)))
+        if value is not None and type(value) is not bool:
+            return refuse("coordinator_current_identity_invalid")
+        response["eligibility"][field] = value
+    response["write_eligible"] = response["eligibility"]["write_eligible"]
+    no_pass_claim = state.get(
+        "no_pass_claim", execution_state.get("no_pass_claim", terminal_source_fields.get("no_pass_claim"))
+    )
+    if no_pass_claim is not None and type(no_pass_claim) is not bool:
+        return refuse("coordinator_current_terminal_identity_invalid")
+    response["no_pass_claim"] = no_pass_claim
+    return _contract_runtime_coordinator_current_wire_response(response)
+
+
 def _contract_runtime_bounded_line_write_response(
     response: Mapping[str, Any],
     *,
@@ -239268,6 +239503,15 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
         ):
             response["next_legal_action"] = active_epoch_resume
         response["position_skippable"] = False
+    if response_view == "coordinator_current":
+        return _contract_runtime_coordinator_current_response(
+            public_record,
+            response,
+            project_id=project_id,
+            contract_execution_id=contract_execution_id,
+            actor_role=actor_role,
+            request_id=ctx.request_id,
+        )
     return response
 
 
