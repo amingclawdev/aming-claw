@@ -7438,3 +7438,26 @@ def test_reference_memo_template_preserves_marker_like_tokens_and_columns(conn, 
     projection = '"__reference_memo_0_0__",__reference_memo_0_0__,__reference_memo_0_1__'
     rows = list(store._reference_pages(conn, 'memo_fixture', projection, reusable={'body': expressions}))
     assert [tuple(r) for r in rows] == [(1, 'literal-column', '["pin"]', 1)]
+
+
+@pytest.mark.parametrize('suffix', ['cursor', 'body_0', 'storage_0', 'v0_0', 'v0_1'])
+@pytest.mark.parametrize('prefix', ['__AC_REFERENCE_', '__Ac_Reference_', '__ac_reference_'])
+def test_reference_memo_alias_ascii_casefold_preserves_exact_owner_columns(conn, monkeypatch, suffix, prefix):
+    column = prefix + suffix
+    # A second case-insensitive collision requires another namespace advance.
+    conn.execute(f'CREATE TABLE alias_fixture(project_id TEXT,body TEXT COLLATE NOCASE,"{column}" TEXT,"__AC_REFERENCE__cursor" TEXT)')
+    rowids = [-9, 0] + list(range(3, 78))
+    conn.executemany(f'INSERT INTO alias_fixture(rowid,project_id,body,"{column}","__AC_REFERENCE__cursor") VALUES (?,?,?,?,?)',
+        [(rid, PID, 'known' if i % 2 == 0 else 'KNOWN', 'original-column', 'deep-column') for i, rid in enumerate(rowids)])
+    conn.execute(f"INSERT INTO alias_fixture(rowid,project_id,body,\"{column}\") VALUES (1,'foreign','known','foreign-column')")
+    conn.commit()
+    image = hashlib.sha256(conn.serialize()).hexdigest()
+    expressions = store._owner_reference_projection('body', [('known', 'known')], json_owner=False)
+    projection = f'"{column}","__AC_REFERENCE__cursor",__reference_memo_0_0__,__reference_memo_0_1__'
+    with store._reference_read_snapshot(conn):
+        cached = [tuple(r) for r in store._reference_pages(conn, 'alias_fixture', projection, 'project_id=?', (PID,), reusable={'body': expressions})]
+        with monkeypatch.context() as m:
+            m.setattr(store, '_reference_memo_page', lambda *args: None)
+            uncached = [tuple(r) for r in store._reference_pages(conn, 'alias_fixture', projection, 'project_id=?', (PID,), reusable={'body': expressions})]
+    assert cached == uncached == [(rid, 'original-column', 'deep-column', '["known"]' if i % 2 == 0 else '[]', 1) for i, rid in enumerate(rowids)]
+    assert image == hashlib.sha256(conn.serialize()).hexdigest() and not conn.in_transaction

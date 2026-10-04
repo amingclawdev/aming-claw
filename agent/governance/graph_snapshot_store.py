@@ -2189,7 +2189,9 @@ def _reference_memo_page(conn, source, args, cursor_key, projection, reusable, c
     if size is not None and size > _REFERENCE_MEMO_BYTES:
         return None
     prefix = "__ac_reference_"
-    while any(col.startswith(prefix) for col in columns):
+    # SQLite folds ASCII identifier case; payload bytes/column spelling stay intact.
+    identifier_fold = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+    while any(col.translate(identifier_fold).startswith(prefix) for col in columns):
         prefix += "_"
     cursor = prefix + "cursor"
     ctes = [f"page_source AS MATERIALIZED (SELECT {cursor_key} AS {cursor},*" + source + ")"]
