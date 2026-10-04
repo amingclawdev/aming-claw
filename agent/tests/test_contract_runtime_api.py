@@ -9,7 +9,6 @@ import pytest
 from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store
 from agent.governance import server
-import pytest
 from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
 from agent.governance.contracts.write_gate import (
     _validate_worker_receipt_hash_evidence,
