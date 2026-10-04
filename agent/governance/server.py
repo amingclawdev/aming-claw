@@ -56197,6 +56197,13 @@ def _runtime_context_finish_no_pass_producer_accepted(
 ) -> bool:
     """Apply the existing premerge ledger rule before accepting a no-PASS finish."""
 
+    if _runtime_context_finish_owned_lane_claimed(value):
+        acceptance = _contract_runtime_finish_test_results_consumer_acceptance(
+            value, expected_baseline_commit=expected_baseline_commit,
+        )
+        return acceptance.get("accepted") is True and (
+            acceptance.get("complete_owned_lane") is True
+        )
     if not _runtime_context_finish_no_pass_baseline_claimed(value):
         return True
     acceptance = _contract_runtime_finish_test_results_consumer_acceptance(
@@ -147856,6 +147863,155 @@ def _contract_runtime_append_completed_line_correction(
     return runtime.store.get(contract_execution_id)
 
 
+def _runtime_context_finish_owned_lane_claimed(value: Any) -> bool:
+    """Identify the existing owned-lane comparison shape, not a PASS switch."""
+
+    return isinstance(value, Mapping) and (
+        "full_suite" in value
+        or "original_tests_unchanged" in value
+        or isinstance(value.get("baseline_comparison"), Mapping)
+        and "baseline_commit" in value["baseline_comparison"]
+    )
+
+
+def _contract_runtime_owned_lane_failure_scan(
+    value: Mapping[str, Any], *, expected_baseline_commit: str,
+) -> dict[str, Any]:
+    """Validate sibling observations before deriving a scan-only copy.
+
+    This is not authority by itself: the callers still bind the exact worker,
+    canonical ledger hash, stored line and unique durable acceptance revision.
+    No raw command, persisted result or overall-suite status is rewritten.
+    """
+
+    comparison = value.get("baseline_comparison")
+    commands = value.get("commands")
+    if not (
+        value.get("status") == "passed" and value.get("passed") is True
+        and value.get("full_suite_passed") is False
+        and value.get("overall_release_pass_claimed") is False
+        and value.get("original_tests_unchanged") is True
+        and str(value.get("scope") or "").strip()
+        and isinstance(comparison, Mapping)
+        and isinstance(commands, list) and commands
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_baseline_commit)
+        and comparison.get("baseline_commit") == expected_baseline_commit
+        and comparison.get("full_suite_passed") is False
+        and str(comparison.get("comparison_scope") or "").strip()
+        and str(comparison.get("failure_classification") or "").strip()
+    ):
+        return {}
+
+    observations = []
+    identities = []
+    for phase in ("baseline", "candidate"):
+        observation = comparison.get(phase)
+        if not isinstance(observation, Mapping):
+            return {}
+        passed, failed = observation.get("passed"), observation.get("failed")
+        ids = observation.get("failure_ids")
+        raw = observation.get("raw_command")
+        if not (
+            type(passed) is int and passed >= 0
+            and type(failed) is int and failed > 0
+            and isinstance(ids, list) and len(ids) == failed
+            and all(isinstance(item, str) and "::" in item for item in ids)
+            and len(set(ids)) == len(ids)
+            and isinstance(raw, Mapping) and type(raw.get("exit_code")) is int
+            and raw.get("exit_code") == 1
+            and isinstance(raw.get("argv"), list) and raw["argv"]
+            and all(isinstance(arg, str) for arg in raw["argv"])
+            and str(raw.get("command") or "").strip()
+            and str(raw.get("cwd") or "").strip()
+            and isinstance(raw.get("stdout"), str) and raw["stdout"]
+            and raw.get("stderr") == ""
+        ):
+            return {}
+        observations.append(observation)
+        identities.append(set(ids))
+    baseline, candidate = observations
+    baseline_ids, sibling_ids = identities
+    resolved = baseline_ids - sibling_ids
+    known = comparison.get("known_baseline_failure_ids")
+    resolved_ids = comparison.get("resolved_baseline_failure_ids")
+    if not (
+        isinstance(known, list) and isinstance(resolved_ids, list)
+        and all(isinstance(item, str) for item in known + resolved_ids)
+        and len(set(known)) == len(known)
+        and len(set(resolved_ids)) == len(resolved_ids)
+    ):
+        return {}
+    if not (
+        sibling_ids < baseline_ids
+        and comparison.get("candidate_new_failure_ids") == []
+        and set(known) == sibling_ids
+        and set(resolved_ids) == resolved
+        and baseline["passed"] + baseline["failed"]
+        == candidate["passed"] + candidate["failed"]
+        and candidate["passed"] == baseline["passed"] + len(resolved)
+        and value.get("full_suite") == {
+            "passed": candidate["passed"], "failed": candidate["failed"],
+        }
+    ):
+        return {}
+    unchanged = comparison.get("unchanged_files")
+    old_hashes = comparison.get("baseline_file_hashes")
+    new_hashes = comparison.get("candidate_file_hashes")
+    if not (
+        isinstance(unchanged, list) and unchanged
+        and all(isinstance(path, str) and path for path in unchanged)
+        and len(set(unchanged)) == len(unchanged)
+        and isinstance(old_hashes, Mapping) and isinstance(new_hashes, Mapping)
+        and set(old_hashes) == set(new_hashes)
+        and all(isinstance(path, str) and path and isinstance(digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", digest)
+                for hashes in (old_hashes, new_hashes)
+                for path, digest in hashes.items())
+        and set(unchanged) == {
+            path for path in old_hashes if old_hashes[path] == new_hashes[path]
+        }
+        and set(unchanged) < set(old_hashes)
+        and {item.split("::", 1)[0] for item in baseline_ids} <= set(unchanged)
+    ):
+        return {}
+    sibling_test_paths = {item.split("::", 1)[0] for item in sibling_ids}
+    owned_test_paths = {item.split("::", 1)[0] for item in resolved}
+    # A failing sibling test file cannot also be classified as an owned pass.
+    if sibling_test_paths & owned_test_paths:
+        return {}
+    full_cwd = baseline["raw_command"]["cwd"]
+    if candidate["raw_command"]["cwd"] != full_cwd:
+        return {}
+    focused_covered = False
+    for command in commands:
+        if not (
+            isinstance(command, Mapping) and command.get("status") == "passed"
+            and type(command.get("exit_code")) is int and command["exit_code"] == 0
+            and command.get("failed_test_ids") == []
+            and command.get("phase") in {"candidate", "candidate_contract"}
+            and isinstance(command.get("argv"), list) and command["argv"]
+            and all(isinstance(arg, str) for arg in command["argv"])
+            and str(command.get("command") or "").strip()
+            and command.get("cwd") == full_cwd
+            and isinstance(command.get("stdout"), str)
+            and command.get("stderr") == ""
+            and not sibling_test_paths.intersection(command["argv"])
+        ):
+            return {}
+        focused_covered |= owned_test_paths <= set(command["argv"])
+    if not focused_covered:
+        return {}
+    scan = deepcopy(dict(value))
+    # Only the three validated observations change names in the private view.
+    # Raw results remain immutable; arbitrary nested QA negatives still scan.
+    for observation in (
+        scan["baseline_comparison"]["baseline"],
+        scan["baseline_comparison"]["candidate"], scan["full_suite"],
+    ):
+        observation["historical_or_sibling_failed"] = observation.pop("failed")
+    return scan
+
+
 def _contract_runtime_finish_test_results_consumer_acceptance(
     value: Any,
     *,
@@ -147868,7 +148024,15 @@ def _contract_runtime_finish_test_results_consumer_acceptance(
     results = deepcopy(dict(value))
     failure_scan = deepcopy(results)
     complete_known_baseline = False
-    if _runtime_context_finish_attestation_no_pass_results_accepted(results):
+    complete_owned_lane = False
+    if _runtime_context_finish_owned_lane_claimed(results):
+        failure_scan = _contract_runtime_owned_lane_failure_scan(
+            results, expected_baseline_commit=expected_baseline_commit,
+        )
+        if not failure_scan:
+            return {}
+        complete_owned_lane = True
+    elif _runtime_context_finish_attestation_no_pass_results_accepted(results):
         commands_present = "commands" in results
         comparison_present = "baseline_comparison" in results
         if commands_present != comparison_present:
@@ -147944,6 +148108,7 @@ def _contract_runtime_finish_test_results_consumer_acceptance(
     return {
         "accepted": True,
         "complete_known_baseline": complete_known_baseline,
+        "complete_owned_lane": complete_owned_lane,
         "failure_scan": failure_scan,
     }
 
@@ -148038,7 +148203,10 @@ def _contract_runtime_worker_implementation_known_baseline_scan_candidate(
         and str(line.get("line_instance_id") or "").strip()
         == f"runtime_context:{expected['runtime_context_id']}"
         and acceptance.get("accepted") is True
-        and acceptance.get("complete_known_baseline") is True
+        and (
+            acceptance.get("complete_known_baseline") is True
+            or acceptance.get("complete_owned_lane") is True
+        )
         and isinstance(commands, list)
         and isinstance(tests_alias, list)
         and stable_sha256(tests_alias) == stable_sha256(commands)
@@ -148308,6 +148476,26 @@ def _contract_runtime_completed_line_acceptance(
         if isinstance(canonical_line.get("payload"), Mapping)
         else {}
     )
+    owned_results = payload.get("test_results")
+    if _runtime_context_finish_owned_lane_claimed(owned_results):
+        # Scan compatibility never substitutes for this exact worker binding.
+        expected = expected_worker_identity or {}
+        fields = (
+            "runtime_context_id", "task_id", "parent_task_id",
+            "worker_id", "worker_slot_id",
+        )
+        if not (
+            all(str(expected.get(field) or "").strip() for field in fields)
+            and all(
+                str(source.get(field) or "").strip()
+                == str(expected[field]).strip()
+                for source in (canonical_line, payload) for field in fields
+            )
+            and _contract_runtime_finish_test_results_consumer_acceptance(
+                owned_results, expected_baseline_commit=expected_baseline_commit,
+            ).get("complete_owned_lane") is True
+        ):
+            return {}
     canonical_no_pass_exception = (
         _contract_runtime_candidate_scoped_no_pass_line(
             canonical_line,

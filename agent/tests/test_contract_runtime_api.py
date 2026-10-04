@@ -1639,3 +1639,174 @@ def test_recorded_line_registered_consumer_companion_fixture(tmp_path, monkeypat
                 (destination / filename).write_text(json.dumps(value, ensure_ascii=False) + "\n")
     finally:
         conn.close()
+
+
+def _r5_owned_lane_ledger(base_commit):
+    """Saved-shaped eight-test sibling comparison with no private identity."""
+    owned_ids = [f"tests/test_owned.py::test_owned_{index}" for index in range(5)]
+    sibling_ids = [f"tests/test_sibling.py::test_sibling_{index}" for index in range(3)]
+    def raw(argv, exit_code, stdout):
+        return {"argv": argv, "command": " ".join(argv), "cwd": "/fixture/worker",
+                "exit_code": exit_code, "stdout": stdout, "stderr": ""}
+    full_argv = ["python3", "-m", "pytest", "-q"]
+    focused = raw(full_argv + ["tests/test_owned.py"], 0, "5 passed")
+    focused.update(status="passed", phase="candidate", failed_test_ids=[])
+    hashes = {"pkg/owned.py": "1" * 64, "pkg/sibling.py": "2" * 64,
+              "tests/test_owned.py": "3" * 64, "tests/test_sibling.py": "4" * 64}
+    candidate_hashes = {**hashes, "pkg/owned.py": "5" * 64}
+    return {"status": "passed", "passed": True,
+        "scope": "owned lane only; no full-suite or release PASS", "commands": [focused],
+        "baseline_comparison": {
+            "baseline_commit": base_commit, "comparison_scope": "original eight tests",
+            "baseline": {"passed": 0, "failed": 8, "failure_ids": owned_ids + sibling_ids,
+                         "raw_command": raw(full_argv, 1, "8 failed")},
+            "candidate": {"passed": 5, "failed": 3, "failure_ids": sibling_ids,
+                          "raw_command": raw(full_argv, 1, "3 failed, 5 passed")},
+            "candidate_new_failure_ids": [], "resolved_baseline_failure_ids": owned_ids,
+            "known_baseline_failure_ids": sibling_ids,
+            "failure_classification": "Unchanged sibling stubs; original owned five pass.",
+            "unchanged_files": ["pkg/sibling.py", "tests/test_owned.py", "tests/test_sibling.py"],
+            "baseline_file_hashes": hashes, "candidate_file_hashes": candidate_hashes,
+            "full_suite_passed": False},
+        "full_suite": {"passed": 5, "failed": 3}, "full_suite_passed": False,
+        "overall_release_pass_claimed": False, "original_tests_unchanged": True}
+
+
+def test_r5_owned_lane_consumer_preserves_truthful_history():
+    results = _r5_owned_lane_ledger("a" * 40)
+    original = copy.deepcopy(results)
+    accepted = server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)
+    assert accepted["accepted"] and accepted["complete_owned_lane"]
+    assert accepted["complete_known_baseline"] is False
+    assert server._runtime_context_finish_no_pass_producer_accepted(
+        results, expected_baseline_commit="a" * 40)
+    assert results == original
+    assert server._runtime_context_finish_attestation_test_results_payload(results) == original
+    assert results["baseline_comparison"]["baseline"]["failed"] == 8
+    assert results["full_suite"]["failed"] == 3
+    assert not server._contract_runtime_value_reports_failed_qa(accepted["failure_scan"])
+    # Exact-copy replacement cannot sanitize a different nested canonical hash.
+    changed = copy.deepcopy(results)
+    changed["full_suite"]["failed"] = 4
+    outer = {"test_results": results, "nested": {"test_results": changed}}
+    scanned = server._contract_runtime_finish_test_results_failure_scan(
+        outer, canonical_test_results=results,
+        accepted_failure_scan=accepted["failure_scan"])
+    assert scanned["nested"]["test_results"] == changed
+    assert server._contract_runtime_value_reports_failed_qa(scanned)
+
+
+def test_r5_owned_lane_consumer_refuses_semantic_tampering():
+    original = _r5_owned_lane_ledger("a" * 40)
+    for change in ("baseline", "new_failure", "owned_as_sibling", "owned_command_failure",
+                   "QA_failure", "missing_comparison", "missing_hash", "changed_test",
+                   "missing_raw", "release_claim", "duplicate_failure", "malformed_argv"):
+        results = copy.deepcopy(original)
+        comparison = results["baseline_comparison"]
+        if change == "baseline": comparison["baseline_commit"] = "b" * 40
+        elif change == "new_failure": comparison["candidate_new_failure_ids"] = ["tests/test_owned.py::new_failure"]
+        elif change == "owned_as_sibling":
+            forged = "tests/test_owned.py::test_owned_0"
+            comparison["candidate"]["failure_ids"][0] = forged
+            comparison["known_baseline_failure_ids"][0] = forged
+            comparison["resolved_baseline_failure_ids"] = sorted(
+                set(comparison["baseline"]["failure_ids"]) - set(comparison["candidate"]["failure_ids"]))
+        elif change == "owned_command_failure": results["commands"][0]["exit_code"] = 1
+        elif change == "QA_failure": results["independent_QA"] = {"status": "failed"}
+        elif change == "missing_comparison": results.pop("baseline_comparison")
+        elif change == "missing_hash": comparison.pop("baseline_file_hashes")
+        elif change == "changed_test": comparison["candidate_file_hashes"]["tests/test_owned.py"] = "9" * 64
+        elif change == "missing_raw": comparison["baseline"].pop("raw_command")
+        elif change == "release_claim": results["overall_release_pass_claimed"] = True
+        elif change == "duplicate_failure": comparison["baseline"]["failure_ids"][1] = comparison["baseline"]["failure_ids"][0]
+        elif change == "malformed_argv": results["commands"][0]["argv"] = [{}]
+        assert not server._contract_runtime_finish_test_results_consumer_acceptance(
+            results, expected_baseline_commit="a" * 40), change
+        assert not server._runtime_context_finish_no_pass_producer_accepted(
+            results, expected_baseline_commit="a" * 40), change
+    assert not server._contract_runtime_finish_test_results_consumer_acceptance(original)
+
+
+def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, monkeypatch, request):
+    # Reuse the existing owning-producer and narrow no-pass integration helpers.
+    # Stop immediately after the real premerge consumer's later predicates;
+    # do not replay that fixture's unrelated tamper/close campaign.
+    import pytest
+    from agent.tests import test_graph_governance_api as api
+    class PremergeObserved(Exception):
+        pass
+    monkeypatch.setattr(api, "_complete_known_baseline_test_results",
+        lambda _results, *, runtime_context, tmp_path: _r5_owned_lane_ledger(runtime_context.base_commit))
+    original_premerge = server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance
+    def observe(conn, *args, **kwargs):
+        protected, authority = original_premerge(conn, *args, **kwargs)
+        assert protected is True and authority["status"] == "satisfied", authority
+        assert authority["db_verified"] is True and len(authority["workers"]) == 2
+        record = server._contract_runtime_store(conn).get(kwargs["source_contract_execution_id"])
+        owned_lines = [(index, line) for index, line in enumerate(record["completed_lines"])
+            if line.get("payload", {}).get("test_results", {}).get("full_suite_passed") is False]
+        assert len(owned_lines) == 3  # implementation, attestation, finish
+        before = copy.deepcopy(record)
+        for index, line in owned_lines:
+            context = api.get_branch_context(conn, kwargs["project_id"], line["task_id"])
+            identity = {field: str(getattr(context, field) or "") for field in (
+                "runtime_context_id", "task_id", "parent_task_id", "worker_id", "worker_slot_id", "merge_queue_id")}
+            options = dict(project_id=kwargs["project_id"], record=record,
+                completed_line_index=index, expected_line=line,
+                expected_worker_identity=identity, expected_baseline_commit=context.base_commit,
+                allow_verified_worker_implementation_known_baseline=line["line_id"] == "worker_implementation",
+                allow_verified_worker_finish_attestation=line["line_id"] == "worker_finish_time_attestation",
+                allow_statusless_worker_finish_gate=line["line_id"] == "worker_finish_gate")
+            assert server._contract_runtime_completed_line_acceptance(conn, **options)["db_verified"]
+            mutated = copy.deepcopy(line)
+            mutated["payload"]["test_results"]["scope"] += " changed"
+            assert not server._contract_runtime_completed_line_acceptance(conn, **{**options, "expected_line": mutated})
+            assert not server._contract_runtime_completed_line_acceptance(conn, **{
+                **options, "expected_worker_identity": {**identity, "worker_slot_id": "foreign-slot"}})
+            # Canonical line/hash is insufficient without unique durable proof.
+            rows = conn.execute("SELECT * FROM backlog_contract_chain_bindings").fetchall()
+            conn.execute("SAVEPOINT r5_missing_proof")
+            conn.execute("DELETE FROM backlog_contract_chain_bindings")
+            assert not server._contract_runtime_completed_line_acceptance(conn, **options)
+            conn.execute("ROLLBACK TO r5_missing_proof")
+            conn.execute("RELEASE r5_missing_proof")
+            assert len(conn.execute("SELECT * FROM backlog_contract_chain_bindings").fetchall()) == len(rows)
+        assert server._contract_runtime_store(conn).get(record["contract_execution_id"]) == before
+        # The public merge handler derives the same acceptance during a dry-run.
+        monkeypatch.setattr(server, "_contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance", original_premerge)
+        selected = api.get_branch_context(conn, kwargs["project_id"], kwargs["task_id"])
+        rows_before = api._fresh_release_fixture_rows(conn, extra_tables=(
+            "parallel_branch_runtime_contexts", "parallel_branch_merge_queue_items"))
+        response = server.handle_graph_governance_parallel_branch_merge_execute(
+            api._ctx({"project_id": kwargs["project_id"]}, method="POST", body={
+                "repo_root_path": selected.target_project_root,
+                "merge_queue_id": kwargs["merge_queue_id"],
+                "queue_item_id": kwargs["queue_item_id"], "task_id": kwargs["task_id"],
+                "branch_ref": selected.branch_ref, "target_ref": kwargs["target_ref"],
+                "source_contract_execution_id": kwargs["source_contract_execution_id"],
+                "observer_route_token_ref": kwargs["observer_route_token_ref"],
+                "dry_run": True, "allow_target_ref_mutation": False,
+                "evidence": {key: {"status": "pass", "passed": True} for key in (
+                    "dirty_worktree_check", "test_evidence", "graph_currentness",
+                    "scope_reconcile", "semantic_projection")}}))
+        assert response["ok"] and response["dry_run"] and response["executed"] is False, response
+        acceptance_row = next(row for row in response["gate_plan"]["evidence"] if row["key"] == "backlog_acceptance")
+        assert acceptance_row["passed"] and acceptance_row["detail"]["db_verified"]
+        assert api._fresh_release_fixture_rows(conn, extra_tables=(
+            "parallel_branch_runtime_contexts", "parallel_branch_merge_queue_items")) == rows_before
+        raise PremergeObserved()
+    monkeypatch.setattr(server, "_contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance", observe)
+    fixture = api._isolated_api_connection(tmp_path, monkeypatch, physical_project_id="aming-claw")
+    conn = next(fixture)
+    try:
+        with pytest.raises(PremergeObserved):
+            api.test_rev10_normal_producer_finish_queue_premerge_accepts_known_baseline_and_pass(
+                conn, monkeypatch, tmp_path, request, "runtime_drift", "mixed", "canonical")
+    finally:
+        fixture.close()
+
+
+def test_r5_owned_lane_preserves_flat_known_baseline_producer_rule(tmp_path):
+    from agent.tests import test_graph_governance_api as api
+    api.test_finish_no_pass_producer_matches_existing_consumer_command_rule(tmp_path)
