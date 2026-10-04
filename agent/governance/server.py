@@ -147884,7 +147884,7 @@ def _contract_runtime_owned_lane_failure_scan(
 
     This is not authority by itself: the callers still bind the exact worker,
     canonical ledger hash, stored line and unique durable acceptance revision.
-    No raw command, persisted result or overall-suite status is rewritten.
+    No canonical raw command, persisted result or overall-suite status is rewritten.
     """
 
     comparison = value.get("baseline_comparison")
@@ -147922,6 +147922,7 @@ def _contract_runtime_owned_lane_failure_scan(
             and len(set(ids)) == len(ids)
             and isinstance(raw, Mapping) and type(raw.get("exit_code")) is int
             and raw.get("exit_code") == 1
+            and ("status" not in raw or raw["status"] == "failed")
             and isinstance(raw.get("argv"), list) and raw["argv"]
             and all(isinstance(arg, str) for arg in raw["argv"])
             and str(raw.get("command") or "").strip()
@@ -148008,13 +148009,17 @@ def _contract_runtime_owned_lane_failure_scan(
     if not focused_covered:
         return {}
     scan = deepcopy(dict(value))
-    # Only the three validated observations change names in the private view.
-    # Raw results remain immutable; arbitrary nested QA negatives still scan.
+    # Classify only validated observations in this private view. Canonical raw
+    # results remain immutable; arbitrary nested QA negatives still scan.
     for observation in (
         scan["baseline_comparison"]["baseline"],
         scan["baseline_comparison"]["candidate"], scan["full_suite"],
     ):
         observation["historical_or_sibling_failed"] = observation.pop("failed")
+    for phase in ("baseline", "candidate"):
+        raw = scan["baseline_comparison"][phase]["raw_command"]
+        if "status" in raw:
+            raw["status"] = "baseline_observation"
     return scan
 
 

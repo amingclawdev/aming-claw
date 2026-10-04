@@ -1924,9 +1924,31 @@ def _r5_owned_lane_ledger(base_commit):
         "overall_release_pass_claimed": False, "original_tests_unchanged": True}
 
 
-def test_r5_owned_lane_consumer_preserves_truthful_history():
-    results = _r5_owned_lane_ledger("a" * 40)
+def _r6_owned_lane_ledger(base_commit):
+    """Anonymous full raw-command shape, including the saved failure status."""
+    results = _r5_owned_lane_ledger(base_commit)
+    comparison = results["baseline_comparison"]
+    for command in (results["commands"][0], comparison["baseline"]["raw_command"],
+                    comparison["candidate"]["raw_command"]):
+        command.update(started_at_UTC="2026-01-01T00:00:00+00:00",
+                       completed_at_UTC="2026-01-01T00:00:01+00:00")
+    comparison["baseline"]["raw_command"].update(
+        resolved_python="/fixture/env/bin/python",
+        environment_overrides={"PYTHONDONTWRITEBYTECODE": "1",
+            "PYTEST_ADDOPTS": "-p no:cacheprovider",
+            "PATH_prefix": "/fixture/env/bin", "PYTHONPATH": "unset"})
+    comparison["candidate"]["raw_command"].update(
+        status="failed", failure_ids=list(comparison["candidate"]["failure_ids"]))
+    results["commands"][0].update(failure_ids=[], passed=5)
+    return results
+
+
+@pytest.mark.parametrize("ledger", [_r5_owned_lane_ledger, _r6_owned_lane_ledger],
+                         ids=["legacy-status-absent", "full-raw-status-failed"])
+def test_r5_owned_lane_consumer_preserves_truthful_history(ledger):
+    results = ledger("a" * 40)
     original = copy.deepcopy(results)
+    original_hash = server.stable_sha256(results)
     accepted = server._contract_runtime_finish_test_results_consumer_acceptance(
         results, expected_baseline_commit="a" * 40)
     assert accepted["accepted"] and accepted["complete_owned_lane"]
@@ -1934,6 +1956,7 @@ def test_r5_owned_lane_consumer_preserves_truthful_history():
     assert server._runtime_context_finish_no_pass_producer_accepted(
         results, expected_baseline_commit="a" * 40)
     assert results == original
+    assert server.stable_sha256(results) == original_hash
     assert server._runtime_context_finish_attestation_test_results_payload(results) == original
     assert results["baseline_comparison"]["baseline"]["failed"] == 8
     assert results["full_suite"]["failed"] == 3
@@ -1949,8 +1972,37 @@ def test_r5_owned_lane_consumer_preserves_truthful_history():
     assert server._contract_runtime_value_reports_failed_qa(scanned)
 
 
+@pytest.mark.parametrize("phase", ["baseline", "candidate"])
+@pytest.mark.parametrize("status", ["failed", "passed", "rejected", "unknown", "", None, False])
+def test_r6_owned_lane_raw_status_is_exact_failure_observation(phase, status):
+    results = _r6_owned_lane_ledger("a" * 40)
+    results["baseline_comparison"][phase]["raw_command"]["status"] = status
+    original = copy.deepcopy(results)
+    accepted = server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)
+    assert bool(accepted) is (status == "failed")
+    assert server._runtime_context_finish_no_pass_producer_accepted(
+        results, expected_baseline_commit="a" * 40) is (status == "failed")
+    if accepted:
+        raw = accepted["failure_scan"]["baseline_comparison"][phase]["raw_command"]
+        assert raw == {**original["baseline_comparison"][phase]["raw_command"],
+                       "status": "baseline_observation"}
+    assert results == original
+
+
+@pytest.mark.parametrize("location", ["ledger", "raw_command"])
+def test_r6_owned_lane_raw_failure_does_not_hide_unrelated_qa(location):
+    results = _r6_owned_lane_ledger("a" * 40)
+    target = results if location == "ledger" else results["baseline_comparison"]["candidate"]["raw_command"]
+    target["independent_qa"] = {"status": "rejected"}
+    original = copy.deepcopy(results)
+    assert not server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)
+    assert results == original
+
+
 def test_r5_owned_lane_consumer_refuses_semantic_tampering():
-    original = _r5_owned_lane_ledger("a" * 40)
+    original = _r6_owned_lane_ledger("a" * 40)
     for change in ("baseline", "new_failure", "owned_as_sibling", "owned_command_failure",
                    "QA_failure", "missing_comparison", "missing_hash", "changed_test",
                    "missing_raw", "release_claim", "duplicate_failure", "malformed_argv"):
@@ -1989,7 +2041,7 @@ def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, mon
     class PremergeObserved(Exception):
         pass
     monkeypatch.setattr(api, "_complete_known_baseline_test_results",
-        lambda _results, *, runtime_context, tmp_path: _r5_owned_lane_ledger(runtime_context.base_commit))
+        lambda _results, *, runtime_context, tmp_path: _r6_owned_lane_ledger(runtime_context.base_commit))
     original_premerge = server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance
     def observe(conn, *args, **kwargs):
         protected, authority = original_premerge(conn, *args, **kwargs)
