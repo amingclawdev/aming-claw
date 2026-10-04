@@ -147949,6 +147949,9 @@ def _contract_runtime_owned_lane_failure_scan(
         and baseline["passed"] + baseline["failed"]
         == candidate["passed"] + candidate["failed"]
         and candidate["passed"] == baseline["passed"] + len(resolved)
+        and isinstance(value.get("full_suite"), Mapping)
+        and type(value["full_suite"].get("passed")) is int
+        and type(value["full_suite"].get("failed")) is int
         and value.get("full_suite") == {
             "passed": candidate["passed"], "failed": candidate["failed"],
         }

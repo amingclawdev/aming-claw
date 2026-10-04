@@ -4,6 +4,8 @@ import copy
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store
 from agent.governance import server
@@ -1810,3 +1812,31 @@ def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, mon
 def test_r5_owned_lane_preserves_flat_known_baseline_producer_rule(tmp_path):
     from agent.tests import test_graph_governance_api as api
     api.test_finish_no_pass_producer_matches_existing_consumer_command_rule(tmp_path)
+
+
+@pytest.mark.parametrize("field", ["passed", "failed"])
+@pytest.mark.parametrize("numeric_alias", [True, 1.0], ids=["bool", "float"])
+def test_r5_full_suite_count_type_requires_actual_int(field, numeric_alias):
+    # Exact independently reproduced owned1/sibling1 comparison shape.
+    results = _r5_owned_lane_ledger("a" * 40)
+    comparison = results["baseline_comparison"]
+    owned_id = comparison["resolved_baseline_failure_ids"][0]
+    sibling_id = comparison["known_baseline_failure_ids"][0]
+    comparison["baseline"].update(failed=2, failure_ids=[owned_id, sibling_id])
+    comparison["baseline"]["raw_command"]["stdout"] = "2 failed"
+    comparison["candidate"].update(passed=1, failed=1, failure_ids=[sibling_id])
+    comparison["candidate"]["raw_command"]["stdout"] = "1 failed, 1 passed"
+    comparison["resolved_baseline_failure_ids"] = [owned_id]
+    comparison["known_baseline_failure_ids"] = [sibling_id]
+    results["commands"][0]["stdout"] = "1 passed"
+    results["full_suite"] = {"passed": 1, "failed": 1}
+    assert server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)["complete_owned_lane"]
+    results["full_suite"][field] = numeric_alias
+    original = copy.deepcopy(results)
+    assert not server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)
+    assert not server._runtime_context_finish_no_pass_producer_accepted(
+        results, expected_baseline_commit="a" * 40)
+    assert results == original
+    assert type(results["full_suite"][field]) is type(numeric_alias)
