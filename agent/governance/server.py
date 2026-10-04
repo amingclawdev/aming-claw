@@ -91133,7 +91133,7 @@ def handle_graph_governance_parallel_branch_recover_expired(ctx: RequestContext)
 def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
     """Dry-run stale governance artifact cleanup projection."""
     project_id = ctx.get_project_id()
-    from . import stale_artifact_cleanup
+    from . import stale_artifact_cleanup, graph_snapshot_store
 
     cow_requested = str(ctx.query.get("dimension") or "").strip().lower() == "graph_snapshot_duplicates"
     if cow_requested and not ctx.token:
@@ -91144,7 +91144,8 @@ def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
     with phase("project_root"):
         root = _graph_governance_project_root(project_id, ctx.query)
     with phase("db_connect"):
-        conn = get_connection(project_id)
+        conn_owner = graph_snapshot_store._owned_reference_connection(lambda: get_connection(project_id))
+        conn = conn_owner.__enter__()
     try:
         with phase("operator"):
             _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.dry-run")
@@ -91181,21 +91182,22 @@ def handle_graph_governance_stale_artifact_cleanup(ctx: RequestContext):
                 "writes_performed": False,
             }, apply=False)
     finally:
-        conn.close()
+        conn_owner.__exit__(None, None, None)
 
 
 @route("POST", "/api/graph-governance/{project_id}/stale-artifact-cleanup/apply")
 def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
     """Apply explicit safe stale governance artifact cleanup candidates."""
     project_id = ctx.get_project_id()
-    from . import stale_artifact_cleanup
+    from . import stale_artifact_cleanup, graph_snapshot_store
 
     cow_requested = str(ctx.body.get("dimension") or "").strip().lower() == "graph_snapshot_duplicates"
     if cow_requested and not ctx.token:
         return 401, {"ok": False, "error": "snapshot_cow_auth_required", "writes_performed": False}
 
     root = _graph_governance_project_root(project_id, ctx.body)
-    conn = get_connection(project_id)
+    conn_owner = graph_snapshot_store._owned_reference_connection(lambda: get_connection(project_id))
+    conn = conn_owner.__enter__()
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.stale-artifact-cleanup.apply")
         if cow_requested and ctx.require_auth(conn).get("project_id") != project_id:
@@ -91243,7 +91245,7 @@ def handle_graph_governance_stale_artifact_cleanup_apply(ctx: RequestContext):
                 "write_disposition": "ambiguous", "safe_retry": False,
             }, apply=True)
     finally:
-        conn.close()
+        conn_owner.__exit__(None, None, None)
 
 
 @route("POST", "/api/graph-governance/{project_id}/stale-artifact-cleanup/recover")
@@ -105511,7 +105513,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     if manager_action is not None:
         from . import graph_snapshot_store as terminalization_store
 
-        terminalization_conn = get_connection(project_id)
+        terminalization_owner = terminalization_store._owned_reference_connection(
+            lambda: get_connection(project_id))
+        terminalization_conn = terminalization_owner.__enter__()
         try:
             terminalization_auth = _require_reconcile_terminalization_auth(
                 ctx,
@@ -105580,9 +105584,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 manager_action["candidate_id"],
             )
         finally:
-            close = getattr(terminalization_conn, "close", None)
-            if callable(close):
-                close()
+            terminalization_owner.__exit__(None, None, None)
         append_receipt = _record_reconcile_run_terminalization(
             project_id,
             run_id=candidate["run_id"],
@@ -105641,7 +105643,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
 
     request_started_at = _utc_now()
     request_started_monotonic = time.monotonic()
-    conn = get_connection(project_id)
+    conn_owner = store._owned_reference_connection(lambda: get_connection(project_id))
+    conn = conn_owner.__enter__()
     request_total_changes_before = int(conn.total_changes)
     process_build_key: tuple[str, str] | None = None
     try:
@@ -107301,7 +107304,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     finally:
         if process_build_key is not None:
             _release_current_full_process_build_key(process_build_key)
-        conn.close()
+        conn_owner.__exit__(None, None, None)
 
 
 @route("POST", "/api/graph-governance/{project_id}/reconcile/pending-scope")

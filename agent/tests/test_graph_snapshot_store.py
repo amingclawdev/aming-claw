@@ -6995,3 +6995,271 @@ def test_markdown_retention_selection_keeps_typed_current_durable_and_bundle_pin
     assert "durable_backlog_bugs_payload_reference" in selected["scope-durable"]
     assert selection["candidates"] == [] and selection["global_refusal_reasons"] == []
     assert changes == conn.total_changes and image == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+def _complete_owner_fixture(*, factory=sqlite3.Connection):
+    connection = sqlite3.connect(':memory:', factory=factory)
+    connection.row_factory = sqlite3.Row
+    _typed_reference_setup(connection, count=0)
+    return connection
+
+
+def test_owned_census_completes_2183_source_rows_and_generic_owner(conn, bundle_namespace):
+    connection = _complete_owner_fixture()
+    connection.execute("INSERT INTO reconcile_run_metrics(project_id,run_id,snapshot_id,status,created_at) "
+                       "VALUES (?, 'late-run', 'scope-current', 'completed', '2020')", (PID,))
+    connection.executemany("INSERT INTO graph_asset_projection(project_id,asset_path,size_bytes,updated_at) "
+                           "VALUES (?,?,?,'now')", [(PID, f'ordinary/{i}', i) for i in range(2183)])
+    late = json.dumps({'late_snapshot_id': 'outside-late-pin', 'serialized': json.dumps({'snapshot_ids': ['scope-durable']})}).replace(
+        'scope-durable', 'scope\\u002ddurable')
+    connection.execute("UPDATE graph_asset_projection SET run_id='late-run',asset_path=?,metadata_json=? "
+                       "WHERE asset_path='ordinary/2182'", (str(store._snapshot_root(PID, 'scope-current')), late))
+    connection.execute('CREATE TABLE ordinary_owner(project_id TEXT,payload TEXT)')
+    connection.execute('CREATE INDEX ordinary_scope ON ordinary_owner(project_id,payload)')
+    rowids = [-10, 0] + [i * 3 for i in range(1, 2100)]
+    connection.executemany('INSERT INTO ordinary_owner(rowid,project_id,payload) VALUES (?,?,?)',
+                           [(i, PID, 'scope-current' if i <= 0 else 'ordinary') for i in rowids])
+    connection.execute("INSERT INTO ordinary_owner(rowid,project_id,payload) VALUES (1,'foreign','foreign-pin')")
+    connection.commit()
+    image = hashlib.sha256(connection.serialize()).hexdigest()
+    changes = connection.total_changes
+    statements = []
+    connection.set_trace_callback(statements.append)
+    with store._owned_reference_connection(lambda: connection):
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert state['complete'], state['refusal_reasons']
+        assert {'scope-current', 'scope-durable', 'outside-late-pin'} <= state['protected'].keys()
+        assert 'foreign-pin' not in state['protected']
+        assert state['census']['max_rows_per_store'] is None
+        pages = [q for q in statements if 'FROM "graph_asset_projection" NOT INDEXED' in q]
+        assert len(pages) == 36  # 35 nonempty64-row pages (last7), then EOF.
+        assert all('LIMIT 64' in q for q in pages)
+        assert tuple(r[0] for r in store._reference_pages(connection, 'ordinary_owner', 'payload',
+            'project_id=?', (PID,))) == tuple(rowids)
+        plan = connection.execute('EXPLAIN QUERY PLAN SELECT _rowid_,payload FROM ordinary_owner '
+            'NOT INDEXED WHERE project_id=? AND _rowid_>? ORDER BY _rowid_ LIMIT64'.replace('LIMIT64','LIMIT 64'),
+            (PID, 0)).fetchall()
+        assert any('INTEGER PRIMARY KEY' in r[3] for r in plan)
+        assert not any('TEMP B-TREE' in r[3] for r in plan)
+        selected = store.select_snapshot_retention_candidates(connection, PID, keep_last_n=0,
+            extra_bundle_snapshot_ids={'scope-current'}, measure_sizes=False)
+        assert selected['reference_authority_complete']
+        assert selected['candidates'] == []
+        assert image == hashlib.sha256(connection.serialize()).hexdigest() and changes == connection.total_changes
+        assert not connection.in_transaction
+    assert store._reference_budget(connection) is None
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute('SELECT 1')
+
+
+@pytest.mark.parametrize('value,valid', [(0, True), (7, True), (2**63-1, True),
+    (-1, False), ('malformed', False), (sqlite3.Binary(b'payload'), False), (0.5, False), (None, False)])
+def test_owned_census_size_actual_scalar_domain(value, valid, bundle_namespace):
+    connection = _complete_owner_fixture()
+    # Remove NOT NULL to exercise actual NULL storage corruption. Integer
+    # affinity remains exact: numeric text stored as INTEGER is an integer.
+    connection.execute('DROP TABLE graph_asset_projection')
+    connection.execute('CREATE TABLE graph_asset_projection(project_id TEXT,size_bytes INTEGER,payload TEXT)')
+    connection.execute('INSERT INTO graph_asset_projection VALUES (?,?,?)', (PID, value, 'scope-current'))
+    connection.commit()
+    with store._owned_reference_connection(lambda: connection):
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert state['complete'] is valid
+        assert 'scope-current' in state['protected']
+        if not valid:
+            assert 'graph_asset_projection_payload_unreadable' in state['refusal_reasons']
+            assert store.select_snapshot_retention_candidates(connection, PID, measure_sizes=False)['candidates'] == []
+
+
+def test_owned_census_small_legacy_outputs_and_borrowed_callback(conn, bundle_namespace):
+    _typed_reference_setup(conn, count=1)
+    calls = []
+    conn.set_progress_handler(lambda: calls.append(1) or 0, 1)
+    before = store.snapshot_retention_reference_state(conn, PID)
+    count = len(calls)
+    assert before['complete']
+    selection_before = store.select_snapshot_retention_candidates(conn, PID, measure_sizes=False)
+    conn.execute('SELECT sum(value) FROM json_each(?)', ('[1,2,3]',)).fetchone()
+    assert len(calls) > count
+    connection = _complete_owner_fixture()
+    conn.backup(connection)
+    with store._owned_reference_connection(lambda: connection):
+        after = store.snapshot_retention_reference_state(connection, PID)
+        after['census'] = before['census']  # Resource metadata is the sole intentional difference.
+        assert after == before
+        assert store.select_snapshot_retention_candidates(connection, PID, measure_sizes=False) == selection_before
+    conn.execute('CREATE TABLE ordinary_owner(payload TEXT)')
+    conn.executemany("INSERT INTO ordinary_owner VALUES ('scope-current')", [()] * 2001)
+    conn.commit()
+    refused = store.snapshot_retention_reference_state(conn, PID)
+    assert not refused['complete'] and any('window_unbounded:ordinary_owner' in r for r in refused['refusal_reasons'])
+    count = len(calls)
+    conn.execute('SELECT 1').fetchone()
+    assert len(calls) > count
+    conn.set_progress_handler(None, 0)
+
+
+@pytest.mark.parametrize('mode', ['sql', 'python'])
+def test_owned_census_budget_keeps_prefix_pins_and_restores(mode, monkeypatch, bundle_namespace):
+    clock = [0.0]
+    monkeypatch.setattr(store.time, 'monotonic', lambda: clock[0])
+    sql_interrupts = []
+    class Timed(sqlite3.Connection):
+        def execute(self, sql, args=()):
+            if mode == 'sql' and 'FROM "zz_owner" NOT INDEXED' in sql:
+                clock[0] = 26.0  # The actual SQLite progress callback interrupts this query.
+            try:
+                cursor = super().execute(sql, args)
+                if mode == 'sql' and 'FROM "zz_owner" NOT INDEXED' in sql:
+                    class ObservedCursor:
+                        def fetchall(self):
+                            try:
+                                return cursor.fetchall()
+                            except sqlite3.OperationalError as exc:
+                                if 'interrupted' in str(exc):
+                                    sql_interrupts.append(str(exc))
+                                raise
+                    return ObservedCursor()
+                return cursor
+            except sqlite3.OperationalError as exc:
+                if 'interrupted' in str(exc):
+                    sql_interrupts.append(str(exc))
+                raise
+    connection = _complete_owner_fixture(factory=Timed)
+    connection.execute('INSERT INTO graph_query_traces VALUES (?,?,?)', (PID, 'scope-current', 'scope-durable'))
+    connection.execute('CREATE TABLE zz_owner(project_id TEXT,payload TEXT)')
+    connection.executemany('INSERT INTO zz_owner VALUES (?,?)', [(PID, json.dumps({'audit': ['ordinary'] * 600}))] * 64)
+    connection.commit()
+    connection.execute('PRAGMA busy_timeout=9000')
+    if mode == 'python':
+        original = store._bounded_decoded_reference_pins
+        def decoded(*args, **kwargs):
+            clock[0] = 26.0
+            return original(*args, **kwargs)
+        monkeypatch.setattr(store, '_bounded_decoded_reference_pins', decoded)
+    with store._owned_reference_connection(lambda: connection):
+        provider = store._reference_budget(connection)
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert not state['complete'] and provider.exhausted
+        assert bool(sql_interrupts) is (mode == 'sql')
+        assert 'reference_census_budget_exhausted' in state['refusal_reasons']
+        assert {'scope-current', 'scope-durable'} <= state['protected'].keys()
+        assert connection.execute('PRAGMA busy_timeout').fetchone()[0] == 9000
+        assert not provider.active and not connection.in_transaction
+        deadline = provider.deadline
+        selected = store.select_snapshot_retention_candidates(connection, PID, measure_sizes=False)
+        assert selected['candidates'] == [] and not selected['reference_authority_complete']
+        assert provider.deadline == deadline == 25.0
+        assert connection.execute('SELECT 1').fetchone()[0] == 1  # Outside census remains usable.
+
+
+@pytest.mark.parametrize('fault', ['gap', 'mutation', 'schema'])
+def test_owned_census_late_failure_keeps_positive_accumulator(fault, bundle_namespace):
+    class Fault(sqlite3.Connection):
+        armed = False
+        def execute(self, sql, args=()):
+            cursor = super().execute(sql, args)
+            if self.armed and 'FROM "zz_owner" NOT INDEXED' in sql:
+                self.armed = False
+                if fault == 'mutation':
+                    super().execute("UPDATE graph_query_traces SET canonical_base_snapshot_id='changed'")
+                elif fault == 'schema':
+                    super().execute('CREATE TABLE schema_change(value TEXT)')
+                else:
+                    class Gap:
+                        def fetchall(self):
+                            return cursor.fetchall()[1:]
+                    return Gap()
+            return cursor
+    connection = _complete_owner_fixture(factory=Fault)
+    connection.execute('INSERT INTO graph_query_traces VALUES (?,?,?)', (PID, 'scope-current', 'scope-durable'))
+    connection.execute('CREATE TABLE zz_owner(payload TEXT)')
+    connection.execute("INSERT INTO zz_owner VALUES ('ordinary')")
+    connection.commit()
+    connection.armed = True
+    with store._owned_reference_connection(lambda: connection):
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert not state['complete']
+        assert {'scope-current', 'scope-durable'} <= state['protected'].keys()
+        assert any('continuation_gap' in r if fault == 'gap' else 'input_changed' in r for r in state['refusal_reasons'])
+        assert not connection.in_transaction
+
+
+def test_owned_census_does_not_rollback_caller_transaction(bundle_namespace):
+    connection = _complete_owner_fixture()
+    with store._owned_reference_connection(lambda: connection):
+        connection.execute('BEGIN')
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert state['complete'] and connection.in_transaction
+        connection.rollback()
+
+
+@pytest.mark.parametrize('phase', ['count', 'json'])
+def test_owned_census_sql_count_and_json_interrupt_retains_pins(phase, monkeypatch, bundle_namespace):
+    clock = [0.0]
+    monkeypatch.setattr(store.time, 'monotonic', lambda: clock[0])
+    interrupted = []
+    class Timed(sqlite3.Connection):
+        def execute(self, sql, args=()):
+            target = ('SELECT count(*) FROM "zz_owner"' in sql if phase == 'count' else
+                      'FROM "contract_runtime_executions" NOT INDEXED' in sql)
+            if target:
+                clock[0] = 26.0
+            try:
+                return super().execute(sql, args)
+            except sqlite3.OperationalError as exc:
+                if 'interrupted' in str(exc):
+                    interrupted.append(str(exc))
+                raise
+    connection = _complete_owner_fixture(factory=Timed)
+    connection.execute('INSERT INTO graph_query_traces VALUES (?,?,?)', (PID, 'scope-current', 'scope-durable'))
+    if phase == 'count':
+        connection.execute('CREATE TABLE zz_owner(project_id TEXT,payload TEXT)')
+        connection.executemany('INSERT INTO zz_owner VALUES (?,?)', [(PID, 'ordinary')] * 5000)
+    else:
+        payload = json.dumps({'runtime_guide': {'next_legal_action': None}, 'history': ['ordinary'] * 5000})
+        connection.execute('INSERT INTO contract_runtime_executions '
+            '(contract_execution_id,project_id,backlog_id,contract_id,version,revision,execution_state_revision,record_json,created_at,updated_at) '
+            "VALUES ('one',?,'backlog','contract','1','1',1,?,'now','now')", (PID, payload))
+    connection.commit()
+    with store._owned_reference_connection(lambda: connection):
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert interrupted == ['interrupted']
+        assert not state['complete'] and 'reference_census_budget_exhausted' in state['refusal_reasons']
+        assert {'scope-current', 'scope-durable'} <= state['protected'].keys()
+        assert not connection.in_transaction
+
+
+def test_owned_census_unsupported_cursor_and_concurrent_commit_are_incomplete(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, '_governance_root', lambda: tmp_path)
+    path = tmp_path / 'owned-census.sqlite3'
+    class Concurrent(sqlite3.Connection):
+        armed = False
+        def execute(self, sql, args=()):
+            result = super().execute(sql, args)
+            if self.armed and 'FROM "zz_owner" NOT INDEXED' in sql:
+                self.armed = False
+                with sqlite3.connect(path) as writer:
+                    writer.execute("UPDATE zz_owner SET payload='committed'")
+            return result
+    def factory():
+        connection = sqlite3.connect(path, factory=Concurrent)
+        connection.row_factory = sqlite3.Row
+        connection.execute('PRAGMA journal_mode=WAL')
+        _typed_reference_setup(connection, count=0)
+        connection.execute('INSERT INTO graph_query_traces VALUES (?,?,?)', (PID, 'scope-current', 'scope-durable'))
+        connection.execute('CREATE TABLE zz_owner(payload TEXT)')
+        connection.execute("INSERT INTO zz_owner VALUES ('ordinary')")
+        connection.commit()
+        connection.armed = True
+        return connection
+    with store._owned_reference_connection(factory) as connection:
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert not state['complete'] and any('input_changed' in r for r in state['refusal_reasons'])
+        assert {'scope-current', 'scope-durable'} <= state['protected'].keys()
+        connection.execute('CREATE TABLE unsupported_owner(payload TEXT PRIMARY KEY) WITHOUT ROWID')
+        connection.execute("INSERT INTO unsupported_owner VALUES ('scope-current')")
+        connection.commit()
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert not state['complete'] and any('cursor_unsupported:unsupported_owner' in r for r in state['refusal_reasons'])
+        assert {'scope-current', 'scope-durable'} <= state['protected'].keys()

@@ -14,6 +14,7 @@ import re
 import sqlite3
 import stat
 import time
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -1945,6 +1946,98 @@ _REFERENCE_MAX_ROWS = 2000
 _REFERENCE_MAX_BYTES = 65536
 
 
+# Only trusted native creators lend fresh connections through this context.
+# Borrowed connections never install/clear a callback or acquire unlimited SQL.
+_REFERENCE_CENSUS_SECONDS = 25.0
+_REFERENCE_CONNECTIONS = threading.local()
+
+
+class _ReferenceBudgetExceeded(ValueError):
+    pass
+
+
+class _ReferenceInventoryExceeded(ValueError):
+    pass
+
+
+class _ReferenceBudget:
+    def __init__(self, conn):
+        self.conn = conn
+        self.deadline = None
+        self.active = False
+        self.exhausted = False
+
+    def checkpoint(self):
+        if self.active and (self.exhausted or time.monotonic() >= self.deadline):
+            self.exhausted = True
+            raise _ReferenceBudgetExceeded("reference_census_budget_exhausted")
+
+    def progress(self):
+        try:
+            self.checkpoint()
+        except _ReferenceBudgetExceeded:
+            return 1
+        return 0
+
+    @contextmanager
+    def census(self):
+        if self.deadline is None:
+            self.deadline = time.monotonic() + _REFERENCE_CENSUS_SECONDS
+        busy = self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.active = True
+        try:
+            self.checkpoint()
+            self.before_sql()
+            yield
+            self.checkpoint()
+        finally:
+            # Cancellation must not interrupt restoration or read rollback.
+            self.active = False
+            self.conn.execute(f"PRAGMA busy_timeout={int(busy)}")
+
+    def before_sql(self):
+        self.checkpoint()
+        remaining = max(0, int((self.deadline - time.monotonic()) * 1000))
+        current = self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.conn.execute(f"PRAGMA busy_timeout={min(current, 1000, remaining)}")
+
+
+def _reference_budget(conn):
+    return getattr(_REFERENCE_CONNECTIONS, "providers", {}).get(conn)
+
+
+def _reference_checkpoint(conn):
+    budget = _reference_budget(conn)
+    if budget is not None:
+        budget.checkpoint()
+
+
+@contextmanager
+def _owned_reference_connection(factory):
+    """Own one source-created fresh connection and its known-absent callback.
+
+    The absolute cooperative census deadline survives subsequent rechecks.
+    Auth/setup/writes outside census scopes are not subject to this callback.
+    This is not an HTTP deadline or a wrapper for arbitrary borrowed handles.
+    """
+    conn = factory()
+    providers = getattr(_REFERENCE_CONNECTIONS, "providers", None)
+    if providers is None:
+        providers = _REFERENCE_CONNECTIONS.providers = {}
+    budget = _ReferenceBudget(conn)
+    try:
+        conn.set_progress_handler(budget.progress, 1000)
+        providers[conn] = budget
+        yield conn
+    finally:
+        budget.active = False
+        providers.pop(conn, None)
+        try:
+            conn.set_progress_handler(None, 0)
+        finally:
+            conn.close()
+
+
 @contextmanager
 def _reference_read_snapshot(conn: sqlite3.Connection):
     """One reader view; never silently accept caller writes or changed input."""
@@ -1961,7 +2054,15 @@ def _reference_read_snapshot(conn: sqlite3.Connection):
             raise ValueError("reference_census_input_changed")
     finally:
         if owns:
-            conn.rollback()  # Read transaction only; no database bytes written.
+            budget = _reference_budget(conn)
+            active = budget.active if budget else False
+            if budget:
+                budget.active = False
+            try:
+                conn.rollback()  # Only this scope's read transaction.
+            finally:
+                if budget:
+                    budget.active = active
     if conn.execute("PRAGMA data_version").fetchone()[0] != before[1]:
         raise ValueError("reference_census_input_changed")
 
@@ -1977,7 +2078,8 @@ def _reference_pages(conn: sqlite3.Connection, table: str, projection: str,
         raise ValueError("reference_census_cursor_unsupported:" + table)
     scope = " WHERE " + where if where else ""
     expected = conn.execute(f"SELECT count(*) FROM {quoted}{scope}", args).fetchone()[0]
-    if expected > max_rows:
+    budget = _reference_budget(conn)
+    if budget is None and expected > max_rows:
         raise ValueError("reference_census_window_unbounded:" + table)
     last, seen = None, 0
     while True:
@@ -1986,14 +2088,20 @@ def _reference_pages(conn: sqlite3.Connection, table: str, projection: str,
         if last is not None:
             predicate = (predicate + " AND " if predicate else "") + f"{cursor_key}>?"
             page_args += (last,)
+        _reference_checkpoint(conn)
+        if budget:
+            budget.before_sql()
         page = conn.execute(f"SELECT {cursor_key},{projection} FROM {quoted}" +
+            (" NOT INDEXED" if budget else "") +
             (" WHERE " + predicate if predicate else "") +
             f" ORDER BY {cursor_key} LIMIT ?", (*page_args, _REFERENCE_PAGE_ROWS)).fetchall()
+        _reference_checkpoint(conn)
         if not page:
             break
         if sum(len(str(cell).encode('utf-8')) for row in page for cell in row) > 1024 * 1024:
             raise ValueError("reference_census_page_unbounded:" + table)
         for row in page:
+            _reference_checkpoint(conn)
             if type(row[0]) is not int or (last is not None and row[0] <= last):
                 raise ValueError("reference_census_continuation_gap:" + table)
             seen += 1
@@ -2012,8 +2120,10 @@ def _snapshot_reference_tokens(conn: sqlite3.Connection, project_id: str,
         raise ValueError("reference_identity_inventory_unbounded")
     tokens = {(sid, token) for sid in known_ids for token in
               (sid, str(_snapshot_root(project_id, sid)))}
+    _reference_checkpoint(conn)
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for table in ("reconcile_run_metrics", "graph_current_full_build_claim_history"):
+        _reference_checkpoint(conn)
         if table not in names:
             continue
         columns = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
@@ -2209,11 +2319,13 @@ def _contract_reference_rows(conn: sqlite3.Connection, project_id: str,
                "complete": bool(complete) and raw_pins is not None, "metadata": metadata}
 
 
-def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]]) -> set[str]:
+def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]],
+                                    checkpoint=lambda: None) -> set[str]:
     """Legacy capped-body fallback, including nested serialized audit strings."""
     pins, visited = set(), 0
     def visit(child: Any, depth: int) -> None:
         nonlocal visited
+        checkpoint()
         visited += 1
         if depth > 8 or visited > 20000:
             raise ValueError("reference_decoding_incomplete")
@@ -2225,7 +2337,10 @@ def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]]) -
             for item in child:
                 visit(item, depth + 1)
         elif isinstance(child, str):
-            pins.update(sid for sid, token in tokens if token in child)
+            for sid, token in tokens:
+                checkpoint()
+                if token in child:
+                    pins.add(sid)
             if child.lstrip().startswith(("{", "[")):
                 visit(json.loads(child), depth + 1)
             elif "\\u" in child:
@@ -2240,24 +2355,73 @@ def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]]) -
 def snapshot_retention_reference_state(
     conn: sqlite3.Connection, project_id: str,
 ) -> dict[str, Any]:
+    accumulator = {"protected": {}, "current_use": {},
+                   "contract_rows": {"current": 0, "completed": 0},
+                   "refusals": [], "refusal_metadata": []}
+    budget = _reference_budget(conn)
     try:
-        with _reference_read_snapshot(conn):
-            return _snapshot_retention_reference_state(conn, project_id)
+        with budget.census() if budget else _unbudgeted_reference_census():
+            with _reference_read_snapshot(conn):
+                _snapshot_retention_reference_state(conn, project_id, accumulator)
     except (ValueError, sqlite3.Error) as exc:
-        return {"protected": {}, "current_use": {}, "durable_references": {},
-                "complete": False, "refusal_reasons": [str(exc)],
-                "census": {"complete": False, "read_snapshot": "same_connection"}}
+        accumulator["refusals"].append("reference_census_budget_exhausted"
+            if budget and budget.exhausted else str(exc))
+    return _reference_result(accumulator, budgeted=budget is not None)
+
+
+@contextmanager
+def _unbudgeted_reference_census():
+    yield
+
+
+def _reference_result(accumulator, *, budgeted):
+    protected, current_use = accumulator["protected"], accumulator["current_use"]
+    refusals = accumulator["refusals"]
+    aggregate_bounded = len(protected) <= _REFERENCE_MAX_ROWS and sum(
+        len(sid.encode('utf-8')) + sum(len(reason.encode('utf-8')) for reason in reasons)
+        for sid, reasons in protected.items()) <= 1024 * 1024
+    if not aggregate_bounded or "durable_reference_pin_inventory_unbounded" in refusals:
+        refusals.append("durable_reference_pin_inventory_unbounded")
+        protected, current_use = {}, {}
+    census = {"complete": not refusals, "read_snapshot": "same_connection",
+              "page_rows": _REFERENCE_PAGE_ROWS,
+              "max_rows_per_store": None if budgeted else _REFERENCE_MAX_ROWS,
+              "aggregate_bounded": aggregate_bounded,
+              "contract_rows": accumulator["contract_rows"]}
+    if budgeted:
+        census.update(resource_budget="owned_connection_cooperative",
+                      budget_seconds=_REFERENCE_CENSUS_SECONDS)
+    return {"protected": {sid: sorted(reasons) for sid, reasons in protected.items()},
+            "current_use": {sid: sorted(reasons) for sid, reasons in current_use.items()},
+            "durable_references": {sid: sorted(reasons) for sid, reasons in protected.items()},
+            "complete": not refusals, "refusal_reasons": sorted(set(refusals)),
+            "refusal_metadata": accumulator["refusal_metadata"], "census": census}
 
 
 def _snapshot_retention_reference_state(
-    conn: sqlite3.Connection, project_id: str,
+    conn: sqlite3.Connection, project_id: str, accumulator: dict,
 ) -> dict[str, Any]:
     """Collect bounded durable identities used by every retention entrypoint."""
-    protected: dict[str, set[str]] = {}
-    current_use: dict[str, set[str]] = {}
-    contract_rows = {"current": 0, "completed": 0}
-    refusal_metadata = []
-    refusals: list[str] = []
+    protected = accumulator["protected"]
+    current_use = accumulator["current_use"]
+    contract_rows = accumulator["contract_rows"]
+    refusal_metadata = accumulator["refusal_metadata"]
+    refusals = accumulator["refusals"]
+
+    pin_bytes = 0
+
+    def add_pin(target, sid, reason):
+        nonlocal pin_bytes
+        _reference_checkpoint(conn)
+        reasons = target.setdefault(sid, set())
+        if reason not in reasons:
+            if target is protected:
+                pin_bytes += len(reason.encode('utf-8'))
+                if not reasons:
+                    pin_bytes += len(sid.encode('utf-8'))
+            reasons.add(reason)
+        if len(protected) > _REFERENCE_MAX_ROWS or pin_bytes > 1024 * 1024:
+            raise _ReferenceInventoryExceeded("durable_reference_pin_inventory_unbounded")
 
     def collect(table: str, columns: tuple[str, ...], reason: str,
                 *, required: bool = False) -> None:
@@ -2296,14 +2460,18 @@ def _snapshot_retention_reference_state(
                 refusals.append(f"{table}_reference_window_unbounded")
                 return
             for row in rows:
+                _reference_checkpoint(conn)
                 sid = row["snapshot_id"]
                 if sid is not None and (not isinstance(sid, str) or len(sid.encode('utf-8')) > 1024):
                     refusals.append(f"{table}_reference_type_unknown")
                     continue
                 sid = sid or ""
                 if sid:
-                    protected.setdefault(sid, set()).add(reason)
+                    add_pin(protected, sid, reason)
+        except _ReferenceInventoryExceeded:
+            raise
         except (sqlite3.Error, TypeError, ValueError):
+            _reference_checkpoint(conn)
             refusals.append(f"{table}_reference_unreadable")
 
     collect("graph_query_traces", ("snapshot_id", "canonical_base_snapshot_id"),
@@ -2359,6 +2527,7 @@ def _snapshot_retention_reference_state(
     # Explicit owner domains from db.py / contracts.runtime schemas. Affinity
     # or an INTEGER in any other owner is never enough to grant an exemption.
     scalar_domains = {
+        "graph_asset_projection": {"size_bytes": "{col}>=0"},
         "audit_index": {"ok": "{col} IN (0,1)"},
         "backlog_contract_chain_bindings": {
             "id": "{col}>0", "generation": "{col}>=0",
@@ -2377,30 +2546,32 @@ def _snapshot_retention_reference_state(
         if root.exists():
             known_ids.update(child.name for child in root.iterdir() if child.is_dir())
     except (sqlite3.Error, OSError, TypeError, ValueError):
+        _reference_checkpoint(conn)
         known_ids = set()
         refusals.append("reference_identity_inventory_unavailable")
 
     def walk(value: Any, reason: str) -> None:
+        _reference_checkpoint(conn)
         if isinstance(value, dict):
             for key, child in value.items():
                 if str(key).endswith("snapshot_id") and isinstance(child, str) and child:
-                    protected.setdefault(child, set()).add(reason)
+                    add_pin(protected, child, reason)
                     if current_row:
-                        current_use.setdefault(child, set()).add("unclassified_owner_use_reference")
+                        add_pin(current_use, child, "unclassified_owner_use_reference")
                 if str(key).endswith("snapshot_ids") and isinstance(child, list):
                     for sid in child:
                         if isinstance(sid, str) and sid:
-                            protected.setdefault(sid, set()).add(reason)
+                            add_pin(protected, sid, reason)
                             if current_row:
-                                current_use.setdefault(sid, set()).add("unclassified_owner_use_reference")
+                                add_pin(current_use, sid, "unclassified_owner_use_reference")
                 walk(child, reason)
         elif isinstance(value, list):
             for child in value:
                 walk(child, reason)
         elif isinstance(value, str) and value in known_ids:
-            protected.setdefault(value, set()).add(reason)
+            add_pin(protected, value, reason)
             if current_row:
-                current_use.setdefault(value, set()).add("unclassified_owner_use_reference")
+                add_pin(current_use, value, "unclassified_owner_use_reference")
 
     tokens = _snapshot_reference_tokens(conn, project_id, known_ids)
 
@@ -2423,6 +2594,7 @@ def _snapshot_retention_reference_state(
             if row[2] == "shadow" and any(str(row[1]) == owner + "_" + suffix
                 for owner in fts5_owners for suffix in ("data", "idx", "content", "docsize", "config"))}
         for table in tables:
+            _reference_checkpoint(conn)
             if table in intrinsic or table in fts5_shadows:
                 continue
             if table == "contract_runtime_executions":
@@ -2437,11 +2609,14 @@ def _snapshot_retention_reference_state(
                                 if reference["state"] not in {"completed", "live"} else "typed_projection_incomplete"})
                         if reference["pins"] is not None:
                             for sid in reference["pins"]:
-                                protected.setdefault(sid, set()).add("durable_contract_runtime_executions_payload_reference")
+                                add_pin(protected, sid, "durable_contract_runtime_executions_payload_reference")
                                 if reference["state"] == "live":
-                                    current_use.setdefault(sid, set()).add("current_contract_runtime_execution_reference")
+                                    add_pin(current_use, sid, "current_contract_runtime_execution_reference")
                         contract_rows["completed" if reference["state"] == "completed" else "current"] += 1
+                except _ReferenceInventoryExceeded:
+                    raise
                 except (ValueError, sqlite3.Error) as exc:
+                    _reference_checkpoint(conn)
                     refusals.append("contract_runtime_executions_projection_unreadable:" + str(exc)[:160])
                 continue
             quoted = '"' + table.replace('"', '""') + '"'
@@ -2498,6 +2673,7 @@ def _snapshot_retention_reference_state(
                 # remove current use; every audit still remains durable.
                 current_row = True
                 for index, col in enumerate(text_columns):
+                    _reference_checkpoint(conn)
                     raw = row[col]
                     storage_type, byte_length = source_row[1+len(text_columns)+index*2:3+len(text_columns)+index*2]
                     if col in owner_fields or col in owner_scalars:
@@ -2515,8 +2691,8 @@ def _snapshot_retention_reference_state(
                         # cannot establish a complete negative dependency proof.
                         if col in owner_fields and raw is not None:
                             for sid in json.loads(raw):
-                                protected.setdefault(sid, set()).add(f"durable_{table}_payload_reference")
-                                current_use.setdefault(sid, set()).add("unclassified_owner_use_reference")
+                                add_pin(protected, sid, f"durable_{table}_payload_reference")
+                                add_pin(current_use, sid, "unclassified_owner_use_reference")
                         continue
                     if col in integer_metadata.get(table, set()) and storage_type == "integer":
                         continue
@@ -2534,40 +2710,29 @@ def _snapshot_retention_reference_state(
                         refusals.append(f"{table}_payload_unreadable")
                         continue
                     for sid in known_ids:
+                        _reference_checkpoint(conn)
                         if sid and sid in raw:
-                            protected.setdefault(sid, set()).add(
-                                f"durable_{table}_text_reference"
-                            )
-                            current_use.setdefault(sid, set()).add("unclassified_owner_use_reference")
+                            add_pin(protected, sid, f"durable_{table}_text_reference")
+                            add_pin(current_use, sid, "unclassified_owner_use_reference")
                     if not raw.lstrip().startswith(("{", "[")):
                         continue
                     try:
                         payload = json.loads(raw)
                         walk(payload, f"durable_{table}_payload_reference")
-                        for sid in _bounded_decoded_reference_pins(payload, tokens):
-                            protected.setdefault(sid, set()).add(f"durable_{table}_payload_reference")
-                            current_use.setdefault(sid, set()).add("unclassified_owner_use_reference")
+                        for sid in _bounded_decoded_reference_pins(payload, tokens,
+                                lambda: _reference_checkpoint(conn)):
+                            add_pin(protected, sid, f"durable_{table}_payload_reference")
+                            add_pin(current_use, sid, "unclassified_owner_use_reference")
+                    except _ReferenceInventoryExceeded:
+                        raise
                     except (ValueError, TypeError, RecursionError):
+                        _reference_checkpoint(conn)
                         refusals.append(f"{table}_payload_unreadable")
+    except _ReferenceInventoryExceeded:
+        raise
     except (sqlite3.Error, TypeError, ValueError) as exc:
+        _reference_checkpoint(conn)
         refusals.append("durable_reference_census_unavailable:" + str(exc)[:160])
-    aggregate_bounded = len(protected) <= _REFERENCE_MAX_ROWS and sum(
-        len(sid.encode('utf-8')) + sum(len(reason.encode('utf-8')) for reason in reasons)
-        for sid, reasons in protected.items()) <= 1024 * 1024
-    if not aggregate_bounded:
-        refusals.append("durable_reference_pin_inventory_unbounded")
-        # Incomplete authority globally protects every candidate. Never return a
-        # truncated pin map that could be mistaken for an absence proof.
-        protected, current_use = {}, {}
-    return {"protected": {sid: sorted(reasons) for sid, reasons in protected.items()},
-            "current_use": {sid: sorted(reasons) for sid, reasons in current_use.items()},
-            "durable_references": {sid: sorted(reasons) for sid, reasons in protected.items()},
-            "complete": not refusals, "refusal_reasons": sorted(set(refusals)),
-            "refusal_metadata": refusal_metadata,
-            "census": {"complete": not refusals, "read_snapshot": "same_connection",
-                       "page_rows": _REFERENCE_PAGE_ROWS, "max_rows_per_store": _REFERENCE_MAX_ROWS,
-                       "aggregate_bounded": aggregate_bounded,
-                       "contract_rows": contract_rows}}
 
 
 def select_snapshot_retention_candidates(

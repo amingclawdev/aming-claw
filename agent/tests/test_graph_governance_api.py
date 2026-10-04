@@ -243150,3 +243150,77 @@ def test_postcommit_same_owner_renewal_attests_original_source_traces(
         "SELECT * FROM graph_query_traces WHERE project_id=? ORDER BY trace_id", (PID,)).fetchall()]
     assert set(after[-1]["payload"]["graph_trace_ids"]) == set(trace_ids)
     assert bool(accepted.get("postcommit_rejoin_trace_continuity")) == bool(renewals)
+
+
+@pytest.mark.parametrize('apply', [False, True])
+def test_cleanup_native_fresh_connection_owns_census_only(apply, monkeypatch, tmp_path):
+    opened = []
+    def factory(_project):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        store.ensure_schema(connection)
+        connection.execute('CREATE TABLE graph_query_traces(project_id TEXT,snapshot_id TEXT,canonical_base_snapshot_id TEXT)')
+        connection.commit()
+        opened.append(connection)
+        return connection
+    monkeypatch.setattr(server, 'get_connection', factory)
+    monkeypatch.setattr(server, '_graph_governance_project_root', lambda *_: tmp_path)
+    monkeypatch.setattr(governance_db, '_governance_root', lambda: tmp_path)
+    def auth(_ctx, connection, _action):
+        assert store._reference_budget(connection) is not None
+        assert store._reference_budget(connection).deadline is None
+    monkeypatch.setattr(server, '_require_graph_governance_operator', auth)
+    def projection(connection, project_id, **_kwargs):
+        state = store.snapshot_retention_reference_state(connection, project_id)
+        assert state['complete'] and state['census']['max_rows_per_store'] is None
+        assert not store._reference_budget(connection).active
+        return {'ok': True, 'writes_performed': False}
+    monkeypatch.setattr(stale_artifact_cleanup,
+        'apply_stale_artifact_cleanup' if apply else 'build_stale_artifact_cleanup_projection', projection)
+    context = SimpleNamespace(get_project_id=lambda: PID, handler=SimpleNamespace(),
+        token='', query={}, body={})
+    result = (server.handle_graph_governance_stale_artifact_cleanup_apply if apply else
+              server.handle_graph_governance_stale_artifact_cleanup)(context)
+    assert result == {'ok': True, 'writes_performed': False}
+    assert len(opened) == 1 and store._reference_budget(opened[0]) is None
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute('SELECT 1')
+
+
+@pytest.mark.parametrize('terminal', [False, True])
+def test_current_full_native_connection_census_lifetime(terminal, monkeypatch, tmp_path):
+    opened = []
+    def factory(_project):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        store.ensure_schema(connection)
+        connection.execute('CREATE TABLE graph_query_traces(project_id TEXT,snapshot_id TEXT,canonical_base_snapshot_id TEXT)')
+        connection.commit()
+        opened.append(connection)
+        return connection
+    monkeypatch.setattr(server, 'get_connection', factory)
+    monkeypatch.setattr(server, '_graph_governance_project_root', lambda *_: tmp_path)
+    monkeypatch.setattr(governance_db, '_governance_root', lambda: tmp_path)
+    monkeypatch.setattr(server, '_require_current_full_reconcile_auth', lambda *_: {})
+    monkeypatch.setattr(server, '_require_reconcile_terminalization_auth', lambda *_: {})
+    monkeypatch.setattr(server, '_prewarm_reconcile_terminalization_schemas', lambda *_: None)
+    def census(connection):
+        assert store._reference_budget(connection).deadline is None
+        state = store.snapshot_retention_reference_state(connection, PID)
+        assert state['complete'] and not store._reference_budget(connection).active
+        return {'ok': True, 'writes_performed': False}
+    monkeypatch.setattr(server, '_graph_release_recovery_retention_preflight',
+        lambda connection, *_args, **_kwargs: census(connection))
+    monkeypatch.setattr(server, '_recover_current_full_operator_provenance',
+        lambda _ctx, connection, *_args, **_kwargs: (200, census(connection)))
+    if terminal:
+        body = {'notes_extra': {'_manager_action': {
+            'action': server._RECONCILE_RELEASE_PREFLIGHT_ACTION, 'apply': False}}}
+    else:
+        body = {'recover_operator_provenance': True}
+    status, result = server.handle_graph_governance_current_full_reconcile(_ctx(
+        {'project_id': PID}, method='POST', body=body))
+    assert status == 200 and result['ok']
+    assert len(opened) == 1 and store._reference_budget(opened[0]) is None
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute('SELECT 1')
