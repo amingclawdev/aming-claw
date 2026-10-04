@@ -1923,6 +1923,58 @@ def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
             state + "," + pin_projection + "," + complete_projection)
 
 
+def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
+                                *, json_owner: bool) -> tuple[str, str]:
+    """Source-owned audit fields: SQL pins only, never transfer their raw body.
+
+    Ordinary owner disposition is unclassified, so every pin stays current too.
+    SQLite traversal is complete within the existing serialized-depth budget;
+    only projected bytes, row counts and aggregate pins have resource bounds.
+    """
+    def literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+    values = ",".join(f"({literal(sid)},{literal(token)})" for sid, token in tokens)
+    token_cte = "VALUES " + values if values else "SELECT '', '' WHERE 0"
+    valid = f"typeof({column})='text' AND instr({column},char(0))=0"
+    if json_owner:
+        valid += f" AND json_valid({column}) AND json_type({column})='object'"
+    else:
+        # Markdown is TEXT; a JSON-looking malformed body cannot prove absence.
+        valid += (f" AND (substr(ltrim({column}),1,1) NOT IN ('{{','[') "
+                  f"OR json_valid({column}))")
+    docs = (f"WITH RECURSIVE docs(doc,depth) AS (SELECT CASE WHEN json_valid({column}) "
+        f"THEN {column} ELSE json_quote({column}) END,0 UNION "
+        "SELECT j.atom,d.depth+1 FROM docs d,json_tree(d.doc) j "
+        "WHERE j.type='text' AND substr(ltrim(j.atom),1,1) IN ('{','[') "
+        "AND json_valid(j.atom) AND d.depth<8), "
+        "numbered AS (SELECT row_number() OVER () AS doc_id,doc,depth FROM docs), "
+        "atoms AS (SELECT d.doc_id,j.id,j.parent,j.key,j.atom,j.type,d.depth "
+        "FROM numbered d,json_tree(d.doc) j) ")
+    candidates = (f"pins(sid) AS (SELECT column1 FROM ({token_cte}) tokens "
+        f"WHERE instr({column},tokens.column2)>0 OR EXISTS(SELECT 1 FROM atoms "
+        "WHERE (type='text' AND instr(atom,tokens.column2)>0) OR "
+        "(typeof(key)='text' AND instr(key,tokens.column2)>0)) UNION "
+        "SELECT atom FROM atoms a WHERE type='text' AND ("
+        "substr(CAST(key AS TEXT),-11)='snapshot_id' OR EXISTS(SELECT 1 FROM atoms p "
+        "WHERE p.doc_id=a.doc_id AND p.id=a.parent AND p.type='array' "
+        "AND substr(CAST(p.key AS TEXT),-12)='snapshot_ids'))) ")
+    pins = "(SELECT json_group_array(sid) FROM (SELECT DISTINCT sid FROM pins WHERE sid!=''))"
+    projection = (f"CASE WHEN {valid} THEN ({docs}, {candidates} SELECT CASE "
+        f"WHEN length(CAST({pins} AS BLOB))<={_REFERENCE_MAX_BYTES} THEN {pins} "
+        "ELSE NULL END) ELSE NULL END")
+    complete = (f"CASE WHEN {valid} THEN ({docs} SELECT CASE WHEN coalesce(max(CASE "
+        "WHEN typeof(key)='text' AND substr(key,-11)='snapshot_id' AND type!='text' THEN 1 "
+        "WHEN typeof(key)='text' AND substr(key,-12)='snapshot_ids' AND type!='array' THEN 1 "
+        "WHEN type!='text' AND EXISTS(SELECT 1 FROM atoms p WHERE p.doc_id=atoms.doc_id "
+        "AND p.id=atoms.parent AND p.type='array' AND substr(CAST(p.key AS TEXT),-12)='snapshot_ids') THEN 1 "
+        "WHEN type='text' AND instr(atom,char(0))>0 THEN 1 "
+        "WHEN type='text' AND substr(ltrim(atom),1,1) IN ('{','[') "
+        "AND (NOT json_valid(atom) OR depth=8) THEN 1 "
+        "WHEN type='text' AND NOT json_valid(atom) AND instr(atom,char(92)||'u')>0 "
+        "THEN 1 ELSE 0 END),0)=1 THEN 0 ELSE 1 END FROM atoms) ELSE 0 END")
+    return projection, complete
+
+
 def _contract_reference_rows(conn: sqlite3.Connection, project_id: str,
                              known_ids: set[str]):
     columns = {r[1] for r in conn.execute("PRAGMA table_info(contract_runtime_executions)")}
@@ -2095,6 +2147,19 @@ def _snapshot_retention_reference_state(
         "sqlite_sequence": {"seq"},
     }
 
+    # Explicit owner domains from db.py / contracts.runtime schemas. Affinity
+    # or an INTEGER in any other owner is never enough to grant an exemption.
+    scalar_domains = {
+        "audit_index": {"ok": "{col} IN (0,1)"},
+        "backlog_contract_chain_bindings": {
+            "id": "{col}>0", "generation": "{col}>=0",
+            "execution_state_revision": "{col}>=0"},
+    }
+    projected_owner_fields = {
+        "backlog_contract_chain_bindings": {"metadata_json": True, "degraded_flags_json": True},
+        "backlog_bugs": {"details_md": False},
+    }
+
     try:
         known_ids = {str(row["snapshot_id"]) for row in conn.execute(
             "SELECT snapshot_id FROM graph_snapshots WHERE project_id=?", (project_id,)
@@ -2194,10 +2259,24 @@ def _snapshot_retention_reference_state(
             text_columns = sorted(columns - (
                 {"snapshot_id"} if table in self_identity_tables else set()))
             quoted_columns = ['"' + col.replace('"', '""') + '"' for col in text_columns]
-            projection = [f"CASE WHEN typeof({col})='text' AND "
-                f"length(CAST({col} AS BLOB))<={_REFERENCE_MAX_BYTES} THEN {col} ELSE NULL END"
-                for col in quoted_columns]
+            owner_fields = projected_owner_fields.get(table, {})
+            owner_scalars = scalar_domains.get(table, {})
+            projection, completions = [], []
+            for name, col in zip(text_columns, quoted_columns):
+                if name in owner_fields:
+                    pins, complete = _owner_reference_projection(col, tokens, json_owner=owner_fields[name])
+                    projection.append(pins)
+                    completions.append(complete)
+                elif name in owner_scalars:
+                    projection.append(f"CASE WHEN typeof({col})='integer' AND " +
+                        owner_scalars[name].format(col=col) + " THEN 1 ELSE 0 END")
+                    completions.append("1")
+                else:
+                    projection.append(f"CASE WHEN typeof({col})='text' AND "
+                        f"length(CAST({col} AS BLOB))<={_REFERENCE_MAX_BYTES} THEN {col} ELSE NULL END")
+                    completions.append("1")
             projection += [f"typeof({col}),length(CAST({col} AS BLOB))" for col in quoted_columns]
+            projection += completions
             if not projection:
                 continue
             rows = _reference_pages(conn, table, ",".join(projection),
@@ -2212,6 +2291,24 @@ def _snapshot_retention_reference_state(
                 for index, col in enumerate(text_columns):
                     raw = row[col]
                     storage_type, byte_length = source_row[1+len(text_columns)+index*2:3+len(text_columns)+index*2]
+                    if col in owner_fields or col in owner_scalars:
+                        complete = source_row[1+3*len(text_columns)+index]
+                        valid = (storage_type == "integer" and raw == 1 if col in owner_scalars
+                                 else storage_type == "text" and complete == 1 and raw is not None)
+                        if not valid:
+                            refusals.append(f"{table}_payload_unreadable")
+                            if not refusal_metadata:
+                                refusal_metadata.append({"table": table, "field": col,
+                                    "sqlite_storage_type": storage_type, "storage_byte_length": byte_length,
+                                    "utf8_byte_length": byte_length if storage_type == "text" else None,
+                                    "cause": "owner_projection_incomplete", "complete": False, "body_fetched": False})
+                        # Partial positive pins still protect even when the owner
+                        # cannot establish a complete negative dependency proof.
+                        if col in owner_fields and raw is not None:
+                            for sid in json.loads(raw):
+                                protected.setdefault(sid, set()).add(f"durable_{table}_payload_reference")
+                                current_use.setdefault(sid, set()).add("unclassified_owner_use_reference")
+                        continue
                     if col in integer_metadata.get(table, set()) and storage_type == "integer":
                         continue
                     if storage_type != "null" and (storage_type != "text" or byte_length > _REFERENCE_MAX_BYTES):

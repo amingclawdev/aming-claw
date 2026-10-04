@@ -6215,3 +6215,126 @@ def test_b1am_healthy_ensure_vm_steps_are_constant_at_50k(conn):
         conn.set_progress_handler(None, 0)
     assert approximate_steps < 5_000
     assert conn.in_transaction is False
+
+
+def _owner_binding_fixture(connection, payloads, *, degraded="{}"):
+    from agent.governance.contracts.runtime import CONTRACT_CHAIN_MAPPING_SCHEMA_SQL
+    connection.executescript(CONTRACT_CHAIN_MAPPING_SCHEMA_SQL)
+    connection.executemany(
+        "INSERT INTO backlog_contract_chain_bindings "
+        "(idempotency_key,project_id,backlog_id,contract_chain_id,contract_execution_id,"
+        "binding_kind,generation,execution_state_revision,metadata_json,degraded_flags_json,created_at) "
+        "VALUES (?,?, 'backlog','chain','execution','fixture',0,0,?,?, 'now')",
+        [(f"binding-{i}", PID, payload, degraded) for i, payload in enumerate(payloads)])
+    connection.commit()
+
+
+def test_owner_projection_767_complex_bindings_late_page_pins_without_raw_transfer(conn):
+    _typed_reference_setup(conn, count=1)
+    marker = "SQL-ONLY-OWNER-BODY-"
+    payload = json.dumps({"metadata": {"history": [{"step": i, "notes": marker + "x"*280}
+        for i in range(185)]}, "ordinary": {"number": 7, "flag": True, "missing": None}})
+    assert 60_000 < len(payload.encode()) < 65_536
+    late = json.loads(payload)
+    late["raw_path"] = str(store._snapshot_root(PID, "scope-current"))
+    late["serialized"] = json.dumps({"snapshot_ids": ["scope-durable"]}).replace(
+        "scope-durable", "scope\\u002ddurable")
+    late["late_snapshot_id"] = "outside-typed-pin"
+    late = json.dumps(late)
+    assert "scope-durable" not in late and len(late.encode()) < 65_536
+    _owner_binding_fixture(conn, [payload]*766 + [late])
+    # A late decoded key and duplicate value must both remain protective.
+    conn.execute("UPDATE backlog_contract_chain_bindings SET degraded_flags_json=? WHERE id=767",
+                 ('{"snapshot_id":"scope\\u002ddurable","snapshot_id":"scope\\u002dcurrent"}',))
+    conn.executemany("INSERT INTO audit_index(event_id,project_id,event,ok,ts) VALUES (?,?, 'fixture',?, 'now')",
+                     [(f"audit-{v}", PID, v) for v in (0, 1)])
+    conn.commit()
+    image = hashlib.sha256(conn.serialize()).hexdigest(); changes = conn.total_changes
+    transferred, statements = [], []
+    def row_factory(cursor, row):
+        # sqlite_master schema SQL is metadata, not a projected payload page.
+        if any(col[0].startswith("typeof(") for col in cursor.description):
+            transferred.extend(len(v.encode()) for v in row if isinstance(v, str))
+        assert not any(marker in v for v in row if isinstance(v, str))
+        return sqlite3.Row(cursor, row)
+    conn.row_factory = row_factory; conn.set_trace_callback(statements.append)
+    state = store.snapshot_retention_reference_state(conn, PID)
+    conn.set_trace_callback(None)
+    assert state["complete"] is True and state["refusal_reasons"] == []
+    assert {"scope-current", "scope-durable", "outside-typed-pin"} <= state["durable_references"].keys()
+    assert {"scope-current", "scope-durable", "outside-typed-pin"} <= state["current_use"].keys()
+    assert max(transferred) < 1024  # Small pins/metadata, even on the >1MiB raw pages.
+    assert any('FROM "backlog_contract_chain_bindings"' in q and '_rowid_>704' in q for q in statements)
+    assert changes == conn.total_changes and image == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+def test_owner_projection_large_markdown_late_raw_and_path_pins(conn):
+    _typed_reference_setup(conn, count=1)
+    body = "ordinary owner Markdown paragraph\n"*3100 + "late scope-durable " + str(store._snapshot_root(PID, "scope-current"))
+    assert len(body.encode()) > 100_406
+    conn.execute("DROP TABLE backlog_bugs")
+    conn.execute("CREATE TABLE backlog_bugs (project_id TEXT, details_md TEXT)")
+    conn.execute("INSERT INTO backlog_bugs VALUES (?,?)", (PID, body)); conn.commit()
+    fetched = []
+    def row_factory(cursor, row):
+        if any(col[0].startswith("typeof(") for col in cursor.description):
+            fetched.extend(v for v in row if isinstance(v, str) and len(v.encode()) > 1024)
+        return sqlite3.Row(cursor, row)
+    conn.row_factory = row_factory
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state["complete"] and not fetched
+    assert {"scope-current", "scope-durable"} <= state["current_use"].keys()
+
+
+@pytest.mark.parametrize("table,column,value", [
+    ("audit_index", "ok", 2), ("audit_index", "ok", -1),
+    ("audit_index", "ok", 0.5), ("audit_index", "ok", "false"),
+    ("audit_index", "ok", sqlite3.Binary(b"1")), ("audit_index", "ok", None),
+    ("backlog_contract_chain_bindings", "id", 0),
+    ("backlog_contract_chain_bindings", "id", -1),
+    ("backlog_contract_chain_bindings", "generation", -1),
+    ("backlog_contract_chain_bindings", "execution_state_revision", -1),
+    ("backlog_contract_chain_bindings", "generation", 1.5),
+    ("backlog_contract_chain_bindings", "id", sqlite3.Binary(b"7")),
+    ("ordinary_owner", "ok", 1),
+])
+def test_owner_projection_scalar_storage_and_domains_protect(conn, table, column, value):
+    _typed_reference_setup(conn, count=1)
+    conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+    conn.execute(f'CREATE TABLE "{table}" (project_id TEXT, "{column}" INTEGER)')
+    conn.execute(f'INSERT INTO "{table}" VALUES (?,?)', (PID, value)); conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state["complete"] and f"{table}_payload_unreadable" in state["refusal_reasons"]
+    selected = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0, extra_bundle_snapshot_ids=set())
+    assert not selected["reference_authority_complete"] and selected["candidates"] == []
+
+
+@pytest.mark.parametrize("payload", [
+    '{bad', 'null', '[]', 'false', sqlite3.Binary(b'{}'),
+    '{"snapshot_id":null}', '{"snapshot_id":7}', '{"snapshot_ids":"scope-current"}',
+    '{"snapshot_ids":["scope-current",7]}',
+    '{"snapshot_id":"scope-current","snapshot_id":false}',
+    '{"serialized":"{bad"}', '{"serialized":"{\\"snapshot_id\\":7}"}',
+    '{"text":"scope\\u0000current"}',
+])
+def test_owner_projection_malformed_json_reference_shapes_protect(conn, payload):
+    _typed_reference_setup(conn, count=1)
+    _owner_binding_fixture(conn, [payload])
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state["complete"] and "backlog_contract_chain_bindings_payload_unreadable" in state["refusal_reasons"]
+    assert state["refusal_metadata"][0]["body_fetched"] is False
+    if isinstance(payload, str) and '"scope-current"' in payload:
+        assert "scope-current" in state["durable_references"]  # Positive pins survive unknown completeness.
+
+
+def test_owner_projection_degraded_flags_object_and_unknown_large_text(conn):
+    _typed_reference_setup(conn, count=1)
+    _owner_binding_fixture(conn, ['{}'], degraded='{"ordinary":{"flag":false,"count":7}}')
+    assert store.snapshot_retention_reference_state(conn, PID)["complete"]
+    conn.execute("UPDATE backlog_contract_chain_bindings SET degraded_flags_json='[]'"); conn.commit()
+    assert not store.snapshot_retention_reference_state(conn, PID)["complete"]
+    conn.execute("UPDATE backlog_contract_chain_bindings SET degraded_flags_json='{}'")
+    conn.execute("CREATE TABLE unknown_owner (payload TEXT)")
+    conn.execute("INSERT INTO unknown_owner VALUES (?)", ('x'*100_406,)); conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state["complete"] and "unknown_owner_payload_unreadable" in state["refusal_reasons"]
