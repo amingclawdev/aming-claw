@@ -231,6 +231,30 @@ def test_native_event_native_seal_and_context_controls(tmp_path, monkeypatch, ch
         conn.close()
 
 
+@pytest.mark.parametrize("marker_event_id", [True, 1.0, "1", 2], ids=["bool", "float", "string", "wrong-int"])
+def test_native_event_sealed_event_id_requires_exact_integer(tmp_path, monkeypatch, marker_event_id):
+    conn, _runtime, _write, request, selector, event, provenance = _native_reconcile_proof_fixture(tmp_path, monkeypatch)
+    try:
+        assert event["id"] == 1
+        marker = copy.deepcopy(provenance["marker"])
+        marker["reconcile_event_id"] = marker_event_id
+        marker["provenance_hash"] = server.stable_sha256({
+            key: value for key, value in marker.items() if key != "provenance_hash"})
+        conn.execute("UPDATE graph_current_full_reconcile_provenance SET marker_json=?,provenance_hash=?",
+            (json.dumps(marker), marker["provenance_hash"]))
+        conn.execute("UPDATE graph_snapshots SET notes=?",
+            (json.dumps({"current_full_reconcile": marker}),))
+        conn.commit()
+        proof = server.handle_project_contract_runtime_current_state(request(selector))
+        (tmp_path / "actual-marker-proof.json").write_text(json.dumps({
+            "marker": marker, "original_native_event_id": event["id"], "proof": proof}, indent=2) + "\n")
+        assert proof["ok"] is False, proof
+        assert proof["error"] == "native_event_event_binding_mismatch"
+        assert proof["native_event"] is None
+    finally:
+        conn.close()
+
+
 def test_native_event_http_final_wire_cap():
     import io
     from agent.governance import native_event_provenance

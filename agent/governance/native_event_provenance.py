@@ -156,6 +156,7 @@ def read_native_event(conn, *, source_record, recorded, selector, actor_role):
         return refusal("native_event_snapshot_binding_mismatch")
     occurred_at = event.get("created_at")
     if not (event.get("backlog_id") == backlog and event.get("task_id") == identity["task_id"]
+            and type(marker.get("reconcile_event_id")) is int
             and marker.get("reconcile_event_id") == event_id
             and seal.get("reconcile_event_id") == event_id
             and marker.get("reconcile_event_created_at") == seal.get("reconcile_event_created_at")
