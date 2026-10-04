@@ -9,10 +9,237 @@ import pytest
 from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store
 from agent.governance import server
+import pytest
 from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
 from agent.governance.contracts.write_gate import (
     _validate_worker_receipt_hash_evidence,
 )
+
+
+def _native_reconcile_proof_fixture(tmp_path, monkeypatch, *, lookalike=False):
+    """Real capability gate, native finalizer, canonical writer and SQLite read.
+
+    The small active graph is fixture input; no graph builder or live service runs.
+    """
+    import sqlite3
+    from contextlib import contextmanager
+    from agent.governance import task_timeline
+    from agent.governance.contracts.runtime import SQLiteContractExecutionStore
+
+    project, backlog, execution = "native-fixture", "AC-NATIVE-FIXTURE", "cex-native-fixture"
+    definition = {
+        "schema_version": "contract_definition.v1", "contract_id": "native_fixture",
+        "version": "v1", "revision": "rev1", "role": "observer",
+        "contract_type": "native_fixture", "status": "active",
+        "rule_layer": {"stages": [{"stage_id": "record", "lines": [
+            {"line_id": line, "owner_role": "observer", "allowed_writer_roles": ["observer"],
+             "evidence_kind": "reconcile" if n == 0 else "recorded_fixture"}
+            for n, line in enumerate(("observer_reconcile", "later_report"))
+        ]}]}, "instruction_layer": {"inline": [], "refs": []},
+    }
+    (tmp_path / "native_fixture.v1.rev1.json").write_text(json.dumps(definition))
+    conn = sqlite3.connect(tmp_path / "native.sqlite")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path),
+        store=SQLiteContractExecutionStore(conn), instruction_root=tmp_path)
+    runtime.start_execution("native_fixture", project_id=project, backlog_id=backlog,
+        contract_execution_id=execution, actor_role="observer")
+    graph_snapshot_store.ensure_schema(conn)
+    task_timeline.ensure_schema(conn)
+    parallel_branch_runtime.upsert_branch_context(conn,
+        parallel_branch_runtime.BranchTaskRuntimeContext(project_id=project,
+            backlog_id=backlog, task_id=execution, runtime_context_id="mfrctx-native-fixture",
+            branch_ref="refs/heads/codex/native-fixture", parent_task_id="parent-native-fixture",
+            status="merged", target_head_commit="d" * 40))
+    graph_snapshot_store.create_graph_snapshot(conn, project, snapshot_id="full-native-fixture",
+        commit_sha="d" * 40, snapshot_kind="full", status="active",
+        graph_json={"nodes": [], "edges": []})
+    session = {"role": "coordinator", "principal_id": "fixture-coordinator", "session_id": "ses-fixture"}
+    body = {"backlog_id": backlog, "task_id": execution}
+    ctx = SimpleNamespace(token="", body=body, query={}, require_auth=lambda actual: session,
+        get_project_id=lambda: project)
+    auth = server._require_current_full_reconcile_auth(ctx, conn, "graph_current_full_reconcile")
+    scope = server._current_full_reconcile_runtime_context_scope(conn, project_id=project,
+        body=body, auth=auth, target_commit_sha="d" * 40)
+    route = server._current_full_reconcile_route_evidence(auth, runtime_context_scope=scope)
+    result = {"ok": True, "snapshot_id": "full-native-fixture", "current_full_reconcile": True, "activated": True,
+        "active_graph_commit": "d" * 40,
+        "activation_verification": {"verified": True, "active_graph_commit": "d" * 40}}
+    event, provenance = server._record_current_full_atomic_evidence(conn, graph_snapshot_store,
+        project_id=project, body=body, result=result, run_id="native-fixture-run",
+        snapshot_id="full-native-fixture", target_commit="d" * 40, route_evidence=route,
+        runtime_context_scope=scope, request_id="req-111111111111",
+        request_started_at=server._utc_now(), graph_delta_mode="full",
+        declared_actor_role="observer", route_bound=False)
+    if lookalike:
+        event = task_timeline.record_event(conn, project_id=event["project_id"],
+            backlog_id=event["backlog_id"], task_id=event["task_id"], event_type=event["event_type"],
+            event_kind=event["event_kind"], phase=event["phase"], status=event["status"],
+            actor=event["actor"], commit_sha=event["commit_sha"], payload=copy.deepcopy(event["payload"]),
+            post_commit_hooks=False)
+
+    def write(line_id, evidence_kind, payload):
+        record = runtime.current_record(execution, actor_role="observer")
+        guide = runtime.current_guide(execution, actor_role="observer")
+        result = runtime.submit_line_write(execution, {
+            "project_id": project, "backlog_id": backlog, "contract_execution_id": execution,
+            "definition_hash": record["definition_hash"], "instruction_bundle_hash": record["instruction_bundle_hash"],
+            "stage_id": "record", "line_id": line_id, "actor_role": "observer", "evidence_kind": evidence_kind,
+            "execution_state_revision": record["execution_state_revision"], "runtime_guide_hash": guide["runtime_guide_hash"],
+            "payload": payload,
+        }, actor_role="observer")
+        assert result["ok"] is True, result
+        conn.commit()
+        return result
+
+    write("observer_reconcile", "reconcile", {"status": "passed", "reconcile_authority": {
+        **{key: scope[key] for key in ("project_id", "backlog_id", "task_id", "parent_task_id", "runtime_context_id", "merge_queue_id")},
+        "contract_execution_id": execution, "reconcile_event_id": event["id"],
+        "reconcile_event_created_at": event["created_at"], "reconcile_source_ref": f"timeline:{event['id']}",
+    }})
+
+    @contextmanager
+    def database(requested_project):
+        assert requested_project == project
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    monkeypatch.setattr(server, "DBContext", database)
+    monkeypatch.setattr(server, "_contract_runtime", lambda actual: runtime if actual is conn else None)
+    def request(query, role="observer"):
+        return SimpleNamespace(path_params={"contract_execution_id": execution}, query=query,
+            request_id="req-222222222222", get_project_id=lambda: project,
+            require_auth=lambda actual: {"role": role})
+    current = server.handle_project_contract_runtime_current_state(request({"response_view": "coordinator_current"}))
+    selector = {"response_view": "native_event", "backlog_id": backlog,
+        "contract_revision_id": current["contract_revision_id"], "contract_hash": current["contract_hash"],
+        "execution_state_revision": str(current["execution_state_revision"]), "execution_state_hash": current["execution_state_hash"],
+        "source_completed_line_index": "latest", "source_event_id": str(event["id"])}
+    return conn, runtime, write, request, selector, event, provenance
+
+
+def test_native_event_actual_writer_current_to_proof(tmp_path, monkeypatch):
+    conn, runtime, _write, request, selector, event, _ = _native_reconcile_proof_fixture(tmp_path, monkeypatch)
+    try:
+        proof = server.handle_project_contract_runtime_current_state(request(selector))
+        assert proof.get("response_view") == "native_event", proof
+        assert proof["ok"] is True, proof
+        original = dict(conn.execute("SELECT * FROM task_timeline_events WHERE id=?", (event["id"],)).fetchone())
+        assert proof["native_event"]["source_event_hash"] == server.stable_sha256(original)
+        line = runtime.store.get("cex-native-fixture")["completed_lines"][0]
+        assert proof["recorded_line"]["source_line_hash"] == server.stable_sha256(line)
+        assert proof["native_event"]["source_event_hash"] != proof["recorded_line"]["source_line_hash"]
+        assert proof["native_event"]["source_event_hash"] != server.stable_sha256(proof["native_event"])
+        assert proof["formal_position"] == "UNKNOWN"
+        assert proof["formal_world"] == "UNKNOWN"
+        assert proof["direction_authority"] is False
+        assert proof["effect_authority"] is False
+        import os
+        from pathlib import Path
+        export = os.environ.get("AC_NATIVE_EVENT_FIXTURE_EXPORT")
+        if export:
+            current = server.handle_project_contract_runtime_current_state(request({"response_view": "coordinator_current"}))
+            Path(export).write_text(json.dumps({"coordinator_current": current, "selector": selector,
+                "source_event": original, "source_line": line, "native_event_proof": proof}, indent=2) + "\n")
+    finally:
+        conn.close()
+
+
+def test_native_event_later_canonical_write_refuses_stale_selector(tmp_path, monkeypatch):
+    conn, _runtime, write, request, selector, _event, _ = _native_reconcile_proof_fixture(tmp_path, monkeypatch)
+    try:
+        write("later_report", "recorded_fixture", {"status": "blocked", "reason": "ordinary later observation"})
+        proof = server.handle_project_contract_runtime_current_state(request(selector))
+        assert proof["ok"] is False
+        assert proof["error"] == "recorded_line_currentness_mismatch"
+    finally:
+        conn.close()
+
+
+def test_native_event_caller_lookalike_has_no_native_seal(tmp_path, monkeypatch):
+    conn, _runtime, _write, request, selector, _event, _ = _native_reconcile_proof_fixture(tmp_path, monkeypatch, lookalike=True)
+    try:
+        # An actual canonical stored claim cannot lend the separate native seal.
+        proof = server.handle_project_contract_runtime_current_state(request(selector))
+        assert proof["error"] == "native_event_native_binding_missing"
+        assert proof["native_event"] is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("changes,expected", [
+    ({"backlog_id": "OTHER"}, "recorded_line_scope_mismatch"),
+    ({"contract_revision_id": "rev-other"}, "native_event_scope_mismatch"),
+    ({"event_family": "worker.finish"}, "native_event_family_unsupported"),
+    ({"source_event_hash": "sha256:" + "0" * 64}, "native_event_digest_mismatch"),
+    ({"source_event_id": "0"}, "native_event_selector_invalid"),
+    ({"source_event_id": "9999"}, "native_event_line_binding_mismatch"),
+])
+def test_native_event_exact_selector_refusals(tmp_path, monkeypatch, changes, expected):
+    conn, _runtime, _write, request, selector, _event, _ = _native_reconcile_proof_fixture(tmp_path, monkeypatch)
+    try:
+        proof = server.handle_project_contract_runtime_current_state(request({**selector, **changes}))
+        assert proof["error"] == expected
+        assert proof["native_event"] is None
+    finally:
+        conn.close()
+
+
+def test_native_event_wrong_read_role_refuses(tmp_path, monkeypatch):
+    from agent.governance import native_event_provenance
+    conn, runtime, _write, request, selector, _event, _ = _native_reconcile_proof_fixture(tmp_path, monkeypatch)
+    try:
+        ordinary = server.handle_project_contract_runtime_current_state(request({**selector, "response_view": "recorded_line"}))
+        assert native_event_provenance.read_native_event(conn, source_record=runtime.store.get("cex-native-fixture"),
+            recorded=ordinary, selector=selector, actor_role="mf_sub")["error"] == "native_event_role_unsupported"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("dev_force", "native_event_native_binding_invalid"),
+    ("operator_no_backlog", "native_event_native_binding_invalid"),
+    ("context", "native_event_runtime_context_mismatch"),
+    ("ambiguous", "native_event_binding_ambiguous"),
+])
+def test_native_event_native_seal_and_context_controls(tmp_path, monkeypatch, change, expected):
+    conn, _runtime, _write, request, selector, event, provenance = _native_reconcile_proof_fixture(tmp_path, monkeypatch)
+    try:
+        if change == "context":
+            conn.execute("UPDATE parallel_branch_runtime_contexts SET parent_task_id='other' WHERE runtime_context_id=?", ("mfrctx-native-fixture",))
+        elif change == "ambiguous":
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(graph_current_full_reconcile_provenance)")]
+            row = dict(conn.execute("SELECT * FROM graph_current_full_reconcile_provenance").fetchone())
+            row["provenance_id"] = "cfrp-second-fixture"
+            conn.execute("INSERT INTO graph_current_full_reconcile_provenance (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")", tuple(row[key] for key in columns))
+        else:
+            marker = copy.deepcopy(provenance["marker"])
+            if change == "dev_force":
+                marker.update(normal_update_path=False, dev_force_graph_only=True)
+            else:
+                marker["operator_event_id"] = "gref-operator-no-backlog"
+            marker["provenance_hash"] = server.stable_sha256({key: value for key, value in marker.items() if key != "provenance_hash"})
+            conn.execute("UPDATE graph_current_full_reconcile_provenance SET marker_json=?,provenance_hash=?", (json.dumps(marker), marker["provenance_hash"]))
+        conn.commit()
+        proof = server.handle_project_contract_runtime_current_state(request(selector))
+        assert proof["error"] == expected
+        assert proof["native_event"] is None
+    finally:
+        conn.close()
+
+
+def test_native_event_http_final_wire_cap():
+    import io
+    from agent.governance import native_event_provenance
+    handler = SimpleNamespace(wfile=io.BytesIO(), CORS_HEADERS=server.GovernanceHandler.CORS_HEADERS,
+        send_response=lambda _code: None, send_header=lambda *_args: None, end_headers=lambda: None)
+    server.GovernanceHandler._respond(handler, 200, {**native_event_provenance.refusal("native_event_missing"),
+        "handler_extension": "汉" * 6000})
+    assert len(handler.wfile.getvalue()) <= 16384
+    assert json.loads(handler.wfile.getvalue())["error"] == "native_event_wire_unbounded"
 
 
 def test_contract_write_gate_rejects_nested_worker_receipt_placeholders():

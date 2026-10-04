@@ -5861,6 +5861,9 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             body = _contract_runtime_coordinator_current_wire_response(body)
         elif body.get("response_view") == "recorded_line":
             body = _contract_runtime_recorded_line_wire_response(body)
+        elif body.get("response_view") == "native_event":
+            from .native_event_provenance import wire_response
+            body = wire_response(body)
         timing = getattr(self, "_cleanup_timing", None)
         with timing.phase("encoding") if timing else nullcontext():
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -240072,7 +240075,7 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     compact_next_action_projection: dict[str, Any] = {}
     response_view = str(ctx.query.get("response_view") or "").strip()
     with DBContext(project_id) as conn:
-        if response_view == "recorded_line" and not conn.in_transaction:
+        if response_view in {"recorded_line", "native_event"} and not conn.in_transaction:
             # Own only a new transaction; preserve an existing caller snapshot.
             conn.execute("BEGIN")
         record = _contract_runtime_store(conn).get(contract_execution_id)
@@ -240192,7 +240195,7 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             active_epoch_resume = _server_integration_epoch_resume_payload(
                 conn, active_epoch
             )
-        if response_view == "recorded_line":
+        if response_view in {"recorded_line", "native_event"}:
             source_record = _contract_runtime_store(conn).get(contract_execution_id)
             public_record = (
                 _operator_supervised_direct_main_public_runtime_record(record)
@@ -240217,6 +240220,10 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
                 project_id=project_id, contract_execution_id=contract_execution_id,
                 actor_role=actor_role, request_id=ctx.request_id,
             )
+            if response_view == "native_event":
+                from .native_event_provenance import read_native_event
+                observed = read_native_event(conn, source_record=source_record,
+                    recorded=observed, selector=ctx.query, actor_role=actor_role)
             # All proof assembly precedes the routine's existing commit/close.
             conn.commit()
             return observed
