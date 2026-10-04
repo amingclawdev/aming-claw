@@ -32248,6 +32248,277 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
     return projection
 
 
+def _runtime_context_finish_attestation_rejoin_trace_evidence(
+    conn, *, project_id: str, context: Any, contract_execution_id: str,
+    trace_ids: list[str], strict_evidence: Mapping[str, Any],
+    finish_order: Mapping[str, Any], event_route_identity: Mapping[str, Any],
+    test_results: Mapping[str, Any], timeline_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bridge only audited renewals of an unchanged, canonically committed lane.
+
+    This is finish-attestation evidence, never general old-fence authorization.
+    The ordinary verifier has already revalidated the full frozen graph world;
+    only its fence mismatches may be discharged by the accepted audit chain.
+    """
+    from .parallel_branch_runtime import (
+        runtime_context_fence_token_verifier, runtime_context_session_token_ref,
+    )
+
+    def payload(value):
+        body = value.get("payload")
+        return body if isinstance(body, Mapping) else {}
+
+    def text(value, field):
+        return str(value.get(field) or "").strip()
+
+    requested = set(trace_ids)
+    mismatches = list(strict_evidence.get("identity_mismatches") or [])
+    if (
+        not requested or not mismatches or strict_evidence.get("missing_trace_ids")
+        or any(item.get("field") != "fence_token_hash" for item in mismatches)
+        or not finish_order.get("canonical_worker_commit_required")
+        or str(getattr(context, "last_recovery_action", "") or "").strip() not in {
+            "mf_subagent_session_token_rejoin_issued",
+            "mf_subagent_session_token_rejoin_replacement_issued",
+        }
+    ):
+        return {}
+    runtime_id, task_id, parent_id = _contract_runtime_context_identity(context)
+    backlog_id = str(context.backlog_id or "").strip()
+    current_fence_hash = runtime_context_fence_token_verifier(context)
+    current_ref = runtime_context_session_token_ref(context)
+    record = _contract_runtime_store(conn).get(contract_execution_id)
+    next_action = record.get("runtime_guide", {}).get("next_legal_action", {})
+    if (
+        text(record, "project_id") != project_id
+        or text(record, "backlog_id") != backlog_id
+        or text(next_action, "line_id") != "worker_finish_time_attestation"
+        or text(next_action, "runtime_context_id") != runtime_id
+        or text(next_action, "task_id") != task_id
+    ):
+        return {}
+    implementation, implementation_payload, lineage = (
+        _runtime_context_actual_worker_implementation_line(
+            conn, contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_id, task_id=task_id,
+        )
+    )
+    commit, commit_payload = _runtime_context_actual_worker_commit_line(
+        conn, contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_id, task_id=task_id,
+    )
+    lines = list(record.get("completed_lines") or [])
+    if implementation not in lines or commit not in lines:
+        return {}
+    implementation_index, commit_index = lines.index(implementation), lines.index(commit)
+    source = _runtime_context_contract_runtime_worker_implementation_projection(
+        record, implementation, lineage, runtime_context_id=runtime_id, task_id=task_id,
+    )
+    old_fence_hash = text(commit_payload, "fence_token_hash")
+    old_ref = text(commit_payload, "session_token_ref")
+    if (
+        implementation_index >= commit_index
+        or not _contract_runtime_line_status_passes(implementation)
+        or not _contract_runtime_line_status_passes(commit)
+        or text(commit, "actor_role") != "mf_sub"
+        or text(commit, "evidence_kind") != "worker_commit"
+        or source.get("accepted") is not True
+        or text(source, "contract_execution_id") != contract_execution_id
+        or text(commit_payload, "contract_execution_id") != contract_execution_id
+        or requested != set(source.get("graph_trace_ids") or [])
+        or requested != set(commit_payload.get("graph_trace_ids") or [])
+        or source.get("test_results") != dict(test_results)
+        or text(commit_payload, "implementation_lineage_ref")
+        != text(lineage, "implementation_lineage_ref")
+        or set(commit_payload.get("changed_files") or [])
+        != set(source.get("changed_files") or [])
+        or not old_ref or not old_fence_hash or old_ref == current_ref
+        or old_fence_hash == current_fence_hash
+        or text(commit_payload, "worker_commit_sha") != text(finish_order, "worker_commit_sha")
+        or any(text(commit_payload, key) != expected for key, expected in {
+            "runtime_context_id": runtime_id, "task_id": task_id,
+            "parent_task_id": parent_id, "backlog_id": backlog_id,
+            "worker_id": str(context.worker_id or ""),
+            "worker_slot_id": str(context.worker_slot_id or context.worker_id or ""),
+            "target_project_root": _runtime_context_effective_target_project_root(context),
+        }.items())
+    ):
+        return {}
+    sequence = _runtime_context_contract_runtime_worker_sequence_evidence(
+        conn, project_id=project_id, context=context,
+    )
+    principal = sequence.get("startup_principal") or {}
+    worker_session_id = text(principal, "worker_session_id")
+    initial_session_id = _runtime_context_initial_join_worker_session_id(
+        timeline_events, runtime_context_id=runtime_id, task_id=task_id, backlog_id=backlog_id,
+    )
+    if (
+        sequence.get("ordered") is not True or not worker_session_id
+        or text(principal, "filer_principal") != worker_session_id
+        or text(commit_payload, "worker_session_id") != worker_session_id
+        or (initial_session_id and initial_session_id != worker_session_id)
+    ):
+        return {}
+    route = _runtime_context_latest_route_identity(conn, context)
+    # The accepted implementation may use a parent-bound child route while
+    # graph queries and the current guide use the runtime contract route.
+    # Retain both identities; require the canonical stored lineage to bind
+    # every child field to this exact, unchanged parent.
+    if any(
+        not text(route, field)
+        or text(event_route_identity, field) != text(route, field)
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        return {}
+    if any(text(implementation_payload, field) != text(route, field)
+           for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS):
+        parent_route = implementation_payload.get("parent_route_lineage") or {}
+        child_route = implementation_payload.get("child_route_lineage") or {}
+        if any(
+            text(parent_route, field) != text(route, field)
+            or not text(implementation_payload, field)
+            or text(child_route, field) != text(implementation_payload, field)
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        ):
+            return {}
+
+    # The canonical commit is authority. Its matching timeline alias supplies
+    # chronology only; it cannot replace or repair a missing canonical line.
+    commit_events = [event for event in timeline_events if (
+        text(event, "event_type") == "mf_subagent.worker_commit"
+        and text(event, "status") == "passed"
+        and text(payload(event), "runtime_context_id") == runtime_id
+        and text(payload(event), "implementation_lineage_ref") == text(lineage, "implementation_lineage_ref")
+        and text(payload(event), "worker_commit_sha") == text(commit_payload, "worker_commit_sha")
+        and text(payload(event), "fence_token_hash") == old_fence_hash
+        and text(payload(event), "session_token_ref") == old_ref
+    )]
+    if len(commit_events) != 1:
+        return {}
+    commit_event_id = int(commit_events[0].get("id") or 0)
+    current_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+        _runtime_context_rejoin_worker_write_baseline(
+            conn, project_id=project_id, context=context, timeline_events=timeline_events,
+        )
+    )
+    if not current_checkpoint:
+        return {}
+    renewals = []
+    seen_bindings = {(old_ref, old_fence_hash)}
+    for event in timeline_events:
+        value = payload(event)
+        if int(event.get("id") or 0) <= commit_event_id:
+            continue
+        if text(value, "runtime_context_id") != runtime_id:
+            continue
+        if text(event, "status") != "accepted":
+            continue
+        action = text(value, "action")
+        if action in {"runtime_context_session_token_initial_join", "runtime_context_session_token_reissue"}:
+            return {}
+        if action != "runtime_context_session_token_rejoin":
+            continue
+        audited_sequence = value.get("contract_runtime_worker_sequence") or {}
+        checkpoint = _runtime_context_rejoin_stage_checkpoint(
+            value.get("bounded_replacement_worker_write_baseline")
+        )
+        audited_route = value.get("route_identity") or {}
+        binding = (text(value, "session_token_ref"), text(value, "fence_token_hash"))
+        if (
+            text(event, "event_type") != "observer.runtime_context_session_token_rejoin"
+            or text(event, "task_id") != task_id or text(event, "backlog_id") != backlog_id
+            or text(value, "bounded_rejoin_kind") not in {
+                "ordinary_initial_rejoin", "bounded_replacement_rejoin",
+            }
+            or any(value.get(field) is True for field in (
+                "reopen_for_revision", "timeline_reopen_for_revision", "revision_rejoin_applied",
+                "reopen_for_failed_qa_revision", "reopen_for_post_qa_merge_conflict",
+                "reopen_for_post_qa_target_retarget",
+            ))
+            or text(value, "current_status") not in {"running", "worktree_ready"}
+            or any(text(value, field) != text(commit_payload, field) for field in (
+                "task_id", "parent_task_id", "backlog_id", "worker_id", "worker_slot_id", "target_project_root",
+            ))
+            or checkpoint != current_checkpoint
+            or text(value, "rejoin_stage_checkpoint_id") != text(current_checkpoint, "stage_checkpoint_id")
+            or any(audited_sequence.get(field) != sequence.get(field) for field in (
+                "source", "source_of_authority", "contract_execution_id", "runtime_context_id",
+                "task_id", "parent_task_id", "read_receipt_ref", "startup_ref", "startup_principal", "ordered",
+            ))
+            or value.get("route_identity_verified") is not True
+            or any(text(audited_route, field) != text(route, field) for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
+            or not all(binding) or binding in seen_bindings
+        ):
+            return {}
+        if text(value, "bounded_rejoin_kind") == "bounded_replacement_rejoin":
+            authority = value.get("bounded_replacement_rejoin_authority") or {}
+            prior = renewals[-1] if renewals else {}
+            prior_value = payload(prior)
+            if (
+                text(prior_value, "bounded_rejoin_kind") != "ordinary_initial_rejoin"
+                or authority.get("server_derived") is not True
+                or authority.get("caller_claims_trusted") is not False
+                or authority.get("eligible") is not True
+                or authority.get("errors") or authority.get("identity_mismatches")
+                or text(authority, "source_event_ref") != f"timeline:{prior.get('id', '')}"
+                or text(authority, "current_session_token_ref") != text(prior_value, "session_token_ref")
+                or authority.get("current_stage_checkpoint") != current_checkpoint
+                or text(authority, "current_stage_checkpoint_id") != text(current_checkpoint, "stage_checkpoint_id")
+                or authority.get("expected_worker_write_baseline") != prior_value.get("bounded_replacement_worker_write_baseline")
+                or authority.get("actual_worker_write_baseline") != value.get("bounded_replacement_worker_write_baseline")
+                or authority.get("current_worker_write_baseline") != value.get("bounded_replacement_worker_write_baseline")
+            ):
+                return {}
+        seen_bindings.add(binding)
+        renewals.append(event)
+    if not renewals or (
+        text(payload(renewals[-1]), "session_token_ref"),
+        text(payload(renewals[-1]), "fence_token_hash"),
+    ) != (current_ref, current_fence_hash):
+        return {}
+
+    # Strict evidence already checked status, purpose, full snapshot and its
+    # frozen commit. Re-read membership/backlog/route and the canonical fence
+    # rather than treating an old client-provided hash as continuity proof.
+    placeholders = ",".join("?" for _ in trace_ids)
+    rows = conn.execute(
+        f"SELECT * FROM graph_query_traces WHERE project_id=? AND trace_id IN ({placeholders})",
+        (project_id, *trace_ids),
+    ).fetchall()
+    if len(rows) != len(requested):
+        return {}
+    for row in rows:
+        trace = dict(row)
+        if (
+            _graph_query_trace_fence_hash(trace) != old_fence_hash
+            or text(trace, "backlog_id") != backlog_id
+            or any(text(trace, field) != text(route, field) for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
+        ):
+            return {}
+    continuity = {
+        "schema_version": "runtime_context.finish_attestation_rejoin_trace_continuity.v1",
+        "server_derived": True, "caller_claims_trusted": False,
+        "source": "canonical_worker_commit_and_accepted_same_owner_rejoins",
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_id, "task_id": task_id,
+        "implementation_lineage_ref": text(lineage, "implementation_lineage_ref"),
+        "worker_commit_sha": text(commit_payload, "worker_commit_sha"),
+        "stage_checkpoint_id": text(current_checkpoint, "stage_checkpoint_id"),
+        "rejoin_event_refs": [f"timeline:{event['id']}" for event in renewals],
+        "rejoin_kinds": [text(payload(event), "bounded_rejoin_kind") for event in renewals],
+        "graph_trace_ids": list(trace_ids),
+        "strict_current_fence_mismatches": mismatches,
+        "trace_rows_mutated": False, "canonical_prefix_rewritten": False,
+        "raw_tokens_persisted": False,
+    }
+    return {
+        **dict(strict_evidence), "db_verified": True,
+        "trace_ids": list(trace_ids), "verified_trace_ids": list(trace_ids),
+        "query_source": "mf_subagent", "worker_role": "mf_sub",
+        "identity_mismatches": [], "postcommit_rejoin_trace_continuity": continuity,
+    }
+
+
 def _runtime_context_service_graph_trace_refs(
     conn,
     *,
@@ -81202,6 +81473,16 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             strict_explicit_trace_ids=True,
         )
         if not graph_trace_db_evidence.get("db_verified"):
+            continuity_evidence = _runtime_context_finish_attestation_rejoin_trace_evidence(
+                conn, project_id=project_id, context=context,
+                contract_execution_id=contract_execution_id, trace_ids=graph_trace_ids,
+                strict_evidence=graph_trace_db_evidence, finish_order=finish_order_projection,
+                event_route_identity=event_route_identity, test_results=test_results,
+                timeline_events=timeline_events,
+            )
+            if continuity_evidence.get("db_verified"):
+                graph_trace_db_evidence = continuity_evidence
+        if not graph_trace_db_evidence.get("db_verified"):
             raise ValidationError(
                 "finish-time worker attestation requires verified mf_sub graph trace ids"
             )
@@ -81440,6 +81721,9 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "raw_session_token_persisted": False,
             "raw_fence_token_persisted": False,
         }
+        continuity = graph_trace_db_evidence.get("postcommit_rejoin_trace_continuity")
+        if isinstance(continuity, Mapping):
+            payload["postcommit_rejoin_trace_continuity"] = dict(continuity)
         if _runtime_context_finish_attestation_no_pass_results_accepted(
             test_results
         ):
@@ -81504,6 +81788,8 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         gate=event.get("meta_contract_gate") if isinstance(event, Mapping) else None,
     )
     response["finish_time_worker_self_attestation"] = public_attestation
+    if isinstance(continuity, Mapping):
+        response["postcommit_rejoin_trace_continuity"] = dict(continuity)
     response["test_results"] = dict(test_results)
     if _runtime_context_finish_attestation_no_pass_results_accepted(test_results):
         response["no_pass"] = True

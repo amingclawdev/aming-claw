@@ -179610,7 +179610,7 @@ def _fresh_release_fixture_rows(conn, *, extra_tables=()) -> dict[str, list[tupl
 def _normal_mf_parallel_finish_precursor(
     conn, tmp_path, *, backlog_id, worker_task_id, worker_token, worker_fence,
     worker_root, graph_trace_id, test_results, project_id=PID, prepared=None,
-    owned_file="agent/governance/server.py",
+    owned_file="agent/governance/server.py", graph_query_count=1, verifier_backed=False,
 ):
     """Seed only onboarding/allocation; run actual worker evidence producers."""
     if prepared is None:
@@ -179686,6 +179686,12 @@ def _normal_mf_parallel_finish_precursor(
         info_exclude = (worker_root / common_dir).resolve() / "info" / "exclude"
         with info_exclude.open("a", encoding="utf-8") as stream:
             stream.write("\n.aming-claw/\n")
+    if verifier_backed:
+        runtime_context = upsert_branch_context(conn, replace(
+            runtime_context, fence_token="",
+            fence_token_verifier=runtime_context_secret_hash(worker_fence),
+        ))
+        conn.commit()
     if callable(test_results):
         test_results = test_results(runtime_context)
     parent_task_id = runtime_context.parent_task_id
@@ -179778,6 +179784,17 @@ def _normal_mf_parallel_finish_precursor(
     )
     assert trace_authority["db_verified"] is True, trace_authority
     assert trace_authority["source_details"]["expected_graph_commit"] == base_commit
+    graph_trace_ids = [graph_trace_id]
+    for _ in range(1, graph_query_count):
+        extra = server.handle_graph_governance_query(
+            _ctx_with_role({"project_id": project_id}, "mf_sub", method="POST",
+                           body={**graph_body, "query_purpose": "subagent_gate_validation"})
+        )
+        assert extra["ok"] is True, extra
+        graph_trace_ids.append(extra["trace_id"])
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"type": "graph_query", "query_source": "mf_subagent",
+                                     "trace_id": extra["trace_id"]}) + "\n")
     for path_name in owned_files:
         (worker_root / path_name).parent.mkdir(parents=True, exist_ok=True)
         (worker_root / path_name).write_text(
@@ -179822,7 +179839,7 @@ def _normal_mf_parallel_finish_precursor(
         **writer, **common, **implementation_route_identity,
         "backlog_id": backlog_id, "line_instance_id": f"runtime_context:{runtime_context.runtime_context_id}",
         "changed_files": owned_files, "owned_files": owned_files,
-        "graph_trace_ids": [graph_trace_id], "test_results": test_results,
+        "graph_trace_ids": graph_trace_ids, "test_results": test_results,
         "summary": "normal source-backed worker test precursor",
     }
     if isinstance(test_results.get("commands"), list):
@@ -179853,7 +179870,7 @@ def _normal_mf_parallel_finish_precursor(
         _ctx_with_role(path, "mf_sub", method="POST", body={
             **common, "worker_commit_sha": head_commit, "commit_sha": head_commit,
             "head_commit": head_commit, "owned_files": owned_files,
-            "changed_files": owned_files, "graph_trace_ids": [graph_trace_id],
+            "changed_files": owned_files, "graph_trace_ids": graph_trace_ids,
             "implementation_lineage_ref": lineage["implementation_lineage_ref"],
         })
     )
@@ -179864,7 +179881,7 @@ def _normal_mf_parallel_finish_precursor(
     return successor, runtime_context, head_commit, {
         "read_receipt": read_event["id"],
         "implementation": int(implementation_response["timeline_event"]["id"]),
-    }, {**startup_body, "head_commit": head_commit, "graph_trace_id": graph_trace_id}
+    }, {**startup_body, "head_commit": head_commit, "graph_trace_id": graph_trace_id, "graph_trace_ids": graph_trace_ids}
 
 
 def _finish_normal_mf_parallel_worker(
@@ -243027,3 +243044,109 @@ def test_cleanup_request_phase_timing_reserves_bounded_final_record(caplog):
     assert len(records) == timing.MAX_RECORDS
     assert records[-1]["event"] == "final" and records[-1]["outcome"] == "ok"
     assert sum(r["event"] == "final" for r in records) == 1
+
+
+@pytest.mark.parametrize("trace_count, renewals", [(1, 1), (2, 1), (2, 2), (1, 0)])
+def test_postcommit_same_owner_renewal_attests_original_source_traces(
+    release_conn, tmp_path, monkeypatch, trace_count, renewals,
+):
+    """Real local producers and final handler; no manufactured audit or verifier."""
+    from datetime import datetime, timedelta, timezone
+    conn = release_conn
+    task = f"postcommit-renewal-{trace_count}-{renewals}"
+    token, fence = "ordinary-fixture-token", "ordinary-fixture-fence"
+    root = tmp_path / task
+    results = {"status": "passed", "passed": True, "commands": [
+        {"command": "python -m pytest focused.py -q", "status": "passed"}]}
+    successor, context, head, events, startup = _normal_mf_parallel_finish_precursor(
+        conn, tmp_path, backlog_id=f"AC-{task.upper()}", worker_task_id=task,
+        worker_token=token, worker_fence=fence, worker_root=root,
+        graph_trace_id="fixture-request-trace", test_results=results,
+        graph_query_count=trace_count, verifier_backed=True,
+    )
+    execution = successor["contract_execution_id"]
+    before = copy.deepcopy(server._contract_runtime_store(conn).get(execution)["completed_lines"])
+    trace_ids = startup["graph_trace_ids"]
+    trace_rows = conn.execute("SELECT * FROM graph_query_traces WHERE project_id=? ORDER BY trace_id", (PID,)).fetchall()
+    original_rows = [tuple(row) for row in trace_rows]
+    path = {"project_id": PID, "runtime_context_id": context.runtime_context_id}
+    query = {"parent_task_id": context.parent_task_id, "session_token": token,
+             "fence_token": fence, "session_token_ref": runtime_context_session_token_ref(context),
+             "target_project_root": str(root)}
+    initial_guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(path, "mf_sub", query=query))
+    original_body = copy.deepcopy(initial_guide["canonical_executable_action"]["copy_safe_body"])
+    assert set(original_body["graph_trace_ids"]) == set(trace_ids)
+    trace_ids = original_body["graph_trace_ids"]
+    owner_fields = (
+        "project_id", "runtime_context_id", "task_id", "parent_task_id", "backlog_id",
+        "worker_id", "worker_slot_id", "actual_host_worker_id", "host_session_id",
+        "target_project_root", "worktree_path", "base_commit", "target_head_commit", "snapshot_id",
+    )
+    context = get_branch_context(conn, PID, task)
+    original_owner = {key: getattr(context, key) for key in owner_fields}
+    for n in range(renewals):
+        context = get_branch_context(conn, PID, task)
+        route = server._runtime_context_latest_route_identity(conn, context)
+        now = datetime.now(timezone.utc) + timedelta(hours=2 * (n + 1))
+        monkeypatch.setattr(server, "_utc_now", lambda: now.isoformat().replace("+00:00", "Z"))
+        rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(path, "coordinator", method="POST", body={
+                "runtime_context_id": context.runtime_context_id, "contract_execution_id": execution,
+                "task_id": task, "parent_task_id": context.parent_task_id,
+                "target_project_root": str(root), "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
+                "agent_id": context.actual_host_worker_id, "allocation_owner": context.allocation_owner,
+                "actual_host_worker_id": context.actual_host_worker_id,
+                "worker_session_id": f"session-{task}", "host_session_id": context.host_session_id,
+                "session_token_ref": runtime_context_session_token_ref(context),
+                "reason": "ordinary same-owner lease renewal", **route,
+            }))
+        assert rejoin["bounded_rejoin_kind"] == (
+            "ordinary_initial_rejoin" if n == 0 else "bounded_replacement_rejoin"
+        ), rejoin
+        print("REJOIN_BINDING", rejoin["bounded_rejoin_kind"],
+              rejoin.get("route_identity_verified"),
+              rejoin.get("rejoin_stage_checkpoint_id"))
+        audit_event = task_timeline.list_events(conn, PID, task_id=task)[-1]
+        audit = audit_event["payload"]
+        renewed_context = get_branch_context(conn, PID, task)
+        renewed_owner = {key: getattr(renewed_context, key) for key in owner_fields}
+        assert renewed_owner == original_owner
+        assert server._runtime_context_latest_route_identity(conn, renewed_context) == route
+        assert server._contract_runtime_store(conn).get(execution)["completed_lines"] == before
+        print("PUBLIC_RENEWAL", json.dumps({
+            "event_ref": f"timeline:{audit_event['id']}", "status": audit_event["status"],
+            "event_type": audit_event["event_type"], "order": n + 1,
+            "owner_before": original_owner, "owner_after": renewed_owner,
+            "contract_execution_id": execution,
+            "worker_session_id": startup["worker_session_id"],
+            "audit": {key: audit.get(key) for key in (
+                "runtime_context_id", "task_id", "parent_task_id", "backlog_id", "worker_id", "worker_slot_id",
+                "target_project_root", "session_token_ref", "fence_token_hash", "route_identity",
+                "bounded_rejoin_kind", "current_status", "contract_runtime_worker_sequence",
+                "bounded_replacement_worker_write_baseline", "bounded_replacement_rejoin_authority",
+            )},
+        }, sort_keys=True))
+        token, fence = rejoin["session_token"], rejoin["fence_token"]
+        context = get_branch_context(conn, PID, task)
+        query.update(session_token=token, fence_token=fence,
+                     session_token_ref=runtime_context_session_token_ref(context))
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(path, "mf_sub", query=query))
+    body = copy.deepcopy(guide["canonical_executable_action"]["copy_safe_body"])
+    assert body["graph_trace_ids"] == trace_ids
+    assert body["head_commit"] == head
+    assert body["test_results"] == original_body["test_results"]
+    body.update(session_token=token, fence_token=fence)
+    accepted = server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+        _ctx_with_role(path, "mf_sub", method="POST", body=body))
+    assert accepted["ok"] is True
+    after = server._contract_runtime_store(conn).get(execution)["completed_lines"]
+    assert after[:-1] == before
+    assert after[-1]["line_id"] == "worker_finish_time_attestation"
+    assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip() == head
+    assert original_rows == [tuple(row) for row in conn.execute(
+        "SELECT * FROM graph_query_traces WHERE project_id=? ORDER BY trace_id", (PID,)).fetchall()]
+    assert set(after[-1]["payload"]["graph_trace_ids"]) == set(trace_ids)
+    assert bool(accepted.get("postcommit_rejoin_trace_continuity")) == bool(renewals)
