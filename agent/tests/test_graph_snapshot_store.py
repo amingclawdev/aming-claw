@@ -7461,3 +7461,93 @@ def test_reference_memo_alias_ascii_casefold_preserves_exact_owner_columns(conn,
             uncached = [tuple(r) for r in store._reference_pages(conn, 'alias_fixture', projection, 'project_id=?', (PID,), reusable={'body': expressions})]
     assert cached == uncached == [(rid, 'original-column', 'deep-column', '["known"]' if i % 2 == 0 else '[]', 1) for i, rid in enumerate(rowids)]
     assert image == hashlib.sha256(conn.serialize()).hexdigest() and not conn.in_transaction
+
+
+def _chain_owner_writer_fixture(connection):
+    """Actual owner DDL/writers, rather than affinity-only scalar fixtures."""
+    from agent.governance.contracts.runtime import SQLiteContractExecutionStore
+    _typed_reference_setup(connection, count=0)
+    writer = SQLiteContractExecutionStore(connection)
+    root = {'contract_execution_id': 'owner-root', 'project_id': PID,
+            'backlog_id': 'owner-backlog', 'contract_id': 'ordinary',
+            'version': '1', 'revision': '1', 'execution_state_revision': 0,
+            'contract_chain_id': 'owner-chain', 'root_contract_execution_id': 'owner-root',
+            'runtime_guide': {'next_legal_action': None},
+            'snapshot_id': 'scope-durable'}
+    writer.create(root)
+    writer.create({**root, 'contract_execution_id': 'owner-child',
+                   'parent_contract_execution_id': 'owner-root',
+                   'execution_state_revision': 2, 'snapshot_id': 'scope-current'})
+    connection.commit()
+
+
+def test_chain_owner_actual_writer_integer_domains_complete(conn):
+    _chain_owner_writer_fixture(conn)
+    generation, watermark = conn.execute('SELECT generation,projection_watermark '
+                                        'FROM backlog_contract_chain_current').fetchone()
+    assert type(generation) is int and generation >= 0
+    assert watermark == conn.execute('SELECT max(id) FROM backlog_contract_chain_bindings').fetchone()[0]
+    assert tuple(conn.execute('SELECT id,generation FROM contract_chain_edges').fetchone()) == (1, 2)
+    before = (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state['complete'], state['refusal_reasons']
+    assert {'scope-current', 'scope-durable'} <= state['durable_references'].keys()
+    assert before == (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+
+
+@pytest.mark.parametrize('table,column', [
+    ('backlog_contract_chain_current', 'generation'),
+    ('backlog_contract_chain_current', 'projection_watermark'),
+    ('contract_chain_edges', 'id'), ('contract_chain_edges', 'generation'),
+])
+@pytest.mark.parametrize('invalid', [-1, 1.5, 'opaque', sqlite3.Binary(b'7')])
+def test_chain_owner_scalar_invalid_domains_still_fail_closed(conn, table, column, invalid):
+    _chain_owner_writer_fixture(conn)
+    # PK enforces integer storage; use exact owner column in a corrupted schema
+    # to cover storage validation independently of SQLite's PK insert guard.
+    if column == 'id':
+        conn.execute('DROP TABLE contract_chain_edges')
+        conn.execute('CREATE TABLE contract_chain_edges(project_id TEXT,id INTEGER,generation INTEGER,metadata_json TEXT)')
+        conn.execute('INSERT INTO contract_chain_edges VALUES (?,1,0,?)',
+                     (PID, '{"snapshot_id":"scope-current"}'))
+    conn.execute(f'UPDATE "{table}" SET "{column}"=?', (invalid,)); conn.commit()
+    before = (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state['complete'] and table + '_payload_unreadable' in state['refusal_reasons']
+    assert {'scope-current', 'scope-durable'} <= state['durable_references'].keys()
+    assert before == (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+
+
+def test_chain_owner_zero_id_and_unknown_integer_not_exempt(conn):
+    _chain_owner_writer_fixture(conn)
+    conn.execute('UPDATE contract_chain_edges SET id=0')
+    conn.execute('ALTER TABLE backlog_contract_chain_current ADD COLUMN unknown_payload INTEGER')
+    conn.execute('UPDATE backlog_contract_chain_current SET unknown_payload=7'); conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state['complete']
+    assert {'contract_chain_edges_payload_unreadable', 'backlog_contract_chain_current_payload_unreadable'} <= set(state['refusal_reasons'])
+
+
+def test_chain_owner_domains_keep_nonmetadata_positive_references(conn):
+    _chain_owner_writer_fixture(conn)
+    conn.execute('UPDATE contract_chain_edges SET metadata_json=?',
+                 ('{"snapshot_id":"extra-edge-pin"}',))
+    conn.execute('UPDATE backlog_contract_chain_current SET active_chain_json=?',
+                 ('{"snapshot_ids":["extra-current-pin"]}',)); conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state['complete']
+    assert {'extra-edge-pin', 'extra-current-pin'} <= state['durable_references'].keys()
+    assert {'extra-edge-pin', 'extra-current-pin'} <= state['current_use'].keys()
+
+
+@pytest.mark.parametrize('table,column', [
+    ('contract_chain_edges', 'metadata_json'),
+    ('backlog_contract_chain_current', 'active_chain_json'),
+])
+@pytest.mark.parametrize('payload', ['{bad', sqlite3.Binary(b'{"snapshot_id":"scope-current"}')])
+def test_chain_owner_domains_do_not_exempt_invalid_payloads(conn, table, column, payload):
+    _chain_owner_writer_fixture(conn)
+    conn.execute(f'UPDATE "{table}" SET "{column}"=?', (payload,)); conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state['complete'] and table + '_payload_unreadable' in state['refusal_reasons']
+    assert {'scope-current', 'scope-durable'} <= state['durable_references'].keys()

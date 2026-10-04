@@ -2652,6 +2652,9 @@ def _snapshot_retention_reference_state(
         "backlog_contract_chain_bindings": {
             "id": "{col}>0", "generation": "{col}>=0",
             "execution_state_revision": "{col}>=0"},
+        "backlog_contract_chain_current": {
+            "generation": "{col}>=0", "projection_watermark": "{col}>=0"},
+        "contract_chain_edges": {"id": "{col}>0", "generation": "{col}>=0"},
     }
     projected_owner_fields = {
         "backlog_contract_chain_bindings": {"metadata_json": True, "degraded_flags_json": True},
