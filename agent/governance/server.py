@@ -40870,7 +40870,11 @@ def _runtime_context_server_bounded_current_state_response(
 ) -> dict[str, Any]:
     """Bound a recursive current-state tree before the public HTTP boundary."""
 
-    full = dict(value or {})
+    full = _runtime_context_worker_guide_public_auth_flags(dict(value or {}))
+    if str(requested_view or "compact").lower() not in {"all", "full"}:
+        transport = _runtime_context_worker_guide_action_continuation(full)
+        if transport is not None:
+            return transport
     serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
     if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_READ_MAX_SERIALIZED_BYTES:
         return full
@@ -41007,7 +41011,7 @@ def _runtime_context_server_bounded_worker_guide_response(
     serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
     if serialized_bytes <= _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES:
         projected = deepcopy(full)
-        if "serialized_bytes" in projected:
+        if "serialized_bytes" in projected and not projected.get("action_continuation"):
             projected["serialized_bytes"] = _runtime_context_server_read_serialized_bytes(
                 {key: item for key, item in projected.items() if key != "serialized_bytes"}
             )
@@ -42128,7 +42132,10 @@ def _runtime_context_worker_guide_compact_response(
 ) -> dict[str, Any]:
     """Return one bounded, non-recursive, copy-safe Worker Guide projection."""
 
-    full = dict(response or {})
+    full = _runtime_context_worker_guide_public_auth_flags(dict(response or {}))
+    transport = _runtime_context_worker_guide_action_continuation(full)
+    if transport is not None:
+        return transport
     nested = full.get("worker_guide")
     nested = nested if isinstance(nested, Mapping) else {}
     actionable = full.get("actionable_payloads")
@@ -42355,6 +42362,252 @@ def _runtime_context_worker_guide_compact_response(
         )
     compact["serialized_bytes"] = serialized_bytes
     return compact
+
+
+# This is transport for existing typed writers, not a new execution facade.
+_RUNTIME_CONTEXT_ACTION_CONTINUATION_TOOLS = frozenset({
+    "runtime_context_read_receipt", "runtime_context_implementation_evidence",
+    "runtime_context_worker_commit", "runtime_context_finish_time_worker_attestation",
+    "runtime_context_finish_gate", "runtime_context_scope_insufficiency_request",
+    "parallel_branch_startup",
+})
+
+
+def _runtime_context_worker_guide_public_auth_flags(value: Any) -> Any:
+    """Public projections must not advertise raw credential handoff aliases."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): (
+                False if str(key).startswith("raw_") and any(
+                    part in str(key) for part in ("required", "exposed", "persist")
+                ) else _runtime_context_worker_guide_public_auth_flags(child)
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_runtime_context_worker_guide_public_auth_flags(child) for child in value]
+    return deepcopy(value)
+
+
+def _runtime_context_worker_guide_public_action(action: Mapping[str, Any]) -> dict[str, Any]:
+    """Redact the complete action before hashing/splitting, including aliases.
+
+    Fragments are opaque JSON strings to field redactors. Running privacy on
+    individual pages would therefore leak nested or boundary-spanning auth.
+    Public semantic metadata survives; private credential containers do not.
+    """
+    private_containers = {"auth", "credentials", "credential_bundle", "host_envelope",
+                          "same_owner_worker_session", "secrets", "worker_auth", "worker_credentials", "env"}
+    secrets: set[str] = set()
+    def collect(value: Any, key: str = "") -> None:
+        normalized = key.lower()
+        if isinstance(value, Mapping):
+            for child_key, child in value.items():
+                collect(child, str(child_key))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                collect(child, key)
+        elif isinstance(value, str) and not value.startswith("<") and value and (
+            normalized in _GUIDE_RAW_AUTH_BODY_FIELDS or
+            normalized in {"aming_worker_session_token", "aming_worker_fence_token", "bearer", "password", "access_token", "token"} or
+            (normalized.startswith("raw_") and ("token" in normalized or "auth" in normalized))
+        ):
+            secrets.add(value)
+    collect(action)
+    def project(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): (f"<host-realized {key}>" if str(key).lower() in _GUIDE_RAW_AUTH_BODY_FIELDS
+                           else project(child))
+                for key, child in value.items()
+                if str(key).lower() not in private_containers and
+                not (str(key).lower() not in {"raw_auth_process_local_only", "raw_worker_auth_process_local_only"} and str(key).lower().startswith("raw_") and any(part in str(key).lower() for part in ("token", "auth"))
+                     and not any(part in str(key).lower() for part in ("required", "exposed", "persist")))
+                and str(key).lower() not in {"aming_worker_session_token", "aming_worker_fence_token", "access_token", "password", "bearer"}
+            }
+        if isinstance(value, (list, tuple)):
+            return [project(child) for child in value]
+        if isinstance(value, str):
+            for secret in sorted(secrets, key=len, reverse=True):
+                value = value.replace(secret, "<private worker credential>")
+        return deepcopy(value)
+    public = _runtime_context_worker_guide_public_auth_flags(project(action))
+    body, paths = _guide_executable_action_safe_body(public.get("copy_safe_body") or {})
+    public["copy_safe_body"] = body
+    realization = dict(public.get("host_realization") or {})
+    realization["required_replacement_paths"] = list(dict.fromkeys([
+        *list(realization.get("required_replacement_paths") or []), *paths,
+    ]))
+    public["host_realization"] = realization
+    return public
+
+
+def _runtime_context_require_materialized_action_current(
+    conn, *, project_id: str, context: Any, precondition: Any, mcp_tool: str,
+) -> None:
+    """Constrain an existing typed writer inside its SQLite transaction.
+
+    Ordinary callers are unchanged. The process-local ref is NOT authority.
+    This prevents completed-line compatibility projection from appending
+    timeline evidence for an action materialized before its own lane changed.
+    Unrelated sibling revisions are left to the existing narrow writer rebase.
+    """
+    if precondition is None:
+        return
+    def reject():
+        raise GovernanceError(
+            "runtime_context_materialized_action_stale", "Selected source-owned action/state is no longer current", 409,
+            {"writes_performed": False, "mutation_performed": False, "zero_contract_runtime_write": True,
+             "zero_timeline_write": True, "zero_worker_implementation_write": True},
+        )
+    if not isinstance(precondition, Mapping) or precondition.get("mcp_tool") != mcp_tool:
+        reject()
+    identity = precondition.get("identity") or {}
+    if not isinstance(identity, Mapping) or any(
+        str(identity.get(key) or "") != str(value or "")
+        for key, value in {"project_id": project_id, "runtime_context_id": context.runtime_context_id,
+                           "task_id": context.task_id, "parent_task_id": _runtime_context_mf_sub_parent_task_id(context)}.items()
+    ):
+        reject()
+    from .parallel_branch_runtime import runtime_context_session_token_ref
+    expected_identity = {
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "target_project_root": _runtime_context_effective_target_project_root(context),
+        "worker_id": context.worker_id, "worker_slot_id": context.worker_slot_id or context.worker_id,
+        **_runtime_context_latest_route_identity(conn, context),
+    }
+    if any(str(identity.get(key) or "") != str(value or "") for key, value in expected_identity.items()
+           if key in {"session_token_ref", "target_project_root", "worker_id", "worker_slot_id", *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS}):
+        reject()
+    execution_id = str(identity.get("contract_execution_id") or "")
+    current_identity, _resolution = _runtime_context_resolve_contract_execution_identity(
+        conn, project_id=project_id, context=context, runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id, contract_identity=_runtime_context_contract_execution_identity(
+            _runtime_context_latest_contract_revision_payload(conn, context)),
+    )
+    if not execution_id or current_identity.get("contract_execution_id") != execution_id:
+        reject()
+    record = _contract_runtime_store(conn).get(execution_id)
+    if record.get("project_id") != project_id or record.get("backlog_id") != context.backlog_id:
+        reject()
+    revision = precondition.get("execution_state_revision")
+    current_revision = record.get("execution_state_revision")
+    lines = list(record.get("completed_lines") or [])
+    if (type(revision) is not int or type(current_revision) is not int or
+        revision < 1 or revision > current_revision or len(lines) != current_revision - 1):
+        reject()
+    for line in lines[revision - 1:]:
+        payload = line.get("payload") or {}
+        if (line.get("runtime_context_id") == context.runtime_context_id or
+            payload.get("runtime_context_id") == context.runtime_context_id or
+            line.get("task_id") == context.task_id or payload.get("task_id") == context.task_id):
+            reject()
+    projection = _runtime_context_contract_runtime_worker_projection(
+        conn, contract_execution_id=execution_id, runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id, context=context,
+    )
+    next_action = projection.get("contract_runtime_next_legal_action") or {}
+    if not precondition.get("selected_line_id") or next_action.get("line_id") != precondition["selected_line_id"]:
+        reject()
+
+
+def _runtime_context_worker_guide_action_continuation(
+    source: Mapping[str, Any], *, detail_ref: str = "", detail_cursor: str = "",
+) -> dict[str, Any] | None:
+    """Page the complete source-owned action before any compact-body omission.
+
+    The semantic ref excludes outer lease TTL/current-time/read audit data.
+    Every page is rebuilt under the ordinary authenticated Guide read, so a
+    changed action/state/session cannot be combined with an earlier page.
+    Final write admission remains the existing canonical lane writer gate,
+    including its narrow, proven concurrent-sibling rebase.
+    """
+    stage = _runtime_context_worker_guide_current_stage(source)
+    actions = source.get("canonical_executable_actions") or {}
+    action = source.get("canonical_executable_action") or actions.get(stage) or {}
+    if not isinstance(action, Mapping) or action.get("mcp_tool") not in _RUNTIME_CONTEXT_ACTION_CONTINUATION_TOOLS:
+        return None
+    action = _runtime_context_worker_guide_public_action(action)
+    encoded = json.dumps(action, sort_keys=True, separators=(",", ":"), default=str)
+    if len(encoded.encode("utf-8")) <= _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES:
+        return None
+    # Bounded host storage; do not raise the managed response limit.
+    if len(encoded) > 1_048_576:
+        raise GovernanceError("runtime_context_worker_guide_action_too_large", "Action exceeds bounded continuation storage", 503, {"writes_performed": False})
+    body = action.get("copy_safe_body") or {}
+    route = source.get("route_identity") or action.get("route_identity") or {}
+    identity = {
+        key: body.get(key) or source.get(key) or ""
+        for key in ("project_id", "runtime_context_id", "task_id", "parent_task_id",
+                    "contract_execution_id", "target_project_root", "session_token_ref",
+                    "worker_id", "worker_slot_id")
+    }
+    identity.update({key: body.get(key) or route.get(key) or "" for key in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS})
+    # Full action hash already binds all semantic fields. These source pins
+    # distinguish identical actions selected from different canonical states.
+    state = source.get("contract_runtime_current_state") or {}
+    source_refs = source.get("source_refs") or {}
+    pins = {
+        "contract_revision_id": source_refs.get("contract_revision_id") or "",
+        "execution_state_revision": body.get("execution_state_revision") or state.get("execution_state_revision"),
+        "runtime_guide_hash": body.get("runtime_guide_hash") or state.get("runtime_guide_hash"),
+        "execution_state_hash": state.get("execution_state_hash"),
+    }
+    fragments = [encoded[index:index + 8192] for index in range(0, len(encoded), 8192)]
+    manifest = {
+        "schema_version": "runtime_context.worker_action_continuation.v1",
+        "identity": identity, "source_state": pins,
+        "mcp_tool": action["mcp_tool"], "stage_id": stage,
+        "selected_line_id": action.get("line_id") or body.get("line_id") or "",
+        "action_hash": _stable_public_hash(action),
+        "action_bytes": len(encoded.encode("utf-8")),
+        "fragment_chars": 8192, "page_count": len(fragments),
+        "encoding": "canonical_json_ascii",
+    }
+    ref = "worker-guide-action:" + _stable_public_hash(manifest)
+    continuation = {**manifest, "detail_ref": ref, "next_cursor": "action:0"}
+    response = {
+        "ok": True, "schema_version": "runtime_context.worker_guide_action_transport.v1",
+        "response_view": "compact_action", **identity,
+        "route_identity": {key: identity[key] for key in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS},
+        "next_legal_action": source.get("next_legal_action") or action.get("action"),
+        "canonical_executable_action": {
+            "mcp_tool": action["mcp_tool"], "materialization_required": True,
+            "action_continuation_ref": ref,
+        },
+        "action_continuation": continuation,
+        "fetch": {"tool": "runtime_context_worker_guide", "arguments": {
+            **identity, "view": "compact", "detail_ref": ref, "detail_cursor": "action:0",
+        }},
+        "writes_performed": False, "mutation_performed": False,
+        "semantic_truncation_performed": False,
+        "raw_worker_env_required": False, "raw_worker_auth_exposed": False,
+        "raw_session_token_exposed": False, "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    if detail_cursor:
+        if detail_ref != ref:
+            raise GovernanceError("runtime_context_worker_guide_detail_ref_invalid", "Action continuation source/state is stale or mismatched", 409, {"writes_performed": False})
+        if not re.fullmatch(r"action:(0|[1-9][0-9]*)", detail_cursor):
+            raise ValidationError("detail_cursor must name an advertised action fragment")
+        index = int(detail_cursor.split(":")[1])
+        if index >= len(fragments):
+            raise ValidationError("detail_cursor is outside the action continuation")
+        fragment = fragments[index]
+        response["response_view"] = "compact_action_detail"
+        response["detail_cursor"] = detail_cursor
+        response["next_cursor"] = f"action:{index + 1}" if index + 1 < len(fragments) else ""
+        response["continuation_complete"] = not response["next_cursor"]
+        response["fragment"] = fragment
+        response["fragment_hash"] = "sha256:" + hashlib.sha256(fragment.encode("utf-8")).hexdigest()
+    # Include the size field itself (fixed point), including JSON escaping of
+    # fragment quotes/backslashes, in the unchanged 32768-byte public bound.
+    response["serialized_bytes"] = 0
+    for _ in range(4):
+        response["serialized_bytes"] = _runtime_context_worker_guide_serialized_bytes(response)
+    if response["serialized_bytes"] > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES:
+        raise GovernanceError("runtime_context_worker_guide_detail_page_too_large", "Action page exceeds managed response limit", 503, {"writes_performed": False})
+    return response
 
 
 def _runtime_context_worker_guide_detail_continuation(
@@ -43607,6 +43860,13 @@ def _runtime_context_worker_guide_early_compact_response(
             },
         },
     }
+    transport = _runtime_context_worker_guide_action_continuation(
+        bounded_source,
+        detail_ref=str(ctx.query.get("detail_ref") or ""),
+        detail_cursor=str(ctx.query.get("detail_cursor") or ""),
+    )
+    if transport is not None:
+        return transport
     compact = _runtime_context_worker_guide_compact_response(bounded_source)
     compact["builder"] = "bounded_current_authority"
     compact["full_worker_guide_builder_called"] = False
@@ -57059,6 +57319,8 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
                 role=role,
             )
             detail_cursor = str(query.get("detail_cursor") or "").strip()
+            if response.get("response_view") == "compact_action_detail":
+                return response
             if detail_cursor:
                 return _runtime_context_worker_guide_detail_page(
                     response,
@@ -80543,11 +80805,18 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
     body = dict(ctx.body or {})
     conn = get_connection(project_id)
     try:
+        materialized_precondition = body.get("worker_guide_action_precondition")
+        if materialized_precondition is not None and not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
             ctx,
             conn,
             action="graph-governance.runtime-context.finish-time-worker-attestation",
             allow_validated=True,
+        )
+        _runtime_context_require_materialized_action_current(
+            conn, project_id=project_id, context=context,
+            precondition=materialized_precondition, mcp_tool="runtime_context_finish_time_worker_attestation",
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
         revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
@@ -81112,6 +81381,9 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             commit_sha=head_commit,
         )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
     response = _runtime_context_write_response(
@@ -82781,6 +83053,8 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                 ),
             )
 
+    if "worker_guide_action_precondition" in body:
+        event_body["worker_guide_action_precondition"] = deepcopy(body["worker_guide_action_precondition"])
     trusted_route_gate = _runtime_context_timeline_route_gate(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -177188,7 +177462,17 @@ def _guide_canonical_executable_action(
     normalized_action = str(action or facade or mcp_tool or "").strip()
     normalized_facade = str(facade or mcp_tool or normalized_action).strip()
     normalized_tool = str(mcp_tool or normalized_facade).strip()
-    copy_safe_body, replacement_paths = _guide_executable_action_safe_body(body)
+    # Collect private values from the original inputs before replacing named
+    # fields with placeholders; otherwise repeated public aliases lose their
+    # association with the private field before complete-action sanitization.
+    public_inputs = _runtime_context_worker_guide_public_action({
+        "copy_safe_body": body,
+        "host_realization": host_realization or {},
+    })
+    copy_safe_body = public_inputs["copy_safe_body"]
+    replacement_paths = public_inputs["host_realization"]["required_replacement_paths"]
+    if isinstance(host_realization, Mapping):
+        host_realization = public_inputs["host_realization"]
     if project_id:
         copy_safe_body.setdefault("project_id", project_id)
 
@@ -177307,7 +177591,7 @@ def _guide_canonical_executable_action(
             )
         )
         projected_host_realization["authority_inference_allowed"] = False
-    return {
+    return _runtime_context_worker_guide_public_action({
         "schema_version": "guide.canonical_executable_action.v1",
         "action": normalized_action,
         "facade": normalized_facade,
@@ -177332,7 +177616,7 @@ def _guide_canonical_executable_action(
             "unrealized_placeholder": "reject_zero_write",
             "raw_secret_exposed": False,
         },
-    }
+    })
 
 
 def _onboard_guide_capsule_blocker_ids(
@@ -213804,6 +214088,20 @@ def _handle_task_timeline_append(ctx: RequestContext):
         else DBContext(project_id)
     )
     with connection_scope as conn:
+        materialized_precondition = ctx.body.get("worker_guide_action_precondition")
+        if materialized_precondition is not None:
+            if not trusted_runtime_context_worker_context:
+                raise GovernanceError("runtime_context_materialized_action_scope_invalid", "Materialized action requires the existing authenticated typed worker facade", 403, {"writes_performed": False})
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            from .parallel_branch_runtime import get_branch_context
+            materialized_context = get_branch_context(conn, project_id, str(ctx.body.get("task_id") or ""))
+            if materialized_context is None:
+                raise GovernanceError("runtime_context_materialized_action_scope_invalid", "Exact worker context is unavailable", 409, {"writes_performed": False})
+            _runtime_context_require_materialized_action_current(
+                conn, project_id=project_id, context=materialized_context,
+                precondition=materialized_precondition, mcp_tool="runtime_context_implementation_evidence",
+            )
         legacy_route_gate = _legacy_contract_route_gate(ctx.body or {})
         if legacy_route_gate.get("blocked"):
             raise GovernanceError(

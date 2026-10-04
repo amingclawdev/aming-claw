@@ -8129,3 +8129,115 @@ def test_finish_attestation_missing_runtime_context_id_is_structured_zero_http(
     assert result["zero_write_rejection"] is True
     assert result["http_request_performed"] is False
     assert calls == []
+
+
+@pytest.mark.parametrize("selected_tool", ["runtime_context_implementation_evidence", "runtime_context_finish_time_worker_attestation"])
+def test_stdio_complete_worker_action_pages_then_one_typed_write(selected_tool):
+    """Real newline MCP process/loopback HTTP, with no native fixture/auth."""
+    import copy
+    from agent.tests.test_mcp_tools import _worker_action_transport_fixture
+    identity, action, header, pages = _worker_action_transport_fixture(selected_tool)
+    ref = header["action_continuation"]["detail_ref"]
+    assert header["action_continuation"]["action_bytes"] >= 36692
+    class Handler(BaseHTTPRequestHandler):
+        writes = []
+        reads = []
+        def log_message(self, *_args):
+            pass
+        def send(self, payload):
+            encoded = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            assert query["session_token"] == ["stdio-action-session"]
+            assert query["fence_token"] == ["stdio-action-fence"]
+            self.__class__.reads.append(self.path)
+            cursor = query.get("detail_cursor", [""])[0]
+            if cursor:
+                assert query["detail_ref"] == [ref]
+                self.send(copy.deepcopy(pages[int(cursor.split(":")[1])]))
+            else:
+                self.send(copy.deepcopy(header))
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path.endswith("/session-token/rejoin"):
+                self.send({"ok": True, "status": "session_token_rejoined", "delivery": "worker_host_envelope",
+                           **identity, "session_token": "stdio-action-session", "fence_token": "stdio-action-fence",
+                           "host_envelope": {**identity, "env": {"AMING_WORKER_SESSION_TOKEN": "stdio-action-session", "AMING_WORKER_FENCE_TOKEN": "stdio-action-fence"}}})
+                return
+            assert self.path.endswith("/implementation-evidence" if selected_tool == "runtime_context_implementation_evidence" else "/finish-time-worker-attestation")
+            assert body["session_token"] == "stdio-action-session"
+            assert body["fence_token"] == "stdio-action-fence"
+            assert "action_continuation_ref" not in body
+            assert body["worker_guide_action_precondition"]["mcp_tool"] == selected_tool
+            assert body["worker_guide_action_precondition"]["selected_line_id"] == action["line_id"]
+            assert body["execution_state_revision"] == 9
+            assert body["runtime_guide_hash"] == action["copy_safe_body"]["runtime_guide_hash"]
+            assert body["payload"] == action["copy_safe_body"]["payload"]
+            assert body["implementation_diff_submission_guidance"] == action["copy_safe_body"]["implementation_diff_submission_guidance"]
+            self.__class__.writes.append(body)
+            self.send({"ok": True, "status": "accepted"})
+    http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    def call(index, name, args):
+        return {"jsonrpc": "2.0", "id": index, "method": "tools/call", "params": {"name": name, "arguments": args}}
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        call(2, "runtime_context_session_token_rejoin", identity),
+        call(3, "runtime_context_worker_guide", identity),
+    ]
+    requests.extend(call(4 + index, "runtime_context_worker_guide", {
+        **identity, "detail_ref": ref, "detail_cursor": f"action:{index}",
+    }) for index in range(len(pages)))
+    write_args = {**identity, "action_continuation_ref": ref,
+                  "changed_files": ["src/app.py"], "tests": [{"command": "pytest actual", "status": "passed"}]}
+    requests.extend([
+        call(4 + len(pages), selected_tool, write_args),
+        call(5 + len(pages), selected_tool, write_args),
+    ])
+    try:
+        # Keep canonical project/listener admission unchanged. Only the
+        # injected test HTTP client connects to this controlled loopback;
+        # actual stdio run/framing/registered dispatcher are production code.
+        bootstrap = """
+import sys, json, urllib.request
+from agent.mcp.server import AmingClawMCP
+server = AmingClawMCP(project_id="aming-claw", governance_url="http://127.0.0.1:40008", workspace=sys.argv[2], redis_url="redis://127.0.0.1:9", max_workers=0)
+def api(method, path, body=None, **kwargs):
+    request = urllib.request.Request(sys.argv[1] + path, data=json.dumps(body).encode() if body is not None else None, method=method, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)
+server.dispatcher._api = api
+server.dispatcher._governance_api_with_timeout = api
+server.run()
+"""
+        proc = subprocess.Popen([sys.executable, "-c", bootstrap, f"http://127.0.0.1:{http.server_address[1]}", str(ROOT)], cwd=ROOT,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = proc.communicate("".join(json.dumps(request) + "\n" for request in requests), timeout=15)
+        code = proc.returncode
+        responses = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+    finally:
+        http.shutdown()
+        http.server_close()
+        thread.join(timeout=3)
+    assert code == 0, stderr
+    assert [response["id"] for response in responses] == [request["id"] for request in requests]
+    public = [json.loads(response["result"]["content"][0]["text"]) for response in responses[1:]]
+    assert public[0]["auth_loaded"] is True
+    assert public[-3]["managed_action_materialized"] is True
+    assert public[-2] == {"ok": True, "status": "accepted"}
+    assert public[-1]["writes_performed"] is False
+    assert len(Handler.reads) == 1 + len(pages)
+    assert len(Handler.writes) == 1
+    for response in responses[2:-2]:
+        text = response["result"]["content"][0]["text"]
+        assert len(text.encode()) <= 32768
+        assert len(json.dumps(response).encode()) <= plugin_mcp_server.MCP_WORKER_GUIDE_FRAME_TARGET_BYTES
+    serialized = json.dumps(responses) + stderr
+    assert "stdio-action-session" not in serialized
+    assert "stdio-action-fence" not in serialized

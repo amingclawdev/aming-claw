@@ -615,8 +615,20 @@ def _runtime_context_schema_properties() -> dict[str, Any]:
     }
 
 
+def _runtime_context_worker_guide_schema_properties() -> dict[str, Any]:
+    return {
+        **_runtime_context_schema_properties(),
+        "detail_ref": {"type": "string"},
+        "detail_cursor": {"type": "string"},
+    }
+
+
 def _runtime_context_write_schema_properties() -> dict[str, Any]:
     properties = dict(_runtime_context_schema_properties())
+    properties["action_continuation_ref"] = {
+        "type": "string",
+        "description": "Complete process-local source-owned action continuation; stripped before domain HTTP.",
+    }
     properties.update(
         {
             "task_id": {"type": "string"},
@@ -3075,7 +3087,7 @@ TOOLS: list[dict] = [
         "description": "Read the Runtime Context Service worker guide, including read/write guide intent for a bounded worker.",
         "inputSchema": {
             "type": "object",
-            "properties": _runtime_context_schema_properties(),
+            "properties": _runtime_context_worker_guide_schema_properties(),
             "required": ["project_id", "runtime_context_id"],
         },
     },
@@ -4354,6 +4366,8 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         request_args = _worker_auth_from_env(args)
         request_args.setdefault("view", "compact")
         query = _runtime_context_query(request_args)
+        if name == "runtime_context_worker_guide":
+            query.update({key: str(request_args[key]) for key in ("detail_ref", "detail_cursor") if request_args.get(key)})
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
         result = _http(

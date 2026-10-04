@@ -9141,3 +9141,199 @@ def test_standalone_cleanup_exception_frame_is_bounded_and_truthful(
         assert data["writes_performed"] is False
         assert data["write_disposition"] == "not_written"
     assert diagnostic[:100] not in output.getvalue()
+
+
+def _worker_action_transport_fixture(tool="runtime_context_implementation_evidence"):
+    """Controlled public source data, never native Models/runtime authority."""
+    from agent.governance import server
+    identity = {
+        "project_id": "aming-claw", "runtime_context_id": "mfrctx-atomic-transport",
+        "task_id": "worker-atomic-transport", "parent_task_id": "cex-atomic-transport",
+        "contract_execution_id": "cex-atomic-transport", "target_project_root": "/tmp/atomic-transport",
+        "session_token_ref": "wstok-atomic-transport", "worker_id": "worker-atomic-transport",
+        "worker_slot_id": "worker-atomic-transport", "route_id": "route-atomic-transport",
+        "route_context_hash": "sha256:" + "1" * 64, "prompt_contract_id": "rprompt-atomic-transport",
+        "prompt_contract_hash": "sha256:" + "2" * 64, "route_token_ref": "rtok-atomic-transport",
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+    }
+    body = {
+        **identity, "session_token": "<host-realized session_token>", "fence_token": "<host-realized fence_token>",
+        "backlog_id": "AC-ATOMIC-TRANSPORT", "definition_hash": "sha256:" + "4" * 64,
+        "instruction_bundle_hash": "sha256:" + "5" * 64, "execution_state_revision": 9,
+        "runtime_guide_hash": "sha256:" + "6" * 64, "stage_id": "worker_implementation",
+        "line_id": "worker_implementation", "evidence_kind": "implementation",
+        "line_instance_id": "runtime_context:mfrctx-atomic-transport",
+        "changed_files": ["<actual changed file>"], "tests": [{"command": "<actual command>", "status": "passed"}],
+        "test_results": {"status": "passed", "passed": True, "commands": [{"command": "<actual command>", "status": "passed"}]},
+        "graph_trace_ids": ["gqt-atomic-transport"],
+        "implementation_diff_submission_guidance": {"unicode_escaped": '雪\\"\n' * 4000},
+        "worker_host_envelope_handoff": {"raw_worker_env_required": False},
+        "payload": {"runtime_context_id": identity["runtime_context_id"], "opaque_semantic_fact": "retain exact source metadata"},
+    }
+    if tool == "runtime_context_finish_time_worker_attestation":
+        body.update({"harness_type": "codex", "worker_session_id": "fixture-attestation-worker",
+                     "worker_transcript_ref": "fixture:attestation", "read_receipt_event_id": "fixture-read",
+                     "read_receipt_hash": "sha256:" + "7" * 64, "stage_id": "worker_attestation",
+                     "line_id": "worker_finish_time_attestation", "evidence_kind": "record_finish_time_worker_attestation"})
+    action = server._guide_canonical_executable_action(
+        project_id=identity["project_id"], action="record_implementation_evidence" if tool == "runtime_context_implementation_evidence" else "record_finish_time_worker_attestation", body=body,
+        mcp_tool=tool, stage_id="implementation" if tool == "runtime_context_implementation_evidence" else "attestation",
+        line_id="worker_implementation" if tool == "runtime_context_implementation_evidence" else "worker_finish_time_attestation",
+    )
+    full = {**identity, "next_legal_action": "record_implementation_evidence" if tool == "runtime_context_implementation_evidence" else "record_finish_time_worker_attestation",
+            "canonical_executable_action": action, "contract_runtime_current_state": {"execution_state_revision": 9}}
+    header = server._runtime_context_worker_guide_action_continuation(full)
+    pages = [server._runtime_context_worker_guide_action_continuation(
+        full, detail_ref=header["action_continuation"]["detail_ref"], detail_cursor=f"action:{index}",
+    ) for index in range(header["action_continuation"]["page_count"])]
+    return identity, action, header, pages
+
+
+def _stage_action_test_envelope(continuity, identity):
+    return continuity.dispatch("runtime_context_session_token_rejoin", identity, lambda _args: {
+        "ok": True, "status": "session_token_rejoined", "delivery": "worker_host_envelope", **identity,
+        "session_token": "atomic-test-session", "fence_token": "atomic-test-fence",
+        "host_envelope": {**identity, "env": {"AMING_WORKER_SESSION_TOKEN": "atomic-test-session", "AMING_WORKER_FENCE_TOKEN": "atomic-test-fence"}},
+    })
+
+
+@pytest.mark.parametrize("failure", ["missing", "reordered", "tampered", "wrong-scope", "changed-state", "duplicate", "wrong-tool", "override", "process-loss", "rotation", "expired"])
+def test_managed_action_continuation_invalid_never_posts(failure, monkeypatch):
+    import copy
+    from agent.mcp.host_envelope_continuity import ManagedHostEnvelopeContinuity
+    continuity = ManagedHostEnvelopeContinuity()
+    identity, action, header, pages = _worker_action_transport_fixture()
+    _stage_action_test_envelope(continuity, identity)
+    ref = header["action_continuation"]["detail_ref"]
+    continuity.dispatch("runtime_context_worker_guide", identity, lambda _args: copy.deepcopy(header))
+    selected = list(enumerate(pages))
+    if failure == "missing":
+        selected = selected[:-1]
+    elif failure == "reordered":
+        selected = [selected[1]]
+    elif failure == "duplicate":
+        selected = [selected[0], selected[0]]
+    elif failure in {"tampered", "wrong-scope", "changed-state"}:
+        bad = copy.deepcopy(pages[0])
+        if failure == "tampered":
+            bad["fragment"] += "x"
+        elif failure == "wrong-scope":
+            bad["action_continuation"]["identity"]["task_id"] = "other-worker"
+        else:
+            bad["action_continuation"]["source_state"]["execution_state_revision"] = 10
+        selected = [(0, bad)]
+    for index, page in selected:
+        result = continuity.dispatch("runtime_context_worker_guide", {
+            **identity, "detail_ref": ref, "detail_cursor": f"action:{index}",
+        }, lambda _args, page=page: copy.deepcopy(page))
+    args = {**identity, "action_continuation_ref": ref,
+            "changed_files": ["src/app.py"], "tests": [{"command": "pytest actual", "status": "passed"}]}
+    tool = "runtime_context_implementation_evidence"
+    if failure == "wrong-tool":
+        tool = "runtime_context_worker_commit"
+    if failure == "override":
+        args["execution_state_revision"] = 10
+    if failure == "process-loss":
+        continuity = ManagedHostEnvelopeContinuity()
+    if failure == "rotation":
+        _stage_action_test_envelope(continuity, identity)
+    if failure == "expired":
+        monkeypatch.setattr(continuity._store, "synchronize", lambda *_args, **_kwargs: "expired")
+    posts = []
+    rejection = continuity.dispatch(tool, args, lambda body: posts.append(body))
+    assert rejection["ok"] is False
+    assert rejection["writes_performed"] is False
+    assert rejection["http_request_performed"] is False
+    assert posts == []
+    assert "atomic-test-session" not in json.dumps(rejection)
+    assert "atomic-test-fence" not in json.dumps(rejection)
+
+
+@pytest.mark.parametrize("adapter", ["runtime", "governance"])
+@pytest.mark.parametrize("selected_tool", ["runtime_context_implementation_evidence", "runtime_context_finish_time_worker_attestation"])
+def test_worker_action_continuation_adapter_materialization_parity(adapter, selected_tool, monkeypatch):
+    import copy
+    from agent.mcp.tools import ToolDispatcher, TOOLS
+    from agent.mcp.host_envelope_continuity import ManagedHostEnvelopeContinuity
+    identity, action, header, pages = _worker_action_transport_fixture(selected_tool)
+    calls = []
+    def api(method, path, body=None, **_kwargs):
+        calls.append((method, path, copy.deepcopy(body)))
+        if method == "GET":
+            assert path.split("?")[0].endswith("/worker-guide")
+            query = parse_qs(urlsplit(path).query)
+            if "detail_cursor" in query:
+                assert query["detail_ref"] == [header["action_continuation"]["detail_ref"]]
+                return copy.deepcopy(pages[int(query["detail_cursor"][0].split(":")[1])])
+            return copy.deepcopy(header)
+        assert path.endswith("/implementation-evidence" if selected_tool == "runtime_context_implementation_evidence" else "/finish-time-worker-attestation")
+        assert body["session_token"] == "atomic-test-session"
+        assert body["fence_token"] == "atomic-test-fence"
+        assert body["execution_state_revision"] == action["copy_safe_body"]["execution_state_revision"]
+        assert body["runtime_guide_hash"] == action["copy_safe_body"]["runtime_guide_hash"]
+        assert body["implementation_diff_submission_guidance"] == action["copy_safe_body"]["implementation_diff_submission_guidance"]
+        assert body["payload"] == action["copy_safe_body"]["payload"]
+        assert "action_continuation_ref" not in body
+        assert body["worker_guide_action_precondition"]["mcp_tool"] == selected_tool
+        assert body["worker_guide_action_precondition"]["selected_line_id"] == action["line_id"]
+        return {"ok": True, "status": "accepted"}
+    if adapter == "runtime":
+        dispatcher = ToolDispatcher(api_fn=lambda *_args: None, worker_pool=None)
+        monkeypatch.setattr(dispatcher, "_governance_api_with_timeout", api)
+        monkeypatch.setattr(dispatcher, "_api", api)
+        continuity = dispatcher._host_envelope_continuity
+        dispatch = dispatcher.dispatch
+        tools = TOOLS
+    else:
+        continuity = ManagedHostEnvelopeContinuity()
+        monkeypatch.setattr(governance_mcp_server, "_HOST_ENVELOPE_CONTINUITY", continuity)
+        monkeypatch.setattr(governance_mcp_server, "_http", api)
+        dispatch = governance_mcp_server._dispatch_tool
+        tools = governance_mcp_server.TOOLS
+    guide_schema = next(tool for tool in tools if tool["name"] == "runtime_context_worker_guide")["inputSchema"]
+    current_schema = next(tool for tool in tools if tool["name"] == "runtime_context_current")["inputSchema"]
+    assert {"detail_ref", "detail_cursor"} <= guide_schema["properties"].keys()
+    assert not {"detail_ref", "detail_cursor"} & current_schema["properties"].keys()
+    _stage_action_test_envelope(continuity, identity)
+    public = [dispatch("runtime_context_worker_guide", identity)]
+    ref = header["action_continuation"]["detail_ref"]
+    for index in range(len(pages)):
+        public.append(dispatch("runtime_context_worker_guide", {**identity, "detail_ref": ref, "detail_cursor": f"action:{index}"}))
+        assert public[-1]["ok"] is True
+    assert public[-1]["managed_action_materialized"] is True
+    assert all(method == "GET" for method, _, _ in calls)
+    assert continuity.pending_count() == 1
+    args = {**identity, "action_continuation_ref": ref,
+            "changed_files": ["src/app.py"], "tests": [{"command": "pytest actual", "status": "passed"}]}
+    public.append(dispatch(selected_tool, args))
+    assert public[-1] == {"ok": True, "status": "accepted"}
+    assert continuity.pending_count() == 1
+    assert dispatch(selected_tool, args)["writes_performed"] is False
+    assert sum(method == "POST" for method, _, _ in calls) == 1
+    assert "atomic-test-session" not in json.dumps(public)
+    assert "atomic-test-fence" not in json.dumps(public)
+
+
+@pytest.mark.parametrize("tool", ["runtime_context_current", "runtime_context_worker_guide", "parallel_branch_startup"])
+def test_managed_public_reads_and_startup_remove_nested_auth_requirement_aliases(tool):
+    from agent.mcp.host_envelope_continuity import ManagedHostEnvelopeContinuity
+    continuity = ManagedHostEnvelopeContinuity()
+    identity, _, _, _ = _worker_action_transport_fixture()
+    _stage_action_test_envelope(continuity, identity)
+    result = continuity.dispatch(tool, {
+        **identity, "actual_host_worker_id": "worker-atomic-transport", "worker_session_id": "fixture-session",
+    }, lambda body: {
+        "ok": True, "status": "startup_recorded" if tool == "parallel_branch_startup" else "current",
+        "nested": {"credentials": {"token": body["session_token"]}, "auth": {"bearer": body["fence_token"]},
+                   "worker_host_envelope_handoff": {"raw_worker_env_required": ["AMING_WORKER_SESSION_TOKEN"],
+                                                    "raw_tokens_persisted_to_timeline": True}},
+        "benign_alias": "response-" + body["session_token"],
+    })
+    serialized = json.dumps(result)
+    assert "atomic-test-session" not in serialized
+    assert "atomic-test-fence" not in serialized
+    assert "credentials" not in result["nested"] and "auth" not in result["nested"]
+    assert result["nested"]["worker_host_envelope_handoff"] == {
+        "raw_worker_env_required": False, "raw_tokens_persisted_to_timeline": False,
+    }
+    assert continuity.pending_count() == (0 if tool == "parallel_branch_startup" else 1)

@@ -138,6 +138,48 @@ _ALLOCATION_AUTH_HASH_FIELDS = frozenset(
 )
 
 
+_ACTION_CONTINUATION_TOOLS = frozenset({
+    "runtime_context_read_receipt", "runtime_context_implementation_evidence",
+    "runtime_context_worker_commit", "runtime_context_finish_time_worker_attestation",
+    "runtime_context_finish_gate", "runtime_context_scope_insufficiency_request",
+    "parallel_branch_startup",
+})
+_ACTION_FACT_FIELDS = frozenset({
+    "changed_files", "tests", "test_results", "summary", "implementation_notes",
+    "worker_commit_sha", "commit_sha", "worker_transcript_ref",
+})
+
+
+def _action_public_hash(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def _scrub_managed_public_payload(value: Any, *, raw_values: tuple[str, ...] = ()) -> None:
+    scrub_host_envelope_payload(value)
+    if isinstance(value, dict):
+        for key in tuple(value):
+            child = value[key]
+            normalized = str(key).lower()
+            if normalized in _ALLOCATION_AUTH_CONTAINER_FIELDS or normalized == "env":
+                value.pop(key, None)
+            elif normalized.startswith("raw_") and any(
+                part in normalized for part in ("required", "exposed", "persist")
+            ):
+                value[key] = False
+            elif isinstance(child, str) and any(secret and secret in child for secret in raw_values):
+                value[key] = "<private worker credential>"
+            else:
+                _scrub_managed_public_payload(child, raw_values=raw_values)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            if isinstance(child, str) and any(secret and secret in child for secret in raw_values):
+                value[index] = "<private worker credential>"
+            else:
+                _scrub_managed_public_payload(child, raw_values=raw_values)
+
+
 def _text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -185,7 +227,7 @@ def _post_response_error(
         for field in _POST_RESPONSE_SAFE_FIELDS
         if result.get(field) not in (None, "")
     }
-    scrub_host_envelope_payload(result)
+    _scrub_managed_public_payload(result)
     result.pop("host_envelope", None)
     return {
         **safe_result,
@@ -236,7 +278,7 @@ def _scrub_allocation_auth_payload(
         for key in tuple(value):
             normalized = str(key).strip().lower()
             child = value.get(key)
-            if normalized.startswith("raw_") and normalized.endswith("_exposed"):
+            if normalized.startswith("raw_") and any(part in normalized for part in ("required", "exposed", "persist")):
                 value[key] = False
                 continue
             if (
@@ -291,6 +333,9 @@ class ManagedHostEnvelopeContinuity:
         self._entries: dict[str, _ManagedEnvelope] = {}
         self._revoked_envelope_refs: set[str] = set()
         self._in_flight: set[str] = set()
+        # Scoped to the staged envelope generation; never persisted or usable
+        # by a restarted MCP process. Auth borrowing remains non-consuming.
+        self._action_continuations: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
 
     @staticmethod
@@ -386,7 +431,7 @@ class ManagedHostEnvelopeContinuity:
         # any request body it aliases.
         result = copy.deepcopy(result)
         if result.get("ok") is not True:
-            scrub_host_envelope_payload(result)
+            _scrub_managed_public_payload(result)
             return result
         host_envelope = result.get("host_envelope")
         if not isinstance(host_envelope, dict):
@@ -394,7 +439,7 @@ class ManagedHostEnvelopeContinuity:
             # not claim delivery.  A real ``delivery=worker_host_envelope``
             # response must carry the typed envelope and fails closed below.
             if _text(result.get("delivery")) != "worker_host_envelope":
-                scrub_host_envelope_payload(result)
+                _scrub_managed_public_payload(result)
                 return result
             return _post_response_error(
                 result,
@@ -532,8 +577,9 @@ class ManagedHostEnvelopeContinuity:
             previous = self._entries.get(run_id)
             if previous is not None and previous.envelope_ref != entry.envelope_ref:
                 self._remember_revoked_ref(previous.envelope_ref)
+                self._action_continuations.pop(previous.envelope_ref, None)
             self._entries[run_id] = entry
-        scrub_host_envelope_payload(result)
+        _scrub_managed_public_payload(result)
         result.pop("host_envelope", None)
         result["auth_loaded"] = True
         result["session_token_ref"] = binding["session_token_ref"]
@@ -621,7 +667,7 @@ class ManagedHostEnvelopeContinuity:
         # principal.  Such responses still receive the recursive public scrub.
         claims_same_owner_auth = bool(session)
         if not claims_same_owner_auth:
-            scrub_host_envelope_payload(result)
+            _scrub_managed_public_payload(result)
             _scrub_allocation_auth_payload(result)
             result["auth_loaded"] = False
             for field in _PUBLIC_AUTH_FLAG_FIELDS:
@@ -876,6 +922,141 @@ class ManagedHostEnvelopeContinuity:
                 )
         return request_args, None
 
+    def _capture_action_page(
+        self, entry: _ManagedEnvelope, request: Mapping[str, Any], result: Any,
+    ) -> Any:
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result
+        advertised = result.get("action_continuation")
+        if not isinstance(advertised, Mapping):
+            return result
+        manifest = dict(advertised)
+        ref = _text(manifest.pop("detail_ref", ""))
+        manifest.pop("next_cursor", None)
+        def reject():
+            self._action_continuations.pop(entry.envelope_ref, None)
+            return _local_error("managed_action_continuation_invalid", "Action page is incomplete, out of order, tampered, or belongs to another source/state/scope.")
+        with self._lock:
+            if ref != "worker-guide-action:" + _action_public_hash(manifest):
+                return reject()
+            identity = manifest.get("identity")
+            if not isinstance(identity, Mapping) or any(
+                not _text(identity.get(key)) or _text(identity.get(key)) != entry.binding.get(key)
+                for key in _BASE_BINDING_FIELDS
+            ):
+                return reject()
+            if any(_text(identity.get(key)) != value for key, value in entry.binding.items()
+                   if key in {"worker_id", "worker_slot_id"} and value):
+                return reject()
+            count, size = manifest.get("page_count"), manifest.get("action_bytes")
+            if (type(count) is not int or not 1 <= count <= 128 or
+                type(size) is not int or not 0 < size <= 1_048_576 or
+                manifest.get("encoding") != "canonical_json_ascii" or
+                manifest.get("fragment_chars") != 8192 or
+                manifest.get("mcp_tool") not in _ACTION_CONTINUATION_TOOLS):
+                return reject()
+            cursor = _text(request.get("detail_cursor"))
+            state = self._action_continuations.get(entry.envelope_ref)
+            if not cursor:
+                if state and state["ref"] == ref and state.get("submitted"):
+                    return _local_error("managed_action_continuation_replayed", "This exact action already attempted its one typed write.")
+                self._action_continuations[entry.envelope_ref] = {
+                    "ref": ref, "manifest": manifest, "fragments": [], "submitted": False,
+                }
+            else:
+                if not state or state["ref"] != ref or state["manifest"] != manifest or state.get("submitted") or state.get("action"):
+                    return reject()
+                index = len(state["fragments"])
+                expected_next = f"action:{index + 1}" if index + 1 < count else ""
+                fragment = result.get("fragment")
+                if (request.get("detail_ref") != ref or cursor != f"action:{index}" or
+                    result.get("detail_cursor") != cursor or result.get("next_cursor") != expected_next or
+                    result.get("continuation_complete") is not (not expected_next) or
+                    not isinstance(fragment, str) or not fragment.isascii() or
+                    len(fragment) > 8192 or not fragment or
+                    (expected_next and len(fragment) != 8192) or
+                    result.get("fragment_hash") != "sha256:" + hashlib.sha256(fragment.encode()).hexdigest()):
+                    return reject()
+                state["fragments"].append(fragment)
+                if not expected_next:
+                    encoded = "".join(state["fragments"])
+                    try:
+                        action = json.loads(encoded)
+                    except (ValueError, TypeError):
+                        return reject()
+                    if (len(encoded.encode()) != size or _action_public_hash(action) != manifest.get("action_hash") or
+                        not isinstance(action, dict) or action.get("mcp_tool") != manifest["mcp_tool"] or
+                        json.dumps(action, sort_keys=True, separators=(",", ":"), default=str) != encoded):
+                        return reject()
+                    body = action.get("copy_safe_body")
+                    if not isinstance(body, dict) or any(
+                        _text(body.get(key)) != entry.binding.get(key)
+                        for key in _BASE_BINDING_FIELDS
+                    ):
+                        return reject()
+                    state["action"] = action
+                    state["fragments"] = []  # Complete once, no duplicate plaintext buffer.
+            result["managed_action_continuation_ref"] = ref
+            result["managed_action_materialized"] = bool(
+                self._action_continuations[entry.envelope_ref].get("action")
+            )
+            result["managed_host_envelope_consumed"] = False
+            result["materialization_performed_write"] = False
+        return result
+
+    def _materialize_action_request(
+        self, tool_name: str, args: dict[str, Any], entry: _ManagedEnvelope,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        ref = _text(args.get("action_continuation_ref"))
+        if not ref:
+            return args, None
+        with self._lock:
+            state = self._action_continuations.get(entry.envelope_ref)
+            if (tool_name not in _ACTION_CONTINUATION_TOOLS or not state or
+                state["ref"] != ref or state.get("submitted") or not state.get("action") or
+                state["action"].get("mcp_tool") != tool_name):
+                return args, _local_error("managed_action_continuation_not_ready", "Exact source-owned action is absent, incomplete, expired, replayed, or for another typed writer.")
+            action = state["action"]
+            body = copy.deepcopy(action["copy_safe_body"])
+            paths = set(action.get("host_realization", {}).get("required_replacement_paths") or [])
+            def merge(source: Any, supplied: Any, path: str) -> Any:
+                if source == supplied:
+                    return copy.deepcopy(source)
+                if path in paths and isinstance(source, str) and source.startswith("<"):
+                    return copy.deepcopy(supplied)
+                if path.split(".")[-1] in _ACTION_FACT_FIELDS and any(
+                    item == path or item.startswith(path + ".") or item.startswith(path + "[") for item in paths
+                ):
+                    return copy.deepcopy(supplied)
+                if isinstance(source, dict) and isinstance(supplied, dict):
+                    merged = copy.deepcopy(source)
+                    for key, value in supplied.items():
+                        if key not in source:
+                            raise ValueError("undeclared field")
+                        merged[key] = merge(source[key], value, path + "." + key)
+                    return merged
+                raise ValueError("immutable action field changed")
+            try:
+                for key, supplied in args.items():
+                    if key in {"action_continuation_ref", "managed_host_envelope_ref"}:
+                        continue
+                    if key not in body:
+                        raise ValueError("undeclared field")
+                    body[key] = merge(body[key], supplied, "copy_safe_body." + key)
+            except ValueError:
+                return args, _local_error("managed_action_continuation_override_rejected", "Only declared factual placeholders may change; action/state/route bindings remain source-owned.")
+            # Reserve before HTTP under the existing in-flight lock. This is
+            # local replay protection, not a server CAS or authority decision.
+            if tool_name in {"runtime_context_implementation_evidence", "runtime_context_finish_time_worker_attestation"}:
+                manifest = state["manifest"]
+                body["worker_guide_action_precondition"] = {
+                    "mcp_tool": tool_name, "identity": copy.deepcopy(manifest["identity"]),
+                    "execution_state_revision": manifest["source_state"]["execution_state_revision"],
+                    "selected_line_id": manifest["selected_line_id"], "action_hash": manifest["action_hash"],
+                }
+            state["submitted"] = True
+            return body, None
+
     def dispatch(
         self,
         tool_name: str,
@@ -1018,6 +1199,8 @@ class ManagedHostEnvelopeContinuity:
 
         entry = self._entry_for(request_args)
         if entry is None:
+            if request_args.get("action_continuation_ref"):
+                return _local_error("managed_action_continuation_not_ready", "Action continuation belongs to another or lost MCP process.")
             supplied_managed_ref = _text(
                 request_args.get("managed_host_envelope_ref")
             )
@@ -1148,6 +1331,12 @@ class ManagedHostEnvelopeContinuity:
                 )
                 if rejection is not None:
                     return rejection
+                request_args, action_rejection = self._materialize_action_request(tool_name, request_args, entry)
+                if action_rejection is not None:
+                    return action_rejection
+                request_args, placeholder_rejection = self._normalize_declared_host_auth_placeholders(request_args)
+                if placeholder_rejection is not None:
+                    return placeholder_rejection
                 self._in_flight.add(entry.run_id)
                 expired_recovery = False
 
@@ -1183,6 +1372,10 @@ class ManagedHostEnvelopeContinuity:
                     "AMING_WORKER_FENCE_TOKEN"
                 ]
                 result = send(enriched)
+                _scrub_managed_public_payload(result, raw_values=(
+                    temporary_environment["AMING_WORKER_SESSION_TOKEN"],
+                    temporary_environment["AMING_WORKER_FENCE_TOKEN"],
+                ))
             finally:
                 enriched.pop("session_token", None)
                 enriched.pop("fence_token", None)
@@ -1192,7 +1385,9 @@ class ManagedHostEnvelopeContinuity:
             with self._lock:
                 self._in_flight.discard(entry.run_id)
 
-        scrub_host_envelope_payload(result)
+        _scrub_managed_public_payload(result)
+        if tool_name == "runtime_context_worker_guide":
+            result = self._capture_action_page(entry, request_args, result)
         if (
             tool_name in {"parallel_branch_startup", "runtime_context_finish_gate"}
             and isinstance(result, dict)
@@ -1216,6 +1411,7 @@ class ManagedHostEnvelopeContinuity:
             self._remember_revoked_ref(entry.envelope_ref)
             with self._lock:
                 self._entries.pop(entry.run_id, None)
+                self._action_continuations.pop(entry.envelope_ref, None)
             result["managed_host_envelope_consumed"] = True
             result["managed_host_envelope_consumed_at"] = tool_name
             result["raw_worker_auth_exposed"] = False
