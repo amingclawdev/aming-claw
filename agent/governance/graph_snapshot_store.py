@@ -2033,6 +2033,24 @@ def _snapshot_reference_tokens(conn: sqlite3.Connection, project_id: str,
     return sorted(tokens)
 
 
+def _decoded_reference_matches(token_cte: str, *, ordered: bool = False) -> str:
+    """Filter once per owner, then confirm matches against original atoms/keys.
+
+    A correlated filtered-token CTE inside the atom loop can rebuild the search
+    for every atom. Carry its bounded identities in one outer row instead;
+    json_each only expands that row's tokens, without another JSON-tree walk.
+    """
+    ordinal = ",tokens.column3" if ordered else ""
+    return ("filtered AS MATERIALIZED (SELECT (SELECT json_group_array(json_array("
+        f"tokens.column1,tokens.column2{ordinal})) FROM ({token_cte}) tokens "
+        "WHERE instr(search.body,tokens.column2)>0) AS token_json FROM search), "
+        "matched AS MATERIALIZED (SELECT json_extract(tokens.value,'$[0]') AS column1,"
+        "json_extract(tokens.value,'$[2]') AS column3 FROM filtered CROSS JOIN atoms "
+        "CROSS JOIN json_each(filtered.token_json) tokens WHERE "
+        "(atoms.type='text' AND instr(atoms.atom,json_extract(tokens.value,'$[1]'))>0) OR "
+        "(typeof(atoms.key)='text' AND instr(atoms.key,json_extract(tokens.value,'$[1]'))>0)), ")
+
+
 def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
     """SQL-only decoded pins; bodies and nested serialized audits stay SQLite-side.
 
@@ -2065,10 +2083,7 @@ def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
                               for i, (sid, token) in enumerate(tokens))
     token_cte = "VALUES " + ordered_tokens if ordered_tokens else "SELECT '' AS column1, '' AS column2, 0 AS column3 WHERE 0"
     pins = (f"(SELECT json_group_array(sid) FROM (SELECT column1 AS sid "
-        f"FROM search CROSS JOIN ({token_cte}) AS tokens WHERE instr(search.body,tokens.column2)>0 "
-        "AND EXISTS(SELECT 1 FROM atoms WHERE "
-        "(type='text' AND instr(atom,tokens.column2)>0) OR "
-        "(typeof(key)='text' AND instr(key,tokens.column2)>0)) "
+        "FROM matched "
         "GROUP BY column1 ORDER BY min(column3)))")
     state = ("CASE WHEN typeof(record_json)!='text' THEN 'nontext' "
         "WHEN instr(record_json,char(0))>0 OR NOT json_valid(record_json) THEN 'malformed_json' ELSE coalesce((SELECT "
@@ -2080,6 +2095,7 @@ def _contract_reference_projection(tokens: list[tuple[str, str]]) -> str:
         "ORDER BY guide.id DESC LIMIT 1),'missing_runtime_guide') END")
     guarded = "typeof(record_json)='text' AND instr(record_json,char(0))=0 AND json_valid(record_json)"
     pin_projection = (f"CASE WHEN {guarded} THEN ({decoded}, "
+        f"{_decoded_reference_matches(token_cte, ordered=True)}"
         f"projected AS MATERIALIZED (SELECT {pins} AS pin_json) "
         f"SELECT CASE WHEN length(pin_json)<={_REFERENCE_MAX_BYTES} THEN pin_json "
         "ELSE NULL END FROM projected) ELSE NULL END")
@@ -2132,14 +2148,12 @@ def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
         "WHEN typeof(key)='text' THEN key END,char(0)),'') AS body FROM atoms) ")
     candidates = (f"pins(sid) AS MATERIALIZED (SELECT column1 FROM ({token_cte}) tokens "
         f"WHERE instr({column},tokens.column2)>0 UNION "
-        f"SELECT column1 FROM search CROSS JOIN ({token_cte}) tokens "
-        "WHERE instr(search.body,tokens.column2)>0 AND EXISTS(SELECT 1 FROM atoms WHERE "
-        "(type='text' AND instr(atom,tokens.column2)>0) OR "
-        "(typeof(key)='text' AND instr(key,tokens.column2)>0)) UNION "
+        "SELECT column1 FROM matched UNION "
         "SELECT atom FROM parented WHERE type='text' AND "
         "(substr(CAST(key AS TEXT),-11)='snapshot_id' OR parent_pin=1)) ")
     pins = "(SELECT json_group_array(sid) FROM (SELECT DISTINCT sid FROM pins WHERE sid!=''))"
-    projection = (f"CASE WHEN {valid} THEN ({docs}, {candidates}, "
+    projection = (f"CASE WHEN {valid} THEN ({docs}, "
+        f"{_decoded_reference_matches(token_cte)}{candidates}, "
         f"projected AS MATERIALIZED (SELECT {pins} AS pin_json) SELECT CASE "
         f"WHEN length(CAST(pin_json AS BLOB))<={_REFERENCE_MAX_BYTES} THEN pin_json "
         "ELSE NULL END FROM projected) ELSE NULL END")

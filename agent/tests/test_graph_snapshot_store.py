@@ -6786,6 +6786,92 @@ def test_contract_reference_projection_empty_inventory_preserves_completion(conn
     assert tuple(row) == ("execution", "text", len(body.encode()), "completed", "[]", 1)
 
 
+@pytest.mark.parametrize("body,tokens,contract_pins,owner_pins,completion", [
+    ('{"runtime_guide":{"next_legal_action":null},"note":"ordinary 雪"}',
+     [("absent", "not-present")], [], [], (1, 1)),
+    ('{"runtime_guide":{"next_legal_action":false},"key-hit":"value-hit"}',
+     [("z-first", "value-hit"), ("a-second", "key-hit"), ("z-first", "key-hit")],
+     ["z-first", "a-second"], ["a-second", "z-first"], (1, 1)),
+    ('{"runtime_guide":{"next_legal_action":null},"note":"scope\\u002dcurrent"}',
+     [("decoded", "scope-current"), ("raw", "\\u002d")], ["decoded"],
+     ["decoded", "raw"], (1, 1)),
+    ('{"runtime_guide":{"next_legal_action":null},"serialized":'
+     '"{\\"scope\\u002dcurrent\\":\\"audit\\",\\"snapshot_ids\\":[\\"outside-pin\\"]}"}',
+     [("current", "scope-current")], ["current"], ["current", "outside-pin"], (1, 1)),
+    ('{"runtime_guide":{"next_legal_action":null},"snapshot_id":"outside-first",'
+     '"snapshot_id":"outside-last","note":"scope-current\\u0000ordinary"}',
+     [("current", "scope-current")], ["current"],
+     ["current", "outside-first", "outside-last"], (0, 0)),
+    ('{"runtime_guide":{"next_legal_action":null},"serialized":"{bad",'
+     '"note":"scope-current"}', [("current", "scope-current")], ["current"],
+     ["current"], (1, 0)),
+    ('{"runtime_guide":{"next_legal_action":null},"snapshot_ids":["outside-pin"]}',
+     [], [], ["outside-pin"], (1, 1)),
+    ('{bad', [("absent", "absent")], None, None, (0, 0)),
+    ('7', [("absent", "absent")], [], None, (1, 0)),
+    (sqlite3.Binary(b'{}'), [("absent", "absent")], None, None, (0, 0)),
+])
+def test_structured_reference_matcher_preserves_pins_and_completion(
+        conn, body, tokens, contract_pins, owner_pins, completion):
+    conn.execute("CREATE TABLE matcher_fixture(contract_execution_id TEXT,record_json TEXT)")
+    conn.execute("INSERT INTO matcher_fixture VALUES ('execution',?)", (body,))
+    contract = conn.execute("SELECT " + store._contract_reference_projection(tokens) +
+                            " FROM matcher_fixture").fetchone()
+    owner = conn.execute("SELECT " + ",".join(store._owner_reference_projection(
+        "record_json", tokens, json_owner=True)) + " FROM matcher_fixture").fetchone()
+    assert (json.loads(contract[4]) if contract[4] is not None else None) == contract_pins
+    assert (json.loads(owner[0]) if owner[0] is not None else None) == owner_pins
+    assert (contract[5], owner[1]) == completion
+    if isinstance(body, str) and body.startswith('{"runtime_guide"'):
+        assert contract[3] == ("live" if '"next_legal_action":false' in body else "completed")
+
+
+@pytest.mark.parametrize("density", ["nohit", "sparse", "dense"])
+def test_structured_reference_matcher_sparse_and_dense_atom_inventory(conn, density):
+    ids = [f"snapshot-{i:03}" for i in range(114)]
+    expected = [] if density == "nohit" else ids[-1:] if density == "sparse" else ids
+    body = json.dumps({"runtime_guide": {"next_legal_action": None},
+        "audit": {str(i): "ordinary text " * 22 for i in range(500)},
+        "pins": " ".join(expected)})
+    conn.execute("CREATE TABLE matcher_fixture(contract_execution_id TEXT,record_json TEXT)")
+    conn.execute("INSERT INTO matcher_fixture VALUES ('execution',?)", (body,))
+    tokens = [(sid, token) for sid in ids for token in (sid, "/private/fixture/" + sid)]
+    contract = conn.execute("SELECT " + store._contract_reference_projection(tokens) +
+                            " FROM matcher_fixture").fetchone()
+    owner = conn.execute("SELECT " + ",".join(store._owner_reference_projection(
+        "record_json", tokens, json_owner=True)) + " FROM matcher_fixture").fetchone()
+    assert json.loads(contract[4]) == json.loads(owner[0]) == expected
+    assert contract[5] == owner[1] == 1
+
+
+def test_structured_reference_matcher_unicode_owner_byte_cap(conn):
+    ids = ["雪" * 330 + f"-{i:03}" for i in range(70)]
+    assert all(len(sid.encode()) <= 1024 for sid in ids)
+    body = json.dumps({"pins": ids}, ensure_ascii=False)
+    conn.execute("CREATE TABLE matcher_fixture(body TEXT)")
+    conn.execute("INSERT INTO matcher_fixture VALUES (?)", (body,))
+    row = conn.execute("SELECT " + ",".join(store._owner_reference_projection(
+        "body", [(sid, sid) for sid in ids], json_owner=True)) +
+        " FROM matcher_fixture").fetchone()
+    assert row[0] is None  # Character count cannot weaken the UTF-8 projection cap.
+    assert row[1] == 1
+
+
+def test_structured_reference_matcher_high_row_store_still_refuses_selection(conn, bundle_namespace):
+    _typed_reference_setup(conn, count=0)
+    conn.execute("DROP TABLE graph_asset_projection")
+    conn.execute("CREATE TABLE graph_asset_projection(project_id TEXT,payload TEXT)")
+    conn.executemany("INSERT INTO graph_asset_projection VALUES (?, '{}')", [(PID,)] * 2183)
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state["complete"]
+    assert any("reference_census_window_unbounded:graph_asset_projection" in reason
+               for reason in state["refusal_reasons"])
+    selected = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0,
+        extra_bundle_snapshot_ids=set(), measure_sizes=False)
+    assert not selected["reference_authority_complete"] and selected["candidates"] == []
+
+
 @pytest.mark.parametrize("json_owner,body,pins", [
     (True, '{"ordinary":"audit"}', []),
     (False, "ordinary owner Markdown paragraph", []),
