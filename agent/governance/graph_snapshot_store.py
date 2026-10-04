@@ -2099,7 +2099,7 @@ def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
     def literal(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
     values = ",".join(f"({literal(sid)},{literal(token)})" for sid, token in tokens)
-    token_cte = "VALUES " + values if values else "SELECT '', '' WHERE 0"
+    token_cte = "VALUES " + values if values else "SELECT '' AS column1, '' AS column2 WHERE 0"
     valid = f"typeof({column})='text' AND instr({column},char(0))=0"
     if json_owner:
         valid += f" AND json_valid({column}) AND json_type({column})='object'"

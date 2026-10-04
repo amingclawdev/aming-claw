@@ -6784,3 +6784,47 @@ def test_contract_reference_projection_empty_inventory_preserves_completion(conn
     row = conn.execute("SELECT " + store._contract_reference_projection([]) +
                        " FROM projection_fixture").fetchone()
     assert tuple(row) == ("execution", "text", len(body.encode()), "completed", "[]", 1)
+
+
+@pytest.mark.parametrize("json_owner,body,pins", [
+    (True, '{"ordinary":"audit"}', []),
+    (False, "ordinary owner Markdown paragraph", []),
+    (True, '{"snapshot_id":"external-pin"}', ["external-pin"]),
+])
+def test_owner_projection_empty_inventory_preserves_completion(conn, json_owner, body, pins):
+    conn.execute("CREATE TABLE projection_fixture(body TEXT)")
+    conn.execute("INSERT INTO projection_fixture VALUES (?)", (body,))
+    projection = ",".join(store._owner_reference_projection("body", [], json_owner=json_owner))
+    row = conn.execute("SELECT " + projection + " FROM projection_fixture").fetchone()
+    assert json.loads(row[0]) == pins
+    assert row[1] == 1
+
+
+@pytest.mark.parametrize("json_owner", [True, False])
+@pytest.mark.parametrize("known_inventory", [False, True])
+def test_owner_census_known_empty_and_nonempty_inventory(conn, json_owner, known_inventory):
+    store.ensure_schema(conn)
+    conn.execute("CREATE TABLE graph_query_traces "
+                 "(project_id TEXT, snapshot_id TEXT, canonical_base_snapshot_id TEXT)")
+    if known_inventory:
+        conn.execute("INSERT INTO graph_snapshots "
+                     "(project_id,snapshot_id,commit_sha,snapshot_kind,status,created_at) "
+                     "VALUES (?, 'scope-known', 'fixture', 'scope', 'superseded', '2020')", (PID,))
+    if json_owner:
+        _owner_binding_fixture(conn, ['{"ordinary":"audit scope-known"}'])
+    else:
+        conn.execute("CREATE TABLE backlog_bugs (project_id TEXT, details_md TEXT)")
+        conn.execute("INSERT INTO backlog_bugs VALUES (?, 'ordinary audit scope-known')", (PID,))
+    conn.commit()
+    known_ids = {row[0] for row in conn.execute(
+        "SELECT snapshot_id FROM graph_snapshots WHERE project_id=?", (PID,))}
+    tokens = store._snapshot_reference_tokens(conn, PID, known_ids)
+    assert bool(tokens) is known_inventory
+    image = hashlib.sha256(conn.serialize()).hexdigest()
+    changes = conn.total_changes
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state["complete"] is True and state["refusal_reasons"] == []
+    expected = {"scope-known"} if known_inventory else set()
+    assert set(state["protected"]) == set(state["current_use"]) == set(state["durable_references"]) == expected
+    assert changes == conn.total_changes
+    assert image == hashlib.sha256(conn.serialize()).hexdigest()
