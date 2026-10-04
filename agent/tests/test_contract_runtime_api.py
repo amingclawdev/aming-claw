@@ -1327,3 +1327,315 @@ def test_batch_postmerge_generation_authority_is_server_derived(
         execution_id=execution_id,
         context=context,
     ) == {}
+
+
+def _recorded_line_real_fixture(tmp_path, monkeypatch, *, line_count=1,
+    project_id="recorded-fixture", backlog_id="AC-RECORDED-FIXTURE", execution="cex-recorded-fixture"):
+    """Real canonical writer/SQLite reader with only disposable connection routing."""
+    import sqlite3
+    from contextlib import contextmanager
+    from agent.governance.contracts.runtime import SQLiteContractExecutionStore
+
+    definition = {
+        "schema_version": "contract_definition.v1", "contract_id": "recorded_fixture",
+        "version": "v1", "revision": "rev1", "role": "observer",
+        "contract_type": "recorded_fixture", "status": "active",
+        "rule_layer": {"stages": [{"stage_id": "record", "lines": [
+            {"line_id": f"record_{n}", "owner_role": "observer",
+             "allowed_writer_roles": ["observer"], "evidence_kind": "recorded_fixture"}
+            for n in range(3)
+        ]}]}, "instruction_layer": {"inline": [], "refs": []},
+    }
+    (tmp_path / "recorded_fixture.v1.rev1.json").write_text(json.dumps(definition))
+    conn = sqlite3.connect(tmp_path / "ordinary-recorded.sqlite")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path),
+        store=SQLiteContractExecutionStore(conn), instruction_root=tmp_path)
+    runtime.start_execution("recorded_fixture", project_id=project_id,
+        backlog_id=backlog_id, contract_execution_id=execution,
+        actor_role="observer")
+
+    def write(n, active_runtime=None):
+        active_runtime = active_runtime or runtime
+        record = active_runtime.current_record(execution, actor_role="observer")
+        guide = active_runtime.current_guide(execution, actor_role="observer")
+        result = active_runtime.submit_line_write(execution, {
+            "project_id": record["project_id"], "backlog_id": record["backlog_id"],
+            "contract_execution_id": execution, "definition_hash": record["definition_hash"],
+            "instruction_bundle_hash": record["instruction_bundle_hash"],
+            "stage_id": "record", "line_id": f"record_{n}", "actor_role": "observer",
+            "evidence_kind": "recorded_fixture",
+            "execution_state_revision": record["execution_state_revision"],
+            "runtime_guide_hash": guide["runtime_guide_hash"],
+            "payload": {"status": "blocked", "reason": "ordinary reporter claim", "sequence": n},
+        }, actor_role="observer")
+        assert result["ok"] is True, result
+        return result
+
+    for n in range(line_count):
+        write(n)
+    conn.commit()
+    boundaries = []
+
+    @contextmanager
+    def context(requested_project):
+        assert requested_project == project_id
+        boundaries.append("enter")
+        try:
+            yield conn
+            conn.commit()
+            boundaries.append("exit")
+        except Exception:
+            conn.rollback()
+            raise
+
+    monkeypatch.setattr(server, "DBContext", context)
+    monkeypatch.setattr(server, "_contract_runtime", lambda actual: runtime if actual is conn else None)
+    def request(query):
+        return SimpleNamespace(path_params={"contract_execution_id": execution},
+            query=query, request_id="req-222222222222", get_project_id=lambda: project_id,
+            require_auth=lambda actual: {"role": "observer"} if actual is conn else {})
+
+    current = runtime.current_record(execution, actor_role="observer")
+    state = server._runtime_current_state_from_record(current)
+    selector = {"response_view": "recorded_line", "backlog_id": current["backlog_id"],
+        "contract_hash": current["definition_hash"],
+        "execution_state_revision": str(current["execution_state_revision"]),
+        "execution_state_hash": state["execution_state_hash"],
+        "source_completed_line_index": "latest"}
+    return conn, runtime, write, request, selector, boundaries
+
+
+def test_recorded_line_real_writer_current_handler_and_v1_compatibility(tmp_path, monkeypatch):
+    import hashlib
+    import os
+    from pathlib import Path
+    conn, runtime, _write, request, selector, boundaries = _recorded_line_real_fixture(tmp_path, monkeypatch)
+    try:
+        record = runtime.current_record("cex-recorded-fixture", actor_role="observer")
+        native = server._contract_runtime_response(record, actor_role="observer",
+            response_view="coordinator_current", request_id="req-222222222222")
+        expected_v1 = server._contract_runtime_coordinator_current_response(record, native,
+            project_id=record["project_id"], contract_execution_id=record["contract_execution_id"],
+            actor_role="observer", request_id="req-222222222222")
+        actual_v1 = server.handle_project_contract_runtime_current_state(request({"response_view": "coordinator_current"}))
+        assert json.dumps(actual_v1, ensure_ascii=False) == json.dumps(expected_v1, ensure_ascii=False)
+        original = copy.deepcopy(runtime.store.get("cex-recorded-fixture")["completed_lines"])
+        actual_projector = server._contract_runtime_recorded_line_response
+        def assemble(*args, **kwargs):
+            assert conn.in_transaction
+            boundaries.append("assemble")
+            return actual_projector(*args, **kwargs)
+        monkeypatch.setattr(server, "_contract_runtime_recorded_line_response", assemble)
+        response = server.handle_project_contract_runtime_current_state(request(selector))
+        assert boundaries[-3:] == ["enter", "assemble", "exit"]
+        assert response["ok"] is True, response
+        proof = response["recorded_line"]
+        digest = "sha256:" + hashlib.sha256(json.dumps(original[0], sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        assert proof == {"source_completed_line_index": 0, "source_stage_id": "record",
+            "source_line_id": "record_0", "evidence_kind": "recorded_fixture",
+            "source_line_hash": digest, "provenance": "accepted_recorded_evidence",
+            "currentness": "latest_completed_line"}
+        assert runtime.store.get("cex-recorded-fixture")["completed_lines"] == original
+        assert "ordinary reporter claim" not in json.dumps(response)
+        assert not {"event_id", "occurred_at", "WorldRef", "Position", "payload", "reason", "status"}.intersection(response)
+        assert len(json.dumps(response, ensure_ascii=False).encode()) < 16384
+        export = os.environ.get("AC_RECORDED_FIXTURE_EXPORT")
+        if export:
+            destination = Path(export)
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "producer-response.json").write_text(json.dumps(response, ensure_ascii=False) + "\n")
+            (destination / "producer-selector.json").write_text(json.dumps(selector, ensure_ascii=False) + "\n")
+            (destination / "synthetic-original-line.json").write_text(json.dumps(original[0], ensure_ascii=False) + "\n")
+            (destination / "fixture-provenance.json").write_text(json.dumps({
+                "kind": "synthetic disposable SQLite canonical writer/read/current-state handler roundtrip",
+                "writer": "ContractRuntime.submit_line_write", "store": "SQLiteContractExecutionStore",
+                "formal_authority": "unverified", "native_event_authority": "unverified",
+                "production_observation": False, "original_line_digest": digest,
+            }, indent=2) + "\n")
+    finally:
+        conn.close()
+
+
+def test_recorded_line_exact_expectations_history_and_advanced_currentness(tmp_path, monkeypatch):
+    conn, runtime, write, request, selector, _ = _recorded_line_real_fixture(tmp_path, monkeypatch)
+    try:
+        first = server.handle_project_contract_runtime_current_state(request(selector))
+        exact = {**selector, **{k: str(v) for k, v in first["recorded_line"].items()
+            if k in {"source_completed_line_index", "source_stage_id", "source_line_id", "evidence_kind", "source_line_hash"}}}
+        assert server.handle_project_contract_runtime_current_state(request(exact))["ok"] is True
+        write(1)
+        conn.commit()
+        advanced = server.handle_project_contract_runtime_current_state(request(exact))
+        assert advanced["error"] == "recorded_line_currentness_mismatch"
+        record = runtime.current_record("cex-recorded-fixture", actor_role="observer")
+        fresh = {**exact, "execution_state_revision": str(record["execution_state_revision"]),
+            "execution_state_hash": record["execution_state"]["execution_state_hash"]}
+        historical = server.handle_project_contract_runtime_current_state(request(fresh))
+        assert historical["ok"] is True
+        assert historical["recorded_line"]["currentness"] == "historical_completed_line"
+        assert historical["recorded_line"]["source_line_hash"] == first["recorded_line"]["source_line_hash"]
+    finally:
+        conn.close()
+
+
+def test_recorded_line_named_absence_and_exact_selector_refusals(tmp_path, monkeypatch):
+    conn, runtime, _write, request, selector, _ = _recorded_line_real_fixture(tmp_path, monkeypatch)
+    try:
+        original = copy.deepcopy(runtime.store.get("cex-recorded-fixture")["completed_lines"])
+        cases = [
+            ({"backlog_id": "wrong"}, "recorded_line_scope_mismatch"),
+            ({"contract_hash": "sha256:" + "0" * 64}, "recorded_line_scope_mismatch"),
+            ({"execution_state_revision": "999"}, "recorded_line_currentness_mismatch"),
+            ({"execution_state_hash": "sha256:" + "0" * 64}, "recorded_line_currentness_mismatch"),
+            ({"source_completed_line_index": "5"}, "recorded_line_missing"),
+            ({"source_completed_line_index": "-1"}, "recorded_line_selector_invalid"),
+            ({"source_completed_line_index": "00"}, "recorded_line_selector_invalid"),
+            ({"source_line_id": "wrong"}, "recorded_line_mismatch"),
+            ({"source_stage_id": "wrong"}, "recorded_line_mismatch"),
+            ({"evidence_kind": "wrong"}, "recorded_line_mismatch"),
+            ({"source_line_hash": "sha256:" + "0" * 64}, "recorded_line_mismatch"),
+            ({"source_line_hash": "not-a-digest"}, "recorded_line_selector_invalid"),
+            ({"source_stage_id": "x" * 257}, "recorded_line_selector_unbounded"),
+            ({"backlog_id": "é" * 513}, "recorded_line_selector_unbounded"),
+        ]
+        for changes, expected in cases:
+            result = server.handle_project_contract_runtime_current_state(request({**selector, **changes}))
+            assert result["ok"] is False and result["error"] == expected, result
+            assert result["recorded_line"] is None
+            assert result["absence"] == (expected if expected == "recorded_line_missing" else None)
+        missing = {k: v for k, v in selector.items() if k != "execution_state_hash"}
+        assert server.handle_project_contract_runtime_current_state(request(missing))["error"] == "recorded_line_selector_missing"
+        assert runtime.store.get("cex-recorded-fixture")["completed_lines"] == original
+    finally:
+        conn.close()
+
+
+def test_recorded_line_empty_and_final_wire_cap(tmp_path, monkeypatch):
+    conn, _runtime, _write, request, selector, _ = _recorded_line_real_fixture(tmp_path, monkeypatch, line_count=0)
+    try:
+        absent = server.handle_project_contract_runtime_current_state(request(selector))
+        assert absent["error"] == absent["absence"] == "recorded_line_missing"
+        small = server._contract_runtime_recorded_line_refusal("recorded_line_missing")
+        assert server._contract_runtime_recorded_line_wire_response(small) == small
+        oversized = {**small, "fixture_extension": "汉" * 6000}
+        assert server._contract_runtime_recorded_line_wire_response(oversized)["error"] == "recorded_line_wire_unbounded"
+    finally:
+        conn.close()
+
+
+def test_recorded_line_cold_start_returns_persisted_proof(tmp_path, monkeypatch):
+    conn, _runtime, _write, request, selector, _ = _recorded_line_real_fixture(tmp_path, monkeypatch)
+    try:
+        # Caller knows only bounded current CEX identity and the explicit latest locator.
+        assert "source_line_hash" not in selector
+        response = server.handle_project_contract_runtime_current_state(request(selector))
+        assert response["response_view"] == "recorded_line", response
+        assert response["ok"] is True
+        assert response["recorded_line"]["source_completed_line_index"] == 0
+        assert response["recorded_line"]["provenance"] == "accepted_recorded_evidence"
+    finally:
+        conn.close()
+
+
+def test_recorded_line_snapshot_survives_concurrent_later_writer(tmp_path, monkeypatch):
+    import sqlite3
+    from agent.governance.contracts.runtime import SQLiteContractExecutionStore
+    conn, runtime, write, request, selector, _ = _recorded_line_real_fixture(tmp_path, monkeypatch)
+    other = None
+    try:
+        # Warm inherited schema in this disposable fixture, then use actual WAL readers/writers.
+        server.handle_project_contract_runtime_current_state(request({"response_view": "coordinator_current"}))
+        conn.execute("PRAGMA journal_mode=WAL")
+        other = sqlite3.connect(tmp_path / "ordinary-recorded.sqlite")
+        other.row_factory = sqlite3.Row
+        other_runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path),
+            store=SQLiteContractExecutionStore(other), instruction_root=tmp_path)
+        original = server._contract_runtime_recorded_line_response
+        def assemble(*args, **kwargs):
+            assert conn.in_transaction
+            write(1, other_runtime)
+            other.commit()
+            # The underlying SQLite read snapshot still sees the original prefix.
+            assert len(runtime.store.get("cex-recorded-fixture")["completed_lines"]) == 1
+            return original(*args, **kwargs)
+        monkeypatch.setattr(server, "_contract_runtime_recorded_line_response", assemble)
+        response = server.handle_project_contract_runtime_current_state(request(selector))
+        assert response["ok"] is True
+        assert response["execution_state_revision"] == 2
+        assert response["recorded_line"]["source_line_id"] == "record_0"
+        assert response["recorded_line"]["currentness"] == "latest_completed_line"
+        assert len(runtime.store.get("cex-recorded-fixture")["completed_lines"]) == 2
+        monkeypatch.setattr(server, "_contract_runtime_recorded_line_response", original)
+        assert server.handle_project_contract_runtime_current_state(request(selector))["error"] == "recorded_line_currentness_mismatch"
+    finally:
+        if other:
+            other.close()
+        conn.close()
+
+
+def test_recorded_line_preserves_source_action_and_project_scope_checks(tmp_path, monkeypatch):
+    conn, runtime, _write, _request, selector, _ = _recorded_line_real_fixture(tmp_path, monkeypatch)
+    try:
+        record = runtime.current_record("cex-recorded-fixture", actor_role="observer")
+        source = runtime.store.get("cex-recorded-fixture")
+        native = server._contract_runtime_response(record, actor_role="observer")
+        changed = copy.deepcopy(native)
+        changed["next_legal_action"]["contract_execution_id"] = "cex-other-epoch"
+        for selected, project, expected in [
+            (changed, "recorded-fixture", "coordinator_current_action_source_mismatch"),
+            (native, "other-project", "coordinator_current_scope_mismatch"),
+        ]:
+            result = server._contract_runtime_recorded_line_response(source, record, selected,
+                selector=selector, project_id=project, contract_execution_id="cex-recorded-fixture",
+                actor_role="observer", request_id="req-222222222222")
+            assert result["error"] == expected
+            assert result["recorded_line"] is None
+    finally:
+        conn.close()
+
+
+def test_recorded_line_http_final_wire_cap_after_handler_additions():
+    import io
+    headers = []
+    handler = SimpleNamespace(wfile=io.BytesIO(), CORS_HEADERS=server.GovernanceHandler.CORS_HEADERS, send_response=lambda _code: None,
+        send_header=lambda key, value: headers.append((key, value)), end_headers=lambda: None)
+    body = {**server._contract_runtime_recorded_line_refusal("recorded_line_missing"),
+        "handler_extension": "汉" * 6000}
+    server.GovernanceHandler._respond(handler, 200, body)
+    payload = handler.wfile.getvalue()
+    assert len(payload) <= 16384
+    assert json.loads(payload)["error"] == "recorded_line_wire_unbounded"
+
+
+def test_recorded_line_registered_consumer_companion_fixture(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    conn, runtime, _write, request, selector, _ = _recorded_line_real_fixture(tmp_path, monkeypatch,
+        project_id="judgment-brain", backlog_id="JB-DURABLE-RECEIPT", execution="cex-receipt-12345678")
+    try:
+        response = server.handle_project_contract_runtime_current_state(request(selector))
+        assert response["ok"] is True, response
+        assert response["project_id"] == "judgment-brain"
+        assert response["backlog_id"] == "JB-DURABLE-RECEIPT"
+        assert response["contract_execution_id"] == "cex-receipt-12345678"
+        assert response["request_id"] == "req-222222222222"
+        line = runtime.store.get("cex-receipt-12345678")["completed_lines"][0]
+        assert response["recorded_line"]["source_line_hash"] == server.stable_sha256(line)
+        export = os.environ.get("AC_RECORDED_FIXTURE_EXPORT")
+        if export:
+            destination = Path(export).parent / "registered-consumer-fixture"
+            destination.mkdir(parents=True, exist_ok=True)
+            for filename, value in [
+                ("producer-response.json", response), ("producer-selector.json", selector),
+                ("synthetic-original-line.json", line),
+                ("fixture-provenance.json", {"kind": "ordinary local SQLite canonical writer/read/handler",
+                    "writer": "ContractRuntime.submit_line_write", "store": "SQLiteContractExecutionStore",
+                    "consumer_mapping": "judgment-brain/JB-DURABLE-RECEIPT/cex-receipt-12345678",
+                    "production_observation": False, "formal_authority": "unverified",
+                    "native_event_authority": "unverified"}),
+            ]:
+                (destination / filename).write_text(json.dumps(value, ensure_ascii=False) + "\n")
+    finally:
+        conn.close()

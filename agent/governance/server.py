@@ -5859,6 +5859,8 @@ class GovernanceHandler(BaseHTTPRequestHandler):
     def _respond(self, code: int, body: dict, extra_headers: dict | None = None):
         if body.get("response_view") == "coordinator_current":
             body = _contract_runtime_coordinator_current_wire_response(body)
+        elif body.get("response_view") == "recorded_line":
+            body = _contract_runtime_recorded_line_wire_response(body)
         timing = getattr(self, "_cleanup_timing", None)
         with timing.phase("encoding") if timing else nullcontext():
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -127424,6 +127426,132 @@ def _contract_runtime_coordinator_current_response(
     return _contract_runtime_coordinator_current_wire_response(response)
 
 
+
+_CONTRACT_RUNTIME_RECORDED_LINE_SCHEMA = "contract_runtime.recorded_line.v1"
+
+
+def _contract_runtime_recorded_line_refusal(reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": _CONTRACT_RUNTIME_RECORDED_LINE_SCHEMA,
+        "response_view": "recorded_line", "ok": False, "error": reason,
+        "absence": reason if reason == "recorded_line_missing" else None,
+        "observation_only": True, "recorded_line": None,
+    }
+
+
+def _contract_runtime_recorded_line_wire_response(response: dict[str, Any]) -> dict[str, Any]:
+    if len(json.dumps(response, ensure_ascii=False).encode("utf-8")) > (
+        _CONTRACT_RUNTIME_COORDINATOR_CURRENT_MAX_BYTES
+    ):
+        return _contract_runtime_recorded_line_refusal("recorded_line_wire_unbounded")
+    return response
+
+
+def _contract_runtime_recorded_line_response(
+    source_record: Mapping[str, Any], record: Mapping[str, Any],
+    native_response: Mapping[str, Any], *, selector: Mapping[str, Any],
+    project_id: str, contract_execution_id: str, actor_role: str, request_id: str,
+) -> dict[str, Any]:
+    """Address an original persisted line; no event or formal authority is inferred."""
+    refuse = _contract_runtime_recorded_line_refusal
+    fields = {
+        "backlog_id": 1024, "contract_hash": 71,
+        "execution_state_revision": 19, "execution_state_hash": 71,
+        "source_completed_line_index": 19, "source_stage_id": 256,
+        "source_line_id": 256, "evidence_kind": 256, "source_line_hash": 71,
+    }
+    required = ("backlog_id", "contract_hash", "execution_state_revision",
+                "execution_state_hash", "source_completed_line_index")
+    if any(field not in selector or selector[field] == "" for field in required):
+        return refuse("recorded_line_selector_missing")
+    for field, limit in fields.items():
+        if field not in selector:
+            continue
+        value = selector[field]
+        if not isinstance(value, str):
+            return refuse("recorded_line_selector_invalid")
+        if len(value.encode("utf-8")) > limit:
+            return refuse("recorded_line_selector_unbounded")
+    for field in ("contract_hash", "execution_state_hash", "source_line_hash"):
+        if field in selector and not re.fullmatch(r"sha256:[0-9a-f]{64}", selector[field]):
+            return refuse("recorded_line_selector_invalid")
+    integers = {}
+    for field, minimum in (("execution_state_revision", 1), ("source_completed_line_index", 0)):
+        if field == "source_completed_line_index" and selector[field] == "latest":
+            continue
+        if not re.fullmatch(r"0|[1-9][0-9]*", selector[field]):
+            return refuse("recorded_line_selector_invalid")
+        value = int(selector[field])
+        if not minimum <= value <= 2**63 - 1:
+            return refuse("recorded_line_selector_invalid")
+        integers[field] = value
+    current = _contract_runtime_coordinator_current_response(
+        record, native_response, project_id=project_id,
+        contract_execution_id=contract_execution_id, actor_role=actor_role,
+        request_id=request_id,
+    )
+    if current.get("ok") is not True:
+        return refuse(current["error"])
+    if selector["backlog_id"] != current["backlog_id"] or (
+        selector["contract_hash"] != current["contract_hash"]
+    ):
+        return refuse("recorded_line_scope_mismatch")
+    if integers["execution_state_revision"] != current["execution_state_revision"] or (
+        selector["execution_state_hash"] != current["execution_state_hash"]
+    ):
+        return refuse("recorded_line_currentness_mismatch")
+    for source_field, current_field in (
+        ("project_id", "project_id"), ("backlog_id", "backlog_id"),
+        ("contract_execution_id", "contract_execution_id"),
+        ("definition_hash", "contract_hash"),
+        ("execution_state_revision", "execution_state_revision"),
+    ):
+        if source_record.get(source_field) != current[current_field]:
+            return refuse("recorded_line_source_invalid")
+    lines = source_record.get("completed_lines")
+    if not isinstance(lines, list):
+        return refuse("recorded_line_source_invalid")
+    index = len(lines) - 1 if selector["source_completed_line_index"] == "latest" else integers["source_completed_line_index"]
+    if index < 0 or index >= len(lines):
+        return refuse("recorded_line_missing")
+    line = lines[index]
+    if not isinstance(line, Mapping):
+        return refuse("recorded_line_source_invalid")
+    for source_field, selector_field in (
+        ("stage_id", "source_stage_id"), ("line_id", "source_line_id"),
+        ("evidence_kind", "evidence_kind"),
+    ):
+        value = line.get(source_field)
+        if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 256:
+            return refuse("recorded_line_source_invalid")
+        if selector_field in selector and value != selector[selector_field]:
+            return refuse("recorded_line_mismatch")
+    # Hash the complete original line, including all persisted payload fields.
+    # The public projection and its digest are deliberately different objects.
+    digest = stable_sha256(line)
+    if "source_line_hash" in selector and digest != selector["source_line_hash"]:
+        return refuse("recorded_line_mismatch")
+    identity_fields = (
+        "project_id", "backlog_id", "contract_execution_id", "contract_id",
+        "contract_revision_id", "contract_hash", "execution_state_revision",
+        "execution_state_hash", "runtime_guide_hash",
+    )
+    return _contract_runtime_recorded_line_wire_response({
+        "schema_version": _CONTRACT_RUNTIME_RECORDED_LINE_SCHEMA,
+        "response_view": "recorded_line", "ok": True, "error": None,
+        "absence": None, "observation_only": True,
+        "actor_role": actor_role, "request_id": request_id,
+        **{field: current[field] for field in identity_fields},
+        "recorded_line": {
+            "source_completed_line_index": index,
+            "source_stage_id": line["stage_id"], "source_line_id": line["line_id"],
+            "evidence_kind": line["evidence_kind"], "source_line_hash": digest,
+            "provenance": "accepted_recorded_evidence",
+            "currentness": "latest_completed_line" if index == len(lines) - 1 else "historical_completed_line",
+        },
+    })
+
+
 def _contract_runtime_bounded_line_write_response(
     response: Mapping[str, Any],
     *,
@@ -239750,6 +239878,9 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     compact_next_action_projection: dict[str, Any] = {}
     response_view = str(ctx.query.get("response_view") or "").strip()
     with DBContext(project_id) as conn:
+        if response_view == "recorded_line" and not conn.in_transaction:
+            # Own only a new transaction; preserve an existing caller snapshot.
+            conn.execute("BEGIN")
         record = _contract_runtime_store(conn).get(contract_execution_id)
         actor_role = _contract_runtime_effective_actor_role(
             ctx,
@@ -239867,6 +239998,34 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             active_epoch_resume = _server_integration_epoch_resume_payload(
                 conn, active_epoch
             )
+        if response_view == "recorded_line":
+            source_record = _contract_runtime_store(conn).get(contract_execution_id)
+            public_record = (
+                _operator_supervised_direct_main_public_runtime_record(record)
+                if str(record.get("contract_id") or "").strip() == "operator_supervised_direct_main"
+                and str(record.get("revision") or "").strip() in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+                else record
+            )
+            selected = _contract_runtime_response(
+                public_record, actor_role=actor_role,
+                response_view="coordinator_current", request_id=ctx.request_id,
+            )
+            if active_epoch_payload:
+                own_action = selected.get("next_legal_action") or {}
+                if not (
+                    active_epoch_resume.get("contract_execution_id") == contract_execution_id
+                    and active_epoch_resume.get("line_id") == "observer_merge"
+                    and own_action.get("line_id") == "observer_merge"
+                ):
+                    selected["next_legal_action"] = active_epoch_resume
+            observed = _contract_runtime_recorded_line_response(
+                source_record, public_record, selected, selector=ctx.query,
+                project_id=project_id, contract_execution_id=contract_execution_id,
+                actor_role=actor_role, request_id=ctx.request_id,
+            )
+            # All proof assembly precedes the routine's existing commit/close.
+            conn.commit()
+            return observed
         conn.commit()
     public_record = (
         _operator_supervised_direct_main_public_runtime_record(record)
