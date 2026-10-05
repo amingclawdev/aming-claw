@@ -50,7 +50,7 @@ MAX_JSON_BYTES = 1024 * 1024
 CLONE_NOFOLLOW_ANY = 0x8
 
 _METADATA_HELPER = Path(__file__).with_name("snapshot_cow_metadata.py")
-_METADATA_HELPER_SHA256 = '7062033e4d0cdbb0c42743199e40fa9eab4b4ca90b5ad4d5708e52797d3582aa'
+_METADATA_HELPER_SHA256 = 'adcd4b4420d5d656dadcf3b30726857bd153aef11579e1371fa9d53b0cc33098'
 _METADATA_SOURCE_BYTES = 16 * 1024
 _METADATA_SECONDS = 2.0
 _METADATA_CONNECTION: ContextVar[Any] = ContextVar("cow_metadata_connection", default=None)
@@ -220,10 +220,23 @@ def _validate_metadata(value):
     return value
 
 
-def _bounded_metadata(path: Path, *, directory: bool):
+def _bounded_metadata(path: Path, *, directory: bool, _batch=None):
     encoded = os.fsencode(path.absolute())
     if len(encoded) > 8192 or b"\0" in encoded or type(directory) is not bool:
         raise CowRefusal("cow_metadata_request_invalid")
+    batch_requests = None
+    if _batch is not None:
+        if not isinstance(_batch, tuple) or not 1 <= len(_batch) <= 3:
+            raise CowRefusal("cow_metadata_request_invalid")
+        batch_requests = []
+        for candidate, is_directory in _batch:
+            raw_path = os.fsencode(candidate.absolute())
+            if len(raw_path) > 8192 or b"\0" in raw_path or type(is_directory) is not bool:
+                raise CowRefusal("cow_metadata_request_invalid")
+            batch_requests.append({"path": os.fsdecode(raw_path), "directory": is_directory})
+        batch_argument = json.dumps(batch_requests, separators=(",", ":"), ensure_ascii=True)
+        if len(batch_argument.encode("utf-8")) > 25 * 1024:
+            raise CowRefusal("cow_metadata_request_invalid")
     for pid, child in list(_METADATA_UNREAPED.items()):
         if child.poll() is None:
             raise CowRefusal("cow_metadata_helper_cleanup_unknown", {"helper_pid": pid})
@@ -265,8 +278,9 @@ def _bounded_metadata(path: Path, *, directory: bool):
         # Execute exactly the verified bytes, not a path that can change after
         # the loaded parent's helper hash check. The fixed helper imports only stdlib.
         process = subprocess.Popen(
-            [sys.executable, "-I", "-B", "-c", worker_source.decode("utf-8"), os.fsdecode(encoded),
-             "1" if directory else "0"], stdin=subprocess.DEVNULL,
+            [sys.executable, "-I", "-B", "-c", worker_source.decode("utf-8"),
+             *( ["--batch", batch_argument] if batch_requests is not None else
+                [os.fsdecode(encoded), "1" if directory else "0"] )], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
             env={"PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1"})
         with selectors.DefaultSelector() as selector:
@@ -316,7 +330,21 @@ def _bounded_metadata(path: Path, *, directory: bool):
                     and 0 < error["errno"] < 4096 and error["reason"] == "os_metadata_error"):
                 raise CowRefusal("cow_metadata_os_error", {"errno": error["errno"]})
             raise CowRefusal("cow_metadata_reply_invalid")
-        result = _validate_metadata(result)
+        if batch_requests is None:
+            result = _validate_metadata(result)
+        else:
+            if (not isinstance(result, dict) or set(result) != {"schema_version", "entries"}
+                    or result["schema_version"] != "cow_metadata_batch.v1"
+                    or not isinstance(result["entries"], list)
+                    or len(result["entries"]) != len(batch_requests)):
+                raise CowRefusal("cow_metadata_reply_invalid")
+            values = []
+            for index, entry in enumerate(result["entries"]):
+                if (not isinstance(entry, dict) or set(entry) != {"index", "metadata"}
+                        or type(entry["index"]) is not int or entry["index"] != index):
+                    raise CowRefusal("cow_metadata_reply_invalid")
+                values.append(_validate_metadata(entry["metadata"]))
+            result = values
         if _metadata_clock() >= deadline:
             raise CowRefusal("cow_metadata_timeout")
         _metadata_timeout()  # No success after the shared absolute budget expired.
@@ -351,6 +379,15 @@ def _xattrs(path: Path) -> dict[str, str]:
 
 def _metadata(path: Path, *, directory: bool = False) -> dict[str, Any]:
     return _bounded_metadata(path, directory=directory)
+
+
+def _metadata_batch(requests: tuple[tuple[Path, bool], ...]) -> list[dict[str, Any]]:
+    """Fresh adjacent captures, one verified short-lived child; no retained results."""
+    if (not isinstance(requests, tuple) or not 1 <= len(requests) <= 3
+            or any(not isinstance(r, tuple) or len(r) != 2 or not isinstance(r[0], Path)
+                   or type(r[1]) is not bool for r in requests)):
+        raise CowRefusal("cow_metadata_request_invalid")
+    return _bounded_metadata(requests[0][0], directory=requests[0][1], _batch=requests)
 
 
 def _same(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
@@ -460,10 +497,10 @@ def _custody(conn: sqlite3.Connection, project_id: str, root: Path) -> dict[str,
     expected = world / project_id / "governance.db"
     if _path(Path(database[0])) != _path(expected):
         raise CowRefusal("cow_database_world_mismatch")
-    info = _metadata(expected)
+    info, root_info, world_info = _metadata_batch(((expected, False), (root, True), (world, True)))
     return {"project_id": project_id, "project_root": str(root.absolute()),
-            "root_identity": _metadata(root, directory=True)["ino"],
-            "world": str(world), "world_identity": _metadata(world, directory=True)["ino"],
+            "root_identity": root_info["ino"],
+            "world": str(world), "world_identity": world_info["ino"],
             "db_path": str(expected), "db_dev": info["dev"], "db_ino": info["ino"]}
 
 
@@ -750,18 +787,21 @@ def _eligible(conn: sqlite3.Connection, project_id: str, sid: str,
 def _pair(project_id: str, sid: str, relative: tuple[str, str]) -> dict[str, Any]:
     root = _path(snapshots._snapshot_root(project_id, sid))
     source, target = root / relative[0], root / relative[1]
-    sm, tm = _metadata(source), _metadata(target)
+    sm, tm = _metadata_batch(((source, False), (target, False)))
     if sm["dev"] != tm["dev"] or sm["ino"] == tm["ino"] or sm["size"] != tm["size"]:
         raise CowRefusal("cow_pair_identity_or_size_mismatch")
     source_hash, target_hash = _hash(source, sm), _hash(target, tm)
     if source_hash != target_hash:
         raise CowRefusal("cow_pair_content_differs")
+    # Keep these captures after both hashes, as in the original proof order.
+    source_dir, target_dir, snapshot_info = _metadata_batch(
+        ((source.parent, True), (target.parent, True), (root, True)))
     return {"candidate_id": "cow-" + _digest([project_id, sid, relative])[:24],
             "snapshot_id": sid, "source": relative[0], "target": relative[1],
             "sha256": source_hash, "source_metadata": sm, "target_metadata": tm,
-            "directories": {str(d.relative_to(root)): _metadata(d, directory=True)
-                            for d in (source.parent, target.parent)},
-            "snapshot_identity": _metadata(root, directory=True), "safe_to_apply": True}
+            "directories": {str(source.parent.relative_to(root)): source_dir,
+                            str(target.parent.relative_to(root)): target_dir},
+            "snapshot_identity": snapshot_info, "safe_to_apply": True}
 
 
 @_metadata_scope
@@ -805,7 +845,8 @@ def preview(conn: sqlite3.Connection, project_id: str, root: Path, *,
                 break
             try:
                 base = snapshots._snapshot_root(project_id, sid)
-                sizes = [_metadata(base / rel)["size"] for rel in relative]
+                sizes = [info["size"] for info in _metadata_batch(
+                    tuple((base / rel, False) for rel in relative))]
                 if hashed + sum(sizes) > budgets["max_hash_bytes"]:
                     incomplete = True
                     break

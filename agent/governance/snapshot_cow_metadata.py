@@ -99,7 +99,7 @@ def _xattrs(path: Path, *, max_bytes=MAX_BYTES) -> dict[str, str]:
     return result
 
 
-def _metadata(path: Path, *, directory: bool = False) -> dict:
+def _metadata(path: Path, *, directory: bool = False, max_bytes: int = MAX_BYTES) -> dict:
     _path(path)
     info = path.lstat()
     if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
@@ -113,20 +113,39 @@ def _metadata(path: Path, *, directory: bool = False) -> dict:
             "birthtime": getattr(info, "st_birthtime", None), "ctime_ns": info.st_ctime_ns,
             "mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid,
             "mtime_ns": info.st_mtime_ns, "flags": getattr(info, "st_flags", 0)}
-    remaining = MAX_BYTES - len(json.dumps(result).encode()) - 32
+    remaining = max_bytes - len(json.dumps(result).encode()) - 32
     result["xattrs"] = _xattrs(path, max_bytes=remaining)
     remaining -= len(json.dumps(result["xattrs"]).encode())
     result["acl"] = _acl(path, max_bytes=remaining) if sys.platform == "darwin" else None
-    if len(json.dumps(result).encode()) > MAX_BYTES:
+    if len(json.dumps(result).encode()) > max_bytes:
         raise ValueError("cow_metadata_output_oversize")
     return result
 
 def main():
-    if (len(sys.argv) != 3 or sys.argv[2] not in ("0", "1")
+    batch = len(sys.argv) == 3 and sys.argv[1] == "--batch"
+    if not batch and (len(sys.argv) != 3 or sys.argv[2] not in ("0", "1")
             or len(os.fsencode(sys.argv[1])) > 8192):
         return 2
     try:
-        result = _metadata(Path(sys.argv[1]), directory=sys.argv[2] == "1")
+        if batch:
+            if len(sys.argv[2].encode("utf-8")) > 25 * 1024:
+                return 2
+            requests = json.loads(sys.argv[2])
+            if (not isinstance(requests, list) or not 1 <= len(requests) <= 3
+                    or any(not isinstance(r, dict) or set(r) != {"path", "directory"}
+                           or type(r["path"]) is not str or type(r["directory"]) is not bool
+                           or len(os.fsencode(r["path"])) > 8192 or "\0" in r["path"]
+                           for r in requests)):
+                return 2
+            result = {"schema_version": "cow_metadata_batch.v1", "entries": []}
+            for index, request in enumerate(requests):
+                remaining = MAX_BYTES - len(json.dumps(result).encode()) - 128
+                if remaining <= 0:
+                    raise ValueError("cow_metadata_output_oversize")
+                value = _metadata(Path(request["path"]), directory=request["directory"], max_bytes=remaining)
+                result["entries"].append({"index": index, "metadata": value})
+        else:
+            result = _metadata(Path(sys.argv[1]), directory=sys.argv[2] == "1")
         raw = json.dumps(result, separators=(",", ":"), allow_nan=False).encode()
         if len(raw) > MAX_BYTES:
             return 3

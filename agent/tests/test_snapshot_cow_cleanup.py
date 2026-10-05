@@ -1913,3 +1913,132 @@ def test_bounded_metadata_helper_source_nonregular_refuses_without_launch(tmp_pa
         cow._metadata(path)
     assert time.monotonic() - began < 0.3
     assert not cow._METADATA_UNREAPED
+
+
+def test_adjacent_metadata_batch_fresh_identity_native_fidelity_and_reaped_child(tmp_path, monkeypatch):
+    tmp_path = tmp_path.resolve()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(b"native first"); second.write_bytes(b"native second longer")
+    expected = [cow._metadata(first), cow._metadata(second), cow._metadata(tmp_path, directory=True)]
+    children = []
+    original = subprocess.Popen
+    def tracked(*args, **kwargs):
+        child = original(*args, **kwargs); children.append(child); return child
+    monkeypatch.setattr(subprocess, "Popen", tracked)
+    requests = ((first, False), (second, False), (tmp_path, True))
+    assert cow._metadata_batch(requests) == expected
+    assert len(children) == 1 and children[0].poll() is not None
+    assert children[0].stdout.closed and children[0].stderr.closed
+    os.chmod(second, 0o600)
+    changed = cow._metadata_batch(requests)
+    assert changed[1]["mode"] == 0o600 and changed[1]["ino"] == expected[1]["ino"]
+    assert len(children) == 2 and all(c.poll() is not None for c in children)
+    assert not cow._METADATA_UNREAPED
+
+
+@pytest.mark.parametrize("malformed", [(), [(Path("a"), False)], ((Path("a"), False),) * 4,
+    ((Path("a"), 1),), (("a", False),), (7,)])
+def test_adjacent_metadata_batch_request_bounds_before_launch(tmp_path, monkeypatch, malformed):
+    def forbidden(*args, **kwargs): pytest.fail("invalid batch must not launch")
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    with pytest.raises(cow.CowRefusal, match="cow_metadata_request_invalid"):
+        cow._metadata_batch(malformed)
+
+
+@pytest.mark.parametrize("malformed", ["count", "order", "boolean_index", "extra", "shape", "invalid_metadata"])
+def test_adjacent_metadata_batch_reply_closed_count_order_all_or_none(tmp_path, monkeypatch, malformed):
+    path = tmp_path / "payload"; path.write_bytes(b"batch reply fixture")
+    value = cow._metadata(path)
+    reply = {"schema_version": "cow_metadata_batch.v1", "entries": [
+        {"index": 0, "metadata": value}, {"index": 1, "metadata": value}]}
+    if malformed == "count": reply["entries"].pop()
+    elif malformed == "order": reply["entries"].reverse()
+    elif malformed == "boolean_index": reply["entries"][0]["index"] = False
+    elif malformed == "extra": reply["entries"][0]["private_extra"] = True
+    elif malformed == "shape": reply["schema_version"] = "unknown"
+    elif malformed == "invalid_metadata": reply["entries"][1]["metadata"] = {"ino": 7}
+    worker = tmp_path / "reply.py"; worker.write_text("print(" + repr(json.dumps(reply)) + ")")
+    monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+    monkeypatch.setattr(cow, "_METADATA_HELPER_SHA256", hashlib.sha256(worker.read_bytes()).hexdigest())
+    with pytest.raises(cow.CowRefusal, match="cow_metadata_reply_invalid"):
+        cow._metadata_batch(((path, False), (path, False)))
+    assert not cow._METADATA_UNREAPED
+
+
+def test_adjacent_metadata_batch_native_second_refusal_never_returns_prefix(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(b"accepted first"); second.write_bytes(b"refused second")
+    os.link(second, tmp_path / "hardlink")
+    with pytest.raises(cow.CowRefusal, match="hardlink_refused"):
+        cow._metadata_batch(((first, False), (second, False)))
+    assert not cow._METADATA_UNREAPED
+
+
+def test_adjacent_metadata_batch_pair_directory_capture_keeps_hash_boundary(cow_fixture, monkeypatch):
+    conn, root, base, *_ = cow_fixture
+    events = []
+    original_batch, original_hash = cow._metadata_batch, cow._hash
+    def batch(requests):
+        events.append(("batch", [str(p.relative_to(base)) for p, _ in requests]))
+        return original_batch(requests)
+    def digest(path, wanted):
+        events.append(("hash", str(path.relative_to(base))))
+        return original_hash(path, wanted)
+    monkeypatch.setattr(cow, "_metadata_batch", batch)
+    monkeypatch.setattr(cow, "_hash", digest)
+    result = cow._pair("proj", "full-old", cow.PAIRS[0])
+    assert [kind for kind, _ in events] == ["batch", "hash", "hash", "batch"]
+    assert events[0][1] == list(cow.PAIRS[0])
+    assert events[3][1] == [str(Path(p).parent) for p in cow.PAIRS[0]] + ["."]
+    assert result["safe_to_apply"]
+
+
+def test_adjacent_metadata_batch_deadline_hang_reaped_and_not_renewed(tmp_path, monkeypatch):
+    import time
+    path = tmp_path / "payload"; path.write_bytes(b"deadline fixture")
+    worker = tmp_path / "hang.py"; worker.write_text("import time; time.sleep(60)")
+    monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+    monkeypatch.setattr(cow, "_METADATA_HELPER_SHA256", hashlib.sha256(worker.read_bytes()).hexdigest())
+    with snapshots._owned_reference_connection(lambda: sqlite3.connect(":memory:")) as conn:
+        budget = snapshots._reference_budget(conn)
+        with budget.census(): pass
+        assert budget.deadline - budget.started == 25
+        budget.deadline = time.monotonic() + 0.06
+        deadline = budget.deadline
+        token = cow._METADATA_CONNECTION.set(conn)
+        try:
+            start = time.monotonic()
+            with pytest.raises(cow.CowRefusal, match="cow_metadata_timeout"):
+                cow._metadata_batch(((path, False), (path, False)))
+            assert time.monotonic() - start < 0.5
+            assert not cow._METADATA_UNREAPED and budget.deadline == deadline
+            with pytest.raises(cow.CowRefusal, match="cow_reference_census_refused"):
+                cow._metadata_batch(((path, False), (path, False)))
+            assert budget.exhausted and budget.deadline == deadline
+        finally: cow._METADATA_CONNECTION.reset(token)
+
+
+def test_adjacent_metadata_batch_aggregate_argument_bound_before_launch(monkeypatch):
+    def forbidden(*args, **kwargs): pytest.fail("oversize request must not launch")
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    for requests in (((Path("/" + "a" * 8193), False),),
+                     ((Path("/" + "汉" * 2000), False),) * 3):
+        with pytest.raises(cow.CowRefusal, match="cow_metadata_request_invalid"):
+            cow._metadata_batch(requests)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Native disposable xattr aggregate")
+def test_adjacent_metadata_batch_native_aggregate_output_is_all_or_refusal(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    for path in (first, second):
+        path.write_bytes(b"bounded aggregate fixture")
+        for index in range(6):
+            raw = b"x" * 50000
+            cow._call("setxattr", ctypes.c_int,
+                [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int],
+                os.fsencode(path), f"org.aming-claw.batch-fixture.{index}".encode(),
+                ctypes.create_string_buffer(raw), len(raw), 0, 0x41)
+        assert len(json.dumps(cow._metadata(path)).encode()) < cow.MAX_JSON_BYTES
+    with pytest.raises(cow.CowRefusal, match="cow_metadata_output_oversize"):
+        cow._metadata_batch(((first, False), (second, False)))
+    assert not cow._METADATA_UNREAPED
