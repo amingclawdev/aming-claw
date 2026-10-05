@@ -7551,6 +7551,38 @@ def test_native_cost_observation_reserves_exhaustion_after_summary(
         assert 'CANARY' not in caplog.text
 
 
+@pytest.mark.parametrize('observing', [False, True])
+def test_native_cost_initial_thread_clock_unavailable_preserves_census(
+        bundle_namespace, monkeypatch, observing):
+    connection = sqlite3.connect(':memory:')
+    connection.row_factory = sqlite3.Row
+    _typed_reference_setup(connection, count=1)
+    connection.execute('INSERT INTO graph_query_traces VALUES (?,?,?)',
+                       (PID, 'scope-current', 'scope-durable'))
+    connection.commit()
+    expected = store.snapshot_retention_reference_state(connection, PID)
+    image = hashlib.sha256(connection.serialize()).hexdigest()
+    changes = connection.total_changes
+    calls = []
+    def unavailable():
+        calls.append(1)
+        raise OSError('observation-thread-clock-unavailable')
+    monkeypatch.setattr(store._REFERENCE_LOG, 'isEnabledFor', lambda _level: observing)
+    monkeypatch.setattr(store.time, 'thread_time', unavailable)
+    with store._owned_reference_connection(lambda: connection):
+        actual = store.snapshot_retention_reference_state(connection, PID)
+        provider = store._reference_budget(connection)
+        assert actual['complete'] and actual['refusal_reasons'] == []
+        assert actual['census']['contract_rows'] == expected['census']['contract_rows']
+        actual['census'] = expected['census']
+        assert actual == expected
+        assert len(calls) == int(observing)
+        assert not provider.observing and provider.observation_partial is observing
+        assert provider.deadline == 25 and not provider.active
+        assert not connection.in_transaction and changes == connection.total_changes
+        assert image == hashlib.sha256(connection.serialize()).hexdigest()
+
+
 def test_nested_serialized_depth_still_refuses_sql_and_python(conn):
     nested = json.dumps({'snapshot_id': 'scope-current'})
     for _ in range(10):

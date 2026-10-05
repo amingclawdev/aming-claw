@@ -2143,8 +2143,14 @@ class _ReferenceBudget:
             self.started = time.monotonic()
             self.deadline = self.started + _REFERENCE_CENSUS_SECONDS
             if self.observing:
-                self.thread_started = time.thread_time()
-                _reference_observe(self.conn, "connection")
+                try:
+                    self.thread_started = time.thread_time()
+                except Exception:
+                    # Optional clock failure cannot replace the original census.
+                    self.observation_partial = True
+                    self.observing = False
+                else:
+                    _reference_observe(self.conn, "connection")
         busy = self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
         self.active = True
         try:
