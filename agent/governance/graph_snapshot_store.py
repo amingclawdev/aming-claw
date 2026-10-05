@@ -1970,8 +1970,11 @@ def _reference_location(conn, phase, **location):
 
 def _reference_diagnostic(conn, cause, **location):
     budget = _reference_budget(conn)
-    # Reserve the final slot for the budget's actual SQL/Python location.
-    limit = _REFERENCE_DIAGNOSTICS if cause == "budget_exhausted" else _REFERENCE_DIAGNOSTICS - 1
+    # Reserve summary and cancellation slots. A later recheck on this same
+    # request must still expose exhaustion after a successful first census.
+    limit = (_REFERENCE_DIAGNOSTICS if cause == "budget_exhausted" else
+             _REFERENCE_DIAGNOSTICS - 1 if cause == "census_end" else
+             _REFERENCE_DIAGNOSTICS - 2)
     if budget is None or budget.diagnostics >= limit:
         return
     budget.diagnostics += 1
@@ -1983,7 +1986,23 @@ def _reference_diagnostic(conn, cause, **location):
                 record[key] = value
         elif key in {"phase", "table", "field", "mode", "storage"}:
             record[key] = _reference_label(value)
-    _REFERENCE_LOG.info("reference_census_diagnostic %s", json.dumps(record, sort_keys=True))
+    try:
+        record.update(budget.cost_observation())
+        if cause == "connection":
+            record.update(budget.connection_observation)
+        _REFERENCE_LOG.info("reference_census_diagnostic %s", json.dumps(record, sort_keys=True))
+    except Exception:
+        # Observation failures never alter the original decision or cancellation.
+        budget.observation_partial = True
+
+
+def _reference_observe(conn, event, **values):
+    budget = _reference_budget(conn)
+    if budget and budget.observing:
+        try:
+            budget.observe(event, **values)
+        except Exception:
+            budget.observation_partial = True
 
 
 class _ReferenceBudgetExceeded(ValueError):
@@ -2003,10 +2022,110 @@ class _ReferenceBudget:
         self.deadline = None
         self.active = False
         self.exhausted = False
+        self.observing = _REFERENCE_LOG.isEnabledFor(logging.INFO)
+        self.started = self.thread_started = None
+        self.observation_partial = False
+        self.connection_observation = {}
+        self.prefix_owners = self.prefix_pages = self.prefix_rows = 0
+        self.prefix_identity_queries = self.prefix_identity_rows = 0
+        self.cex_entered = False
+        self.cex_pages = self.cex_rows = 0
+        self.page_started = self.page_thread_started = None
+        self.last_page = {}
+        self.first_cex_page = {}
+        self.second_cex_page = {}
+        self.cex_entry_cost = {}
+        self.census_outcome = "pending"
+        self.final_observed = False
+
+    def cost_observation(self):
+        if not self.observing or self.started is None:
+            return {}
+        now = time.monotonic()
+        result = {"observation_status": "partial" if self.observation_partial else "available",
+                  "budget_age_ms": round((now - self.started) * 1000, 3),
+                  "budget_remaining_ms": round(max(0, self.deadline - now) * 1000, 3),
+                  "census_thread_ms": round((time.thread_time() - self.thread_started) * 1000, 3),
+                  "prefix_scan_owners": self.prefix_owners,
+                  "prefix_pages": self.prefix_pages, "prefix_page_rows": self.prefix_rows,
+                  "prefix_identity_queries": self.prefix_identity_queries,
+                  "prefix_identity_rows": self.prefix_identity_rows,
+                  "cex_pages": self.cex_pages, "cex_page_rows": self.cex_rows,
+                  "census_outcome": self.census_outcome,
+                  **self.last_page, **self.first_cex_page,
+                  **self.second_cex_page, **self.cex_entry_cost}
+        if self.page_started is not None:
+            result.update(cex_inflight_wall_ms=round((now - self.page_started) * 1000, 3),
+                          cex_inflight_thread_ms=round((time.thread_time() - self.page_thread_started) * 1000, 3))
+        return result
+
+    def observe(self, event, **values):
+        if event == "connection":
+            # Four fixed readonly scalars, once per owned request connection.
+            for key, sql in (("sqlite_version", "SELECT sqlite_version()"),
+                             ("temp_store", "PRAGMA temp_store"),
+                             ("main_cache_size", "PRAGMA main.cache_size"),
+                             ("temp_cache_size", "PRAGMA temp.cache_size")):
+                try:
+                    value = self.conn.execute(sql).fetchone()[0]
+                    valid = (isinstance(value, str) and re.fullmatch(r"[0-9.]{1,32}", value)
+                             if key == "sqlite_version" else type(value) is int)
+                    self.connection_observation[key] = value if valid else None
+                    self.observation_partial |= not bool(valid)
+                except sqlite3.Error:
+                    self.connection_observation[key] = None
+                    self.observation_partial = True
+            # These four values alone are admitted here; arbitrary caller data
+            # never enters this additive diagnostic projection.
+            _reference_diagnostic(self.conn, "connection")
+        elif event == "owner":
+            if not self.cex_entered:
+                self.prefix_owners += 1
+        elif event == "identity_rows":
+            if not self.cex_entered:
+                self.prefix_identity_queries += 1
+                self.prefix_identity_rows += values["rows"]
+        elif event == "cex_entry":
+            if not self.cex_entered:
+                self.cex_entered = True
+                now = time.monotonic()
+                self.cex_entry_cost = {
+                    "cex_entry_budget_age_ms": round((now - self.started) * 1000, 3),
+                    "cex_entry_budget_remaining_ms": round(max(0, self.deadline - now) * 1000, 3),
+                    "cex_entry_thread_ms": round((time.thread_time() - self.thread_started) * 1000, 3)}
+                _reference_diagnostic(self.conn, "cex_entry")
+        elif event == "page_start":
+            if values["table"] == "contract_runtime_executions":
+                self.cex_pages += 1
+                self.page_started, self.page_thread_started = time.monotonic(), time.thread_time()
+                if self.cex_pages <= 2:
+                    _reference_diagnostic(self.conn, "cex_page")
+        elif event == "page_end":
+            if values["table"] == "contract_runtime_executions":
+                self.cex_rows += values["rows"]
+                self.last_page = {"cex_last_page_wall_ms": round((time.monotonic() - self.page_started) * 1000, 3),
+                                  "cex_last_page_thread_ms": round((time.thread_time() - self.page_thread_started) * 1000, 3),
+                                  "cex_last_page_rows": values["rows"]}
+                if self.cex_pages == 1:
+                    self.first_cex_page = {key.replace("last", "first"): value
+                                           for key, value in self.last_page.items()}
+                elif self.cex_pages == 2:
+                    self.second_cex_page = {key.replace("last", "second"): value
+                                            for key, value in self.last_page.items()}
+                self.page_started = self.page_thread_started = None
+            elif not self.cex_entered:
+                self.prefix_pages += 1
+                self.prefix_rows += values["rows"]
+        elif event == "end" and not self.final_observed:
+            self.final_observed = True
+            self.census_outcome = values["outcome"]
+            if not self.exhausted:
+                _reference_diagnostic(self.conn, "census_end")
 
     def checkpoint(self, mode="python"):
         if self.active and (self.exhausted or time.monotonic() >= self.deadline):
             if not self.exhausted:
+                self.census_outcome = "budget_exhausted"
                 _reference_diagnostic(self.conn, "budget_exhausted", mode=mode)
             self.exhausted = True
             raise _ReferenceBudgetExceeded("reference_census_budget_exhausted")
@@ -2021,7 +2140,11 @@ class _ReferenceBudget:
     @contextmanager
     def census(self):
         if self.deadline is None:
-            self.deadline = time.monotonic() + _REFERENCE_CENSUS_SECONDS
+            self.started = time.monotonic()
+            self.deadline = self.started + _REFERENCE_CENSUS_SECONDS
+            if self.observing:
+                self.thread_started = time.thread_time()
+                _reference_observe(self.conn, "connection")
         busy = self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
         self.active = True
         try:
@@ -2134,6 +2257,7 @@ def _reference_pages(conn: sqlite3.Connection, table: str, projection: str,
         if budget:
             budget.before_sql()
         _reference_location(conn, "page", table=table, page_after_rowid=last)
+        _reference_observe(conn, "page_start", table=table, after=last)
         source = (f" FROM {quoted}" + (" NOT INDEXED" if budget else "") +
                   (" WHERE " + predicate if predicate else "") +
                   f" ORDER BY {cursor_key} LIMIT ?")
@@ -2148,6 +2272,7 @@ def _reference_pages(conn: sqlite3.Connection, table: str, projection: str,
                 for i, expression in enumerate(expressions)}
             query = _reference_expand_projection(query, replacements)
         page = conn.execute(query, page_parameters).fetchall()
+        _reference_observe(conn, "page_end", table=table, rows=len(page))
         _reference_location(conn, "rows", table=table, page_after_rowid=last)
         _reference_checkpoint(conn)
         if not page:
@@ -2479,13 +2604,18 @@ def snapshot_retention_reference_state(
                    "contract_rows": {"current": 0, "completed": 0},
                    "refusals": [], "refusal_metadata": []}
     budget = _reference_budget(conn)
+    observed_outcome = "error"
     try:
         with budget.census() if budget else _unbudgeted_reference_census():
             with _reference_read_snapshot(conn):
                 _snapshot_retention_reference_state(conn, project_id, accumulator)
+        observed_outcome = "refused" if accumulator["refusals"] else "complete"
     except (ValueError, sqlite3.Error) as exc:
         accumulator["refusals"].append("reference_census_budget_exhausted"
             if budget and budget.exhausted else str(exc))
+        observed_outcome = "refused"
+    finally:
+        _reference_observe(conn, "end", outcome=observed_outcome)
     return _reference_result(accumulator, budgeted=budget is not None)
 
 
@@ -2576,6 +2706,7 @@ def _snapshot_retention_reference_state(
                 f"SELECT snapshot_id FROM ({union}) ORDER BY snapshot_id LIMIT 2001",
                 tuple(project_id for _ in selected) if scoped else (),
             ).fetchall()
+            _reference_observe(conn, "identity_rows", rows=len(rows))
             if len(rows) > 2000:
                 refusals.append(f"{table}_reference_window_unbounded")
                 return
@@ -2721,6 +2852,8 @@ def _snapshot_retention_reference_state(
             if table in intrinsic or table in fts5_shadows:
                 continue
             if table == "contract_runtime_executions":
+                _reference_location(conn, "entry", table=table)
+                _reference_observe(conn, "cex_entry")
                 try:
                     for reference in _contract_reference_rows(conn, project_id, known_ids):
                         if reference["state"] not in {"completed", "live"}:
@@ -2742,6 +2875,7 @@ def _snapshot_retention_reference_state(
                     _reference_checkpoint(conn)
                     refusals.append("contract_runtime_executions_projection_unreadable:" + str(exc)[:160])
                 continue
+            _reference_observe(conn, "owner")
             quoted = '"' + table.replace('"', '""') + '"'
             schema_rows = conn.execute(
                 f"PRAGMA table_info({quoted})"

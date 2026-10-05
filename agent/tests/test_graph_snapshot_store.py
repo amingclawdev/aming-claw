@@ -7149,9 +7149,10 @@ def test_owned_census_budget_keeps_prefix_pins_and_restores(mode, monkeypatch, b
         assert not provider.active and not connection.in_transaction
         diagnostics = [json.loads(r.message.split("reference_census_diagnostic ", 1)[1])
                        for r in caplog.records if "reference_census_diagnostic " in r.message]
-        assert len(diagnostics) == 1 and diagnostics[0]["cause"] == "budget_exhausted"
-        assert diagnostics[0]["mode"] == mode
-        assert diagnostics[0]["phase"] == ("page" if mode == "sql" else "field")
+        assert len(diagnostics) <= store._REFERENCE_DIAGNOSTICS
+        assert diagnostics[-1]["cause"] == "budget_exhausted"
+        assert diagnostics[-1]["mode"] == mode
+        assert diagnostics[-1]["phase"] == ("page" if mode == "sql" else "field")
         deadline = provider.deadline
         selected = store.select_snapshot_retention_candidates(connection, PID, measure_sizes=False)
         assert selected['candidates'] == [] and not selected['reference_authority_complete']
@@ -7382,9 +7383,172 @@ def test_census_bundle_diagnostic_preserves_positive_refusal_and_no_paths(conn, 
         assert any(r['snapshot_id'] == 'scope-durable' and 'bundle_manifest_reference' in r['reasons'] for r in result['protected'])
         assert result['global_refusal_reasons'] == ['bundle_manifest_reference_unreadable']
         record = json.loads(caplog.records[-1].message.split('reference_census_diagnostic ', 1)[1])
-        assert record == {'cause': 'directory_changed', 'phase': 'bundle', 'entries': 118669,
+        assert {key: record[key] for key in ('cause', 'phase', 'entries', 'request_id')} == {
+            'cause': 'directory_changed', 'phase': 'bundle', 'entries': 118669,
             'request_id': 'sha256:' + hashlib.sha256(b'/private/request/token').hexdigest()}
         assert '/private/' not in caplog.text
+
+
+def _cost_observation_records(caplog):
+    return [json.loads(row.message.split('reference_census_diagnostic ', 1)[1])
+            for row in caplog.records if 'reference_census_diagnostic ' in row.message]
+
+
+def test_native_cost_observation_success_same_decision_and_four_readonly_scalars(
+        bundle_namespace, caplog, monkeypatch):
+    connection = sqlite3.connect(':memory:')
+    connection.row_factory = sqlite3.Row
+    _typed_reference_setup(connection, count=65)
+    connection.execute('CREATE TABLE a_prefix(payload TEXT)')
+    connection.executemany('INSERT INTO a_prefix VALUES (?)', [('scope-current',)] * 3)
+    connection.execute('UPDATE contract_runtime_executions SET record_json=?', (json.dumps({
+        'runtime_guide': {'next_legal_action': None}, 'snapshot_id': 'scope-durable',
+        'private': 'CANARY-body-secret /private/CANARY credential-CANARY'}),))
+    connection.commit()
+    image = hashlib.sha256(connection.serialize()).hexdigest()
+    changes = connection.total_changes
+    statements = []
+    connection.set_trace_callback(statements.append)
+    caplog.set_level('INFO', logger=store.__name__)
+    with store._owned_reference_connection(lambda: connection, diagnostic_request_id='req-cost-test'):
+        observed = store.snapshot_retention_reference_state(connection, PID)
+        records = _cost_observation_records(caplog)
+        assert observed['complete'] and records[-1]['cause'] == 'census_end'
+        assert records[-1]['census_outcome'] == 'complete'
+        assert records[-1]['cex_page_rows'] == 65 and records[-1]['cex_pages'] == 3
+        assert records[-1]['cex_first_page_rows'] == 64
+        assert records[-1]['cex_second_page_rows'] == 1
+        entry = next(row for row in records if row['cause'] == 'cex_entry')
+        assert entry['phase'] == 'entry' and entry['table'] == 'contract_runtime_executions'
+        assert entry['prefix_page_rows'] >= 3 and entry['prefix_pages'] >= 2
+        assert entry['prefix_scan_owners'] > 0
+        settings = [row for row in records if row['cause'] == 'connection']
+        assert len(settings) == 1 and settings[0]['sqlite_version'] == sqlite3.sqlite_version
+        assert settings[0]['temp_store'] == 0 and settings[0]['main_cache_size'] == -2000
+        for sql in ('SELECT sqlite_version()', 'PRAGMA temp_store',
+                    'PRAGMA main.cache_size', 'PRAGMA temp.cache_size'):
+            assert statements.count(sql) == 1
+        assert len(records) <= store._REFERENCE_DIAGNOSTICS
+        assert all(value not in caplog.text for value in
+                   ('CANARY', '/private/', 'scope-current', 'scope-durable', 'SELECT ', 'PRAGMA '))
+        assert connection.total_changes == changes
+        assert hashlib.sha256(connection.serialize()).hexdigest() == image
+        assert not connection.in_transaction
+    # A fresh identical fixture with INFO disabled takes the same decisions,
+    # and does not run the four observational reads.
+    quiet = sqlite3.connect(':memory:')
+    quiet.row_factory = sqlite3.Row
+    _typed_reference_setup(quiet, count=65)
+    quiet.execute('CREATE TABLE a_prefix(payload TEXT)')
+    quiet.executemany('INSERT INTO a_prefix VALUES (?)', [('scope-current',)] * 3)
+    quiet.execute('UPDATE contract_runtime_executions SET record_json=?', (json.dumps({
+        'runtime_guide': {'next_legal_action': None}, 'snapshot_id': 'scope-durable',
+        'private': 'CANARY-body-secret /private/CANARY credential-CANARY'}),))
+    quiet.commit()
+    statements.clear()
+    quiet.set_trace_callback(statements.append)
+    monkeypatch.setattr(store._REFERENCE_LOG, 'isEnabledFor', lambda _level: False)
+    with store._owned_reference_connection(lambda: quiet):
+        assert store.snapshot_retention_reference_state(quiet, PID) == observed
+        assert 'SELECT sqlite_version()' not in statements
+
+
+def test_native_cost_observation_interrupted_second_page_preserves_prefix(
+        bundle_namespace, caplog, monkeypatch):
+    clock, cpu = [0.0], [0.0]
+    monkeypatch.setattr(store.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(store.time, 'thread_time', lambda: cpu[0])
+    class Timed(sqlite3.Connection):
+        def execute(self, sql, args=()):
+            if 'FROM "a_prefix" NOT INDEXED' in sql:
+                clock[0], cpu[0] = 2.0, 1.0
+            if ('FROM "contract_runtime_executions" NOT INDEXED' in sql
+                    and not sql.startswith('SELECT sum(')):
+                clock[0], cpu[0] = (26.0, 20.0) if len(args) == 3 else (5.0, 4.0)
+            return super().execute(sql, args)
+    connection = sqlite3.connect(':memory:', factory=Timed)
+    connection.row_factory = sqlite3.Row
+    _typed_reference_setup(connection, count=65)
+    connection.execute('CREATE TABLE a_prefix(payload TEXT)')
+    connection.executemany('INSERT INTO a_prefix VALUES (?)', [('scope-current',)] * 3)
+    connection.execute('UPDATE contract_runtime_executions SET record_json=?', (json.dumps({
+        'runtime_guide': {'next_legal_action': None}, 'snapshot_id': 'scope-durable',
+        'ordinary': ['CANARY-secret'] * 600}),))
+    connection.commit()
+    caplog.set_level('INFO', logger=store.__name__)
+    with store._owned_reference_connection(lambda: connection, diagnostic_request_id='req-cost-test'):
+        result = store.snapshot_retention_reference_state(connection, PID)
+        budget = store._reference_budget(connection)
+        records = _cost_observation_records(caplog)
+        terminal = records[-1]
+        assert not result['complete'] and budget.exhausted
+        assert result['refusal_reasons'] == ['reference_census_budget_exhausted']
+        assert {'scope-current', 'scope-durable'} <= result['protected'].keys()
+        assert result['census']['contract_rows']['completed'] == 64
+        assert terminal['cause'] == terminal['census_outcome'] == 'budget_exhausted'
+        assert terminal['mode'] == 'sql' and terminal['page_after_rowid'] == 64
+        assert terminal['cex_entry_budget_age_ms'] == 2000
+        assert terminal['cex_entry_thread_ms'] == 1000
+        assert terminal['cex_first_page_wall_ms'] == 3000
+        assert terminal['cex_first_page_rows'] == 64
+        assert terminal['cex_inflight_wall_ms'] == 21000
+        assert terminal['budget_age_ms'] == 26000 and terminal['budget_remaining_ms'] == 0
+        assert terminal['prefix_page_rows'] >= 3 and terminal['cex_page_rows'] == 64
+        assert len(records) <= store._REFERENCE_DIAGNOSTICS and 'CANARY' not in caplog.text
+        assert budget.deadline == 25 and not budget.active and not connection.in_transaction
+
+
+@pytest.mark.parametrize('failure', ['logger', 'settings'])
+def test_native_cost_observation_failure_does_not_change_decisions(
+        bundle_namespace, caplog, monkeypatch, failure):
+    class Unsupported(sqlite3.Connection):
+        def execute(self, sql, args=()):
+            if failure == 'settings' and sql == 'PRAGMA temp.cache_size':
+                raise sqlite3.OperationalError('CANARY-observer-only-error')
+            return super().execute(sql, args)
+    connection = _complete_owner_fixture(factory=Unsupported)
+    before = store.snapshot_retention_reference_state(connection, PID)
+    image = hashlib.sha256(connection.serialize()).hexdigest()
+    caplog.set_level('INFO', logger=store.__name__)
+    if failure == 'logger':
+        def unavailable(*args, **kwargs):
+            raise RuntimeError('CANARY-log-only-error')
+        monkeypatch.setattr(store._REFERENCE_LOG, 'info', unavailable)
+    with store._owned_reference_connection(lambda: connection):
+        observed = store.snapshot_retention_reference_state(connection, PID)
+        observed['census'] = before['census']
+        assert observed == before
+        assert hashlib.sha256(connection.serialize()).hexdigest() == image
+        assert not connection.in_transaction and not store._reference_budget(connection).active
+        if failure == 'settings':
+            records = _cost_observation_records(caplog)
+            assert records[0]['temp_cache_size'] is None
+            assert records[-1]['observation_status'] == 'partial'
+            assert 'CANARY' not in caplog.text
+
+
+def test_native_cost_observation_reserves_exhaustion_after_summary(
+        bundle_namespace, caplog, monkeypatch):
+    connection = _complete_owner_fixture()
+    connection.executemany("INSERT INTO backlog_bugs(bug_id,takeover_json,created_at,updated_at) "
+        "VALUES (?, ?, 'now','now')", [(str(i), '{bad CANARY') for i in range(12)])
+    connection.commit()
+    clock = [0.0]
+    monkeypatch.setattr(store.time, 'monotonic', lambda: clock[0])
+    caplog.set_level('INFO', logger=store.__name__)
+    with store._owned_reference_connection(lambda: connection):
+        first = store.snapshot_retention_reference_state(connection, PID)
+        records = _cost_observation_records(caplog)
+        assert not first['complete'] and records[-1]['cause'] == 'census_end'
+        assert len(records) == store._REFERENCE_DIAGNOSTICS - 1
+        clock[0] = 26.0
+        later = store.snapshot_retention_reference_state(connection, PID)
+        records = _cost_observation_records(caplog)
+        assert not later['complete'] and 'reference_census_budget_exhausted' in later['refusal_reasons']
+        assert len(records) == store._REFERENCE_DIAGNOSTICS
+        assert records[-1]['cause'] == 'budget_exhausted'
+        assert store._reference_budget(connection).deadline == 25
+        assert 'CANARY' not in caplog.text
 
 
 def test_nested_serialized_depth_still_refuses_sql_and_python(conn):
