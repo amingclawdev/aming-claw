@@ -2032,7 +2032,9 @@ def test_r5_owned_lane_consumer_refuses_semantic_tampering():
     assert not server._contract_runtime_finish_test_results_consumer_acceptance(original)
 
 
-def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, monkeypatch, request):
+def _exercise_finish_ledger_real_producer_premerge_and_canonical_guards(
+    tmp_path, monkeypatch, request, ledger,
+):
     # Reuse the existing owning-producer and narrow no-pass integration helpers.
     # Stop immediately after the real premerge consumer's later predicates;
     # do not replay that fixture's unrelated tamper/close campaign.
@@ -2041,7 +2043,7 @@ def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, mon
     class PremergeObserved(Exception):
         pass
     monkeypatch.setattr(api, "_complete_known_baseline_test_results",
-        lambda _results, *, runtime_context, tmp_path: _r6_owned_lane_ledger(runtime_context.base_commit))
+        lambda _results, *, runtime_context, tmp_path: ledger(runtime_context.base_commit))
     original_premerge = server._contract_runtime_mf_parallel_rev10_premerge_backlog_acceptance
     def observe(conn, *args, **kwargs):
         protected, authority = original_premerge(conn, *args, **kwargs)
@@ -2049,7 +2051,7 @@ def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, mon
         assert authority["db_verified"] is True and len(authority["workers"]) == 2
         record = server._contract_runtime_store(conn).get(kwargs["source_contract_execution_id"])
         owned_lines = [(index, line) for index, line in enumerate(record["completed_lines"])
-            if line.get("payload", {}).get("test_results", {}).get("full_suite_passed") is False]
+            if "baseline_commit" in line.get("payload", {}).get("test_results", {}).get("baseline_comparison", {})]
         assert len(owned_lines) == 3  # implementation, attestation, finish
         before = copy.deepcopy(record)
         for index, line in owned_lines:
@@ -2064,7 +2066,7 @@ def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, mon
                 allow_statusless_worker_finish_gate=line["line_id"] == "worker_finish_gate")
             assert server._contract_runtime_completed_line_acceptance(conn, **options)["db_verified"]
             mutated = copy.deepcopy(line)
-            mutated["payload"]["test_results"]["scope"] += " changed"
+            mutated["payload"]["test_results"]["extra"] = "changed"
             assert not server._contract_runtime_completed_line_acceptance(conn, **{**options, "expected_line": mutated})
             assert not server._contract_runtime_completed_line_acceptance(conn, **{
                 **options, "expected_worker_identity": {**identity, "worker_slot_id": "foreign-slot"}})
@@ -2111,6 +2113,11 @@ def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, mon
         fixture.close()
 
 
+def test_r5_owned_lane_real_producer_premerge_and_canonical_guards(tmp_path, monkeypatch, request):
+    _exercise_finish_ledger_real_producer_premerge_and_canonical_guards(
+        tmp_path, monkeypatch, request, _r6_owned_lane_ledger)
+
+
 def test_r5_owned_lane_preserves_flat_known_baseline_producer_rule(tmp_path):
     from agent.tests import test_graph_governance_api as api
     api.test_finish_no_pass_producer_matches_existing_consumer_command_rule(tmp_path)
@@ -2142,3 +2149,116 @@ def test_r5_full_suite_count_type_requires_actual_int(field, numeric_alias):
         results, expected_baseline_commit="a" * 40)
     assert results == original
     assert type(results["full_suite"][field]) is type(numeric_alias)
+
+
+def _r7_resolved_green_ledger(base_commit):
+    """Anonymous saved R7 shape, including every raw command proof field."""
+    ids = [f"tests/test_owned.py::test_owned_{index}" for index in range(3)]
+    def raw(phase, argv, passed, failed, failure_ids):
+        summary = f"{failed} failed, {passed} passed" if failed else f"{passed} passed"
+        stdout = "\n".join(f"FAILED {item} - NotImplementedError" for item in failure_ids)
+        stdout += f"\n========================= {summary} in 0.01s =========================\n"
+        return {"phase": phase, "cwd": "/fixture/worker", "command": " ".join(argv),
+            "argv": argv, "interpreter": "/fixture/env/bin/python",
+            "status": "failed" if failed else "passed", "exit_code": 1 if failed else 0,
+            "started_at": "2026-01-01T00:00:00+00:00", "completed_at": "2026-01-01T00:00:01+00:00",
+            "stdout": stdout, "stderr": "", "stdout_path": f"/fixture/evidence/{phase}.stdout.txt",
+            "stderr_path": f"/fixture/evidence/{phase}.stderr.txt", "passed_count": passed,
+            "failed_count": failed, "collected_count": passed + failed, "failed_test_ids": failure_ids}
+    argv = ["python", "-m", "pytest"]
+    baseline = raw("baseline", argv, 5, 3, ids)
+    baseline["head"] = base_commit
+    return {"status": "passed", "passed": True,
+        "commands": [raw("final-focused", argv + ["tests/test_owned.py"], 3, 0, []),
+                     raw("final-full", argv, 8, 0, [])],
+        "baseline_comparison": {"baseline_commit": base_commit, "baseline_commands": [baseline],
+            "baseline_failed_test_ids": ids, "current_failed_test_ids": [], "resolved_test_ids": ids,
+            "new_failed_test_ids": [], "inherited_dependency_failures": [],
+            "summary": "Original baseline 5 passed/3 stub failures; focused 3 and full 8 now pass."},
+        "local_precommit": {"command": "python -m agent.cli mf precommit-check --json-output",
+            "interpreter": "/fixture/env/bin/python", "cwd": "/fixture/worker", "exit_code": 0,
+            "actual_result": {"ok": True, "checks": {"plugin_update_state": {"ok": True,
+                "status": "pass", "update_status": "current", "blockers": []},
+                "route_context_consumption": {"ok": True, "status": "skipped"}}},
+            "tool_output_chunk_id": "fixture", "result_scope": "Local CLI summary only.",
+            "initial_applicability_note_correction": "Available local command executed once."},
+        "raw_test_ledgers_complete_before_immutable_commit": True}
+
+
+def test_r7_resolved_green_producer_consumer_preserves_raw_ledger():
+    results = _r7_resolved_green_ledger("a" * 40)
+    original = copy.deepcopy(results)
+    original_hash = server.stable_sha256(results)
+    acceptance = server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)
+    assert acceptance["accepted"] and acceptance["complete_resolved_green_baseline"]
+    assert not acceptance["complete_owned_lane"]
+    assert server._runtime_context_finish_no_pass_producer_accepted(
+        results, expected_baseline_commit="a" * 40)
+    server._runtime_context_require_finish_no_pass_producer(
+        results, expected_baseline_commit="a" * 40, require_complete_known_baseline=True)
+    assert not server._contract_runtime_value_reports_failed_qa(acceptance["failure_scan"])
+    assert results == original and server.stable_sha256(results) == original_hash
+    assert server._runtime_context_finish_attestation_test_results_payload(results) == original
+    # A different nested ledger cannot inherit this exact copy's scan authority.
+    changed = copy.deepcopy(results)
+    changed["independent_QA"] = {"status": "failed"}
+    outer = {"test_results": results, "nested": {"test_results": changed}}
+    scanned = server._contract_runtime_finish_test_results_failure_scan(
+        outer, canonical_test_results=results, accepted_failure_scan=acceptance["failure_scan"])
+    assert scanned["nested"]["test_results"] == changed
+    assert server._contract_runtime_value_reports_failed_qa(scanned)
+
+
+@pytest.mark.parametrize("tamper", ["wrong_base", "wrong_head", "current_failure", "new_failure",
+    "count", "bool_count", "status", "exit", "raw_ids", "resolution", "raw_summary",
+    "changed_full_command", "changed_cwd", "unrelated_qa", "nested_baseline_qa"])
+def test_r7_resolved_green_refuses_inconsistent_or_current_negative_evidence(tamper):
+    results = _r7_resolved_green_ledger("a" * 40)
+    comparison = results["baseline_comparison"]
+    baseline = comparison["baseline_commands"][0]
+    focused, full = results["commands"]
+    if tamper == "wrong_base": comparison["baseline_commit"] = "b" * 40
+    elif tamper == "wrong_head": baseline["head"] = "b" * 40
+    elif tamper == "current_failure": full.update(status="failed", exit_code=1)
+    elif tamper == "new_failure": comparison["new_failed_test_ids"] = ["tests/test_owned.py::new"]
+    elif tamper == "count": baseline["failed_count"] = 2
+    elif tamper == "bool_count": focused["failed_count"] = False
+    elif tamper == "status": baseline["status"] = "passed"
+    elif tamper == "exit": full["exit_code"] = 1
+    elif tamper == "raw_ids": baseline["failure_ids"] = ["tests/test_owned.py::foreign"]
+    elif tamper == "resolution": comparison["resolved_test_ids"] = []
+    elif tamper == "raw_summary": baseline["stdout"] = baseline["stdout"].replace("3 failed", "2 failed")
+    elif tamper == "changed_full_command": full["argv"] += ["tests/test_owned.py"]
+    elif tamper == "changed_cwd": baseline["cwd"] = "/fixture/foreign"
+    elif tamper == "unrelated_qa": results["independent_QA"] = {"status": "rejected"}
+    elif tamper == "nested_baseline_qa": baseline["independent_QA"] = {"failed_count": 1}
+    original = copy.deepcopy(results)
+    assert not server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)
+    assert not server._runtime_context_finish_no_pass_producer_accepted(
+        results, expected_baseline_commit="a" * 40)
+    assert results == original
+
+
+def test_r7_resolved_green_real_producer_finish_premerge_and_canonical_guards(tmp_path, monkeypatch, request):
+    _exercise_finish_ledger_real_producer_premerge_and_canonical_guards(
+        tmp_path, monkeypatch, request, _r7_resolved_green_ledger)
+
+
+def test_r7_resolved_green_implementation_alias_is_exact_summary_only():
+    results = _r7_resolved_green_ledger("a" * 40)
+    identity = dict(runtime_context_id="ctx", task_id="task", parent_task_id="parent",
+                    worker_id="worker", worker_slot_id="source", merge_queue_id="queue")
+    aliases = [{key: command[key] for key in ("command", "status", "exit_code", "failed_count")}
+               for command in results["commands"]]
+    line = {**identity, "stage_id": "worker_implementation", "line_id": "worker_implementation",
+        "actor_role": "mf_sub", "evidence_kind": "implementation", "line_instance_id": "runtime_context:ctx",
+        "payload": {**identity, "test_results": results, "tests": aliases}}
+    original = copy.deepcopy(line)
+    assert server._contract_runtime_worker_implementation_known_baseline_scan_candidate(
+        line, expected_worker_identity=identity, expected_baseline_commit="a" * 40)["accepted"]
+    assert line == original
+    line["payload"]["tests"][0]["failed_count"] = False
+    assert not server._contract_runtime_worker_implementation_known_baseline_scan_candidate(
+        line, expected_worker_identity=identity, expected_baseline_commit="a" * 40)

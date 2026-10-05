@@ -56206,6 +56206,7 @@ def _runtime_context_finish_no_pass_producer_accepted(
         )
         return acceptance.get("accepted") is True and (
             acceptance.get("complete_owned_lane") is True
+            or acceptance.get("complete_resolved_green_baseline") is True
         )
     if not _runtime_context_finish_no_pass_baseline_claimed(value):
         return True
@@ -148023,6 +148024,115 @@ def _contract_runtime_owned_lane_failure_scan(
     return scan
 
 
+def _contract_runtime_resolved_green_baseline_scan(
+    value: Mapping[str, Any], *, expected_baseline_commit: str,
+) -> dict[str, Any]:
+    """Classify an exact, fully resolved historical pytest observation locally.
+
+    This accepts the existing raw-command ledger, not an inherited-failure
+    claim. Only its validated baseline status/count are changed in the scan;
+    canonical evidence and unrelated nested negatives remain untouched.
+    """
+
+    comparison = value.get("baseline_comparison")
+    commands = value.get("commands")
+    if not (
+        value.get("status") == "passed" and value.get("passed") is True
+        and isinstance(comparison, Mapping)
+        and isinstance(commands, list) and len(commands) == 2
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_baseline_commit)
+        and comparison.get("baseline_commit") == expected_baseline_commit
+        and isinstance(comparison.get("baseline_commands"), list)
+        and len(comparison["baseline_commands"]) == 1
+    ):
+        return {}
+
+    def identities(raw: Any) -> set[str] | None:
+        if not (
+            isinstance(raw, list)
+            and all(isinstance(item, str) and "::" in item for item in raw)
+            and len(set(raw)) == len(raw)
+        ):
+            return None
+        return set(raw)
+
+    baseline_ids = identities(comparison.get("baseline_failed_test_ids"))
+    if not (
+        baseline_ids
+        and identities(comparison.get("resolved_test_ids")) == baseline_ids
+        and comparison.get("current_failed_test_ids") == []
+        and comparison.get("new_failed_test_ids") == []
+        and comparison.get("inherited_dependency_failures") == []
+    ):
+        return {}
+
+    def command_valid(command: Any, *, phase: str, failures: set[str]) -> bool:
+        if not isinstance(command, Mapping):
+            return False
+        counts = [command.get(field) for field in
+                  ("passed_count", "failed_count", "collected_count")]
+        if not all(type(count) is int and count >= 0 for count in counts):
+            return False
+        passed, failed, collected = counts
+        argv = command.get("argv")
+        stdout = command.get("stdout")
+        if not (
+            command.get("phase") == phase
+            and command.get("status") == ("failed" if failures else "passed")
+            and type(command.get("exit_code")) is int
+            and command["exit_code"] == (1 if failures else 0)
+            and failed == len(failures) and collected == passed + failed
+            and collected > 0
+            and identities(command.get("failed_test_ids")) == failures
+            and isinstance(argv, list) and argv
+            and all(isinstance(arg, str) and arg for arg in argv)
+            and command.get("command") == " ".join(argv)
+            and str(command.get("cwd") or "").strip()
+            and isinstance(stdout, str) and stdout
+            and command.get("stderr") == ""
+        ):
+            return False
+        # Preserve optional raw aliases, but refuse conflicting identities.
+        if any(
+            field in command and identities(command[field]) != failures
+            for field in ("failure_ids", "failure_identities")
+        ):
+            return False
+        summaries = re.findall(r"=+\s*(.*?)\s+in\s+[\d.]+s\s*=+", stdout)
+        if not summaries:
+            return False
+        observed = dict((label, int(count)) for count, label in
+                        re.findall(r"(\d+) (passed|failed|errors?)", summaries[-1]))
+        return (
+            observed.get("passed", 0) == passed
+            and observed.get("failed", 0) == failed
+            and not observed.get("error", 0) and not observed.get("errors", 0)
+            and set(re.findall(r"(?m)^FAILED (\S+::\S+)", stdout)) == failures
+        )
+
+    baseline = comparison["baseline_commands"][0]
+    focused, full = commands
+    if not (
+        command_valid(baseline, phase="baseline", failures=baseline_ids)
+        and baseline.get("head") == expected_baseline_commit
+        and command_valid(focused, phase="final-focused", failures=set())
+        and command_valid(full, phase="final-full", failures=set())
+        and baseline["argv"] == full["argv"]
+        and baseline["cwd"] == focused["cwd"] == full["cwd"]
+        and baseline["collected_count"] == full["collected_count"]
+        and full["passed_count"] == baseline["passed_count"] + len(baseline_ids)
+        and focused["passed_count"] >= len(baseline_ids)
+        and focused["passed_count"] <= full["passed_count"]
+        and {item.split("::", 1)[0] for item in baseline_ids} <= set(focused["argv"])
+    ):
+        return {}
+    scan = deepcopy(dict(value))
+    historical = scan["baseline_comparison"]["baseline_commands"][0]
+    historical["status"] = "baseline_observation"
+    historical["historical_failed_count"] = historical.pop("failed_count")
+    return scan
+
+
 def _contract_runtime_finish_test_results_consumer_acceptance(
     value: Any,
     *,
@@ -148036,7 +148146,16 @@ def _contract_runtime_finish_test_results_consumer_acceptance(
     failure_scan = deepcopy(results)
     complete_known_baseline = False
     complete_owned_lane = False
-    if _runtime_context_finish_owned_lane_claimed(results):
+    complete_resolved_green_baseline = False
+    comparison = results.get("baseline_comparison")
+    if isinstance(comparison, Mapping) and "baseline_commands" in comparison:
+        failure_scan = _contract_runtime_resolved_green_baseline_scan(
+            results, expected_baseline_commit=expected_baseline_commit,
+        )
+        if not failure_scan:
+            return {}
+        complete_resolved_green_baseline = True
+    elif _runtime_context_finish_owned_lane_claimed(results):
         failure_scan = _contract_runtime_owned_lane_failure_scan(
             results, expected_baseline_commit=expected_baseline_commit,
         )
@@ -148120,6 +148239,7 @@ def _contract_runtime_finish_test_results_consumer_acceptance(
         "accepted": True,
         "complete_known_baseline": complete_known_baseline,
         "complete_owned_lane": complete_owned_lane,
+        "complete_resolved_green_baseline": complete_resolved_green_baseline,
         "failure_scan": failure_scan,
     }
 
@@ -148217,10 +148337,23 @@ def _contract_runtime_worker_implementation_known_baseline_scan_candidate(
         and (
             acceptance.get("complete_known_baseline") is True
             or acceptance.get("complete_owned_lane") is True
+            or acceptance.get("complete_resolved_green_baseline") is True
         )
         and isinstance(commands, list)
         and isinstance(tests_alias, list)
-        and stable_sha256(tests_alias) == stable_sha256(commands)
+        and (
+            stable_sha256(tests_alias) == stable_sha256(commands)
+            or acceptance.get("complete_resolved_green_baseline") is True
+            and len(tests_alias) == len(commands)
+            and all(
+                isinstance(alias, Mapping)
+                and all(field in alias for field in ("command", "status"))
+                and set(alias) <= set(command)
+                and stable_sha256(alias)
+                == stable_sha256({field: command[field] for field in alias})
+                for alias, command in zip(tests_alias, commands)
+            )
+        )
         and (
             "test_results" not in line
             or (
@@ -148502,9 +148635,13 @@ def _contract_runtime_completed_line_acceptance(
                 == str(expected[field]).strip()
                 for source in (canonical_line, payload) for field in fields
             )
-            and _contract_runtime_finish_test_results_consumer_acceptance(
+            and (acceptance := _contract_runtime_finish_test_results_consumer_acceptance(
                 owned_results, expected_baseline_commit=expected_baseline_commit,
-            ).get("complete_owned_lane") is True
+            )).get("accepted") is True
+            and (
+                acceptance.get("complete_owned_lane") is True
+                or acceptance.get("complete_resolved_green_baseline") is True
+            )
         ):
             return {}
     canonical_no_pass_exception = (
