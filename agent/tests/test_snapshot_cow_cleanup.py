@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from contextlib import nullcontext
 
 import pytest
 
@@ -160,6 +161,121 @@ def test_owned_connection_cow_census_retains_refusals(cow_fixture, refusal):
         assert not budget.active and not reader.in_transaction
         assert reader.total_changes == changes
         assert reader.execute("PRAGMA busy_timeout").fetchone()[0] == busy
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_legacy_pin_inventory_discards_only_unrelated_aggregate_text(cow_fixture, owned):
+    conn, root, _base, _config, _archive = cow_fixture
+    original_pins = cow._live_pins(conn, "proj")
+    text = "unrelated operational prose " * 350
+    assert len(text.encode()) * 128 > cow.MAX_JSON_BYTES
+    conn.executemany(
+        "INSERT INTO backlog_bugs(bug_id,status,details_md,created_at,updated_at) "
+        "VALUES(?,'OPEN',?,'2026','2026')",
+        [(f"unrelated-{n}", text) for n in range(128)])
+    conn.commit()
+    before = hashlib.sha256(conn.serialize()).hexdigest()
+    database = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+
+    def factory():
+        reader = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+        reader.row_factory = sqlite3.Row
+        reader.execute("PRAGMA query_only=ON")
+        return reader
+
+    context = snapshots._owned_reference_connection(factory) if owned else nullcontext(conn)
+    with context as reader:
+        changes = reader.total_changes
+        pins = cow._live_pins(reader, "proj")
+        assert pins == original_pins
+        cow._eligible(reader, "proj", "full-old", pins)
+        assert reader.total_changes == changes
+        assert len(cleanup.build_stale_artifact_cleanup_projection(
+            reader, "proj", repo_root_path=root, dimension=cow.DIMENSION)["candidates"]) == 2
+    assert before == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+@pytest.mark.parametrize("form", ["scalar", "prose", "path", "json", "escaped_path", "nested_json", "future_column"])
+def test_legacy_pin_inventory_preserves_complete_row_and_decoded_matches(cow_fixture, form):
+    conn, _root, base, *_ = cow_fixture
+    field = "details_md"
+    value = "full-old"
+    if form == "prose":
+        value = "prefix/full-old/suffix with surrounding prose"
+    elif form == "path":
+        value = str(base / "graph.json")
+    elif form in {"json", "escaped_path", "nested_json"}:
+        field = "takeover_json"
+        value = json.dumps({"snapshot_path": str(base)})
+        if form == "escaped_path":
+            value = value.replace("/", "\\/")
+        elif form == "nested_json":
+            value = json.dumps({"serialized": value})
+    elif form == "future_column":
+        field = "future_snapshot_note"
+        conn.execute("ALTER TABLE backlog_bugs ADD COLUMN future_snapshot_note TEXT")
+    conn.execute(
+        f"INSERT INTO backlog_bugs(bug_id,status,{field},created_at,updated_at) "
+        "VALUES('legacy-positive','unknown',?,'2026','2026')", (value,))
+    conn.commit()
+    changes = conn.total_changes
+    pins = cow._live_pins(conn, "proj")
+    assert "full-old" in pins
+    with pytest.raises(cow.CowRefusal, match="cow_snapshot_live_or_retained"):
+        cow._eligible(conn, "proj", "full-old", pins)
+    assert conn.total_changes == changes
+
+
+@pytest.mark.parametrize("payload,reason", [
+    ("{broken", "cow_live_payload_malformed:backlog_bugs"),
+    (sqlite3.Binary(b'{}'), "cow_live_payload_unbounded:backlog_bugs"),
+    (json.dumps({"large": "x" * (1024 * 1024)}), "cow_live_payload_unbounded:backlog_bugs"),
+])
+def test_legacy_pin_inventory_keeps_perfield_refusals(cow_fixture, payload, reason):
+    conn = cow_fixture[0]
+    conn.execute("INSERT INTO backlog_bugs(bug_id,status,takeover_json,created_at,updated_at) "
+                 "VALUES('invalid-live','OPEN',?,'2026','2026')", (payload,))
+    conn.commit()
+    changes = conn.total_changes
+    with pytest.raises(cow.CowRefusal, match=reason):
+        cow._live_pins(conn, "proj")
+    assert conn.total_changes == changes
+
+
+def test_legacy_pin_inventory_keeps_individual_row_and_real_pin_byte_caps(cow_fixture):
+    conn = cow_fixture[0]
+    conn.execute("INSERT INTO backlog_bugs(bug_id,status,details_md,created_at,updated_at) "
+                 "VALUES('oversized-row','OPEN',?,'2026','2026')", ("x" * (cow.MAX_JSON_BYTES + 1),))
+    conn.commit()
+    with pytest.raises(cow.CowRefusal, match="cow_reference_census_refused"):
+        cow._live_pins(conn, "proj")
+    # SQLite page transfer is below1MiB, but legacy JSON escaping expands this
+    # individual row beyond1MiB. Preserve that original row-body refusal too.
+    conn.execute("UPDATE backlog_bugs SET details_md=? WHERE bug_id='oversized-row'", ("雪" * 175000,))
+    conn.commit()
+    with pytest.raises(cow.CowRefusal, match="cow_live_census_unbounded"):
+        cow._live_pins(conn, "proj")
+    conn.execute("UPDATE backlog_bugs SET details_md='' WHERE bug_id='oversized-row'")
+    # These are actual reference IDs, not unrelated serialized prose. Keep the
+    # original aggregate pin-byte cap even when their count is below2000.
+    conn.executemany(
+        "INSERT INTO graph_snapshot_refs(project_id,ref_name,snapshot_id,updated_at,commit_sha) "
+        "VALUES('proj',?,?,'2020','fixture')",
+        [(f"large-pin-{n}", f"actual-ref-{n}-" + "z" * 1050) for n in range(1000)])
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM graph_snapshot_refs").fetchone()[0] < cow.MAX_LIVE_ROWS
+    with pytest.raises(cow.CowRefusal, match="cow_live_census_unbounded"):
+        cow._live_pins(conn, "proj")
+
+
+def test_legacy_pin_inventory_keeps_real_live_row_cap(cow_fixture):
+    conn = cow_fixture[0]
+    conn.executemany(
+        "INSERT INTO backlog_bugs(bug_id,status,created_at,updated_at) "
+        "VALUES(?,'OPEN','2026','2026')", [(f"row-{n}",) for n in range(cow.MAX_LIVE_ROWS + 1)])
+    conn.commit()
+    with pytest.raises(cow.CowRefusal, match="cow_live_window_unbounded:backlog_bugs"):
+        cow._live_pins(conn, "proj")
 
 
 @pytest.mark.parametrize("declared_type,payload", [

@@ -408,6 +408,8 @@ def _live_pins_in_snapshot(conn: sqlite3.Connection, project_id: str) -> set[str
     known_ids = {str(r[0]) for r in conn.execute(
         "SELECT snapshot_id FROM graph_snapshots WHERE project_id=?", (project_id,))}
     reference_tokens = snapshots._snapshot_reference_tokens(conn, project_id, known_ids)
+    # The native token builder has already bounded/validated this ID inventory.
+    legacy_tokens = [(sid, str(snapshots._snapshot_root(project_id, sid))) for sid in known_ids]
     if "graph_semantic_projections" in names:
         if not {"project_id", "snapshot_id", "status", "projection_json"} <= cleanup._table_columns(conn, "graph_semantic_projections"):
             raise CowRefusal("cow_semantic_projection_schema_incomplete")
@@ -565,8 +567,15 @@ def _live_pins_in_snapshot(conn: sqlite3.Connection, project_id: str) -> set[str
                     except (ValueError, RecursionError) as exc:
                         raise CowRefusal("cow_live_payload_unbounded:" + table,
                             {**metadata, "cause": "typed_projection_incomplete", "complete": False}) from exc
-            # Keep exact IDs/paths in a bounded typed inventory for per-item matching.
-            pins.add(json.dumps(value, sort_keys=True, default=str))
+            # Preserve complete-row ID/path substring matching, retaining only
+            # matched identities rather than every unrelated serialized body.
+            serialized = json.dumps(value, sort_keys=True, default=str)
+            if len(serialized.encode('utf-8')) > MAX_JSON_BYTES:
+                raise CowRefusal("cow_live_census_unbounded")
+            for sid, root in legacy_tokens:
+                snapshots._reference_checkpoint(conn)
+                if sid in serialized or root in serialized:
+                    pins.add(sid)
             if len(pins) > snapshots._REFERENCE_MAX_ROWS or sum(
                     len(pin.encode('utf-8')) for pin in pins) > MAX_JSON_BYTES:
                 raise CowRefusal("cow_live_census_unbounded")
