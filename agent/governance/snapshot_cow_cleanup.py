@@ -323,9 +323,11 @@ def _custody(conn: sqlite3.Connection, project_id: str, root: Path) -> dict[str,
 
 
 def _live_pins(conn: sqlite3.Connection, project_id: str) -> set[str]:
+    budget = snapshots._reference_budget(conn)
     try:
-        with snapshots._reference_read_snapshot(conn):
-            return _live_pins_in_snapshot(conn, project_id)
+        with budget.census() if budget else snapshots._unbudgeted_reference_census():
+            with snapshots._reference_read_snapshot(conn):
+                return _live_pins_in_snapshot(conn, project_id)
     except (ValueError, sqlite3.Error) as exc:
         if isinstance(exc, CowRefusal):
             raise

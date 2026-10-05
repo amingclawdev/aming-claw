@@ -88,6 +88,80 @@ def preview(fixture):
                                                           dimension=cow.DIMENSION)
 
 
+@pytest.mark.parametrize("nested_snapshot", [False, True])
+def test_owned_connection_cow_preview_initializes_shared_census(cow_fixture, nested_snapshot):
+    fixture_conn, root, *_ = cow_fixture
+    database = Path(fixture_conn.execute("PRAGMA database_list").fetchone()[2])
+
+    def factory():
+        reader = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+        reader.row_factory = sqlite3.Row
+        reader.execute("PRAGMA query_only=ON")
+        return reader
+
+    with snapshots._owned_reference_connection(factory) as reader:
+        budget = snapshots._reference_budget(reader)
+        assert budget.deadline is None
+        changes = reader.total_changes
+        busy = reader.execute("PRAGMA busy_timeout").fetchone()[0]
+
+        def check_preview():
+            plan = cleanup.build_stale_artifact_cleanup_projection(
+                reader, "proj", repo_root_path=root, dimension=cow.DIMENSION)
+            assert len(plan["candidates"]) == 2 and plan["writes_performed"] is False
+            assert budget.deadline is not None and not budget.active
+            deadline = budget.deadline
+            pins = cow._live_pins(reader, "proj")
+            assert "full-active" in pins and "full-old" not in pins
+            assert budget.deadline == deadline and not budget.active
+            assert reader.total_changes == changes
+            assert reader.execute("PRAGMA busy_timeout").fetchone()[0] == busy
+
+        if nested_snapshot:
+            with snapshots._reference_read_snapshot(reader):
+                check_preview()
+                assert reader.in_transaction
+        else:
+            check_preview()
+        assert not reader.in_transaction
+    with pytest.raises(sqlite3.ProgrammingError):
+        reader.execute("SELECT 1")
+
+
+@pytest.mark.parametrize("refusal", ["deadline", "row_limit"])
+def test_owned_connection_cow_census_retains_refusals(cow_fixture, refusal):
+    fixture_conn, _root, *_ = cow_fixture
+    if refusal == "row_limit":
+        fixture_conn.executemany(
+            "INSERT INTO graph_snapshot_refs(project_id,ref_name,snapshot_id,updated_at,commit_sha) "
+            "VALUES('proj',?,'full-old','2020','fixture')",
+            [(f"bounded-{n}",) for n in range(cow.MAX_LIVE_ROWS)])
+        fixture_conn.commit()
+    database = Path(fixture_conn.execute("PRAGMA database_list").fetchone()[2])
+
+    def factory():
+        reader = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+        reader.row_factory = sqlite3.Row
+        reader.execute("PRAGMA query_only=ON")
+        return reader
+
+    with snapshots._owned_reference_connection(factory) as reader:
+        budget = snapshots._reference_budget(reader)
+        if refusal == "deadline":
+            budget.deadline = snapshots.time.monotonic() - 1
+        changes = reader.total_changes
+        busy = reader.execute("PRAGMA busy_timeout").fetchone()[0]
+        expected = "cow_reference_census_refused" if refusal == "deadline" else "cow_ref_window_unbounded"
+        with pytest.raises(cow.CowRefusal, match=expected) as caught:
+            cow._live_pins(reader, "proj")
+        if refusal == "deadline":
+            assert caught.value.metadata["cause"] == "reference_census_budget_exhausted"
+            assert budget.exhausted
+        assert not budget.active and not reader.in_transaction
+        assert reader.total_changes == changes
+        assert reader.execute("PRAGMA busy_timeout").fetchone()[0] == busy
+
+
 @pytest.mark.parametrize("declared_type,payload", [
     ("BLOB", sqlite3.Binary(b'{"snapshot_id":"scope-opaque-reference"}')),
     ("BLOB", sqlite3.Binary(b'\x00\xffopaque-owner')),
