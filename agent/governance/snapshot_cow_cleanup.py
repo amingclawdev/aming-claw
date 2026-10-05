@@ -234,8 +234,31 @@ def _bounded_metadata(path: Path, *, directory: bool):
     try:
         # Exact current interpreter and principal. No shell, identity override,
         # governance imports, credential environment, DB or mutation command.
-        with _METADATA_HELPER.open("rb") as source:
-            worker_source = source.read(_METADATA_SOURCE_BYTES + 1)
+        if not all(hasattr(os, flag) for flag in ("O_NONBLOCK", "O_NOFOLLOW")):
+            raise CowRefusal("cow_metadata_source_facility_unsupported")
+        try:
+            descriptor = os.open(_METADATA_HELPER, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
+                raise CowRefusal("cow_metadata_helper_source_drift") from exc
+            raise
+        try:
+            source_info = os.fstat(descriptor)
+            if not stat.S_ISREG(source_info.st_mode) or source_info.st_size > _METADATA_SOURCE_BYTES:
+                raise CowRefusal("cow_metadata_helper_source_drift")
+            chunks = []
+            source_size = 0
+            while source_size <= _METADATA_SOURCE_BYTES:
+                if _metadata_clock() >= deadline:
+                    raise CowRefusal("cow_metadata_timeout")
+                chunk = os.read(descriptor, _METADATA_SOURCE_BYTES + 1 - source_size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                source_size += len(chunk)
+            worker_source = b"".join(chunks)
+        finally:
+            os.close(descriptor)
         if (len(worker_source) > _METADATA_SOURCE_BYTES
                 or hashlib.sha256(worker_source).hexdigest() != _METADATA_HELPER_SHA256):
             raise CowRefusal("cow_metadata_helper_source_drift")

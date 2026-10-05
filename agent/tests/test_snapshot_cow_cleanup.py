@@ -1587,6 +1587,9 @@ def test_bounded_metadata_reply_typed_shape_is_fail_closed(tmp_path, monkeypatch
 
 def test_bounded_metadata_exact_native_xattr_acl_fidelity_and_identity(tmp_path, monkeypatch):
     from agent.governance import snapshot_cow_metadata as worker
+    if sys.platform != "darwin" and not all(hasattr(os, name) for name in ("setxattr", "listxattr", "getxattr")):
+        pytest.skip("native metadata fidelity needs supported xattr facilities")
+    attr_name = "org.aming-claw.binary-test" if sys.platform == "darwin" else "user.org.aming-claw.binary-test"
     path = tmp_path / "payload"
     path.write_bytes(b"native local fixture")
     os.chmod(path, 0o640)
@@ -1595,10 +1598,15 @@ def test_bounded_metadata_exact_native_xattr_acl_fidelity_and_identity(tmp_path,
         worker._call("setxattr", ctypes.c_int,
                      [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
                       ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int],
-                     os.fsencode(path), b"org.aming-claw.binary-test",
+                     os.fsencode(path), os.fsencode(attr_name),
                      ctypes.create_string_buffer(b"\x00\xff\x01"), 3, 0, 0x41)
     else:
-        os.setxattr(path, "org.aming-claw.binary-test", b"\x00\xff\x01", follow_symlinks=False)
+        try:
+            os.setxattr(path, attr_name, b"\x00\xff\x01", follow_symlinks=False)
+        except OSError as exc:
+            if exc.errno in (cow.errno.ENOTSUP, cow.errno.ENOSYS):
+                pytest.skip("fixture filesystem lacks native xattr facilities")
+            raise
     if sys.platform == "darwin":
         subprocess.run(["/bin/chmod", "+a", "everyone allow read", str(path)], check=True)
     info = path.lstat()
@@ -1608,7 +1616,7 @@ def test_bounded_metadata_exact_native_xattr_acl_fidelity_and_identity(tmp_path,
     assert actual["ino"] == info.st_ino and actual["dev"] == info.st_dev
     assert actual["mode"] == 0o640 and actual["mtime_ns"] == 24_000_000_000
     assert actual["xattrs"] == worker._xattrs(path)
-    assert actual["xattrs"]["org.aming-claw.binary-test"] == "00ff01"
+    assert actual["xattrs"][attr_name] == "00ff01"
     if sys.platform == "darwin":
         assert "everyone" in actual["acl"] and "read" in actual["acl"]
     assert cow._xattrs(path) == actual["xattrs"]
@@ -1853,4 +1861,55 @@ def test_bounded_metadata_executes_verified_source_bytes_not_reopened_file(tmp_p
         return original(argv, **kwargs)
     monkeypatch.setattr(subprocess, "Popen", replace_after_check)
     assert cow._metadata(path) == expected
+    assert not cow._METADATA_UNREAPED
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="private POSIX special-file fixture")
+@pytest.mark.parametrize("kind", ["fifo", "symlink", "directory"])
+def test_bounded_metadata_helper_source_nonregular_refuses_without_launch(tmp_path, monkeypatch, kind):
+    import time
+    path = tmp_path / "payload"
+    path.write_bytes(b"private metadata source fixture")
+    helper = tmp_path / "source"
+    if kind == "fifo":
+        os.mkfifo(helper)
+    elif kind == "symlink":
+        helper.symlink_to(cow._METADATA_HELPER)
+    else:
+        helper.mkdir()
+    if kind == "fifo":
+        # Keep this regression itself bounded even against the old blocking code.
+        code = ("import json,time; from pathlib import Path; "
+                "from agent.governance import snapshot_cow_cleanup as cow; "
+                "cow._METADATA_SECONDS=0.03; cow._METADATA_HELPER=Path(" + repr(str(helper)) + "); "
+                "began=time.monotonic(); "
+                "\ntry:\n cow._metadata(Path(" + repr(str(path)) + "))"
+                "\nexcept cow.CowRefusal as exc:\n print(json.dumps({'reason':str(exc),'elapsed':time.monotonic()-began,'helpers':len(cow._METADATA_UNREAPED)}))")
+        process = subprocess.Popen([sys.executable, "-B", "-c", code],
+                                   cwd=Path(cow.__file__).resolve().parents[2],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            try:
+                out, error = process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill(); process.wait(timeout=0.5)
+                pytest.fail("helper source FIFO trapped the parent")
+            assert process.returncode == 0 and not error
+            value = json.loads(out)
+            assert value['reason'] == 'cow_metadata_helper_source_drift'
+            assert value['elapsed'] < 0.3 and value['helpers'] == 0
+        finally:
+            if process.poll() is None:
+                process.kill(); process.wait(timeout=0.5)
+            process.stdout.close(); process.stderr.close()
+        return
+    monkeypatch.setattr(cow, "_METADATA_HELPER", helper)
+    monkeypatch.setattr(cow, "_METADATA_SECONDS", 0.03)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("nonregular/aliased helper must never launch")
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    began = time.monotonic()
+    with pytest.raises(cow.CowRefusal, match="cow_metadata_helper_source_drift"):
+        cow._metadata(path)
+    assert time.monotonic() - began < 0.3
     assert not cow._METADATA_UNREAPED
