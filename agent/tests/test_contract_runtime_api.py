@@ -669,12 +669,14 @@ def test_native_event_shared_batch_archived_dispatch_shape(tmp_path, monkeypatch
     from pathlib import Path
 
     archive = os.environ.get("AC_NATIVE_READER_R7_ARCHIVE")
-    if not archive:
-        pytest.skip("requires read-only original R7 archived full readbacks")
-    name = ("Models", "Planner")[child_index]
-    archived = json.loads((Path(archive) / f"{name}-final-own-full-current-readback.json").read_text())
-    original_dispatch = archived["runtime_guide"]["completed_lines"][1]
-    assert archived["runtime_guide"]["completed_lines"][10]["line_id"] == "observer_reconcile"
+    if archive:
+        name = ("Models", "Planner")[child_index]
+        archived = json.loads((Path(archive) / f"{name}-final-own-full-current-readback.json").read_text())
+        original_dispatch = archived["runtime_guide"]["completed_lines"][1]
+        assert archived["runtime_guide"]["completed_lines"][10]["line_id"] == "observer_reconcile"
+    else:
+        original_dispatch = {"payload": {"ordinary_metadata":
+            (f"child {child_index}: bounded worker contract metadata; " * 400)}}
     conn, world, batch, connection, _parent = _native_shared_batch_fixture(tmp_path, monkeypatch)
     execution = batch._BATCH_QA_CHILD_EXECUTIONS[child_index]
     try:
