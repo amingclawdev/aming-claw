@@ -96,6 +96,13 @@ def _read_shared_batch_event(conn, *, source_record, recorded, claim, authority,
             and _mapping(_mapping(binding).get("receipt")) != claim):
         return refusal("native_event_association_invalid")
     child_scope = {key: authority.get(key) for key in (*SCOPE_FIELDS, "contract_execution_id")}
+    selected_line = source_record["completed_lines"][
+        recorded["recorded_line"]["source_completed_line_index"]]
+    # A coherent line digest does not prove that its own scope belongs to the
+    # child whose original receipt the durable authority just verified.
+    if any(selected_line.get(key) != child_scope[key]
+            for key in ("task_id", "runtime_context_id", "parent_task_id")):
+        return refusal("native_event_association_invalid")
     source_scope = {"project_id": event.get("project_id"),
         "backlog_id": event.get("backlog_id"), "task_id": event.get("task_id")}
     if not (_public_scope(child_scope) and _public_scope(source_scope)
