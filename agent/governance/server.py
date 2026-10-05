@@ -127461,6 +127461,58 @@ def _contract_runtime_recorded_line_wire_response(response: dict[str, Any]) -> d
     return response
 
 
+def _contract_runtime_native_event_shared_batch_binding(
+    conn, *, source_record: Mapping[str, Any], authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recompute the native reader's child binding through existing authority.
+
+    The selected immutable receipt is only an address. Current durable merge,
+    dispatch, epoch, queue, native provenance and HEAD must still qualify.
+    """
+    from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+
+    project_id = str(source_record.get("project_id") or "")
+    context = get_branch_context_by_runtime_context_id(
+        conn, project_id, str(authority.get("runtime_context_id") or "")
+    )
+    if context is None:
+        return {}
+    # The existing matcher defines admission; count its exact matches rather
+    # than allowing its first-match projection to hide a duplicate dispatch.
+    matches = []
+    for index, line in _contract_runtime_completed_lines(source_record):
+        match = _contract_runtime_dispatch_line_match(
+            {**source_record, "completed_lines": [line]}, context
+        )
+        if match:
+            match["line_index"] = index
+            match["source_ref"] = (
+                f"contract_runtime:{source_record['contract_execution_id']}:"
+                f"completed_lines:{index}"
+            )
+            matches.append(match)
+    if len(matches) != 1 or not _contract_runtime_verified_dispatch_lineage(
+        source_record, context, matches[0]
+    ):
+        return {}
+    receipt = _contract_runtime_reconcile_record_authority(
+        conn, project_id=project_id, record=source_record
+    )
+    terminal = receipt.get("terminal_current_full_reconcile_authority")
+    if not isinstance(terminal, Mapping):
+        return {}
+    recomputed = _contract_runtime_shared_batch_reconcile_authority(
+        conn, project_id=project_id, record=source_record, context=context,
+        merge=terminal, allow_postmerge_qa_admission=True,
+    )
+    if not recomputed or any(
+        terminal.get(key) != value for key, value in recomputed.items()
+        if key != "authority_hash"
+    ):
+        return {}
+    return {"authority": dict(terminal), "receipt": receipt, "dispatch": matches[0]}
+
+
 def _contract_runtime_recorded_line_response(
     source_record: Mapping[str, Any], record: Mapping[str, Any],
     native_response: Mapping[str, Any], *, selector: Mapping[str, Any],
@@ -240388,7 +240440,10 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             if response_view == "native_event":
                 from .native_event_provenance import read_native_event
                 observed = read_native_event(conn, source_record=source_record,
-                    recorded=observed, selector=ctx.query, actor_role=actor_role)
+                    recorded=observed, selector=ctx.query, actor_role=actor_role,
+                    shared_batch_reader=lambda authority:
+                        _contract_runtime_native_event_shared_batch_binding(
+                            conn, source_record=source_record, authority=authority))
             # All proof assembly precedes the routine's existing commit/close.
             conn.commit()
             return observed
