@@ -265,6 +265,378 @@ def test_native_event_http_final_wire_cap():
     assert json.loads(handler.wfile.getvalue())["error"] == "native_event_wire_unbounded"
 
 
+def _native_shared_batch_fixture(tmp_path, monkeypatch, *, parent_alias="enter"):
+    """Reuse the durable two-child world; only adapt native writer input.
+
+    Authority producers, immutable CAS revisions, dispatch matching, epoch,
+    queue, current HEAD and snapshot checks all run as shipped.
+    """
+    from agent.tests import test_graph_governance_api as batch
+    connection = batch._isolated_api_connection(tmp_path, monkeypatch)
+    conn = next(connection)
+    writer = graph_snapshot_store.record_current_full_reconcile_provenance
+    parent = {"enter": batch._BATCH_QA_ENTER_TASK_ID,
+              "epoch": batch._BATCH_QA_EPOCH_ID + ":final-reconcile",
+              "batch": batch._BATCH_QA_BATCH_ID}[parent_alias]
+
+    def native_writer(actual, **kwargs):
+        event = dict(actual.execute("SELECT * FROM task_timeline_events WHERE id=?",
+            (kwargs["reconcile_event_id"],)).fetchone())
+        payload = json.loads(event["payload_json"])
+        payload.update(snapshot_id=kwargs["snapshot_id"], target_commit_sha=kwargs["target_commit_sha"])
+        actual.execute("UPDATE task_timeline_events SET task_id=?,payload_json=? WHERE id=?",
+            (parent, json.dumps(payload), event["id"]))
+        route = copy.deepcopy(kwargs["route_evidence"])
+        for key in ("route_token_scope", "idempotency_scope"):
+            route[key]["task_id"] = parent
+        return writer(actual, **{**kwargs, "route_evidence": route})
+
+    with monkeypatch.context() as setup:
+        setup.setattr(graph_snapshot_store, "record_current_full_reconcile_provenance", native_writer)
+        world = batch._mf_batch_child_postmerge_qa_world(conn, tmp_path, monkeypatch)
+    assert all(record["execution_state_revision"] == 12 for record in world.records)
+    assert all(record["completed_lines"][10]["line_id"] == "observer_reconcile"
+               for record in world.records)
+    for record in world.records:
+        original = record["completed_lines"][10]["payload"]["reconcile_authority"]
+        assert original["current_full_reconcile_activation_verified"] is True
+        terminal = original["terminal_current_full_reconcile_authority"]
+        shared = terminal["shared_batch_reconcile_authority"]
+        assert shared["authority_purpose"] == "postmerge_qa_admission"
+        assert shared["all_children_contract_qa_verified"] is False
+        assert shared["current_child_contract_qa_verified"] is False
+        assert shared["final_qa_required_for_current_child"] is True
+        assert terminal["close_satisfying"] is False
+    return conn, world, batch, connection, parent
+
+
+def _native_batch_request(batch, execution, query):
+    return server.RequestContext(None, "GET",
+        {"project_id": batch.PID, "contract_execution_id": execution},
+        query, {}, "req-333333333333", "", "")
+
+
+def _native_batch_selector(batch, execution, event_id):
+    current = server.handle_project_contract_runtime_current_state(
+        _native_batch_request(batch, execution, {"response_view": "coordinator_current"}))
+    assert current["ok"] is True, current
+    return {"response_view": "native_event", "backlog_id": current["backlog_id"],
+        "contract_revision_id": current["contract_revision_id"],
+        "contract_hash": current["contract_hash"],
+        "execution_state_revision": str(current["execution_state_revision"]),
+        "execution_state_hash": current["execution_state_hash"],
+        "source_completed_line_index": "10", "source_event_id": str(event_id)}
+
+
+def _native_batch_http(batch, execution, query):
+    """Exercise the registered GET, RequestContext, handler and final serializer.
+
+    The real HTTP handler runs on the SQLite owner's thread. A client thread
+    connects only to this temporary test listener; no runtime is started.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from http.server import HTTPServer
+    from urllib.parse import urlencode
+    from urllib.request import urlopen
+
+    with HTTPServer(("127.0.0.1", 0), server.GovernanceHandler) as listener:
+        listener.timeout = 5
+        url = (f"http://127.0.0.1:{listener.server_port}/api/projects/{batch.PID}/"
+               f"contract-runtime/{execution}/current-state?" + urlencode(query))
+        def get():
+            with urlopen(url, timeout=5) as response:
+                return response.status, response.read()
+        with ThreadPoolExecutor(max_workers=1) as client:
+            result = client.submit(get)
+            listener.handle_request()
+            status, raw = result.result(timeout=5)
+    assert status == 200
+    assert len(raw) <= 16384
+    return json.loads(raw)
+
+
+def _native_batch_read_without_writes(conn, read):
+    before = ("\n".join(conn.iterdump()), conn.total_changes)
+    result = read()
+    assert ("\n".join(conn.iterdump()), conn.total_changes) == before
+    return result
+
+
+def _native_wire_hash(value):
+    import hashlib
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+_NATIVE_ASSOCIATION_KEYS = frozenset("""
+    schema_version source_of_authority authority_purpose batch_id epoch_id
+    merge_queue_id queue_item_id target_commit snapshot_id provenance_id provenance_hash
+    source_event_id source_event_hash source_event_time source_scope queried_child_scope
+    child_dispatch_scope child_dispatch_ref child_dispatch_hash epoch_hash ordered_queue_hash
+    shared_authority_hash terminal_authority_hash queried_binding_hash recorded_line_hash
+    all_children_contract_qa_verified current_child_contract_qa_verified
+    final_qa_required_for_current_child close_satisfying association_hash
+""".split())
+_NATIVE_CHILD_SCOPE_KEYS = frozenset("""
+    project_id backlog_id contract_execution_id task_id parent_task_id runtime_context_id merge_queue_id
+""".split())
+_NATIVE_SHARED_ENVELOPE_KEYS = frozenset("""
+    absence actor_role association backlog_id contract_execution_id contract_hash
+    contract_id contract_revision_id direction_authority effect_authority error
+    execution execution_state_hash execution_state_revision formal_position
+    formal_position_authority formal_world formal_world_authority generation
+    native_event observation_only ok project_id proof_variant recorded_line
+    request_id response_view runtime_guide_hash schema_version source_of_authority
+""".split())
+_NATIVE_SHARED_EVENT_KEYS = frozenset("""
+    binding_hash binding_locator digest_convention event_family event_type
+    occurred_at runtime_scope source_event_hash source_event_id source_locator
+    source_scope timestamp_provenance
+""".split())
+
+
+@pytest.mark.parametrize("parent_alias", ["enter", "epoch", "batch"])
+@pytest.mark.parametrize("closed", [False, True])
+def test_native_event_shared_batch_frozen_wire_for_both_children(tmp_path, monkeypatch, parent_alias, closed):
+    conn, world, batch, connection, parent = _native_shared_batch_fixture(
+        tmp_path, monkeypatch, parent_alias=parent_alias)
+    try:
+        original_lines = [copy.deepcopy(record["completed_lines"][10]) for record in world.records]
+        if closed:
+            # Later accepted revisions preserve the exact original admission line.
+            # This mirrors the R7 readback revision 12 versus current revision 15.
+            for record in world.records:
+                for stage, line in (("qa_graph_context", "qa_graph_context"),
+                                    ("qa_verification", "qa_verify"),
+                                    ("close", "observer_close")):
+                    batch._batch_qa_append_line(server._contract_runtime_store(conn), record,
+                        {"stage_id": stage, "line_id": line, "actor_role": "qa" if stage != "close" else "observer",
+                         "evidence_kind": "verification" if stage != "close" else "close",
+                         "status": "accepted", "payload": {
+                             "status": "closed" if stage == "close" else "NO-PASS",
+                             "verdict": "WAIVED" if stage == "close" else "NO-PASS",
+                             "no_pass_claim": True, "overall_release_pass_claimed": False,
+                             "authoritative_pass_synthesized": False,
+                             "audit_only": True}})
+            conn.commit()
+        proofs = []
+        for index, execution in enumerate(batch._BATCH_QA_CHILD_EXECUTIONS):
+            selector = _native_batch_selector(batch, execution, world.reconcile_event["id"])
+            proof = _native_batch_read_without_writes(conn, lambda:
+                _native_batch_http(batch, execution, selector))
+            assert proof["ok"] is True, proof
+            assert set(proof) == _NATIVE_SHARED_ENVELOPE_KEYS
+            assert set(proof["native_event"]) == _NATIVE_SHARED_EVENT_KEYS
+            assert proof["schema_version"] == "contract_runtime.native_event.shared_batch_association.v1"
+            assert proof["proof_variant"] == "shared_batch_association.v1"
+            association = proof["association"]
+            assert set(association) == _NATIVE_ASSOCIATION_KEYS
+            assert association["schema_version"] == "shared_batch_association.v1"
+            source_scope = {"project_id": batch.PID, "backlog_id": batch._BATCH_QA_COORDINATION_BACKLOG,
+                            "task_id": parent}
+            assert proof["native_event"]["source_scope"] == association["source_scope"] == source_scope
+            if parent_alias != "batch":
+                assert parent != batch._BATCH_QA_BATCH_ID
+            assert proof["native_event"]["runtime_scope"] == {}
+            child = world.child_contexts[index]
+            expected_scope = {"project_id": batch.PID, "backlog_id": child.backlog_id,
+                "contract_execution_id": execution, "task_id": child.task_id,
+                "parent_task_id": child.parent_task_id, "runtime_context_id": child.runtime_context_id,
+                "merge_queue_id": child.merge_queue_id}
+            assert set(association["queried_child_scope"]) == _NATIVE_CHILD_SCOPE_KEYS
+            assert association["queried_child_scope"] == association["child_dispatch_scope"] == expected_scope
+            assert association["child_dispatch_ref"] == f"contract_runtime:{execution}:completed_lines:1"
+            record = server._contract_runtime_store(conn).get(execution)
+            assert record["completed_lines"][10] == original_lines[index]
+            assert proof["execution_state_revision"] == (15 if closed else 12)
+            assert proof["recorded_line"]["source_completed_line_index"] == 10
+            assert proof["recorded_line"]["currentness"] == (
+                "historical_completed_line" if closed else "latest_completed_line")
+            assert proof["recorded_line"]["source_line_hash"] == _native_wire_hash(original_lines[index])
+            event = dict(conn.execute("SELECT * FROM task_timeline_events WHERE id=?",
+                (world.reconcile_event["id"],)).fetchone())
+            assert proof["native_event"]["source_event_hash"] == association["source_event_hash"] == _native_wire_hash(event)
+            epoch = dict(conn.execute("SELECT * FROM parallel_branch_integration_epochs").fetchone())
+            queue = [dict(row) for row in conn.execute(
+                "SELECT * FROM parallel_branch_merge_queue_items ORDER BY queue_index,queue_item_id")]
+            assert association["epoch_hash"] == _native_wire_hash(epoch)
+            assert association["ordered_queue_hash"] == _native_wire_hash(queue)
+            assert association["child_dispatch_hash"] == _native_wire_hash(record["completed_lines"][1])
+            receipt = original_lines[index]["payload"]["reconcile_authority"]
+            terminal = receipt["terminal_current_full_reconcile_authority"]
+            shared = terminal["shared_batch_reconcile_authority"]
+            assert association["shared_authority_hash"] == shared["authority_hash"] == _native_wire_hash(
+                {key: value for key, value in shared.items() if key != "authority_hash"})
+            assert association["terminal_authority_hash"] == terminal["authority_hash"] == _native_wire_hash(
+                {key: value for key, value in terminal.items() if key != "authority_hash"})
+            binding_keys = ("project_id", "backlog_id", "contract_execution_id", "contract_id",
+                "contract_revision_id", "contract_hash", "execution_state_revision", "execution_state_hash", "runtime_guide_hash")
+            assert association["queried_binding_hash"] == _native_wire_hash({key: proof[key] for key in binding_keys})
+            assert association["recorded_line_hash"] == _native_wire_hash(proof["recorded_line"])
+            assert association["association_hash"] == _native_wire_hash(
+                {key: value for key, value in association.items() if key != "association_hash"})
+            assert association["target_commit"] == world.final_head
+            assert association["snapshot_id"] == batch._BATCH_QA_SNAPSHOT_ID
+            assert association["queue_item_id"] == batch._BATCH_QA_QUEUE_ITEM_IDS[index]
+            assert association["authority_purpose"] == "postmerge_qa_admission"
+            assert association["all_children_contract_qa_verified"] is False
+            assert association["current_child_contract_qa_verified"] is False
+            assert association["final_qa_required_for_current_child"] is True
+            assert association["close_satisfying"] is False
+            for field in ("formal_world", "formal_position", "generation", "execution"):
+                assert proof[field] == "UNKNOWN"
+            for field in ("formal_world_authority", "formal_position_authority", "direction_authority", "effect_authority"):
+                assert proof[field] is False
+            assert proof["observation_only"] is True
+            recorded = _native_batch_read_without_writes(conn, lambda:
+                _native_batch_http(batch, execution, {**selector, "response_view": "recorded_line"}))
+            assert recorded["ok"] is True
+            assert recorded["recorded_line"] == proof["recorded_line"]
+            proofs.append(proof)
+        assert proofs[0]["native_event"]["source_event_hash"] == proofs[1]["native_event"]["source_event_hash"]
+        assert proofs[0]["association"]["association_hash"] != proofs[1]["association"]["association_hash"]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("tamper", [
+    "wrong_child", "epoch_open", "epoch_queue", "epoch_id", "epoch_snapshot", "queue_order", "queue_commit",
+    "dispatch_missing", "dispatch_duplicate", "event_task", "event_payload",
+    "seal_missing", "seal_rehashed", "snapshot_notes", "snapshot_commit", "head",
+    "authority_rehashed", "receipt_rehashed", "oversize_identifier", "oversize_evidence",
+])
+def test_native_event_shared_batch_refuses_durable_forgery_without_writes(tmp_path, monkeypatch, tamper):
+    import subprocess
+    conn, world, batch, connection, _parent = _native_shared_batch_fixture(tmp_path, monkeypatch)
+    execution = batch._BATCH_QA_CHILD_EXECUTIONS[0]
+    try:
+        selector = _native_batch_selector(batch, execution, world.reconcile_event["id"])
+        # Every negative starts from an independently valid HTTP proof.
+        baseline = _native_batch_read_without_writes(conn, lambda:
+            _native_batch_http(batch, execution, selector))
+        assert baseline["ok"] is True, baseline
+        if tamper == "wrong_child":
+            conn.execute("UPDATE parallel_branch_runtime_contexts SET backlog_id='OTHER' WHERE runtime_context_id=?",
+                (batch._BATCH_QA_CHILD_RUNTIME_IDS[0],))
+        elif tamper == "epoch_open":
+            conn.execute("UPDATE parallel_branch_integration_epochs SET status='open'")
+        elif tamper == "epoch_queue":
+            conn.execute("UPDATE parallel_branch_integration_epochs SET merge_queue_id='mq-other'")
+        elif tamper == "epoch_id":
+            conn.execute("UPDATE parallel_branch_integration_epochs SET epoch_id='epoch-other'")
+        elif tamper == "epoch_snapshot":
+            conn.execute("UPDATE parallel_branch_integration_epochs SET snapshot_id='snapshot-other'")
+        elif tamper == "queue_order":
+            conn.execute("UPDATE parallel_branch_merge_queue_items SET queue_index=3-queue_index")
+        elif tamper == "queue_commit":
+            conn.execute("UPDATE parallel_branch_merge_queue_items SET target_head_after_merge=? WHERE queue_index=1",
+                ("e" * 40,))
+        elif tamper in ("dispatch_missing", "dispatch_duplicate", "authority_rehashed", "receipt_rehashed"):
+            record = server._contract_runtime_store(conn).get(execution)
+            changed = copy.deepcopy(record)
+            if tamper == "dispatch_missing":
+                dispatch = changed["completed_lines"][1]
+                for carrier in (dispatch, dispatch["payload"], *dispatch["payload"]["bounded_workers"]):
+                    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+                        carrier[field] = "other"
+            elif tamper == "dispatch_duplicate":
+                changed["completed_lines"].append(copy.deepcopy(changed["completed_lines"][1]))
+            elif tamper == "receipt_rehashed":
+                receipt = changed["completed_lines"][10]["payload"]["reconcile_authority"]
+                receipt["caller_extension"] = "coherently-rehashed-forged-receipt"
+                receipt["authority_hash"] = _native_wire_hash({k: v for k, v in receipt.items() if k != "authority_hash"})
+            else:
+                terminal = changed["completed_lines"][10]["payload"]["reconcile_authority"]["terminal_current_full_reconcile_authority"]
+                shared = terminal["shared_batch_reconcile_authority"]
+                shared["final_head_commit"] = "e" * 40
+                shared["authority_hash"] = _native_wire_hash({k: v for k, v in shared.items() if k != "authority_hash"})
+                terminal["authority_hash"] = _native_wire_hash({k: v for k, v in terminal.items() if k != "authority_hash"})
+            changed["execution_state_revision"] += 1
+            server._contract_runtime_store(conn).update(execution, changed, expected_revision=record["execution_state_revision"])
+        elif tamper in ("event_task", "event_payload", "oversize_evidence"):
+            if tamper == "event_task":
+                conn.execute("UPDATE task_timeline_events SET task_id='caller-shaped-parent' WHERE id=?",
+                    (world.reconcile_event["id"],))
+            else:
+                row = conn.execute("SELECT payload_json FROM task_timeline_events WHERE id=?",
+                    (world.reconcile_event["id"],)).fetchone()
+                payload = json.loads(row[0])
+                if tamper == "oversize_evidence":
+                    payload["caller_extension"] = "汉" * 6000
+                else:
+                    payload["target_commit_sha"] = "e" * 40
+                conn.execute("UPDATE task_timeline_events SET payload_json=? WHERE id=?",
+                    (json.dumps(payload), world.reconcile_event["id"]))
+        elif tamper == "seal_missing":
+            conn.execute("DELETE FROM graph_current_full_reconcile_provenance")
+        elif tamper == "seal_rehashed":
+            row = conn.execute("SELECT marker_json FROM graph_current_full_reconcile_provenance").fetchone()
+            marker = json.loads(row[0])
+            marker.update(normal_update_path=False, dev_force_graph_only=True)
+            marker["provenance_hash"] = _native_wire_hash({k: v for k, v in marker.items() if k != "provenance_hash"})
+            conn.execute("UPDATE graph_current_full_reconcile_provenance SET marker_json=?,provenance_hash=?",
+                (json.dumps(marker), marker["provenance_hash"]))
+            conn.execute("UPDATE graph_snapshots SET notes=?", (json.dumps({"current_full_reconcile": marker}),))
+        elif tamper == "snapshot_notes":
+            conn.execute("UPDATE graph_snapshots SET notes='{}'")
+        elif tamper == "snapshot_commit":
+            conn.execute("UPDATE graph_snapshots SET commit_sha=?", ("e" * 40,))
+        elif tamper == "head":
+            subprocess.run(["git", "commit", "--allow-empty", "-m", "move canonical head"], cwd=world.root,
+                check=True, capture_output=True)
+        else:
+            conn.execute("UPDATE parallel_branch_integration_epochs SET epoch_id=?", ("x" * 257,))
+        conn.commit()
+        # Refresh only current binding; the selected immutable source remains line 10.
+        if tamper in ("dispatch_missing", "dispatch_duplicate", "authority_rehashed", "receipt_rehashed"):
+            selector = _native_batch_selector(batch, execution, world.reconcile_event["id"])
+        forged_query = {**selector, "association": json.dumps(baseline["association"]),
+            "shared_batch_association": json.dumps(baseline["association"])}
+        proof = _native_batch_read_without_writes(conn, lambda:
+            _native_batch_http(batch, execution, forged_query))
+        assert proof["ok"] is False, (tamper, proof)
+        assert proof["error"] in {
+            "native_event_association_missing", "native_event_association_invalid",
+            "native_event_association_unsupported", "native_event_native_binding_missing",
+            "native_event_native_binding_invalid", "native_event_event_binding_mismatch",
+            "native_event_snapshot_binding_mismatch", "native_event_wire_unbounded",
+            "coordinator_current_action_source_mismatch",
+        }, (tamper, proof)
+        assert proof["native_event"] is None
+        assert not proof.get("association")
+        assert proof["observation_only"] is True
+        assert proof["direction_authority"] is proof["effect_authority"] is False
+    finally:
+        connection.close()
+
+
+def test_native_event_shared_batch_requires_current_selector_and_server_reader(tmp_path, monkeypatch):
+    from agent.governance import native_event_provenance
+    conn, world, batch, connection, _parent = _native_shared_batch_fixture(tmp_path, monkeypatch)
+    execution = batch._BATCH_QA_CHILD_EXECUTIONS[0]
+    try:
+        selector = _native_batch_selector(batch, execution, world.reconcile_event["id"])
+        recorded = server.handle_project_contract_runtime_current_state(
+            _native_batch_request(batch, execution, {**selector, "response_view": "recorded_line"}))
+        record = server._contract_runtime_store(conn).get(execution)
+        missing = _native_batch_read_without_writes(conn, lambda: native_event_provenance.read_native_event(
+            conn, source_record=record, recorded=recorded, selector=selector, actor_role="coordinator"))
+        assert missing["ok"] is False
+        assert missing["error"] == "native_event_association_missing"
+        assert missing["native_event"] is None
+        batch._batch_qa_append_line(server._contract_runtime_store(conn), record,
+            {"stage_id": "close", "line_id": "observer_close", "actor_role": "observer",
+             "evidence_kind": "close", "payload": {"status": "closed"}})
+        conn.commit()
+        stale = _native_batch_read_without_writes(conn, lambda:
+            _native_batch_http(batch, execution, selector))
+        assert stale["error"] == "recorded_line_currentness_mismatch"
+        fresh = _native_batch_selector(batch, execution, world.reconcile_event["id"])
+        assert _native_batch_read_without_writes(conn, lambda:
+            _native_batch_http(batch, execution, fresh))["ok"] is True
+    finally:
+        connection.close()
+
 def test_contract_write_gate_rejects_nested_worker_receipt_placeholders():
     errors: list[str] = []
 
