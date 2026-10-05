@@ -6961,3 +6961,293 @@ def test_position_checkpoint_malformed_source_and_echo_are_bounded_unknown(tmp_p
     assert not result["ok"] and result["absence"]
     assert result["semantic_checkpoint"] is None and result["custody_envelope"] is None
     assert len(json.dumps(result, ensure_ascii=False).encode()) <= 16384
+
+
+def _failed_qa_association_fixture(tmp_path, *, sqlite=True):
+    """Synthetic sanitized prefix, genuinely admitted by the existing writer/Gate."""
+    seed, seed_conn, selector = _position_checkpoint_fixture(tmp_path, sqlite=False)
+    prefix = deepcopy(seed.store.get("cex-position")["completed_lines"])
+    # Native lane parent is this CEX, as required by the unchanged consumer.
+    for line in prefix[1:]:
+        payload = line["payload"]
+        payload["parent_task_id"] = "cex-position"
+        if "parent_task_id" in line:
+            line["parent_task_id"] = "cex-position"
+        for worker in payload.get("bounded_workers", []):
+            worker["parent_task_id"] = "cex-position"
+        if "graph_trace_evidence" in payload:
+            payload["graph_trace_evidence"]["parent_task_id"] = "cex-position"
+    definition_path = tmp_path / "position_fixture.v1.rev1.json"
+    definition = json.loads(definition_path.read_text())
+    definition["rule_layer"]["stages"].append({"stage_id": "qa", "lines": [{
+        "line_id": "qa_independent_verification", "owner_role": "qa",
+        "allowed_writer_roles": ["qa"], "evidence_kind": "independent_verification",
+        "requires": ["worker_graph_context"]}]})
+    definition_path.write_text(json.dumps(definition))
+    conn = sqlite3.connect(tmp_path / "failed-qa-synthetic.sqlite") if sqlite else None
+    if conn is not None:
+        conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path), instruction_root=tmp_path,
+        **({"store": SQLiteContractExecutionStore(conn)} if conn is not None else {}))
+    runtime.start_execution("position_fixture", project_id=selector["project_id"],
+        backlog_id=selector["backlog_id"], contract_execution_id="cex-position", actor_role="observer")
+    prefix[4]["graph_trace_ids"] = ["gqt-synthetic-disposable"]
+    prefix[4]["graph_trace_evidence"] = {
+        **prefix[4]["payload"]["graph_trace_evidence"], "db_verified": True,
+        "query_source": "mf_subagent", "query_purpose": "subagent_context_build"}
+    prefix[4]["payload"]["graph_trace_evidence"] = deepcopy(prefix[4]["graph_trace_evidence"])
+    for line in prefix:
+        current = runtime.current_record("cex-position", actor_role=line["actor_role"])
+        line.update({key: current[key] for key in ("project_id", "backlog_id", "contract_execution_id",
+            "definition_hash", "instruction_bundle_hash", "execution_state_revision")})
+        line["runtime_guide_hash"] = current["runtime_guide"]["runtime_guide_hash"]
+        result = runtime.submit_line_write("cex-position", line, actor_role=line["actor_role"])
+        assert result["ok"], json.dumps({"line": line["line_id"], "decision": result["decision"]})
+    session = {"role": "qa", "principal_id": "synthetic-qa", "session_id": "ses-synthetic-qa"}
+    ctx = SimpleNamespace(require_auth=lambda actual: session)
+    write = {"stage_id": "qa", "line_id": "qa_independent_verification", "actor_role": "qa",
+        "evidence_kind": "independent_verification", "status": "failed", "commit_sha": "a" * 40,
+        "runtime_context_id": selector["runtime_context_id"], "task_id": selector["task_id"],
+        "parent_task_id": "cex-position", "payload": {"status": "failed", "verdict": "FAIL",
+            "candidate_commit_sha": "a" * 40, "runtime_context_id": selector["runtime_context_id"],
+            "task_id": selector["task_id"], "parent_task_id": "cex-position"}}
+    current = runtime.current_record("cex-position", actor_role="qa")
+    write.update({key: current[key] for key in ("project_id", "backlog_id", "contract_execution_id",
+        "definition_hash", "instruction_bundle_hash", "execution_state_revision")})
+    write["runtime_guide_hash"] = current["runtime_guide"]["runtime_guide_hash"]
+    write = server._contract_runtime_bind_qa_independent_verification_authority(ctx, conn,
+        project_id=selector["project_id"], record=runtime.current_record("cex-position", actor_role="qa"),
+        write=write)
+    if conn is not None:
+        conn.commit()
+    return runtime, conn, selector, ctx, write
+
+
+def _submit_synthetic_failed_qa(runtime, ctx, write):
+    return runtime.submit_line_write("cex-position", write, actor_role="qa",
+        accepted_qa_context=ctx._accepted_failed_qa_writer_context)
+
+
+def test_failed_qa_association_admitted_stamp_and_read_only_roots(tmp_path):
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    before_prefix = runtime.store.get("cex-position")["completed_lines"]
+    result = _submit_synthetic_failed_qa(runtime, ctx, write)
+    assert result["ok"], result
+    stored = runtime.store.get("cex-position")
+    assert stored["completed_lines"][:5] == before_prefix
+    stamp = stored["completed_lines"][5]["failed_qa_event_stamp"]
+    assert stamp["event_id"] == "contract_runtime:cex-position:completed_lines:5"
+    assert stamp["execution_anchor"]["kind"] == "execution_context_anchor"
+    conn.commit()
+    before, changes = list(conn.iterdump()), conn.total_changes
+    view = runtime.failed_qa_association_view("cex-position", project_id=selector["project_id"],
+        backlog_id=selector["backlog_id"], source_completed_line_index=5)
+    assert view["ok"], view
+    a, cp = view["association"], view["position_checkpoint"]
+    assert a["event_claim_hash"] == _position_digest(a["event_claim"])
+    assert a["association_hash"] == _position_digest({k: v for k, v in a.items() if k != "association_hash"})
+    assert a["source_event_hash"] == _position_digest(stored["completed_lines"][5])
+    assert a["execution_anchor"]["position_ref"] == cp["semantic_ref"]
+    assert a["qa_authorship"]["qa_session_id"] != cp["semantic_checkpoint"]["role_assignment"]["holder_id"]
+    assert a["current_boundary"]["status"] == "active_failed_qa"
+    assert a["genuine_authority_block"] is False and a["event_time_position_status"] == "unavailable"
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    # Exact replay keeps ordinary duplicate semantics and original immutable occurrence.
+    replay = _submit_synthetic_failed_qa(runtime, ctx, write)
+    assert not replay["ok"]
+    assert runtime.store.get("cex-position")["completed_lines"][5] == stored["completed_lines"][5]
+    conn.close()
+
+
+@pytest.mark.parametrize("caller_context", [None, {"source": "authenticated_qa_session", "server_derived": True}])
+def test_failed_qa_association_direct_caller_cannot_issue_stamp(tmp_path, caller_context):
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    write["failed_qa_event_stamp"] = {"schema_version": "contract_runtime.failed_qa_event_stamp.v1"}
+    write["payload"]["failed_qa_event_stamp"] = deepcopy(write["failed_qa_event_stamp"])
+    write["payload"]["nested"] = {"failed_qa_association": {"server_derived": True}}
+    result = runtime.submit_line_write("cex-position", write, actor_role="qa",
+                                      accepted_qa_context=caller_context)
+    assert result["ok"] and result["failed_qa_observation_absence"] == "source_stamp_origin_unverified"
+    line = runtime.store.get("cex-position")["completed_lines"][5]
+    assert "failed_qa_event_stamp" not in json.dumps(line)
+    assert "failed_qa_association" not in json.dumps(line)
+    view = runtime.failed_qa_association_view("cex-position", project_id=selector["project_id"],
+        backlog_id=selector["backlog_id"], source_completed_line_index=5)
+    assert not view["ok"] and view["absence"] == "source_occurrence_stamp_unavailable"
+    conn.close()
+
+
+@pytest.mark.parametrize("unavailable", ["candidate", "scope", "holder"])
+def test_failed_qa_association_optional_failure_preserves_legal_qa(tmp_path, unavailable):
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    if unavailable == "candidate":
+        write["commit_sha"] = write["payload"]["candidate_commit_sha"] = "b" * 40
+    elif unavailable == "scope":
+        write["task_id"] = write["payload"]["task_id"] = "foreign-task"
+    else:
+        # Actual QA principal remains separate from the mf_sub subject holder.
+        p = write["qa_evidence_provenance"]
+        p["authenticated_qa_binding"]["qa_session_id"] = "opaque-actor"
+        for source in (write, p):
+            source["evidence_owner_session"] = source["submitter_session"] = "opaque-actor"
+    result = _submit_synthetic_failed_qa(runtime, ctx, write)
+    assert result["ok"], result
+    assert result.get("failed_qa_observation_absence")
+    assert "failed_qa_event_stamp" not in runtime.store.get("cex-position")["completed_lines"][5]
+    conn.close()
+
+
+def test_failed_qa_association_CAS_conflict_and_no_mutation_are_unstamped(tmp_path, monkeypatch):
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    before, changes = list(conn.iterdump()), conn.total_changes
+    dry = {**write, "payload": {**write["payload"], "no_mutation_expected": True}}
+    dry["no_mutation_expected"] = True
+    result = _submit_synthetic_failed_qa(runtime, ctx, dry)
+    assert not result["ok"]
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    def conflict(*args, **kwargs):
+        assert kwargs["expected_revision"] == 6
+        # The optional stamp belongs to this candidate CAS only.
+        assert "failed_qa_event_stamp" in args[1]["completed_lines"][5]
+        raise ContractRuntimeError("synthetic_CAS_conflict")
+    monkeypatch.setattr(runtime.store, "update", conflict)
+    result = _submit_synthetic_failed_qa(runtime, ctx, write)
+    assert not result["ok"]
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    assert len(runtime.store.get("cex-position")["completed_lines"]) == 5
+    conn.close()
+
+
+@pytest.mark.parametrize("attack", ["project", "backlog", "ordinal", "timestamp", "position",
+    "prefix", "provenance", "qa_session", "qa_principal", "task", "runtime_context", "parent",
+    "candidate_coherent", "rule", "extra_stamp_key", "missing_stamp"])
+def test_failed_qa_association_coherently_rehashed_source_corruption_refused(tmp_path, attack):
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    assert _submit_synthetic_failed_qa(runtime, ctx, write)["ok"]
+    record = runtime.store.get("cex-position")
+    line = record["completed_lines"][5]
+    stamp = line["failed_qa_event_stamp"]
+    if attack in {"project", "backlog"}:
+        stamp[attack + "_id"] = "foreign"
+    elif attack == "ordinal": stamp["source_completed_line_index"] = 4
+    elif attack == "timestamp": stamp["occurred_at"] = "2026-01-01"
+    elif attack == "position": stamp["execution_anchor"]["position_ref"] = "position:sha256:" + "f" * 64
+    elif attack == "prefix": stamp["execution_anchor"]["prefix_commitment"] = "sha256:" + "f" * 64
+    elif attack == "provenance": line["qa_evidence_provenance"]["source"] = "caller_verified"
+    elif attack == "qa_session": line["qa_evidence_provenance"]["authenticated_qa_binding"]["qa_session_id"] = "foreign"
+    elif attack == "qa_principal": line["actor_session_principal"] = "foreign"
+    elif attack in {"task", "runtime_context", "parent"}:
+        key = {"task": "task_id", "runtime_context": "runtime_context_id", "parent": "parent_task_id"}[attack]
+        line[key] = line["payload"][key] = "foreign"
+    elif attack == "candidate_coherent":
+        line["commit_sha"] = line["payload"]["candidate_commit_sha"] = "b" * 40
+        line["payload"]["canonical_ref_adoption_qa_payload"]["candidate_commit_sha"] = "b" * 40
+    elif attack == "rule": stamp["admission_rule_commitment"] = "sha256:" + "f" * 64
+    elif attack == "extra_stamp_key": stamp["server_derived"] = True
+    else: del line["failed_qa_event_stamp"]
+    record["runtime_guide"]["completed_lines"] = deepcopy(record["completed_lines"])
+    runtime.store.update("cex-position", record)
+    conn.commit()
+    before, changes = list(conn.iterdump()), conn.total_changes
+    # Fresh complete line hash cannot hide the coherent scope/commit mutation.
+    view = runtime.failed_qa_association_view("cex-position", project_id=selector["project_id"],
+        backlog_id=selector["backlog_id"], source_completed_line_index=5,
+        source_event_hash=_position_digest(line))
+    assert not view["ok"], (attack, view)
+    assert view["position_checkpoint"] is None and view["association"] is None
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    conn.close()
+
+
+def test_failed_qa_association_later_current_custody_preserves_claim(tmp_path):
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    assert _submit_synthetic_failed_qa(runtime, ctx, write)["ok"]
+    kwargs = {"project_id": selector["project_id"], "backlog_id": selector["backlog_id"],
+              "source_completed_line_index": 5}
+    first = runtime.failed_qa_association_view("cex-position", **kwargs)
+    record = runtime.store.get("cex-position")
+    record["metadata"]["synthetic_later_read_boundary"] = "changed"
+    record["execution_state_revision"] += 1
+    runtime.store.update("cex-position", record)
+    later = runtime.failed_qa_association_view("cex-position", **kwargs)
+    assert first["ok"] and later["ok"]
+    for key in ("event_claim", "event_claim_hash", "source_event_hash", "execution_anchor"):
+        assert first["association"][key] == later["association"][key]
+    assert first["position_checkpoint"]["semantic_ref"] == later["position_checkpoint"]["semantic_ref"]
+    assert first["position_checkpoint"]["custody_ref"] != later["position_checkpoint"]["custody_ref"]
+    conn.close()
+
+
+def test_failed_qa_association_valid_qa_supersession_keeps_historical_occurrence(tmp_path):
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    assert _submit_synthetic_failed_qa(runtime, ctx, write)["ok"]
+    original = deepcopy(runtime.store.get("cex-position")["completed_lines"][5])
+    kwargs = {"project_id": selector["project_id"], "backlog_id": selector["backlog_id"],
+              "source_completed_line_index": 5}
+    first = runtime.failed_qa_association_view("cex-position", **kwargs)
+    # Follow the existing compiler's actual worker rework path, no policy/Gate mocks.
+    for line in deepcopy(runtime.store.get("cex-position")["completed_lines"][2:5]):
+        current = runtime.current_record("cex-position", actor_role="mf_sub")
+        line.update({key: current[key] for key in ("project_id", "backlog_id", "contract_execution_id",
+            "definition_hash", "instruction_bundle_hash", "execution_state_revision")})
+        line["runtime_guide_hash"] = current["runtime_guide"]["runtime_guide_hash"]
+        assert runtime.submit_line_write("cex-position", line, actor_role="mf_sub")["ok"]
+    current = runtime.current_record("cex-position", actor_role="qa")
+    write["status"] = write["payload"]["status"] = "passed"
+    write["payload"]["verdict"] = "PASS"
+    write.update({key: current[key] for key in ("execution_state_revision", "definition_hash", "instruction_bundle_hash")})
+    write["runtime_guide_hash"] = current["runtime_guide"]["runtime_guide_hash"]
+    write = server._contract_runtime_bind_qa_independent_verification_authority(ctx, conn,
+        project_id=selector["project_id"], record=current, write=write)
+    assert _submit_synthetic_failed_qa(runtime, ctx, write)["ok"]
+    later = runtime.failed_qa_association_view("cex-position", **kwargs)
+    assert later["ok"], later
+    assert later["association"]["current_boundary"]["status"] == "superseded_by_later_valid_qa"
+    assert later["association"]["current_boundary"]["active_source_line_index"] is None
+    for key in ("source_event_hash", "event_claim", "event_claim_hash", "execution_anchor"):
+        assert first["association"][key] == later["association"][key]
+    assert runtime.store.get("cex-position")["completed_lines"][5] == original
+    assert "failed_qa_event_stamp" not in runtime.store.get("cex-position")["completed_lines"][-1]
+    conn.close()
+
+
+def test_failed_qa_association_writer_auth_and_rejected_PASS_have_zero_stamp(tmp_path):
+    from agent.governance.errors import PermissionDeniedError
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    before, changes = list(conn.iterdump()), conn.total_changes
+    bad_ctx = SimpleNamespace(require_auth=lambda actual: {"role": "mf_sub", "principal_id": "caller"})
+    with pytest.raises(PermissionDeniedError):
+        server._contract_runtime_bind_qa_independent_verification_authority(bad_ctx, conn,
+            project_id=selector["project_id"], record=runtime.store.get("cex-position"), write=write)
+    write["status"] = "passed"  # Nested FAIL must not become an admitted failed event.
+    rejected = _submit_synthetic_failed_qa(runtime, ctx, write)
+    assert not rejected["ok"] and rejected.get("zero_contract_runtime_write")
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    conn.close()
+
+
+def test_failed_qa_association_same_CAS_prestate_without_second_get(tmp_path, monkeypatch):
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    original = runtime.store.get
+    gets = []
+    def get(execution):
+        gets.append(execution)
+        return original(execution)
+    monkeypatch.setattr(runtime.store, "get", get)
+    assert _submit_synthetic_failed_qa(runtime, ctx, write)["ok"]
+    assert gets == ["cex-position"]
+    conn.close()
+
+
+def test_position_checkpoint_store_error_retains_structured_refusal(tmp_path, monkeypatch):
+    runtime, _, selector = _position_checkpoint_fixture(tmp_path)
+    gets = []
+    def unavailable(execution):
+        gets.append(execution)
+        raise ContractRuntimeError("synthetic source record unavailable")
+    monkeypatch.setattr(runtime.store, "get", unavailable)
+    response = runtime.position_checkpoint_view("cex-position", **selector)
+    assert response["ok"] is False and response["error"] == "position_checkpoint_unavailable"
+    assert response["absence"] == "invalid_source_binding"
+    assert response["semantic_checkpoint"] is None and response["custody_envelope"] is None
+    assert gets == ["cex-position"]

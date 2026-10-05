@@ -2882,3 +2882,112 @@ def test_position_checkpoint_handler_malformed_decimal_is_bounded_unknown(tmp_pa
     assert len(json.dumps(result, ensure_ascii=False).encode()) <= 16384
     assert conn.total_changes == changes and list(conn.iterdump()) == before
     conn.close()
+
+
+def _failed_qa_association_handler_fixture(tmp_path, monkeypatch):
+    """Actual producer/read/HTTP serializer on synthetic disposable SQLite only."""
+    from contextlib import contextmanager
+    from agent.tests.test_contract_runtime import _failed_qa_association_fixture, _submit_synthetic_failed_qa
+    runtime, conn, selector, writer_ctx, write = _failed_qa_association_fixture(tmp_path)
+    result = _submit_synthetic_failed_qa(runtime, writer_ctx, write)
+    assert result["ok"], result
+    conn.commit()
+    @contextmanager
+    def db_context(project):
+        assert project == selector["project_id"]
+        yield conn
+    monkeypatch.setattr(server, "DBContext", db_context)
+    monkeypatch.setattr(server, "_contract_runtime", lambda actual: runtime)
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda actual: runtime.store)
+    monkeypatch.setattr(server, "_contract_runtime_effective_actor_role", lambda *a, **k: "observer")
+    # Independent readonly observer context; QA remains only the event author.
+    ctx = SimpleNamespace(require_auth=lambda actual: {"role": "observer",
+        "principal_id": "synthetic-observer", "session_id": "ses-synthetic-observer"},
+        get_project_id=lambda: selector["project_id"],
+        path_params={"contract_execution_id": "cex-position"}, request_id="req-111122223333",
+        query={"response_view": "failed_qa_association", "backlog_id": selector["backlog_id"],
+               "source_completed_line_index": "5"})
+    return runtime, conn, ctx
+
+
+def _failed_qa_association_http_bytes(body):
+    import io
+    handler = object.__new__(server.GovernanceHandler)
+    handler.wfile = io.BytesIO()
+    headers = {}
+    handler.send_response = lambda code: headers.update(status=code)
+    handler.send_header = lambda k, v: headers.update({k: v})
+    handler.end_headers = lambda: None
+    handler._respond(200, body)
+    return handler.wfile.getvalue(), headers
+
+
+def test_failed_qa_association_handler_and_exact_compact_transport(tmp_path, monkeypatch):
+    runtime, conn, ctx = _failed_qa_association_handler_fixture(tmp_path, monkeypatch)
+    before, changes = list(conn.iterdump()), conn.total_changes
+    response = server.handle_project_contract_runtime_current_state(ctx)
+    assert response["ok"], response
+    assert response["request_id"] == response["position_checkpoint"]["request_id"] == ctx.request_id
+    assert response["position_checkpoint"]["actor_role"] == "observer"
+    assert response["association"]["qa_authorship"]["qa_principal"] == "synthetic-qa"
+    raw, headers = _failed_qa_association_http_bytes(response)
+    assert raw == json.dumps(response, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"), allow_nan=False).encode()
+    assert len(raw) <= 16384 and headers["Content-Length"] == str(len(raw))
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    conn.close()
+
+
+@pytest.mark.parametrize("selector", ["-1", "9" * 5000, True, "05", "1.0", [5]])
+def test_failed_qa_association_handler_bad_ordinal_no_fallback(tmp_path, monkeypatch, selector):
+    runtime, conn, ctx = _failed_qa_association_handler_fixture(tmp_path, monkeypatch)
+    before, changes = list(conn.iterdump()), conn.total_changes
+    ctx.query["source_completed_line_index"] = selector
+    response = server.handle_project_contract_runtime_current_state(ctx)
+    assert not response["ok"] and response["absence"] == "source_line_missing"
+    raw, headers = _failed_qa_association_http_bytes(response)
+    assert len(raw) <= 16384 and headers["Content-Length"] == str(len(raw))
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    conn.close()
+
+
+def test_failed_qa_association_raw_utf8_cap_and_legacy_serialization(tmp_path, monkeypatch):
+    runtime, conn, ctx = _failed_qa_association_handler_fixture(tmp_path, monkeypatch)
+    response = server.handle_project_contract_runtime_current_state(ctx)
+    response["association"]["qa_authorship"]["qa_principal"] = "汉" * 6000
+    raw, headers = _failed_qa_association_http_bytes(response)
+    refused = json.loads(raw)
+    assert refused == server._failed_qa_wire_refusal("wire_oversize", ctx.request_id)
+    assert len(raw) <= 16384 and headers["Content-Length"] == str(len(raw))
+    for tag in ("position_checkpoint", "ordinary", "failed_qa_association"):
+        # Wrong schema on the proposed tag stays on the original JSON branch.
+        legacy = {"schema_version": "legacy.v1", "response_view": tag, "payload": "汉"}
+        raw, _ = _failed_qa_association_http_bytes(legacy)
+        assert raw == json.dumps(legacy, ensure_ascii=False).encode()
+    conn.close()
+
+
+def test_failed_qa_association_claim_uses_original_report_timestamp_and_world_shape(tmp_path, monkeypatch):
+    import re
+    runtime, conn, ctx = _failed_qa_association_handler_fixture(tmp_path, monkeypatch)
+    response = server.handle_project_contract_runtime_current_state(ctx)
+    claim = response["association"]["event_claim"]
+    assert re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", claim["event"]["occurred_at"])
+    assert claim["scope"]["world_id"] == "world:" + claim["scope"]["world_ref_hash"]
+    assert re.fullmatch(r"sha256:[a-f0-9]{64}", claim["scope"]["world_ref_hash"])
+    assert set(claim["block"]) == {"subsystem", "reason_code", "claimed_disposition", "rule_ref",
+        "fact_ref", "position_ref", "direction_ref", "guide_ref", "evidence_digests", "attempted_actions"}
+    for bad in [{"runtime_context_id": "foreign"}, {"unknown": "extension"}]:
+        ctx.query.update(bad)
+        refused = server.handle_project_contract_runtime_current_state(ctx)
+        assert refused == server._failed_qa_wire_refusal("invalid_selector", ctx.request_id)
+        for key in bad:del ctx.query[key]
+    conn.close()
+
+
+@pytest.mark.parametrize("request_id", ["汉" * 10000, "\ud800", None])
+def test_failed_qa_association_oversize_refusal_never_echoes_invalid_request_id(request_id):
+    body = server._failed_qa_wire_refusal("wire_oversize", request_id)
+    raw, headers = _failed_qa_association_http_bytes(body)
+    assert body["request_id"] == "" and len(raw) <= 16384
+    assert headers["Content-Length"] == str(len(raw))

@@ -45,6 +45,77 @@ from .write_gate import WriteGateDecision
 from ..db import dev_runtime_verify_only, verify_existing_schema_capabilities
 
 
+_FAILED_QA_STAMP_FIELD = "failed_qa_event_stamp"
+_FAILED_QA_CONTEXT_FIELD = "_accepted_failed_qa_writer_context"
+
+
+class _AcceptedFailedQAWriterContext:
+    """Process-local binder capability; never accepted from JSON or persisted."""
+
+    def __init__(self, execution_id: str, write: Mapping[str, Any]):
+        self.execution_id = execution_id
+        provenance = write.get("qa_evidence_provenance") or {}
+        self.binding = deepcopy(provenance.get("authenticated_qa_binding") or {})
+        self.scope = {key: write.get(key) for key in
+                      ("runtime_context_id", "task_id", "parent_task_id")}
+
+
+def _strip_failed_qa_observation_claims(value):
+    if isinstance(value, Mapping):
+        return {key: _strip_failed_qa_observation_claims(item)
+                for key, item in value.items()
+                if key not in {_FAILED_QA_STAMP_FIELD, _FAILED_QA_CONTEXT_FIELD,
+                               "failed_qa_association"}}
+    if isinstance(value, (list, tuple)):
+        return [_strip_failed_qa_observation_claims(item) for item in value]
+    return value
+
+
+def _failed_qa_digest(value):
+    return "sha256:" + hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _failed_qa_require(condition, reason):
+    if not condition:
+        raise ValueError(reason)
+
+
+def _failed_qa_authorship(line):
+    p = line["qa_evidence_provenance"]
+    b = p["authenticated_qa_binding"]
+    principal, session = b["qa_principal"], b["qa_session_id"]
+    _failed_qa_require(line["actor_role"] == "qa" and
+        line["line_id"] == "qa_independent_verification" and
+        line["evidence_kind"] == "independent_verification" and
+        p["source"] == "contract_runtime_qa_independent_verification_binding" and
+        p["authorization_source"] == line["authorization_source"] == "qa_session_token_ref" and
+        p["observer_impersonation"] is False and line["observer_impersonation"] is False and
+        b["independent_verification_session_matched"] is True and
+        p["evidence_owner_role"] == "qa" and
+        all(type(v) is str and v.strip() == v and 0 < len(v.encode()) <= 512
+            for v in (principal, session)), "qa_authorship_unavailable")
+    for source in (line, p):
+        _failed_qa_require(source["evidence_owner_actor"] == source["submitter_principal"] == principal
+            and source["evidence_owner_session"] == source["submitter_session"] == session,
+            "qa_authorship_unavailable")
+    _failed_qa_require(line["actor_session_principal"] == principal,
+                       "qa_authorship_unavailable")
+    payload = line["payload"]
+    candidate = payload.get("candidate_commit_sha") or line.get("commit_sha")
+    _failed_qa_require(type(candidate) is str and re.fullmatch(r"[a-f0-9]{40}", candidate),
+                       "qa_authorship_unavailable")
+    for source in (line, payload):
+        for key in ("commit_sha", "candidate_commit_sha", "immutable_head_commit", "validated_head_commit"):
+            if key in source:
+                _failed_qa_require(source[key] == candidate, "qa_candidate_mismatch")
+    return {"qa_principal": principal, "qa_session_id": session,
+            "governed_runtime_context_id": line["runtime_context_id"],
+            "governed_task_id": line["task_id"], "candidate_commit": candidate,
+            "provenance_commitment": _failed_qa_digest(p)}
+
+
 log = logging.getLogger(__name__)
 _JUDGMENT_HINTS_DISABLED_ENV = "AMING_JB_HINTS_DISABLED"
 _JUDGMENT_HINT_PORT_ENV = "JUDGMENT_BRAIN_HINT_PORT"
@@ -9634,6 +9705,24 @@ class ContractRuntime:
         self, contract_execution_id: str, *, project_id: str, backlog_id: str,
         runtime_context_id: str, task_id: str, attempt: int, through_ordinal: int,
     ) -> dict[str, Any]:
+        try:
+            record = self.store.get(contract_execution_id)
+        except ContractRuntimeError:
+            record = None
+        result = self._position_checkpoint_from_record(
+            record, contract_execution_id,
+            project_id=project_id, backlog_id=backlog_id,
+            runtime_context_id=runtime_context_id, task_id=task_id,
+            attempt=attempt, through_ordinal=through_ordinal,
+        )
+        if record is None and result.get("absence") == "invalid_source_record":
+            result["absence"] = "invalid_source_binding"
+        return result
+
+    def _position_checkpoint_from_record(
+        self, record: Mapping[str, Any], contract_execution_id: str, *, project_id: str, backlog_id: str,
+        runtime_context_id: str, task_id: str, attempt: int, through_ordinal: int,
+    ) -> dict[str, Any]:
         """Project a durable admitted prefix; never replay missing historical Gate inputs.
 
         Complete Rule/line/record digests are source-attested leaves. The public
@@ -9670,7 +9759,6 @@ class ContractRuntime:
             require(type(through_ordinal) is int and through_ordinal == 4, "unsupported_prefix")
             require(all(type(v) is str and v.strip() == v and v for v in
                         (project_id, backlog_id, runtime_context_id, task_id)), "missing_scope")
-            record = self.store.get(contract_execution_id)
             require(isinstance(record, Mapping), "invalid_source_record")
             require(record.get("project_id") == project_id and
                     record.get("backlog_id") == backlog_id and
@@ -9687,7 +9775,11 @@ class ContractRuntime:
             require(all(isinstance(l, Mapping) and isinstance(l.get("payload"), Mapping)
                         for l in lines[:5]), "invalid_source_line")
             if "completed_lines" in persisted_guide:
-                require(persisted_guide["completed_lines"] == lines,
+                # The completion compiler omits protected observational stamps;
+                # all original admitted evidence must still match exactly.
+                guide_lines = [{k: v for k, v in line.items() if k != _FAILED_QA_STAMP_FIELD}
+                               if isinstance(line, Mapping) else line for line in lines]
+                require(persisted_guide["completed_lines"] in (lines, guide_lines),
                         "durable_prefix_representation_mismatch")
             selected = lines[:5]
             rules = {(s["stage_id"], l["line_id"]): l
@@ -9868,6 +9960,174 @@ class ContractRuntime:
             for key in ("contract_id", "contract_revision_id", "contract_hash", "execution_state_revision",
                         "execution_state_hash", "runtime_guide_hash"):
                 result.pop(key, None)
+        return result
+
+    def _failed_qa_stamp(self, record, line, ordinal, occurred_at):
+        """Pure construction from the admitted CAS prestate, never a store read."""
+        authorship = _failed_qa_authorship(line)
+        dispatch = record["completed_lines"][1]["payload"]
+        workers = dispatch["bounded_workers"]
+        _failed_qa_require(len(workers) == 1, "unsupported_execution_anchor")
+        attempt = workers[0]["retry_policy"]["attempt"]
+        selector = {"project_id": record["project_id"], "backlog_id": record["backlog_id"],
+                    "runtime_context_id": authorship["governed_runtime_context_id"],
+                    "task_id": authorship["governed_task_id"], "attempt": attempt, "through_ordinal": 4}
+        checkpoint = self._position_checkpoint_from_record(record, record["contract_execution_id"], **selector)
+        _failed_qa_require(checkpoint["ok"], "unsupported_execution_anchor")
+        semantic = checkpoint["semantic_checkpoint"]
+        assignment = semantic["role_assignment"]
+        _failed_qa_require(authorship["qa_session_id"] != assignment["holder_id"],
+                           "qa_authorship_unavailable")
+        for source in (line, line["payload"]):
+            for key in ("runtime_context_id", "task_id", "parent_task_id"):
+                _failed_qa_require(source.get(key) == assignment[key], "qa_worker_scope_mismatch")
+            if "attempt" in source:
+                _failed_qa_require(type(source["attempt"]) is int and source["attempt"] == attempt,
+                                   "qa_worker_scope_mismatch")
+        # Bind QA's candidate to this admitted worker's source commit before
+        # the event ordinal, independently of redundant QA-authored labels.
+        source_commit = semantic["world"]["commit_sha"]
+        for committed in record["completed_lines"][5:ordinal]:
+            if committed.get("line_id") != "worker_commit":
+                continue
+            committed_payload = committed.get("payload") or {}
+            _failed_qa_require(committed.get("actor_role") == "mf_sub" and
+                all((committed.get(key) or committed_payload.get(key)) == assignment[key]
+                    for key in ("runtime_context_id", "task_id", "parent_task_id")),
+                "qa_worker_scope_mismatch")
+            source_commit = (committed.get("immutable_head_commit") or committed.get("commit_sha")
+                             or committed_payload.get("immutable_head_commit") or committed_payload.get("commit_sha"))
+            _failed_qa_require(type(source_commit) is str and re.fullmatch(r"[a-f0-9]{40}", source_commit),
+                               "qa_candidate_mismatch")
+            for source in (committed, committed_payload):
+                for key in ("immutable_head_commit", "commit_sha", "validated_head_commit"):
+                    if key in source:
+                        _failed_qa_require(source[key] == source_commit, "qa_candidate_mismatch")
+        _failed_qa_require(authorship["candidate_commit"] == source_commit, "qa_candidate_mismatch")
+        definition = self._load_pinned_definition(record)
+        rules = [rule for stage, rule in iter_stage_lines(definition)
+                 if stage["stage_id"] == line["stage_id"] and rule["line_id"] == line["line_id"]]
+        _failed_qa_require(len(rules) == 1 and "qa" in rules[0]["allowed_writer_roles"]
+                           and rules[0]["evidence_kind"] == line["evidence_kind"],
+                           "source_scope_mismatch")
+        _failed_qa_require(type(ordinal) is int and ordinal >= 5 and
+                           type(occurred_at) is str and len(occurred_at) <= 40,
+                           "source_occurrence_stamp_unavailable")
+        instant = datetime.strptime(occurred_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        _failed_qa_require(instant.strftime("%Y-%m-%dT%H:%M:%SZ") == occurred_at,
+                           "source_occurrence_stamp_unavailable")
+        stamp = {"schema_version": "contract_runtime.failed_qa_event_stamp.v1",
+                 "writer_entrypoint": "ContractRuntime.submit_line_write/authenticated_qa",
+                 "occurred_at": occurred_at,
+                 "event_id": "contract_runtime:" + record["contract_execution_id"] + ":completed_lines:" + str(ordinal),
+                 "project_id": record["project_id"], "backlog_id": record["backlog_id"],
+                 "contract_execution_id": record["contract_execution_id"],
+                 "source_completed_line_index": ordinal,
+                 "execution_anchor": {"kind": "execution_context_anchor",
+                     "position_ref": checkpoint["semantic_ref"],
+                     "scope": {**selector, "contract_execution_id": record["contract_execution_id"]},
+                     "prefix_through_ordinal": 4,
+                     "prefix_commitment": semantic["evidence_prefix"]["prefix_digest"]},
+                 "qa_authorship_commitment": authorship["provenance_commitment"],
+                 "admission_rule_commitment": _failed_qa_digest({
+                     "definition_digest": definition["definition_hash"],
+                     "instruction_bundle_hash": record["instruction_bundle_hash"],
+                     "stage_id": line["stage_id"], "line_rule": rules[0]})}
+        return stamp, checkpoint
+
+    def failed_qa_association_view(self, contract_execution_id, *, project_id,
+                                   backlog_id, source_completed_line_index,
+                                   source_event_hash=None):
+        """Exact admitted occurrence plus current custody; never writes or backfills."""
+        result = {"schema_version": "contract_runtime.failed_qa_association.v1",
+                  "response_view": "failed_qa_association", "ok": False,
+                  "error": "failed_qa_association_unavailable", "absence": None,
+                  "observation_only": True, "request_id": None,
+                  "source_of_authority": "ContractRuntime.durable_admitted_failed_qa_line",
+                  "position_checkpoint": None, "association": None}
+        try:
+            _failed_qa_require(all(type(v) is str and v.strip() == v and
+                0 < len(v.encode()) <= 512 for v in (project_id, backlog_id, contract_execution_id)),
+                "source_scope_mismatch")
+            _failed_qa_require(type(source_completed_line_index) is int and
+                5 <= source_completed_line_index <= 127, "source_line_missing")
+            _failed_qa_require(source_event_hash is None or (type(source_event_hash) is str and
+                re.fullmatch(r"sha256:[a-f0-9]{64}", source_event_hash)), "source_line_commitment_mismatch")
+            record = self.store.get(contract_execution_id)
+            _failed_qa_require(record["project_id"] == project_id and record["backlog_id"] == backlog_id,
+                               "source_scope_mismatch")
+            lines = record["completed_lines"]
+            _failed_qa_require(isinstance(lines, list) and source_completed_line_index < len(lines),
+                               "source_line_missing")
+            line = lines[source_completed_line_index]
+            stamp = line.get(_FAILED_QA_STAMP_FIELD)
+            _failed_qa_require(isinstance(stamp, Mapping), "source_occurrence_stamp_unavailable")
+            expected, checkpoint = self._failed_qa_stamp(record, line, source_completed_line_index,
+                                                         stamp.get("occurred_at"))
+            _failed_qa_require(stamp == expected, "source_stamp_origin_unverified")
+            _failed_qa_require(not _authenticated_authored_qa_pass_attempt(line) and
+                not _qa_line_supersedes_active_failed_qa(line, source_record=record,
+                                                        source_line_index=source_completed_line_index),
+                "unsupported_event_family")
+            event_hash = _failed_qa_digest(line)
+            _failed_qa_require(source_event_hash is None or source_event_hash == event_hash,
+                               "source_line_commitment_mismatch")
+            authorship = _failed_qa_authorship(line)
+            semantic = checkpoint["semantic_checkpoint"]
+            execution = semantic["execution_binding"]
+            authorship["governed_attempt"] = execution["attempt"]
+            rule_ref = "rule:" + _failed_qa_digest({"definition_digest": checkpoint["contract_hash"],
+                "stage_id": line["stage_id"], "line_id": line["line_id"],
+                "evidence_kind": line["evidence_kind"], "actor_role": line["actor_role"]})
+            fact_ref = "fact:" + _failed_qa_digest({"source_line_ref": stamp["event_id"],
+                "source_line_digest": event_hash, "rule_ref": rule_ref})
+            claim = {"event": {"type": "governance.block_observed.v1", "id": stamp["event_id"],
+                               "occurred_at": stamp["occurred_at"]},
+                "scope": {"project_id": project_id, "backlog_id": backlog_id,
+                    "contract_execution_id": contract_execution_id,
+                    "world_id": semantic["world"]["world_ref"],
+                    "world_ref_hash": semantic["world"]["world_ref"][6:],
+                    "generation_id": execution["generation_id"], "execution_id": execution["execution_id"]},
+                "block": {"subsystem": "contract_runtime", "reason_code": "failed_independent_qa",
+                    "claimed_disposition": "BLOCK", "rule_ref": rule_ref, "fact_ref": fact_ref,
+                    "position_ref": checkpoint["semantic_ref"], "direction_ref": "unavailable",
+                    "guide_ref": "unavailable", "attempted_actions": [],
+                    "evidence_digests": [event_hash, authorship["provenance_commitment"],
+                                         stamp["admission_rule_commitment"]]}}
+            active_index, _ = _active_failed_qa_line(lines, source_record=record)
+            # A different failed QA is not a passing supersession.
+            _failed_qa_require(active_index in {-1, source_completed_line_index}, "active_boundary_mismatch")
+            association = {"schema_version": "contract_runtime.failed_qa_association.v1",
+                "kind": "execution_context_anchor_event_association",
+                "event_family": "contract_runtime.admitted_failed_qa_boundary",
+                "native_event_disposition": "failed_independent_qa_no_completion",
+                "source_locator": {"store": "contract_runtime_executions",
+                                   "source_completed_line_index": source_completed_line_index},
+                "source_event_hash": event_hash,
+                "digest_convention": "sha256_canonical_complete_stored_completed_line_v1",
+                "occurrence": {"timestamp_provenance": "native_accepted_qa_line_writer_utc",
+                               "writer_entrypoint": stamp["writer_entrypoint"]},
+                "execution_anchor": {key: stamp["execution_anchor"][key] for key in
+                                     ("kind", "position_ref", "prefix_through_ordinal", "prefix_commitment")},
+                "admission": {"instruction_bundle_hash": record["instruction_bundle_hash"],
+                    "line_id": line["line_id"], "stage_id": line["stage_id"],
+                    "evidence_kind": line["evidence_kind"], "actor_role": line["actor_role"],
+                    "pinned_line_rule_ref": rule_ref},
+                "qa_authorship": authorship, "event_claim": claim,
+                "event_claim_hash": _failed_qa_digest(claim),
+                "event_time_position_status": "unavailable", "genuine_authority_block": False,
+                "current_boundary": {"status": "active_failed_qa" if active_index >= 0 else "superseded_by_later_valid_qa",
+                    "source_revision": checkpoint["execution_state_revision"],
+                    "state_hash": checkpoint["execution_state_hash"],
+                    "active_source_line_index": active_index if active_index >= 0 else None,
+                    "authority_scope": "audit_only", "audit_only": True, "close_satisfying": False}}
+            association["association_hash"] = _failed_qa_digest(association)
+            result.update(ok=True, error=None, absence=None,
+                          position_checkpoint=checkpoint, association=association)
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError,
+                ContractRuntimeError, ContractDefinitionError, UnicodeError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else "invalid_source_binding"
+            result["absence"] = reason if re.fullmatch(r"[a-z][a-z0-9_]{0,100}", reason) else "invalid_source_binding"
         return result
 
     def projected_record(
@@ -10226,11 +10486,14 @@ class ContractRuntime:
         actor_role: str | None = None,
         projected_completed_lines: Sequence[Mapping[str, Any]] | None = None,
         projection: Mapping[str, Any] | None = None,
+        accepted_qa_context: _AcceptedFailedQAWriterContext | None = None,
     ) -> dict[str, Any]:
         record = self.store.get(contract_execution_id)
         self._raise_if_terminally_retired(record)
         definition = self._load_pinned_definition(record)
-        effective_write = dict(write)
+        admitted_prestate = record
+        writer_context = accepted_qa_context
+        effective_write = _strip_failed_qa_observation_claims(write)
         body_actor_role = str(effective_write.get("actor_role") or "")
         effective_actor_role = _effective_actor_role(effective_write, actor_role=actor_role)
         if effective_actor_role:
@@ -10387,6 +10650,38 @@ class ContractRuntime:
                     }
                 )
             return result
+        observation_absence = None
+        unstamped_candidate = (refreshed, result_record)
+        if (written_line.get("line_id") == "qa_independent_verification"
+                and effective_actor_role == "qa"
+                and _active_failed_qa_line_index(refreshed["completed_lines"],
+                                                source_record=refreshed)
+                    == len(refreshed["completed_lines"]) - 1):
+            try:
+                _failed_qa_require(type(writer_context) is _AcceptedFailedQAWriterContext
+                    and writer_context.execution_id == contract_execution_id,
+                    "source_stamp_origin_unverified")
+                _failed_qa_require(writer_context.binding ==
+                    written_line["qa_evidence_provenance"]["authenticated_qa_binding"] and
+                    writer_context.scope == {key: written_line.get(key) for key in writer_context.scope},
+                    "qa_worker_scope_mismatch")
+                stamp, _ = self._failed_qa_stamp(admitted_prestate, written_line,
+                    len(admitted_prestate.get("completed_lines") or []),
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                stamped_source_lines = deepcopy(refreshed["completed_lines"])
+                stamped_source_lines[-1][_FAILED_QA_STAMP_FIELD] = stamp
+                stamped_result_lines = deepcopy(result_record["completed_lines"])
+                stamped_result_lines[-1][_FAILED_QA_STAMP_FIELD] = stamp
+                refreshed = self._record_view(refreshed, actor_role=effective_actor_role,
+                                              completed_lines=stamped_source_lines)
+                # Projection may differ, but the same source-owned stamped line is used.
+                result_record = self._record_view(result_record, actor_role=effective_actor_role,
+                                                 completed_lines=stamped_result_lines,
+                                                 projection=projection if use_completed_line_projection else None)
+            except Exception as exc:
+                # Optional observation must never alter otherwise admitted QA behavior.
+                refreshed, result_record = unstamped_candidate
+                observation_absence = str(exc) if isinstance(exc, ValueError) else "unsupported_execution_anchor"
         try:
             self.store.update(
                 contract_execution_id,
@@ -10403,6 +10698,7 @@ class ContractRuntime:
         return {
             "schema_version": "contract_runtime_write_result.v1",
             "ok": True,
+            **({"failed_qa_observation_absence": observation_absence} if observation_absence else {}),
             "decision": _gate_decision_payload(gate_decision),
             "record": result_record,
         }
@@ -12563,6 +12859,7 @@ def _line_evidence_from_write(
     write: Mapping[str, Any],
     effective_actor_role: str,
 ) -> dict[str, Any]:
+    write = _strip_failed_qa_observation_claims(write)
     evidence: dict[str, Any] = {
         "stage_id": str(write.get("stage_id") or ""),
         "line_id": str(write.get("line_id") or ""),

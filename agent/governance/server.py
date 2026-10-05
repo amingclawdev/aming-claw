@@ -5796,6 +5796,16 @@ class _CleanupRequestTiming:
             self._record("request", "final", outcome)
 
 
+
+def _failed_qa_wire_refusal(absence, request_id):
+    return {"schema_version": "contract_runtime.failed_qa_association.v1",
+            "response_view": "failed_qa_association", "ok": False,
+            "error": "failed_qa_association_unavailable", "absence": absence,
+            "observation_only": True,
+            "request_id": request_id if type(request_id) is str and re.fullmatch(r"req-[a-f0-9]{12,32}", request_id) else "",
+            "source_of_authority": "ContractRuntime.durable_admitted_failed_qa_line",
+            "position_checkpoint": None, "association": None}
+
 class GovernanceHandler(BaseHTTPRequestHandler):
     """HTTP request handler with routing and middleware."""
 
@@ -5866,7 +5876,21 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             body = wire_response(body)
         timing = getattr(self, "_cleanup_timing", None)
         with timing.phase("encoding") if timing else nullcontext():
-            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            if (body.get("response_view") == "failed_qa_association" and
+                    body.get("schema_version") == "contract_runtime.failed_qa_association.v1"):
+                encode = lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False).encode("utf-8")
+                try:
+                    payload = encode(body)
+                    if len(payload) > 16384:
+                        body = _failed_qa_wire_refusal("wire_oversize", body.get("request_id"))
+                        payload = encode(body)
+                except (TypeError, ValueError, UnicodeError):
+                    body = _failed_qa_wire_refusal("invalid_source_binding", body.get("request_id"))
+                    payload = encode(body)
+                assert len(payload) <= 16384
+            else:
+                payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         try:
             with timing.phase("response") if timing else nullcontext():
                 self.send_response(code)
@@ -140358,6 +140382,8 @@ def _contract_runtime_bind_authenticated_qa_provenance(
 ) -> dict[str, Any]:
     """Replace caller-shaped QA authority with authenticated session facts."""
 
+    from .contracts.runtime import _strip_failed_qa_observation_claims
+    write = _strip_failed_qa_observation_claims(write)
     sanitized = _contract_runtime_strip_authority_claims(
         write,
         field_names=_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS,
@@ -140927,12 +140953,17 @@ def _contract_runtime_bind_qa_independent_verification_authority(
                 else None
             ),
         )
-    return _contract_runtime_bind_qa_no_pass_ledger_authority(
+    effective = _contract_runtime_bind_qa_no_pass_ledger_authority(
         conn,
         project_id=project_id,
         record=record,
         write=effective,
     )
+
+    from .contracts.runtime import _AcceptedFailedQAWriterContext
+    ctx._accepted_failed_qa_writer_context = _AcceptedFailedQAWriterContext(
+        str(record.get("contract_execution_id") or ""), effective)
+    return effective
 
 
 def _contract_runtime_transient_post_worker_lines(
@@ -240296,7 +240327,7 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     compact_next_action_projection: dict[str, Any] = {}
     response_view = str(ctx.query.get("response_view") or "").strip()
     with DBContext(project_id) as conn:
-        if response_view in {"recorded_line", "native_event", "position_checkpoint"} and not conn.in_transaction:
+        if response_view in {"recorded_line", "native_event", "position_checkpoint", "failed_qa_association"} and not conn.in_transaction:
             # Own only a new transaction; preserve an existing caller snapshot.
             conn.execute("BEGIN")
         record = _contract_runtime_store(conn).get(contract_execution_id)
@@ -240308,6 +240339,25 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             contract_execution_id=contract_execution_id,
             record=record,
         )
+        if response_view == "failed_qa_association":
+            permitted = {"response_view", "backlog_id", "source_completed_line_index", "source_event_hash"}
+            index = ctx.query.get("source_completed_line_index")
+            if type(index) is str and len(index) <= 3 and re.fullmatch(r"0|[1-9][0-9]*", index):
+                index = int(index)
+            elif type(index) is not int:
+                index = None
+            if set(ctx.query) - permitted:
+                response = _failed_qa_wire_refusal("invalid_selector", ctx.request_id)
+            else:
+                response = _contract_runtime(conn).failed_qa_association_view(
+                    contract_execution_id, project_id=project_id,
+                    backlog_id=ctx.query.get("backlog_id"), source_completed_line_index=index,
+                    source_event_hash=ctx.query.get("source_event_hash"))
+                response["request_id"] = ctx.request_id
+                if response["ok"]:
+                    response["position_checkpoint"].update(request_id=ctx.request_id, actor_role=actor_role)
+            conn.commit()
+            return response
         if response_view == "position_checkpoint":
             def selector_integer(name):
                 value = ctx.query.get(name)
@@ -241589,6 +241639,7 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                             contract_execution_id,
                             write,
                             actor_role=actor_role,
+                            accepted_qa_context=getattr(ctx, "_accepted_failed_qa_writer_context", None),
                             projected_completed_lines=(
                                 _contract_runtime_projection_completed_lines(
                                     projection
