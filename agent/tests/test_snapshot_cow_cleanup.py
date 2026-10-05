@@ -2042,3 +2042,148 @@ def test_adjacent_metadata_batch_native_aggregate_output_is_all_or_refusal(tmp_p
     with pytest.raises(cow.CowRefusal, match="cow_metadata_output_oversize"):
         cow._metadata_batch(((first, False), (second, False)))
     assert not cow._METADATA_UNREAPED
+
+
+@pytest.fixture
+def volume_diagnostic_fixture(monkeypatch):
+    from types import SimpleNamespace
+    import stat
+    path = Path("/private/diagnostic-only-secret/snapshot")
+    mount = Path("/private/diagnostic-only-secret/mount")
+    node = Path("/dev/disk42")
+    before = SimpleNamespace(st_dev=42, st_ino=11, st_mode=stat.S_IFDIR)
+    device = SimpleNamespace(st_dev=1, st_ino=12, st_rdev=42, st_mode=stat.S_IFBLK)
+    real_lstat = Path.lstat
+    def lstat(item):
+        if item == node:
+            return device
+        if item in (path, mount):
+            return before
+        return real_lstat(item)
+    monkeypatch.setattr(cow.sys, "platform", "darwin")
+    monkeypatch.setattr(cow, "_path", lambda item, **_kw: item)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    info = {"FilesystemType": "apfs", "MountPoint": str(mount),
+            "DeviceNode": str(node), "VolumeUUID": "private-fixture-uuid"}
+    calls = []
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        raw = (b"Filesystem 512-blocks Used Available Capacity Mounted on\n"
+               b"/dev/disk42 1 1 1 1% /private/mount\n") if argv[0] == "df" else plistlib.dumps(info)
+        return subprocess.CompletedProcess(argv, 0, stdout=raw, stderr=b"secret-stderr")
+    monkeypatch.setattr(cow.subprocess, "run", run)
+    return path, mount, node, info, calls, run
+
+
+@pytest.mark.parametrize("command", ["df", "diskutil"])
+@pytest.mark.parametrize("kind", ["timeout", "exit", "os_error"])
+def test_volume_diagnostic_command_phase_safe_metadata(volume_diagnostic_fixture, monkeypatch, command, kind):
+    import errno
+    path, _, _, _, calls, normal = volume_diagnostic_fixture
+    def fail(argv, **kwargs):
+        if argv[0] != command:
+            return normal(argv, **kwargs)
+        calls.append((argv, kwargs))
+        if kind == "timeout":
+            raise subprocess.TimeoutExpired(argv, 10, output=b"secret-stdout", stderr=b"secret-stderr")
+        if kind == "exit":
+            raise subprocess.CalledProcessError(7, argv, output=b"secret-stdout", stderr=b"secret-stderr")
+        raise PermissionError(errno.EACCES, "secret-exception-message", str(path))
+    monkeypatch.setattr(cow.subprocess, "run", fail)
+    with pytest.raises(cow.CowRefusal, match="^cow_volume_unreadable$") as caught:
+        cow._volume(path)
+    diagnostic = caught.value.metadata["volume_diagnostic"]
+    expected = {"context": "unspecified", "phase": command + "_command",
+                "exception_category": {"timeout": "timeout", "exit": "command_exit", "os_error": "os_error"}[kind]}
+    expected.update({"timeout_seconds": 10} if kind == "timeout" else
+                    {"returncode": 7} if kind == "exit" else {"errno": errno.EACCES})
+    assert diagnostic == expected
+    assert "secret" not in json.dumps(caught.value.metadata)
+    assert [argv[0] for argv, _ in calls] == (["df"] if command == "df" else ["df", "diskutil"])
+    assert all(options == {"capture_output": True, "check": True, "timeout": 10} for _, options in calls)
+
+
+@pytest.mark.parametrize("case,phase,reason,category", [
+    ("decode", "df_decode", "cow_volume_unreadable", "decode_error"),
+    ("plist", "diskutil_decode", "cow_volume_unreadable", "plist_error"),
+    ("device", "device_validation", "cow_volume_device_unverified", "validation"),
+    ("filesystem", "filesystem_validation", "apfs_filesystem_required", "validation"),
+    ("identity", "volume_identity", "cow_volume_identity_unverified", "validation"),
+])
+def test_volume_diagnostic_decode_and_explicit_validation(volume_diagnostic_fixture, monkeypatch, case, phase, reason, category):
+    path, _, _, info, _, normal = volume_diagnostic_fixture
+    if case == "filesystem":
+        info["FilesystemType"] = "other"
+    if case == "identity":
+        del info["VolumeUUID"]
+    def run(argv, **kwargs):
+        if case == "decode" and argv[0] == "df":
+            return subprocess.CompletedProcess(argv, 0, stdout=b"\xffsecret")
+        if case == "device" and argv[0] == "df":
+            return subprocess.CompletedProcess(argv, 0, stdout=b"header\nsecret-node value\n")
+        if case == "plist" and argv[0] == "diskutil":
+            return subprocess.CompletedProcess(argv, 0, stdout=b'<?xml version="1.0"?><plist><dict>')
+        return normal(argv, **kwargs)
+    monkeypatch.setattr(cow.subprocess, "run", run)
+    with pytest.raises(cow.CowRefusal, match="^" + reason + "$") as caught:
+        cow._volume(path)
+    assert caught.value.metadata["volume_diagnostic"] == {
+        "context": "unspecified", "phase": phase, "exception_category": category}
+    assert "secret" not in json.dumps(caught.value.metadata)
+
+
+def test_volume_diagnostic_success_unchanged_and_archive_scope(volume_diagnostic_fixture, monkeypatch):
+    path, mount, _, info, calls, normal = volume_diagnostic_fixture
+    assert cow._volume(path) == {"uuid": info["VolumeUUID"], "mount": str(mount), "device": 42}
+    monkeypatch.setattr(cow, "_config", lambda _pid: {"archive_root": str(path), "archive_mount": "/private"})
+    monkeypatch.setattr(cow.os.path, "ismount", lambda _path: True)
+    def fail(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 10, output=b"secret")
+    monkeypatch.setattr(cow.subprocess, "run", fail)
+    with pytest.raises(cow.CowRefusal) as caught:
+        cow._archive("proj", path)
+    assert caught.value.metadata["volume_diagnostic"]["context"] == "archive"
+    monkeypatch.setattr(cow.subprocess, "run", fail)
+    with pytest.raises(cow.CowRefusal) as direct:
+        cow._volume(path)
+    assert direct.value.metadata["volume_diagnostic"]["context"] == "unspecified"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native private COW fixture requires macOS")
+def test_volume_diagnostic_snapshot_scope_survives_prejournal(cow_fixture, monkeypatch):
+    plan = preview(cow_fixture)
+    real_run = subprocess.run
+    def fail(argv, **kwargs):
+        if argv[0] == "df":
+            raise subprocess.TimeoutExpired(argv, 10, output=b"secret-stdout", stderr=b"secret-stderr")
+        return real_run(argv, **kwargs)
+    monkeypatch.setattr(cow, "_volume", _REAL_VOLUME)
+    monkeypatch.setattr(cow.subprocess, "run", fail)
+    with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+        apply(cow_fixture, plan)
+    payload = caught.value.payload
+    assert payload["refusal_reason"] == "cow_volume_unreadable" and payload["native_prejournal_refusal"]
+    assert payload["refusal_metadata"]["volume_diagnostic"] == {
+        "context": "snapshot", "phase": "df_command", "exception_category": "timeout", "timeout_seconds": 10}
+    assert payload["writes_performed"] is False and payload["write_disposition"] == "not_written"
+    assert not cow._state_root("proj").exists() and not list(cow_fixture[4].iterdir())
+    assert "secret" not in json.dumps(payload["refusal_metadata"])
+
+
+@pytest.mark.parametrize("exception,category", [
+    (subprocess.TimeoutExpired(["secret-command"], 2 ** 4096, output=b"secret"), "timeout"),
+    (subprocess.CalledProcessError("secret-returncode", ["secret-command"], output=b"secret"), "command_exit"),
+    (OSError("secret-os-message"), "os_error"),
+    (ValueError("secret-value-message"), "value_error"),
+])
+def test_volume_diagnostic_untrusted_exception_numbers_stay_bounded(volume_diagnostic_fixture, monkeypatch, exception, category):
+    path = volume_diagnostic_fixture[0]
+    def fail(*_args, **_kwargs):
+        raise exception
+    monkeypatch.setattr(cow.subprocess, "run", fail)
+    with pytest.raises(cow.CowRefusal, match="^cow_volume_unreadable$") as caught:
+        cow._volume(path)
+    assert caught.value.metadata["volume_diagnostic"] == {
+        "context": "unspecified", "phase": "df_command", "exception_category": category}
+    assert len(json.dumps(caught.value.metadata)) < 160
+    assert "secret" not in json.dumps(caught.value.metadata)
