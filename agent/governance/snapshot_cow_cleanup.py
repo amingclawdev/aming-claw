@@ -421,7 +421,8 @@ def _live_pins_in_snapshot(conn: sqlite3.Connection, project_id: str) -> set[str
     for table in sorted(stores & names):
         columns = cleanup._table_columns(conn, table)
         if table == "contract_runtime_executions":
-            for reference in snapshots._contract_reference_rows(conn, project_id, known_ids):
+            for reference in snapshots._contract_reference_rows(
+                    conn, project_id, known_ids, current_only=True):
                 scanned += 1
                 state, metadata = reference["state"], reference["metadata"]
                 if state not in {"completed", "live"}:

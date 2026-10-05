@@ -2400,7 +2400,8 @@ def _decoded_reference_matches(token_cte: str, *, ordered: bool = False) -> str:
         "(typeof(atoms.key)='text' AND instr(atoms.key,json_extract(tokens.value,'$[1]'))>0)), ")
 
 
-def _contract_reference_projection(tokens: list[tuple[str, str]], *, reusable=None) -> str:
+def _contract_reference_projection(tokens: list[tuple[str, str]], *, reusable=None,
+                                   current_only: bool = False) -> str:
     """SQL-only decoded pins; bodies and nested serialized audits stay SQLite-side.
 
     Literal and decoded substring matches deliberately overprotect. Nested JSON
@@ -2455,6 +2456,13 @@ def _contract_reference_projection(tokens: list[tuple[str, str]], *, reusable=No
         f"SELECT CASE WHEN length(pin_json)<={_REFERENCE_MAX_BYTES} THEN pin_json "
         "ELSE NULL END FROM projected) ELSE NULL END")
     complete_projection = f"CASE WHEN {guarded} THEN ({decoded} SELECT {complete}) ELSE 0 END"
+    if current_only:
+        # COW's current-use census already discards exact typed completed rows.
+        # Do not traverse their historical audits just to discard the result.
+        # Durable retention uses the default projection, including completed
+        # pins/completeness. Live and unknown states keep the original checks.
+        pin_projection = f"CASE WHEN ({state})='completed' THEN '[]' ELSE {pin_projection} END"
+        complete_projection = f"CASE WHEN ({state})='completed' THEN 1 ELSE {complete_projection} END"
     if reusable is not None:
         reusable["record_json"] = (state, pin_projection, complete_projection)
         state, pin_projection, complete_projection = (
@@ -2546,7 +2554,7 @@ def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
 
 
 def _contract_reference_rows(conn: sqlite3.Connection, project_id: str,
-                             known_ids: set[str]):
+                             known_ids: set[str], *, current_only: bool = False):
     columns = {r[1] for r in conn.execute("PRAGMA table_info(contract_runtime_executions)")}
     required = {"contract_execution_id", "project_id", "backlog_id", "record_json"}
     owned = required | {"contract_id", "version", "revision", "execution_state_revision",
@@ -2556,7 +2564,8 @@ def _contract_reference_rows(conn: sqlite3.Connection, project_id: str,
         raise ValueError("contract_runtime_executions_owner_schema_unknown")
     tokens = _snapshot_reference_tokens(conn, project_id, known_ids)
     reusable = {}
-    projection = _contract_reference_projection(tokens, reusable=reusable)
+    projection = _contract_reference_projection(tokens, reusable=reusable,
+                                               current_only=current_only)
     for row in _reference_pages(conn, "contract_runtime_executions",
             projection, "project_id=?", (project_id,), reusable=reusable):
         _, identity, storage_type, byte_length, state, raw_pins, complete = row

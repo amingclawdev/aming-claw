@@ -7842,8 +7842,8 @@ def test_contract_search_dedup_page_continuation_and_memo_are_lossless(conn, mon
             conn, 'contract_runtime_executions', projection, 'project_id=?', (PID,), reusable=reusable)]
     candidate = collect()
     ordinary = store._contract_reference_projection
-    def original_projection(tokens, *, reusable=None):
-        projection = ordinary(tokens, reusable=reusable)
+    def original_projection(tokens, *, reusable=None, current_only=False):
+        projection = ordinary(tokens, reusable=reusable, current_only=current_only)
         if reusable is not None:
             reusable['record_json'] = tuple(expression.replace(
                 _DISTINCT_REFERENCE_SEARCH, _REPEATED_REFERENCE_SEARCH)

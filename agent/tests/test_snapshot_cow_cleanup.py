@@ -1341,3 +1341,176 @@ def test_internal_plan_fresh_pin_and_engine_policy_drift_are_not_bypassed(cow_fi
     config['governance']['snapshot_cow_cleanup']['max_pairs'] = 7
     with pytest.raises(cow.CowRefusal, match='config_drift'):
         cow._fresh(conn, 'proj', root, plan, plan['candidates'][0])
+
+
+def test_current_contract_completed_audits_do_not_spend_prejournal_census_budget(cow_fixture, monkeypatch):
+    """Real apply shape: preview then selected-row _fresh, same native writer lock."""
+    if sys.platform != 'darwin':
+        pytest.skip('native apply preflight requires macOS')
+    conn, root, base, *_ = cow_fixture
+    records = [(f'phase-{n}', 'proj', 'backlog', 'contract', '1', '1', 1,
+                json.dumps({'runtime_guide': {'next_legal_action': False if n<19 else None},
+                            'history': {'note': f'live-audit-{n:03d} full-active' if n<19 else f'completed-audit-{n:03d} full-old',
+                                        'nested': json.dumps({'values': [{'audit': 'large independent completed metadata ' * 128}] * 8})}}), 'now', 'now')
+               for n in range(110)]
+    conn.executemany('INSERT INTO contract_runtime_executions '
+                     '(contract_execution_id,project_id,backlog_id,contract_id,version,revision,'
+                     'execution_state_revision,record_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', records)
+    conn.commit()
+    approved = preview(cow_fixture)
+    row = approved['candidates'][0]
+    files_before = {p: p.read_bytes() for p in base.rglob('*.json')}
+    database = Path(conn.execute('PRAGMA database_list').fetchone()[2])
+    clock = [0.0]
+    completed_deep_searches = [0]
+    builtin = sqlite3.connect(':memory:')
+
+    def factory():
+        reader = sqlite3.connect(database)
+        reader.row_factory = sqlite3.Row
+        def instr(haystack, needle):
+            # Charge only the real SQL completed-audit decoded-pin search.
+            # State validation, live projection and all unrelated SQL stay real.
+            if (needle == 'full-old' and isinstance(haystack, str)
+                    and '\x00' in haystack and 'completed-audit-' in haystack):
+                completed_deep_searches[0] += 1
+                clock[0] += 13.0 / 91
+            return builtin.execute('SELECT instr(?,?)', (haystack, needle)).fetchone()[0]
+        reader.create_function('instr', 2, instr)
+        return reader
+
+    phases = []
+    original_rows = snapshots._contract_reference_rows
+    def contract_rows(*args, **kwargs):
+        phases.append((args[0].in_transaction, snapshots._reference_budget(args[0]).deadline))
+        yield from original_rows(*args, **kwargs)
+    monkeypatch.setattr(snapshots, '_contract_reference_rows', contract_rows)
+    monkeypatch.setattr(snapshots.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(snapshots._REFERENCE_LOG, 'isEnabledFor', lambda *_: False)
+    try:
+        with snapshots._owned_reference_connection(factory) as reader:
+            budget = snapshots._reference_budget(reader)
+            result = cleanup._cow_locked(reader, 'proj', root, 'apply',
+                    candidate_ids=[row['candidate_id']], plan_hash=approved['plan_hash'],
+                    plan_revision=approved['plan_revision'], operation_id=approved['operation_id'])
+            assert result['ok'] and result['writes_performed']
+            assert len(phases)==5 and all(phase==(True,25.0) for phase in phases)
+            assert completed_deep_searches == [0] and budget.deadline == 25.0
+            assert not reader.in_transaction and not budget.active and not budget.exhausted
+            assert cow._state_root('proj').exists()
+        assert {p: p.read_bytes() for p in files_before} == files_before
+        assert len(approved['candidates'])==2  # Both original equal graph/index pairs, one selected.
+    finally:
+        builtin.close()
+
+
+@pytest.mark.parametrize('body', [
+    {'runtime_guide': {'next_legal_action': None}, 'snapshot_id': 'full-old'},
+    {'runtime_guide': {'next_legal_action': False}, 'snapshot_id': 'full-old'},
+    {'runtime_guide': {'next_legal_action': 0}, 'serialized': json.dumps({'snapshot_id': 'full-old'})},
+    {}, {'runtime_guide': {}}, '{broken', sqlite3.Binary(b'{}'), None,
+    '{"runtime_guide":{"next_legal_action":false},"runtime_guide":{"next_legal_action":null},"snapshot_id":"full-old"}',
+    '{"runtime_guide":{"next_legal_action":null},"runtime_guide":{"next_legal_action":false},"snapshot_id":"full-old"}',
+    '{"runtime_guide":{"next_legal_action":false,"next_legal_action":null},"snapshot_id":"full-old"}',
+    '{"runtime_guide":{"next_legal_action":null,"next_legal_action":false},"snapshot_id":"full-old"}',
+])
+def test_current_contract_projection_only_skips_exact_completed_state(cow_fixture, body):
+    conn = cow_fixture[0]
+    payload = json.dumps(body) if isinstance(body, dict) else body
+    if payload is None:
+        conn.execute('DROP TABLE contract_runtime_executions')
+        conn.execute('CREATE TABLE contract_runtime_executions(contract_execution_id TEXT, '
+                     'project_id TEXT,backlog_id TEXT,record_json TEXT)')
+    _insert_census_contract(conn, payload) if payload is not None else conn.execute(
+        "INSERT INTO contract_runtime_executions VALUES('null','proj','backlog',NULL)")
+    durable = list(snapshots._contract_reference_rows(conn, 'proj', {'full-old'}))
+    current = list(snapshots._contract_reference_rows(conn, 'proj', {'full-old'}, current_only=True))
+    assert len(current) == len(durable) == 1
+    assert current[0]['state'] == durable[0]['state']
+    assert current[0]['metadata'] == durable[0]['metadata']
+    if durable[0]['state'] == 'completed':
+        assert durable[0]['pins'] == ['full-old']  # Historical durable protection remains.
+        assert current[0]['pins'] == [] and current[0]['complete']
+    else:
+        assert current == durable
+
+
+@pytest.mark.parametrize('change', ['live_data', 'schema', 'token', 'unknown_store', 'external_manifest', 'current_fence'])
+def test_current_contract_rechecks_late_protections_without_memo(cow_fixture, monkeypatch, change):
+    conn, root, _, config, _ = cow_fixture
+    _insert_census_contract(conn, json.dumps({'runtime_guide': {'next_legal_action': None},
+                                            'snapshot_id': 'full-old'}))
+    manifest = root / 'current-manifest.json'
+    if change == 'external_manifest':
+        manifest.write_text(json.dumps({'snapshot_id': 'full-active'}))
+        config['governance']['snapshot_cow_cleanup']['bundle_manifests'] = [str(manifest)]
+    approved = preview(cow_fixture)
+    row = approved['candidates'][0]
+    cow._fresh(conn, 'proj', root, approved, row)
+    if change == 'live_data':
+        conn.execute("UPDATE contract_runtime_executions SET record_json=?",
+                     (json.dumps({'runtime_guide': {'next_legal_action': False}, 'late_pin': 'full-old'}),))
+        conn.commit()  # End the earlier view; the next census must freshly read.
+    elif change == 'schema':
+        conn.execute('ALTER TABLE contract_runtime_executions ADD COLUMN unowned TEXT')
+    elif change == 'token':
+        conn.execute("INSERT INTO graph_snapshots(project_id,snapshot_id,snapshot_kind,status,created_at,commit_sha) VALUES('proj',?,'full','superseded','2019','fixture')",('x'*1025,))
+    elif change == 'unknown_store':
+        conn.execute('CREATE TABLE late_qa_session(snapshot_id TEXT,status TEXT)')
+        conn.execute("INSERT INTO late_qa_session VALUES('full-old','completed')")
+    elif change == 'external_manifest':
+        manifest.write_text(json.dumps({'snapshot_id': 'full-old'}))
+    else:
+        monkeypatch.setattr(server, '_graph_release_build_fence_state', lambda *_: {'clear': False})
+    with pytest.raises(cow.CowRefusal) as caught:
+        cow._fresh(conn, 'proj', root, approved, row)
+    if change == 'schema':
+        assert str(caught.value)=='cow_reference_census_refused'
+        assert caught.value.metadata['cause']=='contract_runtime_executions_owner_schema_unknown'
+    elif change == 'token':
+        assert str(caught.value)=='cow_reference_census_refused'
+        assert caught.value.metadata['cause']=='reference_identity_inventory_unbounded'
+    elif change == 'current_fence':
+        assert str(caught.value)=='cow_current_full_writer_active'
+    else:
+        assert str(caught.value)=='cow_snapshot_live_or_retained'
+    assert not cow._state_root('proj').exists()
+
+
+@pytest.mark.parametrize('phase', ['prejournal', 'before_replace'])
+def test_current_contract_shortcut_retains_absolute_budget_in_later_apply_phases(cow_fixture, monkeypatch, phase):
+    if sys.platform != 'darwin':
+        pytest.skip('native apply preflight requires macOS')
+    conn, root, base, *_ = cow_fixture
+    _insert_census_contract(conn, json.dumps({'runtime_guide': {'next_legal_action': None},
+                                            'snapshot_id': 'full-old'}))
+    approved=preview(cow_fixture);row=approved['candidates'][0]
+    database=Path(conn.execute('PRAGMA database_list').fetchone()[2])
+    before={p:p.read_bytes() for p in base.rglob('*.json')}
+    clock=[0.0];fresh_calls=[0];fresh=cow._fresh
+    def timed_fresh(*args, **kwargs):
+        fresh_calls[0]+=1
+        if fresh_calls[0]==(1 if phase=='prejournal' else 4):
+            clock[0]=26.0
+        return fresh(*args,**kwargs)
+    monkeypatch.setattr(cow,'_fresh',timed_fresh)
+    monkeypatch.setattr(snapshots.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(snapshots._REFERENCE_LOG,'isEnabledFor',lambda *_:False)
+    def factory():
+        reader=sqlite3.connect(database);reader.row_factory=sqlite3.Row;return reader
+    with snapshots._owned_reference_connection(factory) as reader:
+        budget=snapshots._reference_budget(reader)
+        arguments=dict(candidate_ids=[row['candidate_id']],plan_hash=approved['plan_hash'],
+                       plan_revision=approved['plan_revision'],operation_id=approved['operation_id'])
+        if phase=='prejournal':
+            with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+                cleanup._cow_locked(reader,'proj',root,'apply',**arguments)
+            assert caught.value.payload['native_prejournal_refusal']
+            assert not cow._state_root('proj').exists()
+        else:
+            result=cleanup._cow_locked(reader,'proj',root,'apply',**arguments)
+            assert not result['ok'] and result['applied_count']==0
+            assert result['error']=='CowRefusal:cow_reference_census_refused'
+        assert budget.deadline==25.0 and budget.exhausted and not budget.active
+        assert not reader.in_transaction
+    assert {p:p.read_bytes() for p in before}==before
