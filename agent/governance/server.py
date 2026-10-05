@@ -140960,9 +140960,14 @@ def _contract_runtime_bind_qa_independent_verification_authority(
         write=effective,
     )
 
-    from .contracts.runtime import _AcceptedFailedQAWriterContext
-    ctx._accepted_failed_qa_writer_context = _AcceptedFailedQAWriterContext(
+    from .contracts.runtime import (
+        _AcceptedFailedQAWriterContext, _FAILED_QA_ISSUED_CONTEXTS, _failed_qa_digest,
+    )
+    context = _AcceptedFailedQAWriterContext(
         str(record.get("contract_execution_id") or ""), effective)
+    _FAILED_QA_ISSUED_CONTEXTS[context] = (
+        context.execution_id, _failed_qa_digest(context.binding), _failed_qa_digest(context.scope))
+    ctx._accepted_failed_qa_writer_context = context
     return effective
 
 

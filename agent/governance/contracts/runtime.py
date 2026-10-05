@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from .execution_state import (
     _first_mapping_text,
@@ -47,6 +48,9 @@ from ..db import dev_runtime_verify_only, verify_existing_schema_capabilities
 
 _FAILED_QA_STAMP_FIELD = "failed_qa_event_stamp"
 _FAILED_QA_CONTEXT_FIELD = "_accepted_failed_qa_writer_context"
+# Source binder issues one ephemeral capability with an immutable scope/author
+# snapshot. Private-code access in this trusted interpreter is not a sandbox.
+_FAILED_QA_ISSUED_CONTEXTS = WeakKeyDictionary()
 
 
 class _AcceptedFailedQAWriterContext:
@@ -10657,13 +10661,16 @@ class ContractRuntime:
                 and _active_failed_qa_line_index(refreshed["completed_lines"],
                                                 source_record=refreshed)
                     == len(refreshed["completed_lines"]) - 1):
+            issued_context = (_FAILED_QA_ISSUED_CONTEXTS.pop(writer_context, None)
+                              if type(writer_context) is _AcceptedFailedQAWriterContext else None)
             try:
-                _failed_qa_require(type(writer_context) is _AcceptedFailedQAWriterContext
-                    and writer_context.execution_id == contract_execution_id,
+                _failed_qa_require(issued_context is not None
+                    and issued_context[0] == contract_execution_id,
                     "source_stamp_origin_unverified")
-                _failed_qa_require(writer_context.binding ==
-                    written_line["qa_evidence_provenance"]["authenticated_qa_binding"] and
-                    writer_context.scope == {key: written_line.get(key) for key in writer_context.scope},
+                _failed_qa_require(issued_context[1] == _failed_qa_digest(
+                    written_line["qa_evidence_provenance"]["authenticated_qa_binding"]) and
+                    issued_context[2] == _failed_qa_digest({key: written_line.get(key) for key in
+                        ("runtime_context_id", "task_id", "parent_task_id")}),
                     "qa_worker_scope_mismatch")
                 stamp, _ = self._failed_qa_stamp(admitted_prestate, written_line,
                     len(admitted_prestate.get("completed_lines") or []),

@@ -2884,11 +2884,11 @@ def test_position_checkpoint_handler_malformed_decimal_is_bounded_unknown(tmp_pa
     conn.close()
 
 
-def _failed_qa_association_handler_fixture(tmp_path, monkeypatch):
+def _failed_qa_association_handler_fixture(tmp_path, monkeypatch, *, qa_stage="qa"):
     """Actual producer/read/HTTP serializer on synthetic disposable SQLite only."""
     from contextlib import contextmanager
     from agent.tests.test_contract_runtime import _failed_qa_association_fixture, _submit_synthetic_failed_qa
-    runtime, conn, selector, writer_ctx, write = _failed_qa_association_fixture(tmp_path)
+    runtime, conn, selector, writer_ctx, write = _failed_qa_association_fixture(tmp_path, qa_stage=qa_stage)
     result = _submit_synthetic_failed_qa(runtime, writer_ctx, write)
     assert result["ok"], result
     conn.commit()
@@ -2991,3 +2991,13 @@ def test_failed_qa_association_oversize_refusal_never_echoes_invalid_request_id(
     raw, headers = _failed_qa_association_http_bytes(body)
     assert body["request_id"] == "" and len(raw) <= 16384
     assert headers["Content-Length"] == str(len(raw))
+
+
+def test_failed_qa_association_uses_exact_dynamic_pinned_QA_stage(tmp_path, monkeypatch):
+    runtime, conn, ctx = _failed_qa_association_handler_fixture(tmp_path, monkeypatch, qa_stage="independent_qa")
+    response = server.handle_project_contract_runtime_current_state(ctx)
+    assert response["ok"]
+    assert response["association"]["admission"]["stage_id"] == "independent_qa"
+    raw, headers = _failed_qa_association_http_bytes(response)
+    assert len(raw) <= 16384 and headers["Content-Length"] == str(len(raw))
+    conn.close()

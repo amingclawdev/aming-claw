@@ -6963,7 +6963,7 @@ def test_position_checkpoint_malformed_source_and_echo_are_bounded_unknown(tmp_p
     assert len(json.dumps(result, ensure_ascii=False).encode()) <= 16384
 
 
-def _failed_qa_association_fixture(tmp_path, *, sqlite=True):
+def _failed_qa_association_fixture(tmp_path, *, sqlite=True, qa_stage="qa"):
     """Synthetic sanitized prefix, genuinely admitted by the existing writer/Gate."""
     seed, seed_conn, selector = _position_checkpoint_fixture(tmp_path, sqlite=False)
     prefix = deepcopy(seed.store.get("cex-position")["completed_lines"])
@@ -6979,7 +6979,7 @@ def _failed_qa_association_fixture(tmp_path, *, sqlite=True):
             payload["graph_trace_evidence"]["parent_task_id"] = "cex-position"
     definition_path = tmp_path / "position_fixture.v1.rev1.json"
     definition = json.loads(definition_path.read_text())
-    definition["rule_layer"]["stages"].append({"stage_id": "qa", "lines": [{
+    definition["rule_layer"]["stages"].append({"stage_id": qa_stage, "lines": [{
         "line_id": "qa_independent_verification", "owner_role": "qa",
         "allowed_writer_roles": ["qa"], "evidence_kind": "independent_verification",
         "requires": ["worker_graph_context"]}]})
@@ -7005,7 +7005,7 @@ def _failed_qa_association_fixture(tmp_path, *, sqlite=True):
         assert result["ok"], json.dumps({"line": line["line_id"], "decision": result["decision"]})
     session = {"role": "qa", "principal_id": "synthetic-qa", "session_id": "ses-synthetic-qa"}
     ctx = SimpleNamespace(require_auth=lambda actual: session)
-    write = {"stage_id": "qa", "line_id": "qa_independent_verification", "actor_role": "qa",
+    write = {"stage_id": qa_stage, "line_id": "qa_independent_verification", "actor_role": "qa",
         "evidence_kind": "independent_verification", "status": "failed", "commit_sha": "a" * 40,
         "runtime_context_id": selector["runtime_context_id"], "task_id": selector["task_id"],
         "parent_task_id": "cex-position", "payload": {"status": "failed", "verdict": "FAIL",
@@ -7251,3 +7251,30 @@ def test_position_checkpoint_store_error_retains_structured_refusal(tmp_path, mo
     assert response["absence"] == "invalid_source_binding"
     assert response["semantic_checkpoint"] is None and response["custody_envelope"] is None
     assert gets == ["cex-position"]
+
+
+@pytest.mark.parametrize("use_issued_object", [False, True])
+def test_failed_qa_association_constructor_or_mutated_context_is_not_binder_issuance(tmp_path, use_issued_object):
+    from agent.governance.contracts.runtime import _AcceptedFailedQAWriterContext
+    runtime, conn, selector, ctx, write = _failed_qa_association_fixture(tmp_path)
+    forged = json.loads(json.dumps(write))
+    provenance = forged["qa_evidence_provenance"]
+    binding = provenance["authenticated_qa_binding"]
+    binding.update(qa_principal="caller-unauthenticated", qa_session_id="caller-session")
+    for source in (forged, provenance):
+        source["evidence_owner_actor"] = source["submitter_principal"] = "caller-unauthenticated"
+        source["evidence_owner_session"] = source["submitter_session"] = "caller-session"
+    forged["actor_session_principal"] = "caller-unauthenticated"
+    if use_issued_object:
+        context = ctx._accepted_failed_qa_writer_context
+        context.binding = deepcopy(binding)
+        context.scope = {key: forged[key] for key in ("runtime_context_id", "task_id", "parent_task_id")}
+    else:
+        context = _AcceptedFailedQAWriterContext("cex-position", forged)
+    result = runtime.submit_line_write("cex-position", forged, actor_role="qa", accepted_qa_context=context)
+    assert result["ok"]  # Observational failure cannot reject otherwise legal QA.
+    assert "failed_qa_event_stamp" not in runtime.store.get("cex-position")["completed_lines"][5]
+    view = runtime.failed_qa_association_view("cex-position", project_id=selector["project_id"],
+        backlog_id=selector["backlog_id"], source_completed_line_index=5)
+    assert not view["ok"] and view["absence"] == "source_occurrence_stamp_unavailable"
+    conn.close()
