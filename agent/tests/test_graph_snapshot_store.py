@@ -7998,3 +7998,130 @@ def test_followthrough_memo_partial_positive_survives_miss_cancellation(conn, mo
             collected.append(sid)
     assert collected == ['scope-current']
     assert memo.cache == {} and memo.bytes == 0
+
+
+@pytest.mark.parametrize('escaped', ['\\ud800', '\\udfff'])
+def test_followthrough_lone_surrogate_does_not_change_census_admission(conn, escaped):
+    _typed_reference_setup(conn, count=0)
+    conn.execute('CREATE TABLE ordinary_surrogate(project_id TEXT,asset_path TEXT,evidence_json TEXT)')
+    body = '{"note":"' + escaped + '","reference":"scope-durable"}'
+    conn.execute('INSERT INTO ordinary_surrogate VALUES (?,?,?)', (PID, 'scope-current', body))
+    conn.commit()
+    before = (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state['complete'], state['refusal_reasons']
+    assert {'scope-current', 'scope-durable'} <= state['durable_references'].keys()
+    memo = store._ReferenceTextMatches(conn, {'scope-durable'}, [('scope-durable', 'scope-durable')])
+    value = json.loads('"' + escaped + '"') + 'scope-durable'
+    assert set(memo.matches('decoded', value)) == {'scope-durable'}
+    assert memo.cache == {} and memo.bytes == 0
+    assert before == (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+
+
+_OWNER_FOLLOWTHROUGH_FIELDS = [
+    ('ai_output_events', 'id'),
+    ('ai_output_queue', 'priority'), ('ai_output_queue', 'attempt_count'), ('ai_output_queue', 'max_attempts'),
+    ('chain_events', 'id'), ('event_outbox', 'id'), ('event_outbox', 'retry_count'), ('event_outbox', 'dead_letter'),
+    ('gate_events', 'id'), ('gate_events', 'passed'), ('node_history', 'id'), ('node_history', 'version'),
+    ('node_state', 'version'), ('pending_nodes', 'id'), ('reconcile_file_inventory', 'size_bytes'),
+    ('reconcile_sessions', 'cluster_count_total'), ('reconcile_sessions', 'cluster_count_resolved'),
+    ('reconcile_sessions', 'cluster_count_failed'), ('snapshots', 'version'), ('task_attempts', 'id'),
+    ('task_attempts', 'attempt_num'), ('task_timeline_events', 'id'), ('task_timeline_events', 'attempt_num'),
+    ('task_timeline_events', 'parent_event_id'), ('task_timeline_events', 'schema_version'),
+    ('tasks', 'attempt_count'), ('tasks', 'max_attempts'), ('tasks', 'priority'), ('tasks', 'retry_round'),
+]
+
+
+def _canonical_owner_scalar_row(connection, table):
+    _typed_reference_setup(connection, count=0)
+    rows = connection.execute('PRAGMA table_info("' + table + '")').fetchall()
+    values = {}
+    for row in rows:
+        name, declared, notnull, default, pk = row[1:]
+        if name == 'id' and declared == 'INTEGER' and pk:
+            continue  # The canonical SQLite owner allocates the identity.
+        if name == 'project_id':
+            values[name] = PID
+        elif name.endswith('_json'):
+            values[name] = json.dumps({'snapshot_id': 'scope-durable'})
+        elif default is None and (notnull or pk):
+            values[name] = 1 if declared == 'INTEGER' else 'fixture'
+    names = {row['name'] for row in rows}
+    for name in ('reason', 'path', 'doc_path', 'target_id', 'prompt', 'node_id', 'task_id'):
+        if name in names:
+            values[name] = 'scope-durable'
+            break
+    fields = ','.join('"' + name + '"' for name in values)
+    connection.execute('INSERT INTO "' + table + '" (' + fields + ') VALUES (' + ','.join('?' for _ in values) + ')', tuple(values.values()))
+    connection.commit()
+
+
+@pytest.mark.parametrize('table,field', _OWNER_FOLLOWTHROUGH_FIELDS)
+def test_followthrough_canonical_owner_numeric_domains_are_complete(conn, table, field):
+    _canonical_owner_scalar_row(conn, table)
+    if field == 'priority':
+        conn.execute('UPDATE "' + table + '" SET priority=-7')
+        conn.commit()  # Both real ranking writers accept signed priorities.
+    schema = conn.execute('PRAGMA table_info("' + table + '")').fetchall()
+    assert field in store._generic_owned_scalar_domains(table, schema)
+    before = (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+    state = store.snapshot_retention_reference_state(conn, PID)
+    if table == 'pending_nodes':
+        assert not state['complete']  # Confidence is deliberately still unknown.
+        assert state['refusal_metadata'][0]['field'] == 'confidence'
+        assert 'confidence' not in store._generic_owned_scalar_domains(table, schema)
+    else:
+        assert state['complete'], state['refusal_reasons']
+    assert 'scope-durable' in state['durable_references']
+    assert before == (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+
+
+@pytest.mark.parametrize('table,field,value', [
+    ('task_timeline_events','id',0), ('task_timeline_events','attempt_num',-1),
+    ('task_timeline_events','parent_event_id',-1), ('task_timeline_events','schema_version',0),
+    ('tasks','attempt_count',-1), ('tasks','max_attempts',-1), ('tasks','retry_round',-1),
+    ('ai_output_queue','priority',1.5), ('ai_output_queue','max_attempts',0),
+    ('gate_events','passed',2), ('event_outbox','dead_letter',2),
+    ('event_outbox','retry_count',sqlite3.Binary(b'0')), ('event_outbox','retry_count','opaque'),
+    ('reconcile_file_inventory','size_bytes',-1), ('node_state','version',0),
+    ('snapshots','version',0), ('task_attempts','attempt_num',0),
+])
+def test_followthrough_canonical_owner_numeric_invalid_storage_refuses(conn, table, field, value):
+    _canonical_owner_scalar_row(conn, table)
+    conn.execute('UPDATE "' + table + '" SET "' + field + '"=?', (value,))
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state['complete'] and table + '_payload_unreadable' in state['refusal_reasons']
+    assert 'scope-durable' in state['durable_references']
+
+
+def test_followthrough_owner_mapping_case_drift_and_extra_payload(conn):
+    _canonical_owner_scalar_row(conn, 'task_timeline_events')
+    conn.execute('ALTER TABLE task_timeline_events RENAME TO temporary_case_owner')
+    conn.execute('ALTER TABLE temporary_case_owner RENAME TO Task_Timeline_Events')
+    conn.execute('ALTER TABLE Task_Timeline_Events RENAME COLUMN schema_version TO temporary_case_column')
+    conn.execute('ALTER TABLE Task_Timeline_Events RENAME COLUMN temporary_case_column TO Schema_Version')
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state['complete'], state['refusal_reasons']
+    conn.execute('ALTER TABLE Task_Timeline_Events ADD COLUMN caller_payload INTEGER')
+    conn.execute('UPDATE Task_Timeline_Events SET caller_payload=7')
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state['complete'] and 'scope-durable' in state['durable_references']
+    conn.execute('CREATE TABLE unknown_counts(project_id TEXT,retry_count INTEGER,payload_json TEXT)')
+    schema = conn.execute('PRAGMA table_info(unknown_counts)').fetchall()
+    assert store._generic_owned_scalar_domains('unknown_counts', schema) == {}
+    conn.execute('CREATE TABLE other_owner(id INTEGER PRIMARY KEY,retry_count REAL NOT NULL DEFAULT 0,event_type TEXT,payload_json TEXT,project_id TEXT,created_at TEXT)')
+    schema = conn.execute('PRAGMA table_info(other_owner)').fetchall()
+    assert 'retry_count' not in store._generic_owned_scalar_domains('event_outbox', schema)
+
+
+def test_followthrough_actual_outbox_writer_now_completes(conn):
+    from agent.governance.outbox import write_outbox
+    _typed_reference_setup(conn, count=0)
+    write_outbox(conn, 'synthetic.observed', {'snapshot_id':'scope-durable'}, PID)
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state['complete'], state['refusal_reasons']
+    assert 'scope-durable' in state['durable_references']

@@ -2572,6 +2572,108 @@ def _contract_reference_rows(conn: sqlite3.Connection, project_id: str,
                "complete": bool(complete) and raw_pins is not None, "metadata": metadata}
 
 
+def _generic_owned_scalar_domains(table, schema_rows):
+    """Closed canonical DDL/writer-owned numeric metadata, never affinity alone.
+
+    db.SCHEMA_SQL owns these exact columns. IDs are allocated by omitted
+    AUTOINCREMENT keys; versions/tallies/flags/ranks come from the matching
+    state_service, task_registry/timeline, outbox, ai_output_intake,
+    auto_chain and reconcile_file_inventory/deferred_queue writers. Priority
+    is a signed ordering rank, not a positive counter. Unsupported confidence
+    and all caller payload columns remain on the original conservative path.
+    Exact column metadata is checked while ordinary migration-added columns
+    remain independently inspected; no table is skipped.
+    """
+    domains = {
+        'ai_output_events': {
+            'id': (('INTEGER', 0, None, 1), '{col} >0'),
+        },
+        'ai_output_queue': {
+            'priority': (('INTEGER', 1, '0', 0), '1'),
+            'attempt_count': (('INTEGER', 1, '0', 0), '{col} >=0'),
+            'max_attempts': (('INTEGER', 1, '3', 0), '{col} >=1'),
+        },
+        'chain_events': {
+            'id': (('INTEGER', 0, None, 1), '{col} >0'),
+        },
+        'event_outbox': {
+            'id': (('INTEGER', 0, None, 1), '{col} >0'),
+            'retry_count': (('INTEGER', 1, '0', 0), '{col} >=0'),
+            'dead_letter': (('INTEGER', 1, '0', 0), '{col} IN (0,1)'),
+        },
+        'gate_events': {
+            'id': (('INTEGER', 0, None, 1), '{col} >0'),
+            'passed': (('INTEGER', 1, None, 0), '{col} IN (0,1)'),
+        },
+        'node_history': {
+            'id': (('INTEGER', 0, None, 1), '{col} >0'),
+            'version': (('INTEGER', 1, None, 0), '{col} >=1'),
+        },
+        'node_state': {
+            'version': (('INTEGER', 1, '1', 0), '{col} >=1'),
+        },
+        'pending_nodes': {
+            'id': (('INTEGER', 0, None, 1), '{col} >0'),
+        },
+        'reconcile_file_inventory': {
+            'size_bytes': (('INTEGER', 1, '0', 0), '{col} >=0'),
+        },
+        'reconcile_sessions': {
+            'cluster_count_total': (('INTEGER', 1, '0', 0), '{col} >=0'),
+            'cluster_count_resolved': (('INTEGER', 1, '0', 0), '{col} >=0'),
+            'cluster_count_failed': (('INTEGER', 1, '0', 0), '{col} >=0'),
+        },
+        'snapshots': {
+            'version': (('INTEGER', 1, None, 2), '{col} >=1'),
+        },
+        'task_attempts': {
+            'id': (('INTEGER', 0, None, 1), '{col} >0'),
+            'attempt_num': (('INTEGER', 1, None, 0), '{col} >=1'),
+        },
+        'task_timeline_events': {
+            'id': (('INTEGER', 0, None, 1), '{col} >0'),
+            'attempt_num': (('INTEGER', 1, '0', 0), '{col} >=0'),
+            'parent_event_id': (('INTEGER', 1, '0', 0), '{col} >=0'),
+            'schema_version': (('INTEGER', 1, '2', 0), '{col} >=1'),
+        },
+        'tasks': {
+            'attempt_count': (('INTEGER', 1, '0', 0), '{col} >=0'),
+            'max_attempts': (('INTEGER', 1, '3', 0), '{col} >=0'),
+            'priority': (('INTEGER', 1, '0', 0), '1'),
+            'retry_round': (('INTEGER', 1, '0', 0), '{col} >=0'),
+        },
+    }
+    owner_keys = {
+        'ai_output_events': ('event_type', 'output_id', 'payload_json', 'project_id'),
+        'ai_output_queue': ('output_id', 'project_id', 'status', 'task_type'),
+        'chain_events': ('event_type', 'payload_json', 'root_task_id', 'task_id'),
+        'event_outbox': ('created_at', 'event_type', 'payload_json', 'project_id'),
+        'gate_events': ('gate_name', 'passed', 'project_id', 'task_id'),
+        'node_history': ('evidence_json', 'node_id', 'project_id', 'to_status'),
+        'node_state': ('build_status', 'node_id', 'project_id', 'verify_status'),
+        'pending_nodes': ('confidence', 'doc_path', 'node_id', 'project_id'),
+        'reconcile_file_inventory': ('mapped_node_ids', 'path', 'project_id', 'run_id'),
+        'reconcile_sessions': ('cluster_count_total', 'project_id', 'session_id', 'status'),
+        'snapshots': ('created_at', 'project_id', 'snapshot_json'),
+        'task_attempts': ('started_at', 'status', 'task_id'),
+        'task_timeline_events': ('artifact_refs_json', 'event_type', 'payload_json', 'project_id', 'verification_json'),
+        'tasks': ('project_id', 'prompt', 'status', 'task_id', 'type'),
+    }
+    # SQLite identifiers fold ASCII only, including actual mixed-case DDL.
+    fold = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+    owner = table.translate(fold)
+    expected = domains.get(owner, {})
+    actual = {str(row["name"]).translate(fold): row for row in schema_rows}
+    if not set(owner_keys.get(owner, ())) <= actual.keys():
+        return {}
+    result = {}
+    for field, (metadata, predicate) in expected.items():
+        row = actual.get(field)
+        if row is not None and tuple(row)[2:] == metadata:
+            result[str(row["name"])] = predicate
+    return result
+
+
 class _ReferenceTextMatches:
     """Request-local, bounded memo of pure token matches, never owner verdicts.
 
@@ -2602,7 +2704,13 @@ class _ReferenceTextMatches:
                     yield sid
             _reference_checkpoint(self.conn)
             result = frozenset(pins)
-            cost = len(text.encode("utf-8")) + sum(len(sid.encode("utf-8")) for sid in result) + 64
+            try:
+                cost = len(text.encode("utf-8")) + sum(len(sid.encode("utf-8")) for sid in result) + 64
+            except UnicodeEncodeError:
+                # Valid decoded JSON can contain a lone surrogate. Cache
+                # accounting is optional; preserve exact original matching
+                # and admission without replacing or normalizing the text.
+                return
             if (len(self.cache) < _REFERENCE_TEXT_MEMO_ENTRIES and
                     self.bytes + cost <= _REFERENCE_TEXT_MEMO_BYTES):
                 self.cache[key] = result
@@ -2967,7 +3075,8 @@ def _snapshot_retention_reference_state(
                 {"snapshot_id"} if table in self_identity_tables else set()))
             quoted_columns = ['"' + col.replace('"', '""') + '"' for col in text_columns]
             owner_fields = projected_owner_fields.get(table, {})
-            owner_scalars = scalar_domains.get(table, {})
+            owner_scalars = {**_generic_owned_scalar_domains(table, schema_rows),
+                             **scalar_domains.get(table, {})}
             if table == "dashboard_backlog_cache_generation":
                 # This is the exact separately owned db.py capability, not a
                 # name/affinity exemption for an arbitrary generation payload.
