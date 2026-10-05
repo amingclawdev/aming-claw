@@ -1514,3 +1514,303 @@ def test_current_contract_shortcut_retains_absolute_budget_in_later_apply_phases
         assert budget.deadline==25.0 and budget.exhausted and not budget.active
         assert not reader.in_transaction
     assert {p:p.read_bytes() for p in before}==before
+
+
+@pytest.mark.parametrize("reply", ["hang", "malformed", "oversize", "error"])
+def test_bounded_metadata_worker_refuses_untrusted_or_hanging_reply(tmp_path, monkeypatch, reply):
+    import time
+    path = tmp_path / "payload"
+    path.write_bytes(b"private metadata fixture")
+    worker = tmp_path / "metadata_worker.py"
+    programs = {"hang": "import time; time.sleep(60)",
+                "malformed": "print('not json')",
+                "oversize": "print('x' * (1024 * 1024 + 1))",
+                "error": "import sys; sys.exit(7)"}
+    worker.write_text(programs[reply])
+    monkeypatch.setattr(cow, "_METADATA_HELPER", worker, raising=False)
+    monkeypatch.setattr(cow, "_METADATA_SECONDS", 0.08, raising=False)
+    # Baseline synchronous acquisition demonstrably does not honor this wall bound.
+    original_xattrs = cow._xattrs
+    if reply == "hang":
+        def slow_inline(candidate):
+            time.sleep(0.15)
+            return original_xattrs(candidate)
+        monkeypatch.setattr(cow, "_xattrs", slow_inline)
+    processes = []
+    original_popen = subprocess.Popen
+    def tracked(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(subprocess, "Popen", tracked)
+    started = time.monotonic()
+    with pytest.raises(cow.CowRefusal, match="cow_metadata_"):
+        cow._metadata(path)
+    assert time.monotonic() - started < 0.8
+    assert len(processes) == 1
+    assert all(p.poll() is not None for p in processes)
+    assert all(p.stdout.closed and p.stderr.closed for p in processes)
+
+
+@pytest.mark.parametrize("field", ["missing", "boolean_stat", "invalid_hex", "acl", "extra", "duplicate", "stderr", "nonfinite_birth", "huge_birth"])
+def test_bounded_metadata_reply_typed_shape_is_fail_closed(tmp_path, monkeypatch, field):
+    path = tmp_path / "payload"
+    path.write_bytes(b"typed metadata")
+    metadata = cow._metadata(path)
+    if field == "missing":
+        metadata.pop("xattrs")
+    elif field == "boolean_stat":
+        metadata["ino"] = True
+    elif field == "invalid_hex":
+        metadata["xattrs"] = {"test": "not-hex"}
+    elif field == "acl":
+        metadata["acl"] = None if sys.platform == "darwin" else "invented ACL"
+    elif field == "extra":
+        metadata["unknown"] = 1
+    elif field == "nonfinite_birth":
+        metadata["birthtime"] = float("nan")
+    elif field == "huge_birth":
+        metadata["birthtime"] = 10 ** 1000
+    raw = json.dumps(metadata)
+    if field == "duplicate":
+        raw = raw[:-1] + ', "ino": 123}'
+    worker = tmp_path / "reply.py"
+    worker.write_text("import sys; sys.stdout.write(" + repr(raw) + ")" +
+                      ("; sys.stderr.write('metadata denied')" if field == "stderr" else ""))
+    monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+    with pytest.raises(cow.CowRefusal, match="cow_metadata_reply_invalid|cow_metadata_worker_failed"):
+        cow._metadata(path)
+    assert not cow._METADATA_UNREAPED
+
+
+def test_bounded_metadata_exact_native_xattr_acl_fidelity_and_identity(tmp_path, monkeypatch):
+    from agent.governance import snapshot_cow_metadata as worker
+    path = tmp_path / "payload"
+    path.write_bytes(b"native local fixture")
+    os.chmod(path, 0o640)
+    os.utime(path, ns=(12_000_000_000, 24_000_000_000))
+    if sys.platform == "darwin":
+        worker._call("setxattr", ctypes.c_int,
+                     [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
+                      ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int],
+                     os.fsencode(path), b"org.aming-claw.binary-test",
+                     ctypes.create_string_buffer(b"\x00\xff\x01"), 3, 0, 0x41)
+    else:
+        os.setxattr(path, "org.aming-claw.binary-test", b"\x00\xff\x01", follow_symlinks=False)
+    if sys.platform == "darwin":
+        subprocess.run(["/bin/chmod", "+a", "everyone allow read", str(path)], check=True)
+    info = path.lstat()
+    expected = worker._metadata(path)
+    actual = cow._metadata(path)
+    assert actual == expected
+    assert actual["ino"] == info.st_ino and actual["dev"] == info.st_dev
+    assert actual["mode"] == 0o640 and actual["mtime_ns"] == 24_000_000_000
+    assert actual["xattrs"] == worker._xattrs(path)
+    assert actual["xattrs"]["org.aming-claw.binary-test"] == "00ff01"
+    if sys.platform == "darwin":
+        assert "everyone" in actual["acl"] and "read" in actual["acl"]
+    assert cow._xattrs(path) == actual["xattrs"]
+    directory = cow._metadata(tmp_path, directory=True)
+    assert directory == worker._metadata(tmp_path, directory=True)
+    assert not cow._METADATA_UNREAPED
+    observed = []
+    original = subprocess.Popen
+    def tracked(argv, **kwargs):
+        observed.append((argv, kwargs))
+        return original(argv, **kwargs)
+    monkeypatch.setattr(subprocess, "Popen", tracked)
+    monkeypatch.setenv("GOV_TOKEN", "disposable-not-a-credential")
+    assert cow._metadata(path) == expected
+    argv, options = observed[0]
+    assert argv[:3] == [sys.executable, "-I", "-B"]
+    assert set(options["env"]) == {"PATH", "PYTHONDONTWRITEBYTECODE"}
+    assert not any(key in options for key in ("user", "group", "extra_groups", "preexec_fn", "shell"))
+    assert "GOV_TOKEN" not in options["env"]
+
+
+def test_bounded_metadata_shared_absolute_census_deadline_not_reset(tmp_path, monkeypatch):
+    import time
+    path = tmp_path / "payload"
+    path.write_bytes(b"budgeted fixture")
+    worker = tmp_path / "hang.py"
+    worker.write_text("import time; time.sleep(60)")
+    monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+    with snapshots._owned_reference_connection(lambda: sqlite3.connect(":memory:")) as conn:
+        budget = snapshots._reference_budget(conn)
+        with budget.census():
+            pass
+        assert budget.deadline - budget.started == 25
+        budget.deadline = time.monotonic() + 0.04  # Remaining original deadline, no renewal.
+        deadline = budget.deadline
+        token = cow._METADATA_CONNECTION.set(conn)
+        try:
+            start = time.monotonic()
+            with pytest.raises(cow.CowRefusal, match="cow_metadata_timeout"):
+                cow._metadata(path)
+            assert time.monotonic() - start < 0.7
+            assert budget.deadline == deadline
+            with pytest.raises(cow.CowRefusal, match="cow_reference_census_refused") as exhausted:
+                cow._metadata(path)
+            assert exhausted.value.metadata["cause"] == "reference_census_budget_exhausted"
+            assert budget.deadline == deadline
+            with pytest.raises(snapshots._ReferenceBudgetExceeded):
+                with budget.census():
+                    pass
+        finally:
+            cow._METADATA_CONNECTION.reset(token)
+        assert not cow._METADATA_UNREAPED
+    assert cow._METADATA_CONNECTION.get() is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="private APFS fixture")
+@pytest.mark.parametrize("fresh_phase", [1, 2])
+def test_bounded_metadata_timeout_preserves_native_journal_boundary(cow_fixture, monkeypatch, fresh_phase):
+    plan = preview(cow_fixture)
+    worker = cow_fixture[1].parent / "hang.py"
+    worker.write_text("import time; time.sleep(60)")
+    original = cow._fresh
+    calls = [0]
+    processes = []
+    popen = subprocess.Popen
+    def tracked(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        processes.append(child)
+        return child
+    monkeypatch.setattr(subprocess, "Popen", tracked)
+    def inject(*args, **kwargs):
+        calls[0] += 1
+        if calls[0] == fresh_phase:
+            monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+            monkeypatch.setattr(cow, "_METADATA_SECONDS", 0.08)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(cow, "_fresh", inject)
+    journal = cow._journal_path("proj", plan["operation_id"])
+    if fresh_phase == 1:
+        with pytest.raises(cleanup.StaleArtifactCleanupError) as caught:
+            cleanup.apply_stale_artifact_cleanup(
+                cow_fixture[0], "proj", repo_root_path=cow_fixture[1],
+                dimension=cow.DIMENSION, plan_hash=plan["plan_hash"],
+                plan_revision=plan["plan_revision"], operation_id=plan["operation_id"],
+                candidate_ids=[plan["candidates"][0]["candidate_id"]])
+        assert caught.value.payload["native_prejournal_refusal"] is True
+        assert caught.value.payload["writes_performed"] is False
+        assert not journal.exists() and not journal.with_name(journal.name + ".pending").exists()
+    else:
+        result = cleanup.apply_stale_artifact_cleanup(
+                cow_fixture[0], "proj", repo_root_path=cow_fixture[1],
+                dimension=cow.DIMENSION, plan_hash=plan["plan_hash"],
+                plan_revision=plan["plan_revision"], operation_id=plan["operation_id"],
+                candidate_ids=[plan["candidates"][0]["candidate_id"]])
+        assert result["state"] == "partial_or_ambiguous"
+        assert journal.exists()
+        record = json.loads(journal.read_text())
+        assert record["state"] == "partial_or_ambiguous"
+        assert "cow_metadata_timeout" in record["error"]
+    assert not list(cow_fixture[4].rglob("*.backup"))
+    for row in plan["candidates"]:
+        for side in ("source", "target"):
+            path = cow_fixture[2] / row[side]
+            assert hashlib.sha256(path.read_bytes()).hexdigest() == row["sha256"]
+            assert path.stat().st_ino == row[side + "_metadata"]["ino"]
+    assert all(child.poll() is not None for child in processes)
+    assert not cow._METADATA_UNREAPED and cow._METADATA_CONNECTION.get() is None
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "missing", "errno", "bad_error"])
+def test_bounded_metadata_preserves_specific_refusal_and_typed_errno(tmp_path, monkeypatch, kind):
+    path = tmp_path / "payload"
+    path.write_bytes(b"private refusal fixture")
+    expected = "cow_metadata_reply_invalid"
+    if kind == "symlink":
+        link = tmp_path / "link"
+        link.symlink_to(path)
+        path = link
+        expected = "symlink_component"
+    elif kind == "hardlink":
+        os.link(path, tmp_path / "second-link")
+        expected = "hardlink_refused"
+    elif kind == "missing":
+        path.unlink()
+        expected = "path_missing"
+    else:
+        reason = "os_metadata_error" if kind == "errno" else []
+        reply = {"error": {"type": "oserror", "errno": 13, "reason": reason}}
+        worker = tmp_path / "error.py"
+        worker.write_text("import sys; print(" + repr(json.dumps(reply)) + "); sys.exit(4)")
+        monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+        if kind == "errno":
+            expected = "cow_metadata_os_error"
+    with pytest.raises(cow.CowRefusal, match=expected) as caught:
+        cow._metadata(path)
+    if kind == "errno":
+        assert caught.value.metadata == {"errno": 13}
+    assert not cow._METADATA_UNREAPED
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin ctypes aggregate fixture")
+def test_bounded_metadata_child_refuses_aggregate_before_next_value_allocation(tmp_path, monkeypatch):
+    from agent.governance import snapshot_cow_metadata as worker
+    value_allocations = []
+    allocate = ctypes.create_string_buffer
+    def buffer(size):
+        value_allocations.append(size)
+        return allocate(size)
+    monkeypatch.setattr(worker.ctypes, "create_string_buffer", buffer)
+    names = b"first\x00second\x00"
+    def call(name, _restype, _args, *args):
+        if name == "listxattr":
+            if args[1] is not None:
+                ctypes.memmove(args[1], names, len(names))
+            return len(names)
+        assert name == "getxattr"
+        if args[2] is not None:
+            ctypes.memset(args[2], 1, args[3])
+        return 24
+    monkeypatch.setattr(worker, "_call", call)
+    with pytest.raises(ValueError, match="cow_metadata_output_oversize"):
+        worker._xattrs(tmp_path, max_bytes=90)
+    assert value_allocations == [len(names), 24]  # Second 24-byte value never allocated/hex-copied.
+
+
+def test_bounded_metadata_unreapable_helper_cleanup_is_bounded_and_accounted(tmp_path, monkeypatch):
+    import time
+    path = tmp_path / "payload"
+    path.write_bytes(b"cleanup fixture")
+    class Unreapable:
+        pid = 123456789
+        ended = False
+        killed = 0
+        waits = []
+        def __init__(self):
+            r1, w1 = os.pipe(); r2, w2 = os.pipe()
+            self.stdout = os.fdopen(r1, "rb"); self.stderr = os.fdopen(r2, "rb")
+            self.writers = [w1, w2]
+        def poll(self):
+            return 0 if self.ended else None
+        def kill(self):
+            self.killed += 1
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired("disposable simulated OS wait", timeout)
+    child = Unreapable()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: child)
+    monkeypatch.setattr(cow, "_METADATA_SECONDS", 0.02)
+    try:
+        started = time.monotonic()
+        with pytest.raises(cow.CowRefusal, match="cow_metadata_helper_cleanup_unknown") as caught:
+            cow._metadata(path)
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.65 and child.waits == [0.25] and child.killed == 1
+        assert caught.value.metadata == {"helper_pid": child.pid}
+        assert cow._METADATA_UNREAPED[child.pid] is child
+        assert child.stdout.closed and child.stderr.closed
+        # No new helper/permission route while OS cleanup remains unknown.
+        with pytest.raises(cow.CowRefusal, match="cow_metadata_helper_cleanup_unknown"):
+            cow._metadata(path)
+        assert child.killed == 1
+    finally:
+        for fd in child.writers:
+            os.close(fd)
+        child.ended = True
+        cow._METADATA_UNREAPED.pop(child.pid, None)

@@ -20,6 +20,10 @@ import subprocess
 import sys
 import uuid
 import time
+import math
+import selectors
+from functools import wraps
+from time import monotonic as _metadata_clock
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -44,6 +48,11 @@ PRESERVED = ("mode", "uid", "gid", "mtime_ns", "flags", "xattrs", "acl")
 MAX_LIVE_ROWS = 2000
 MAX_JSON_BYTES = 1024 * 1024
 CLONE_NOFOLLOW_ANY = 0x8
+
+_METADATA_HELPER = Path(__file__).with_name("snapshot_cow_metadata.py")
+_METADATA_SECONDS = 2.0
+_METADATA_CONNECTION: ContextVar[Any] = ContextVar("cow_metadata_connection", default=None)
+_METADATA_UNREAPED: dict[int, Any] = {}
 
 
 class CowRefusal(ValueError):
@@ -145,67 +154,171 @@ def _call(name: str, restype: Any, argtypes: list[Any], *args: Any) -> Any:
     return result
 
 
-def _acl(path: Path) -> str:
-    try:
-        pointer = _call("acl_get_link_np", ctypes.c_void_p, [ctypes.c_char_p, ctypes.c_int],
-                        os.fsencode(path), 0x100)
-    except OSError as exc:
-        if exc.errno == errno.ENOENT:
-            return ""
-        raise
-    try:
-        length = ctypes.c_ssize_t()
-        text = _call("acl_to_text", ctypes.c_void_p,
-                     [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ssize_t)], pointer, ctypes.byref(length))
+def _metadata_scope(function):
+    @wraps(function)
+    def scoped(conn, *args, **kwargs):
+        token = _METADATA_CONNECTION.set(conn)
         try:
-            return ctypes.string_at(text, length.value).decode()
+            return function(conn, *args, **kwargs)
         finally:
-            _call("acl_free", ctypes.c_int, [ctypes.c_void_p], text)
+            _METADATA_CONNECTION.reset(token)
+    return scoped
+
+
+def _metadata_timeout():
+    budget = snapshots._reference_budget(_METADATA_CONNECTION.get())
+    remaining = _METADATA_SECONDS
+    if budget is not None and budget.deadline is not None:
+        remaining = min(remaining, budget.deadline - time.monotonic())
+    if remaining <= 0:
+        if budget is not None and budget.deadline is not None:
+            try:
+                if budget.active:
+                    budget.checkpoint()
+                else:
+                    # Use the original owner refusal/diagnostic and exhausted
+                    # state. An initialized census deadline is never renewed.
+                    with budget.census():
+                        pass
+            except snapshots._ReferenceBudgetExceeded as exc:
+                raise CowRefusal("cow_reference_census_refused",
+                                 {"cause": str(exc)[:160], "complete": False,
+                                  "body_fetched": False}) from exc
+        raise CowRefusal("cow_metadata_budget_exhausted")
+    return remaining
+
+
+def _metadata_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate metadata member")
+        value[key] = item
+    return value
+
+
+def _validate_metadata(value):
+    integers = ("dev", "ino", "size", "allocated_bytes", "nlink", "ctime_ns",
+                "mode", "uid", "gid", "mtime_ns", "flags")
+    if (not isinstance(value, dict)
+            or set(value) != {*integers, "birthtime", "xattrs", "acl"}
+            or any(type(value[key]) is not int for key in integers)
+            or value["size"] < 0 or value["allocated_bytes"] < 0
+            or (value["birthtime"] is not None and
+                (type(value["birthtime"]) not in (int, float)
+                 or abs(value["birthtime"]) > sys.float_info.max
+                 or not math.isfinite(value["birthtime"])))
+            or not isinstance(value["xattrs"], dict)
+            or any(not isinstance(k, str) or not isinstance(v, str)
+                   or re.fullmatch(r"(?:[0-9a-f]{2})*", v) is None
+                   for k, v in value["xattrs"].items())
+            or (not isinstance(value["acl"], str) if sys.platform == "darwin"
+                else value["acl"] is not None)):
+        raise CowRefusal("cow_metadata_reply_invalid")
+    return value
+
+
+def _bounded_metadata(path: Path, *, directory: bool):
+    encoded = os.fsencode(path.absolute())
+    if len(encoded) > 8192 or b"\0" in encoded or type(directory) is not bool:
+        raise CowRefusal("cow_metadata_request_invalid")
+    for pid, child in list(_METADATA_UNREAPED.items()):
+        if child.poll() is None:
+            raise CowRefusal("cow_metadata_helper_cleanup_unknown", {"helper_pid": pid})
+        _METADATA_UNREAPED.pop(pid, None)
+    deadline = _metadata_clock() + _metadata_timeout()
+    process = None
+    streams = {"stdout": bytearray(), "stderr": bytearray()}
+    try:
+        # Exact current interpreter and principal. No shell, identity override,
+        # governance imports, credential environment, DB or mutation command.
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-B", str(_METADATA_HELPER), os.fsdecode(encoded),
+             "1" if directory else "0"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
+            env={"PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1"})
+        with selectors.DefaultSelector() as selector:
+            for name in streams:
+                pipe = getattr(process, name)
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, selectors.EVENT_READ, name)
+            total = 0
+            while selector.get_map():
+                remaining = deadline - _metadata_clock()
+                if remaining <= 0:
+                    raise CowRefusal("cow_metadata_timeout")
+                for key, _ in selector.select(remaining):
+                    data = os.read(key.fileobj.fileno(), min(65536, MAX_JSON_BYTES + 1 - total))
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(data)
+                    if total > MAX_JSON_BYTES:
+                        raise CowRefusal("cow_metadata_output_oversize")
+                    streams[key.data].extend(data)
+        try:
+            code = process.wait(timeout=max(0, deadline - _metadata_clock()))
+        except subprocess.TimeoutExpired as exc:
+            raise CowRefusal("cow_metadata_timeout") from exc
+        if streams["stderr"]:
+            raise CowRefusal("cow_metadata_worker_failed")
+        try:
+            result = json.loads(streams["stdout"], object_pairs_hook=_metadata_object)
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise CowRefusal("cow_metadata_reply_invalid") from exc
+        if code != 0:
+            if (code != 4 or not isinstance(result, dict) or set(result) != {"error"}
+                    or not isinstance(result["error"], dict)
+                    or set(result["error"]) != {"type", "errno", "reason"}):
+                raise CowRefusal("cow_metadata_worker_failed")
+            error = result["error"]
+            if not isinstance(error["type"], str) or not isinstance(error["reason"], str):
+                raise CowRefusal("cow_metadata_reply_invalid")
+            refusals = {"symlink_component", "path_missing", "unexpected_file_type", "hardlink_refused",
+                        "apfs_platform_unsupported", "cow_metadata_or_clone_facility_unsupported",
+                        "cow_xattr_facility_unsupported", "cow_xattr_list_drift", "cow_xattr_value_drift",
+                        "cow_metadata_output_oversize", "cow_metadata_worker_failed"}
+            if error["type"] == "refusal" and error["errno"] is None and error["reason"] in refusals:
+                raise CowRefusal(error["reason"])
+            if (error["type"] == "oserror" and type(error["errno"]) is int
+                    and 0 < error["errno"] < 4096 and error["reason"] == "os_metadata_error"):
+                raise CowRefusal("cow_metadata_os_error", {"errno": error["errno"]})
+            raise CowRefusal("cow_metadata_reply_invalid")
+        result = _validate_metadata(result)
+        if _metadata_clock() >= deadline:
+            raise CowRefusal("cow_metadata_timeout")
+        _metadata_timeout()  # No success after the shared absolute budget expired.
+        return result
+    except OSError as exc:
+        raise CowRefusal("cow_metadata_worker_failed") from exc
     finally:
-        _call("acl_free", ctypes.c_int, [ctypes.c_void_p], pointer)
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                try:
+                    process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired as exc:
+                    # OS-uninterruptible helpers must remain accounted for;
+                    # refuse further workers instead of hanging cleanup/retrying.
+                    _METADATA_UNREAPED[process.pid] = process
+                    raise CowRefusal("cow_metadata_helper_cleanup_unknown",
+                                     {"helper_pid": process.pid}) from exc
+            finally:
+                process.stdout.close()
+                process.stderr.close()
+
+
+def _acl(path: Path) -> str:
+    return _metadata(path)["acl"]
 
 
 def _xattrs(path: Path) -> dict[str, str]:
-    if sys.platform != "darwin":
-        if not hasattr(os, "listxattr"):
-            raise CowRefusal("cow_xattr_facility_unsupported")
-        return {key: os.getxattr(path, key, follow_symlinks=False).hex()
-                for key in os.listxattr(path, follow_symlinks=False)}
-    args = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-    size = _call("listxattr", ctypes.c_ssize_t, args, os.fsencode(path), None, 0, 0x41)
-    if not size:
-        return {}
-    buffer = ctypes.create_string_buffer(size)
-    if _call("listxattr", ctypes.c_ssize_t, args, os.fsencode(path), buffer, size, 0x41) != size:
-        raise CowRefusal("cow_xattr_list_drift")
-    result = {}
-    get_args = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
-                ctypes.c_uint32, ctypes.c_int]
-    for name in buffer.raw.rstrip(b"\0").split(b"\0"):
-        size = _call("getxattr", ctypes.c_ssize_t, get_args, os.fsencode(path), name, None, 0, 0, 0x41)
-        value = ctypes.create_string_buffer(max(1, size))
-        if _call("getxattr", ctypes.c_ssize_t, get_args, os.fsencode(path), name, value, size, 0, 0x41) != size:
-            raise CowRefusal("cow_xattr_value_drift")
-        result[os.fsdecode(name)] = value.raw[:size].hex()
-    return result
+    return _metadata(path)["xattrs"]
 
 
 def _metadata(path: Path, *, directory: bool = False) -> dict[str, Any]:
-    _path(path)
-    info = path.lstat()
-    if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
-        raise CowRefusal("unexpected_file_type")
-    if not directory and info.st_nlink != 1:
-        raise CowRefusal("hardlink_refused")
-    # POSIX identity can be previewed portably; unsupported apply is refused
-    # before any backup/journal effect, never by substituting a copy for clone.
-    return {"dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
-            "allocated_bytes": info.st_blocks * 512, "nlink": info.st_nlink,
-            "birthtime": getattr(info, "st_birthtime", None), "ctime_ns": info.st_ctime_ns,
-            "mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid,
-            "mtime_ns": info.st_mtime_ns, "flags": getattr(info, "st_flags", 0),
-            "xattrs": _xattrs(path),
-            "acl": _acl(path) if sys.platform == "darwin" else None}
+    return _bounded_metadata(path, directory=directory)
 
 
 def _same(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
@@ -619,6 +732,7 @@ def _pair(project_id: str, sid: str, relative: tuple[str, str]) -> dict[str, Any
             "snapshot_identity": _metadata(root, directory=True), "safe_to_apply": True}
 
 
+@_metadata_scope
 def preview(conn: sqlite3.Connection, project_id: str, root: Path, *,
             _run_selection: RunSelection | None = None) -> dict[str, Any]:
     custody = _custody(conn, project_id, root)
@@ -1032,6 +1146,7 @@ def _result(record: dict[str, Any], *, replay: bool = False) -> dict[str, Any]:
             "measurement_note": "Available-byte deltas include background activity; st_blocks and df do not identify shared extents or exclusive reclaimed blocks."}
 
 
+@_metadata_scope
 def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_ids: list[str],
           plan_hash: str, plan_revision: int, operation_id: str,
           _run_selection: RunSelection | None = None) -> dict[str, Any]:
@@ -1152,6 +1267,7 @@ def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_id
     return _result(record)
 
 
+@_metadata_scope
 def recover(conn: sqlite3.Connection, project_id: str, root: Path, *, operation_id: str,
             action: str = "inspect") -> dict[str, Any]:
     if action not in {"inspect", "restore"}:
@@ -1256,6 +1372,7 @@ def recover(conn: sqlite3.Connection, project_id: str, root: Path, *, operation_
             "backup_retained": True, "original_journal_retained": True, "safe_retry": False}
 
 
+@_metadata_scope
 def periodic_resolution(conn: sqlite3.Connection, project_id: str, root: Path, *,
                         operation_id: str) -> dict[str, Any]:
     """Read-only terminal proof under the same native facade locks as recovery."""
@@ -1316,6 +1433,7 @@ def periodic_resolution(conn: sqlite3.Connection, project_id: str, root: Path, *
             'resolution': resolution}
 
 
+@_metadata_scope
 def periodic_journal_readiness(conn: sqlite3.Connection, project_id: str, root: Path, *,
                                acknowledgements: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Fixed, metadata-only inventory. Unknown suffixes are never an empty census."""
@@ -1379,6 +1497,7 @@ def periodic_journal_readiness(conn: sqlite3.Connection, project_id: str, root: 
             'skipped_candidate_ids': sorted(skipped_candidates)}
 
 
+@_metadata_scope
 def periodic_zero_effect(conn: sqlite3.Connection, project_id: str, root: Path, *,
                          plan: dict[str, Any], acknowledgements: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Known pre-journal refusal must also prove unchanged files under native locks."""
