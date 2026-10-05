@@ -50,6 +50,8 @@ MAX_JSON_BYTES = 1024 * 1024
 CLONE_NOFOLLOW_ANY = 0x8
 
 _METADATA_HELPER = Path(__file__).with_name("snapshot_cow_metadata.py")
+_METADATA_HELPER_SHA256 = '7062033e4d0cdbb0c42743199e40fa9eab4b4ca90b5ad4d5708e52797d3582aa'
+_METADATA_SOURCE_BYTES = 16 * 1024
 _METADATA_SECONDS = 2.0
 _METADATA_CONNECTION: ContextVar[Any] = ContextVar("cow_metadata_connection", default=None)
 _METADATA_UNREAPED: dict[int, Any] = {}
@@ -232,8 +234,15 @@ def _bounded_metadata(path: Path, *, directory: bool):
     try:
         # Exact current interpreter and principal. No shell, identity override,
         # governance imports, credential environment, DB or mutation command.
+        with _METADATA_HELPER.open("rb") as source:
+            worker_source = source.read(_METADATA_SOURCE_BYTES + 1)
+        if (len(worker_source) > _METADATA_SOURCE_BYTES
+                or hashlib.sha256(worker_source).hexdigest() != _METADATA_HELPER_SHA256):
+            raise CowRefusal("cow_metadata_helper_source_drift")
+        # Execute exactly the verified bytes, not a path that can change after
+        # the loaded parent's helper hash check. The fixed helper imports only stdlib.
         process = subprocess.Popen(
-            [sys.executable, "-I", "-B", str(_METADATA_HELPER), os.fsdecode(encoded),
+            [sys.executable, "-I", "-B", "-c", worker_source.decode("utf-8"), os.fsdecode(encoded),
              "1" if directory else "0"], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
             env={"PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1"})

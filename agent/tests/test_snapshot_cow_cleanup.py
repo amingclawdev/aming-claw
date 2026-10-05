@@ -1528,6 +1528,7 @@ def test_bounded_metadata_worker_refuses_untrusted_or_hanging_reply(tmp_path, mo
                 "error": "import sys; sys.exit(7)"}
     worker.write_text(programs[reply])
     monkeypatch.setattr(cow, "_METADATA_HELPER", worker, raising=False)
+    monkeypatch.setattr(cow, "_METADATA_HELPER_SHA256", hashlib.sha256(worker.read_bytes()).hexdigest(), raising=False)
     monkeypatch.setattr(cow, "_METADATA_SECONDS", 0.08, raising=False)
     # Baseline synchronous acquisition demonstrably does not honor this wall bound.
     original_xattrs = cow._xattrs
@@ -1578,6 +1579,7 @@ def test_bounded_metadata_reply_typed_shape_is_fail_closed(tmp_path, monkeypatch
     worker.write_text("import sys; sys.stdout.write(" + repr(raw) + ")" +
                       ("; sys.stderr.write('metadata denied')" if field == "stderr" else ""))
     monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+    monkeypatch.setattr(cow, "_METADATA_HELPER_SHA256", hashlib.sha256(worker.read_bytes()).hexdigest(), raising=False)
     with pytest.raises(cow.CowRefusal, match="cow_metadata_reply_invalid|cow_metadata_worker_failed"):
         cow._metadata(path)
     assert not cow._METADATA_UNREAPED
@@ -1635,6 +1637,7 @@ def test_bounded_metadata_shared_absolute_census_deadline_not_reset(tmp_path, mo
     worker = tmp_path / "hang.py"
     worker.write_text("import time; time.sleep(60)")
     monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+    monkeypatch.setattr(cow, "_METADATA_HELPER_SHA256", hashlib.sha256(worker.read_bytes()).hexdigest(), raising=False)
     with snapshots._owned_reference_connection(lambda: sqlite3.connect(":memory:")) as conn:
         budget = snapshots._reference_budget(conn)
         with budget.census():
@@ -1681,6 +1684,7 @@ def test_bounded_metadata_timeout_preserves_native_journal_boundary(cow_fixture,
         calls[0] += 1
         if calls[0] == fresh_phase:
             monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+            monkeypatch.setattr(cow, "_METADATA_HELPER_SHA256", hashlib.sha256(worker.read_bytes()).hexdigest(), raising=False)
             monkeypatch.setattr(cow, "_METADATA_SECONDS", 0.08)
         return original(*args, **kwargs)
     monkeypatch.setattr(cow, "_fresh", inject)
@@ -1738,6 +1742,7 @@ def test_bounded_metadata_preserves_specific_refusal_and_typed_errno(tmp_path, m
         worker = tmp_path / "error.py"
         worker.write_text("import sys; print(" + repr(json.dumps(reply)) + "); sys.exit(4)")
         monkeypatch.setattr(cow, "_METADATA_HELPER", worker)
+        monkeypatch.setattr(cow, "_METADATA_HELPER_SHA256", hashlib.sha256(worker.read_bytes()).hexdigest(), raising=False)
         if kind == "errno":
             expected = "cow_metadata_os_error"
     with pytest.raises(cow.CowRefusal, match=expected) as caught:
@@ -1814,3 +1819,38 @@ def test_bounded_metadata_unreapable_helper_cleanup_is_bounded_and_accounted(tmp
             os.close(fd)
         child.ended = True
         cow._METADATA_UNREAPED.pop(child.pid, None)
+
+
+@pytest.mark.parametrize("oversize", [False, True])
+def test_bounded_metadata_helper_drift_refuses_before_process_launch(tmp_path, monkeypatch, oversize):
+    path = tmp_path / "payload"
+    path.write_bytes(b"private source-fence fixture")
+    source = cow._METADATA_HELPER.read_bytes()
+    helper = tmp_path / "drift.py"
+    helper.write_bytes(b"x" * (cow._METADATA_SOURCE_BYTES + 1) if oversize else source + b"\n# changed helper\n")
+    monkeypatch.setattr(cow, "_METADATA_HELPER", helper)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("drifted helper must not launch")
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    with pytest.raises(cow.CowRefusal, match="cow_metadata_helper_source_drift"):
+        cow._metadata(path)
+    assert not cow._METADATA_UNREAPED
+
+
+def test_bounded_metadata_executes_verified_source_bytes_not_reopened_file(tmp_path, monkeypatch):
+    path = tmp_path / "payload"
+    path.write_bytes(b"source-identity fixture")
+    expected = cow._metadata(path)
+    helper = tmp_path / "metadata.py"
+    source = cow._METADATA_HELPER.read_bytes()
+    helper.write_bytes(source)
+    monkeypatch.setattr(cow, "_METADATA_HELPER", helper)
+    original = subprocess.Popen
+    def replace_after_check(argv, **kwargs):
+        assert argv[3] == "-c"
+        assert hashlib.sha256(argv[4].encode()).hexdigest() == cow._METADATA_HELPER_SHA256
+        helper.write_text("raise AssertionError('replacement must never execute')")
+        return original(argv, **kwargs)
+    monkeypatch.setattr(subprocess, "Popen", replace_after_check)
+    assert cow._metadata(path) == expected
+    assert not cow._METADATA_UNREAPED
