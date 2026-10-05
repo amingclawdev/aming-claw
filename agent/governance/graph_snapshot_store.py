@@ -1952,6 +1952,8 @@ _REFERENCE_MAX_BYTES = 65536
 _REFERENCE_CENSUS_SECONDS = 25.0
 _REFERENCE_CONNECTIONS = threading.local()
 _REFERENCE_MEMO_BYTES = 8 * 1024 * 1024  # Per page, SQLite-side bodies only.
+_REFERENCE_TEXT_MEMO_BYTES = 1024 * 1024
+_REFERENCE_TEXT_MEMO_ENTRIES = 256
 _REFERENCE_DIAGNOSTICS = 8
 _REFERENCE_LOG = logging.getLogger(__name__)
 
@@ -1970,11 +1972,12 @@ def _reference_location(conn, phase, **location):
 
 def _reference_diagnostic(conn, cause, **location):
     budget = _reference_budget(conn)
-    # Reserve summary and cancellation slots. A later recheck on this same
-    # request must still expose exhaustion after a successful first census.
-    limit = (_REFERENCE_DIAGNOSTICS if cause == "budget_exhausted" else
-             _REFERENCE_DIAGNOSTICS - 1 if cause == "census_end" else
-             _REFERENCE_DIAGNOSTICS - 2)
+    # Reserve summary, cancellation and the subsequent independent Rule 4
+    # bundle observation. All still share the same eight-record request cap.
+    limit = (_REFERENCE_DIAGNOSTICS if location.get("phase") == "bundle" else
+             _REFERENCE_DIAGNOSTICS - 1 if cause == "budget_exhausted" else
+             _REFERENCE_DIAGNOSTICS - 2 if cause == "census_end" else
+             _REFERENCE_DIAGNOSTICS - 3)
     if budget is None or budget.diagnostics >= limit:
         return
     budget.diagnostics += 1
@@ -2569,8 +2572,51 @@ def _contract_reference_rows(conn: sqlite3.Connection, project_id: str,
                "complete": bool(complete) and raw_pins is not None, "metadata": metadata}
 
 
+class _ReferenceTextMatches:
+    """Request-local, bounded memo of pure token matches, never owner verdicts.
+
+    Raw known-ID substrings and decoded/encoded tokens are separate namespaces.
+    Every row still performs its original storage, JSON, current-use and reason
+    handling. The token inventory is immutable for this one census.
+    """
+    def __init__(self, conn, known_ids, tokens):
+        self.conn = conn
+        self.inventories = {"raw": tuple((sid, sid) for sid in known_ids if sid),
+                            "decoded": tuple(tokens)}
+        self.cache = {}
+        self.bytes = 0
+
+    def matches(self, kind, text):
+        _reference_checkpoint(self.conn)
+        key = (kind, text)
+        result = self.cache.get(key)
+        if result is None:
+            pins = set()
+            for sid, token in self.inventories[kind]:
+                _reference_checkpoint(self.conn)
+                if token in text:
+                    pins.add(sid)
+                    # Preserve each already observed positive pin if a later
+                    # token checkpoint exhausts the budget. Only complete
+                    # matching results may become a reusable cache entry.
+                    yield sid
+            _reference_checkpoint(self.conn)
+            result = frozenset(pins)
+            cost = len(text.encode("utf-8")) + sum(len(sid.encode("utf-8")) for sid in result) + 64
+            if (len(self.cache) < _REFERENCE_TEXT_MEMO_ENTRIES and
+                    self.bytes + cost <= _REFERENCE_TEXT_MEMO_BYTES):
+                self.cache[key] = result
+                self.bytes += cost
+        else:
+            for sid in result:
+                _reference_checkpoint(self.conn)
+                yield sid
+            # A hit cannot bypass the shared deadline or a field check.
+            _reference_checkpoint(self.conn)
+
+
 def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]],
-                                    checkpoint=lambda: None) -> set[str]:
+                                    checkpoint=lambda: None, matches=None) -> set[str]:
     """Legacy capped-body fallback, including nested serialized audit strings."""
     pins, visited = set(), 0
     def visit(child: Any, depth: int, declared_json=False) -> None:
@@ -2587,10 +2633,13 @@ def _bounded_decoded_reference_pins(value: Any, tokens: list[tuple[str, str]],
             for item in child:
                 visit(item, depth + 1)
         elif isinstance(child, str):
-            for sid, token in tokens:
-                checkpoint()
-                if token in child:
-                    pins.add(sid)
+            if matches is None:
+                for sid, token in tokens:
+                    checkpoint()
+                    if token in child:
+                        pins.add(sid)
+            else:
+                pins.update(matches("decoded", child))
             if "\x00" in child:
                 raise ValueError("reference_decoding_unknown")
             if child.lstrip().startswith(("{", "[")):
@@ -2844,6 +2893,7 @@ def _snapshot_retention_reference_state(
                 add_pin(current_use, value, "unclassified_owner_use_reference")
 
     tokens = _snapshot_reference_tokens(conn, project_id, known_ids)
+    text_matches = _ReferenceTextMatches(conn, known_ids, tokens)
 
     try:
         tables = [str(row["name"]) for row in conn.execute(
@@ -2918,6 +2968,16 @@ def _snapshot_retention_reference_state(
             quoted_columns = ['"' + col.replace('"', '""') + '"' for col in text_columns]
             owner_fields = projected_owner_fields.get(table, {})
             owner_scalars = scalar_domains.get(table, {})
+            if table == "dashboard_backlog_cache_generation":
+                # This is the exact separately owned db.py capability, not a
+                # name/affinity exemption for an arbitrary generation payload.
+                from .db import BACKLOG_READ_SCHEMA_TABLE_DEFINITION
+                actual = tuple(tuple(row)[1:] for row in schema_rows)
+                expected = tuple(metadata for metadata, _sql in BACKLOG_READ_SCHEMA_TABLE_DEFINITION)
+                if actual == expected:
+                    # Writer: seed 1, then +1 per backlog mutation. The owner
+                    # validator requires the one backlog resource and >=1.
+                    owner_scalars = {"generation": "{col}>=1 AND resource='backlog'"}
             projection, completions, reusable = [], [], {}
             for name, col in zip(text_columns, quoted_columns):
                 if name in owner_fields:
@@ -2989,11 +3049,9 @@ def _snapshot_retention_reference_state(
                     if not isinstance(raw, str) or len(raw) > 65536:
                         refusals.append(f"{table}_payload_unreadable")
                         continue
-                    for sid in known_ids:
-                        _reference_checkpoint(conn)
-                        if sid and sid in raw:
-                            add_pin(protected, sid, f"durable_{table}_text_reference")
-                            add_pin(current_use, sid, "unclassified_owner_use_reference")
+                    for sid in text_matches.matches("raw", raw):
+                        add_pin(protected, sid, f"durable_{table}_text_reference")
+                        add_pin(current_use, sid, "unclassified_owner_use_reference")
                     if "\x00" in raw or ("\\u" in raw and not raw.lstrip().startswith(("{", "["))):
                         refusals.append(f"{table}_payload_unreadable")
                         _reference_diagnostic(conn, "opaque_text_escape", storage=storage_type, bytes=byte_length)
@@ -3016,7 +3074,7 @@ def _snapshot_retention_reference_state(
                             raise
                         walk(payload, f"durable_{table}_payload_reference")
                         for sid in _bounded_decoded_reference_pins(payload, tokens,
-                                lambda: _reference_checkpoint(conn)):
+                                lambda: _reference_checkpoint(conn), matches=text_matches.matches):
                             add_pin(protected, sid, f"durable_{table}_payload_reference")
                             add_pin(current_use, sid, "unclassified_owner_use_reference")
                     except _ReferenceInventoryExceeded:

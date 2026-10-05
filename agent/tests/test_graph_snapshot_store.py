@@ -7356,7 +7356,7 @@ def test_census_diagnostics_bounded_private_and_plan_stable(conn, bundle_namespa
     with store._owned_reference_connection(lambda: conn, diagnostic_request_id='req-private-diagnostic'):
         second = store.snapshot_retention_reference_state(conn, PID)
         assert first['protected'] == second['protected'] and first['refusal_reasons'] == second['refusal_reasons']
-        assert len(caplog.records) == store._REFERENCE_DIAGNOSTICS - 1
+        assert len(caplog.records) == store._REFERENCE_DIAGNOSTICS - 2
         logs = '\n'.join(r.message for r in caplog.records)
         assert 'req-private-diagnostic' in logs and 'bounded_decoder_incomplete' in logs
         assert all(value not in logs for value in ['secret-body', '/private/path', 'authorization-token', 'SELECT '])
@@ -7540,12 +7540,12 @@ def test_native_cost_observation_reserves_exhaustion_after_summary(
         first = store.snapshot_retention_reference_state(connection, PID)
         records = _cost_observation_records(caplog)
         assert not first['complete'] and records[-1]['cause'] == 'census_end'
-        assert len(records) == store._REFERENCE_DIAGNOSTICS - 1
+        assert len(records) == store._REFERENCE_DIAGNOSTICS - 2
         clock[0] = 26.0
         later = store.snapshot_retention_reference_state(connection, PID)
         records = _cost_observation_records(caplog)
         assert not later['complete'] and 'reference_census_budget_exhausted' in later['refusal_reasons']
-        assert len(records) == store._REFERENCE_DIAGNOSTICS
+        assert len(records) == store._REFERENCE_DIAGNOSTICS - 1
         assert records[-1]['cause'] == 'budget_exhausted'
         assert store._reference_budget(connection).deadline == 25
         assert 'CANARY' not in caplog.text
@@ -7859,3 +7859,142 @@ def test_contract_search_dedup_page_continuation_and_memo_are_lossless(conn, mon
     assert all(row[5:] == ('["known"]', 1) for row in candidate)
     assert {row[4] for row in candidate} == {'completed', 'live'}
     assert before == hashlib.sha256(conn.serialize()).hexdigest()
+
+
+def _followthrough_owner_fixture(connection):
+    _typed_reference_setup(connection, count=0)
+    connection.execute(db.BACKLOG_READ_SCHEMA_TABLE_SQL)
+    connection.execute(db.BACKLOG_READ_SCHEMA_SEED_SQL)
+    for sql in db.BACKLOG_READ_SCHEMA_TRIGGER_SQL.values():
+        connection.execute(sql)
+    connection.execute("INSERT INTO backlog_bugs(bug_id,created_at,updated_at) VALUES ('owner-followthrough','now','now')")
+    connection.commit()
+
+
+def test_followthrough_generation_actual_writer_and_text_pin(conn):
+    _followthrough_owner_fixture(conn)
+    assert conn.execute("SELECT generation FROM dashboard_backlog_cache_generation").fetchone()[0] == 2
+    conn.execute("UPDATE dashboard_backlog_cache_generation SET updated_at='scope-durable'")
+    conn.commit()
+    before = (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert state['complete'], state['refusal_reasons']
+    assert 'scope-durable' in state['durable_references']
+    assert before == (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+
+
+@pytest.mark.parametrize('invalid', [0, -1, 1.5, 'opaque', sqlite3.Binary(b'1')])
+def test_followthrough_generation_invalid_domains_refuse(conn, invalid):
+    _followthrough_owner_fixture(conn)
+    conn.execute("UPDATE dashboard_backlog_cache_generation SET generation=?", (invalid,))
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state['complete']
+    assert 'dashboard_backlog_cache_generation_payload_unreadable' in state['refusal_reasons']
+    assert state['refusal_metadata'][0]['field'] == 'generation'
+
+
+@pytest.mark.parametrize('drift', ['unknown_resource', 'extra_column', 'wrong_default', 'unknown_owner'])
+def test_followthrough_generation_owner_schema_not_affinity_exempt(conn, drift):
+    _followthrough_owner_fixture(conn)
+    if drift == 'unknown_resource':
+        conn.execute("UPDATE dashboard_backlog_cache_generation SET resource='caller-payload'")
+    elif drift == 'extra_column':
+        conn.execute("ALTER TABLE dashboard_backlog_cache_generation ADD COLUMN caller_payload INTEGER")
+        conn.execute("UPDATE dashboard_backlog_cache_generation SET caller_payload=7")
+    elif drift == 'wrong_default':
+        conn.execute("DROP TABLE dashboard_backlog_cache_generation")
+        conn.execute("CREATE TABLE dashboard_backlog_cache_generation(resource TEXT PRIMARY KEY,generation INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL DEFAULT '')")
+        conn.execute("INSERT INTO dashboard_backlog_cache_generation VALUES ('backlog',1,'now')")
+    else:
+        conn.execute("CREATE TABLE unknown_owner(generation INTEGER,resource TEXT)")
+        conn.execute("INSERT INTO unknown_owner VALUES (1,'scope-durable')")
+    conn.commit()
+    state = store.snapshot_retention_reference_state(conn, PID)
+    assert not state['complete']
+    assert ('unknown_owner' if drift == 'unknown_owner' else 'dashboard_backlog_cache_generation') + '_payload_unreadable' in state['refusal_reasons']
+    if drift == 'unknown_owner':
+        assert 'scope-durable' in state['current_use']
+
+
+@pytest.mark.parametrize('entries,bytecap', [(256, 1048576), (0, 1048576), (256, 0), (1, 40)])
+def test_followthrough_text_memo_lossless_per_owner_reasons_and_invalids(conn, monkeypatch, entries, bytecap):
+    _typed_reference_setup(conn, count=0)
+    body = json.dumps({'snapshot_ids': ['new-outside-inventory'],
+                       'serialized': json.dumps({'notes': 'scope-durable'}),
+                       'escaped': '%73cope-current', 'case': 'SCOPE-CURRENT'})
+    conn.execute("CREATE TABLE owner_a(project_id TEXT,asset_path TEXT,evidence_json TEXT)")
+    conn.execute("CREATE TABLE owner_b(project_id TEXT,asset_path TEXT,evidence_json TEXT)")
+    for table in ('owner_a', 'owner_b'):
+        conn.executemany(f'INSERT INTO {table} VALUES (?,?,?)', [(PID, 'path/scope-current', body)] * 6)
+    conn.execute("INSERT INTO owner_b VALUES (?,?,?)", (PID, 'scope-durable\\u0061', sqlite3.Binary(body.encode())))
+    conn.commit()
+    before = (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+    with monkeypatch.context() as m:
+        m.setattr(store, '_REFERENCE_TEXT_MEMO_ENTRIES', 0)
+        expected = store.snapshot_retention_reference_state(conn, PID)
+    monkeypatch.setattr(store, '_REFERENCE_TEXT_MEMO_ENTRIES', entries)
+    monkeypatch.setattr(store, '_REFERENCE_TEXT_MEMO_BYTES', bytecap)
+    actual = store.snapshot_retention_reference_state(conn, PID)
+    assert actual == expected
+    assert {'scope-current', 'scope-durable', 'new-outside-inventory'} <= actual['durable_references'].keys()
+    assert 'durable_owner_a_text_reference' in actual['durable_references']['scope-current']
+    assert 'durable_owner_b_text_reference' in actual['durable_references']['scope-current']
+    assert not actual['complete']
+    assert before == (conn.total_changes, hashlib.sha256(conn.serialize()).hexdigest())
+
+
+def test_followthrough_memo_bounds_namespace_and_hit_deadline(conn, monkeypatch):
+    calls = []
+    monkeypatch.setattr(store, '_reference_checkpoint', lambda c: calls.append(c))
+    memo = store._ReferenceTextMatches(conn, {'scope-current'}, [('scope-current', '%73cope-current')])
+    assert set(memo.matches('raw', '%73cope-current')) == set()
+    assert set(memo.matches('decoded', '%73cope-current')) == {'scope-current'}
+    assert memo.bytes <= store._REFERENCE_TEXT_MEMO_BYTES
+    assert len(memo.cache) <= store._REFERENCE_TEXT_MEMO_ENTRIES
+    calls.clear()
+    assert set(memo.matches('decoded', '%73cope-current')) == {'scope-current'}
+    assert len(calls) == 3
+    def expired(_conn):
+        raise store._ReferenceBudgetExceeded('reference_census_budget_exhausted')
+    monkeypatch.setattr(store, '_reference_checkpoint', expired)
+    with pytest.raises(store._ReferenceBudgetExceeded):
+        set(memo.matches('decoded', '%73cope-current'))
+
+
+def test_followthrough_diagnostics_reserve_bundle_after_exhaustion(conn, bundle_namespace, monkeypatch, caplog):
+    _typed_reference_setup(conn, count=0)
+    caplog.set_level('INFO', logger=store.__name__)
+    def missing():
+        raise store._BundleInventoryIncomplete('directory_changed', {'scope-durable'}, 17)
+    monkeypatch.setattr(store, '_bundle_referenced_snapshot_ids', missing)
+    with store._owned_reference_connection(lambda: conn, diagnostic_request_id='req-reserved-bundle'):
+        budget = store._reference_budget(conn)
+        with budget.census():
+            for _ in range(12):
+                store._reference_diagnostic(conn, 'unsupported_payload_storage', table='synthetic_owner')
+        budget.deadline = 0
+        result = store.select_snapshot_retention_candidates(conn, PID, keep_last_n=0, measure_sizes=False)
+        records = _cost_observation_records(caplog)
+        assert len(records) <= 8
+        assert {'connection', 'budget_exhausted', 'directory_changed'} <= {r['cause'] for r in records}
+        assert records[-1]['phase'] == 'bundle'
+        assert 'bundle_manifest_reference_unreadable' in result['global_refusal_reasons']
+        assert any(row['snapshot_id'] == 'scope-durable' and 'bundle_manifest_reference' in row['reasons'] for row in result['protected'])
+        assert '/private/' not in caplog.text and 'SELECT' not in caplog.text
+
+
+def test_followthrough_memo_partial_positive_survives_miss_cancellation(conn, monkeypatch):
+    calls = [0]
+    def checkpoint(_conn):
+        calls[0] += 1
+        if calls[0] == 3:
+            raise store._ReferenceBudgetExceeded('reference_census_budget_exhausted')
+    monkeypatch.setattr(store, '_reference_checkpoint', checkpoint)
+    memo = store._ReferenceTextMatches(conn, ['scope-current', 'scope-durable'], [])
+    collected = []
+    with pytest.raises(store._ReferenceBudgetExceeded):
+        for sid in memo.matches('raw', 'scope-current scope-durable'):
+            collected.append(sid)
+    assert collected == ['scope-current']
+    assert memo.cache == {} and memo.bytes == 0
