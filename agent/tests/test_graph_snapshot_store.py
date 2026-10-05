@@ -7747,3 +7747,115 @@ def test_chain_owner_domains_do_not_exempt_invalid_payloads(conn, table, column,
     state = store.snapshot_retention_reference_state(conn, PID)
     assert not state['complete'] and table + '_payload_unreadable' in state['refusal_reasons']
     assert {'scope-current', 'scope-durable'} <= state['durable_references'].keys()
+
+
+# Baseline SQL is retained only as the private regression oracle for the
+# necessary-condition search. Original atoms still decide every real match.
+_REPEATED_REFERENCE_SEARCH = (
+    "search AS MATERIALIZED (SELECT coalesce(group_concat(CASE WHEN type='text' "
+    "THEN atom END,char(0)),'')||char(0)||coalesce(group_concat(CASE "
+    "WHEN typeof(key)='text' THEN key END,char(0)),'') AS body FROM atoms)")
+_DISTINCT_REFERENCE_SEARCH = (
+    "search_text AS MATERIALIZED (SELECT DISTINCT atom COLLATE BINARY AS atom "
+    "FROM atoms WHERE type='text'), "
+    "search_keys AS MATERIALIZED (SELECT DISTINCT key COLLATE BINARY AS key "
+    "FROM atoms WHERE typeof(key)='text'), "
+    "search AS MATERIALIZED (SELECT coalesce((SELECT group_concat(atom,char(0)) "
+    "FROM search_text),'')||char(0)||coalesce((SELECT group_concat(key,char(0)) "
+    "FROM search_keys),'') AS body)")
+
+
+@pytest.mark.parametrize('action,complete', [(None, 1), ('continue', 1), (None, 0)])
+def test_reference_search_dedup_preserves_exact_atoms_and_completion(conn, action, complete):
+    # Case, Unicode, duplicate keys and decoded serialized records must retain
+    # their individual matches without changing the original confirming atoms.
+    serialized = json.dumps({'key-pin': '雪-pin', 'snapshot_ids': ['external']})
+    body = ('{"runtime_guide":{"next_legal_action":' + json.dumps(action) + '},'
+            '"repeat":' + json.dumps(['ordinary'] * 128) + ','
+            '"duplicate":"UPPER","duplicate":"upper",'
+            '"serialized":' + json.dumps(serialized) + ','
+            '"note":' + json.dumps('opaque\\u' if not complete else 'ordinary') + '}')
+    tokens = [('case-first', 'UPPER'), ('case-second', 'upper'),
+              ('unicode', '雪-pin'), ('key', 'key-pin'),
+              ('substring', 'PPER')]
+    conn.execute('CREATE TABLE repeated_fixture(contract_execution_id TEXT,record_json TEXT)')
+    conn.execute("INSERT INTO repeated_fixture VALUES ('execution',?)", (body,))
+    for kind in ['contract', 'owner']:
+        projection = (store._contract_reference_projection(tokens) if kind == 'contract'
+                      else ','.join(store._owner_reference_projection('record_json', tokens, json_owner=True)))
+        assert _DISTINCT_REFERENCE_SEARCH in projection
+        current = tuple(conn.execute('SELECT ' + projection + ' FROM repeated_fixture').fetchone())
+        original = tuple(conn.execute('SELECT ' + projection.replace(
+            _DISTINCT_REFERENCE_SEARCH, _REPEATED_REFERENCE_SEARCH) + ' FROM repeated_fixture').fetchone())
+        assert current == original
+        pins = json.loads(current[4] if kind == 'contract' else current[0])
+        assert set(pins) == {'case-first', 'case-second', 'unicode', 'key', 'substring'} | (
+            {'external'} if kind == 'owner' else set())
+        assert current[5 if kind == 'contract' else 1] == complete
+        if kind == 'contract':
+            assert pins == ['case-first', 'case-second', 'unicode', 'key', 'substring']
+            assert current[3] == ('completed' if action is None else 'live')
+
+
+def test_reference_search_dedup_reduces_repeated_prefilter_bytes(conn):
+    body = json.dumps({'runtime_guide': {'next_legal_action': None},
+                       'values': ['ordinary repetition ' + ('x' * 170)] * 256})
+    conn.execute('CREATE TABLE repeated_fixture(contract_execution_id TEXT,record_json TEXT)')
+    conn.execute("INSERT INTO repeated_fixture VALUES ('execution',?)", (body,))
+    tokens = [(f'absent-{i}', f'probe-{i}') for i in range(32)]
+    projection = store._contract_reference_projection(tokens)
+    builtin = sqlite3.connect(':memory:')
+    measured = []
+    try:
+        for sql in [projection.replace(_DISTINCT_REFERENCE_SEARCH, _REPEATED_REFERENCE_SEARCH), projection]:
+            scanned = [0]
+            def instr(haystack, needle):
+                if isinstance(haystack, str) and isinstance(needle, str) and needle.startswith('probe-'):
+                    scanned[0] += len(haystack.encode('utf-8'))
+                # Preserve SQLite's own NULL/storage/string semantics rather
+                # than replacing the matcher with a Python implementation.
+                return builtin.execute('SELECT instr(?,?)', (haystack, needle)).fetchone()[0]
+            conn.create_function('instr', 2, instr)
+            row = tuple(conn.execute('SELECT ' + sql + ' FROM repeated_fixture').fetchone())
+            measured.append((row, scanned[0]))
+        assert measured[0][0] == measured[1][0]
+        assert measured[1][0][4:] == ('[]', 1)
+        assert measured[0][1] > 100 * measured[1][1] > 0
+    finally:
+        conn.create_function('instr', 2, None)
+        builtin.close()
+
+
+def test_contract_search_dedup_page_continuation_and_memo_are_lossless(conn, monkeypatch):
+    conn.execute('CREATE TABLE contract_runtime_executions('
+                 'contract_execution_id TEXT,project_id TEXT,record_json TEXT)')
+    bodies = [json.dumps({'runtime_guide': {'next_legal_action': action},
+                         'values': ['known repeated'] * 64}) for action in [None, 'continue']]
+    conn.executemany('INSERT INTO contract_runtime_executions VALUES (?,?,?)',
+                     [(f'execution-{i}', PID, bodies[i % 2]) for i in range(65)])
+    conn.commit()
+    before = hashlib.sha256(conn.serialize()).hexdigest()
+    def collect():
+        reusable = {}
+        projection = store._contract_reference_projection([('known', 'known')], reusable=reusable)
+        return [tuple(row) for row in store._reference_pages(
+            conn, 'contract_runtime_executions', projection, 'project_id=?', (PID,), reusable=reusable)]
+    candidate = collect()
+    ordinary = store._contract_reference_projection
+    def original_projection(tokens, *, reusable=None):
+        projection = ordinary(tokens, reusable=reusable)
+        if reusable is not None:
+            reusable['record_json'] = tuple(expression.replace(
+                _DISTINCT_REFERENCE_SEARCH, _REPEATED_REFERENCE_SEARCH)
+                for expression in reusable['record_json'])
+        return projection.replace(_DISTINCT_REFERENCE_SEARCH, _REPEATED_REFERENCE_SEARCH)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, '_contract_reference_projection', original_projection)
+        assert collect() == candidate
+    with monkeypatch.context() as patch:
+        patch.setattr(store, '_reference_memo_page', lambda *args: None)
+        assert collect() == candidate
+    assert len(candidate) == 65 and [row[0] for row in candidate] == list(range(1, 66))
+    assert all(row[5:] == ('["known"]', 1) for row in candidate)
+    assert {row[4] for row in candidate} == {'completed', 'live'}
+    assert before == hashlib.sha256(conn.serialize()).hexdigest()

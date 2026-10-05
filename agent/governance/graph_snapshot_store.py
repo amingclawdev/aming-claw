@@ -2411,9 +2411,13 @@ def _contract_reference_projection(tokens: list[tuple[str, str]], *, reusable=No
         "WHERE j.type='text' AND substr(ltrim(j.atom),1,1) IN ('{','[') "
         "AND json_valid(j.atom) AND d.depth<8), "
         "atoms AS MATERIALIZED (SELECT d.depth,j.key,j.atom,j.type FROM docs d,json_tree(d.doc) j), "
-        "search AS MATERIALIZED (SELECT coalesce(group_concat(CASE WHEN type='text' "
-        "THEN atom END,char(0)),'')||char(0)||coalesce(group_concat(CASE "
-        "WHEN typeof(key)='text' THEN key END,char(0)),'') AS body FROM atoms) ")
+        "search_text AS MATERIALIZED (SELECT DISTINCT atom COLLATE BINARY AS atom "
+        "FROM atoms WHERE type='text'), "
+        "search_keys AS MATERIALIZED (SELECT DISTINCT key COLLATE BINARY AS key "
+        "FROM atoms WHERE typeof(key)='text'), "
+        "search AS MATERIALIZED (SELECT coalesce((SELECT group_concat(atom,char(0)) "
+        "FROM search_text),'')||char(0)||coalesce((SELECT group_concat(key,char(0)) "
+        "FROM search_keys),'') AS body) ")
     complete = ("(SELECT CASE WHEN coalesce(max(CASE "
         "WHEN depth=8 AND type='text' AND substr(ltrim(atom),1,1) IN ('{','[') "
         "AND json_valid(atom) THEN 1 "
@@ -2421,8 +2425,10 @@ def _contract_reference_projection(tokens: list[tuple[str, str]], *, reusable=No
         "WHEN type='text' AND NOT json_valid(atom) AND "
         "instr(atom,char(92)||'u')>0 "
         "THEN 1 ELSE 0 END),0)=1 THEN 0 ELSE 1 END FROM atoms)")
-    # Search concatenation is only a necessary-condition prefilter. Confirm
-    # each hit against its original atom/key, including tokens spanning the NUL
+    # Deduplicate only the necessary-condition search, with exact BINARY text.
+    # Every original atom/key remains in the confirming matcher; repeating the
+    # same value cannot add a hit but makes every token rescan those bytes.
+    # Confirm each hit against its original atom/key, including tokens spanning the NUL
     # separators. Raw bodies and the search string never leave SQLite. The
     # ordinal preserves the original token-order projection.
     ordered_tokens = ",".join(f"({literal(sid)},{literal(token)},{i})"
@@ -2489,9 +2495,13 @@ def _owner_reference_projection(column: str, tokens: list[tuple[str, str]],
         "FROM atoms WHERE type='array' AND "
         "substr(CAST(key AS TEXT),-12)='snapshot_ids')), "
         "parented AS MATERIALIZED (SELECT * FROM families WHERE marker_row=0), "
-        "search AS MATERIALIZED (SELECT coalesce(group_concat(CASE WHEN type='text' "
-        "THEN atom END,char(0)),'')||char(0)||coalesce(group_concat(CASE "
-        "WHEN typeof(key)='text' THEN key END,char(0)),'') AS body FROM atoms) ")
+        "search_text AS MATERIALIZED (SELECT DISTINCT atom COLLATE BINARY AS atom "
+        "FROM atoms WHERE type='text'), "
+        "search_keys AS MATERIALIZED (SELECT DISTINCT key COLLATE BINARY AS key "
+        "FROM atoms WHERE typeof(key)='text'), "
+        "search AS MATERIALIZED (SELECT coalesce((SELECT group_concat(atom,char(0)) "
+        "FROM search_text),'')||char(0)||coalesce((SELECT group_concat(key,char(0)) "
+        "FROM search_keys),'') AS body) ")
     candidates = (f"pins(sid) AS MATERIALIZED (SELECT column1 FROM ({token_cte}) tokens "
         f"WHERE instr({column},tokens.column2)>0 UNION "
         "SELECT column1 FROM matched UNION "
