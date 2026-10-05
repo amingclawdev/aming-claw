@@ -661,6 +661,86 @@ def test_native_event_shared_batch_selected_line_scope_with_coherent_hash(tmp_pa
         connection.close()
 
 
+@pytest.mark.parametrize("child_index", [0, 1])
+@pytest.mark.parametrize("shape", ["nested_large", "top_large", "duplicate", "foreign_task", "foreign_runtime"])
+def test_native_event_shared_batch_archived_dispatch_shape(tmp_path, monkeypatch, child_index, shape):
+    """Replay archived dispatch content only inside the existing disposable world."""
+    import os
+    from pathlib import Path
+
+    archive = os.environ.get("AC_NATIVE_READER_R7_ARCHIVE")
+    if not archive:
+        pytest.skip("requires read-only original R7 archived full readbacks")
+    name = ("Models", "Planner")[child_index]
+    archived = json.loads((Path(archive) / f"{name}-final-own-full-current-readback.json").read_text())
+    original_dispatch = archived["runtime_guide"]["completed_lines"][1]
+    assert archived["runtime_guide"]["completed_lines"][10]["line_id"] == "observer_reconcile"
+    conn, world, batch, connection, _parent = _native_shared_batch_fixture(tmp_path, monkeypatch)
+    execution = batch._BATCH_QA_CHILD_EXECUTIONS[child_index]
+    try:
+        store = server._contract_runtime_store(conn)
+        record = store.get(execution)
+        changed = copy.deepcopy(record)
+        original_receipt = copy.deepcopy(changed["completed_lines"][10]["payload"]["reconcile_authority"])
+        # Preserve the actual archived worker contract in full. Only this
+        # disposable world's authority-bearing outer identity is retained.
+        dispatch = changed["completed_lines"][1]
+        dispatch["payload"]["archived_worker_contract"] = copy.deepcopy(original_dispatch["payload"])
+        if shape == "duplicate":
+            changed["completed_lines"].append(copy.deepcopy(dispatch))
+        elif shape in ("foreign_task", "foreign_runtime"):
+            field = "task_id" if shape == "foreign_task" else "runtime_context_id"
+            changed["completed_lines"][10][field] = "foreign-child-scope"
+        if shape != "top_large":
+            changed["runtime_guide"] = {"completed_lines": copy.deepcopy(changed["completed_lines"])}
+        changed["execution_state_revision"] += 1
+        store.update(execution, changed, expected_revision=record["execution_state_revision"])
+        conn.commit()
+        source = store.get(execution)
+        if shape != "top_large":
+            source["runtime_guide"] = copy.deepcopy(changed["runtime_guide"])
+        context = world.child_contexts[child_index]
+        match = server._contract_runtime_dispatch_line_match(source, context)
+        assert len(json.dumps(match, ensure_ascii=False).encode("utf-8")) > 30000
+        authority = original_receipt["terminal_current_full_reconcile_authority"]
+        frozen_source = copy.deepcopy(source)
+        binding = _native_batch_read_without_writes(conn, lambda:
+            server._contract_runtime_native_event_shared_batch_binding(conn,
+                source_record=source, authority=authority))
+        assert source == frozen_source
+        if shape == "duplicate":
+            assert binding == {}
+            return
+        assert binding["authority"] == authority
+        assert binding["receipt"] == original_receipt
+        assert binding["dispatch"]["line_index"] == 1
+        assert binding["dispatch"]["line"] == source["completed_lines"][1]
+        selector = _native_batch_selector(batch, execution, world.reconcile_event["id"])
+        selector["source_line_hash"] = _native_wire_hash(source["completed_lines"][10])
+        recorded = _native_batch_read_without_writes(conn, lambda:
+            server.handle_project_contract_runtime_current_state(
+                _native_batch_request(batch, execution, {**selector, "response_view": "recorded_line"})))
+        from agent.governance.native_event_provenance import read_native_event
+        proof = _native_batch_read_without_writes(conn, lambda: read_native_event(
+            conn, source_record=source, recorded=recorded, selector=selector,
+            actor_role="coordinator", shared_batch_reader=lambda current:
+                server._contract_runtime_native_event_shared_batch_binding(conn,
+                    source_record=source, authority=current)))
+        assert source == frozen_source
+        assert len(json.dumps(proof, ensure_ascii=False).encode("utf-8")) <= 16384
+        if shape in ("foreign_task", "foreign_runtime"):
+            assert proof["ok"] is False
+            assert proof["native_event"] is None
+            assert not proof.get("association")
+        else:
+            assert proof["ok"] is True, proof
+            assert proof["association"]["child_dispatch_hash"] == _native_wire_hash(dispatch)
+            assert proof["association"]["shared_authority_hash"] == authority["shared_batch_reconcile_authority"]["authority_hash"]
+            assert proof["association"]["terminal_authority_hash"] == authority["authority_hash"]
+    finally:
+        connection.close()
+
+
 def test_native_event_shared_batch_requires_current_selector_and_server_reader(tmp_path, monkeypatch):
     from agent.governance import native_event_provenance
     conn, world, batch, connection, _parent = _native_shared_batch_fixture(tmp_path, monkeypatch)

@@ -127481,8 +127481,12 @@ def _contract_runtime_native_event_shared_batch_binding(
     # than allowing its first-match projection to hide a duplicate dispatch.
     matches = []
     for index, line in _contract_runtime_completed_lines(source_record):
+        isolated = {**source_record, "completed_lines": [line]}
+        guide = source_record.get("runtime_guide")
+        if isinstance(guide, Mapping):
+            isolated["runtime_guide"] = {**guide, "completed_lines": [line]}
         match = _contract_runtime_dispatch_line_match(
-            {**source_record, "completed_lines": [line]}, context
+            isolated, context
         )
         if match:
             match["line_index"] = index

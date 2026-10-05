@@ -90,8 +90,6 @@ def _read_shared_batch_event(conn, *, source_record, recorded, claim, authority,
     dispatch = _mapping(_mapping(binding).get("dispatch"))
     if not fresh or fresh != authority or not dispatch:
         return refusal("native_event_association_invalid")
-    if len(json.dumps(dispatch, ensure_ascii=False).encode("utf-8")) > MAX_BYTES:
-        return refusal("native_event_association_invalid")
     if ("terminal_current_full_reconcile_authority" in claim
             and _mapping(_mapping(binding).get("receipt")) != claim):
         return refusal("native_event_association_invalid")
