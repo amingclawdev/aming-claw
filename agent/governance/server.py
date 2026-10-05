@@ -148101,12 +148101,25 @@ def _contract_runtime_resolved_green_baseline_scan(
         summaries = re.findall(r"=+\s*(.*?)\s+in\s+[\d.]+s\s*=+", stdout)
         if not summaries:
             return False
-        observed = dict((label, int(count)) for count, label in
-                        re.findall(r"(\d+) (passed|failed|errors?)", summaries[-1]))
+        observed: dict[str, int] = {}
+        for item in summaries[-1].split(","):
+            match = re.fullmatch(
+                r"\s*(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)\s*",
+                item,
+            )
+            if not match:
+                return False
+            count, label = match.groups()
+            label = {"error": "errors", "warning": "warnings"}.get(label, label)
+            if label in observed:
+                return False
+            observed[label] = int(count)
         return (
             observed.get("passed", 0) == passed
             and observed.get("failed", 0) == failed
-            and not observed.get("error", 0) and not observed.get("errors", 0)
+            and not any(observed.get(label, 0) for label in
+                        ("errors", "skipped", "xfailed", "xpassed", "deselected"))
+            and sum(count for label, count in observed.items() if label != "warnings") == collected
             and set(re.findall(r"(?m)^FAILED (\S+::\S+)", stdout)) == failures
         )
 
@@ -148148,7 +148161,17 @@ def _contract_runtime_finish_test_results_consumer_acceptance(
     complete_owned_lane = False
     complete_resolved_green_baseline = False
     comparison = results.get("baseline_comparison")
-    if isinstance(comparison, Mapping) and "baseline_commands" in comparison:
+    # An explicit sibling full-suite claim retains its existing validator even
+    # when it also carries a truthful raw baseline copy. Invalid claims do not
+    # fall back to the resolved-green or ordinary PASS paths.
+    if _runtime_context_finish_owned_lane_claimed(results) and "full_suite" in results:
+        failure_scan = _contract_runtime_owned_lane_failure_scan(
+            results, expected_baseline_commit=expected_baseline_commit,
+        )
+        if not failure_scan:
+            return {}
+        complete_owned_lane = True
+    elif isinstance(comparison, Mapping) and "baseline_commands" in comparison:
         failure_scan = _contract_runtime_resolved_green_baseline_scan(
             results, expected_baseline_commit=expected_baseline_commit,
         )

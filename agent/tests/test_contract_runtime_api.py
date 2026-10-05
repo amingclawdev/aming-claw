@@ -2212,7 +2212,7 @@ def test_r7_resolved_green_producer_consumer_preserves_raw_ledger():
 
 @pytest.mark.parametrize("tamper", ["wrong_base", "wrong_head", "current_failure", "new_failure",
     "count", "bool_count", "status", "exit", "raw_ids", "resolution", "raw_summary",
-    "changed_full_command", "changed_cwd", "unrelated_qa", "nested_baseline_qa"])
+    "changed_full_command", "changed_cwd", "unrelated_qa", "nested_baseline_qa", "invalid_sibling_fallback"])
 def test_r7_resolved_green_refuses_inconsistent_or_current_negative_evidence(tamper):
     results = _r7_resolved_green_ledger("a" * 40)
     comparison = results["baseline_comparison"]
@@ -2233,6 +2233,7 @@ def test_r7_resolved_green_refuses_inconsistent_or_current_negative_evidence(tam
     elif tamper == "changed_cwd": baseline["cwd"] = "/fixture/foreign"
     elif tamper == "unrelated_qa": results["independent_QA"] = {"status": "rejected"}
     elif tamper == "nested_baseline_qa": baseline["independent_QA"] = {"failed_count": 1}
+    elif tamper == "invalid_sibling_fallback": results.update(full_suite={}, full_suite_passed=False)
     original = copy.deepcopy(results)
     assert not server._contract_runtime_finish_test_results_consumer_acceptance(
         results, expected_baseline_commit="a" * 40)
@@ -2244,6 +2245,32 @@ def test_r7_resolved_green_refuses_inconsistent_or_current_negative_evidence(tam
 def test_r7_resolved_green_real_producer_finish_premerge_and_canonical_guards(tmp_path, monkeypatch, request):
     _exercise_finish_ledger_real_producer_premerge_and_canonical_guards(
         tmp_path, monkeypatch, request, _r7_resolved_green_ledger)
+
+
+def test_r7_sibling_raw_baseline_copy_retains_existing_acceptance():
+    results = _r6_owned_lane_ledger("a" * 40)
+    comparison = results["baseline_comparison"]
+    comparison["baseline_commands"] = [copy.deepcopy(comparison["baseline"]["raw_command"])]
+    original = copy.deepcopy(results)
+    acceptance = server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)
+    assert acceptance["complete_owned_lane"]
+    assert not acceptance["complete_resolved_green_baseline"]
+    assert server._runtime_context_finish_no_pass_producer_accepted(
+        results, expected_baseline_commit="a" * 40)
+    assert results == original
+
+
+@pytest.mark.parametrize("summary", ["8 passed, 1 skipped", "8 passed, 1 xfailed", "1 passed, 8 passed"])
+def test_r7_resolved_green_summary_cannot_drop_or_overwrite_results(summary):
+    results = _r7_resolved_green_ledger("a" * 40)
+    results["commands"][1]["stdout"] = f"================= {summary} in 0.01s =================\n"
+    original = copy.deepcopy(results)
+    assert not server._contract_runtime_finish_test_results_consumer_acceptance(
+        results, expected_baseline_commit="a" * 40)
+    assert not server._runtime_context_finish_no_pass_producer_accepted(
+        results, expected_baseline_commit="a" * 40)
+    assert results == original
 
 
 def test_r7_resolved_green_implementation_alias_is_exact_summary_only():
