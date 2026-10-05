@@ -240296,7 +240296,7 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     compact_next_action_projection: dict[str, Any] = {}
     response_view = str(ctx.query.get("response_view") or "").strip()
     with DBContext(project_id) as conn:
-        if response_view in {"recorded_line", "native_event"} and not conn.in_transaction:
+        if response_view in {"recorded_line", "native_event", "position_checkpoint"} and not conn.in_transaction:
             # Own only a new transaction; preserve an existing caller snapshot.
             conn.execute("BEGIN")
         record = _contract_runtime_store(conn).get(contract_execution_id)
@@ -240308,6 +240308,52 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             contract_execution_id=contract_execution_id,
             record=record,
         )
+        if response_view == "position_checkpoint":
+            def selector_integer(name):
+                value = ctx.query.get(name)
+                if type(value) is int:
+                    return value
+                if type(value) is str and re.fullmatch(r"0|[1-9][0-9]*", value):
+                    return int(value)
+                return None
+
+            selector_keys = ("runtime_context_id", "task_id", "attempt", "through_ordinal")
+            resolved = {key: ctx.query.get(key) for key in selector_keys}
+            discovery_error = ""
+            if not any(key in ctx.query for key in selector_keys):
+                # Only this exact durable CEX is considered; never an ambient/latest lane.
+                try:
+                    prefix = record["completed_lines"][:5]
+                    dispatch = prefix[1]["payload"]
+                    workers = dispatch["bounded_workers"]
+                    if len(prefix) != 5 or len(workers) != 1:
+                        raise ValueError("ambiguous_source_selector")
+                    worker = workers[0]
+                    resolved = {"runtime_context_id": worker["runtime_context_id"],
+                                "task_id": worker["task_id"],
+                                "attempt": worker["retry_policy"]["attempt"], "through_ordinal": 4}
+                except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+                    discovery_error = "missing_or_ambiguous_source_selector"
+            else:
+                resolved["attempt"] = selector_integer("attempt")
+                resolved["through_ordinal"] = selector_integer("through_ordinal")
+            response = _contract_runtime(conn).position_checkpoint_view(
+                contract_execution_id, project_id=project_id,
+                backlog_id=str(ctx.query.get("backlog_id") or ""),
+                runtime_context_id=str(resolved.get("runtime_context_id") or ""),
+                task_id=str(resolved.get("task_id") or ""),
+                attempt=resolved.get("attempt"), through_ordinal=resolved.get("through_ordinal"),
+            )
+            if discovery_error:
+                response.update(ok=False, error="position_checkpoint_unavailable", absence=discovery_error,
+                                semantic_checkpoint=None, semantic_ref=None, custody_envelope=None, custody_ref=None)
+            response.update(actor_role=actor_role, request_id=ctx.request_id)
+            if len(json.dumps(response, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False, allow_nan=False).encode("utf-8")) > 16384:
+                response.update(ok=False, error="position_checkpoint_unavailable", absence="wire_oversize",
+                                semantic_checkpoint=None, semantic_ref=None, custody_envelope=None, custody_ref=None)
+            conn.commit()
+            return response
         try:
             record = _contract_runtime_read(
                 conn,

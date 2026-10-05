@@ -6744,3 +6744,220 @@ def test_dev_contract_runtime_uses_canonical_keys_in_physically_separate_databas
         runtime.direct_main_dev_storage_contract_id(namespace)
         == "operator_supervised_direct_main"
     )
+
+
+def _position_checkpoint_fixture(tmp_path, *, sqlite=False):
+    """Disposable durable prefix shaped like native mf dispatch/startup/graph lines."""
+    names = ["observer_prefill_child_contracts", "observer_dispatch_bounded_workers",
+             "worker_read_runtime_guide", "worker_startup", "worker_graph_context"]
+    stages = ["orchestration", "dispatch", "worker_read", "worker_startup", "worker_context"]
+    definition = {"schema_version": "contract_definition.v1", "contract_id": "position_fixture",
+        "version": "v1", "revision": "rev1", "role": "observer", "contract_type": "fixture",
+        "status": "active", "instruction_layer": {"inline": [], "refs": []},
+        "rule_layer": {"stages": [{"stage_id": stage, "lines": [{"line_id": name,
+            "owner_role": "observer" if i < 2 else "mf_sub",
+            "allowed_writer_roles": ["observer"] if i < 2 else ["mf_sub"],
+            "evidence_kind": "fixture_" + str(i), "requires": [] if i == 0 else [names[i - 1]]}]}
+            for i, (stage, name) in enumerate(zip(stages, names))]}}
+    (tmp_path / "position_fixture.v1.rev1.json").write_text(json.dumps(definition))
+    conn = sqlite3.connect(tmp_path / "position.sqlite") if sqlite else None
+    if conn is not None:
+        conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path), instruction_root=tmp_path,
+        **({"store": SQLiteContractExecutionStore(conn)} if conn is not None else {}))
+    runtime.start_execution("position_fixture", project_id="fixture-project", backlog_id="AC-POSITION",
+                          contract_execution_id="cex-position", actor_role="observer")
+    assignment = {"runtime_context_id": "ctx-position", "task_id": "task-position",
+        "parent_task_id": "cex-parent", "worker_id": "worker-position", "worker_role": "mf_sub",
+        "owned_files": ["product.py"], "target_project_root": "/disposable/position",
+        "target_head_commit": "a" * 40, "agent_id": "opaque-actor", "retry_policy": {"attempt": 1}}
+    dispatch = {**assignment, "bounded_workers": [deepcopy(assignment)]}
+    startup = {**assignment, "worker_session_id": "opaque-actor", "semantic_role_binding": {
+        "semantic_role": "mf_sub", "source": "server_verified_runtime_context_startup",
+        "worker_session_id": "opaque-actor", "opaque_identity_is_role_bearing": False}}
+    graph = {**assignment, "graph_trace_evidence": {
+        **{k: assignment[k] for k in ("runtime_context_id", "task_id", "parent_task_id")},
+        "expected_runtime_context_commit": "a" * 40, "snapshot_commit": "a" * 40,
+        "snapshot_id": "full-position"}}
+    payloads = [{"prefill": True}, dispatch, deepcopy(assignment), startup, graph]
+    lines = [{"stage_id": stage, "line_id": name,
+        "actor_role": "observer" if i < 2 else "mf_sub", "evidence_kind": "fixture_" + str(i),
+        "payload": payloads[i]} for i, (stage, name) in enumerate(zip(stages, names))]
+    record = runtime.store.get("cex-position")
+    record.update(completed_lines=lines, execution_state_revision=6)
+    record["runtime_guide"]["completed_lines"] = deepcopy(lines)
+    runtime.store.update("cex-position", record)
+    if conn is not None:
+        conn.commit()
+    selector = {"project_id": "fixture-project", "backlog_id": "AC-POSITION",
+                "runtime_context_id": "ctx-position", "task_id": "task-position", "attempt": 1,
+                "through_ordinal": 4}
+    return runtime, conn, selector
+
+
+def _position_digest(value):
+    import hashlib
+    return "sha256:" + hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def test_position_checkpoint_native_roots_and_zero_source_mutation(tmp_path):
+    runtime, conn, selector = _position_checkpoint_fixture(tmp_path, sqlite=True)
+    before, changes = list(conn.iterdump()), conn.total_changes
+    result = runtime.position_checkpoint_view("cex-position", **selector)
+    assert result["ok"], result
+    c, custody = result["semantic_checkpoint"], result["custody_envelope"]
+    assert result["semantic_ref"] == "position:" + _position_digest(c)
+    assert result["custody_ref"] == "custody:" + _position_digest(custody)
+    stored = runtime.store.get("cex-position")
+    assert custody["canonical_payload_digest"] == _position_digest(stored)
+    assert custody["ordered_source_line_digests"] == [_position_digest(l) for l in stored["completed_lines"]]
+    refs = []
+    for i, fact in enumerate(c["admitted_facts"]):
+        assert fact["source_line_digest"] == _position_digest(stored["completed_lines"][i])
+        assert fact["fact_ref"] == "fact:" + _position_digest({"ordinal": i,
+            "source_line_ref": fact["source_line_ref"], "source_line_digest": fact["source_line_digest"],
+            "definition_ref": c["object_revision"]["definition_ref"]})
+        refs.append(fact["fact_ref"])
+    assert custody["full_completed_lines_root"] == _position_digest({
+        "ordered_source_line_digests": custody["ordered_source_line_digests"], "line_count": 5})
+    assert c["evidence_prefix"]["prefix_digest"] == _position_digest({"ordered_fact_refs": refs, "through_ordinal": 4})
+    for key, ref_key, prefix in (("world", "world_ref", "world:"),
+                                  ("role_definition", "role_definition_ref", "role-definition:"),
+                                  ("admission_receipt", "receipt_ref", "admission-projection:")):
+        body = c[key]
+        assert body[ref_key] == prefix + _position_digest({k: v for k, v in body.items() if k != ref_key})
+    binding = c["execution_binding"]
+    assert binding["generation_id"] == "generation:" + _position_digest({
+        "project_id": selector["project_id"], "contract_execution_id": "cex-position",
+        "definition_digest": c["object_revision"]["definition_digest"]})
+    assert binding["execution_id"] == "execution:" + _position_digest({
+        "generation_id": binding["generation_id"], "runtime_context_id": selector["runtime_context_id"],
+        "task_id": selector["task_id"], "attempt": 1})
+    assert c["role_assignment"]["provenance_digest"] == _position_digest({
+        "dispatch_line_digest": c["admitted_facts"][1]["source_line_digest"],
+        "startup_line_digest": c["admitted_facts"][3]["source_line_digest"],
+        "semantic_role_binding": {"semantic_role": "mf_sub", "source": "server_verified_runtime_context_startup",
+                                  "worker_session_id": "opaque-actor"}})
+    assert c["authority"] == {"construction_only": True, "effect_authority": False,
+        "direction_authority": False, "release_pass": False, "close_satisfying": False}
+    assert "source_verified" not in custody and "source_archive_ref" not in custody
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    conn.close()
+
+
+@pytest.mark.parametrize("attack", ["task", "runtime", "holder", "role", "parent", "world", "root",
+    "attempt", "duplicate_worker", "writer", "kind", "rule", "representation", "missing", "oversize"])
+def test_position_checkpoint_rejects_incoherent_durable_evidence(tmp_path, attack):
+    runtime, _, selector = _position_checkpoint_fixture(tmp_path)
+    record = runtime.store.get("cex-position")
+    lines = record["completed_lines"]
+    if attack in {"task", "runtime", "parent", "root"}:
+        key = {"task": "task_id", "runtime": "runtime_context_id", "parent": "parent_task_id",
+               "root": "target_project_root"}[attack]
+        lines[3]["payload"][key] = "foreign"
+    elif attack == "holder": lines[3]["payload"]["semantic_role_binding"]["worker_session_id"] = "foreign"
+    elif attack == "role": lines[3]["payload"]["semantic_role_binding"]["semantic_role"] = "qa"
+    elif attack == "world": lines[4]["payload"]["graph_trace_evidence"]["snapshot_commit"] = "b" * 40
+    elif attack == "attempt": lines[1]["payload"]["bounded_workers"][0]["retry_policy"]["attempt"] = 2
+    elif attack == "duplicate_worker": lines[1]["payload"]["bounded_workers"] *= 2
+    elif attack == "writer": lines[3]["actor_role"] = "qa"
+    elif attack == "kind": lines[3]["evidence_kind"] = "unadmitted"
+    elif attack == "rule": record["definition_hash"] = "sha256:" + "f" * 64
+    elif attack == "missing": del lines[3]["payload"]["semantic_role_binding"]
+    elif attack == "oversize": record["completed_lines"] = lines * 26
+    if attack != "representation": record["runtime_guide"]["completed_lines"] = deepcopy(record["completed_lines"])
+    else: record["runtime_guide"]["completed_lines"][0]["payload"] = {"foreign": True}
+    runtime.store.update("cex-position", record)
+    result = runtime.position_checkpoint_view("cex-position", **selector)
+    assert not result["ok"], result
+    assert result["semantic_checkpoint"] is None and result["custody_envelope"] is None
+
+
+def test_position_checkpoint_source_selector_and_later_custody_are_distinct(tmp_path):
+    runtime, _, selector = _position_checkpoint_fixture(tmp_path)
+    first = runtime.position_checkpoint_view("cex-position", **selector)
+    source_selector = {**selector, "runtime_context_id": "", "task_id": "", "attempt": None,
+                       "through_ordinal": None}
+    assert not runtime.position_checkpoint_view("cex-position", **source_selector)["ok"]
+    assert not runtime.position_checkpoint_view("cex-position", **{**selector, "attempt": True})["ok"]
+    assert not runtime.position_checkpoint_view("cex-position", **{**selector, "through_ordinal": 3})["ok"]
+    record = runtime.store.get("cex-position")
+    record["completed_lines"].append({"stage_id": "later", "line_id": "close", "status": "NO-PASS", "payload": {"waived": True}})
+    record["runtime_guide"]["completed_lines"] = deepcopy(record["completed_lines"])
+    record["execution_state_revision"] += 1
+    runtime.store.update("cex-position", record)
+    later = runtime.position_checkpoint_view("cex-position", **selector)
+    assert later["ok"], later
+    assert later["semantic_ref"] == first["semantic_ref"]
+    assert later["custody_ref"] != first["custody_ref"]
+    assert later["semantic_checkpoint"]["authority"]["close_satisfying"] is False
+
+
+def test_position_checkpoint_governed_worker_identity_is_not_session_role(tmp_path):
+    runtime, _, selector = _position_checkpoint_fixture(tmp_path)
+    record = runtime.store.get("cex-position")
+    d, start = (record["completed_lines"][i]["payload"] for i in (1, 3))
+    d["agent_id"] = d["bounded_workers"][0]["agent_id"] = d["worker_id"]
+    start["actual_host_worker_id"] = start["agent_id"] = d["worker_id"]
+    start["semantic_role_binding"]["actual_host_worker_id"] = d["worker_id"]
+    record["runtime_guide"]["completed_lines"] = deepcopy(record["completed_lines"])
+    runtime.store.update("cex-position", record)
+    good = runtime.position_checkpoint_view("cex-position", **selector)
+    assert good["ok"], good
+    assert good["semantic_checkpoint"]["role_assignment"]["holder_id"] == "opaque-actor"
+    assert good["semantic_checkpoint"]["role_assignment"]["worker_role"] == "mf_sub"
+    start["actual_host_worker_id"] = "foreign-host"
+    record["runtime_guide"]["completed_lines"] = deepcopy(record["completed_lines"])
+    runtime.store.update("cex-position", record)
+    assert not runtime.position_checkpoint_view("cex-position", **selector)["ok"]
+
+
+@pytest.mark.parametrize("change", ["oversize_wire", "invalid_revision", "nonfinite", "wrong_backlog", "partial_scope"])
+def test_position_checkpoint_bounded_refusal_without_partial_body(tmp_path, change):
+    runtime, _, selector = _position_checkpoint_fixture(tmp_path)
+    record = runtime.store.get("cex-position")
+    if change == "oversize_wire":
+        large = ["汉" * 6000]
+        for i in (1, 3): record["completed_lines"][i]["payload"]["owned_files"] = large
+        record["completed_lines"][1]["payload"]["bounded_workers"][0]["owned_files"] = large
+    elif change == "invalid_revision": record["execution_state_revision"] = True
+    elif change == "nonfinite": record["completed_lines"][0]["payload"]["extra"] = float("nan")
+    elif change == "wrong_backlog": selector["backlog_id"] = "foreign"
+    elif change == "partial_scope": selector["attempt"] = None
+    record["runtime_guide"]["completed_lines"] = deepcopy(record["completed_lines"])
+    runtime.store.update("cex-position", record)
+    result = runtime.position_checkpoint_view("cex-position", **selector)
+    assert not result["ok"] and result["absence"]
+    assert result["semantic_checkpoint"] is None and result["custody_envelope"] is None
+    assert len(json.dumps(result, ensure_ascii=False).encode()) < 16384
+
+
+@pytest.mark.parametrize("ordinal", [1, 2, 3, 4])
+@pytest.mark.parametrize("field", ["task_id", "runtime_context_id"])
+def test_position_checkpoint_original_line_scope_cannot_hide_in_nested_payload(tmp_path, ordinal, field):
+    runtime, _, selector = _position_checkpoint_fixture(tmp_path)
+    record = runtime.store.get("cex-position")
+    record["completed_lines"][ordinal][field] = "foreign-scope"
+    record["runtime_guide"]["completed_lines"] = deepcopy(record["completed_lines"])
+    runtime.store.update("cex-position", record)
+    result = runtime.position_checkpoint_view("cex-position", **selector)
+    assert not result["ok"] and result["absence"] == "original_line_scope_mismatch"
+
+
+@pytest.mark.parametrize("malformed", ["worker_integer", "worker_container", "guide_container", "line_container", "semantic_container", "huge_backlog"])
+def test_position_checkpoint_malformed_source_and_echo_are_bounded_unknown(tmp_path, malformed):
+    runtime, _, selector = _position_checkpoint_fixture(tmp_path)
+    record = runtime.store.get("cex-position")
+    if malformed == "worker_integer": record["completed_lines"][1]["payload"]["bounded_workers"] = [7]
+    elif malformed == "worker_container": record["completed_lines"][1]["payload"]["bounded_workers"] = "bad"
+    elif malformed == "line_container": record["completed_lines"][3] = 7
+    elif malformed == "semantic_container": record["completed_lines"][3]["payload"]["semantic_role_binding"] = []
+    elif malformed == "huge_backlog": selector["backlog_id"] = "汉" * 10000
+    record["runtime_guide"]["completed_lines"] = deepcopy(record["completed_lines"])
+    if malformed == "guide_container": record["runtime_guide"] = [7]
+    runtime.store.update("cex-position", record)
+    result = runtime.position_checkpoint_view("cex-position", **selector)
+    assert not result["ok"] and result["absence"]
+    assert result["semantic_checkpoint"] is None and result["custody_envelope"] is None
+    assert len(json.dumps(result, ensure_ascii=False).encode()) <= 16384

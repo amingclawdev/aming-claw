@@ -9630,6 +9630,246 @@ class ContractRuntime:
             completed_lines=record.get("completed_lines") or [],
         )
 
+    def position_checkpoint_view(
+        self, contract_execution_id: str, *, project_id: str, backlog_id: str,
+        runtime_context_id: str, task_id: str, attempt: int, through_ordinal: int,
+    ) -> dict[str, Any]:
+        """Project a durable admitted prefix; never replay missing historical Gate inputs.
+
+        Complete Rule/line/record digests are source-attested leaves. The public
+        semantic and custody bodies expose all preimages for their derived roots.
+        This read neither grants effects nor persists derived guide state.
+        """
+        def encoded(value):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+        def digest(value):
+            return "sha256:" + hashlib.sha256(encoded(value)).hexdigest()
+
+        def require(condition, reason):
+            if not condition:
+                raise ValueError(reason)
+
+        result = {
+            "schema_version": "contract_runtime.position_checkpoint.v1",
+            "response_view": "position_checkpoint", "ok": False,
+            "error": None, "absence": None, "observation_only": True,
+            "project_id": project_id if type(project_id) is str and len(project_id.encode("utf-8")) <= 512 else "",
+            "backlog_id": backlog_id if type(backlog_id) is str and len(backlog_id.encode("utf-8")) <= 512 else "",
+            "contract_execution_id": contract_execution_id if type(contract_execution_id) is str and len(contract_execution_id.encode("utf-8")) <= 512 else "",
+            "source_of_authority": "ContractRuntime.position_checkpoint_view/durable_admitted_prefix",
+            "semantic_checkpoint": None, "semantic_ref": None,
+            "custody_envelope": None, "custody_ref": None,
+        }
+        try:
+            require(all(type(v) is str and len(v.encode("utf-8")) <= 512 for v in
+                        (project_id, backlog_id, contract_execution_id, runtime_context_id, task_id)),
+                    "oversize_or_invalid_selector")
+            require(type(attempt) is int and attempt > 0, "invalid_attempt")
+            require(type(through_ordinal) is int and through_ordinal == 4, "unsupported_prefix")
+            require(all(type(v) is str and v.strip() == v and v for v in
+                        (project_id, backlog_id, runtime_context_id, task_id)), "missing_scope")
+            record = self.store.get(contract_execution_id)
+            require(isinstance(record, Mapping), "invalid_source_record")
+            require(record.get("project_id") == project_id and
+                    record.get("backlog_id") == backlog_id and
+                    record.get("contract_execution_id") == contract_execution_id,
+                    "source_scope_mismatch")
+            definition = self._load_pinned_definition(record)
+            lines = record.get("completed_lines")
+            require(isinstance(lines, list) and 5 <= len(lines) <= 128,
+                    "missing_or_oversize_durable_prefix")
+            require(type(record.get("execution_state_revision")) is int and
+                    record["execution_state_revision"] >= 5, "invalid_source_revision")
+            persisted_guide = record.get("runtime_guide") or {}
+            require(isinstance(persisted_guide, Mapping), "invalid_source_guide")
+            require(all(isinstance(l, Mapping) and isinstance(l.get("payload"), Mapping)
+                        for l in lines[:5]), "invalid_source_line")
+            if "completed_lines" in persisted_guide:
+                require(persisted_guide["completed_lines"] == lines,
+                        "durable_prefix_representation_mismatch")
+            selected = lines[:5]
+            rules = {(s["stage_id"], l["line_id"]): l
+                     for s, l in iter_stage_lines(definition)}
+            seen = set()
+            for line in selected:
+                rule = rules.get((line["stage_id"], line["line_id"]))
+                require(rule is not None and line["actor_role"] in rule["allowed_writer_roles"]
+                        and line["evidence_kind"] == rule["evidence_kind"]
+                        and all(dep in seen for dep in rule.get("requires", []))
+                        and line["line_id"] not in seen, "pinned_line_conformance")
+                seen.add(line["line_id"])
+            require([l["line_id"] for l in selected] == [
+                "observer_prefill_child_contracts", "observer_dispatch_bounded_workers",
+                "worker_read_runtime_guide", "worker_startup", "worker_graph_context"],
+                "unsupported_prefix_shape")
+            dispatch, startup, graph = (selected[i]["payload"] for i in (1, 3, 4))
+            ge, sem = graph["graph_trace_evidence"], startup["semantic_role_binding"]
+            require(isinstance(ge, Mapping) and isinstance(sem, Mapping), "invalid_source_provenance")
+            for key in ("runtime_context_id", "task_id", "parent_task_id", "worker_id", "worker_role"):
+                require(type(dispatch[key]) is str and bool(dispatch[key]) and
+                        dispatch[key] == startup[key] == graph[key], "assignment_scope_mismatch")
+            require(dispatch["runtime_context_id"] == runtime_context_id and
+                    dispatch["task_id"] == task_id and dispatch["worker_role"] == "mf_sub",
+                    "selected_scope_mismatch")
+            # The source-owned startup provenance, not an opaque holder ID, assigns Role.
+            require(sem["semantic_role"] == "mf_sub" and
+                    sem["source"] == "server_verified_runtime_context_startup" and
+                    type(sem["worker_session_id"]) is str and bool(sem["worker_session_id"]) and
+                    sem["worker_session_id"] == startup["worker_session_id"],
+                    "startup_provenance_mismatch")
+            require(dispatch["agent_id"] == sem["worker_session_id"] or (
+                    dispatch["agent_id"] == dispatch["worker_id"] == startup.get("actual_host_worker_id")
+                    == startup.get("agent_id") == sem.get("actual_host_worker_id")),
+                    "dispatch_holder_provenance_mismatch")
+            files = dispatch["owned_files"]
+            require(isinstance(files, list) and files and len(set(files)) == len(files)
+                    and all(type(f) is str and f for f in files)
+                    and files == startup["owned_files"], "owned_scope_mismatch")
+            workers = dispatch["bounded_workers"]
+            require(isinstance(workers, list) and all(isinstance(w, Mapping) for w in workers),
+                    "invalid_dispatch_workers")
+            matching = [w for w in workers if w.get("runtime_context_id") == runtime_context_id
+                        and w.get("task_id") == task_id]
+            require(len(matching) == 1, "ambiguous_dispatch_assignment")
+            worker = matching[0]
+            for key in ("worker_id", "worker_role", "parent_task_id", "owned_files",
+                        "target_project_root", "target_head_commit", "agent_id"):
+                require(worker[key] == dispatch[key], "dispatch_assignment_mismatch")
+            require(type(worker["retry_policy"]["attempt"]) is int and
+                    worker["retry_policy"]["attempt"] == attempt, "attempt_mismatch")
+            commit = dispatch["target_head_commit"]
+            require(type(commit) is str and re.fullmatch("[a-f0-9]{40}", commit) and
+                    commit == startup["target_head_commit"] == ge["expected_runtime_context_commit"]
+                    == ge["snapshot_commit"], "world_commit_mismatch")
+            require(type(dispatch["target_project_root"]) is str and dispatch["target_project_root"]
+                    and dispatch["target_project_root"] == startup["target_project_root"]
+                    == graph["target_project_root"], "world_root_mismatch")
+            require(type(ge["snapshot_id"]) is str and ge["snapshot_id"], "missing_snapshot")
+            for key in ("runtime_context_id", "task_id", "parent_task_id"):
+                require(ge[key] == dispatch[key], "graph_scope_mismatch")
+            # Original line scope is authoritative too: a nested payload cannot
+            # conceal a coherently rehashed foreign top-level lane assignment.
+            for line in selected[1:]:
+                payload = line["payload"]
+                for key in ("runtime_context_id", "task_id", "parent_task_id", "worker_id",
+                            "worker_role", "target_project_root", "owned_files", "worker_session_id",
+                            "graph_trace_evidence"):
+                    if key in line:
+                        require(key in payload and line[key] == payload[key], "original_line_scope_mismatch")
+            # Read-guide provenance must refer to this same lane, when present.
+            read = selected[2]["payload"]
+            for key in ("runtime_context_id", "task_id", "parent_task_id", "worker_id", "worker_role"):
+                if key in read:
+                    require(read[key] == dispatch[key], "read_scope_mismatch")
+            dh = definition["definition_hash"]
+            obj = {"contract_id": definition["contract_id"], "revision": definition["revision"],
+                   "definition_digest": dh, "definition_ref": "definition:" + dh}
+            permissions = [{"stage_id": s["stage_id"], "line_id": l["line_id"],
+                            "evidence_kind": l["evidence_kind"],
+                            "allowed_writer_roles": l["allowed_writer_roles"],
+                            "requires": l.get("requires", [])}
+                           for s, l in iter_stage_lines(definition)
+                           if "mf_sub" in l["allowed_writer_roles"]]
+            require(bool(permissions), "missing_role_definition")
+            role = {"role": "mf_sub", "definition_ref": obj["definition_ref"],
+                    "stage_line_permissions": permissions, "scope_rule_refs": [
+                        obj["definition_ref"] + "/system_layer/write_authority_policy",
+                        obj["definition_ref"] + "/system_layer/dispatch_ticket_authority_policy"]}
+            role["role_definition_ref"] = "role-definition:" + digest(role)
+            facts = []
+            for i, line in enumerate(selected):
+                base = {"ordinal": i, "source_line_ref": "contract_runtime:" + contract_execution_id
+                        + ":completed_lines:" + str(i), "source_line_digest": digest(line),
+                        "definition_ref": obj["definition_ref"]}
+                facts.append({"fact_ref": "fact:" + digest(base), "ordinal": i,
+                              "source_line_ref": base["source_line_ref"],
+                              "source_line_digest": base["source_line_digest"],
+                              "role_definition_ref": role["role_definition_ref"]})
+            refs = [f["fact_ref"] for f in facts]
+            prefix = digest({"ordered_fact_refs": refs, "through_ordinal": 4})
+            admission = {"owner": "ContractRuntime", "rule_ref": obj["definition_ref"],
+                         "source_record_ref": "contract_runtime:" + project_id + ":" + backlog_id
+                         + ":" + contract_execution_id + ":completed_lines:0..4:" + prefix,
+                         "ordered_fact_refs": refs,
+                         "gate_owner": "ContractRuntime.submit_line_write/ContractGateKernel.precheck/validate_contract_write",
+                         "unresolved_refs": [], "conflicting_refs": []}
+            admission["receipt_ref"] = "admission-projection:" + digest(admission)
+            for fact in facts:
+                fact["admission_ref"] = admission["receipt_ref"]
+            public_sem = {"semantic_role": "mf_sub", "source": sem["source"],
+                          "worker_session_id": sem["worker_session_id"]}
+            assignment = {"assignment_fact_refs": [refs[1], refs[3]],
+                          "holder_id": sem["worker_session_id"],
+                          **{k: dispatch[k] for k in ("worker_id", "runtime_context_id", "task_id",
+                                                     "parent_task_id", "worker_role", "owned_files")},
+                          "provenance_digest": digest({"dispatch_line_digest": facts[1]["source_line_digest"],
+                                                       "startup_line_digest": facts[3]["source_line_digest"],
+                                                       "semantic_role_binding": public_sem})}
+            world = {"phase": "worker_context", "target_project_root": dispatch["target_project_root"],
+                     "commit_sha": commit, "snapshot_id": ge["snapshot_id"],
+                     "assignment_fact_ref": refs[1], "graph_fact_ref": refs[4]}
+            world["world_ref"] = "world:" + digest(world)
+            generation = "generation:" + digest({"project_id": project_id,
+                         "contract_execution_id": contract_execution_id, "definition_digest": dh})
+            execution = "execution:" + digest({"generation_id": generation,
+                        "runtime_context_id": runtime_context_id, "task_id": task_id, "attempt": attempt})
+            semantic = {
+                "schema_version": "ac.position_checkpoint.v2",
+                "source": {"owner": "ContractRuntime", "project_id": project_id,
+                           "backlog_id": backlog_id, "contract_execution_id": contract_execution_id},
+                "object_revision": obj, "evidence_prefix": {"through_ordinal": 4,
+                    "line_count": 5, "ordered_fact_refs": refs, "prefix_digest": prefix},
+                "admitted_facts": facts, "admission_receipt": admission,
+                "role_definition": role, "role_assignment": assignment, "world": world,
+                "execution_binding": {"convention_id": "ac.cex_lane_attempt.position_convention.v1",
+                    "generation_id": generation, "execution_id": execution,
+                    "contract_execution_id": contract_execution_id, "definition_digest": dh,
+                    "runtime_context_id": runtime_context_id, "task_id": task_id, "attempt": attempt},
+                "scope": {"project_id": project_id, "backlog_id": backlog_id, "task_id": task_id,
+                    "runtime_context_id": runtime_context_id, "owned_files": files,
+                    "world_ref": world["world_ref"], "role_definition_ref": role["role_definition_ref"],
+                    "assignment_fact_refs": assignment["assignment_fact_refs"]},
+                "admitted_fact_root": digest({"schema_version": "ac.admitted_fact_root.v1",
+                    "ordered_fact_refs": refs, "rule_ref": admission["rule_ref"],
+                    "admission_ref": admission["receipt_ref"]}),
+                "authority": {"construction_only": True, "effect_authority": False,
+                    "direction_authority": False, "release_pass": False, "close_satisfying": False},
+            }
+            semantic_ref = "position:" + digest(semantic)
+            # Custody binds the complete stored mapping independently of selected semantic facts.
+            line_digests = [digest(line) for line in lines]
+            view = self._record_view(record, completed_lines=lines)
+            state = view["execution_state"]
+            custody = {"schema_version": "ac.position_checkpoint.custody.v2",
+                "semantic_position_ref": semantic_ref, "canonical_payload_digest": digest(record),
+                "source_record_ref": "contract_runtime:" + project_id + ":" + backlog_id + ":"
+                    + contract_execution_id + ":execution_state_revision:" + str(record["execution_state_revision"]),
+                "source_record_revision": record["execution_state_revision"],
+                "source_execution_state_hash": state["execution_state_hash"],
+                "ordered_source_line_digests": line_digests, "full_completed_line_count": len(lines),
+                "full_completed_lines_root": digest({"ordered_source_line_digests": line_digests,
+                                                     "line_count": len(lines)}),
+                "selected_prefix_digest": prefix, "validation_mode": "durable_admitted_prefix"}
+            result.update(ok=True, semantic_checkpoint=semantic, semantic_ref=semantic_ref,
+                          custody_envelope=custody, custody_ref="custody:" + digest(custody),
+                          contract_id=record["contract_id"], contract_revision_id=record["revision"],
+                          contract_hash=dh, execution_state_revision=record["execution_state_revision"],
+                          execution_state_hash=state["execution_state_hash"],
+                          runtime_guide_hash=view["runtime_guide"]["runtime_guide_hash"])
+            require(len(encoded(result)) <= 16000, "wire_oversize")
+        except (KeyError, TypeError, ValueError, AttributeError, ContractRuntimeError, ContractDefinitionError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else "invalid_source_binding"
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,100}", reason):
+                reason = "invalid_source_binding"
+            result.update(ok=False, error="position_checkpoint_unavailable", absence=reason,
+                          semantic_checkpoint=None, semantic_ref=None, custody_envelope=None, custody_ref=None)
+            for key in ("contract_id", "contract_revision_id", "contract_hash", "execution_state_revision",
+                        "execution_state_hash", "runtime_guide_hash"):
+                result.pop(key, None)
+        return result
+
     def projected_record(
         self,
         contract_execution_id: str,

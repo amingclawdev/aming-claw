@@ -2794,3 +2794,58 @@ def test_r7_resolved_green_implementation_alias_is_exact_summary_only():
     line["payload"]["tests"][0]["failed_count"] = False
     assert not server._contract_runtime_worker_implementation_known_baseline_scan_candidate(
         line, expected_worker_identity=identity, expected_baseline_commit="a" * 40)
+
+
+def test_position_checkpoint_current_state_uses_authenticated_durable_source(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from agent.tests.test_contract_runtime import _position_checkpoint_fixture
+    runtime, conn, selector = _position_checkpoint_fixture(tmp_path, sqlite=True)
+    @contextmanager
+    def db_context(project):
+        assert project == selector["project_id"]
+        yield conn
+    monkeypatch.setattr(server, "DBContext", db_context)
+    monkeypatch.setattr(server, "_CONTRACT_DEFINITION_REGISTRY", runtime.registry)
+    roles = []
+    def effective(ctx, actual_conn, **kwargs):
+        roles.append(kwargs)
+        assert actual_conn is conn and kwargs["record"]["contract_execution_id"] == "cex-position"
+        return "observer"
+    monkeypatch.setattr(server, "_contract_runtime_effective_actor_role", effective)
+    # The unrelated current projection/guide writer must not provide Position authority.
+    monkeypatch.setattr(server, "_contract_runtime_read", lambda *a, **k: pytest.fail("broad projection invoked"))
+    ctx = SimpleNamespace(get_project_id=lambda: selector["project_id"],
+        path_params={"contract_execution_id": "cex-position"}, request_id="req-position-fixture",
+        query={"response_view": "position_checkpoint", "backlog_id": selector["backlog_id"]})
+    before, changes = list(conn.iterdump()), conn.total_changes
+    result = server.handle_project_contract_runtime_current_state(ctx)
+    assert result["ok"], result
+    assert result["actor_role"] == "observer" and len(roles) == 1
+    assert result["semantic_checkpoint"]["scope"]["task_id"] == "task-position"
+    assert result["source_of_authority"] == "ContractRuntime.position_checkpoint_view/durable_admitted_prefix"
+    assert len(json.dumps(result, ensure_ascii=False).encode()) < 16384
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    ctx.query.update(runtime_context_id="ctx-position")
+    assert not server.handle_project_contract_runtime_current_state(ctx)["ok"]
+    del ctx.query["runtime_context_id"]
+    stored = runtime.store.get("cex-position")
+    duplicate = copy.deepcopy(stored)
+    duplicate["completed_lines"][1]["payload"]["bounded_workers"] *= 2
+    duplicate["runtime_guide"]["completed_lines"] = copy.deepcopy(duplicate["completed_lines"])
+    runtime.store.update("cex-position", duplicate)
+    ambiguous = server.handle_project_contract_runtime_current_state(ctx)
+    assert not ambiguous["ok"] and ambiguous["absence"] == "missing_or_ambiguous_source_selector"
+    runtime.store.update("cex-position", stored)
+    ctx.query.update(runtime_context_id="ctx-position", task_id="foreign", attempt="1", through_ordinal="4")
+    denied = server.handle_project_contract_runtime_current_state(ctx)
+    assert not denied["ok"] and denied["absence"] == "selected_scope_mismatch"
+    ctx.query = {"response_view": "position_checkpoint", "backlog_id": "汉" * 10000}
+    oversized = server.handle_project_contract_runtime_current_state(ctx)
+    assert not oversized["ok"] and len(json.dumps(oversized, ensure_ascii=False).encode()) <= 16384
+    malformed = copy.deepcopy(stored)
+    malformed["completed_lines"][1]["payload"]["bounded_workers"] = [7]
+    malformed["runtime_guide"]["completed_lines"] = copy.deepcopy(malformed["completed_lines"])
+    runtime.store.update("cex-position", malformed)
+    ctx.query = {"response_view": "position_checkpoint", "backlog_id": selector["backlog_id"]}
+    assert not server.handle_project_contract_runtime_current_state(ctx)["ok"]
+    conn.close()
