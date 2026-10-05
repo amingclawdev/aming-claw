@@ -240313,8 +240313,11 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
                 value = ctx.query.get(name)
                 if type(value) is int:
                     return value
-                if type(value) is str and re.fullmatch(r"0|[1-9][0-9]*", value):
-                    return int(value)
+                if type(value) is str and len(value) <= 18 and re.fullmatch(r"0|[1-9][0-9]*", value):
+                    try:
+                        return int(value)
+                    except ValueError:
+                        return None
                 return None
 
             selector_keys = ("runtime_context_id", "task_id", "attempt", "through_ordinal")

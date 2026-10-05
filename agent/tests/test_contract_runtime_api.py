@@ -2849,3 +2849,36 @@ def test_position_checkpoint_current_state_uses_authenticated_durable_source(tmp
     ctx.query = {"response_view": "position_checkpoint", "backlog_id": selector["backlog_id"]}
     assert not server.handle_project_contract_runtime_current_state(ctx)["ok"]
     conn.close()
+
+
+@pytest.mark.parametrize("field", ["attempt", "through_ordinal"])
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("invalid", ["9" * 5000, "not-decimal", "-1"])
+def test_position_checkpoint_handler_malformed_decimal_is_bounded_unknown(tmp_path, monkeypatch, field, partial, invalid):
+    from contextlib import contextmanager
+    from agent.tests.test_contract_runtime import _position_checkpoint_fixture
+    runtime, conn, selector = _position_checkpoint_fixture(tmp_path, sqlite=True)
+    @contextmanager
+    def db_context(project):
+        assert project == selector["project_id"]
+        yield conn
+    monkeypatch.setattr(server, "DBContext", db_context)
+    monkeypatch.setattr(server, "_CONTRACT_DEFINITION_REGISTRY", runtime.registry)
+    monkeypatch.setattr(server, "_contract_runtime_effective_actor_role", lambda *a, **k: "observer")
+    query = {"response_view": "position_checkpoint", "backlog_id": selector["backlog_id"]}
+    ctx = SimpleNamespace(get_project_id=lambda: selector["project_id"],
+        path_params={"contract_execution_id": "cex-position"}, request_id="req-111111111111", query=query)
+    assert server.handle_project_contract_runtime_current_state(ctx)["ok"]
+    if not partial:
+        query.update(runtime_context_id=selector["runtime_context_id"], task_id=selector["task_id"],
+                     attempt="1", through_ordinal="4")
+    query[field] = invalid
+    before, changes = list(conn.iterdump()), conn.total_changes
+    result = server.handle_project_contract_runtime_current_state(ctx)
+    assert not result["ok"] and result["error"] == "position_checkpoint_unavailable"
+    assert result["absence"] in {"invalid_attempt", "unsupported_prefix", "missing_scope"}
+    assert result["semantic_checkpoint"] is None and result["custody_envelope"] is None
+    assert result["semantic_ref"] is None and result["custody_ref"] is None
+    assert len(json.dumps(result, ensure_ascii=False).encode()) <= 16384
+    assert conn.total_changes == changes and list(conn.iterdump()) == before
+    conn.close()
