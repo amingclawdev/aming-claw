@@ -610,6 +610,57 @@ def test_native_event_shared_batch_refuses_durable_forgery_without_writes(tmp_pa
         connection.close()
 
 
+@pytest.mark.parametrize("child_index", [0, 1])
+@pytest.mark.parametrize("mutation", ["task_id", "runtime_context_id", "payload_metadata"])
+def test_native_event_shared_batch_selected_line_scope_with_coherent_hash(tmp_path, monkeypatch, child_index, mutation):
+    conn, world, batch, connection, _parent = _native_shared_batch_fixture(tmp_path, monkeypatch)
+    execution = batch._BATCH_QA_CHILD_EXECUTIONS[child_index]
+    try:
+        selector = _native_batch_selector(batch, execution, world.reconcile_event["id"])
+        baseline = _native_batch_read_without_writes(conn, lambda:
+            _native_batch_http(batch, execution, selector))
+        assert baseline["ok"] is True, baseline
+        store = server._contract_runtime_store(conn)
+        record = store.get(execution)
+        changed = copy.deepcopy(record)
+        original = copy.deepcopy(record["completed_lines"][10])
+        selected = changed["completed_lines"][10]
+        if mutation == "payload_metadata":
+            selected["payload"]["caller_extension"] = "allowed-observation-metadata"
+        else:
+            selected[mutation] = "foreign-task" if mutation == "task_id" else "foreign-context"
+        assert selected["payload"]["reconcile_authority"] == original["payload"]["reconcile_authority"]
+        assert _native_wire_hash(selected) != _native_wire_hash(original)
+        changed["execution_state_revision"] += 1
+        store.update(execution, changed, expected_revision=record["execution_state_revision"])
+        conn.commit()
+        selector = _native_batch_selector(batch, execution, world.reconcile_event["id"])
+        selector.update(source_line_hash=_native_wire_hash(selected),
+            source_event_hash=baseline["native_event"]["source_event_hash"])
+        recorded = _native_batch_read_without_writes(conn, lambda:
+            _native_batch_http(batch, execution, {**selector, "response_view": "recorded_line"}))
+        assert recorded["ok"] is True, recorded
+        assert recorded["recorded_line"]["source_line_hash"] == _native_wire_hash(selected)
+        proof = _native_batch_read_without_writes(conn, lambda:
+            _native_batch_http(batch, execution, selector))
+        if mutation == "payload_metadata":
+            assert proof["ok"] is True, proof
+            assert proof["native_event"] == baseline["native_event"]
+            for pin in ("source_scope", "queried_child_scope", "child_dispatch_scope", "source_event_hash",
+                        "epoch_hash", "ordered_queue_hash", "shared_authority_hash", "terminal_authority_hash"):
+                assert proof["association"][pin] == baseline["association"][pin]
+        else:
+            assert proof["ok"] is False, (mutation, proof)
+            assert proof["error"] in {"native_event_scope_mismatch", "native_event_association_invalid"}
+            assert proof["native_event"] is None
+            assert not proof.get("association")
+            assert proof["observation_only"] is True
+            assert proof["direction_authority"] is proof["effect_authority"] is False
+        assert store.get(execution)["completed_lines"][10]["payload"]["reconcile_authority"] == original["payload"]["reconcile_authority"]
+    finally:
+        connection.close()
+
+
 def test_native_event_shared_batch_requires_current_selector_and_server_reader(tmp_path, monkeypatch):
     from agent.governance import native_event_provenance
     conn, world, batch, connection, _parent = _native_shared_batch_fixture(tmp_path, monkeypatch)
