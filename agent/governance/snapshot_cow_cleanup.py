@@ -55,6 +55,7 @@ _METADATA_SOURCE_BYTES = 16 * 1024
 _METADATA_SECONDS = 2.0
 _METADATA_CONNECTION: ContextVar[Any] = ContextVar("cow_metadata_connection", default=None)
 _METADATA_UNREAPED: dict[int, Any] = {}
+_VOLUME_CONTEXT: ContextVar[str] = ContextVar("cow_volume_context", default="unspecified")
 
 
 class CowRefusal(ValueError):
@@ -906,37 +907,89 @@ def preview(conn: sqlite3.Connection, project_id: str, root: Path, *,
                 "physical_reclaim": "UNKNOWN"}}
 
 
+@contextmanager
+def _volume_scope(context: str):
+    token = _VOLUME_CONTEXT.set(context if context in ("snapshot", "archive") else "unspecified")
+    try:
+        yield
+    finally:
+        _VOLUME_CONTEXT.reset(token)
+
+
+def _volume_diagnostic(exc: BaseException, phase: str) -> dict[str, Any]:
+    context = _VOLUME_CONTEXT.get()
+    diagnostic = {"context": context if context in ("snapshot", "archive") else "unspecified",
+                  "phase": phase, "exception_category": "validation"}
+    if isinstance(exc, subprocess.TimeoutExpired):
+        diagnostic["exception_category"] = "timeout"
+        if type(exc.timeout) in (int, float) and 0 <= exc.timeout <= 10 and math.isfinite(exc.timeout):
+            diagnostic["timeout_seconds"] = exc.timeout
+    elif isinstance(exc, subprocess.CalledProcessError):
+        diagnostic["exception_category"] = "command_exit"
+        if type(exc.returncode) is int and -(2 ** 31) <= exc.returncode < 2 ** 31:
+            diagnostic["returncode"] = exc.returncode
+    elif isinstance(exc, OSError):
+        diagnostic["exception_category"] = "os_error"
+        if type(exc.errno) is int and 0 <= exc.errno <= 4095:
+            diagnostic["errno"] = exc.errno
+    elif isinstance(exc, UnicodeError):
+        diagnostic["exception_category"] = "decode_error"
+    elif isinstance(exc, (plistlib.InvalidFileException, ExpatError)):
+        diagnostic["exception_category"] = "plist_error"
+    elif isinstance(exc, subprocess.SubprocessError):
+        diagnostic["exception_category"] = "subprocess_error"
+    elif not isinstance(exc, CowRefusal):
+        diagnostic["exception_category"] = "value_error"
+    return {"volume_diagnostic": diagnostic}
+
+
 def _volume(path: Path) -> dict[str, Any]:
     if sys.platform != "darwin":
-        raise CowRefusal("apfs_platform_unsupported")
+        raise CowRefusal("apfs_platform_unsupported",
+                         _volume_diagnostic(CowRefusal("apfs_platform_unsupported"), "platform"))
+    phase = "path_validation"
     try:
         path = _path(path)
+        phase = "path_stat"
         before = path.lstat()
         # diskutil accepts a mounted device, but not an arbitrary directory.
         # df resolves APFS firmlinks too; walking lexical parents does not.
+        phase = "df_command"
         inventory = subprocess.run(["df", "-P", str(path)], capture_output=True,
                                    check=True, timeout=10)
+        phase = "df_decode"
         lines = inventory.stdout.decode("utf-8").splitlines()
         node = lines[1].split()[0] if len(lines) == 2 and lines[1].split() else ""
+        phase = "device_validation"
         if not re.fullmatch(r"/dev/disk[0-9]+(?:s[0-9]+)*", node):
             raise CowRefusal("cow_volume_device_unverified")
+        phase = "device_identity"
         device = _path(Path(node)).lstat()
         if not stat.S_ISBLK(device.st_mode) or device.st_rdev != before.st_dev:
             raise CowRefusal("cow_volume_device_mismatch")
+        phase = "diskutil_command"
         result = subprocess.run(["diskutil", "info", "-plist", node],
                                 capture_output=True, check=True, timeout=10)
+        phase = "diskutil_decode"
         info = plistlib.loads(result.stdout)
+        phase = "plist_validation"
         if not isinstance(info, dict) or info.get("Error"):
             raise CowRefusal("cow_volume_unreadable")
+        phase = "filesystem_validation"
         if str(info.get("FilesystemType") or "").lower() != "apfs":
             raise CowRefusal("apfs_filesystem_required")
+        phase = "volume_identity"
         mount = Path(str(info.get("MountPoint") or ""))
         if (info.get("DeviceNode") != node or not info.get("VolumeUUID")
                 or not mount.is_absolute()):
             raise CowRefusal("cow_volume_identity_unverified")
+        phase = "mount_stat"
         mounted = _path(mount).lstat()
+        phase = "path_restat"
         after = _path(path).lstat()
+        phase = "device_restat"
         device_after = _path(Path(node)).lstat()
+        phase = "identity_recheck"
         if (not stat.S_ISDIR(mounted.st_mode) or mounted.st_dev != before.st_dev
                 or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
                 or (device_after.st_dev, device_after.st_ino, device_after.st_rdev)
@@ -944,9 +997,11 @@ def _volume(path: Path) -> dict[str, Any]:
             raise CowRefusal("cow_volume_identity_drift")
         return {"uuid": info["VolumeUUID"], "mount": str(mount), "device": before.st_dev}
     except (OSError, subprocess.SubprocessError, ValueError, ExpatError) as exc:
+        diagnostic = _volume_diagnostic(exc, phase)
         if isinstance(exc, CowRefusal):
+            exc.metadata = {**exc.metadata, **diagnostic}
             raise
-        raise CowRefusal("cow_volume_unreadable") from exc
+        raise CowRefusal("cow_volume_unreadable", diagnostic) from exc
 
 
 def _archive(project_id: str, source: Path, bytes_needed: int = 0) -> dict[str, Any]:
@@ -962,7 +1017,8 @@ def _archive(project_id: str, source: Path, bytes_needed: int = 0) -> dict[str, 
         raise CowRefusal("cow_archive_unavailable") from exc
     if not path.is_relative_to(mount) or not os.path.ismount(mount):
         raise CowRefusal("cow_archive_mount_unverified")
-    volume = _volume(path)
+    with _volume_scope("archive"):
+        volume = _volume(path)
     if (not config.get("archive_volume_uuid") or volume["uuid"] != config["archive_volume_uuid"]
             or volume["mount"] != str(mount) or path.stat().st_dev == source.stat().st_dev):
         raise CowRefusal("cow_archive_volume_mismatch")
@@ -1255,7 +1311,8 @@ def apply(conn: sqlite3.Connection, project_id: str, root: Path, *, candidate_id
         raise CowRefusal("cow_candidate_not_in_exact_plan")
     rows = [candidates[cid] for cid in candidate_ids]
     try:
-        _volume(snapshots._snapshot_root(project_id, rows[0]["snapshot_id"]))
+        with _volume_scope("snapshot"):
+            _volume(snapshots._snapshot_root(project_id, rows[0]["snapshot_id"]))
         # Verify all prerequisites before even creating the local operation ledger.
         for row in rows:
             _fresh(conn, project_id, root, projection, row)
